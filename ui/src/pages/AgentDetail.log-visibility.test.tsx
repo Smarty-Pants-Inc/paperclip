@@ -248,7 +248,12 @@ it("preserves saved event details and catches up payload-free commit signals", a
     });
     expect(container.textContent).toContain("saved event details");
     expect(container.textContent).toContain("live row 2205");
-    expect(container.textContent).toContain("Events (2200)");
+    expect(container.textContent).toContain("Events (2205)");
+    const retainedMessages = [...container.querySelectorAll("span.break-all")].map(node => node.textContent);
+    expect(retainedMessages).toEqual([
+      "saved event details", "new canonical event details", "complete live event details",
+      ...Array.from({ length: 2202 }, (_, index) => `live row ${index + 4}`),
+    ]);
     await act(async () => root.render(<LiveEventSubscriptionContext.Provider value={subscription}><LogViewer run={{ ...run, status: "succeeded" }} adapterType="paperclip_runner" /></LiveEventSubscriptionContext.Provider>));
     expect(container.textContent).toContain("saved event details");
     expect(container.textContent).toContain("live row 2205");

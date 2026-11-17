@@ -1,4 +1,6 @@
 import { useTaskChatExpansion } from "./expansion-state";
+import { SavedOutputNotice } from "./SavedOutputNotice";
+import { savedOutputForDisplay } from "./saved-output";
 import { cn } from "@/lib/utils";
 import {
   Check,
@@ -54,7 +56,8 @@ export function TaskChatToolCard({ item }: { item: TaskChatToolItem }) {
   const RowIcon = toolTaxonomy(item.rawName ?? item.name).icon;
   const providerIcons = useProviderToolIcons(item.rawName ?? item.name);
   const [showDetail, setShowDetail] = useTaskChatExpansion(item.id, false);
-  const expandable = Boolean(item.target || item.detail || item.diff);
+  const { output: detail, outputTruncated } = savedOutputForDisplay(item.detail, item.outputTruncated);
+  const expandable = Boolean(item.target || detail || item.diff || outputTruncated);
 
   return (
     <div data-testid="task-chat-tool-card" className="flex min-w-0 max-w-full flex-col text-xs">
@@ -138,15 +141,16 @@ export function TaskChatToolCard({ item }: { item: TaskChatToolItem }) {
           {item.target}
         </div>
       ) : null}
-      {item.detail && showDetail ? (
+      {detail && showDetail ? (
         <pre className="task-chat-expanded-line-wrap ml-1.5 mt-0.5 min-w-0 max-w-full overflow-hidden whitespace-pre-wrap border-l-2 border-border py-1 pl-2.5 font-mono text-(length:--text-micro) leading-relaxed text-muted-foreground">
-          {item.detail}
+          {detail}
         </pre>
       ) : null}
+      {outputTruncated && showDetail ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
       {item.diff && showDetail ? (
         item.diff.lines && item.diff.lines.length > 0 ? (
           <div className="ml-1.5 mt-1 min-w-0 max-w-full" data-testid="task-chat-tool-diff">
-            <TaskChatDiffView lines={item.diff.lines} truncated={item.diff.truncated} />
+            <TaskChatDiffView lines={item.diff.lines} truncated={item.diff.truncated} runLogHref={item.runLogHref} />
           </div>
         ) : (
           <div

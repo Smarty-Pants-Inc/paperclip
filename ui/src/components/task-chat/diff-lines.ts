@@ -1,8 +1,8 @@
 import type { TaskChatDiffLine } from "./task-chat-model";
 import { createUnifiedDiffClassifier } from "@/lib/patch";
 
-/** Display cap for one diff in the task chat. */
-export const TASK_CHAT_DIFF_LINE_LIMIT = 400;
+/** No data cap: TaskChatDiffView progressively reveals the complete patch. */
+export const TASK_CHAT_DIFF_LINE_LIMIT = Number.POSITIVE_INFINITY;
 
 export { createUnifiedDiffClassifier } from "@/lib/patch";
 export type { PatchLineKind as UnifiedDiffLineKind } from "@/lib/patch";
@@ -10,7 +10,7 @@ export type { PatchLineKind as UnifiedDiffLineKind } from "@/lib/patch";
 /**
  * Parse a unified diff body into display lines. File headers (`---`, `+++`,
  * `diff --git`, `index`) are dropped because the row or card already names the
- * file. Lines past the display cap are omitted and reported as truncated.
+ * file. The default retains every line for the view's expand control.
  */
 export function parseUnifiedDiffLines(
   patch: string,

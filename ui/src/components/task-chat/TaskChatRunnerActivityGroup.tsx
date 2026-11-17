@@ -1,4 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
+import { SavedOutputNotice } from "./SavedOutputNotice";
+import { savedOutputForDisplay } from "./saved-output";
 import { completedActivitySummary } from "./completed-activity-summary";
 import {
   Brain,
@@ -418,9 +420,16 @@ function ActivityDetailsBody({ item }: { item: Activity }) {
         {item.detail ?? item.label}
       </p>
     );
+  const { output: detail, outputTruncated } = savedOutputForDisplay(item.detail, item.outputTruncated);
   if (item.diff?.lines?.length)
     return (
-      <TaskChatDiffView lines={item.diff.lines} truncated={item.diff.truncated} />
+      <>
+        <TaskChatDiffView lines={item.diff.lines} truncated={item.diff.truncated} runLogHref={item.runLogHref} />
+        {outputTruncated ? <>
+          {detail ? <pre className="whitespace-pre-wrap break-words font-mono">{detail}</pre> : null}
+          <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} />
+        </> : null}
+      </>
     );
   return (
     <>
@@ -429,11 +438,12 @@ function ActivityDetailsBody({ item }: { item: Activity }) {
         <p className="break-all font-mono">{item.target}</p>
       ) : null}
       {item.blockedReason ? <p className="text-destructive">Blocked: {item.blockedReason}</p> : null}
-      {item.detail ? (
+      {detail ? (
         <pre className="whitespace-pre-wrap break-words font-mono">
-          {item.detail}
+          {detail}
         </pre>
       ) : null}
+      {outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
       {item.decision ? <p>Permission {item.decision}</p> : null}
       {item.diff ? (
         <p className="break-all font-mono">
@@ -450,7 +460,7 @@ function hasActivityDetails(item: Activity): boolean {
   if (item.kind === "thinking") return item.lines.some((line) => line.trim());
   if (item.kind === "tool")
     return Boolean(
-      item.target?.trim() || item.detail?.trim() || item.diff || item.decision || item.blockedReason || item.description,
+      item.target?.trim() || item.detail?.trim() || item.outputTruncated || item.diff || item.decision || item.blockedReason || item.description,
     );
   if (item.kind === "marker") return Boolean(item.detail?.trim());
   return Boolean(

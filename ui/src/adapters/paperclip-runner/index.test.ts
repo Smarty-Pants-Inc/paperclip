@@ -22,6 +22,133 @@ const piFailure = (overrides: Record<string, unknown> = {}, eventOverrides: Reco
 });
 
 describe("paperclip runner transcript projection", () => {
+  describe("command output producer fields (note 5 C2)", () => {
+    const payloadFor = (field: string, output: string) => {
+      const item = { id: "exec-output", type: "commandExecution", command: "printf output", status: "completed" };
+      return field.startsWith("payload.")
+        ? { kind: "commandExecution", item, [field.slice(8)]: output }
+        : { kind: "commandExecution", item: { ...item, [field]: output } };
+    };
+    const replay = (events: Array<{ eventType: string; payload: Record<string, unknown>; itemId?: string }>) => {
+      const parser = paperclipRunnerUIAdapter.createStdoutParser!();
+      return events.flatMap(event => parser.parseLine(JSON.stringify({ type: "paperclip.prp.event", event: {
+        itemId: "exec-output", ...event,
+      } }), "2026-11-17T14:00:00.000Z"));
+    };
+    const command = (events: Parameters<typeof replay>[0], running = false) => transcriptToTaskChatItems(replay([
+      { eventType: "item.started", payload: payloadFor("output", "") }, ...events,
+    ]), { runId: "command-output", running }).filter(item => item.kind === "tool");
+
+    // Pure parser -> existing person-facing projection proves exact preservation
+    // and spill evidence without introducing another test file or renderer.
+    for (const field of ["aggregatedOutput", "aggregated_output", "output", "payload.output", "text", "payload.text"]) {
+      for (const large of [false, true]) {
+        it(`shows the whole ${large ? "100 KiB" : "whitespace/Unicode"} output from ${field} without a kept-output notice`, () => {
+          const output = large ? "x".repeat(100 * 1024 - 8) + "\nTHE END" : " \tfirst\r\n🌍 final\n\n";
+          expect(Buffer.byteLength(output)).toBe(large ? 100 * 1024 : 21);
+          expect(replay([{ eventType: "item.completed", payload: payloadFor(field, output) }]))
+            .toEqual([expect.objectContaining({ kind: "tool_result", content: output })]);
+          const tools = command([{ eventType: "item.completed", payload: payloadFor(field, output) }]);
+          expect(tools).toHaveLength(1);
+          expect(tools[0]).toMatchObject({ detail: output, status: "completed" });
+          expect(tools[0].outputTruncated).not.toBe(true);
+        });
+      }
+    }
+
+    it("uses nonempty snapshot precedence, including an empty aggregate placeholder", () => {
+      const payload = payloadFor("output", "provider output\n");
+      expect(command([{ eventType: "item.completed", payload: {
+        ...payload, item: { ...payload.item, aggregatedOutput: "", aggregated_output: "" },
+      } }])[0]).toMatchObject({ detail: "provider output\n" });
+      expect(command([{ eventType: "item.completed", payload: {
+        ...payload, output: "envelope alias", text: "text alias",
+        item: { ...payload.item, aggregatedOutput: "canonical\n", aggregated_output: "legacy alias" },
+      } }])[0]).toMatchObject({ detail: "canonical\n" });
+    });
+
+    it("assembles ordered deltas without losing bytes or replacing them with an exit code", () => {
+      const chunks = [" \tfirst\r\n", "🌍", "\n", "x".repeat(100 * 1024), "\nTHE END\n"];
+      const tools = command([
+        ...chunks.map(text => ({ eventType: "item.delta", payload: { kind: "commandExecution", text } })),
+        { eventType: "item.completed", payload: { kind: "commandExecution", item: {
+          id: "exec-output", type: "commandExecution", exitCode: 0,
+        } } },
+      ]);
+      expect(tools[0]).toMatchObject({ detail: `exit_code: 0\n${chunks.join("")}`, status: "completed" });
+      expect(tools[0].outputTruncated).not.toBe(true);
+    });
+
+    it.each(["output", "aggregatedOutput"])("reconciles streamed prefixes with a complete %s snapshot exactly once", field => {
+      const output = "streamed prefix\ncompletion-only suffix\n";
+      expect(command([
+        { eventType: "item.delta", payload: { kind: "commandExecution", text: "streamed prefix\n" } },
+        { eventType: "item.completed", payload: payloadFor(field, output) },
+      ])[0]).toMatchObject({ detail: output });
+    });
+
+    it("keeps streamed bytes when completion contains a shorter snapshot or a distinct tail", () => {
+      for (const [completed, expected] of [["first", "first\nsecond\n"], ["third\n", "first\nsecond\nthird\n"]]) {
+        expect(command([
+          { eventType: "item.delta", payload: { kind: "commandExecution", text: "first\nsecond\n" } },
+          { eventType: "item.completed", payload: payloadFor("output", completed) },
+        ])[0]).toMatchObject({ detail: expected });
+      }
+    });
+
+    it("projects Pi's cumulative payload.output updates without duplicating them", () => {
+      const item = { id: "exec-output", type: "tool_use", name: "bash", input: { command: "printf output" } };
+      const tools = command([
+        { eventType: "item.delta", payload: { kind: "commandExecution", item, output: "first\n" } },
+        { eventType: "item.delta", payload: { kind: "commandExecution", item, output: "first\nsecond\n" } },
+        { eventType: "item.completed", payload: { kind: "commandExecution", item, output: "first\nsecond\nthird\n" } },
+      ]);
+      expect(tools[0]).toMatchObject({ detail: "first\nsecond\nthird\n", status: "completed" });
+      expect(command([{ eventType: "item.delta", payload: { kind: "commandExecution", item, output: "first\n" } }], true)[0])
+        .toMatchObject({ detail: "first\n", status: "in_progress" });
+    });
+
+    it("finishes a delta-only command when the completion carries only its identity", () => {
+      expect(command([
+        { eventType: "item.delta", payload: { kind: "commandExecution", text: "first\n" } },
+        { eventType: "item.delta", payload: { kind: "commandExecution", text: "last\n" } },
+        { eventType: "item.completed", payload: { itemId: "exec-output" } },
+      ])[0]).toMatchObject({ detail: "first\nlast\n", status: "completed" });
+    });
+
+    it("isolates command streams and clears accumulated output on reset", () => {
+      const parser = paperclipRunnerUIAdapter.createStdoutParser!();
+      const parse = (eventType: string, itemId: string, payload: Record<string, unknown>) => parser.parseLine(JSON.stringify({
+        type: "paperclip.prp.event", event: { eventType, itemId, payload },
+      }), "now");
+      parse("item.delta", "one", { kind: "commandExecution", text: "one\n" });
+      parse("item.delta", "two", { kind: "commandExecution", text: "two\n" });
+      const completed = { kind: "commandExecution", item: { type: "commandExecution" } };
+      expect(parse("item.completed", "two", completed)).toEqual([expect.objectContaining({ content: "two\n" })]);
+      expect(parse("item.completed", "one", completed)).toEqual([expect.objectContaining({ content: "one\n" })]);
+      parse("item.delta", "one", { kind: "commandExecution", text: "old\n" });
+      parser.reset();
+      expect(parse("item.completed", "one", completed)).toEqual([expect.objectContaining({ content: "command completed" })]);
+    });
+
+    it("passes real spill flags and only validated markers through the existing grammar", () => {
+      for (const scope of ["item", "payload"]) {
+        const payload = payloadFor("output", "kept content\n");
+        const flagged = scope === "item" ? { ...payload, item: { ...payload.item, outputTruncated: true } }
+          : { ...payload, outputTruncated: true };
+        expect(command([{ eventType: "item.completed", payload: flagged }])[0])
+          .toMatchObject({ detail: "kept content\n", outputTruncated: true });
+      }
+      for (const marker of ["[Full output: /tmp/output (102400 bytes; saved)]", "[Full output: /tmp/output (read it with offset/limit)]"]) {
+        expect(command([{ eventType: "item.completed", payload: payloadFor("output", `before\n${marker}\nafter\n`) }])[0])
+          .toMatchObject({ detail: "before\nafter\n", outputTruncated: true });
+      }
+      const ordinary = "[Full output: not a spill]\n";
+      const tool = command([{ eventType: "item.completed", payload: payloadFor("output", ordinary) }])[0];
+      expect(tool).toMatchObject({ detail: ordinary });
+      expect(tool.outputTruncated).not.toBe(true);
+    });
+  });
   it("keeps both pinned Pi failure facts in diagnostics without adding a task warning", async () => {
     const adapter = createPiProfileExtensionAdapter({ workspacePath: "/fixture", sessionId: "session-1", turnId: "turn-1" });
     const notice = { sessionId: "session-1", category: "runtime_failure", severity: "error",

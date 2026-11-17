@@ -116,7 +116,7 @@ function summarizeIssueDescription(description: string | null | undefined) {
     .trim();
 
   if (!summary) return null;
-  return summary.length > 180 ? `${summary.slice(0, 177).trimEnd()}...` : summary;
+  return summary;
 }
 
 /** "·" between facts in the quicklook's meta and status lines. */
@@ -211,7 +211,7 @@ export function IssueQuicklookCard({
       </RouterDom.Link>
 
       {description ? (
-        <p data-slot="task-preview-description" className="text-xs leading-5 text-muted-foreground [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:4] overflow-hidden">
+        <p data-slot="task-preview-description" className="whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">
           {description}
         </p>
       ) : null}

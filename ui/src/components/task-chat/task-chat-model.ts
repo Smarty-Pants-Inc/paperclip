@@ -223,6 +223,7 @@ export interface TaskChatAutoReview {
 
 /** A tool invocation row (ACP tool_call / tool_call_update). */
 export interface TaskChatToolItem {
+  runLogHref?: string;
   id: string;
   kind: "tool";
   name: string;
@@ -242,6 +243,8 @@ export interface TaskChatToolItem {
    */
   taskRefId?: string;
   detail?: string;
+  /** A producer flag or full-output marker, not a browser display limit. */
+  outputTruncated?: boolean;
   diff?: TaskChatDiff;
   /** Resolved permission decision badge, when one applied. */
   decision?: "allowed" | "rejected";
@@ -421,6 +424,8 @@ export interface TaskChatProtocolChild {
 }
 
 export interface TaskChatProviderActivityItem {
+  /** Diagnostics for this run; never a promise that omitted bytes were kept. */
+  runLogHref?: string;
   id: string;
   kind: "protocol";
   surface: "provider_activity";
@@ -484,6 +489,7 @@ export interface TaskChatSubagentGroupItem {
 }
 
 export interface TaskChatWorkspaceChangeItem {
+  runLogHref?: string;
   id: string;
   kind: "protocol";
   surface: "workspace_change";
@@ -497,6 +503,7 @@ export interface TaskChatWorkspaceChangeItem {
 }
 
 export interface TaskChatWorkspaceFileItem {
+  runLogHref?: string;
   id: string;
   kind: "protocol";
   surface: "workspace_file";

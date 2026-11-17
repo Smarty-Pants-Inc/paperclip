@@ -300,7 +300,7 @@ export function buildScenario(id: TaskChatStateId): TaskChatScenario {
       return {
         surface: "thread",
         items: [
-          { id: "st-trunc", kind: "status", status: "truncated", label: "Turn ended: max tokens", detail: "Output was cut off — continue to resume.", tokens: { used: 199120, size: 200000 } },
+          { id: "st-trunc", kind: "status", status: "truncated", label: "Turn ended: max tokens", detail: "Continue this turn to resume.", tokens: { used: 199120, size: 200000 } },
         ],
       };
     case "live-token-cost":

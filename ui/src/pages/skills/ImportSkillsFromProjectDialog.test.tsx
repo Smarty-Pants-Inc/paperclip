@@ -5,8 +5,16 @@ import type {
   Project,
   ProjectWorkspace,
 } from "@paperclipai/shared";
-import { describe, expect, it } from "vitest";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { companySkillsApi } from "@/api/companySkills";
+import { projectsApi } from "@/api/projects";
+import { MemoryRouter } from "@/lib/router";
+vi.mock("@/context/ToastContext", () => ({ useToastActions: () => ({ pushToast: vi.fn() }) }));
 import {
+  ImportSkillsFromProjectDialog,
   defaultSelection,
   filterCandidates,
   groupCandidates,
@@ -183,6 +191,63 @@ function workspace(overrides: Partial<ProjectWorkspace>): ProjectWorkspace {
     ...overrides,
   } as ProjectWorkspace;
 }
+
+describe("NOTE 5: reachable local skill browse paging", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("loads the first bounded page, reaches the LAST entry, and resets paging on folder/workspace changes", async () => {
+    const project = { id: "p", name: "Daily workspace", archivedAt: null, workspaces: [workspace({ name: "Primary" }), workspace({ id: WS_B, name: "Secondary", isPrimary: false })] } as unknown as Project;
+    vi.spyOn(projectsApi, "list").mockResolvedValue([project]);
+    vi.spyOn(companySkillsApi, "scanProjects").mockResolvedValue({ candidates: [], imported: [], updated: [], skipped: [], conflicts: [], warnings: [], scannedProjects: 1, scannedWorkspaces: 1, discovered: 0 } as never);
+    const entries = Array.from({ length: 253 }, (_, i) => ({ name: `folder-${String(i).padStart(3, "0")}`, path: `folder-${String(i).padStart(3, "0")}`, kind: "directory" as const, isSkill: false }));
+    entries.push({ name: "LAST_SKILL", path: "LAST_SKILL", kind: "directory", isSkill: true });
+    const browse = vi.spyOn(companySkillsApi, "browseProject").mockImplementation(async (_companyId, input) => {
+      const offset = (input as { offset?: number }).offset ?? 0;
+      const limit = (input as { limit?: number }).limit ?? 250;
+      const folder = input.path ?? ".";
+      const all = folder === "." ? entries : [];
+      return { projectId: "p", workspaceId: input.workspaceId, workspaceName: "Primary", path: folder, parentPath: folder === "." ? null : ".", entries: all.slice(offset, offset + limit), truncated: false, nextOffset: offset + limit < all.length ? offset + limit : null };
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    async function settle() { await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); }); }
+    function button(label: string) {
+      const found = [...document.querySelectorAll<HTMLButtonElement>("button")].find(node => node.textContent?.trim() === label);
+      expect(found, `button ${label}`).toBeDefined();
+      return found!;
+    }
+    try {
+      await act(async () => { root.render(<QueryClientProvider client={client}><MemoryRouter><ImportSkillsFromProjectDialog companyId="c" open onOpenChange={() => {}} /></MemoryRouter></QueryClientProvider>); });
+      await settle();
+      await act(async () => document.querySelector<HTMLButtonElement>('[data-testid="project-row-p"]')!.click());
+      await settle();
+      await act(async () => document.querySelector<HTMLButtonElement>('[data-testid="browse-project-folders-empty"]')!.click());
+      await settle();
+      expect(document.querySelectorAll('[data-testid="project-skill-browser"] li')).toHaveLength(250);
+      expect(document.body.textContent).not.toContain("LAST_SKILL");
+      await act(async () => button("Load more").click());
+      await settle();
+      expect(document.querySelectorAll('[data-testid="project-skill-browser"] li')).toHaveLength(254);
+      expect(document.body.textContent).toContain("LAST_SKILL");
+      expect(browse).toHaveBeenLastCalledWith("c", expect.objectContaining({ path: ".", offset: 250, limit: 250 }));
+      expect([...document.querySelectorAll("button")].some(node => node.textContent?.trim() === "Load more")).toBe(false);
+      await act(async () => button("folder-000").click());
+      await settle();
+      expect(browse).toHaveBeenLastCalledWith("c", expect.objectContaining({ path: "folder-000", offset: 0 }));
+      expect(document.body.textContent).not.toContain("LAST_SKILL");
+      await act(async () => button("Secondary").click());
+      await settle();
+      expect(browse).toHaveBeenLastCalledWith("c", expect.objectContaining({ workspaceId: WS_B, path: ".", offset: 0 }));
+      expect(document.querySelectorAll('[data-testid="project-skill-browser"] li')).toHaveLength(250);
+    } finally {
+      await act(async () => root.unmount());
+      client.clear();
+      container.remove();
+    }
+  });
+});
 
 describe("scannable workspace detection", () => {
   it("local/git/folder workspaces with a cwd are scannable", () => {
