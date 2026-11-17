@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { and, eq, sql, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog, agentWakeupRequests, agents, approvals, authUsers, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueApprovals, issueRecoveryActions, issueThreadInteractions,
+  activityLog, agentTaskSessions, agentWakeupRequests, agents, approvals, authUsers, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueApprovals, issueRecoveryActions, issueThreadInteractions,
   heartbeatRunEvents, issueComments, issues, nativeRunFinalizations, toolInvocations, companyMemberships,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
@@ -21,7 +21,7 @@ import {
   resetBacklogContinuationPacingForTests,
   freshContinuationNote, heldExecutionsAwaitingFreshContinuation, nextFreshContinuationCheckAt, recordFreshContinuationCheck, FRESH_CONTINUATION_PENDING_BOUND_MS, FRESH_CONTINUATION_PROGRESS_BOUND_MS, FRESH_CONTINUATION_SAVED_WORK_BOUND_MS,
 } from "./fresh-continuation-fallback.js";
-import { heartbeatService } from "./heartbeat.js";
+import { deriveTaskKeyWithHeartbeatFallback, heartbeatService, shouldResetTaskSessionForWake } from "./heartbeat.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { currentProcessSpaceHash, observedProcessStartedAt } from "./controller-process-identity.js";
 import { executionControlSchedule } from "./execution-control-work.js";
@@ -234,6 +234,100 @@ suite("fresh-continuation fallback", () => {
       expect(next?.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeCommentId: message.id });
     } else expect(redeliveries).toHaveLength(0);
     if (shape === "inside_grace") expect(deadlines).toContain(ended.getTime() + 90_000);
+  }, 120_000);
+
+  /** A person's message whose own conversation turn succeeded with no reply, ended at `ended`. */
+  async function silentConversationTurn(ended: Date) {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "adapter_failed", hold: "none" });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please answer this accepted request.", createdAt: new Date(ended.getTime() - 60_000) }).returning();
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "active", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: ended, createdAt: new Date(ended.getTime() - 30_000),
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } }).where(eq(heartbeatRuns.id, f.runId));
+    const redeliveries = async () => db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${message!.id}`)));
+    return { ...f, messageId: message!.id, redeliveries };
+  }
+
+  // RFL DESIGN-F1 condition 1 (R-REPLAY): the redelivered turn continues the
+  // SAME provider session as the silent run (the comment-wake path resumes the
+  // task session keyed by the issue; nothing forces a fresh session), so the
+  // model sees its own earlier turn and no tool of that turn runs again.
+  it("R-REPLAY: the redelivered turn resumes the silent run's provider session, never a fresh one", async () => {
+    const f = await silentConversationTurn(new Date(Date.now() - 121_000));
+    const sessionId = `pi-session-${randomUUID()}`;
+    await db.update(heartbeatRuns).set({ sessionIdBefore: sessionId, sessionIdAfter: sessionId }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner", taskKey: f.issueId,
+      sessionDisplayId: sessionId, sessionParamsJson: { sessionId }, lastRunId: f.runId });
+    await occupySlot(); // keep the redelivered run queued, as admitted
+    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    const [wake] = await f.redeliveries();
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, wake!.id));
+    const [silent] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    // The same resolvers heartbeat.ts uses at run start (taskKey -> getTaskSession; reset gate).
+    const nextKey = deriveTaskKeyWithHeartbeatFallback(next!.contextSnapshot, null);
+    expect(nextKey).toBe(deriveTaskKeyWithHeartbeatFallback(silent!.contextSnapshot, null));
+    expect(next!.contextSnapshot?.forceFreshSession).toBeUndefined();
+    expect(shouldResetTaskSessionForWake(next!.contextSnapshot)).toBe(false);
+    const [resumed] = await db.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, companyId),
+      eq(agentTaskSessions.agentId, agentId), eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, nextKey!)));
+    console.info(JSON.stringify({ rReplay: { silentSession: silent!.sessionIdAfter, redeliveredSession: resumed?.sessionDisplayId, nextRunId: next!.id } }));
+    expect(resumed?.sessionDisplayId).toBe(silent!.sessionIdAfter);
+    // session-preparation resumes only a session whose last run is another run.
+    expect(resumed?.lastRunId).toBe(f.runId);
+    expect(resumed?.lastRunId).not.toBe(next!.id);
+  }, 120_000);
+
+  // RFL DESIGN-F1 condition 2 (the clock), on a fake clock: the run ends at t,
+  // nothing happens before t+90 s, ONE wake lands by t+120 s, and a second
+  // recovery pass is a no-op (wake idempotency key).
+  it("R-SILENT clock: nothing before t+90 s, one wake by t+120 s, a second pass is a no-op", async () => {
+    const t = new Date(Date.now() - 600_000);
+    const f = await silentConversationTurn(t);
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    const deadlines: number[] = [];
+    const pass = (at: number) => { vi.setSystemTime(at);
+      return heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId, onDeferredDeadline: d => { deadlines.push(d); } }); };
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const seen: Array<{ at: number; wakes: number }> = [];
+    try {
+      for (const offset of [0, 45_000, 89_999]) {
+        await pass(t.getTime() + offset);
+        seen.push({ at: offset, wakes: (await f.redeliveries()).length });
+      }
+      await pass(t.getTime() + 120_000);
+      seen.push({ at: 120_000, wakes: (await f.redeliveries()).length });
+      await pass(t.getTime() + 120_000);
+      await pass(t.getTime() + 600_000);
+      seen.push({ at: 600_000, wakes: (await f.redeliveries()).length });
+    } finally { vi.useRealTimers(); }
+    console.info(JSON.stringify({ rSilentClock: { seen, deadlines: deadlines.map(d => d - t.getTime()) } }));
+    expect(seen).toEqual([{ at: 0, wakes: 0 }, { at: 45_000, wakes: 0 }, { at: 89_999, wakes: 0 }, { at: 120_000, wakes: 1 }, { at: 600_000, wakes: 1 }]);
+    expect(deadlines.length).toBeGreaterThanOrEqual(3);
+    expect(deadlines.every(d => d === t.getTime() + 90_000)).toBe(true);
+  }, 120_000);
+
+  // stack135 FIX3 item 2 (D129/D150/D151/D183): the rule is keyed on the run
+  // that carried the person's message, not the latest run. An unrelated timer
+  // run that succeeds afterwards must not hide the silent turn.
+  it("R-SILENT keys on the message's own run: an unrelated later success still gets exactly one redelivery", async () => {
+    const ended = new Date(Date.now() - 200_000);
+    const f = await silentConversationTurn(ended);
+    const [timer] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId, invocationSource: "timer",
+      status: "succeeded", createdAt: new Date(ended.getTime() + 5_000), startedAt: new Date(ended.getTime() + 10_000),
+      finishedAt: new Date(ended.getTime() + 20_000), responsibleUserId: userId,
+      contextSnapshot: { issueId: f.issueId, wakeReason: "heartbeat_timer", wakeSource: "timer" } }).returning();
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass++) await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    const wakes = await f.redeliveries();
+    const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.wakeupRequestId, wakes.map(w => w.id)));
+    console.info(JSON.stringify({ rSilentLaterSuccess: { timerRunId: timer!.id, redeliveries: wakes.length, carried: runs.map(r => r.contextSnapshot?.wakeCommentId) } }));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.payload).toMatchObject({ commentId: f.messageId, redeliveredAfterRunId: f.runId });
+    expect(runs.map(r => r.contextSnapshot?.wakeCommentId)).toEqual([f.messageId]);
   }, 120_000);
 
   // RFL 12:36Z regression probes. Keep reasons: executor exclusion is a data

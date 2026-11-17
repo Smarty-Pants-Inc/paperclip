@@ -759,6 +759,30 @@ export async function deliverConversationComments(
 export const CONVERSATION_REDELIVERY_KEY_PREFIX = "conversation-comment-redelivery:";
 
 /**
+ * The run that carried the person's latest message into the conversation (its
+ * `wakeCommentId`, or `commentId`), whatever ran after it. Keying R-SILENT on
+ * this run, not on the latest run, means an unrelated timer or continuation
+ * that succeeds later cannot hide a silent turn for the person's message.
+ */
+export async function latestPersonMessageTurnRunId(
+  db: Db,
+  issue: { id: string; companyId: string; conversationAgentId: string | null },
+): Promise<string | null> {
+  if (!issue.conversationAgentId) return null;
+  const [message] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), isNull(issueComments.deletedAt),
+    isNull(issueComments.authorAgentId), sql`${issueComments.authorUserId} is not null`))
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+  if (!message) return null;
+  const [run] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, issue.conversationAgentId),
+    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
+    sql`coalesce(${heartbeatRuns.contextSnapshot}->>'wakeCommentId', ${heartbeatRuns.contextSnapshot}->>'commentId') = ${message.id}`))
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  return run?.id ?? null;
+}
+
+/**
  * A succeeded turn that `settleConversationTurn` would not park (no durable
  * response, no interaction, no /new) did not answer the person's message it
  * was woken for. The outbox delivered that message once; deliver it once more,
