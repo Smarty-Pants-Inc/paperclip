@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
+import { loadConfig } from "../config.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describePostgres = support.supported ? describe : describe.skip;
@@ -46,7 +47,8 @@ describePostgres("agent task hierarchy depth through the issue routes", () => {
       { id: runOnConversation, companyId, agentId, scopeKind: "issue", issueId: conversationId, status: "running", contextSnapshot: { issueId: conversationId } },
     ]);
   }, 30_000);
-  afterAll(async () => { await database?.cleanup(); });
+  afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
+  afterEach(() => vi.unstubAllEnvs());
 
   const boardActor = { type: "board", userId: "board-user", source: "local_implicit", isInstanceAdmin: true } as Express.Request["actor"];
   function agentActor(runId: string): Express.Request["actor"] {
@@ -71,6 +73,34 @@ describePostgres("agent task hierarchy depth through the issue routes", () => {
     requestedParent: { id: childId, identifier: "DEP-2" },
     effectiveParent: { id: rootId, identifier: "DEP-1" },
   };
+
+  it.each([undefined, "invalid", "5"])("refuses malformed depth or makes re-parenting visible in response and activity (depth %s)", async raw => {
+    vi.stubEnv("PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH", raw);
+    if (raw === "invalid") {
+      expect(() => loadConfig(null)).toThrow("Invalid PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH: expected a positive safe integer.");
+      return;
+    }
+    for (const route of [`/api/companies/${companyId}/issues`, `/api/issues/${childId}/children`]) {
+      const created = await request(app(agentActor(runOnChild))).post(route)
+        .send({ title: `Visible placement ${raw} ${route}`, parentId: childId });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+      const audit = await activity(created.body.id, "issue.parent_adjusted");
+      if (raw === "5") {
+        expect(created.body.parentId).toBe(childId);
+        expect(created.body).not.toHaveProperty("parentAdjusted");
+        expect(created.body).not.toHaveProperty("parentAdjustmentWarning");
+        expect(audit).toBeNull();
+      } else {
+        expect(created.body.parentId).toBe(rootId);
+        expect(created.body.parentAdjusted).toEqual(expectedAdjustment);
+        expect(created.body.parentAdjustmentWarning).toEqual(expect.stringContaining("PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH"));
+        expect(created.body.parentAdjustmentWarning).toContain(childId);
+        expect(created.body.parentAdjustmentWarning).toContain(rootId);
+        expect(audit).toMatchObject({ companyId, actorType: "agent", actorId: agentId, runId: runOnChild,
+          details: { parentAdjusted: expectedAdjustment, warning: created.body.parentAdjustmentWarning } });
+      }
+    }
+  });
 
   it("places a run's default follow-up beside the child task it is working on", async () => {
     const created = await request(app(agentActor(runOnChild)))
@@ -121,6 +151,8 @@ describePostgres("agent task hierarchy depth through the issue routes", () => {
     expect(created.status, JSON.stringify(created.body)).toBe(201);
     expect(created.body.parentId).toBe(childId);
     expect(created.body).not.toHaveProperty("parentAdjusted");
+    expect(created.body).not.toHaveProperty("parentAdjustmentWarning");
+    expect(await activity(created.body.id, "issue.parent_adjusted")).toBeNull();
 
     const viaChildren = await request(app(boardActor))
       .post(`/api/issues/${childId}/children`)

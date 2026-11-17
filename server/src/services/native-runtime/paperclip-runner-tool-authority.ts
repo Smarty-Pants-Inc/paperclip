@@ -2354,6 +2354,9 @@ export class PaperclipRunnerToolAuthority {
           id: child.id,
           identifier: child.identifier,
           parentId: child.parentId,
+          ...("parentAdjusted" in child && child.parentAdjusted ? { parentAdjusted: child.parentAdjusted } : {}),
+          ...("parentAdjustmentWarning" in child && child.parentAdjustmentWarning
+            ? { parentAdjustmentWarning: child.parentAdjustmentWarning } : {}),
           projectId: child.projectId,
           status: childStatus,
           assigneeActorId: child.assigneeAgentId,
