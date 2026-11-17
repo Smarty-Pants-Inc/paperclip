@@ -292,7 +292,7 @@ describeEmbeddedPostgres("stopped observed native workspace preservation", () =>
     const [run] = await f.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
     expect(run.resultJson).toMatchObject({ workspaceRestoreFailure: "restore_failed",
       workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [f.leaseId] } });
-    expect(run.resultJson).not.toHaveProperty("workspaceRestorePending");
+    expect(run.resultJson?.workspaceRestorePending).toBe(true);
     const [action] = await f.db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, f.issueId),
       eq(issueRecoveryActions.fingerprint, `native-workspace:${f.runId}`)));
     expect(action).toMatchObject({ status: "resolved", outcome: "blocked", cause: "native_continuation_requires_reconciliation",
