@@ -14,6 +14,7 @@
  * plus the unrelated MCP / wake / usage boundaries (as warm-rebind-recovery-policy.test.ts).
  */
 import { execFile } from "node:child_process";
+import { assertDrainAdmissionReplacement } from "./drain-admission.test-fixture.js";
 import { promises as auditFs } from 'node:fs';
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -292,52 +293,16 @@ const support = await getEmbeddedPostgresTestSupport();
   }
 
 
-  // ---- rf-4 cf5ka fragment, UNCHANGED bytes (cf5ka-independent-case.fragment.ts.txt) ----
-
-  it.each(['parent-mkdir', 'publish-rename'] as const)('INDEPENDENT regular-file %s held past deadline cannot overwrite next owner', async (branch) => {
+  // rf-4 cf5ka fragment: replaced in place under the binding drain ruling.
+  // The original held calls and never-OK final bytes remain; only admission order changes.
+  it.each([
+    ['parent-mkdir', 'deadline'], ['publish-rename', 'deadline'],
+    ['parent-mkdir', 'lock-session-kill'], ['publish-rename', 'lock-session-kill'],
+  ] as const)('(superseded by replacement: next owner waits for the drain, RFL record SUPERSEDE-U-DRAIN-ADMISSION-1117) INDEPENDENT regular-file %s held past deadline cannot overwrite next owner (%s)', async (branch, cause) => {
     const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
     await settleLater(f);
-    let release!: () => void, arrived!: () => void;
-    const held = new Promise<void>(r => { release = r; });
-    const reached = new Promise<void>(r => { arrived = r; });
-    const originalMkdir = auditFs.mkdir.bind(auditFs);
-    const originalRename = auditFs.rename.bind(auditFs);
-    const spy = branch === 'parent-mkdir'
-      ? vi.spyOn(auditFs, 'mkdir').mockImplementation(async (...args: Parameters<typeof auditFs.mkdir>) => {
-          if (String(args[0]) === f.host) { arrived(); await held; }
-          return originalMkdir(...args);
-        })
-      : vi.spyOn(auditFs, 'rename').mockImplementation(async (...args: Parameters<typeof auditFs.rename>) => {
-          if (String(args[1]) === join(f.host, 'task.txt')) { arrived(); await held; }
-          return originalRename(...args);
-        });
-    let exportPromise: Promise<void> | undefined;
-    const originalRestore = f.sync.restoreWorkspace.bind(f.sync);
-    vi.spyOn(f.sync, 'restoreWorkspace').mockImplementation((...args) => (exportPromise = originalRestore(...args)));
-    const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
-      nativeWorkspaceSync: f.sync, timeoutMs: 3_000 });
-    let reachedTimer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([reached, new Promise((_, reject) => { reachedTimer = setTimeout(() => reject(new Error('never reached ' + branch)), 15_000); })]);
-      clearTimeout(reachedTimer);
-      expect(await work).toEqual({ outcome: 'unproven', reason: 'timed_out' });
-      const next = await withNativeWorkspaceFinalizationOwnership({ db, companyId: f.companyId, runId: f.runId }, async () => {
-        await auditFs.writeFile(join(f.host, 'task.txt'), 'NEXT OWNER');
-        return 'next owner wrote';
-      });
-      expect(next).toMatchObject({ acquired: true });
-      release();
-      const error = await exportPromise!.then(() => null, error => String(error));
-      const actual = await auditFs.readFile(join(f.host, 'task.txt'), 'utf8');
-      const proof = { branch, next, error, actual };
-      console.log('INDEPENDENT_REGULAR_FILE_DEADLINE', JSON.stringify(proof));
-      await writeFile(join(process.env.TASK_OUT!, `independent-${branch}-result.json`), JSON.stringify(proof, null, 2));
-      expect(actual).toBe('NEXT OWNER');
-    } finally {
-      clearTimeout(reachedTimer);
-      release(); await work; await exportPromise?.catch(() => undefined); spy.mockRestore();
-    }
-  }, 45_000);
+    await assertDrainAdmissionReplacement({ db, connectionString: database.connectionString, f, branch, cause });
+  }, 60_000);
 
   // ---- adopt-drain: the same never-OK assertion under the drain contract ----
   type HeldBranch = 'parent-mkdir' | 'publish-rename' | 'symlink-parent-mkdir';
