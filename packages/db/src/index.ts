@@ -40,6 +40,8 @@ export {
   type RunDatabaseBackupOptions,
   type RunDatabaseBackupResult,
   type RunDatabaseRestoreOptions,
+  type RunDatabaseRestoreResult,
+  type RestoreConstraintViolation,
 } from "./backup-lib.js";
 export {
   createEmbeddedPostgresLogBuffer,

@@ -1717,11 +1717,11 @@ async function seedWorktreeDatabase(input: {
     const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${targetHandle.port}/postgres`;
     await resetPostgresDatabase(adminConnectionString, "paperclip");
     const targetConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${targetHandle.port}/paperclip`;
-    await runDatabaseRestore({
+    const restore = await runDatabaseRestore({
       connectionString: targetConnectionString,
       backupFile: backup.backupFile,
     });
-    input.onPhase?.("restore", "succeeded");
+    input.onPhase?.("restore", "succeeded", restore.summary);
     input.onPhase?.("migrations", "started");
     await applyPendingMigrations(targetConnectionString);
     input.onPhase?.("migrations", "succeeded");
