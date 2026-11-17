@@ -149,7 +149,8 @@ import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../s
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { ACCOUNTING_WRITE_CONTENTION_MESSAGE, AccountingContentionError } from "../services/accounting-transaction.js";
 import { transactionRetryStats } from "../services/transaction-retry.js";
-import { isTransientLockContention, postgresErrorCode, retryTransientLockContention } from "../services/transient-lock-contention.js";
+import { isTransientLockContention, postgresErrorCode } from "../services/transient-lock-contention.js";
+import { retryRunPreparationLockContention } from "../services/run-preparation-lock-retry.js";
 import { AGENT_HIRE_ATTEMPTS, AgentHireContentionError, COMPANY_DEFAULT_GRANTS_DEFERRED } from "../services/agent-lifecycle.js";
 import { ensureNewAgentMembership } from "../services/agent-hiring.js";
 import { agentBudgetPage, assertAuthenticated, assertBoard, assertCompanyAccess, COMPANY_BUDGETS_PAGE, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -1448,7 +1449,7 @@ export function agentRoutes(
 
   async function ensureCompanyDefaultAgentGrantsAfterCreate(companyId: string) {
     try {
-      await retryTransientLockContention(() => builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId), AGENT_HIRE_ATTEMPTS, {
+      await retryRunPreparationLockContention(() => builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId), AGENT_HIRE_ATTEMPTS, {
         jitterMs: 50,
         onRetry: () => { transactionRetryStats.retried++; },
       });
@@ -1466,7 +1467,7 @@ export function agentRoutes(
   // callers. Only this hire CREATE boundary names the proven one-attempt
   // rollback (#20389, RFL 07:45Z). The GRANT step runs inside the same hire
   // transaction (#20805 F2); its contention is retried by the hire's one
-  // wrapper (retryTransientLockContention, agent-lifecycle.ts) and, exhausted,
+  // wrapper (retryRunPreparationLockContention, agent-lifecycle.ts) and, exhausted,
   // answers the distinct agent_hire_grant_contention (AgentHireContentionError).
   function namedHireCreateContention(error: unknown): never {
     if (!(error instanceof AccountingContentionError) || error.attempts !== 1) throw error;

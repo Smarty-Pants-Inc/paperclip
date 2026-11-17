@@ -12,7 +12,8 @@ import { notifyNativeResponsePresentation } from "./native-response-presentation
 import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
 import { logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
-import { isTransientLockContention, postgresErrorCode, retryTransientLockContention } from "./transient-lock-contention.js";
+import { isTransientLockContention, postgresErrorCode } from "./transient-lock-contention.js";
+import { retryRunPreparationLockContention } from "./run-preparation-lock-retry.js";
 import { transactionRetryStats } from "./transaction-retry.js";
 import { agents, companies, type Db } from "@paperclipai/db";
 import type { AgentLifecycleRequester } from "@paperclipai/shared";
@@ -241,7 +242,7 @@ class HireCreateStepContention {
 async function requestHireWithContentionRetry(db: Db, requestHire: RequestHire, ...args: Parameters<RequestHire>) {
   let agent: Awaited<ReturnType<RequestHire>>;
   try {
-    agent = await retryTransientLockContention(async () => {
+    agent = await retryRunPreparationLockContention(async () => {
       try {
         return await requestHire(...args);
       } catch (error) {
