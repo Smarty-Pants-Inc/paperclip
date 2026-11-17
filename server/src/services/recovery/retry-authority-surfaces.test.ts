@@ -8,6 +8,7 @@ import { getExecutionBlocker } from "../execution-blocker.js";
 import { executionProjectionForRun } from "../execution-projection.js";
 import { UNRESTORED_FILES_NEXT_ACTION } from "../legacy-execution-recovery.js";
 import { requestTaskRetry } from "../task-retry.js";
+import { HELD_PREDECESSOR_NOTICE, HELD_RECOVERED_WORK_MESSAGE, HELD_RETRY_ACTION } from "../native-runtime/held-predecessor-notice-text.js";
 import { taskInterruptionPresentation } from "../task-interruption-presentation.js";
 
 // Retry fold (judge bar R6 G, R7 M1, R8 E-on-A, R11 F2 row D, R15): ONE
@@ -15,9 +16,9 @@ import { taskInterruptionPresentation } from "../task-interruption-presentation.
 // and whether Retry is offered or accepted. Strings are the exact ones the
 // person reads; each row asserts card == transcript and canRetry false where
 // the Retry path refuses.
-const NEW_TASK_ACTION = "Assign this agent a new task to continue.";
-const HELD_RECOVERED = "Saved work recovered, but this conversation cannot continue. Assign this agent a new task to continue.";
-const HELD_NOTICE = "Your message and saved work are kept, but this conversation cannot continue. Assign this agent a new task to continue.";
+// rf-3 STOP 2 (follow-Paperclip Cut B R8): the held texts name Retry, the card's single action.
+const HELD_RECOVERED = HELD_RECOVERED_WORK_MESSAGE;
+const HELD_NOTICE = HELD_PREDECESSOR_NOTICE;
 const PAUSED = "This agent is paused. Resume this agent to continue. Your message and saved work are kept.";
 
 describe("retry fold: one authority across card, transcript, Retry API", () => {
@@ -93,27 +94,28 @@ describe("retry fold: one authority across card, transcript, Retry API", () => {
     expect(presentation).toMatchObject({ canRetry: false, userAction: "resume" });
   });
 
-  it("R7 M1: a fence-refused dead end never says 'Retry continues from it'; card = transcript; canRetry false", async () => {
+  // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z; follow-Paperclip Cut B R8): a held
+  // conversation never withholds Retry; the words name Retry's real effect.
+  it("supersedes: R7 M1: a fence-refused dead end never says 'Retry continues from it'; card = transcript; canRetry false", async () => {
     const f = await seed();
     await fenceRefused(f);
     const { card, transcript, presentation } = await surfaces(f);
-    expect(card?.canRetry).toBe(false);
+    expect(card?.canRetry).toBe(true);
     expect(card?.nextAction).toBe(HELD_RECOVERED);
-    expect(card?.nextAction).not.toMatch(/Retry continues from it/);
-    expect(transcript?.nextAction).toBe(card?.nextAction);
-    expect(presentation?.canRetry).toBe(false);
+    expect(card?.nextAction).not.toMatch(/Retry continues from it|new task|send a new message/i);
+    // Upstream's execution-projection-recovery.test.ts pins the transcript's status
+    // words for a held, recovered run ("Saved work recovered."): it names no
+    // other instruction beside the card's Retry.
+    expect([card?.nextAction, "Saved work recovered."]).toContain(transcript?.nextAction);
+    expect(presentation?.canRetry).toBe(true);
   });
 
-  it("R8 E-on-A: a Retry the fence will refuse is REFUSED at the API with a reason (never 202 'working' with no run)", async () => {
+  // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z): the API accepts what the card offers.
+  it("supersedes: R8 E-on-A: a Retry the fence will refuse is REFUSED at the API with a reason (never 202 'working' with no run)", async () => {
     const f = await seed();
     await fenceRefused(f);
-    const before = await db.select().from(agentWakeupRequests);
-    await expect(requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "board",
-      actorSource: "local_implicit", observedRunId: f.runId, idempotencyKey: randomUUID() }))
-      .rejects.toMatchObject({ status: 409, details: { code: "retry_not_available", userAction: "new_task" } });
-    // Nothing accepted, nothing left waiting: no receipt that could show 'working'.
-    expect(await db.select().from(agentWakeupRequests)).toEqual(before);
-    expect((await surfaces(f)).presentation?.state).not.toBe("working");
+    expect(await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "board",
+      actorSource: "local_implicit", observedRunId: f.runId, idempotencyKey: randomUUID() })).toMatchObject({ accepted: true });
   });
 
   it("R8: an ACCEPTED Retry is one the dispatcher can run (accepted implies the authority offers it)", async () => {
@@ -126,7 +128,8 @@ describe("retry fold: one authority across card, transcript, Retry API", () => {
     expect(receipt).toMatchObject({ accepted: true });
   });
 
-  it("R11 F2 row D: standing HELD notice + deferred prior_owner_scope_mismatch Retry: canRetry false with the new-task text", async () => {
+  // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z): the fence refusal and the notice choose words, not a veto.
+  it("supersedes: R11 F2 row D: standing HELD notice + deferred prior_owner_scope_mismatch Retry: canRetry false with the new-task text", async () => {
     const f = await seed();
     await heldNotice(f);
     await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
@@ -134,24 +137,27 @@ describe("retry fold: one authority across card, transcript, Retry API", () => {
       payload: { issueId: f.issueId, taskRetry: { schema: "paperclip.task-retry.v1", sourceRunId: f.runId },
         executionWait: { reason: "prior_owner_scope_mismatch", message: "held" } } });
     const { card, transcript, presentation } = await surfaces(f);
-    expect(card).toMatchObject({ canRetry: false, nextAction: HELD_RECOVERED });
-    expect(transcript?.nextAction).toBe(card?.nextAction);
-    expect(presentation?.canRetry).toBe(false);
+    expect(card).toMatchObject({ canRetry: true, nextAction: HELD_RECOVERED });
+    // Upstream's execution-projection-recovery.test.ts pins the transcript's status
+    // words for a held, recovered run ("Saved work recovered."): it names no
+    // other instruction beside the card's Retry.
+    expect([card?.nextAction, "Saved work recovered."]).toContain(transcript?.nextAction);
+    expect(presentation?.canRetry).toBe(true);
     // R15: the card and the newest transcript note carry the same instruction, exactly.
     const [note] = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-    expect(note!.body).toContain(NEW_TASK_ACTION);
-    expect(card!.nextAction).toContain(NEW_TASK_ACTION);
+    expect(note!.body).toContain(HELD_RETRY_ACTION);
+    expect(card!.nextAction).toContain(HELD_RETRY_ACTION);
   });
 
-  it("R11 F2: the deferred prior_owner_scope_mismatch refusal alone (no notice yet) withdraws Retry", async () => {
+  it("supersedes: R11 F2: the deferred prior_owner_scope_mismatch refusal alone (no notice yet) withdraws Retry", async () => {
     const f = await seed();
     await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
       reason: "task_retry", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "board",
       payload: { issueId: f.issueId, taskRetry: { schema: "paperclip.task-retry.v1", sourceRunId: f.runId },
         executionWait: { reason: "prior_owner_scope_mismatch", message: "held" } } });
     const { card, presentation } = await surfaces(f);
-    expect(card?.canRetry).toBe(false);
-    expect(card?.nextAction).toContain(NEW_TASK_ACTION);
-    expect(presentation?.canRetry).toBe(false);
+    expect(card?.canRetry).toBe(true);
+    expect(card?.nextAction ?? "").not.toMatch(/new task/i);
+    expect(presentation?.canRetry).toBe(true);
   });
 });
