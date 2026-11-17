@@ -23,6 +23,7 @@ import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-loc
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { EXECUTION_FINALIZATION_DEADLINE_EXCEEDED, EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 import { NATIVE_HUMAN_SELF_HANDOFF_KEY } from "./native-runtime/native-human-self-handoff.js";
+import { readUnsupersededHeldConversationNotice } from "./native-runtime/pi-session-recovery-notice.js";
 
 const blockerContextKeys = ["issueId", "taskId", "source", "connectionIntentResolution",
   "interactionKind", "interactionStatus", "mutation", "interactionId"] as const;
@@ -474,8 +475,10 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   )).limit(1) : [];
   const heldRefusal = canRetry ? (await heldTaskRetryRefusals(db, companyId, [issueId])).get(issueId) : undefined;
   const retryOffered = canRetry && (!chatBinding || recoveredFailure) && heldRetryOffersRetry(heldRefusal);
+  const heldConversation = workspaceRecoveryState?.status === "recovered"
+    ? await readUnsupersededHeldConversationNotice(db, { companyId, issueId }) : null;
   const workspaceRecovery = workspaceRecoveryState?.status === "recovered"
-    ? { ...workspaceRecoveryState, message: recoveredWorkMessage(run?.status, retryOffered) }
+    ? { ...workspaceRecoveryState, message: recoveredWorkMessage(run?.status, retryOffered, Boolean(heldConversation)) }
     : restoreDelayed && workspaceRecoveryState ? { ...workspaceRecoveryState, canRetry: retryOffered,
       message: retryOffered ? WORKSPACE_RESTORE_DELAYED_TEXT : workspaceRecoveryState.message }
     : workspaceRecoveryState && { ...workspaceRecoveryState, canRetry: workspaceRecoveryState.canRetry && retryOffered };
