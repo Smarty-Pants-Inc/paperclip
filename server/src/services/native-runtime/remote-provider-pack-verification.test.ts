@@ -495,6 +495,27 @@ describe("lease-scoped remote provider pack verification memo", () => {
       input: { ...fixture.input, runner: { execute }, memoScope: randomUUID(), onMemoHit } };
   }
 
+  it("rejects a mismatching manifest before the immutability walk and still walks a match", async () => {
+    const f = await memoFixture();
+    try {
+      const expected = structuredClone(f.pack);
+      expected.payload.runnerSourceRevision = "b".repeat(40);
+      expected.digest = sha(canonicalProviderPackDigestJson(expected.payload));
+      const started = performance.now();
+      await expect(verifyRemoteProviderPack({ ...f.input, manifest: expected })).rejects.toMatchObject({
+        failureCheck: "manifest_mismatch:runnerSourceRevision",
+        message: expect.stringContaining("manifest mismatch"),
+      });
+      console.log(JSON.stringify({ evidence: "manifest-first-rejection", wallMs: performance.now() - started,
+        walks: f.state.audits, fullCommands: f.state.fullCalls }));
+      expect(f.state.audits).toBe(0);
+      expect(f.execute.mock.calls.filter(([request]) => request.args?.[1]?.includes("paperclip-provider-pack-immutable-v1"))).toHaveLength(0);
+      await verifyRemoteProviderPack(f.input);
+      expect(f.state.audits).toBe(1);
+      expect(f.state.fullCalls).toBe(3); // rejected manifest, then content + version
+    } finally { await f.cleanup(); }
+  });
+
   it("does the first full verify, then only one cheap round trip on the same lease", async () => {
     const f = await memoFixture();
     try {

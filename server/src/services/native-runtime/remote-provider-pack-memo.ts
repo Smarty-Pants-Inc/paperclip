@@ -110,15 +110,16 @@ export async function verifyWithRemoteProviderPackMemo<T>(input: {
     return structuredClone(previous.value) as T;
   }
   verifiedPacks.delete(key);
+  // The verifier compares the small manifest before hashing any pack contents.
+  // Reject an incompatible pack before paying for the find/realpath audit too.
+  // Verify the captured root, never a caller-writable alias that can retarget.
+  const verified = await verify(probe.root); // Never cache a failed verification.
   let immutable = false;
   try {
     const result = await input.runner.execute({ command: "/bin/sh", args: ["-c", immutableScript, "sh", probe.root],
       cwd: input.cwd, bypassSession: true, timeoutMs: 120_000 });
     immutable = result.exitCode === 0 && !result.timedOut && !result.signal && result.stdout === "immutable\n";
   } catch { /* Uncertain or writable packs still get the complete verifier. */ }
-  // Verify the captured resolved root, not a caller-writable alias that could
-  // be retargeted during verification and poison another root's memo entry.
-  const verified = await verify(probe.root); // Never cache an in-flight or failed verification.
   if (immutable) {
     const after = await probePack(input.runner, input.cwd, input.packRoot);
     if (after?.fingerprint === probe.fingerprint) {
