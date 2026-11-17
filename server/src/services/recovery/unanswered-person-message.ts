@@ -1,4 +1,5 @@
 import { and, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { decideRetryAuthority } from "../task-retry-eligibility.js";
 import { completedPersonMessageAnswerSql, PENDING_WAIT_START_BOUND_MS, unansweredCardAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
@@ -1074,7 +1075,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : heldAtEndBound ? "Send a new message to try again."
         : cardAnswer ? "Retry; if it fails again, assign this agent a new task."
-        : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
+        // Retry fold: a HELD body names only a new task; its Next action is the same one instruction.
+        : boundReached ? "Send a new message to try again."
+        : held ? decideRetryAuthority({ heldConversation: true }).nextAction!
+        : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,

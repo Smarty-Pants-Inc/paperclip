@@ -14,9 +14,9 @@ import { executionBlockerPredicate, restoreHoldReleasedForCurrentOwnerPredicate 
 export const RETRY_STOP_PROOF_BOUND_MS = 5 * 60_000;
 export const RETRY_STOP_WAIT_REASON = "execution_settling";
 export const RETRY_STOP_UNPROVEN_REASON = "execution_stop_unproven";
-export const RETRY_STOP_WAIT_MESSAGE = "Retry is waiting for the previous execution to stop. Your message is saved.";
-export const RETRY_STOP_UNPROVEN_MESSAGE = "Paperclip could not confirm that the previous run stopped, so Retry can't continue this conversation. "
-  + "To continue, assign this agent a new task.";
+// Person-facing strings live with the other Stop / saved-work copy.
+export { RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_WAIT_MESSAGE } from "./native-runtime/held-predecessor-notice-text.js";
+import { RETRY_STOP_UNPROVEN_MESSAGE } from "./native-runtime/held-predecessor-notice-text.js";
 const RETIRED_NOTE_REASON = "retry_stop_unproven:";
 
 export type RetryStopGate = { state: "waiting" | "expired"; since: Date; cause: "stop_pending" | "source_settling" | "retired" };
