@@ -1679,8 +1679,9 @@ pub(crate) fn normalize_pi_notification_in(
     let streamed = match method {
         "item/agentMessage/delta" => Some(("agentMessage", "progress", params.get("delta"))),
         "item/reasoning/summaryTextDelta" => Some(("reasoning", "summary", params.get("delta"))),
-        // Pi's facade forwards reasoning item.delta as item/delta (not the
-        // Codex summary notification). Do not drop this real wire shape.
+        "item/reasoning/textDelta" => Some(("reasoning", "summary", params.get("delta"))),
+        // Older Pi facades forward reasoning item.delta as item/delta. Keep
+        // accepting that wire shape alongside the current textDelta method.
         "item/delta" => match string(params.get("kind").or_else(|| item(params).get("type"))) {
             "agentMessage" => Some((
                 "agentMessage",
@@ -2680,6 +2681,7 @@ mod tests {
     fn dl_n5_delta_reasoning_normalizes_whole() {
         assert_pi_delta_normalizes_whole("item/delta", "reasoning");
         assert_pi_delta_normalizes_whole("item/reasoning/summaryTextDelta", "reasoning");
+        assert_pi_delta_normalizes_whole("item/reasoning/textDelta", "reasoning");
     }
 
     fn assert_pi_delta_normalizes_whole(method: &str, kind: &str) {
