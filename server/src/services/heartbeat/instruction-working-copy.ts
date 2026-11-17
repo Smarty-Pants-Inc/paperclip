@@ -28,12 +28,13 @@ type Copies = ReturnType<typeof agentInstructionWorkingCopyService>;
 export function createAgentFileRetirementCollector(input: {
   db: Db; instructionCopies: Pick<Copies, "collectStopped">; environmentRuntime: EnvironmentRuntimeService;
 }): AgentFileRetirementCollector {
-  return async ({ environment, lease, runId }) => {
+  return async ({ environment, lease, runId, signal }) => {
+    signal?.throwIfAborted();
     const target = await resolveEnvironmentExecutionTarget({ db: input.db, companyId: lease.companyId, adapterType: "paperclip_runner",
       environment, leaseId: lease.id, leaseMetadata: lease.metadata, lease, environmentRuntime: input.environmentRuntime });
     return collectStoppedInstructionCopyWithRetries(() => input.instructionCopies.collectStopped({
-      companyId: lease.companyId, runId, target,
-    }));
+      companyId: lease.companyId, runId, target, signal,
+    }), signal);
   };
 }
 type Selection = HeartbeatRuntimeSelectionInput;

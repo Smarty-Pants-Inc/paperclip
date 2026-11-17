@@ -6795,6 +6795,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     // The provider transport hangs on every command (a stuck sandbox RPC) and
     // never settles on its own; the test releases it only at the end.
     let remoteCalls = 0;
+    const remoteCommands: string[] = [];
     let remoteInFlight = 0;
     let remoteCallsAfterDeadline = 0;
     let deadlinePassed = false;
@@ -6806,7 +6807,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       kind: "remote", transport: "sandbox", providerKey: "fake-plugin", environmentId: environment.id, leaseId: first.lease.id,
       remoteCwd: "/workspace", shellCommand: "sh", timeoutMs: 120_000,
       runner: {
-        execute: async () => {
+        execute: async (call: { command: string; args?: string[] }) => {
+          remoteCommands.push([call.command, ...(call.args ?? [])].join(" ").slice(0, 160));
           remoteCalls++; remoteInFlight++;
           if (deadlinePassed) remoteCallsAfterDeadline++;
           firstRemoteCall();
@@ -6877,7 +6879,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       await new Promise(resolve => setTimeout(resolve, 300));
     }
     expect(remoteInFlight).toBe(0);
-    expect(remoteCalls, "the aborted collection starts no provider call after its stuck one returns").toBe(callsBeforeRelease);
+    expect(remoteCalls, `the aborted collection starts no provider call after its stuck one returns: ${JSON.stringify(remoteCommands)}`).toBe(callsBeforeRelease);
     const [after] = await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, runId));
     expect(after?.receipt?.savePending).toMatchObject({ code: "AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT" });
     expect(await idleInTransaction()).toEqual([]);

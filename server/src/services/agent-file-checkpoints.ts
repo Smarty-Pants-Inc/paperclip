@@ -69,7 +69,13 @@ export async function validateAgentFileCheckpoint(directory: string, previous: A
 
 export async function captureAgentFileCheckpoint(input: {
   runId: string; localRoot: string; executionRoot: string; previous: AgentFileManifest; target?: AdapterExecutionTarget | null;
+  /** AF-ABORT: once aborted, no further remote command (capture step or
+   * scratch cleanup) is started; a step already in flight that returns later
+   * leads to nothing. Remote scratch is reclaimed at session retirement. */
+  signal?: AbortSignal;
 }): Promise<{ directory: string; manifest: AgentFileManifest; stats: AgentFileCheckpointStats; cleanup: () => Promise<void> }> {
+  const live = () => input.signal?.throwIfAborted();
+  live();
   const directory = path.join(path.dirname(input.localRoot), `checkpoint-${randomUUID()}`);
   const target = input.target?.kind === "remote" ? input.target : null;
   // Scratch lives inside this session's reserved runtime area, so retirement
@@ -82,7 +88,7 @@ export async function captureAgentFileCheckpoint(input: {
       await restore?.cleanupWorkspaceSnapshot?.();
     } finally {
       await fs.rm(directory, { recursive: true, force: true });
-      if (target && remoteDirectory) {
+      if (target && remoteDirectory && !input.signal?.aborted) {
         const paths = [...new Set([remoteDirectory, cacheRuntime?.runtimeRootDir, restore?.runtimeRootDir].filter((p): p is string => Boolean(p)))];
         const result = await runAdapterExecutionTargetShellCommand(input.runId, target, `rm -rf -- ${paths.map(quote).join(" ")}`, { cwd: target.remoteCwd, env: {}, timeoutSec: 15 });
         if (result.exitCode !== 0 || result.timedOut) throw new Error("Agent checkpoint cleanup failed");
@@ -97,19 +103,24 @@ export async function captureAgentFileCheckpoint(input: {
       await fs.mkdir(cacheDir, { recursive: true });
       const cache = JSON.stringify(input.previous);
       await fs.writeFile(path.join(cacheDir, "manifest.json"), cache);
+      live();
       const prepared = cacheRuntime = await prepareAdapterExecutionTargetRuntime({ target, runId: input.runId, adapterKey: `agent-checkpoint-${path.basename(directory)}`,
         workspaceLocalDir: directory, workspaceRemoteDir: remoteDirectory!, syncWorkspace: false, assets: [{ key: "cache", localDir: cacheDir, followSymlinks: false }] });
       const script = await fs.readFile(new URL("./scripts/agent-file-checkpoint.mjs", import.meta.url), "utf8");
       const options = { root: input.executionRoot, output: remoteDirectory, cacheFile: path.posix.join(prepared.assetDirs.cache!, "manifest.json"), cacheHash: createHash("sha256").update(cache).digest("hex") };
+      live();
       const result = await runAdapterExecutionTargetShellCommand(input.runId, target, `node --input-type=module -e ${quote(script)} -- --checkpoint ${quote(JSON.stringify(options))}`,
         { cwd: target.remoteCwd, env: {}, timeoutSec: 120 });
       if (result.exitCode !== 0 || result.timedOut) throw new Error(`Agent file checkpoint failed: ${result.stderr.trim()}`);
       stats = JSON.parse(result.stdout.trim()) as AgentFileCheckpointStats;
       await fs.rm(cacheDir, { recursive: true, force: true });
+      live();
       restore = await prepareAdapterExecutionTargetRuntime({ target, runId: input.runId, adapterKey: `agent-checkpoint-download-${path.basename(directory)}`, workspaceLocalDir: directory,
         workspaceRemoteDir: remoteDirectory!, syncWorkspace: true, workspaceInboundMode: "adopt_remote", workspaceBaseline: { exclude: [], entries: new Map() }, workspaceGitSnapshot: null, workspaceRepositories: [], workspaceFileMode: "all" });
+      live();
       await restore.restoreWorkspace();
+      live();
     }
     return { directory, manifest: await validateAgentFileCheckpoint(directory, input.previous), stats, cleanup };
-  } catch (error) { await cleanup().catch(() => undefined); throw error; }
+  } catch (error) { await cleanup().catch(() => undefined); live(); throw error; }
 }

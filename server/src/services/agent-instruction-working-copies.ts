@@ -65,10 +65,12 @@ function serializeCopySave<T>(db: Db, companyId: string, runId: string, save: ()
 
 
 /** Finish only bounded immediate collection work; deferred ownership remains pending. */
-export async function collectStoppedInstructionCopyWithRetries<T extends Pick<Copy, "state" | "attempts" | "nextAttemptAt">>(collect: () => Promise<T | null>): Promise<T | null> {
+export async function collectStoppedInstructionCopyWithRetries<T extends Pick<Copy, "state" | "attempts" | "nextAttemptAt">>(collect: () => Promise<T | null>, signal?: AbortSignal): Promise<T | null> {
   let saved: T | null = null;
   let previousAttempts = -1;
   for (let calls = 0; calls < MAX_COLLECTION_ATTEMPTS; calls++) {
+    // AF-ABORT: an aborted collection makes no further attempt.
+    signal?.throwIfAborted();
     saved = await collect();
     if (!saved || saved.state !== "pending_collection" || saved.nextAttemptAt === null
       || saved.attempts >= MAX_COLLECTION_ATTEMPTS || saved.attempts <= previousAttempts) break;
@@ -331,13 +333,16 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
   }
 
   /** Caller must have joined the owned provider process before granting this proof. */
-  function collectStopped(input: { companyId: string; runId: string; target?: AdapterExecutionTarget | null }): Promise<Copy | null> {
+  /** `signal` (AF-ABORT): once aborted, the collection starts no further remote
+   * command or write and releases its operation-lock transaction at once. */
+  function collectStopped(input: { companyId: string; runId: string; target?: AdapterExecutionTarget | null; signal?: AbortSignal }): Promise<Copy | null> {
     return trackAgentFileCheckpoint(serializeCopySave(db, input.companyId, input.runId, () => collectStoppedOnce(input)));
   }
   async function collectStoppedOnce(input: Parameters<typeof collectStopped>[0]) {
+    input.signal?.throwIfAborted();
     let row = await get(input.companyId, input.runId);
     if (!row) return row;
-    if (isAgentDirectoryCopy(row)) return directories.collectStopped(row, input.target);
+    if (isAgentDirectoryCopy(row)) return directories.collectStopped(row, input.target, input.signal);
     if (completed.has(row.state) || row.state === "conflict") return row;
     row = await patch(row, { processStoppedAt: row.processStoppedAt ?? new Date(), attempts: row.attempts + 1 });
     if (completed.has(row.state) || row.state === "conflict") return row;

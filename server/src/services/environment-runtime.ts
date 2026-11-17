@@ -423,7 +423,10 @@ export function buildEnvironmentLeaseContext(input: {
  * (CR6). Bound by the owner of the instruction-copy service (heartbeat), so the
  * runtime never imports it. Returns the copy row after collection.
  */
-export type AgentFileRetirementCollector = (input: { environment: Environment; lease: EnvironmentLease; runId: string }) =>
+export type AgentFileRetirementCollector = (input: { environment: Environment; lease: EnvironmentLease; runId: string;
+  /** AF-ABORT: aborted at the aggregate deadline; the collection then starts no
+   * further remote command or write and ends its lock transaction at once. */
+  signal?: AbortSignal }) =>
   Promise<{ state: string; receipt?: Record<string, unknown> | null; processStoppedAt?: Date | null } | null>;
 
 /**
@@ -437,9 +440,12 @@ export type AgentFileRetirementCollector = (input: { environment: Environment; l
  * durable savePending hold, and the acquisition proceeds.
  */
 export const AGENT_FILE_RETIREMENT_COLLECTION_DEADLINE_MS = 60_000;
+/** AF-ABORT: after the abort, the stop waits this long at most for the aborted
+ * collection to end (its lock transaction and session), then proceeds. */
+export const AGENT_FILE_RETIREMENT_ABORT_SETTLE_MS = 1_000;
 const RETIREMENT_COLLECTION_TIMED_OUT = Symbol("agent-file retirement collection deadline");
-/** Waits for `work` until the monotonic `deadlineAt` (performance.now()); the
- * late work keeps running, with its rejection owned here. Same race-and-clear
+/** Waits for `work` until the monotonic `deadlineAt` (performance.now()), with
+ * its rejection owned here. A timed-out collection is then aborted (AF-ABORT). Same race-and-clear
  * pattern as controller-instance-lease.ts withTimeout (module-private there). */
 async function settleBeforeDeadline<T>(work: Promise<T>, deadlineAt: number): Promise<T | typeof RETIREMENT_COLLECTION_TIMED_OUT> {
   work.catch(() => undefined);
@@ -1908,6 +1914,15 @@ function createSandboxEnvironmentDriver(
     let collectionDeadlineAt: number | null = null;
     let collectionTimedOut = false;
     const collectionDeadline = () => collectionDeadlineAt ??= performance.now() + agentFileRetirementCollectionDeadlineMs;
+    // AF-ABORT (RFL row-22, rf-4): at the deadline the collection is ABORTED,
+    // not abandoned. The abort lands before any stop is prepared, and the stop
+    // waits (bounded) for the aborted work to end, so no collector transaction,
+    // lock session or new remote call outlives the deadline + 1 s.
+    const collectionAbort = new AbortController();
+    const abortCollection = async (work: Promise<unknown>) => {
+      if (!collectionAbort.signal.aborted) collectionAbort.abort(new Error("agent-file retirement collection deadline expired"));
+      await settleBeforeDeadline(work.catch(() => undefined), performance.now() + AGENT_FILE_RETIREMENT_ABORT_SETTLE_MS);
+    };
     // Re-read and re-prove right before acting: the tip may have changed since it was admitted.
     const closedActiveTipStill = async (id: string) => {
       if (!input.closedActiveTips || !closedActiveTipIds.has(id)) return null;
@@ -1948,10 +1963,13 @@ function createSandboxEnvironmentDriver(
       if (!canCollect && copiesToCollect.length) agentFilesSettled = false;
       if (collectionTimedOut && !uncollected.length) uncollected.push(...copiesToCollect);
       for (const runId of canCollect ? copiesToCollect : []) {
-        const collected = collectionTimedOut ? RETIREMENT_COLLECTION_TIMED_OUT : await settleBeforeDeadline(
-          options.agentFileCollector?.current?.({ environment: input.environment, lease, runId })
-            .catch((error: unknown) => { logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file collection before source-change retirement failed"); return null; })
-          ?? Promise.resolve(null), collectionDeadline());
+        const work = collectionTimedOut ? null : options.agentFileCollector?.current?.({ environment: input.environment, lease, runId, signal: collectionAbort.signal })
+          .catch((error: unknown) => {
+            if (!collectionAbort.signal.aborted) logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file collection before source-change retirement failed");
+            return null;
+          }) ?? Promise.resolve(null);
+        const collected = work === null ? RETIREMENT_COLLECTION_TIMED_OUT : await settleBeforeDeadline(work, collectionDeadline());
+        if (collected === RETIREMENT_COLLECTION_TIMED_OUT && work) await abortCollection(work);
         if (collected === RETIREMENT_COLLECTION_TIMED_OUT) {
           collectionTimedOut = true;
           agentFilesSettled = false;
