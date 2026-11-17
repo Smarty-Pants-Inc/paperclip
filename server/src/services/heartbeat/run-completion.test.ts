@@ -767,18 +767,23 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(await posted()).toHaveLength(1);
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
-  it.each(["own open card", "SMA-627"] as const)("keeps a run's own open question card's park under a busy finalization lease: %s", async shape => {
+  it.each(["own open card", "SMA-627"] as const)("does not publish after commit when the run's own open question card owns the response: %s", async shape => {
     const { f, publish, posted } = await leaseBusyConversationTurn(shape);
+    expect((await read(f.run.id)).resultJson?.finalizationPhase).toBe("committed");
+    await publish();
     await publish();
     expect(await posted()).toEqual([]);
     expect((await read(f.run.id)).resultJson?.presentationDecision).toMatchObject({ chosenSource: "none", commentAction: "none" });
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
-  it("publishes a committed conversation turn's final reply once when the lease is free", async () => {
+  it("does not publish another reply after commit when the lease was free", async () => {
     const { f, answer, publish, posted } = await leaseBusyConversationTurn("lease free");
-    expect((await posted()).map(comment => comment.body)).toEqual([answer]);
+    expect((await read(f.run.id)).resultJson?.finalizationPhase).toBe("committed");
+    const committedReplies = await posted();
+    expect(committedReplies.map(comment => comment.body)).toEqual([answer]);
     await publish();
-    expect(await posted()).toHaveLength(1);
+    await publish();
+    expect(await posted()).toEqual(committedReplies);
     expect((await read(f.run.id)).resultJson?.presentationDecision).toMatchObject({ chosenSource: "final_agent_message", commentAction: "create" });
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
