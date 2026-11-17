@@ -88,7 +88,7 @@ async function functionStatements(path: string, names: string[] = FUNCTIONS) {
       expect(await revisions()).toEqual(seeded);
 
       // UP over the previous bodies: identical to the migrated head, no row changes.
-      const up = await read("./migrations/0493_connector_runtime_company_lock.sql");
+      const up = await read("./migrations/0494_connector_runtime_company_lock.sql");
       await sql.unsafe(up);
       expect(await definitions()).toEqual(head);
       expect(await triggers()).toEqual(headTriggers);

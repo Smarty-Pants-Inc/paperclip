@@ -1,6 +1,6 @@
 import { RetainedSandboxAbsentError, isSandboxLeaseStartDeniedError } from "./retained-sandbox-absent-error.js";
 import { freshWorkspaceSchema } from "@paperclipai/plugin-sdk";
-import { prepareRemoteWorkspace, readRemoteWorkspaceAuthority, remoteWorkspaceRepositoryPath } from "./remote-workspaces.js";
+import { prepareRemoteWorkspace, readRemoteWorkspaceAuthority, remoteWorkspaceRepositoryPath, supportsSshRemoteWorkspace } from "./remote-workspaces.js";
 /**
  * Centralized environment run orchestrator.
  *
@@ -562,15 +562,15 @@ export function environmentRunOrchestrator(
     };
     const remoteAuthority = readRemoteWorkspaceAuthority(persistedExecutionWorkspace?.metadata);
     if (remoteAuthority && persistedExecutionWorkspace) {
-      if (adapterType !== "paperclip_runner" || environment.driver !== "sandbox") {
-        throw new EnvironmentRunError("unsupported_adapter_environment", "Remote workspace storage requires a qualified native sandbox");
+      if (!(adapterType === "paperclip_runner" && environment.driver === "sandbox") && !supportsSshRemoteWorkspace(adapterType, environment.driver)) {
+        throw new EnvironmentRunError("unsupported_adapter_environment", "Remote workspace storage requires a supported remote environment");
       }
       const target = withAcquisitionReceipt(await resolveEnvironmentExecutionTarget({
         db, companyId, adapterType, environment, leaseId: lease.id, leaseMetadata: lease.metadata,
         lease, environmentRuntime, duplexObservabilityRecorder: input.duplexObservabilityRecorder ?? null,
       }));
-      if (!target || target.kind !== "remote" || target.transport !== "sandbox" || !target.runner || target.runnerTask) {
-        throw new EnvironmentRunError("transport_resolution_failed", "Remote workspace storage requires a sandbox file transport");
+      if (!target || target.kind !== "remote" || (target.transport === "sandbox" && (!target.runner || target.runnerTask))) {
+        throw new EnvironmentRunError("transport_resolution_failed", "Remote workspace storage requires a remote file transport");
       }
       const prepared = await prepareRemoteWorkspace({
         db, workspace: persistedExecutionWorkspace, runId: heartbeatRunId, lease, target,
@@ -599,6 +599,7 @@ export function environmentRunOrchestrator(
       input.executionWorkspace.cwd = prepared.remoteRoot;
       const executionTarget: AdapterExecutionTarget = {
         ...target, remoteCwd: prepared.remoteRoot,
+        ...(target.transport === "ssh" ? { spec: { ...target.spec, remoteCwd: prepared.remoteRoot } } : {}),
         workspaceRealization: { mode: "in_place", authoritativeRoot: prepared.remoteRoot,
           pathAliases: [], outboundRestorePaths: [] },
       };

@@ -3,10 +3,11 @@ import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { issueService } from "../issues.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE } from "./completed-turn-cleanup.js";
-import { completeTerminatedRemoteNativeSessionCleanup, nativeSessionCleanupBlock, nativeSessionCleanupGateOwners }
+import { completeTerminatedRemoteNativeSessionCleanup, completeTerminatedRemoteNativeSessionCleanupForTask,
+  nativeSessionCleanupBlock, nativeSessionCleanupGateOwners, nativeSessionCleanupRemoteScopes }
   from "../../vendor/paperclip-runner/index.js";
 import { logger } from "../../middleware/logger.js";
-import { hasBoundRemoteStopReceipt, remoteLeaseCleanupScope, stoppedRemoteCleanupScopes } from "../remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, remoteLeaseCleanupScope, stoppedRemoteCleanupScopes, terminatedRemoteCleanupScope } from "../remote-execution-termination.js";
 import { prepareCleanupGateOwnerStop, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
 
 type CleanupGateOwner = ReturnType<typeof nativeSessionCleanupGateOwners>[number];
@@ -67,11 +68,38 @@ export function nativeCleanupAdmissionBlock(input: { companyId: string; issueId:
   return nativeSessionCleanupBlock(input);
 }
 
+async function retireTerminatedRemoteCleanup(db: Db, input: { companyId: string; issueId: string }) {
+  for (const remoteCleanupScope of nativeSessionCleanupRemoteScopes(input)) {
+    const lease = await terminatedRemoteCleanupScope(db, input.companyId, remoteCleanupScope).catch(() => null);
+    if (!lease) continue;
+    const retired = completeTerminatedRemoteNativeSessionCleanupForTask({ ...input, remoteCleanupScope });
+    if (retired === 0) continue;
+    logger.warn({ companyId: input.companyId, issueId: input.issueId, leaseId: lease.id, runId: lease.heartbeatRunId,
+      provider: lease.provider, providerLeaseId: lease.providerLeaseId, retired },
+    "native session cleanup retired because its sandbox is confirmed terminated");
+    if (!lease.heartbeatRunId) continue;
+    const [run] = await db.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId)))
+      .limit(1).catch(() => []);
+    if (!run) continue;
+    await appendHeartbeatRunEvent(db, {
+      companyId: input.companyId, runId: lease.heartbeatRunId, agentId: run.agentId,
+      eventType: "native.session_cleanup_gate_retired", stream: "system", level: "info",
+      message: "The task's previous sandbox is confirmed terminated, so its session cleanup gate was retired.",
+      payload: { leaseId: lease.id, provider: lease.provider, providerLeaseId: lease.providerLeaseId,
+        termination: lease.metadata?.remoteExecutionTermination ?? null, retired },
+    }).catch(() => undefined);
+  }
+}
+
 export async function nativeCleanupHoldsAdmission(
   db: Db,
   input: { companyId: string; issueId: string },
 ): Promise<"pending" | "operator_required" | null> {
   let block = nativeSessionCleanupBlock(input);
+  if (block === null) return null;
+  await retireTerminatedRemoteCleanup(db, input);
+  block = nativeSessionCleanupBlock(input);
   if (block === "operator_required") {
     const { retireStoppedSessionCleanupGates } = await import("./native-session-executor.js");
     await retireStoppedSessionCleanupGates(db, input).catch(() => false);

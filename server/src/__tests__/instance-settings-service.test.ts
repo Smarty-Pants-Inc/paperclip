@@ -99,7 +99,7 @@ describe("instance settings service", () => {
     expect(normalizeExperimentalSettings({}).enableOpenAiDot).toBe(false);
     const enabled = applyExperimentalSettingsPatch({}, { enableOpenAiDot: true });
     expect(normalizeExperimentalSettings(JSON.parse(JSON.stringify(enabled)))).toMatchObject({
-      enableOpenAiDot: true, enablePublicMcp: false,
+      enableOpenAiDot: true, enablePublicMcp: true,
     });
     expect(applyExperimentalSettingsPatch(enabled, { enableOpenAiDot: false }).enableOpenAiDot).toBe(false);
   });
@@ -148,7 +148,7 @@ describe("instance settings service", () => {
       enableApps: true,
     enableMcpAggregators: true,
       enableAgentChat: true,
-      enablePublicMcp: false,
+      enablePublicMcp: true,
       enableOpenAiDot: false,
       enableMuse: false,
       enableGrokBot: false,
