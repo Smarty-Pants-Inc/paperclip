@@ -7,7 +7,7 @@ import { assignmentWakePayloadSql, type DeferredExecutionScope, type DeferredRec
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { dependencyResolvedWakePayloadSql } from "../issue-dependency-wakeups.js";
 import { anchorParkedWake, noticeParkedWakeDeadline, PARKED_WAKE_RETRY_MS, parkedWakeAnchor, parkedWakeDeadlineMs,
-  parkedWakeNoticedSql } from "./parked-wake-deadline.js";
+  parkedWakeNoticedSql, personControlledWait, personControlledWaitSql } from "./parked-wake-deadline.js";
 
 type Entry = { id: string; companyId: string; dueAt: number; immediate: boolean; operatorRetry?: boolean };
 /** S124: 30 s after the last attempt, never past the first park's deadline. */
@@ -108,9 +108,9 @@ export function registerDeferredReceiptWork(
           delayed: sql<boolean>`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null
             or ${agentWakeupRequests.payload}->'executionWait' is not null`,
           // S124: the parked Send's first-park anchor and its press.
-          // A named executionWait (paused agent, budget) is not a silent park.
+          // Only a person-controlled wait (their pause, a budget) is not a silent park.
           parked: sql<boolean>`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null
-            and ${agentWakeupRequests.payload}->'executionWait' is null`,
+            and not ${personControlledWaitSql(agentWakeupRequests.payload)}`,
           pressedAt: sql<string | null>`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'requestedAt'`,
           firstParkedAt: sql<string | null>`${agentWakeupRequests.payload}->>'firstParkedAt'`,
           interruptedLegacy: sql<boolean>`exists (select 1 from heartbeat_runs r
@@ -196,7 +196,7 @@ export function registerDeferredReceiptWork(
           // S124: a parked Send keeps its FIRST park time (stored once); its
           // 30 s cadence and its one deadline count from it, not updatedAt.
           const parked = kind === "deferred" && current.status === "deferred_issue_execution" && !current.interruptedLegacy
-            && Boolean(current.payload?.queuedCommentInterrupt) && !current.payload?.executionWait;
+            && Boolean(current.payload?.queuedCommentInterrupt) && !personControlledWait(current.payload);
           const anchor = parked ? parkedWakeAnchor(current.payload) ?? await anchorParkedWake(db, scope0(entry)) : null;
           if (anchor !== null && anchor + parkedWakeDeadlineMs() <= Date.now()) {
             // Past the deadline: ONE true note (+ Retry), no further silent retry.
@@ -235,7 +235,7 @@ export function registerDeferredReceiptWork(
         // S124: a parked Send that is still parked is checked again on its
         // cadence, at the latest at its deadline (where its one note is due).
         // A wake that is no longer a silent park (dispatched, or refused into a
-        // named executionWait) has no anchor here: null, as before S124.
+        // person-controlled wait) has no anchor here: null, as before S124.
         if (next === null && kind === "deferred") {
           const [still] = await db.select({ payload: agentWakeupRequests.payload, updatedAt: agentWakeupRequests.updatedAt })
             .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
