@@ -20,7 +20,6 @@ import {
   CornerDownRight,
   GripVertical,
   Loader2,
-  MoreHorizontal,
   Pencil,
   Trash2,
 } from "lucide-react";
@@ -37,14 +36,9 @@ import {
   queuedMessageAutoSteerEligible,
   queuedMessageAutoSteerKey,
 } from "./queued-message-auto-steer";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { isQueuedInterruptHandoff } from "@/lib/issue-queued-comment-queue";
 
-type QueueAction = "steer" | "interrupt" | "discard" | null;
+type QueueAction = "steer" | "interrupt" | "discard" | "intent" | null;
 
 export function reorderQueuedMessageEntries(
   entries: IssueQueuedCommentEntry[],
@@ -88,8 +82,13 @@ export interface TaskChatQueuedMessagesProps {
   onEdit: (commentId: string) => void;
   onReorder: (orderedCommentIds: string[], revision: string) => Promise<void>;
   onSteer: (commentId: string, revision: string) => Promise<void>;
-  onInterrupt?: () => Promise<IssueQueuedCommentQueue | void>;
-  onDiscard: (commentId: string, revision: string) => Promise<void>;
+  /** With a commentId: Interrupt now for that one message (it goes first; the rest stay queued). */
+  onInterrupt?: (commentId?: string) => Promise<IssueQueuedCommentQueue | void>;
+  onDiscard: (commentId: string, revision: string, queueId?: string) => Promise<void>;
+  /** Stores a waiting message's mode (Steer or Queue) on the server. */
+  onSetIntent?: (commentId: string, intent: "steer" | "queue") => Promise<void>;
+  /** A read-only viewer sees the list without controls. */
+  readOnly?: boolean;
   /** The queued message open in the editor; its automatic send waits for the save. */
   editingCommentId?: string | null;
   /** Steer eligible queued messages automatically after this delay; null keeps every message queued. */
@@ -98,87 +97,138 @@ export interface TaskChatQueuedMessagesProps {
   steerHeadOnly?: boolean;
 }
 
+export const RESET_ROW_CAPTION = "Starts a new conversation; always waits for this turn";
+export const RESET_INTERRUPT_REASON = "Starts a new conversation; it waits for this turn. Use Stop to end the turn now";
+export const BEHIND_RESET_INTERRUPT_REASON = "Behind /new: interrupting would send it into the current conversation";
+export const BEHIND_RESET_STEER_REASON = "Can't move to Steering: this message is behind /new";
+export const STEERING_PAUSED = "Steering paused: will send after this turn";
+
+const isResetEntry = (entry: IssueQueuedCommentEntry) => entry.comment.body.trim() === "/new";
+const intentOf = (entry: IssueQueuedCommentEntry): "steer" | "queue" =>
+  isResetEntry(entry) || entry.source?.kind === "interaction" ? "queue" : entry.deliveryIntent ?? "steer";
+const atOrBehindReset = (entry: IssueQueuedCommentEntry) => isResetEntry(entry) || entry.behindReset === true;
+
+/**
+ * Steering is always the head of the server order: the leading run of
+ * Steer-mode messages ahead of any /new. The server steers one at a time in
+ * that order, so everything after it waits for the turn boundary.
+ */
+export function steeringCount(entries: IssueQueuedCommentEntry[]): number {
+  let count = 0;
+  for (const entry of entries) {
+    if (intentOf(entry) !== "steer" || atOrBehindReset(entry) || entry.queueId) break;
+    count += 1;
+  }
+  return count;
+}
+
+const ROW_BUTTON = "flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45 max-sm:h-11 max-sm:min-w-11 max-sm:justify-center";
+
 function SortableQueuedMessage({
   entry,
   queue,
+  section,
   busy,
   queueMutationDisabled,
+  readOnly,
   action,
   autoSteerSecondsLeft,
+  pausedForEdit,
+  steeringAvailable,
+  canSetIntent,
   onEdit,
-  onSteer,
+  onToggleIntent,
   onInterrupt,
   onDiscard,
   onCancelAutoSteer,
 }: {
   entry: IssueQueuedCommentEntry;
   queue: IssueQueuedCommentQueue;
+  section: "steering" | "queued";
   busy: boolean;
   queueMutationDisabled: boolean;
+  readOnly: boolean;
   action: QueueAction;
   /** Seconds until this message is steered automatically, or null when it waits in the queue. */
   autoSteerSecondsLeft: number | null;
+  pausedForEdit: boolean;
+  steeringAvailable: boolean;
+  canSetIntent: boolean;
   onEdit: () => void;
-  onSteer: () => void;
+  onToggleIntent: () => void;
   onInterrupt?: () => void;
   onDiscard: () => void;
   onCancelAutoSteer: () => void;
 }) {
   const immutableResponse = entry.source?.kind === "interaction";
+  const reset = isResetEntry(entry);
+  const behindReset = !reset && entry.behindReset === true;
+  const tail = Boolean(entry.queueId);
   const body = queuedMessageLabel(entry);
   const images = extractImageRefs(body).filter(image =>
     /^\/api\/(?:attachments|assets)\/[^/?#\\]+\/content(?:\?[^#\\]*)?$/.test(image.url));
   const label = stripStandaloneImageEmbeds(body);
+  const dragDisabledReason = readOnly ? "Only the conversation owner can reorder"
+    : immutableResponse ? "A saved response keeps its place"
+      : tail ? "Waits behind /new; it moves after /new starts"
+        : !queue.queueId ? "Saving… reorder in a moment" : null;
   const sortable = useSortable({
     id: entry.comment.id,
-    disabled: queueMutationDisabled || immutableResponse,
+    disabled: queueMutationDisabled || Boolean(dragDisabledReason),
   });
   const style = {
     transform: CSS.Transform.toString(sortable.transform),
     transition: sortable.transition,
   };
-  const steerDisabled =
-    queueMutationDisabled || queue.steeringDisposition !== "available";
-  const steerTitle =
-    queue.steeringDisposition === "unsupported"
-      ? "This runner does not support steering"
-      : queue.steeringDisposition === "temporarily_unavailable"
-        ? "Steering is temporarily unavailable"
-        : "Steer this message into the active turn";
+  const toTarget = section === "steering" ? "queue" : "steer";
+  const toggleReason = !canSetIntent ? "Changing the mode is unavailable here"
+    : toTarget === "steer" && behindReset ? BEHIND_RESET_STEER_REASON
+      : toTarget === "steer" && immutableResponse ? "A saved response waits for this turn"
+        : null;
+  const idleQueue = !queue.targetRunId;
+  const interruptReason = !onInterrupt ? "Interrupt is unavailable here"
+    : reset ? RESET_INTERRUPT_REASON
+      : behindReset || tail ? BEHIND_RESET_INTERRUPT_REASON
+        : !queue.queueId ? "Saving… try again in a moment"
+          : null;
+  const editReason = immutableResponse ? "A saved response can't be edited"
+    : tail ? "Edit it after /new starts"
+      : !entry.canEdit ? "Only the author can edit this message" : null;
+  const discardReason = !entry.canDiscard ? "Only the author can delete this message" : null;
 
   return (
     <div
       ref={sortable.setNodeRef}
       style={style}
       className={cn(
-        "group flex min-h-11 min-w-0 flex-wrap items-center gap-1 border-b border-border/55 bg-card/95 px-2.5 py-1 text-sm last:border-b-0",
-        sortable.isDragging &&
-          "relative z-20 rounded-lg border border-border shadow-lg",
+        "group flex min-h-11 min-w-0 flex-wrap items-center gap-1 rounded-lg bg-card/95 px-2 py-1 text-sm max-sm:py-2",
+        sortable.isDragging && "relative z-20 ring-1 ring-border shadow-lg",
       )}
       data-testid={`task-chat-queued-message-${entry.comment.id}`}
+      data-section={section}
+      data-intent={intentOf(entry)}
     >
-      <button
+      {!readOnly ? <button
         type="button"
         ref={sortable.setActivatorNodeRef}
         {...sortable.attributes}
         {...sortable.listeners}
-        disabled={queueMutationDisabled || immutableResponse}
+        disabled={queueMutationDisabled || Boolean(dragDisabledReason)}
+        title={dragDisabledReason ?? "Drag to reorder, or into the other section to change its mode"}
         aria-label={`Reorder queued message: ${label || "Images"}`}
-        className="flex h-7 w-7 shrink-0 cursor-grab items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:bg-accent hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40"
+        className="flex h-7 w-7 shrink-0 cursor-grab items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:bg-accent hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 max-sm:h-11 max-sm:w-11"
+        data-testid={`task-chat-queued-grip-${entry.comment.id}`}
       >
         <GripVertical className="h-3.5 w-3.5" aria-hidden />
-      </button>
+      </button> : null}
 
-      <CornerDownRight
-        className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
-        aria-hidden
-      />
-      <div className="flex min-w-24 max-w-full flex-1 flex-col items-start gap-1 overflow-hidden px-1 sm:flex-row sm:items-center sm:gap-2" title={label || undefined}>
+      <div className="flex min-w-24 max-w-full flex-1 flex-col items-start gap-0.5 overflow-hidden px-1" title={label || undefined}>
         {label ? <MarkdownBody
-          className="w-full min-w-0 line-clamp-2 sm:w-auto sm:flex-1 sm:line-clamp-1 [&_p]:m-0!"
+          className="w-full min-w-0 line-clamp-2 sm:line-clamp-1 [&_p]:m-0!"
           linkIssueReferences={false}
           mediaMode="omit"
         >{label}</MarkdownBody> : null}
+        {reset ? <span className="text-xs text-muted-foreground" data-testid={`task-chat-queued-reset-caption-${entry.comment.id}`}>{RESET_ROW_CAPTION}</span> : null}
         {images.length ? <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1" role="group" aria-label="Queued images">
           {images.slice(0, 3).map(image => <img
             key={image.url} src={image.url} alt={image.name} loading="lazy"
@@ -188,102 +238,75 @@ function SortableQueuedMessage({
         </div> : null}
       </div>
 
-      {autoSteerSecondsLeft !== null ? (
-        <span className="flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
-          <span className="px-1 text-xs text-muted-foreground tabular-nums">
-            Sending in {autoSteerSecondsLeft}s
+      {readOnly ? null : <div className="flex shrink-0 flex-wrap items-center gap-0.5 max-sm:w-full max-sm:justify-end">
+        {autoSteerSecondsLeft !== null ? (
+          <span className="flex shrink-0 items-center gap-0.5" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
+            <span className="px-1 text-xs text-muted-foreground tabular-nums">
+              Steers in {autoSteerSecondsLeft}s
+            </span>
+            <button type="button" onClick={onCancelAutoSteer} title="Keep this message queued for after this turn"
+              className={ROW_BUTTON} data-testid={`task-chat-queued-auto-steer-cancel-${entry.comment.id}`}>
+              Cancel
+            </button>
           </span>
+        ) : pausedForEdit ? (
+          <span className="px-1 text-xs text-muted-foreground" data-testid={`task-chat-queued-paused-${entry.comment.id}`}>Paused while editing</span>
+        ) : null}
+        {reset ? null : (
           <button
             type="button"
-            onClick={onEdit}
-            disabled={!entry.canEdit}
-            title="Edit before it is sent"
-            className="flex h-7 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
-            data-testid={`task-chat-queued-auto-steer-edit-${entry.comment.id}`}
+            onClick={onToggleIntent}
+            disabled={busy || Boolean(toggleReason) || (toTarget === "steer" && !queue.queueId)}
+            title={toggleReason ?? (toTarget === "steer"
+              ? steeringAvailable ? "Move to Steering: delivered at the agent's next step" : "Move to Steering: sent when the runner can take it, or after this turn"
+              : "Move to Queued: sent after the agent finishes this turn")}
+            className={ROW_BUTTON}
+            data-testid={`task-chat-queued-mode-${entry.comment.id}`}
           >
-            Edit
+            {action === "intent" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
+            {toTarget === "steer" ? "Steer" : "Queue"}
           </button>
-          <button
-            type="button"
-            onClick={onCancelAutoSteer}
-            title="Keep this message in the queue"
-            className="flex h-7 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-            data-testid={`task-chat-queued-auto-steer-cancel-${entry.comment.id}`}
-          >
-            Cancel
-          </button>
-        </span>
-      ) : (queue.targetRunId || queue.state === "deferred") && (!queue.targetRunId || queue.protocol === "legacy" || entry.source?.requiresFreshSession ||
-        (queue.steeringDisposition !== "available" && onInterrupt) ? (
+        )}
         <button
           type="button"
           onClick={onInterrupt}
-          aria-label={!queue.targetRunId ? "Send queued messages" : undefined}
-          disabled={busy || !queue.queueId || !onInterrupt}
-          title={queue.targetRunId ? "Interrupt the active turn and send queued messages" : "Send queued messages now"}
-          className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+          aria-label={idleQueue ? "Send queued messages" : `Interrupt now: ${label || "Images"}`}
+          disabled={busy || Boolean(interruptReason)}
+          title={interruptReason ?? (idleQueue ? "Send queued messages now" : "Stops the current step and sends this message first; the rest stay queued")}
+          className={ROW_BUTTON}
           data-testid={`task-chat-queued-interrupt-${entry.comment.id}`}
         >
-          {action === "interrupt" ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-          ) : (
-            <CornerDownRight className="h-3.5 w-3.5" aria-hidden />
-          )}
-          {queue.targetRunId ? "Interrupt" : "Send"}
+          {action === "interrupt" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <CornerDownRight className="h-3.5 w-3.5" aria-hidden />}
+          {idleQueue ? "Send" : "Interrupt now"}
         </button>
-      ) : (
         <button
           type="button"
-          onClick={onSteer}
-          disabled={steerDisabled}
-          title={steerTitle}
-          className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
-          data-testid={`task-chat-queued-steer-${entry.comment.id}`}
+          onClick={onEdit}
+          disabled={Boolean(editReason)}
+          title={editReason ?? (autoSteerSecondsLeft !== null ? "Edit before it is sent (pauses the countdown)" : "Edit message")}
+          aria-label={`Edit queued message: ${label}`}
+          className={ROW_BUTTON}
+          data-testid={`task-chat-queued-edit-${entry.comment.id}`}
         >
-          {action === "steer" ? (
+          <Pencil className="h-3.5 w-3.5" aria-hidden />
+          <span className="max-sm:sr-only">Edit</span>
+        </button>
+        <button
+          type="button"
+          onClick={onDiscard}
+          disabled={busy || Boolean(discardReason)}
+          title={discardReason ?? "Delete queued message"}
+          aria-label={`Discard queued message: ${label}`}
+          className={cn(ROW_BUTTON, "w-7 justify-center px-0 hover:bg-destructive/10 hover:text-destructive")}
+          data-testid={`task-chat-queued-discard-${entry.comment.id}`}
+        >
+          {action === "discard" ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
           ) : (
-            <CornerDownRight className="h-3.5 w-3.5" aria-hidden />
+            <Trash2 className="h-3.5 w-3.5" aria-hidden />
           )}
-          Steer
         </button>
-      ))}
-
-      <button
-        type="button"
-        onClick={onDiscard}
-        disabled={busy || !entry.canDiscard}
-        title="Discard queued message"
-        aria-label={`Discard queued message: ${label}`}
-        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
-        data-testid={`task-chat-queued-discard-${entry.comment.id}`}
-      >
-        {action === "discard" ? (
-          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-        ) : (
-          <Trash2 className="h-3.5 w-3.5" aria-hidden />
-        )}
-      </button>
-
-      {autoSteerSecondsLeft === null ? <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            disabled={queueMutationDisabled || immutableResponse}
-            title="Queued message actions"
-            aria-label={`Queued message actions: ${label}`}
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
-          >
-            <MoreHorizontal className="h-4 w-4" aria-hidden />
-          </button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-44">
-          <DropdownMenuItem disabled={!entry.canEdit} onSelect={onEdit}>
-            <Pencil className="h-4 w-4" aria-hidden />
-            Edit message
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu> : null}
+      </div>}
     </div>
   );
 }
@@ -296,6 +319,8 @@ export function TaskChatQueuedMessages({
   onSteer,
   onInterrupt,
   onDiscard,
+  onSetIntent,
+  readOnly = false,
   editingCommentId = null,
   autoSteerDelayMs = null,
   steerHeadOnly = false,
@@ -359,9 +384,11 @@ export function TaskChatQueuedMessages({
   );
   const autoSteerDeadlines = useMemo(() => {
     const deadlines = new Map<string, number>();
-    if (autoSteerDelayMs === null) return deadlines;
+    if (autoSteerDelayMs === null || readOnly) return deadlines;
+    // Only the Steering section (the head of the server order) steers.
+    const steering = new Set(autoSteerEntries.slice(0, steeringCount(autoSteerEntries)).map((entry) => entry.comment.id));
     for (const entry of autoSteerEntries) {
-      if (queuedMessageAutoSteerEligible({ queue, entry, cancelledIds: cancelledAutoSteer,
+      if (steering.has(entry.comment.id) && queuedMessageAutoSteerEligible({ queue, entry, cancelledIds: cancelledAutoSteer,
         attemptedKeys: attemptedAutoSteer.current, editingCommentId, headOnly: steerHeadOnly })) {
         const key = queuedMessageAutoSteerKey(entry);
         if (!firstEligibleAt.current.has(key)) firstEligibleAt.current.set(key, Date.now());
@@ -369,7 +396,7 @@ export function TaskChatQueuedMessages({
       }
     }
     return deadlines;
-  }, [autoSteerEntries, queue, cancelledAutoSteer, editingCommentId, autoSteerDelayMs, autoSteerAttempts, steerHeadOnly]);
+  }, [autoSteerEntries, queue, cancelledAutoSteer, editingCommentId, autoSteerDelayMs, autoSteerAttempts, steerHeadOnly, readOnly]);
 
   // Announce a new countdown once; the ticking text itself is not a live region.
   const announcedCountdowns = useRef(new Set<string>());
@@ -414,23 +441,42 @@ export function TaskChatQueuedMessages({
     )
       return;
     const previous = entries;
-    const next = reorderQueuedMessageEntries(
-      entries,
-      String(active.id),
-      String(over.id),
-    );
-    if (!next) return;
-    const orderedIds = next.map((entry) => entry.comment.id);
     const activeCommentId = String(active.id);
+    const moved = entries.find((entry) => entry.comment.id === activeCommentId);
+    const from = entries.findIndex((entry) => entry.comment.id === activeCommentId);
+    const overIndex = entries.findIndex((entry) => entry.comment.id === String(over.id));
+    if (!moved || overIndex < 0) return;
+    // The drop takes the section of the row it lands on.
+    const steeringRows = steeringCount(entries);
+    const fromSection = from < steeringRows ? "steering" : "queued";
+    const toSection = overIndex < steeringRows ? "steering" : "queued";
+    if (toSection === "steering" && fromSection === "queued" && (atOrBehindReset(moved) || moved.source?.kind === "interaction")) {
+      setVisibleError(isResetEntry(moved) ? "Can't move to Steering: /new always waits for this turn" : BEHIND_RESET_STEER_REASON);
+      return;
+    }
+    const intentChange: "steer" | "queue" | null = toSection !== fromSection ? (toSection === "steering" ? "steer" : "queue") : null;
+    const reordered = reorderQueuedMessageEntries(entries, activeCommentId, String(over.id));
+    if (!reordered) return;
+    const next = intentChange
+      ? reordered.map((entry) => entry.comment.id === activeCommentId ? { ...entry, deliveryIntent: intentChange } : entry)
+      : reordered;
+    // The order route reorders the queue's own wake; rows behind a /new keep their wakes.
+    const orderedIds = next.filter((entry) => !entry.queueId).map((entry) => entry.comment.id);
     const to = next.findIndex((entry) => entry.comment.id === activeCommentId);
     setEntries(next);
     setReordering(true);
     setVisibleError(null);
     setAnnouncement(
-      `Moved queued message to position ${to + 1} of ${next.length}.`,
+      intentChange
+        ? `Moved queued message to ${intentChange === "steer" ? "Steering" : "Queued"}.`
+        : `Moved queued message to position ${to + 1} of ${next.length}.`,
     );
     try {
       await onReorder(orderedIds, queue.revision);
+      if (intentChange) {
+        if (!onSetIntent) throw new Error("Changing the mode is unavailable.");
+        await onSetIntent(activeCommentId, intentChange);
+      }
     } catch (error) {
       setEntries(previous);
       setAnnouncement("");
@@ -441,6 +487,46 @@ export function TaskChatQueuedMessages({
       );
     } finally {
       setReordering(false);
+    }
+  }
+
+  /**
+   * The row's Steer/Queue toggle. Steering is the head of the order, so a
+   * message moving to Steering goes to the end of Steering, and one leaving
+   * it goes to the top of Queued. The order is saved first, then the mode.
+   */
+  async function changeIntent(commentId: string) {
+    const entry = entries.find((candidate) => candidate.comment.id === commentId);
+    if (!entry || !onSetIntent) return;
+    const steeringRows = steeringCount(entries);
+    const from = entries.indexOf(entry);
+    const intent: "steer" | "queue" = from < steeringRows ? "queue" : "steer";
+    if (intent === "steer" && (atOrBehindReset(entry) || entry.source?.kind === "interaction")) {
+      setVisibleError(BEHIND_RESET_STEER_REASON);
+      return;
+    }
+    const previous = entries;
+    const others = entries.filter((candidate) => candidate !== entry);
+    const insertAt = intent === "steer" ? steeringRows : steeringRows - 1;
+    const next = [...others.slice(0, insertAt), { ...entry, deliveryIntent: intent }, ...others.slice(insertAt)]
+      .map((candidate, position) => ({ ...candidate, position }));
+    const orderedIds = next.filter((candidate) => !candidate.queueId).map((candidate) => candidate.comment.id);
+    const orderChanged = orderedIds.join() !== previous.filter((candidate) => !candidate.queueId).map((candidate) => candidate.comment.id).join();
+    setEntries(next);
+    setPending({ commentId, action: "intent" });
+    setVisibleError(null);
+    try {
+      if (orderChanged) await onReorder(orderedIds, queue.revision);
+      await onSetIntent(commentId, intent);
+      if (intent === "queue") setCancelledAutoSteer((current) => new Set(current).add(commentId));
+      else setCancelledAutoSteer((current) => { const copy = new Set(current); copy.delete(commentId); return copy; });
+      setAnnouncement(intent === "steer" ? "Moved to Steering." : "Moved to Queued. It will be sent after this turn.");
+    } catch (error) {
+      setEntries(previous);
+      setVisibleError(queueActionErrorCode(error) === "conversation_behind_reset" ? BEHIND_RESET_STEER_REASON
+        : "Couldn’t change how this message is sent. It is unchanged.");
+    } finally {
+      setPending(null);
     }
   }
 
@@ -455,8 +541,12 @@ export function TaskChatQueuedMessages({
     ) {
       return;
     }
+    const target = entries.find((entry) => entry.comment.id === commentId);
+    // Interrupt now sends this one message first; with no running turn, Send sends them all.
+    const oneMessageInterrupt = action === "interrupt" && Boolean(queue.targetRunId);
+    if (action === "intent") return void changeIntent(commentId);
     const deliveredIds = action === "interrupt"
-      ? entries.map((entry) => entry.comment.id)
+      ? oneMessageInterrupt ? [commentId] : entries.map((entry) => entry.comment.id)
       : action === "steer" ? [commentId] : [];
     for (const id of deliveredIds) optimisticDeliveryIds.current.add(id);
     if (deliveredIds.length) {
@@ -470,14 +560,15 @@ export function TaskChatQueuedMessages({
       action === "steer"
         ? "Steering queued message."
         : action === "interrupt"
-          ? "Sending queued messages."
+          ? oneMessageInterrupt ? "Interrupting to send this message first." : "Sending queued messages."
           : "Discarding queued message.",
     );
     try {
       if (action === "steer") await onSteer(commentId, queue.revision);
       else if (action === "interrupt") {
-        const updatedQueue = await onInterrupt?.();
-        if (updatedQueue?.state === "deferred") {
+        const updatedQueue = await (oneMessageInterrupt ? onInterrupt?.(commentId) : onInterrupt?.());
+        // The stopped turn is handing off to these messages: they are sent.
+        if (updatedQueue?.state === "deferred" && !isQueuedInterruptHandoff(updatedQueue)) {
           for (const entry of updatedQueue.entries) optimisticDeliveryIds.current.delete(entry.comment.id);
           setEntries(updatedQueue.entries.filter(entry => !optimisticDeliveryIds.current.has(entry.comment.id)));
           setDeferredStatus({ queueId: updatedQueue.queueId, message: updatedQueue.executionWait?.message ?? "Messages are still queued. They will send when the task is ready." });
@@ -485,6 +576,7 @@ export function TaskChatQueuedMessages({
           return;
         }
       }
+      else if (target?.queueId) await onDiscard(commentId, target.queueRevision ?? queue.revision, target.queueId);
       else await onDiscard(commentId, queue.revision);
       if (action === "discard") {
         setEntries((current) =>
@@ -496,7 +588,8 @@ export function TaskChatQueuedMessages({
           ? "Message steered into the active turn."
           : action === "interrupt"
             ? queue.targetRunId
-              ? "Queued messages will be sent when the previous run has stopped."
+              ? oneMessageInterrupt ? "This message will be sent first when the current step stops. The rest stay queued."
+                : "Queued messages will be sent when the previous run has stopped."
               : "Queued messages submitted. Waiting for the agent."
             : "Queued message discarded.",
       );
@@ -533,6 +626,7 @@ export function TaskChatQueuedMessages({
       ? queue.executionWait?.message ?? null : null);
 
   if (entries.length === 0 && !visibleError && !statusMessage) return null;
+  const steeringRows = steeringCount(entries);
 
   return (
     <TaskChatComposerBar
@@ -550,46 +644,72 @@ export function TaskChatQueuedMessages({
             className="max-h-(--tc-queued-list-max-h) overflow-y-auto overscroll-contain"
             data-testid="task-chat-queued-messages-list"
           >
-          {entries.map((entry) => {
-            const action =
-              pending?.commentId === entry.comment.id ? pending.action : null;
-            const busy = Boolean(pending || reordering);
-            const queueMutationDisabled = Boolean(
-              !queue.queueId || pending || reordering,
-            );
+          {(["steering", "queued"] as const).map((section) => {
+            const rows = section === "steering" ? entries.slice(0, steeringRows) : entries.slice(steeringRows);
+            const paused = section === "steering" && rows.length > 0 && Boolean(queue.targetRunId)
+              && queue.steeringDisposition !== "available";
             return (
-              <SortableQueuedMessage
-                key={entry.comment.id}
-                entry={entry}
-                queue={queue}
-                busy={busy}
-                queueMutationDisabled={queueMutationDisabled}
-                action={action}
-                autoSteerSecondsLeft={(() => {
+              <section
+                key={section}
+                aria-label={section === "steering" ? "Steering" : "Queued"}
+                data-testid={`task-chat-queued-section-${section}`}
+                className={cn("flex flex-col gap-0.5 px-1.5 py-1", section === "queued" && "mt-px")}
+              >
+                {section === "queued" ? <div aria-hidden className="mx-1 mb-1 h-px bg-border/70" /> : null}
+                <h3 className="flex items-baseline gap-1.5 px-1.5 pt-0.5 text-xs font-medium text-muted-foreground">
+                  <span>{section === "steering" ? "Steering" : "Queued"}</span>
+                  <span className="tabular-nums" data-testid={`task-chat-queued-count-${section}`}>{rows.length}</span>
+                  {paused ? <span className="font-normal" data-testid="task-chat-queued-steering-paused">· {STEERING_PAUSED}</span> : null}
+                </h3>
+                {rows.length === 0 ? (
+                  <p className="px-1.5 pb-1 text-xs text-muted-foreground">
+                    {section === "steering"
+                      ? readOnly ? "Nothing steering." : "Nothing steering. Drag a message here, or press Steer on it."
+                      : "Nothing queued."}
+                  </p>
+                ) : rows.map((entry) => {
+                  const action = pending?.commentId === entry.comment.id ? pending.action : null;
+                  const busy = Boolean(pending || reordering);
+                  const queueMutationDisabled = Boolean(!queue.queueId || pending || reordering);
                   const deadline = autoSteerDeadlines.get(entry.comment.id);
-                  return deadline === undefined ? null : Math.max(0, Math.ceil((deadline - now) / 1000));
-                })()}
-                onCancelAutoSteer={() => setCancelledAutoSteer(current => new Set(current).add(entry.comment.id))}
-                onEdit={() => onEdit(entry.comment.id)}
-                onSteer={() => void runRowAction(entry.comment.id, "steer")}
-                onInterrupt={
-                  onInterrupt
-                    ? () => void runRowAction(entry.comment.id, "interrupt")
-                    : undefined
-                }
-                onDiscard={() => void runRowAction(entry.comment.id, "discard")}
-              />
+                  return (
+                    <SortableQueuedMessage
+                      key={entry.comment.id}
+                      entry={entry}
+                      queue={queue}
+                      section={section}
+                      busy={busy}
+                      queueMutationDisabled={queueMutationDisabled}
+                      readOnly={readOnly}
+                      action={action}
+                      autoSteerSecondsLeft={deadline === undefined ? null : Math.max(0, Math.ceil((deadline - now) / 1000))}
+                      pausedForEdit={section === "steering" && editingCommentId === entry.comment.id && autoSteerDelayMs !== null}
+                      steeringAvailable={queue.steeringDisposition === "available"}
+                      canSetIntent={Boolean(onSetIntent)}
+                      onCancelAutoSteer={() => {
+                        setCancelledAutoSteer(current => new Set(current).add(entry.comment.id));
+                        // Cancel keeps it queued everywhere, not only in this view.
+                        if (onSetIntent) void runRowAction(entry.comment.id, "intent");
+                      }}
+                      onEdit={() => onEdit(entry.comment.id)}
+                      onToggleIntent={() => void runRowAction(entry.comment.id, "intent")}
+                      onInterrupt={onInterrupt ? () => void runRowAction(entry.comment.id, "interrupt") : undefined}
+                      onDiscard={() => void runRowAction(entry.comment.id, "discard")}
+                    />
+                  );
+                })}
+              </section>
             );
           })}
           </div>
         </SortableContext>
       </DndContext>
-      {statusMessage ? <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground">{statusMessage}</p> : null}
+      {statusMessage ? <p role="status" className="px-3 py-1.5 text-xs text-muted-foreground">{statusMessage}</p> : null}
       {visibleError ? (
         <div
           role="status"
           aria-live="polite"
-          className="border-t border-destructive/20 bg-destructive/5 px-3 py-1.5 text-xs text-destructive"
+          className="bg-destructive/5 px-3 py-1.5 text-xs text-destructive"
         >
           {visibleError}
         </div>

@@ -84,6 +84,15 @@ import { ComposerAddMenu, ComposerModeChip, ComposerPrivacyChip } from "./Compos
 import { supportsComposerModel, type ComposerRunSettings } from "./composer-run-settings";
 import { useCoordinatorPresentation } from "@/components/coordinator/CoordinatorPresentation";
 import type { Agent, IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
+import { ComposerSendButton } from "./ComposerSendButton";
+import {
+  defaultSendMode,
+  isConversationResetDraft,
+  steerUnavailableReason,
+  type SendChord,
+  type SendMode,
+  type SteeringDisposition,
+} from "./send-mode";
 
 /** Structurally identical to IssueChatThread's module-private CommentReassignment. */
 export interface CommentReassignment {
@@ -115,7 +124,11 @@ interface TaskChatComposerProps {
     attachmentIds?: string[],
     clientRequestId?: string,
     runSettings?: ComposerRunSettings,
+    /** While the agent works: Steer, Queue or Interrupt (Paul NOTE 6). Undefined when idle. */
+    sendMode?: SendMode,
   ) => Promise<void> | void;
+  /** The live queue's steering answer; Steer is offered only when it is "available". */
+  steeringDisposition?: SteeringDisposition | null;
   /** New tasks share the editor and controls, but retain their draft until creation succeeds. */
   creation?: {
     value: string;
@@ -391,6 +404,7 @@ function escapeMarkdownLabel(name: string): string {
 
 export function TaskChatComposer({
   onAdd,
+  steeringDisposition = null,
   creation,
   confirmedSubmissionIds,
   onStop,
@@ -430,6 +444,7 @@ export function TaskChatComposer({
 }: TaskChatComposerProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
   const submitKey = useComposerSubmitKey();
+  const [pickedSendMode, setPickedSendMode] = useState<SendMode | null>(null);
   const stopControl = useComposerStop(onStop, stopPending, confirmedStoppedRunIds);
   const [localBody, setBody] = useState(() => (draftKey ? loadDraft(draftKey) : ""));
   const body = creation ? creation.value : localBody;
@@ -900,6 +915,13 @@ export function TaskChatComposer({
     body.trim().length === 0 &&
     attachments.length === 0 &&
     Boolean(onStop || stopControl.stopping);
+  // Paul NOTE 6: while the agent works, Send offers Steer (default), Queue and Interrupt.
+  const sendModesActive = Boolean(onStop) && !queuedEdit && !creation;
+  const draftIsReset = Boolean(conversationMode) && isConversationResetDraft(body);
+  const defaultMode = defaultSendMode({ steeringDisposition, draftIsReset });
+  const steerReason = steerUnavailableReason({ steeringDisposition, draftIsReset });
+  const effectiveSendMode: SendMode =
+    pickedSendMode === "steer" && steerReason ? defaultMode : pickedSendMode ?? defaultMode;
   const uploadPending = attachments.some((item) => item.status === "uploading");
   const uploadFailed = attachments.some((item) => item.status === "error");
   const takeoverVisible = Boolean(takeover && !pause);
@@ -937,8 +959,11 @@ export function TaskChatComposer({
 
   const canResetPausedConversation = conversationMode && !queuedEdit && body.trim() === "/new" && attachments.length === 0;
 
-  async function submit() {
+  async function submit(chord?: SendChord) {
     if (disabled || (pause && !canResetPausedConversation)) return;
+    // The mode this one message is sent in; a pick lasts for one message.
+    const sendMode: SendMode | undefined = !sendModesActive ? undefined
+      : chord === "queue" ? "queue" : chord === "interrupt" ? "interrupt" : effectiveSendMode;
     if (creation) {
       if (submittingRef.current || uploadPending || uploadFailed || creation.submitDisabled || (!bodyRef.current.trim() && !creation.canSubmitWithoutBody)) return;
       submittingRef.current = true;
@@ -1136,11 +1161,12 @@ export function TaskChatComposer({
         changeBody(bodyRef.current);
       }
       sentModeChoice.current = { attemptId, generation: submittedModeGeneration };
-      if (runSettings) {
-        await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId, runSettings);
+      if (runSettings || sendMode) {
+        await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId, runSettings ?? undefined, sendMode);
       } else {
         await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId);
       }
+      setPickedSendMode(null);
       // Navigation does not invalidate the server receipt. Settle the captured
       // task before checking whether this composer is still on screen.
       if (draftKey) settleDraftSubmission(draftKey, attemptId,
@@ -1471,8 +1497,9 @@ export function TaskChatComposer({
                 description: "Start fresh context here, preserving conversation history.", aliases: ["new"],
                 disabled,
               }] : [goalCommandOption]}
-              onSubmit={() => void submit()}
+              onSubmit={(chord) => void submit(chord)}
               submitKey={submitKey}
+              sendModeKeys={sendModesActive}
               fileDropTarget="parent"
               bordered={false}
               className={cn(disabled && "opacity-60")}
@@ -1684,7 +1711,35 @@ export function TaskChatComposer({
                 Cancel
               </button>
             ) : null}
-            <button
+            {!showStop && !queuedEdit && !creation ? (
+              <ComposerSendButton
+                working={sendModesActive}
+                mode={sendModesActive ? effectiveSendMode : "steer"}
+                defaultMode={defaultMode}
+                steerUnavailableReason={steerReason}
+                submitKey={submitKey}
+                streamlined={streamlined}
+                busy={submitting}
+                disabled={
+                  disabled ||
+                  (Boolean(pause) && !canResetPausedConversation) ||
+                  submitting ||
+                  !!uncertainSubmission ||
+                  uploadPending ||
+                  uploadFailed ||
+                  (body.trim().length === 0 && attachedRefs.length === 0)
+                }
+                title={
+                  uploadPending
+                    ? "Waiting for upload to finish"
+                    : uploadFailed
+                      ? "Remove the failed attachment to send"
+                      : `Send (${submitKey === "mod-enter" ? "⌘/Ctrl+Enter" : "Enter"})`
+                }
+                onSend={() => void submit()}
+                onPick={(mode) => setPickedSendMode(mode)}
+              />
+            ) : <button
               type="button"
               onClick={() => void (showStop ? stopControl.stop() : submit())}
               disabled={
@@ -1744,7 +1799,7 @@ export function TaskChatComposer({
               ) : (
                 <ArrowUp className="h-4 w-4" aria-hidden />
               )}
-            </button>
+            </button>}
             </div>
           </div>
           {stopControl.error ? (

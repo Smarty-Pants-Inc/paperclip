@@ -1,4 +1,5 @@
 import { FILE_DROP_TARGET_ATTRIBUTE } from "../lib/file-drop-target";
+import { resolveSendIntent, type SendChord } from "./task-chat/send-mode";
 import { AgentAvatar } from "./AgentAvatar";
 import {
   Component,
@@ -102,10 +103,12 @@ interface MarkdownEditorProps {
   mentions?: MentionOption[];
   /** Capability-aware action commands supplied by the owning composer. */
   actionCommands?: SlashCommandOption[];
-  /** Called on the configured submit shortcut. */
-  onSubmit?: () => void;
+  /** Called on the configured submit shortcut, with the send chord it was (see `resolveSendIntent`). */
+  onSubmit?: (intent?: SendChord) => void;
   /** Task composers use Enter; document editors retain Cmd/Ctrl+Enter by default. */
   submitKey?: "enter" | "mod-enter";
+  /** The agent is working: Ctrl/⌘+Enter queues and Ctrl/⌘+Alt+Enter interrupts (Paul NOTE 6). */
+  sendModeKeys?: boolean;
   /** Render the rich editor without allowing edits. */
   readOnly?: boolean;
 }
@@ -770,17 +773,20 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
   actionCommands = [],
   onSubmit,
   submitKey = "mod-enter",
+  sendModeKeys = false,
   readOnly = false,
 }: MarkdownEditorProps, forwardedRef) {
   const editorValue = useMemo(() => prepareMarkdownForEditor(value), [value]);
+  function submitChord(event: KeyboardEvent<HTMLElement>): SendChord | null {
+    if (readOnly) return null;
+    return resolveSendIntent({
+      key: event.key, shiftKey: event.shiftKey, altKey: event.altKey, ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey, isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode,
+      getModifierState: (key) => event.getModifierState?.(key as "AltGraph") ?? false,
+    }, submitKey, { working: sendModeKeys });
+  }
   function isSubmitShortcut(event: KeyboardEvent<HTMLElement>): boolean {
-    return !readOnly
-      && event.key === "Enter"
-      && !event.nativeEvent.isComposing
-      && event.keyCode !== 229
-      && !event.shiftKey
-      && !event.altKey
-      && (submitKey === "enter" || event.metaKey || event.ctrlKey);
+    return submitChord(event) !== null;
   }
   const { slashCommands: sharedSlashCommands } = useEditorAutocomplete();
   const slashCommands = useMemo(
@@ -1410,7 +1416,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
             if (onSubmit && isSubmitShortcut(event)) {
               event.preventDefault();
               event.stopPropagation();
-              onSubmit();
+              onSubmit(submitChord(event) ?? "default");
             }
           }}
           className={cn(
@@ -1458,7 +1464,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
         if (onSubmit && isSubmitShortcut(e) && (e.metaKey || e.ctrlKey)) {
           e.preventDefault();
           e.stopPropagation();
-          onSubmit();
+          onSubmit(submitChord(e) ?? "default");
           return;
         }
 
@@ -1519,7 +1525,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
         ) {
           e.preventDefault();
           e.stopPropagation();
-          onSubmit();
+          onSubmit(submitChord(e) ?? "default");
         }
       }}
       onDragEnter={(evt) => {

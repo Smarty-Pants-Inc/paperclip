@@ -586,17 +586,25 @@ export const issuesApi = {
     ),
   interruptQueuedComments: (
     id: string,
-    data: { queueId: string; targetRunId: string | null; revision: string },
+    data: { queueId: string; targetRunId: string | null; revision: string; commentId?: string },
   ) => api.post<IssueQueuedCommentQueue>(`/issues/${id}/queued-comments/interrupt`, data),
-  interruptLatestQueuedComments: async (id: string, expectedTargetRunId: string | null): Promise<IssueQueuedCommentQueue> => {
+  /** Interrupt; with a commentId, that one message goes first and the rest stay queued (never across a /new). */
+  interruptLatestQueuedComments: async (id: string, expectedTargetRunId: string | null, commentId?: string): Promise<IssueQueuedCommentQueue> => {
     const queue = await issuesApi.getQueuedComments(id);
-    if (!queue.queueId || (queue.targetRunId && queue.targetRunId !== expectedTargetRunId)) {
+    const entry = commentId ? queue.entries.find((candidate) => candidate.comment.id === commentId) : undefined;
+    const queueId = entry?.queueId ?? queue.queueId;
+    if (!queueId || (queue.targetRunId && !commentId && queue.targetRunId !== expectedTargetRunId) ||
+        (commentId && !entry)) {
       throw new Error("The queued messages changed. Refresh and try again.");
     }
     return issuesApi.interruptQueuedComments(id, {
-      queueId: queue.queueId, revision: queue.revision, targetRunId: queue.targetRunId,
+      queueId, revision: entry?.queueRevision ?? queue.revision, targetRunId: queue.targetRunId,
+      ...(commentId ? { commentId } : {}),
     });
   },
+  /** A waiting message's mode, stored on the server (owner only). */
+  setQueuedCommentIntent: (id: string, commentId: string, intent: "steer" | "queue") =>
+    api.patch<IssueQueuedCommentQueue>(`/issues/${id}/queued-comments/${commentId}/intent`, { intent }),
   steerQueuedComment: (
     id: string,
     commentId: string,
@@ -734,11 +742,13 @@ export const issuesApi = {
     interrupt?: boolean,
     attachmentIds?: string[],
     clientRequestId?: string,
+    deliveryIntent?: "steer" | "queue",
   ) =>
     confirmedCommentResponse(
       api.post<IssueComment>(`/issues/${id}/comments`, {
         body,
         ...(clientRequestId ? { clientRequestId } : {}),
+        ...(deliveryIntent ? { deliveryIntent } : {}),
         ...(reopen === undefined ? {} : { reopen }),
         ...(interrupt === undefined ? {} : { interrupt }),
         ...(attachmentIds?.length ? { attachmentIds } : {}),
