@@ -136,6 +136,8 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
     hasInstructionFilesystem: boolean;
     nativeLifecyclePolicy: NativeLifecyclePolicy | null;
   }) {
+    // A copied predecessor context is not this run's delivery receipt.
+    delete context.paperclipAgentFileConflictNotice;
     if (hasInstructionFilesystem && !task) {
       try {
         // Missing contract fields on a restored session mean the deployed
@@ -206,6 +208,20 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
         }
       }
       if (instructionCopy) {
+        if (isAgentDirectoryCopy(instructionCopy)) {
+          const notice = await instructionCopies.claimConflictNotice({ companyId: agent.companyId, agentId: agent.id,
+            runId: readRun().id, previousRunId: taskSessionForRun?.lastRunId ?? taskSession?.lastRunId });
+          // Native inputs use both bootstrap and continuation projections. Keep
+          // the notice separate from stable instructions so warm turns see it.
+          context.paperclipAgentFileConflictNotice = notice;
+          if (notice) context.agentFileConflictNotice = { runId: readRun().id, text: notice };
+          else delete context.agentFileConflictNotice;
+          if (notice && nativeRuntimeResolution.kind !== "native") {
+            for (const key of ["paperclipTaskMarkdown", "paperclipTaskMarkdownCompact", "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownAssignmentCompact"]) {
+              context[key] = [readNonEmptyString(context[key]), notice].filter(Boolean).join("\n\n");
+            }
+          }
+        }
         const storageWarning = readNonEmptyString(instructionCopy.receipt?.storageWarning);
         if (storageWarning) {
           instructionSave = { state: "prepared", contract: "agent_files", storageWarning };

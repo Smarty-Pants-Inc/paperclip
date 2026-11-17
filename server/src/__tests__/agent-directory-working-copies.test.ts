@@ -27,6 +27,9 @@ import { agentInstructionRevisionService } from "../services/agent-instruction-r
 import { agentInstructionWorkingCopyService, instructionWorkingCopyGuidance } from "../services/agent-instruction-working-copies.js";
 import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { buildNativeRuntimeContext } from "../services/native-runtime/runtime-context.js";
+import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
+import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createReusableLeaseHandoff } from "../services/environment-lease-handoff.js";
@@ -1363,13 +1366,15 @@ describe("persistent agent directories", () => {
   });
   // Exercise the production heartbeat callback consumed by the native executor,
   // rather than duplicating its saved-state-to-boolean expression in this test.
-  async function heartbeatCopy(copy: Awaited<ReturnType<typeof run>>, appendRunEvent = vi.fn(async (..._args: unknown[]) => {})) {
+  async function heartbeatCopy(copy: Awaited<ReturnType<typeof run>>, appendRunEvent = vi.fn(async (..._args: unknown[]) => {}),
+    options: { previousRunId?: string; context?: Record<string, unknown> } = {}) {
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     const [currentRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, copy.runId));
     type Input = Parameters<typeof createHeartbeatInstructionWorkingCopy>[0];
     const lifecycle = createHeartbeatInstructionWorkingCopy({ db, instructionCopies: copies,
-      agent: agent!, readRun: () => currentRun!, context: {},
-      session: { taskSession: null, taskSessionForRun: null, sessionConfigMetadata: {} as Input["session"]["sessionConfigMetadata"] },
+      agent: agent!, readRun: () => currentRun!, context: options.context ?? {},
+      session: { taskSession: options.previousRunId ? { lastRunId: options.previousRunId } : null,
+        taskSessionForRun: null, sessionConfigMetadata: {} as Input["session"]["sessionConfigMetadata"] },
       workspace: { executionTarget: null, executionWorkspace: { cwd: home } as Input["workspace"]["executionWorkspace"], persistedExecutionWorkspace: null },
       appendRunEvent,
     });
@@ -1408,6 +1413,67 @@ describe("persistent agent directories", () => {
     const fresh = await run();
     expect(await fs.readFile(path.join(fresh.localRoot, "memory", "x.md"), "utf8")).toBe("B");
     expect(await fs.readFile(path.join(fresh.localRoot, copyPath), "utf8")).toBe("A");
+  });
+  // Data-safety regression: use real saves, cleanup, the next run's prepare,
+  // and the native envelope consumed on warm resume (not just save events).
+  it.each([false, true])("carries a conflict notice into the next model input once, after cleanup (warm save: %s)", async warm => {
+    await fs.mkdir(path.join(root, "memory"));
+    await fs.writeFile(path.join(root, "memory/x.md"), "C");
+    await fs.writeFile(path.join(root, "memory/y.md"), "C");
+    const first = await run({ warm });
+    await fs.writeFile(path.join(first.localRoot, "memory/x.md"), "A");
+    await fs.unlink(path.join(first.localRoot, "memory/y.md"));
+    await fs.writeFile(path.join(root, "memory/x.md"), "B");
+    await fs.writeFile(path.join(root, "memory/y.md"), "B");
+    const saved = warm ? await copies.checkpointWarm({ companyId, runId: first.runId })
+      : await copies.collectStopped({ companyId, runId: first.runId });
+    const conflicts = saved!.receipt!.conflicts as Array<{ path: string; conflictCopy: string | null }>;
+    const copyPath = conflicts.find(item => item.path === "memory/x.md")!.conflictCopy!;
+    // A no-change retirement checkpoint must not erase an undelivered notice.
+    if (warm) await copies.collectStopped({ companyId, runId: first.runId });
+    const next = await run();
+    const context: Record<string, unknown> = {};
+    await heartbeatCopy(next, undefined, { previousRunId: first.runId, context });
+    const notice = context.paperclipAgentFileConflictNotice;
+    expect(notice).toBe(`Note: "memory/x.md" was also saved by another run; that version was kept. Your earlier edit is saved as "${copyPath}".\nNote: "memory/y.md" was also saved by another run; that version was kept. Your earlier deletion was not applied.`);
+    const modelInput = (text: unknown) => buildNativeExecutionInput({ companyId, agentId, runId: next.runId,
+      issue: { id: randomUUID(), identifier: null, title: "Continue this chat", description: null, workMode: "standard" },
+      taskPrompt: "Continue", agentFileConflictNotice: typeof text === "string" ? text : null,
+      workspace: { id: next.runId, cwd: home, repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: randomUUID(), resumedSession: true,
+      previousTurn: { runId: first.runId, task: { title: "Continue this chat", description: null } },
+      provider: "codex", completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`,
+        schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Continue", criteria: [{ id: "answer", requirement: "Answer" }] } },
+      runtimeContext: nativeRuntimeContextFixture() });
+    for (const envelope of [buildNativeModelEnvelope(modelInput(notice)), buildNativeModelEnvelope(modelInput(notice), { resumedSession: true })]) {
+      const text = JSON.stringify(envelope);
+      expect(text).toContain(copyPath);
+      expect(text).toContain("that version was kept");
+      expect(text.split("Your earlier edit is saved as")).toHaveLength(2);
+    }
+    // Preparation retries, including a new facade after controller restart,
+    // rebuild the same input without consuming another delivery.
+    await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, next.runId));
+    copies = agentInstructionWorkingCopyService(db);
+    const retryContext: Record<string, unknown> = {};
+    await heartbeatCopy(next, undefined, { previousRunId: first.runId, context: retryContext });
+    expect(retryContext.paperclipAgentFileConflictNotice).toBe(notice);
+    await copies.collectStopped({ companyId, runId: next.runId });
+    const later = await run();
+    const laterContext: Record<string, unknown> = {};
+    await heartbeatCopy(later, undefined, { previousRunId: next.runId, context: laterContext });
+    expect(laterContext.paperclipAgentFileConflictNotice ?? null).toBeNull();
+    expect(JSON.stringify(buildNativeModelEnvelope(modelInput(laterContext.paperclipAgentFileConflictNotice), { resumedSession: true }))).not.toContain("Your earlier edit");
+    expect(await fs.readFile(path.join(root, "memory/x.md"), "utf8")).toBe("B");
+    expect(await fs.readFile(path.join(root, copyPath), "utf8")).toBe("A");
+  });
+  it("adds no next-turn notice after an ordinary save", async () => {
+    const first = await run();
+    await fs.writeFile(path.join(first.localRoot, "ordinary.md"), "Saved without a competing writer");
+    await copies.collectStopped({ companyId, runId: first.runId });
+    const next = await run(), context: Record<string, unknown> = {};
+    await heartbeatCopy(next, undefined, { previousRunId: first.runId, context });
+    expect(context.paperclipAgentFileConflictNotice ?? null).toBeNull();
   });
   it("b13 RED: the executor-facing checkpointWarm callback returns true for an unchanged low-trust turn", async () => {
     await lowTrust();
