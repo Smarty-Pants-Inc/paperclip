@@ -23,8 +23,8 @@ const PI_REFUSAL_CATEGORIES = new Set([
  * provider error evidence, never assistant prose, tools or notice text. Prefer
  * native refusal evidence when forwarded: explanation text is not stable.
  * Pinned packs can forward only that text, including OUTPUT-side Terms of
- * Service refusals. Require a policy/terms family AND actual rejection language
- * so ordinary policy mentions and transport failures do not stop retries. */
+ * Service refusals. Match request refusals, not account/key rejection plus an
+ * unrelated policy/terms mention. Native refusal fields remain authoritative. */
 function isPiPolicyRefusal(error: Record<string, unknown>): boolean {
   if (error.code === PROVIDER_POLICY_REFUSAL_CODE) return true;
   if (error.code !== "pi_provider_error") return false;
@@ -35,8 +35,10 @@ function isPiPolicyRefusal(error: Record<string, unknown>): boolean {
   if (typeof error.message !== "string") return false;
   const message = error.message;
   return message.trim() === "The model refused to complete the request"
-    || (/\b(?:(?:usage|acceptable[ -]use|safety|content)[ -]polic(?:y|ies)|terms[ -]of[ -](?:service|use)|commercial[ -]terms)\b/i.test(message)
-      && /\b(?:refus\w*|block\w*|flag\w*|violat\w*|reject\w*|disallow\w*|not allowed)\b/i.test(message));
+    || /https:\/\/(?:platform\.claude\.com\/docs\/en\/build-with-claude\/refusals-and-fallback|www\.anthropic\.com\/legal\/commercial-terms)(?:[\s"'?#/.,]|$)/i.test(message)
+    || /\b(?:this|your|the) request triggered\b[^\n]*\brestrictions\b/i.test(message)
+    || /\bblocked as it seems to violate\b[^\n]*\bterms of service restrictions on\b/i.test(message)
+    || /\b(?:this|your|the) request (?:was |is |has been |would )?(?:blocked|flagged|refused|rejected|violate[sd]?)\b[^\n]*\b(?:(?:usage|acceptable[ -]use|safety|content)[ -]polic(?:y|ies)|terms[ -]of[ -]use|commercial[ -]terms)\b/i.test(message);
 }
 export const NATIVE_PROVIDER_OVERLOADED_DIAGNOSTIC = {
   provider: "codex",

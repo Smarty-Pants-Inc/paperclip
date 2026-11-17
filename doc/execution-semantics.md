@@ -1406,9 +1406,11 @@ A bound Pi provider terminal refusal is `provider_policy_refusal`, a permanent
 failure, not a capacity error or an interrupted session. The Pi driver preserves
 Anthropic's `rawStopReason: "refusal"` as that code even when the provider's
 explanation does not mention policy. Older pinned packs forward
-`pi_provider_error` with Pi's default refusal message or an explicit policy or
-Terms of Service rejection; the server classifies those at the same
-committed-event boundary. This includes output-side refusals after streamed
+`pi_provider_error` with Pi's default refusal message, request-specific policy
+rejection, the documented triggered-restrictions or Terms of Service
+restrictions wording, or the refusal/commercial-terms URL; the server
+classifies those at the same committed-event boundary. Account/key rejection
+because Terms of Service have not been accepted is not a content refusal. This includes output-side refusals after streamed
 reasoning, not just refusals before output. Where forwarded, native
 `rawStopReason`/`stop_reason: "refusal"`, `stop_details.type: "refusal"`, or a
 known `stop_details.category` (including `reasoning_extraction`) identifies the
@@ -1422,12 +1424,17 @@ lose native details. Anthropic offers optional model fallback for some categorie
 Paperclip does not opt into automatic resubmission after a refusal.
 Assistant prose, tool output and events from another run, source or turn cannot
 authorize this classification. Finalization after restart re-derives it from the
-hash-checked persisted runner event, not a display diagnostic.
+hash-checked persisted runner event, not a display diagnostic. When the native
+runtime throws a failed terminal without a semantic result, the server catch
+uses the latest accepted bound turn event for the same refusal classification;
+it cannot reuse a refusal from an earlier turn. This preserves the named
+permanent failure and closed diagnostic without changing runner/PACK bytes.
 
 Neither the native status decision nor generic recovery/fresh continuation
-retries that request automatically. The unanswered-person-message sweep writes
-one idempotent note: “The model provider refused this request under its usage
-policy; it won't be retried automatically.” It never recommends resending that
+retries that request automatically. The shared bounded-retry scheduling port
+also refuses it, including callers supplying an alternate retry reason or cap.
+The unanswered-person-message sweep writes one idempotent note: “The model
+provider refused this request under its policies; it won't be retried automatically.” It never recommends resending that
 request. A provider refusal does not itself request Stop or prove execution
 cleanup: no Stop-pending card is created for it without a recorded Stop request,
 and the existing execution claims and cleanup gates remain intact. A genuinely
