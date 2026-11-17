@@ -98,6 +98,8 @@ export const HANDED_OFF_WARM_EXIT_KEY = "handedOffWarmOwnerRunnerExited";
 /** rf-4 row 22f: bound on the remote proof (stop the idle Runner, wait for its exit). */
 export const handedOffWarmProofTimeout = { ms: 20_000 };
 const proofsInFlight = new Map<string, Promise<"none" | "proven" | "unproven" | "timed_out">>();
+/** The in-flight proofs started by a pause (stopFallback false). */
+const pauseProofs = new WeakSet<Promise<"none" | "proven" | "unproven" | "timed_out">>();
 /** A proof for this run is running outside the transaction right now. */
 export function handedOffWarmProofInFlight(runId: string): boolean { return proofsInFlight.has(runId); }
 
@@ -109,9 +111,20 @@ export function handedOffWarmProofInFlight(runId: string): boolean { return proo
  * stop_and_retain intent (its provider receipt then admits the successor),
  * never for a busy owner (handedOffWarmOwnerBusy). The intent records which:
  * proofFailure "timed_out" or "proof_error". */
-export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<"none" | "proven" | "unproven" | "timed_out"> {
+export function proveHandedOffWarmLeases(db: Db, run: Run,
+  options: { stopFallback?: boolean } = {}): Promise<"none" | "proven" | "unproven" | "timed_out"> {
+  // pl/pausing2: the whole-agent pause passes stopFallback false: it stops the
+  // PROCESS only (TERM of the idle Runner) and never writes the box's
+  // stop-and-retain intent; a failed or timed-out proof just keeps 'pausing'.
+  const stopFallback = options.stopFallback !== false;
   const running = proofsInFlight.get(run.id);
-  if (running) return running;
+  if (running) {
+    // A Send joining a pause's proof keeps its own fallback: after a pause's
+    // timeout (no intent written) it runs its own bounded proof.
+    return stopFallback && pauseProofs.has(running)
+      ? running.then(outcome => outcome === "timed_out" ? proveHandedOffWarmLeases(db, run, options) : outcome)
+      : running;
+  }
   const work = (async () => {
     const leases = (await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
       eq(environmentLeases.heartbeatRunId, run.id)))).filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));
@@ -119,6 +132,11 @@ export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<"none" | "pr
     const { handedOffWarmOwnerRunnerExited, handedOffWarmOwnerBusy } = await import("./native-session-executor.js");
     let outcome: "proven" | "unproven" | "timed_out" = "proven";
     for (const lease of leases) {
+      // pl/pausing2 GUARD 1: the pause never TERMs a busy or preparing Runner.
+      if (!stopFallback && handedOffWarmOwnerBusy({ runId: run.id, providerLeaseId: lease.providerLeaseId })) {
+        outcome = "unproven";
+        break;
+      }
       let timer: NodeJS.Timeout | undefined;
       const answer = await Promise.race([
         // rf-4 row 22f: a proof ERROR is not "not exited"; it takes the timeout's fallback below.
@@ -134,6 +152,11 @@ export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<"none" | "pr
       }
       if (answer === "timeout" || typeof answer === "object") {
         const proofFailure = answer === "timeout" ? "timed_out" as const : "proof_error" as const;
+        if (!stopFallback) {
+          logger.warn({ runId: run.id, leaseId: lease.id, providerLeaseId: lease.providerLeaseId, proofFailure,
+            timeoutMs: handedOffWarmProofTimeout.ms }, "handed-off warm proof failed during a pause; the agent stays pausing and retries");
+          return "timed_out" as const;
+        }
         // Never stop a busy owner: the warm entry's own idle check (busy or preparing).
         if (handedOffWarmOwnerBusy({ runId: run.id, providerLeaseId: lease.providerLeaseId })) {
           logger.warn({ runId: run.id, leaseId: lease.id, providerLeaseId: lease.providerLeaseId, proofFailure },
@@ -164,6 +187,7 @@ export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<"none" | "pr
     return outcome;
   })().finally(() => proofsInFlight.delete(run.id));
   proofsInFlight.set(run.id, work);
+  if (!stopFallback) pauseProofs.add(work);
   return work;
 }
 
