@@ -40,7 +40,8 @@ describe("recovered-work receipt respects the conversation's held state", () => 
         automaticRecovery: { policy: "preserve_without_replay_v1", runId, replay: "blocked", actionOutcome: "unknown", recordedAt: new Date().toISOString() },
         workspaceRecovery: { schema: "paperclip.workspace-recovery.v1", runId, status: "recovered", stage: "saving_receipts", attempt: 1, requestIds: [] } } });
     if (held) await db.insert(issueComments).values({ companyId, issueId, authorType: "system", body: HELD_PREDECESSOR_NOTICE,
-      metadata: { version: 1, authorizationReason: `native_prior_owner_held:${sessionId}` } });
+      metadata: { version: 1, authorizationReason: `native_prior_owner_held:${sessionId}`,
+        sections: [{ rows: [{ type: "run_link", runId, agentId }] }] } });
     return { companyId, issueId, runId };
   }
 
