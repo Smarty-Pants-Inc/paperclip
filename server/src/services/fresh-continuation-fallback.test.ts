@@ -35,7 +35,7 @@ import { createSystemRecovery } from "./system-recovery-state.js";
 import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
-import { settleUnansweredPersonMessagesForTask } from "./recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessagesForTask, PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS } from "./recovery/unanswered-person-message.js";
 import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";
 import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
@@ -738,14 +738,25 @@ suite("fresh-continuation fallback", () => {
     }
   }, 60_000);
 
-  it("step 1 loop: the same deterministic refusal backs off at upstream's rolling-hour brake", async () => {
-    const failure = "temporary_runner_transport_unavailable";
+  it.each(["direct", "watchdog"] as const)("step 1 loop: %s refusal backs off at upstream's rolling-hour brake", async path => {
+    const failure = path === "watchdog" ? "native_controller_recovery_missing_evidence:snapshot_binding"
+      : "temporary_runner_transport_unavailable";
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation", error: failure });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please finish the requested work.", createdAt: new Date(Date.now() - 12 * 60_000) }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
     await occupySlot();
     let sourceId: string = f.runId;
     for (let attempt = 1; attempt <= FRESH_CONTINUATIONS_PER_HOUR; attempt++) {
-      expect(await ensureFreshContinuation(db, { companyId, runId: sourceId, trigger: "recovery_refused" }),
-        `deterministic failure ${attempt}`).toMatchObject({ kind: "continued" });
+      if (path === "watchdog") {
+        // Production disposition consumes a fresh active_run_watchdog action
+        // on every failed preparation; it must not get a new allowance per hold.
+        await settleUnrecoverableExecutions(db);
+      } else {
+        expect(await ensureFreshContinuation(db, { companyId, runId: sourceId, trigger: "recovery_refused" }),
+          `deterministic failure ${attempt}`).toMatchObject({ kind: "continued" });
+      }
       await deliver();
       const next = await successors(sourceId);
       expect(next).toHaveLength(1);
@@ -764,11 +775,29 @@ suite("fresh-continuation fallback", () => {
       sql`${issueRecoveryActions.evidence}->'freshContinuation' is not null`));
     expect(records).toHaveLength(FRESH_CONTINUATIONS_PER_HOUR);
     expect(records.every(record => !/Send a new message|tried to continue this task twice/.test(record.nextAction))).toBe(true);
-    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
-    // Upstream schedules another check instead of handing this failure to a
-    // person. Retry is intentionally absent while that check is scheduled.
-    expect(await taskInterruptionPresentation(db, await issue(f.issueId)))
-      .toMatchObject({ state: "retry_scheduled", canRetry: false, nextRetryAt: expect.any(String) });
+    // Expire the message owner's durable 2-minute wait, without expiring the
+    // upstream hour. No recheck may post a contradictory resend instruction.
+    await db.insert(activityLog).values({ companyId, actorType: "system", actorId: "recovery", action: PENDING_WAIT_ACTION,
+      entityType: "issue", entityId: f.issueId, createdAt: new Date(Date.now() - PENDING_WAIT_BOUND_MS - 1_000),
+      details: { messageId: message.id, runId: sourceId } });
+    const scheduled = await taskInterruptionPresentation(db, await issue(f.issueId));
+    expect(scheduled).toMatchObject({ state: "retry_scheduled", canRetry: false, nextRetryAt: expect.any(String) });
+    const restarted = createDb(temporary!.connectionString);
+    try {
+      for (let pass = 0; pass < 3; pass++) {
+        expect(await settleUnansweredPersonMessagesForTask(restarted, { companyId, issueId: f.issueId,
+          now: new Date(Date.now() + PENDING_WAIT_BOUND_MS + 30_000) })).toEqual({ noticed: 0, pending: 1 });
+        await settleUnrecoverableExecutions(restarted); await continueHeldExecutions(restarted);
+        await deliverReconciledExecutions(restarted, heartbeatService(restarted).wakeup);
+        expect(await successors(sourceId)).toHaveLength(0);
+      }
+    } finally { await restarted.$client.end(); }
+    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+    expect(notes).toHaveLength(0); // At most one: the sweep adds none to the card/transcript's one instruction.
+    if (process.env.PAPERCLIP_STEP1B_OBSERVATIONS) await writeFile(
+      join(process.env.PAPERCLIP_STEP1B_OBSERVATIONS, `loop-${path}.json`),
+      JSON.stringify({ path, failure, rootRunId: f.runId, stoppedSourceRunId: sourceId, continuations: records.length,
+        scheduled, sweepNotes: notes.length, forbiddenSuccessors: (await successors(sourceId)).length }, null, 2) + "\n");
   }, 60_000);
 
   // follow-Paperclip Cut B R1/R5: preserve the unproven retained source, not the removed stop-before-fresh upgrade.
