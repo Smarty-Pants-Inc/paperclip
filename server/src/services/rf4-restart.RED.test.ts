@@ -140,7 +140,8 @@ describe("RF4 row 12: restart between warm Stop and the person's Send", () => {
     await heartbeatService(db).resumeQueuedCommentInterrupt(companyId, queueId);
     expect((await lease()).metadata?.sandboxStopAndRetain).toEqual(intent);
     expect((await runs()).map(run => run.id)).toEqual([sourceRunId]);
-    const stopReceipt = await runtime.retryPendingSandboxTeardown({ environment, lease: stopping });
+    const stopReceipt = await runtime.retryPendingSandboxTeardown({ environment,
+      lease: stopping as Parameters<typeof runtime.retryPendingSandboxTeardown>[0]["lease"] });
     const settled = await settleStopOnlyCleanup(db, stopping, { attemptId: String(stopping.metadata?.pendingCleanupAttemptId), receipt: stopReceipt });
     expect(settled).toMatchObject({ status: "released", providerLeaseId });
     // Occupy the agent's one scheduler slot on another task: admission/queueing
