@@ -4,7 +4,7 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  agentWakeupRequests, agents, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues,
+  agentWakeupRequests, agents, companies, companyMemberships, createDb, environmentLeases, heartbeatRuns, issueComments, issues,
   issueRecoveryActions, nativeRunFinalizations,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
@@ -12,6 +12,8 @@ import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { deliverConversationComments } from "../services/agent-conversations.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { providerResourceDispositionForTerminalRun } from "../services/runner-environment-lifecycle.js";
+import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -55,7 +57,8 @@ describeEmbeddedPostgres("queued-comment Interrupt keeps the person's order", ()
       status: "active", membershipRole: "operator" });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "assignment",
       triggerDetail: "order test", status: "running", runtimeMode: "native", startedAt: new Date(Date.now() - 600_000),
-      createdAt: new Date(Date.now() - 600_000), contextSnapshot: { issueId }, nativeIssueId: issueId, responsibleUserId: "queue-owner" });
+      createdAt: new Date(Date.now() - 600_000), contextSnapshot: { issueId }, nativeIssueId: issueId, responsibleUserId: "queue-owner",
+      runnerProfileJson: { nativeResourceDisposition: "keep_running" } });
     await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
     await db.insert(issues).values({ id: issueId, companyId, identifier: "ORD-1", title: "Chat", status: "in_progress",
       priority: "medium", assigneeAgentId: agentId, executionRunId: runId,
@@ -102,9 +105,10 @@ describeEmbeddedPostgres("queued-comment Interrupt keeps the person's order", ()
       .filter(run => run.id !== f.runId && run.contextSnapshot?.issueId === f.issueId)
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 
-  // Live shape: the runner acknowledged the person's Stop, so the release
-  // recorded no recovery hold (postgres.ts isAcknowledgedNativeStop). The
-  // harness has no runner, so it writes that acknowledgement itself.
+  // U shape: the person's Stop of a warm box releases stop_and_retain,
+  // never a keep_running handoff. The harness has no runner/provider, so it
+  // writes the acknowledgement and pending release; only the bound provider
+  // receipt below proves cleanup and permits admission.
   async function acknowledgeStop(f: { companyId: string; issueId: string; runId: string }) {
     const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
     expect(stopped.status).toBe("cancelled");
@@ -112,10 +116,21 @@ describeEmbeddedPostgres("queued-comment Interrupt keeps the person's order", ()
       nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId,
         issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
         dispatched: true, intentAuditId: "s8", acknowledgementAuditId: "s8" } } }).where(eq(heartbeatRuns.id, f.runId));
+    expect(providerResourceDispositionForTerminalRun("keep_running", "cancelled", "cancelled")).toBe("stop_and_retain");
+    await db.insert(environmentLeases).values({ id: randomUUID(), companyId: f.companyId, heartbeatRunId: f.runId,
+      provider: "daytona", providerLeaseId: `s8-${f.runId}`, leasePolicy: "reuse_by_environment",
+      status: "pending_cleanup", cleanupStatus: "pending", metadata: {} });
     await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
   }
 
-  async function finishTeardown(f: Awaited<ReturnType<typeof seedBusyChat>>) {
+  async function landStopReceipt(f: { runId: string }) {
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.runId));
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease,
+        { providerLeaseId: lease.providerLeaseId, state: "stopped" }) } }).where(eq(environmentLeases.id, lease.id));
+  }
+
+  async function finishTeardown(f: Awaited<ReturnType<typeof seedBusyChat>>, receipt = true) {
     const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
     await db.update(heartbeatRuns).set({ processPid: 999_999_999, resultJson: { ...stopped.resultJson,
       nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId,
@@ -123,6 +138,7 @@ describeEmbeddedPostgres("queued-comment Interrupt keeps the person's order", ()
         dispatched: true, intentAuditId: "s8", acknowledgementAuditId: "s8" } } }).where(eq(heartbeatRuns.id, f.runId));
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: null })
       .where(eq(nativeRunFinalizations.runId, f.runId));
+    if (receipt) await landStopReceipt(f);
   }
 
   it("answers M1, M2, M3, then the message written after the Interrupt, each once", async () => {
@@ -134,8 +150,13 @@ describeEmbeddedPostgres("queued-comment Interrupt keeps the person's order", ()
     const m4 = await sendLater(f);
     expect(m4.wake.status).toBe("deferred_issue_execution");
     expect(await successors(f)).toEqual([]);
-    await finishTeardown(f);
+    await finishTeardown(f, false);
     const service = heartbeatService(db);
+    // A terminal coordinator and acknowledged Stop alone cannot admit a
+    // successor on U: admission waits for this box's recorded stop receipt.
+    await service.resumeQueuedCommentInterrupt(f.companyId, f.wakeIds[0]);
+    expect(await successors(f)).toEqual([]);
+    await landStopReceipt(f);
     await service.resumeQueuedCommentInterrupt(f.companyId, f.wakeIds[0]);
     const [first, ...early] = await successors(f);
     expect(early).toEqual([]);
@@ -159,6 +180,7 @@ describeEmbeddedPostgres("queued-comment Interrupt keeps the person's order", ()
     const f = await seedBusyChat();
     await heartbeatService(db).cancelRun(f.runId);
     await acknowledgeStop(f);
+    await finishTeardown(f);
     await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.companyId, f.companyId));
     const m4 = await sendLater(f);
     expect(m4.wake.status).toBe("queued");
@@ -168,6 +190,7 @@ describeEmbeddedPostgres("queued-comment Interrupt keeps the person's order", ()
   it("does not hold a later message behind a stale press", async () => {
     const f = await seedBusyChat();
     await press(f);
+    await finishTeardown(f);
     // A later run on the issue ended: the press no longer targets the latest run.
     await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
       finishedAt: new Date(), contextSnapshot: { issueId: f.issueId } });
@@ -178,6 +201,7 @@ describeEmbeddedPostgres("queued-comment Interrupt keeps the person's order", ()
   it("does not hold a later message behind a press whose target was not stopped by it", async () => {
     const f = await seedBusyChat();
     await press(f);
+    await finishTeardown(f);
     const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
     await db.update(heartbeatRuns).set({ resultJson: { ...stopped.resultJson, queuedCommentInterruptQueueId: randomUUID() } })
       .where(eq(heartbeatRuns.id, f.runId));
