@@ -111,13 +111,24 @@ describe("Pi manual compaction", () => {
     } finally { release?.(); await f.close(); }
   });
 
-  it("surfaces native refusal and never fabricates a successful compaction", async () => {
+  it.each([
+    { message: "Nothing to compact (session too small)", noop: true },
+    { message: "Summarizer unavailable", noop: false },
+  ])("maps native compaction outcomes without poisoning the next message: $message", async ({ message, noop }) => {
     const f = await fixture();
     try {
-      f.transport.compactError = new PiRpcCommandError("compact", { error: "Nothing to compact (session too small)" });
-      await expect(f.session.compact()).rejects.toThrow("Nothing to compact");
-      expect(f.events.some(event => event.eventType === "context.compacted")).toBe(false);
+      f.transport.compactError = new PiRpcCommandError("compact", { error: message });
+      f.transport.onCompact = async () => {
+        f.transport.send({ type: "compaction_end", reason: "manual", aborted: false, errorMessage: `Compaction failed: ${message}` });
+        await new Promise<void>(resolve => setImmediate(resolve)); // Drain native progress before rejecting the command.
+      };
+      if (noop) await expect(f.session.compact()).resolves.toEqual({ noop: true });
+      else await expect(f.session.compact()).rejects.toThrow(message);
+      await vi.waitFor(() => expect(f.events).toContainEqual(expect.objectContaining({ eventType: "provider.notice.recorded", payload: expect.objectContaining({ severity: noop ? "info" : "warning", summary: noop ? "Nothing to compact yet" : "Context compaction failed" }) })));
+      expect(f.events.some(event => event.eventType === "context.compacted" || event.eventType === "turn.failed" || event.eventType === "session.failed")).toBe(false);
+      if (noop) expect(f.events.some(event => event.payload.severity === "warning")).toBe(false);
       expect(f.transport.calls.filter(call => call.type === "compact")).toHaveLength(1);
+      await expect(f.session.startTurn({ message: { role: "user", text: "continue" } })).resolves.toHaveProperty("turnId");
       expect(f.transport.closed).toBe(false);
     } finally { await f.close(); }
   });

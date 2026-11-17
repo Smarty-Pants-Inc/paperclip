@@ -408,7 +408,7 @@ describe("Pi RPC app-server facade proxy", () => {
     } finally { await proxy.close(); }
   });
 
-  it("dispatches compact on the open session and settles the control envelope, not a prompt", async () => {
+  it.each([false, true])("dispatches compact and settles the control envelope, not a prompt (noop=%s)", async noop => {
     const sink = new FakeSink();
     let finish!: (value: Record<string, unknown>) => void;
     const calls: unknown[] = [];
@@ -425,17 +425,20 @@ describe("Pi RPC app-server facade proxy", () => {
       expect(session.turnInputs).toEqual([]);
       const turnId = (accepted.result as any).turn.id;
       expect(sink.decoded().filter(frame => frame.method === "turn/started")).toHaveLength(1);
-      finish({ tokensBefore: 100, estimatedTokensAfter: 25, firstKeptEntryId: "entry", summary: "private summary" });
+      finish(noop ? { noop: true } : { tokensBefore: 100, estimatedTokensAfter: 25, firstKeptEntryId: "entry", summary: "private summary" });
       // The event iterator is independent of the native command promise. A
-      // delayed success event must be durable before the control terminal.
-      setImmediate(() => session.push("context.compacted", { schema: "paperclip.context.compacted.v1", compactionId: "native-compact", reason: "manual", preTokens: 100, postTokens: 25, sameSession: true }));
+      // delayed success or no-op notice must precede the control terminal.
+      setImmediate(() => noop
+        ? session.push("provider.notice.recorded", { category: "context_compaction", severity: "info", summary: "Nothing to compact yet", details: [{ name: "Phase", value: "completed" }, { name: "Outcome", value: "noop" }] })
+        : session.push("context.compacted", { schema: "paperclip.context.compacted.v1", compactionId: "native-compact", reason: "manual", preTokens: 100, postTokens: 25, sameSession: true }));
       await waitFor(() => sink.decoded().some(frame => frame.method === "turn/completed"));
       const notifications = sink.decoded().filter(frame => frame.method);
-      const compactIndex = notifications.findIndex(frame => frame.method === "thread/compacted");
+      const compactIndex = notifications.findIndex(frame => frame.method === (noop ? "warning" : "thread/compacted"));
       expect(compactIndex).toBeGreaterThanOrEqual(0);
       expect(compactIndex).toBeLessThan(notifications.findIndex(frame => frame.method === "turn/completed"));
-      expect(notifications[compactIndex]).toMatchObject({ params: { threadId: session.id, turnId, preTokens: 100, postTokens: 25 } });
-      expect(sink.decoded().find(frame => frame.method === "turn/completed")).toMatchObject({ params: { turn: { id: turnId, status: "completed" } } });
+      expect(notifications[compactIndex]).toMatchObject({ params: { threadId: session.id, turnId, ...(noop ? { severity: "info", message: "Nothing to compact yet" } : { preTokens: 100, postTokens: 25 }) } });
+      expect(sink.decoded().find(frame => frame.method === "turn/completed")).toMatchObject({ params: { turn: { id: turnId, status: "completed" }, ...(noop ? { compaction: { noop: true } } : {}) } });
+      if (noop) expect(notifications.some(frame => frame.method === "thread/compacted" || frame.method === "turn/failed")).toBe(false);
       expect(JSON.stringify(sink.decoded())).not.toContain("private summary");
       expect(sink.decoded().some(frame => frame.method === "item/agentMessage/delta")).toBe(false);
       expect((await request(proxy, sink, 92, "thread/read")).result).toMatchObject({ thread: { id: session.id, turns: [] } });
