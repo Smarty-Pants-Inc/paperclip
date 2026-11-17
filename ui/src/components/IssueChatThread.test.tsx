@@ -466,10 +466,13 @@ describe("IssueChatThread", () => {
       comments={[]} onAdd={async () => {}} enableLiveTranscriptPolling={false} recoveryAction={{
       id: "stop-card", companyId: "company-1", sourceIssueId: "issue-1", kind: "active_run_watchdog",
       cause: "execution_stop_pending", status: "escalated", ownerType: "board", ownerAgentId: null,
+      recoveryIssueId: null, ownerUserId: null, previousOwnerAgentId: null, returnOwnerAgentId: null,
+      fingerprint: "stop-card", monitorPolicy: null, timeoutAt: null, lastAttemptAt: null,
+      resolutionNote: null, resolvedAt: null,
       attemptCount: 1, maxAttempts: 1, outcome: "escalated", wakePolicy: null,
       evidence: { stopPending: { personStop } }, nextAction: "Your Stop is not confirmed yet.",
       createdAt: "2026-11-17T22:00:00Z", updatedAt: "2026-11-17T22:00:00Z",
-    } as NonNullable<ComponentProps<typeof IssueChatThread>["recoveryAction"]>} /></MemoryRouter></QueryClientProvider>));
+    }} /></MemoryRouter></QueryClientProvider>));
     const card = container.querySelector('[data-recovery-kind="active_run_watchdog"]');
     expect(card).not.toBeNull();
     expect(card!.textContent).toContain(personStop ? "STOP PENDING" : "RECOVERY ESCALATED");
