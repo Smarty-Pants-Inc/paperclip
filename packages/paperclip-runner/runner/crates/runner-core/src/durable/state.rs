@@ -4636,7 +4636,10 @@ mod tests {
             }
         }
 
-        // A frame too small for the complete answer keeps the marked preview.
+        // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): this
+        // half formerly asserted that a frame too small for the complete answer
+        // keeps the 4,096-byte preview ending "…[truncated]". Now the person is
+        // told plainly, and the whole answer is kept in a referenced file.
         let mut small_frame = config.clone();
         small_frame.max_frame_bytes = 8_000;
         let mut small = DurableState::new(&small_frame);
@@ -4648,12 +4651,27 @@ mod tests {
                 json!({"kind": "agentMessage", "channel": "final", "text": answer}),
             )
             .unwrap();
-        assert!(small.outbox[0]
+        let shown = small.outbox[0]
             .envelope
             .pointer("/payload/payload/text")
             .and_then(Value::as_str)
             .unwrap()
-            .ends_with("…[truncated]"));
+            .to_owned();
+        assert_oversized_answer_notice(&shown, &answer.replace("secret-value", "[REDACTED]"));
+    }
+
+    /// The person sees a plain statement (not a cut copy presented as the
+    /// answer), and the referenced file holds the whole redacted answer.
+    fn assert_oversized_answer_notice(shown: &str, whole: &str) {
+        assert!(!shown.contains("…[truncated]"), "{shown}");
+        assert!(shown.starts_with("This answer is too large"), "{shown}");
+        assert!(shown.contains("excerpt, not the whole answer"), "{shown}");
+        let path = shown
+            .split("The whole answer is saved at ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .expect("spill path in the notice");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), whole);
     }
 
     // C4 (pack-n5): at the production frame (paperclip-runnerd default 1 MiB)
@@ -4716,9 +4734,12 @@ mod tests {
                 .to_owned()
         };
 
-        // 20,000 raw bytes, but about 40,000 once JSON-escaped: keep the preview.
+        // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was
+        // assert!(final_text(&quotes).ends_with("…[truncated]")). 20,000 raw
+        // bytes, about 40,000 once JSON-escaped, do not fit: say so plainly and
+        // keep the whole answer in a referenced file; the frame bound still holds.
         let quotes = "\"".repeat(20_000);
-        assert!(final_text(&quotes).ends_with("…[truncated]"));
+        assert_oversized_answer_notice(&final_text(&quotes), &quotes);
 
         // The same length of plain prose fits and is kept complete.
         let prose = "a".repeat(20_000);
