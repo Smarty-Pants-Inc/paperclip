@@ -8446,7 +8446,7 @@ describe("executeNativeSession recovery", () => {
       cursor: "1",
       activeTurnId: null,
       terminalTurns: [
-        { turnId: "turn-work", fingerprint: "terminal-fingerprint" },
+        { turnId: "turn-work", fingerprint: canonicalTestJson({ status: "completed", semanticResult: null }) },
       ],
       dispositionOnlyRecoveryConsumed: true,
       dispositionOnlyRecoveryTurnId: "turn-missing-disposition",
@@ -8649,6 +8649,7 @@ describe("executeNativeSession recovery", () => {
       {
         ...runnerEvent(4, "item.completed", {
           kind: "agentMessage",
+          channel: "final",
           text: "Work may already have been performed.",
         }),
         turnId: "turn-work",
@@ -8714,6 +8715,100 @@ describe("executeNativeSession recovery", () => {
       providerSessionId: "provider-recovery",
     });
     expect(startTurn).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { name: "cancelled ACP turn plus new message", fingerprint: { status: "interrupted" }, queuedInput: "PERSON_AFTER_STOP", recordedAnswer: false, dispositionOnly: false },
+    { name: "cancelled turn plus new message", fingerprint: { terminalState: "cancelled", error: null, result: null }, queuedInput: "PERSON_AFTER_STOP", recordedAnswer: false, dispositionOnly: false },
+    { name: "interrupted turn plus new message", fingerprint: { terminalState: "interrupted", error: null, result: null }, queuedInput: "PERSON_AFTER_STOP", recordedAnswer: false, dispositionOnly: false },
+    { name: "failed turn plus new message", fingerprint: { status: "failed" }, queuedInput: "PERSON_AFTER_STOP", recordedAnswer: false, dispositionOnly: false },
+    { name: "completed ACP turn with answer and no new input", fingerprint: { status: "completed", semanticResult: null }, queuedInput: null, recordedAnswer: true, dispositionOnly: true },
+    { name: "completed Codex turn with answer and no new input", fingerprint: { terminalState: "completed", error: null, result: null }, queuedInput: null, recordedAnswer: true, dispositionOnly: true },
+    { name: "completed turn with answer plus new message", fingerprint: { status: "completed", semanticResult: null }, queuedInput: "PERSON_NEW_QUESTION", recordedAnswer: true, dispositionOnly: false },
+    { name: "completed turn without a recorded answer", fingerprint: { status: "completed", semanticResult: null }, queuedInput: null, recordedAnswer: false, dispositionOnly: false },
+  ])("cold-restored recovery routes $name", async ({ fingerprint, queuedInput, recordedAnswer, dispositionOnly }) => {
+    const executionInput: NativeExecutionInputV5 = {
+      ...preparedInput(),
+      continuationPrompt: "CURRENT_WAKE_CONTEXT",
+    };
+    const checkpoint: PersistedNativeSession = {
+      backendKind: "mock",
+      driverKind: "acpx_runtime",
+      sessionId: "driver-recovery",
+      identity,
+      providerSessionId: "provider-recovery",
+      cursor: "2",
+      activeTurnId: null,
+      terminalTurns: [
+        { turnId: "turn-older-completed", fingerprint: canonicalTestJson({ status: "completed", semanticResult: null }) },
+        { turnId: "turn-latest", fingerprint: canonicalTestJson(fingerprint) },
+      ],
+      dispositionOnlyRecoveryConsumed: false,
+      pendingRuntimeRequests: [],
+      lineage: [],
+    };
+    const recorded = [
+      { ...runnerEvent(1, "item.completed", { kind: "agentMessage", channel: "final", text: "PRIOR_RECORDED_ANSWER" }), turnId: recordedAnswer ? "turn-latest" : "turn-older-completed" },
+      { ...runnerEvent(2, "turn.completed", { status: "completed", error: null }), turnId: recordedAnswer ? "turn-latest" : "turn-older-completed" },
+    ];
+    const startTurn = vi.fn<NativeSession["startTurn"]>(async () => ({ turnId: "turn-new" }));
+    const session: NativeSession = {
+      identity: () => identity,
+      async capabilities() { return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
+      async *events() { yield { ...runnerEvent(3, "turn.completed"), turnId: "turn-new" }; },
+      startTurn,
+      async result() { return { result, terminal, turnId: "turn-new" }; },
+      async snapshot() { return structuredClone(checkpoint); },
+      async close() {},
+    };
+    const backend: NativeSessionBackend = {
+      async descriptor() { return { kind: "mock", name: "cold-recovery", version: "1", runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" }, capabilities: await session.capabilities() }; },
+      async openSession() { throw new Error("must recover the cold provider session"); },
+      async recoverSession() { return { recovered: true, session }; },
+    };
+    const events: PrpEvent[] = [];
+    const port: ControlPlanePort = {
+      async openRun() {},
+      async loadSessionCheckpoint() { return structuredClone(checkpoint); },
+      async checkpointSession() {},
+      async appendEvent(event) {
+        events.push(structuredClone(event));
+        return { cursor: events.length, highestContiguousSourceSeq: highestContiguous(events), disposition: "committed" };
+      },
+      async replayEvents(request) {
+        const sourceEvents = request.sourceInstanceId === "runner-recovery" ? recorded : events.filter(event => event.sourceInstanceId === request.sourceInstanceId);
+        return { events: sourceEvents.filter(event => event.sourceSeq > request.afterSourceSeq), highestContiguousSourceSeq: highestContiguous(sourceEvents) };
+      },
+      async completeRun() {},
+    };
+    const getFirstTurnQueuedInput = vi.fn(async () => queuedInput);
+    await expect(executeNativeSession({
+      input: executionInput,
+      backend,
+      controlPlane: port,
+      runnerInstanceId: "runner-recovery",
+      controlPlaneInstanceId: "control-recovery",
+      getFirstTurnQueuedInput,
+      prepareWakeAttachmentPrompt: async () => ({ prompt: "NEW_ATTACHMENT", localImagePaths: ["/workspace/person-image.png"] }),
+    })).resolves.toMatchObject({ turnId: "turn-new" });
+    expect(startTurn).toHaveBeenCalledOnce();
+    const submitted = startTurn.mock.calls[0]![0];
+    const envelope = JSON.parse(submitted.message.text);
+    if (dispositionOnly) {
+      expect(envelope).toHaveProperty("task.prompt");
+      expect(envelope.task.prompt).toContain("semantic-result recovery for a prior completed provider turn");
+      expect(envelope.task.prompt).toContain("Do not repeat implementation, tests, research, or the final answer");
+      expect(envelope.task.prompt).not.toContain("NEW_ATTACHMENT");
+    } else {
+      expect(submitted.message.text).not.toContain("semantic-result recovery");
+      expect(envelope).toMatchObject({ schema: "paperclip.native-continuation.v1" });
+      expect(envelope.events).toContain("CURRENT_WAKE_CONTEXT");
+      expect(envelope.events).toContain("NEW_ATTACHMENT");
+      expect(submitted.message.localImagePaths).toEqual(["/workspace/person-image.png"]);
+      expect(submitted.continuation).toBe(true);
+      expect(envelope).not.toHaveProperty("task");
+      if (queuedInput) expect(envelope.events).toContain(queuedInput);
+    }
   });
 
   it.each(
