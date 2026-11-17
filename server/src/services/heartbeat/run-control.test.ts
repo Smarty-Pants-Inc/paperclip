@@ -925,7 +925,10 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
       await writeFile(join(host, "task.txt"), "before the turn\n");
       await db.insert(heartbeatRuns).values({ id: runId, companyId: company.id, agentId: agent.id,
         issueId: issue.id, nativeIssueId: issue.id, runtimeMode: "native", status: "cancelled", finishedAt: new Date(),
-        errorCode: "cancelled", runnerProfileJson: { nativeResourceDisposition: "keep_running" },
+        errorCode: "cancelled", runnerProfileJson: { nativeResourceDisposition: "keep_running",
+          // pl/r4-work3 (a): NSE's settle recorded the closed session's clean close.
+          nativeStoppedSessionClose: { schema: "paperclip.native-stopped-session-close.v1", companyId: company.id,
+            issueId: issue.id, runId, sessionId: null, clean: true, at: new Date().toISOString() } },
         resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator", nativeCancellation: {
           schema: "paperclip.native-cancellation.v1", runId, companyId: company.id, issueId: issue.id,
           scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
