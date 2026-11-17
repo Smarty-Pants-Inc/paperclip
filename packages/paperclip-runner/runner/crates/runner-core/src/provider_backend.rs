@@ -10726,8 +10726,35 @@ done
         }
     }
 
+    // C4 (pack-n5): the person's final answer is never cut. A 40,000-character
+    // Pi final answer (as streamed: quotes, newlines, multi-byte text) must
+    // arrive whole, byte-equal to the text in the raw Pi JSONL record.
     #[test]
-    fn b7_pi_final_channel_is_bounded_at_12000_characters() {
+    fn c4_pi_final_answer_of_40000_characters_arrives_whole() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let unit = "Line \"quoted\" 🦀 naïve\n";
+        let mut answer = unit.repeat(40_000 / unit.chars().count() + 1);
+        answer = answer.chars().take(40_000).collect();
+        assert_eq!(answer.chars().count(), 40_000);
+        let raw_jsonl = serde_json::to_string(&json!({"threadId": "thread-1", "turnId": "turn-1",
+            "channel": "final", "item": {"id": "pi-message", "type": "agentMessage", "text": answer}}))
+        .unwrap();
+        let raw: Value = serde_json::from_str(&raw_jsonl).unwrap();
+        let raw_text = raw["item"]["text"].as_str().unwrap().to_owned();
+        let events = normalize_provider_notification(&mut state, "item/completed", &raw).unwrap();
+        assert_eq!(events[0].event_type, "item.completed");
+        assert_eq!(events[0].payload["channel"], "final");
+        let text = events[0].payload["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), 40_000);
+        assert_eq!(text.as_bytes(), raw_text.as_bytes());
+        assert!(!text.contains("[truncated]"));
+    }
+
+    #[test]
+    // JUDGE SUPERSEDE (pack-n5 C4): formerly pinned the silent 12,000-character
+    // cut of the person's final answer. Superseded: the final channel is whole.
+    fn b7_pi_final_channel_is_not_cut_at_12000_characters() {
         let mut state = opencode_result_state();
         state.config.provider = "pi_rpc".to_owned();
         for length in [12_000, 12_001, 33_000] {
@@ -10741,8 +10768,8 @@ done
             .unwrap();
             assert_eq!(events[0].payload["channel"], "final");
             let text = events[0].payload["text"].as_str().unwrap();
-            assert_eq!(text.chars().count(), 12_000, "input length {length}");
-            assert_eq!(text, "🦀".repeat(12_000));
+            assert_eq!(text.chars().count(), length, "input length {length}");
+            assert_eq!(text, "🦀".repeat(length));
         }
     }
 
