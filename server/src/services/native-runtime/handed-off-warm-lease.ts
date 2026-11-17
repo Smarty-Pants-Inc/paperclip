@@ -104,8 +104,11 @@ export function handedOffWarmProofInFlight(runId: string): boolean { return proo
 /** rf-4 row 22a/22f: run the s3 fence's runner-exit proof for every handed-off
  * warm lease of this run that has no persisted answer yet, OUTSIDE any
  * transaction (callers pass the root Db), bounded by handedOffWarmProofTimeout.
- * Proven -> the evidence key is written on the lease. Timed out -> sas3's
- * stop_and_retain intent (its provider receipt then admits the successor). */
+ * Proven -> the evidence key is written on the lease. Timed out, or the proof
+ * itself failed (rf-4 row 22f: e.g. the Runner answered 502) -> sas3's
+ * stop_and_retain intent (its provider receipt then admits the successor),
+ * never for a busy owner (handedOffWarmOwnerBusy). The intent records which:
+ * proofFailure "timed_out" or "proof_error". */
 export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<"none" | "proven" | "unproven" | "timed_out"> {
   const running = proofsInFlight.get(run.id);
   if (running) return running;
@@ -113,12 +116,14 @@ export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<"none" | "pr
     const leases = (await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
       eq(environmentLeases.heartbeatRunId, run.id)))).filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));
     if (!leases.length) return "none" as const;
-    const { handedOffWarmOwnerRunnerExited } = await import("./native-session-executor.js");
+    const { handedOffWarmOwnerRunnerExited, handedOffWarmOwnerBusy } = await import("./native-session-executor.js");
     let outcome: "proven" | "unproven" | "timed_out" = "proven";
     for (const lease of leases) {
       let timer: NodeJS.Timeout | undefined;
       const answer = await Promise.race([
-        handedOffWarmOwnerRunnerExited({ runId: run.id, providerLeaseId: lease.providerLeaseId }).catch(() => false),
+        // rf-4 row 22f: a proof ERROR is not "not exited"; it takes the timeout's fallback below.
+        handedOffWarmOwnerRunnerExited({ runId: run.id, providerLeaseId: lease.providerLeaseId })
+          .catch((error: unknown) => ({ proofError: error })),
         new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), handedOffWarmProofTimeout.ms); }),
       ]).finally(() => clearTimeout(timer));
       if (answer === true) {
@@ -127,19 +132,30 @@ export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<"none" | "pr
           .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, run.companyId)));
         continue;
       }
-      if (answer === "timeout") {
+      if (answer === "timeout" || typeof answer === "object") {
+        const proofFailure = answer === "timeout" ? "timed_out" as const : "proof_error" as const;
+        // Never stop a busy owner: the warm entry's own idle check (busy or preparing).
+        if (handedOffWarmOwnerBusy({ runId: run.id, providerLeaseId: lease.providerLeaseId })) {
+          logger.warn({ runId: run.id, leaseId: lease.id, providerLeaseId: lease.providerLeaseId, proofFailure },
+            "handed-off warm proof failed but the owner is busy; no stop-and-retain intent written (the messages stay held)");
+          outcome = "unproven";
+          break;
+        }
+        if (proofFailure === "proof_error") logger.warn({ runId: run.id, leaseId: lease.id, providerLeaseId: lease.providerLeaseId,
+          proofError: String((answer as { proofError: unknown }).proofError) }, "handed-off warm proof failed; taking the bounded stop-and-retain fallback");
         const [candidate] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.id, lease.id),
           eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
           warmSandboxExpiryCandidateCondition())).limit(1);
         const requested = candidate && handedOffWarmLease(run, candidate)
-          ? await prepareSupersededWarmSandboxStop(db, candidate, { [HANDED_OFF_WARM_STOP_KEY]: true, proofTimedOutMs: handedOffWarmProofTimeout.ms })
+          ? await prepareSupersededWarmSandboxStop(db, candidate, { [HANDED_OFF_WARM_STOP_KEY]: true, proofFailure,
+            ...(proofFailure === "timed_out" ? { proofTimedOutMs: handedOffWarmProofTimeout.ms } : {}) })
           : null;
         // rf-4 row 21 (the kind): a refusal is never silent. No intent here means
         // the box is not a stop candidate (warmSandboxExpiryCandidateCondition:
         // e.g. another live lease holds the same provider box, or a stop is in flight).
         if (!requested) logger.warn({ runId: run.id, leaseId: lease.id, providerLeaseId: lease.providerLeaseId,
-          candidate: Boolean(candidate), timeoutMs: handedOffWarmProofTimeout.ms },
-          "handed-off warm proof timed out; no stop-and-retain intent written (the box is not a stop candidate)");
+          candidate: Boolean(candidate), proofFailure, timeoutMs: handedOffWarmProofTimeout.ms },
+          "handed-off warm proof failed; no stop-and-retain intent written (the box is not a stop candidate)");
         return "timed_out" as const;
       }
       outcome = "unproven";
