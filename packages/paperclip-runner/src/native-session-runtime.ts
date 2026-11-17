@@ -2295,6 +2295,59 @@ function isZeroWorkAcpxUsage(payload: Record<string, unknown>): boolean {
   });
 }
 
+function completedProviderTurnId(snapshot: PersistedNativeSession): string | null {
+  const terminal = snapshot.terminalTurns?.at(-1);
+  if (!terminal) return null;
+  try {
+    const value = objectRecord(JSON.parse(terminal.fingerprint));
+    if (!value || (value.error !== undefined && value.error !== null)) return null;
+    const states = [value.status, value.terminalState].filter(state => state !== undefined);
+    return states.length > 0 && states.every(state => state === "completed") ? terminal.turnId : null;
+  } catch {
+    return null;
+  }
+}
+
+async function replayProvesRecordedFinalAnswer(input: {
+  controlPlane: ControlPlanePort;
+  runId: string;
+  sourceInstanceId: string;
+  sessionId: string;
+  turnId: string;
+}): Promise<boolean> {
+  let afterSourceSeq = 0;
+  let finalAnswerSeq = 0;
+  let completedSeq = 0;
+  let eventCount = 0;
+  try {
+    while (true) {
+      const replay = await input.controlPlane.replayEvents({
+        runId: input.runId,
+        sourceInstanceId: input.sourceInstanceId,
+        afterSourceSeq,
+        limit: 1_000,
+      });
+      if (replay.events.length === 0) return finalAnswerSeq > 0 && completedSeq > finalAnswerSeq;
+      for (const event of replay.events) {
+        if (event.sourceSeq <= afterSourceSeq || ++eventCount > 10_000) return false;
+        afterSourceSeq = event.sourceSeq;
+        if (event.runId !== input.runId || event.sourceInstanceId !== input.sourceInstanceId ||
+            event.normalizedSessionId !== input.sessionId || event.turnId !== input.turnId) continue;
+        if (isTurnTerminal(event)) {
+          if (event.eventType !== "turn.completed" || event.payload.error != null) return false;
+          completedSeq = event.sourceSeq;
+        }
+        if (event.eventType === "item.completed" && event.payload.kind === "agentMessage" &&
+            event.payload.channel === "final" && typeof event.payload.text === "string" && event.payload.text.trim()) {
+          finalAnswerSeq = event.sourceSeq;
+        }
+      }
+    }
+  } catch {
+    return false;
+  }
+}
+
 async function replayProvesEffectFreeInitialAcpxTurn(input: {
   controlPlane: ControlPlanePort;
   checkpoint: PersistedNativeSession;
@@ -3321,14 +3374,17 @@ export async function executeNativeSession(
             const handoff = await options.getFreshSessionHandoff();
             if (handoff) modelEnvelope.task.prompt = `${handoff}\n\n${modelEnvelope.task.prompt}`;
           }
-          const dispositionOnlyRecovery = Boolean(
+          const queuedInput = await options.getFirstTurnQueuedInput?.();
+          const completedTurnId = completedProviderTurnId(recoveredSnapshot);
+          const dispositionOnlyRecoveryCandidate = Boolean(
             recovered &&
             !recoveredSnapshot.semanticResult &&
-            (persistedSession?.terminalTurns?.length ?? 0) > 0 &&
-            !recoveredActiveTurnId,
+            completedTurnId &&
+            !recoveredActiveTurnId &&
+            !queuedInput,
           );
           const effectFreeInitialAcpxTurn =
-            dispositionOnlyRecovery && persistedSession
+            dispositionOnlyRecoveryCandidate && persistedSession
               ? await replayProvesEffectFreeInitialAcpxTurn({
                   controlPlane: options.controlPlane,
                   checkpoint: persistedSession,
@@ -3336,6 +3392,14 @@ export async function executeNativeSession(
                   sourceInstanceId: options.runnerInstanceId,
                 })
               : false;
+          const dispositionOnlyRecovery = dispositionOnlyRecoveryCandidate &&
+            !effectFreeInitialAcpxTurn && await replayProvesRecordedFinalAnswer({
+              controlPlane: options.controlPlane,
+              runId: input.binding.runId,
+              sourceInstanceId: options.runnerInstanceId,
+              sessionId: recoveredSnapshot.identity.sessionId,
+              turnId: completedTurnId!,
+            });
           if (dispositionOnlyRecovery && !effectFreeInitialAcpxTurn) {
             modelEnvelope = buildNativeModelEnvelope(input);
             // Source references cannot resolve after replacing the task prompt.
@@ -3358,7 +3422,6 @@ export async function executeNativeSession(
           if (!dispositionOnlyRecovery || effectFreeInitialAcpxTurn) {
             const attachments = attachmentInput(await options.prepareWakeAttachmentPrompt?.());
             localImagePaths = attachments.localImagePaths;
-            const queuedInput = await options.getFirstTurnQueuedInput?.();
             const supplemental = [attachments.prompt, queuedInput].filter(Boolean).join("\n\n");
 
             if (supplemental && "task" in modelEnvelope) {
