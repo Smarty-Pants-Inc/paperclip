@@ -38,7 +38,15 @@ const rows: Array<{ row: string; facts: RetryAuthorityFacts; canRetry: boolean; 
   { row: "restore hold, files owed", facts: { restoreHold: { [WORKSPACE_RESTORE_PENDING_KEY]: true }, retrySource: true }, canRetry: true, userAction: "wait", text: RECOVERING_SAVED_WORK_NEXT_ACTION, admission: "held" },
   { row: "restore hold, Paperclip's workspace recovery owns the files", facts: { restoreHold: { workspaceRestoreFailure: "restore_failed",
     workspaceRestoreRecovery: { schema: LEGACY_WORKSPACE_RECOVERY_SCHEMA } }, retrySource: true }, canRetry: true, userAction: "wait",
-    text: workspaceRestoreHoldNextAction({ workspaceRestoreFailure: "restore_failed" }), admission: "held" },
+    // fam-retry3 ITEM B: an accepted, held Retry never says "could not be put back... Create a new task":
+    // Paperclip's recovery owns the files, so the hold says the RECOVERING words.
+    text: RECOVERING_SAVED_WORK_NEXT_ACTION, admission: "held" },
+  // fam-retry3 ITEM A (RFL 20:33Z): the source run's person message is answered above: a no-op with the line.
+  { row: "person message already answered", facts: { personMessageAnswered: true, retrySource: true }, canRetry: false, userAction: "message",
+    text: "Already answered above." },
+  { row: "person message already answered, under a restore hold", facts: { personMessageAnswered: true,
+    restoreHold: { [WORKSPACE_RESTORE_PENDING_KEY]: true }, retrySource: true }, canRetry: false, userAction: "message",
+    text: "Already answered above." },
   { row: "restore hold, restore failed", facts: { restoreHold: { workspaceRestoreFailure: "restore_failed" }, retrySource: true }, canRetry: false, userAction: "new_task",
     text: withoutUnavailableRetry(workspaceRestoreHoldNextAction({ workspaceRestoreFailure: "restore_failed" }), false) },
 ];
