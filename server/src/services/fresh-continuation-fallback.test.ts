@@ -37,7 +37,7 @@ import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
-import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT, UNANSWERED_MESSAGE_REASON_PREFIX, UNANSWERED_MESSAGE_TEXT } from "./recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessages, unansweredPersonMessageCommentCondition, settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT, UNANSWERED_MESSAGE_REASON_PREFIX, UNANSWERED_MESSAGE_TEXT } from "./recovery/unanswered-person-message.js";
 import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";
 import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
@@ -519,6 +519,64 @@ suite("fresh-continuation fallback", () => {
     // Never cleared silently: the obligation's keyed row is retained, not deleted.
     expect(notes.find(note => note.id === unanswered!.id)).toMatchObject({ deletedAt: null,
       metadata: { authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${message!.id}`, supersededByCommentId: expect.any(String) } });
+  });
+
+  it("SRB independent: after the fresh successor fails unanswered, one actionable failure instruction remains", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, f.runId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Repeat the 3 facts.", createdAt: new Date(Date.now() - 120_000) }).returning();
+    const [unanswered] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "system",
+      body: UNANSWERED_MESSAGE_TEXT, metadata: { version: 1, authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${message!.id}`,
+        sections: [{ rows: [{ type: "key_value", label: "Failure code", value: "adapter_failed" }] }] } }).returning();
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" })).toMatchObject({ kind: "continued" });
+    const next = await selectFreshSuccessor(f);
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", error: "Provider failed", finishedAt: new Date(),
+      contextSnapshot: { ...next.contextSnapshot, issueId: f.issueId, wakeCommentId: message!.id } }).where(eq(heartbeatRuns.id, next.id));
+    await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + 24 * 3600_000) });
+    const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).filter(n => n.authorType === "system");
+    const current = currentNotices(notes, [unanswered]);
+    console.log("SRB current notices after failed successor", current.map(n => ({ body: n.body, metadata: n.metadata })));
+    expect(current).toHaveLength(1);
+    expect(current[0]!.body).toMatch(/wasn't answered|send.*again|resend|retry/i);
+  });
+
+  it.each(["failed", "answered"] as const)("the sweep rechecks a superseded obligation after its successor %s, without duplicate instructions", async outcome => {
+    const f = await unfinishedThread({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Repeat the 3 facts.", createdAt: new Date(Date.now() - 120_000) }).returning();
+    const [unanswered] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "system",
+      body: UNANSWERED_MESSAGE_TEXT, metadata: { version: 1, authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`,
+        sections: [{ rows: [{ type: "key_value", label: "Failure code", value: "adapter_failed" }] }] } }).returning();
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" })).toMatchObject({ kind: "continued" });
+    const next = await selectFreshSuccessor(f);
+    const readNotes = async () => (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+      .filter(note => note.authorType === "system");
+    await settleUnansweredPersonMessages(db, { companyId, issueId: f.issueId });
+    expect(currentNotices(await readNotes(), [unanswered]).map(note => note.body)).toEqual([FRESH_THREAD_STARTED_NOTE]);
+    await db.update(heartbeatRuns).set({ status: outcome === "answered" ? "succeeded" : "failed", errorCode: outcome === "answered" ? null : "adapter_failed",
+      error: outcome === "answered" ? null : "Provider failed", finishedAt: new Date(),
+      contextSnapshot: { ...next.contextSnapshot, issueId: f.issueId, wakeCommentId: message.id } }).where(eq(heartbeatRuns.id, next.id));
+    if (outcome === "answered") await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: agentId, createdByRunId: next.id, body: "Here are the three facts." });
+    expect(await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      unansweredPersonMessageCommentCondition()))).not.toHaveLength(0);
+    const now = new Date(Date.now() + 24 * 3600_000);
+    await settleUnansweredPersonMessages(db, { companyId, issueId: f.issueId, now });
+    await Promise.all([1, 2].map(() => settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now })));
+    const notes = await readNotes();
+    const current = currentNotices(notes.filter(note => !note.deletedAt), outcome === "failed" ? [unanswered] : []);
+    expect(current).toHaveLength(1);
+    expect(current[0].body).toBe(outcome === "answered" ? FRESH_THREAD_STARTED_NOTE : UNANSWERED_MESSAGE_TEXT);
+    if (outcome === "answered") {
+      expect(notes.find(note => note.id === unanswered.id)?.deletedAt).toBeInstanceOf(Date);
+      expect(notes.filter(note => !note.deletedAt).some(note => note.body === UNANSWERED_MESSAGE_TEXT)).toBe(false);
+    } else {
+      expect(notes).toHaveLength(3);
+      expect(current[0].metadata?.sections).toEqual(expect.arrayContaining([
+        expect.objectContaining({ rows: expect.arrayContaining([expect.objectContaining({ label: "Failure code", value: "adapter_failed" })]) }),
+      ]));
+    }
   });
 
   it.each([
