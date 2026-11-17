@@ -1041,6 +1041,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     }
     const deliveryPayload = response ? { ...payload } : withQueuedCommentIdsInWakePayload(payload, commentIds);
     delete deliveryPayload.queuedCommentInterrupt;
+    // S124: the park ends here; a later park anchors afresh.
+    delete deliveryPayload.firstParkedAt;
+    delete deliveryPayload.parkedNoticeAt;
     await enqueueWakeup(wake.agentId, {
       source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
       payload: deliveryPayload, contextSnapshot: response

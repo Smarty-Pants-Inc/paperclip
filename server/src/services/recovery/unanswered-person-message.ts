@@ -72,6 +72,8 @@ export const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
 /** The non-failure marker row of a waiting note (no "Failure code" row). */
 const WAITING_ROW_LABEL = "Waiting code";
 const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] }]);
+/** S124: the parked-wake note replaces a standing waiting note in place. */
+export const UNANSWERED_WAITING_ROW_JSON = WAITING_ROW_JSON;
 /** The agent that answers the conversation is paused (or held) and will not
  * run until it is resumed. Not a failure: a waiting-kind note. */
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";

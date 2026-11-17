@@ -6,8 +6,16 @@ import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { assignmentWakePayloadSql, type DeferredExecutionScope, type DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { dependencyResolvedWakePayloadSql } from "../issue-dependency-wakeups.js";
+import { anchorParkedWake, noticeParkedWakeDeadline, PARKED_WAKE_RETRY_MS, parkedWakeAnchor, parkedWakeDeadlineMs,
+  parkedWakeNoticedSql } from "./parked-wake-deadline.js";
 
 type Entry = { id: string; companyId: string; dueAt: number; immediate: boolean; operatorRetry?: boolean };
+/** S124: 30 s after the last attempt, never past the first park's deadline. */
+function parkedDue(updatedAt: Date, anchor: number | null) {
+  const cadence = updatedAt.getTime() + PARKED_WAKE_RETRY_MS;
+  return anchor === null ? cadence : Math.min(cadence, anchor + parkedWakeDeadlineMs());
+}
+const scope0 = (entry: Entry) => ({ companyId: entry.companyId, requestId: entry.id });
 type NativeIntentOptions = DeferredExecutionScope & {
   onDeferredDeadline(at: number): void;
   onError(error: unknown): void;
@@ -99,6 +107,10 @@ export function registerDeferredReceiptWork(
           operatorRetry: sql<boolean>`${operatorRetry}`,
           delayed: sql<boolean>`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null
             or ${agentWakeupRequests.payload}->'executionWait' is not null`,
+          // S124: the parked Send's first-park anchor and its press.
+          parked: sql<boolean>`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
+          pressedAt: sql<string | null>`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'requestedAt'`,
+          firstParkedAt: sql<string | null>`${agentWakeupRequests.payload}->>'firstParkedAt'`,
           interruptedLegacy: sql<boolean>`exists (select 1 from heartbeat_runs r
             where r.company_id = agent_wakeup_requests.company_id and r.agent_id = agent_wakeup_requests.agent_id
               and r.runtime_mode = 'legacy' and r.status = 'cancelled'
@@ -110,6 +122,9 @@ export function registerDeferredReceiptWork(
         };
         const eligible = and(
           scope ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
+          // S124: a parked Send whose one note is written waits for the
+          // person's Retry (a new press), never for another silent retry.
+          kind === "deferred" ? sql`not ${parkedWakeNoticedSql(agentWakeupRequests.payload)}` : undefined,
           scope?.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
           kind === "native" ? and(
             eq(agentWakeupRequests.requestedByActorType, "system"),
@@ -154,7 +169,8 @@ export function registerDeferredReceiptWork(
           const deadline = kind === "native" && row.status === "claimed" && row.claimedAt ? row.claimedAt.getTime() + 60_000
             : kind === "native" && row.error ? row.updatedAt.getTime() + 30_000
             : kind === "deferred" && row.delayed && !row.interruptedLegacy && !row.interruptedNative && !row.stoppedSource
-              ? row.updatedAt.getTime() + 30_000
+              ? parkedDue(row.updatedAt, row.parked ? parkedWakeAnchor({ queuedCommentInterrupt: { requestedAt: row.pressedAt },
+                firstParkedAt: row.firstParkedAt }) : null)
             : null;
           const immediate = deadline === null || deadline <= now;
           return { id: row.id, companyId: row.companyId, dueAt: immediate ? now : deadline, immediate,
@@ -175,12 +191,22 @@ export function registerDeferredReceiptWork(
           }).from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
             eq(agentWakeupRequests.id, entry.id)));
           if (!current) return null;
+          // S124: a parked Send keeps its FIRST park time (stored once); its
+          // 30 s cadence and its one deadline count from it, not updatedAt.
+          const parked = kind === "deferred" && current.status === "deferred_issue_execution" && !current.interruptedLegacy
+            && Boolean(current.payload?.queuedCommentInterrupt);
+          const anchor = parked ? parkedWakeAnchor(current.payload) ?? await anchorParkedWake(db, scope0(entry)) : null;
+          if (anchor !== null && anchor + parkedWakeDeadlineMs() <= Date.now()) {
+            // Past the deadline: ONE true note (+ Retry), no further silent retry.
+            await noticeParkedWakeDeadline(db, scope0(entry));
+            return null;
+          }
           const due = kind === "native" && current.status === "claimed" && current.claimedAt
             ? current.claimedAt.getTime() + 60_000
             : kind === "native" && current.status === "queued" && current.error ? current.updatedAt.getTime() + 30_000
               : kind === "deferred" && current.status === "deferred_issue_execution" && !current.interruptedLegacy
                 && (current.payload?.queuedCommentInterrupt || current.payload?.executionWait)
-                ? current.updatedAt.getTime() + 30_000 : null;
+                ? parkedDue(current.updatedAt, anchor) : null;
           const stoppedInterrupt = kind === "deferred" && due !== null && due > Date.now() &&
             Boolean(current.payload?.queuedCommentInterrupt) && owner.interruptTargetStopped &&
             await owner.interruptTargetStopped({ companyId: entry.companyId, requestId: entry.id });
@@ -204,6 +230,15 @@ export function registerDeferredReceiptWork(
           catch (error) { failed(error); }
         }
         if (errors.length) throw new AggregateError(errors, `Deferred receipt ${entry.id} could not settle`);
+        // S124: a parked Send that is still parked is checked again on its
+        // cadence, at the latest at its deadline (where its one note is due).
+        if (next === null && kind === "deferred") {
+          const [still] = await db.select({ payload: agentWakeupRequests.payload, updatedAt: agentWakeupRequests.updatedAt })
+            .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
+              eq(agentWakeupRequests.id, entry.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+          const stillAnchor = still?.payload?.queuedCommentInterrupt ? parkedWakeAnchor(still.payload) : null;
+          if (still && stillAnchor !== null) next = parkedDue(still.updatedAt, stillAnchor);
+        }
         return next === null ? null : { ...entry, dueAt: next, immediate: false };
       },
     }, canRun);
