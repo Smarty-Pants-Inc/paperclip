@@ -287,6 +287,7 @@ export {
 } from "./environment-driver-traits.js";
 import { ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT } from "./environment-driver-traits.js";
 import { warmSandboxWindowMetadata } from "./warm-sandbox-expiry.js";
+import { stoppedReusableSourceHold, stoppedReusableSourceSaved } from "./workspace-restore-hold-settlement.js";
 
 /**
  * The one general capability classifier. It resolves each of the eight effective
@@ -5225,16 +5226,20 @@ export function environmentRuntimeService(
 }
 
 async function releaseRestoreSourcesForEnvironmentDelete(db: Db, input: { environmentId: string; consentedBy: string }): Promise<number> {
-  const sources = await db.select({ provider: environmentLeases.provider, providerLeaseId: environmentLeases.providerLeaseId })
+  const sources = await db.select()
     .from(environmentLeases).where(and(
       eq(environmentLeases.environmentId, input.environmentId),
-      eq(environmentLeases.leasePolicy, "retain_on_failure"),
+      // A stopped warm v3 source holds its reusable policy under the marker.
+      or(eq(environmentLeases.leasePolicy, "retain_on_failure"),
+        and(stoppedReusableSourceHold(), eq(environmentLeases.status, "released"))),
       inArray(environmentLeases.status, ["released", "retained", "failed", "pending_cleanup"]),
       sql`${environmentLeases.metadata} ? 'workspaceRestoreRecovery'`,
       sql`${environmentLeases.providerLeaseId} is not null`,
     ));
   let released = 0;
   for (const source of sources) {
+    // Its consent covers only saved files: one still owed keeps its hold.
+    if (source.leasePolicy !== "retain_on_failure" && !await stoppedReusableSourceSaved(db, source)) continue;
     const rows = await db.update(environmentLeases).set({ updatedAt: new Date(),
       metadata: sql`(${environmentLeases.metadata} - 'workspaceRestoreRecovery') || ${JSON.stringify({
         restoreSourceReleasedByEnvironmentDelete: { consentedBy: input.consentedBy, releasedAt: new Date().toISOString() },
