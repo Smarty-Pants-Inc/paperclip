@@ -6,7 +6,8 @@ import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { readSystemRecovery, SystemRecoveryFailure } from "./system-recovery-state.js";
 import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
-import { readStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
+import { hasConfirmedSandboxStopAndRetain, readStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
+import { stoppedNativeSyncSource } from "./native-runtime/native-sync-stopped-source.js";
 import { isAbandonedPreparedRemoteWorkspace } from "./remote-workspace-abandoned-preparation.js";
 import { LEGACY_WORKSPACE_RECOVERY_SCHEMA, SETTLED_WORKSPACE_RESTORE_HOLD_KEY } from "./workspace-restore-recovery-state.js";
 import { ENVIRONMENT_LEASE_POLICIES, EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type EnvironmentLeasePolicy,
@@ -175,7 +176,18 @@ export async function inspectWorkspaceRecoverySource(db: Db, input: WorkspaceRec
     // that saved source back stays verifiable; it authorizes nothing new.
     const settledHold = lease.leasePolicy === "reuse_by_environment" && readSystemRecovery(action.evidence)?.state === "complete"
       && (lease.metadata?.[SETTLED_WORKSPACE_RESTORE_HOLD_KEY] as { runId?: unknown } | undefined)?.runId === run.id;
-    if (!["retain_on_failure", "ephemeral"].includes(lease.leasePolicy) && !reusableExport && !preparingRetention && !settledHold)
+    // A stopped warm v3 source preserved for this run (rf-4 R2): the lease
+    // restore marker names this run, its stop-and-retain receipt is confirmed,
+    // and the run's own owed v3 reference proves the exact lease binding.
+    // While the recovery holds its own stop-only claim on that lease, the v3
+    // descriptor (owed or just copied back) stays bound by the checks below.
+    const restoreMarker = lease.metadata?.workspaceRestoreRecovery as { schema?: unknown; runId?: unknown } | undefined;
+    const stoppedWarmV3 = ["reuse_by_environment", "reuse_by_execution_workspace"].includes(lease.leasePolicy)
+      && restoreMarker?.schema === LEGACY_WORKSPACE_RECOVERY_SCHEMA && restoreMarker.runId === run.id
+      && ((hasConfirmedSandboxStopAndRetain(lease) && stoppedNativeSyncSource(run.runnerProfileJson, lease))
+        || (legacyDescriptor?.schema === "paperclip.native-workspace-sync/v3" && lease.metadata?.pendingCleanupInFlight === true
+          && Boolean(readStopOnlyCleanup(lease))));
+    if (!["retain_on_failure", "ephemeral"].includes(lease.leasePolicy) && !reusableExport && !preparingRetention && !settledHold && !stoppedWarmV3)
       throw invalid("lease_policy_not_retained", lease.leasePolicy);
     if (typeof remoteCwd !== "string" || !remoteCwd.startsWith("/")) throw invalid("lease_cwd_invalid");
     if (descriptor && lease.providerLeaseId !== descriptor.providerLeaseId) throw invalid("allocation_reference_mismatch");
