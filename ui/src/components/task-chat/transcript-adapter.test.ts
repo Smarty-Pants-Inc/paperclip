@@ -758,7 +758,28 @@ describe("transcriptToTaskChatItems protocol surfaces", () => {
     });
   });
 
-  it("bounds provider output and workspace previews to 8 KiB", () => {
+  it.each(["\n", "\r\n"])("removes exactly a standalone spill marker line and recognizes the marker without a flag (%j)", (newline) => {
+    const before = `  first byte${newline}${newline}last byte\t ${newline}`;
+    const after = `${newline}AFTER_MARKER${newline}`;
+    const output = before + `[Full output: /tmp/pi-output.log (123456 bytes; sha256: abc123)]${newline}` + after;
+    const [item] = transcriptToTaskChatItems([{
+      kind: "provider_activity", ts: TS, family: "tool_execution", eventType: "tool.execution.completed",
+      status: "completed", title: "Read", summary: output, payload: { output, outputTruncated: false },
+    }], opts);
+    expect(item).toMatchObject({ output: before + after, summary: before + after, outputTruncated: true });
+    expect(JSON.stringify(item)).not.toContain("/tmp/pi-output.log");
+  });
+
+  it("does not remove ordinary output lines that only resemble a spill marker", () => {
+    const output = "before [Full output: example] after\n[Full output: not a producer marker]\n keep this\n";
+    const [item] = transcriptToTaskChatItems([{
+      kind: "provider_activity", ts: TS, family: "tool_execution", eventType: "tool.execution.completed",
+      status: "completed", title: "Read", summary: "Done", payload: { output },
+    }], opts);
+    expect(item).toMatchObject({ output });
+  });
+
+  it("preserves full provider output and workspace previews above 8 KiB", () => {
     const oversized = "x".repeat(9 * 1024);
     const items = transcriptToTaskChatItems(
       [
@@ -798,20 +819,20 @@ describe("transcriptToTaskChatItems protocol surfaces", () => {
     );
     expect(
       provider && provider.surface === "provider_activity"
-        ? provider.output?.length
-        : 0,
-    ).toBe(8 * 1024);
+        ? provider.output
+        : "",
+    ).toBe(oversized);
     expect(
       provider && provider.surface === "provider_activity"
         ? provider.outputTruncated
-        : false,
-    ).toBe(true);
+        : true,
+    ).toBe(false);
     expect(
-      file && file.surface === "workspace_file" ? file.preview?.length : 0,
-    ).toBe(8 * 1024);
+      file && file.surface === "workspace_file" ? file.preview : "",
+    ).toBe(oversized);
     expect(
-      file && file.surface === "workspace_file" ? file.previewTruncated : false,
-    ).toBe(true);
+      file && file.surface === "workspace_file" ? file.previewTruncated : true,
+    ).toBe(false);
   });
 
   it("turns canonical research sources into safe links and exposes notice metadata", () => {

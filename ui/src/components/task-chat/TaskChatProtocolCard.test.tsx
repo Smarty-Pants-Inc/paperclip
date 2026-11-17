@@ -19,6 +19,8 @@ import { IssueGalleryContext } from "@/context/IssueGalleryContext";
 import { RichWorkProductCard } from "./RichWorkProductCard";
 import { stateChipFor } from "./RichWorkProductCard";
 
+vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompany: { issuePrefix: "PAP" } }), useOptionalCompany: () => null }));
+
 function workProduct(overrides: Partial<IssueWorkProduct> = {}): IssueWorkProduct {
   return {
     id: "work-product-1",
@@ -107,6 +109,18 @@ function renderCard(
 describe("TaskChatProtocolCard", () => {
   let container: HTMLDivElement;
   let root: Root;
+
+  it("judge: Expand all must not fabricate a producer omission for an unflagged no-text change", () => {
+    renderCard(root, { id: "c", kind: "protocol", surface: "workspace_change", changeSetId: "c", revision: 1, source: "runner_verified", complete: true, runLogHref: "/agents/a/runs/r", files: [
+      { path: "mode.txt", previousPath: null, operation: "mode_change", additions: 0, deletions: 0, binary: false, diff: null, diffTruncated: false },
+      { path: "normal.txt", previousPath: null, operation: "modify", additions: 1, deletions: 0, binary: false, diff: "+hello", diffTruncated: false },
+    ], totals: { files: 2, additions: 1, deletions: 0 }, patchArtifactRef: null });
+    const expand = [...container.querySelectorAll("button")].find(button => button.textContent?.includes("Expand all"));
+    expect(expand).toBeDefined();
+    act(() => expand!.click());
+    expect(container.textContent).not.toContain("runner saved only part");
+    expect(container.textContent).toContain("hello");
+  });
 
   beforeEach(() => {
     container = document.createElement("div");
@@ -383,6 +397,34 @@ describe("TaskChatProtocolCard", () => {
     for (const label of absent) expect(container.textContent).not.toContain(label);
   });
 
+  it.each([
+    [true, "", ""],
+    [false, "[Full output: /tmp/pi-output-42.log (102400 bytes; sha256: abc123)]", ""],
+    [true, "  First byte\n\nLast byte\t \n", "  First byte\n\nLast byte\t \n"],
+    [false, "  First byte\n\nLast byte\t \n[Full output: /tmp/pi-output-42.log (102400 bytes; sha256: abc123)]\nAFTER_MARKER\n", "  First byte\n\nLast byte\t \nAFTER_MARKER\n"],
+  ])("shows one kept line for spilled provider output (flag=%s), preserving all other bytes", (outputTruncated, output, displayed) => {
+    renderCard(root, {
+      id: "spilled-tool", kind: "protocol", surface: "provider_activity",
+      family: "tool_execution", eventType: "tool.completed", status: "completed", title: "Read",
+      details: [], steps: [], links: [], children: [], output, outputTruncated,
+      runLogHref: "/agents/a/runs/r",
+    });
+    expect(container.querySelector("pre")?.textContent ?? "").toBe(displayed);
+    expect([...container.querySelectorAll("p")].filter(node => node.textContent?.includes("The full text is kept; ask me to show any part."))).toHaveLength(1);
+    expect(container.textContent).not.toMatch(/\[Full output:|\/tmp\/pi-output-42|saved only part|truncated|\bcut\b/i);
+    expect(container.querySelector('a[href*="/agents/a/runs/r"]')).not.toBeNull();
+  });
+
+  it("shows no producer notice for an unflagged tool output", () => {
+    renderCard(root, {
+      id: "whole-tool", kind: "protocol", surface: "provider_activity",
+      family: "tool_execution", eventType: "tool.completed", status: "completed", title: "Read",
+      details: [], steps: [], links: [], children: [], output: "All the output", outputTruncated: false,
+    });
+    expect(container.querySelector("pre")?.textContent).toBe("All the output");
+    expect(container.textContent).not.toMatch(/full text is kept|saved only part/);
+  });
+
   it("renders provider plan steps and status", () => {
     renderCard(root, {
       id: "provider-plan",
@@ -464,7 +506,8 @@ describe("TaskChatProtocolCard", () => {
       patchArtifactRef: null,
     });
     expect(container.textContent).toContain("40 files changed");
-    expect(container.querySelector('[data-testid="task-chat-workspace-change-omitted"]')?.textContent).toContain("39 more files changed.");
+    expect(container.querySelector('[data-testid="task-chat-workspace-change-omitted"]')).toBeNull();
+    expect(container.textContent).not.toMatch(/additional files without file details|runner saved only part/);
   });
 
   it("lists the turn's changed files and opens each diff in place", async () => {

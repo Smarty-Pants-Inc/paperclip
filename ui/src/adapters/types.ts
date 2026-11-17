@@ -1,8 +1,13 @@
 import type { ComponentType } from "react";
-import type { CreateConfigValues } from "@paperclipai/adapter-utils";
+import type { CreateConfigValues, TranscriptEntry as SharedTranscriptEntry } from "@paperclipai/adapter-utils";
+
+// Keep native run-event spill evidence on the UI's tool-result projection.
+export type TranscriptEntry =
+  | Exclude<SharedTranscriptEntry, { kind: "tool_result" }>
+  | (Extract<SharedTranscriptEntry, { kind: "tool_result" }> & { outputTruncated?: boolean });
 
 // Re-export shared types so local consumers don't need to change imports
-export type { TranscriptEntry, StdoutLineParser, CreateConfigValues } from "@paperclipai/adapter-utils";
+export type { StdoutLineParser, CreateConfigValues } from "@paperclipai/adapter-utils";
 
 export interface StatefulStdoutParser {
   parseLine: (line: string, ts: string) => import("@paperclipai/adapter-utils").TranscriptEntry[];

@@ -27,12 +27,8 @@ export interface ChunkMergeRefs {
 const SEEN_CHUNK_KEY_CAP = 12000;
 
 /**
- * Retention budget for a run's kept chunk window. Task views pass a byte budget
- * with `collapseTrimmed` so the just-rendered scrollback is retained and, when
- * the budget is genuinely exceeded, the oldest content collapses behind a
- * visible marker instead of silently vanishing midstream. Compact consumers
- * (dashboard tickers, summary draft) keep the historical chunk-count cap by
- * passing a bare number, which discards silently as before.
+ * Compact consumers can bound their preview window. Full-task consumers use
+ * `collapseTrimmed` to retain every chunk; a UI marker cannot restore bytes.
  */
 export interface ChunkRetentionBudget {
   /** Hard ceiling on retained chunk count. */
@@ -40,31 +36,10 @@ export interface ChunkRetentionBudget {
   /** Soft ceiling on retained chunk payload size (UTF-16 code units ≈ bytes). */
   maxBytes?: number;
   /**
-   * When true, trimming leaves a single visible "earlier output trimmed" marker
-   * at the head so collapsed content never disappears without a trace. When
-   * false (the default for count-only callers), trimming is silent.
+   * Legacy option for full-task scrollback. When true, retain all chunks.
+   * Count-only compact consumers leave this false.
    */
   collapseTrimmed?: boolean;
-}
-
-/**
- * Text of the synthetic system chunk that marks where older output was
- * collapsed out of the retained window. Rendered as an ordinary system line by
- * `buildTranscript`, so the affordance is adapter-agnostic.
- */
-export const TRIMMED_OUTPUT_MARKER_TEXT =
-  "⋯ earlier output trimmed to stay within the live transcript buffer ⋯";
-
-export function isTrimmedOutputMarkerChunk(chunk: RunLogChunk): boolean {
-  return (
-    chunk.stream === "system" &&
-    chunk.chunk === TRIMMED_OUTPUT_MARKER_TEXT &&
-    chunk.seq === undefined
-  );
-}
-
-function makeTrimmedOutputMarkerChunk(ts: string): RunLogChunk {
-  return { ts, stream: "system", chunk: TRIMMED_OUTPUT_MARKER_TEXT };
 }
 
 function chunkRetainedSize(chunk: RunLogChunk): number {
@@ -76,9 +51,7 @@ function normalizeRetentionBudget(budget: number | ChunkRetentionBudget): ChunkR
 }
 
 /**
- * Trim a run's retained window to its budget. Byte-budget trimming keeps the
- * newest chunks and (when `collapseTrimmed`) prepends one marker so the
- * scrollback shows earlier output was collapsed rather than silently dropped.
+ * Bound compact preview windows only. Full-task scrollback remains complete.
  * Returns the highest sequenced chunk actually removed so callers can raise the
  * trimmed-seq floor and drop re-delivered older records.
  */
@@ -88,10 +61,8 @@ export function applyRetentionBudget(
 ): { chunks: RunLogChunk[]; trimmedSeq: number | null } {
   const { maxChunks, maxBytes, collapseTrimmed } = budget;
 
-  // Peel off any existing marker so it is never counted or duplicated; a single
-  // marker is re-added below if trimming is (still) in effect.
-  const hadMarker = chunks.length > 0 && isTrimmedOutputMarkerChunk(chunks[0]!);
-  const real = hadMarker ? chunks.slice(1) : chunks;
+  if (collapseTrimmed) return { chunks, trimmedSeq: null };
+  const real = chunks;
 
   let removeCount = 0;
   if (typeof maxChunks === "number" && real.length > maxChunks) {
@@ -109,13 +80,7 @@ export function applyRetentionBudget(
     if (byteRemove > removeCount) removeCount = byteRemove;
   }
 
-  if (removeCount <= 0) {
-    // Nothing new to trim. Preserve an existing marker so an earlier collapse
-    // keeps its trace; otherwise return the marker-stripped array only if we
-    // actually stripped one (we never had a real trim to justify keeping it).
-    if (hadMarker) return { chunks, trimmedSeq: null };
-    return { chunks: real, trimmedSeq: null };
-  }
+  if (removeCount <= 0) return { chunks: real, trimmedSeq: null };
 
   const removed = real.slice(0, removeCount);
   const kept = real.slice(removeCount);
@@ -127,10 +92,6 @@ export function applyRetentionBudget(
     }
   }
 
-  if (collapseTrimmed || hadMarker) {
-    const markerTs = kept[0]?.ts ?? removed[removed.length - 1]!.ts;
-    return { chunks: [makeTrimmedOutputMarkerChunk(markerTs), ...kept], trimmedSeq };
-  }
   return { chunks: kept, trimmedSeq };
 }
 

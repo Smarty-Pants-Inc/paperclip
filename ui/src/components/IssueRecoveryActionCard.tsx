@@ -243,7 +243,7 @@ function readEvidenceString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   if (!trimmed) return null;
-  return trimmed.length > 240 ? `${trimmed.slice(0, 237)}…` : trimmed;
+  return trimmed;
 }
 
 // Human-sentence evidence sources render as prose; code-shaped sources

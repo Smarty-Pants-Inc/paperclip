@@ -10,9 +10,8 @@ import { formatReviewPolicyValue } from "./review-policy";
  * receipt; this module turns it into something a human can scan in the activity
  * stream without opening the audit log.
  *
- * The server already drops `updatedAt` and truncates long text (flagging it with
- * `updated: true`), so this module renders what it is given rather than
- * re-deciding what is interesting.
+ * The server drops `updatedAt` but retains complete text values. Historical
+ * `updated: true` marks description edits, not a producer omission flag.
  */
 
 /** Field names whose raw ids carry no meaning in a scannable summary. */
@@ -54,8 +53,6 @@ export function issueChangeFieldLabel(field: string): string {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
-const VALUE_PREVIEW_BUDGET = 72;
-
 /**
  * Render one side of a change for display. Never returns an empty string, so a
  * receipt row always reads as "from → to" rather than trailing into nothing.
@@ -85,6 +82,7 @@ export function formatIssueChangeValue(
   if (value instanceof Date) return value.toLocaleString();
 
   if (typeof value === "string") {
+    if (options.field === "description" || options.field === "title") return value;
     const trimmed = value.trim();
     if (!trimmed) return "none";
     // Ids resolve to names when the directory is loaded; otherwise they shorten.
@@ -97,18 +95,12 @@ export function formatIssueChangeValue(
     if (isIsoTimestamp(trimmed)) return new Date(trimmed).toLocaleString();
     if (looksLikeId(trimmed)) return shortenId(trimmed);
     const humanized = trimmed.includes(" ") ? trimmed : trimmed.replace(/_/g, " ");
-    return truncate(humanized);
+    return humanized;
   }
 
   // Objects (execution policy, workspace settings) are structural — the receipt
   // records that they moved, and the audit log holds the full value.
   return "updated";
-}
-
-function truncate(value: string): string {
-  const chars = Array.from(value);
-  if (chars.length <= VALUE_PREVIEW_BUDGET) return value;
-  return `${chars.slice(0, VALUE_PREVIEW_BUDGET).join("")}…`;
 }
 
 function isIsoTimestamp(value: string): boolean {
@@ -120,7 +112,7 @@ function looksLikeId(value: string): boolean {
 }
 
 function shortenId(value: string): string {
-  return looksLikeId(value) ? value.slice(0, 8) : truncate(value);
+  return looksLikeId(value) ? value.slice(0, 8) : value;
 }
 
 export interface IssueChangeReceiptRow {
@@ -128,8 +120,6 @@ export interface IssueChangeReceiptRow {
   label: string;
   from: string;
   to: string;
-  /** Server flagged the values as truncated previews of long text. */
-  truncated: boolean;
 }
 
 function isChangeEntry(value: unknown): value is IssueChangeReceiptEntry {
@@ -156,7 +146,6 @@ export function readIssueChangeReceipt(
       label: issueChangeFieldLabel(field),
       from: formatIssueChangeValue(entry.from, { ...options, field }),
       to: formatIssueChangeValue(entry.to, { ...options, field }),
-      truncated: entry.updated === true,
     });
   }
   // Stable, scannable order regardless of JSON key order (jsonb reorders keys).

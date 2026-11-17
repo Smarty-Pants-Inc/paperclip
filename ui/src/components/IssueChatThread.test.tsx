@@ -4239,6 +4239,79 @@ describe("IssueChatThread", () => {
     });
   });
 
+  it.each(["tool result", "provider activity"] as const)(
+    "hides the spill marker and shows the kept line for a spilled %s",
+    (kind) => {
+      const root = createRoot(container);
+      const run = issueChatLongThreadLinkedRuns[2];
+      const path = "/workspace/.paperclip/tool-output/kept-line-proof.txt";
+      const output = `Saved output preview\n[Full output: ${path} (50000 bytes; ask to read any part)]\n`;
+      const toolName = kind === "provider activity" ? "paperclip_provider_activity" : "command_execution";
+      act(() => renderIssueThread(root, {
+        linkedRuns: [run],
+        showComposer: false,
+        transcriptsByRunId: new Map([[run.runId, [
+          { kind: "tool_call", ts: "2026-04-06T12:00:10.000Z", name: toolName, toolUseId: "kept-tool", input: kind === "provider activity"
+            ? { family: "research", title: "Kept-line provider proof", summary: output, payload: { output } }
+            : { command: "echo kept-line-proof", description: "kept-line-proof" } },
+          { kind: "tool_result", ts: "2026-04-06T12:00:20.000Z", toolUseId: "kept-tool", toolName, content: output, isError: false },
+        ]]]),
+        hasOutputForRun: () => true,
+      }));
+      const worked = [...container.querySelectorAll("button")].find(button => /worked/i.test(button.textContent ?? ""));
+      expect(worked).toBeDefined();
+      act(() => worked!.click());
+      const activity = [...container.querySelectorAll("button")].find(button => button.textContent?.startsWith("Worked"));
+      expect(activity).toBeDefined();
+      act(() => activity!.click());
+      const tool = [...container.querySelectorAll("button")].find(button => button.textContent?.includes(kind === "provider activity" ? "Kept-line provider proof" : "kept-line-proof"));
+      expect(tool).toBeDefined();
+      expect(container.textContent).not.toContain("[Full output:");
+      expect(container.textContent).not.toContain(path);
+      act(() => tool!.click());
+      expect(container.textContent).toContain("Saved output preview");
+      expect(container.textContent).toContain("The full text is kept; ask me to show any part.");
+      expect(container.textContent).not.toContain("[Full output:");
+      expect(container.textContent).not.toContain(path);
+      const link = [...container.querySelectorAll("a")].find(anchor => anchor.textContent === "Open the run log");
+      expect(link?.getAttribute("href")).toContain(`/runs/${run.runId}`);
+      act(() => root.unmount());
+    },
+  );
+
+  it.each(["tool result", "provider activity"] as const)(
+    "shows no saved-output notice for an unflagged %s",
+    (kind) => {
+      const root = createRoot(container);
+      const run = issueChatLongThreadLinkedRuns[2];
+      const toolName = kind === "provider activity" ? "paperclip_provider_activity" : "command_execution";
+      const output = "Complete output without a producer omission";
+      act(() => renderIssueThread(root, {
+        linkedRuns: [run],
+        showComposer: false,
+        transcriptsByRunId: new Map([[run.runId, [
+          { kind: "tool_call", ts: "2026-04-06T12:00:10.000Z", name: toolName, toolUseId: "complete-tool", input: kind === "provider activity"
+            ? { family: "research", title: "Complete provider proof", payload: { output } }
+            : { command: "echo complete-output-proof", description: "complete-output-proof" } },
+          { kind: "tool_result", ts: "2026-04-06T12:00:20.000Z", toolUseId: "complete-tool", toolName, content: output, isError: false },
+        ]]]),
+        hasOutputForRun: () => true,
+      }));
+      const worked = [...container.querySelectorAll("button")].find(button => /worked/i.test(button.textContent ?? ""));
+      expect(worked).toBeDefined();
+      act(() => worked!.click());
+      const activity = [...container.querySelectorAll("button")].find(button => button.textContent?.startsWith("Worked"));
+      expect(activity).toBeDefined();
+      act(() => activity!.click());
+      const tool = [...container.querySelectorAll("button")].find(button => button.textContent?.includes(kind === "provider activity" ? "Complete provider proof" : "complete-output-proof"));
+      expect(tool).toBeDefined();
+      act(() => tool!.click());
+      expect(container.textContent).toContain(output);
+      expect(container.textContent).not.toMatch(/full text is kept|runner saved only part|Open the run log/);
+      act(() => root.unmount());
+    },
+  );
+
   it("keeps a running chain-of-thought in the Working state between commands", () => {
     const root = createRoot(container);
 

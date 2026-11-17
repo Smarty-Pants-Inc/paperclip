@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { SavedOutputNotice } from "./SavedOutputNotice";
 import { cn } from "@/lib/utils";
 import { hunkLabel } from "./diff-lines";
 import type { TaskChatDiffLine } from "./task-chat-model";
@@ -43,11 +44,13 @@ const MARKER: Record<TaskChatDiffLine["kind"], string> = {
  */
 export function TaskChatDiffView({
   lines,
+  runLogHref,
   truncated = false,
   previewLines = 24,
   className,
 }: {
   lines: readonly TaskChatDiffLine[];
+  runLogHref?: string;
   truncated?: boolean;
   previewLines?: number;
   className?: string;
@@ -121,7 +124,7 @@ export function TaskChatDiffView({
               Show {hidden} more {hidden === 1 ? "line" : "lines"}
             </button>
           ) : null}
-          {truncated && hidden === 0 ? <span>Diff shortened for display.</span> : null}
+          {truncated ? <SavedOutputNotice kind="patch" runLogHref={runLogHref} /> : null}
         </div>
       ) : null}
     </div>

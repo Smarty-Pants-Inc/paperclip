@@ -1,13 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import type { IssueChanges } from "@paperclipai/shared";
 
-const ISSUE_CHANGE_TEXT_BUDGET = 200;
-
-function truncateIssueChangeText(value: unknown) {
-  if (typeof value !== "string") return value;
-  return Array.from(value).slice(0, ISSUE_CHANGE_TEXT_BUDGET).join("");
-}
-
 function canonicalIdArray(value: unknown): unknown {
   if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) return value;
   return [...new Set(value)].sort();
@@ -30,14 +23,9 @@ export function buildIssueChanges(
     const to = updated[key];
     if (isDeepStrictEqual(from, to)) continue;
 
-    const longText =
-      key === "description" ||
-      (key === "title" &&
-        ((typeof from === "string" && Array.from(from).length > ISSUE_CHANGE_TEXT_BUDGET) ||
-          (typeof to === "string" && Array.from(to).length > ISSUE_CHANGE_TEXT_BUDGET)));
-    changes[key] = longText
-      ? { from: truncateIssueChangeText(from), to: truncateIssueChangeText(to), updated: true }
-      : { from, to };
+    // `updated` is historical change metadata, not evidence of omitted bytes.
+    // Retain complete values: board edits may have no producing run to reopen.
+    changes[key] = key === "description" ? { from, to, updated: true } : { from, to };
   }
 
   for (const [key, change] of Object.entries(relationChanges)) {
