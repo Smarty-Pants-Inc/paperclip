@@ -550,7 +550,8 @@ suite("fresh-continuation fallback", () => {
     | "D181_old_question_before_failed_message" | "D182_board_confirmation_for_someone_else" | "D152_first_turn_input_failed"
     | "D139_no_wake_no_run" | "D136_board_hold_no_run" | "D138_wake_failed_no_run" | "D137_coalesced_execution_wait_failed"
     | "D180_old_approval_board_hold" | "D157_queued_wake_never_runs" | "D160_workspace_pending" | "D168_carrying_queued_run_never_starts"
-    | "D128_approval_after_run_before_message" | "D138_wake_failed_no_run_blocked" | "D137_coalesced_execution_wait_failed_blocked";
+    | "D128_approval_after_run_before_message" | "D138_wake_failed_no_run_blocked" | "D137_coalesced_execution_wait_failed_blocked"
+    | "D160_ready_for_assessment" | "D160_arbitrating";
   it.each([
     "D008_failed_first_message", "D110_first_turn_input_silent", "D110_first_turn_input_failed_then_timer",
     "D114_two_messages_first_answered", "D115_earlier_runs_card_after_message", "D116_three_messages_before_prose",
@@ -559,6 +560,7 @@ suite("fresh-continuation fallback", () => {
     "D139_no_wake_no_run", "D136_board_hold_no_run", "D138_wake_failed_no_run", "D137_coalesced_execution_wait_failed",
     "D180_old_approval_board_hold", "D157_queued_wake_never_runs", "D160_workspace_pending", "D168_carrying_queued_run_never_starts",
     "D128_approval_after_run_before_message", "D138_wake_failed_no_run_blocked", "D137_coalesced_execution_wait_failed_blocked",
+    "D160_ready_for_assessment", "D160_arbitrating",
   ] satisfies PinShape[])("F3 pin re-home %s: the latest person message has exactly one truthful outcome by 120 s", async shape => {
     const t = new Date(Date.now() - 600_000);
     const at = (offset: number) => new Date(t.getTime() + offset);
@@ -727,10 +729,16 @@ suite("fresh-continuation fallback", () => {
           contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: latest.id } }).returning();
         await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id)); break;
       }
+      // rf-3 D160 residual: the executor settles the run succeeded even when finalizeNativeRun threw after
+      // writing ready_for_assessment (native-run-finalizer.ts) or arbitrating (runtime-execution.ts catch
+      // "the reconciliation loop will retry"); the reconciler can still commit and publish its reply.
+      case "D160_ready_for_assessment":
+      case "D160_arbitrating":
       case "D160_workspace_pending": {
+        const phase = shape === "D160_workspace_pending" ? "workspace_pending" : shape === "D160_arbitrating" ? "arbitrating" : "ready_for_assessment";
         latest = await message("Please answer this accepted request.", -60_000);
-        const pending = await run(0, "succeeded", { wakeCommentId: latest.id }, { runtimeMode: "native", nativeIssueId: issueId, nativePhase: "workspace_pending" } as never);
-        await db.insert(nativeRunFinalizations).values({ runId: pending.id, companyId, issueId, phase: "workspace_pending", recoveryState: "pending", leaseOwner: null } as never); break;
+        const pending = await run(0, "succeeded", { wakeCommentId: latest.id }, { runtimeMode: "native", nativeIssueId: issueId, nativePhase: phase } as never);
+        await db.insert(nativeRunFinalizations).values({ runId: pending.id, companyId, issueId, phase, recoveryState: "pending", leaseOwner: null } as never); break;
       }
       case "D168_carrying_queued_run_never_starts": {
         // The person's own wake owns the queued run (heartbeat/queue.ts:5618-5668).
@@ -782,7 +790,8 @@ suite("fresh-continuation fallback", () => {
         // publication: committed-response recovery posts its reply once it commits (D160, RFL 19:17Z ruling 3).
         const finishing = await db.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
           .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, nativeRunFinalizations.runId)).where(and(
-            eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.phase, "workspace_pending"),
+            eq(nativeRunFinalizations.companyId, companyId),
+            inArray(nativeRunFinalizations.phase, ["workspace_pending", "ready_for_assessment", "arbitrating"]),
             sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${latest.id}`));
         const outcomes = notes.length + live.length + queuedWakes.length + finishing.length
           + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
@@ -798,7 +807,7 @@ suite("fresh-continuation fallback", () => {
       const first = await observe();
       if (shape === "D128_approval_after_run_before_message")
         expect(first.card, "the failed attempt for the later message owns the card, not the older approval").toMatchObject({ state: "failed", canRetry: true });
-      if (shape === "D160_workspace_pending") expect(first.redeliveries, "the finishing turn is not re-offered (D160)").toBe(0);
+      if (shape.startsWith("D160_")) expect(first.redeliveries, "the finishing turn is not re-offered (D160)").toBe(0);
       if (shape === "D157_queued_wake_never_runs" || shape === "D168_carrying_queued_run_never_starts") {
         expect(first.card, "inside the start bound the person's queued run is working").toMatchObject({ state: "working" });
         // RFL 19:59Z (S9 queued-time rule): queued at t - 59 s behind a busy turn. At enqueue + 10 min
