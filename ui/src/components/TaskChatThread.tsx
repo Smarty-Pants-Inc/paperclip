@@ -1221,6 +1221,18 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     return null;
   }, [heldPaperclipRunnerRunId, transcriptByRun]);
 
+  // The live lane hides this saved duplicate. Give its visible final bubble
+  // the durable identity so actually seeing the reply can advance chat reads.
+  const heldPaperclipRunnerResponseComment = useMemo(() => {
+    if (!heldPaperclipRunnerRunId || !heldPaperclipRunnerFinalText) return undefined;
+    const comment = projectedComments.findLast(comment =>
+      comment.authorType === "agent" && !comment.deletedAt &&
+      normalizedMessageText(comment.body) === normalizedMessageText(heldPaperclipRunnerFinalText) &&
+      isRunnerResponseComment({ comment, runId: heldPaperclipRunnerRunId,
+        runStartedAtMs: heldPaperclipRunnerStartedAtMs, finalText: heldPaperclipRunnerFinalText }));
+    return comment ? { id: comment.id, text: comment.body, createdAtIso: new Date(comment.createdAt).toISOString() } : undefined;
+  }, [projectedComments, heldPaperclipRunnerRunId, heldPaperclipRunnerStartedAtMs, heldPaperclipRunnerFinalText]);
+
   // Runs observed non-terminal while mounted: their turns ANIMATE the fold when
   // they settle. Runs already terminal at mount collapse instantly.
   const liveSeenRef = useRef<Set<string>>(new Set());
@@ -3597,6 +3609,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                                       agentIcon={visibleTailAgentIcon}
                                       agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                       items={tailItems}
+                                      responseComment={heldPaperclipRunnerResponseComment}
                                       preparationLabel={optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
                                       allowSummaryFallback={!paperclipRunnerTail ||
                                         terminalHydratedRunIds.has(tailRunId ?? "") ||

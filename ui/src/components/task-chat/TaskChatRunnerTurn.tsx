@@ -170,6 +170,7 @@ export function TaskChatRunnerTurn({
   agentIcon,
   agent,
   items,
+  responseComment,
   status,
   execution,
   preparationLabel,
@@ -190,6 +191,8 @@ export function TaskChatRunnerTurn({
   agentIcon?: string | null;
   agent?: import("../AgentAvatar").AvatarAgent;
   items: readonly TaskChatItem[];
+  /** Saved duplicate hidden by this live lane; only its identical visible reply is read. */
+  responseComment?: Pick<TaskChatMessageItem, "id" | "text" | "createdAtIso">;
   status: string;
   execution?: ExecutionProjection | null;
   /** Presentation only while Send/Retry admission has no run yet. */
@@ -268,6 +271,10 @@ export function TaskChatRunnerTurn({
     finalRef.current.providerText = observedProviderText;
   }
   const final = finalRef.current.item;
+  const responseReadIdentity = final && responseComment &&
+    final.text.trim().replace(/\s+/g, " ") === responseComment.text.trim().replace(/\s+/g, " ")
+    ? { id: responseComment.id, createdAtIso: responseComment.createdAtIso }
+    : {};
   const timelineItems = paperclipRunnerTimelineItems(turnItems);
   const currentActivityItems = currentActivityStatusItems(timelineItems);
   const timelineRows = groupImageResources(buildTurnTimelineRows(
@@ -342,7 +349,7 @@ export function TaskChatRunnerTurn({
           data-testid="task-chat-final-response"
         >
           <TaskChatBubble
-            item={{ ...final, authorName: agentName ?? undefined, agentIcon, agent, timestamp: final.timestamp ?? formatTaskChatTimestamp(final.atMs) }}
+            item={{ ...final, ...responseReadIdentity, authorName: agentName ?? undefined, agentIcon, agent, timestamp: final.timestamp ?? formatTaskChatTimestamp(final.atMs) }}
             animateEntry={false}
             hideAgentIdentity={!continuedAfterSteering}
             actions={<TaskChatBubbleActions copyText={final.text} />}
