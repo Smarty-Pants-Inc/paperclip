@@ -17880,6 +17880,22 @@ export function issueRoutes(
     };
   }
 
+  /**
+   * A chat's queue is personal: only its owner reorders, edits, discards or
+   * interrupts it, the same rule as Steer (403 otherwise).
+   */
+  async function assertChatQueueOwner(
+    req: Request,
+    issue: { conversationAgentId?: string | null; conversationUserId?: string | null },
+    action: string,
+  ) {
+    if (!issue.conversationAgentId) return;
+    if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
+    if (req.actor.type !== "board" || !req.actor.userId || req.actor.userId !== issue.conversationUserId) {
+      throw forbidden(`Only the conversation owner can ${action}`);
+    }
+  }
+
   /** Runs a queued-comment queue mutation and maps its error onto the route's HTTP error, so each call site is a `const`. */
   async function runQueuedCommentMutation<T>(run: () => Promise<T>): Promise<T> {
     try {
@@ -17951,6 +17967,7 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
+      await assertChatQueueOwner(req, issue, "edit a chat's queued messages");
       const actor = getActorInfo(req);
       const { queue, activityPublication } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.editQueuedComment({
@@ -17961,6 +17978,7 @@ export function issueRoutes(
           revision: req.body.revision,
           body: req.body.body,
           now: new Date(),
+          bodyIsConversationReset: Boolean(issue.conversationAgentId) && isConversationReset(req.body.body),
         }),
       );
       publishActivity(activityPublication as ActivityPublication);
@@ -17982,6 +18000,7 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
+      await assertChatQueueOwner(req, issue, "reorder a chat's queued messages");
       const actor = getActorInfo(req);
       const { queue, activityPublication } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.reorderQueuedComments({
@@ -18008,12 +18027,7 @@ export function issueRoutes(
       if (!issue) return;
       const decision = await decideIssueAccess(req, issue, "issue:comment");
       if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
-      if (issue.conversationAgentId) {
-        if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
-        if (req.actor.userId !== issue.conversationUserId) {
-          throw forbidden("Only the conversation owner can interrupt a chat to send queued messages");
-        }
-      }
+      await assertChatQueueOwner(req, issue, "interrupt a chat to send queued messages");
       const actor = getActorInfo(req);
       const interruptPlan = await db.transaction(async (tx): Promise<{ firstTurnRunId: string } | { runToInterrupt: string | null }> => {
         const locked = await lockQueuedCommentState({
@@ -18385,7 +18399,12 @@ export function issueRoutes(
                 ...acknowledgedContext,
                 wakeCommentIds: carriedCommentIds.includes(commentId)
                   ? carriedCommentIds : [...carriedCommentIds, commentId],
-                ...(issue.conversationAgentId ? { conversationReplyBoundaryCommentId: commentId } : {}),
+                // A steer can deliver a message ahead of earlier queued ones
+                // (after a drag). It answers itself only, never the earlier
+                // ones by timestamp, and never moves the chat's reply boundary.
+                steeredCommentIds: [...(Array.isArray(acknowledgedContext.steeredCommentIds)
+                  ? acknowledgedContext.steeredCommentIds : [])
+                  .filter((id): id is string => typeof id === "string" && id !== commentId), commentId],
               },
               resultJson: {
                 ...acknowledgedResult,
@@ -18483,6 +18502,7 @@ export function issueRoutes(
       );
       if (!issue) return;
       if (!(await assertIssueReadAllowed(req, res, issue))) return;
+      await assertChatQueueOwner(req, issue, "discard a chat's queued messages");
       const actor = getActorInfo(req);
       const result = await runQueuedCommentMutation(() =>
         queuedCommentQueue.discardQueuedComment({

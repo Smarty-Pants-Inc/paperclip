@@ -10,7 +10,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import type { NativeStatusDecision } from "./native-runtime/status-arbiter.js";
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, notInArray, sql } from "drizzle-orm";
 import {
   agents,
   agentTaskSessions,
@@ -424,6 +424,15 @@ export async function settleConversationTurn(
             .from(issueComments)
             .where(eq(issueComments.id, wakeId))
         : [];
+    // A message this turn carried (its wake, a merged queue, its first turn or
+    // a steer) is not pending, whatever its timestamp: a drag can deliver a
+    // later message before an earlier one, which then stays pending.
+    const firstTurn = (context.firstTurnQueuedInput ?? {}) as Record<string, unknown>;
+    const carried = [
+      ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
+      ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : []),
+      context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
+    ].filter((id): id is string => typeof id === "string" && id.length > 0);
     const [pending] = wake
       ? await tx
           .select({ id: issueComments.id })
@@ -433,6 +442,7 @@ export async function settleConversationTurn(
               eq(issueComments.issueId, issueId),
               isNull(issueComments.deletedAt),
               sql`${issueComments.authorUserId} is not null`,
+              carried.length > 0 ? notInArray(issueComments.id, carried) : undefined,
               sql`(${issueComments.createdAt}, ${issueComments.id}) > (select cursor.created_at, cursor.id from issue_comments cursor where cursor.id = ${wake.id}::uuid)`,
             ),
           )
