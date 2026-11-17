@@ -1,5 +1,5 @@
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
-import { agentFileHoldWriteCondition } from "./agent-file-save-hold.js";
+import { agentFileHoldWriteCondition, pinLeaseForCollection, unpinLeaseForCollection } from "./agent-file-save-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -582,6 +582,27 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     await release(row);
     return (await get(row.companyId, row.runId))!;
   }
+  /**
+   * A stopped collection pins its bound lease (same row lock as the destroy
+   * claim) before it starts, so no destroy is claimed while it is in flight.
+   * A destroy that already holds the claim refuses the collection: nothing is
+   * read, saved or held here. The pin is dropped only once the collection
+   * returned (saved, unchanged or held); a thrown collection keeps it (its
+   * outcome is unknown) until this copy's next collection replaces it.
+   */
+  async function pinnedCollectStopped(row: Copy, target?: AdapterExecutionTarget | null) {
+    const leaseId = (row.receipt?.cleanup as { leaseId?: unknown } | undefined)?.leaseId;
+    if (typeof leaseId !== "string" || !leaseId) return collectStopped(row, target);
+    const copyKey = `${row.companyId}:${row.runId}:${row.agentId}`;
+    const pin = await pinLeaseForCollection(db, leaseId, copyKey);
+    if (pin === null) {
+      logger.warn({ runId: row.runId, leaseId }, "Agent-file collection refused: a destroy holds the lease claim");
+      return row;
+    }
+    const collected = await collectStopped(row, target);
+    if (pin !== "unbound") await unpinLeaseForCollection(db, leaseId, copyKey, pin);
+    return collected;
+  }
   function releaseIsNoop(row: Copy) {
     return row.state === "superseded" || !row.processStoppedAt ||
       settled(row) && row.receipt?.cleanupPending === false;
@@ -756,7 +777,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     destroyedRemote: (row: Copy) => destroyedRemoteCopy(row),
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),
     checkpointWarm: (row: Copy, target?: AdapterExecutionTarget | null) => trackAgentFileCheckpoint(serial(row, current => current.receipt?.warm === true ? checkpoint(current, target) : Promise.resolve(current), "agent_directory_checkpoint")),
-    collectStopped: (row: Copy, target?: AdapterExecutionTarget | null) => trackAgentFileCheckpoint(serial(row, current => collectStopped(current, target), "agent_directory_collect")),
+    collectStopped: (row: Copy, target?: AdapterExecutionTarget | null) => trackAgentFileCheckpoint(serial(row, current => pinnedCollectStopped(current, target), "agent_directory_collect")),
     release: async (row: Copy) => {
       let current = await get(row.companyId, row.runId);
       if (!current) return;
