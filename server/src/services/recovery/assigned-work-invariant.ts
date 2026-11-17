@@ -1,4 +1,5 @@
 import { SERVER_RESTART_RETRY_MAX_ATTEMPTS, SERVER_RESTART_RETRY_WINDOW_MS } from "../execution-recovery-attempt.js";
+import { SETTLING_GRACE_MS } from "./settling-grace.js";
 
 /**
  * The assigned-work invariant. Every open task assigned to an agent (`todo`,
@@ -104,9 +105,7 @@ const WAITING_RECOVERY_CAUSES: Readonly<Record<string, WaitingReason>> = {
 /** Provider usage limits are a wait only while a resume time is known. */
 const PROVIDER_LIMIT_CAUSES = new Set(["provider_quota", "native_provider_usage_limit"]);
 
-/** How long a just-finished run may still be settling (retry scheduling,
- * claim release) before its task is judged. A re-check follows at the end. */
-export const SETTLING_GRACE_MS = 90_000;
+export { SETTLING_GRACE_MS };
 /** Upper bound on how long another server's lease can keep a finished run settling. */
 export const SETTLING_MAX_MS = 5 * 60_000;
 export const SYSTEM_RECOVERY_WORKING_BOUND_MS = 17 * 60_000;

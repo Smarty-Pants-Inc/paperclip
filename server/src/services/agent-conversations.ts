@@ -1,5 +1,5 @@
 import { isContextCompactionRun } from "./context-compaction.js";
-import { SETTLING_GRACE_MS } from "./recovery/assigned-work-invariant.js";
+import { SETTLING_GRACE_MS } from "./recovery/settling-grace.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
