@@ -1196,6 +1196,57 @@ export function environmentRoutes(
     res.json(redactEnvironmentLeaseForResponse(lease));
   });
 
+  // A person clears ONE kept box (a lease blocked with
+  // `reusableSandboxKeptAfterReplacement` after its chat moved to a new box):
+  // that box is destroyed and its block removed, with who and why recorded on
+  // the lease and in the activity log. No other lease is touched, unlike the
+  // consented environment delete. Same authorization as that delete.
+  router.post("/environment-leases/:leaseId/destroy-kept-sandbox", async (req, res) => {
+    assertCanAccessInstanceEnvironments(req);
+    const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+    if (!reason) throw unprocessable("Say why this kept sandbox is being destroyed (reason).");
+    if (reason.length > 1000) throw unprocessable("The reason must be 1000 characters or fewer.");
+    const lease = await svc.getLeaseById(req.params.leaseId as string);
+    if (!lease) {
+      res.status(404).json({ error: "Environment lease not found" });
+      return;
+    }
+    const environment = lease.environmentId ? await svc.getById(lease.environmentId) : null;
+    if (!environment) {
+      res.status(404).json({ error: "Environment not found" });
+      return;
+    }
+    await assertPlatformProvisionedEnvironmentWritable(environment);
+    const actor = getActorInfo(req);
+    const result = await environmentRuntime.destroyKeptReusableSandboxLease({
+      leaseId: lease.id, actorId: actor.actorId, reason,
+    });
+    if (result.outcome === "not_found") {
+      res.status(404).json({ error: "Environment lease not found" });
+      return;
+    }
+    if (result.outcome === "not_kept") {
+      throw conflict("This lease is not a sandbox kept after its chat moved to a new box; nothing was destroyed.",
+        { outcome: result.outcome });
+    }
+    if (result.outcome === "busy") {
+      throw conflict("This kept sandbox is held by a run or a cleanup in progress; nothing was destroyed. Retry after it finishes.",
+        { outcome: result.outcome });
+    }
+    await logActivity(db, {
+      companyId: lease.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "environment_lease.kept_sandbox_destroyed",
+      entityType: "environment_lease",
+      entityId: lease.id,
+      details: { environmentId: environment.id, providerLeaseId: lease.providerLeaseId, reason, outcome: result.outcome },
+    });
+    res.json({ outcome: result.outcome, lease: result.lease ? redactEnvironmentLeaseForResponse(result.lease) : null });
+  });
+
   router.patch("/environments/:id", validate(updateEnvironmentSchema), async (req, res) => {
     assertCanAccessInstanceEnvironments(req);
     const existing = await svc.getById(req.params.id as string);

@@ -5,6 +5,10 @@ import { logger } from "../middleware/logger.js";
 
 export const REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY = "reusableSandboxKeptAfterReplacement";
 
+/** Who cleared ONE kept box and why, recorded on its lease in the claim write
+ * (`destroyKeptReusableSandboxLease`), with the block it removed. */
+export const KEPT_SANDBOX_CLEARED_BY_OPERATOR_KEY = "keptSandboxClearedByOperator";
+
 /**
  * Why a run kept an old box when it moved the chat to a new one. Recorded on
  * the kept lease with the block itself:
@@ -17,10 +21,14 @@ export type ReusableSandboxKeptReason = "identity_mismatch" | "resume_failed";
 
 /**
  * The block on a kept box. Nothing automatic clears it: no sweep, expiry,
- * retry or later run removes this key. Only a person's consented environment
- * delete (DELETE /api/environments/:id?destroyReusableSandboxLeases=true,
- * routes/environments.ts, `destroyReusableSandboxLeasesForEnvironment` with
- * `releasesKeptSandbox`) destroys the box and removes the key in the same write.
+ * retry or later run removes this key. Only a person clears it, in the same
+ * write that claims the box for destruction:
+ * - the narrow per-box action, POST /api/environment-leases/:leaseId/destroy-kept-sandbox
+ *   (routes/environments.ts, `destroyKeptReusableSandboxLease`), which records
+ *   the actor and reason on the lease (`keptSandboxClearedByOperator`) and in
+ *   the activity log and touches no other lease;
+ * - the consented environment delete (DELETE /api/environments/:id?destroyReusableSandboxLeases=true,
+ *   `destroyReusableSandboxLeasesForEnvironment` with `releasesKeptSandbox`).
  */
 export type ReusableSandboxKeptMarker = {
   runId: string;

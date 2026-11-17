@@ -9786,6 +9786,19 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/environment-leases/{leaseId}/destroy-kept-sandbox",
+  tags: ["environments"],
+  summary: "Destroy one sandbox kept after its chat moved to a new box",
+  description: "Clears the block on ONE kept lease by destroying its sandbox. Records the actor and reason on the lease and in the activity log. No other lease is touched.",
+  request: {
+    params: z.object({ leaseId: z.string() }),
+    body: jsonBody(z.object({ reason: z.string().min(1).max(1000) })),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
+registry.registerPath({
   method: "patch",
   path: "/api/environments/{id}",
   tags: ["environments"],

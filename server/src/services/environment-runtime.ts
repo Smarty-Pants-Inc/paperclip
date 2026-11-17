@@ -26,7 +26,7 @@ import {
   sandboxResumeRefusedForGood,
   sandboxStateTransitionFailure,
 } from "./reusable-sandbox-resume-replacement.js";
-import { assertSandboxNotKeptAfterReplacement } from "./reusable-sandbox-kept-marker.js";
+import { assertSandboxNotKeptAfterReplacement, KEPT_SANDBOX_CLEARED_BY_OPERATOR_KEY } from "./reusable-sandbox-kept-marker.js";
 import { admittedSandboxLeaseConfig, sandboxLeaseIdentityConfig, sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import { HttpError } from "../errors.js";
@@ -4400,6 +4400,8 @@ export function environmentRuntimeService(
     failureReason: string;
     anyLeasePolicy?: boolean;
     releasesKeptSandbox?: boolean;
+    /** A person cleared this ONE kept box: who and why, recorded in the claim write. */
+    clearedKeptSandbox?: { actorId: string; reason: string };
   }): Promise<EnvironmentLease | null> {
     if (await nativeWorkspaceExportPendingForLease(db, input.leaseRow)) return null;
     if (!(await allowLegacyShutdownWorkspaceCleanup(db, input.leaseRow))) return null;
@@ -4423,7 +4425,13 @@ export function environmentRuntimeService(
         then ${environmentLeases.metadata} else '{}'::jsonb end - 'remoteExecutionTermination'
         - ${input.releasesKeptSandbox ? REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY : ""}::text)
         || ${JSON.stringify({ pendingCleanupAttemptId: attemptId, pendingCleanupInFlight: true,
-          pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000, pendingCleanupController: controller })}::jsonb`,
+          pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000, pendingCleanupController: controller })}::jsonb
+        || ${input.clearedKeptSandbox
+          ? sql`jsonb_build_object(${KEPT_SANDBOX_CLEARED_BY_OPERATOR_KEY}::text, jsonb_build_object(
+            'actorId', ${input.clearedKeptSandbox.actorId}::text, 'reason', ${input.clearedKeptSandbox.reason}::text,
+            'at', ${now.toISOString()}::text,
+            'kept', ${environmentLeases.metadata}->${REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY}::text))`
+          : sql`'{}'::jsonb`}`,
     }).where(and(
       eq(environmentLeases.id, input.leaseRow.id),
       eq(environmentLeases.companyId, input.leaseRow.companyId),
@@ -5094,6 +5102,39 @@ export function environmentRuntimeService(
         else failed += 1;
       }
       return { destroyed, failed, skippedLiveRun };
+    },
+
+    /**
+     * A person clears ONE kept box (`reusableSandboxKeptAfterReplacement`): its
+     * lease is claimed and the box destroyed, exactly like the consented
+     * environment delete does per lease, but no other lease of the environment
+     * is read or touched. The claim write removes the block and records who
+     * cleared it and why (`keptSandboxClearedByOperator`, with the old block).
+     * Refused for a lease without the block, and for one a live run still holds
+     * (`busy`: the claim's live-run guard); a failed provider destroy leaves the
+     * lease `pending_cleanup` for the sweep, never silently orphaned.
+     */
+    async destroyKeptReusableSandboxLease(input: {
+      leaseId: string;
+      actorId: string;
+      reason: string;
+    }): Promise<{ outcome: "destroyed" | "pending_cleanup" | "not_found" | "not_kept" | "busy"; lease: EnvironmentLease | null }> {
+      const [leaseRow] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, input.leaseId));
+      if (!leaseRow) return { outcome: "not_found", lease: null };
+      const snapshot = toEnvironmentLeaseSnapshot(leaseRow);
+      if (!reusableSandboxKeptAfterReplacement(snapshot)) return { outcome: "not_kept", lease: snapshot };
+      const environment = leaseRow.environmentId ? await environmentsSvc.getById(leaseRow.environmentId) : null;
+      if (!environment) return { outcome: "not_found", lease: null };
+      const key = REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY;
+      const lease = await destroyClaimedSandboxLease({ environment, leaseRow, anyLeasePolicy: true,
+        failureReason: "kept_sandbox_cleared_by_operator", releasesKeptSandbox: true,
+        clearedKeptSandbox: { actorId: input.actorId, reason: input.reason },
+        scopeCondition: and(
+          inArray(environmentLeases.status, ["active", "released", "retained", "failed"]),
+          sql`jsonb_typeof(${environmentLeases.metadata}->${key}::text) = 'object'`,
+        ) });
+      if (!lease) return { outcome: "busy", lease: snapshot };
+      return { outcome: lease.status === "pending_cleanup" ? "pending_cleanup" : "destroyed", lease };
     },
 
     async resumeRunLease(input: EnvironmentDriverResumeInput): Promise<PluginEnvironmentLease | EnvironmentLease | null> {

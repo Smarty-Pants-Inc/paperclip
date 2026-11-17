@@ -498,6 +498,46 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     expect(deleted?.metadata?.reusableSandboxKeptAfterReplacement).toBeUndefined();
   });
 
+  it("destroys ONE kept sandbox on a person's per-box clear, records who and why, and touches no other lease", async () => {
+    const seeded = await seed({ leaseStatus: "released", backupStamp: false });
+    const clock = rpcTimeoutClock();
+    const { runtime } = worker(seeded, async (_attempt, timeoutMs) => { throw clock.timeOut(timeoutMs); });
+    const acquired = await acquire(seeded, runtime);
+    await environmentService(db).releaseLease(acquired.lease.id, "released");
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, seeded.runId));
+    // A second box kept in the same environment by another chat's switch.
+    const [keptRow] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.lease.id));
+    const otherKeptId = randomUUID();
+    await db.insert(environmentLeases).values({ ...keptRow!, id: otherKeptId, providerLeaseId: "other-kept-sandbox" });
+    const before = await db.select().from(environmentLeases);
+
+    const teardown = worker(seeded, async () => { throw new Error("no resume during the clear"); });
+    teardown.call.mockImplementation(async (_pluginId: string, method: string, params: unknown) => {
+      if (method === "environmentDestroyLease") return { providerLeaseId: (params as { providerLeaseId: string }).providerLeaseId };
+      throw new Error(`Unexpected plugin method: ${method}`);
+    });
+    // A lease without the block is refused: the action is narrow.
+    await expect(teardown.runtime.destroyKeptReusableSandboxLease({ leaseId: acquired.lease.id,
+      actorId: "operator-1", reason: "wrong box" })).resolves.toMatchObject({ outcome: "not_kept" });
+    const result = await teardown.runtime.destroyKeptReusableSandboxLease({ leaseId: seeded.lease.id,
+      actorId: "operator-1", reason: "a runner survived on the old box" });
+
+    expect(result.outcome).toBe("destroyed");
+    const destroys = teardown.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease");
+    expect(destroys.map(([, , params]) => (params as { providerLeaseId: string }).providerLeaseId)).toEqual([seeded.providerLeaseId]);
+    const cleared = await environmentService(db).getLeaseById(seeded.lease.id);
+    expect(cleared?.status).toBe("expired");
+    expect(cleared?.metadata?.reusableSandboxKeptAfterReplacement).toBeUndefined();
+    expect(cleared?.metadata?.keptSandboxClearedByOperator).toMatchObject({ actorId: "operator-1",
+      reason: "a runner survived on the old box", kept: { runId: seeded.runId, replacementLeaseId: acquired.lease.id } });
+    // Every other lease of the environment is byte-for-byte as it was.
+    const after = await db.select().from(environmentLeases);
+    for (const row of before.filter(lease => lease.id !== seeded.lease.id)) {
+      expect(after.find(lease => lease.id === row.id)).toEqual(row);
+    }
+    expect(after.find(lease => lease.id === otherKeptId)?.metadata?.reusableSandboxKeptAfterReplacement).toBeTruthy();
+  });
+
   it("keeps an idle sandbox with no harness backup when some resume calls failed for another reason", async () => {
     const seeded = await seed({ leaseStatus: "released", backupStamp: false });
     const clock = rpcTimeoutClock();
