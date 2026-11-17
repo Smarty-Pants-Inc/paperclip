@@ -40,6 +40,8 @@ import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
+import * as sweepModule from "./unanswered-person-message.js";
+import * as pendingModule from "./automatic-recovery-pending.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -339,11 +341,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         expect(notices).toHaveLength(1);
         expect(notices[0]!.body).toBe(NOT_ANSWERED);
       }
-      const heldNotices = await held.visible();
-      expect(heldNotices).toHaveLength(1);
-      expect(heldNotices[0]!.body).toBe(NOT_ANSWERED);
-      expect(heldNotices[0]!.presentation).toMatchObject({ title: "Your message wasn't answered" });
-      expect(heldNotices[0]!.body).not.toContain("I'm stopping");
+      // RFL 17:18Z: its fresh continuation is recorded and its delivery is
+      // pending (automaticRecoveryPending (b)), so no resend advice for it;
+      // the sweep's own bound still posts one note if it never delivers.
+      expect(await held.visible()).toHaveLength(0);
     }
   });
 
@@ -2330,4 +2331,237 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     });
   });
 
+  // Keep: gate 1 'without' 951a0225 card row C (cardC/DB-ROWS.md): message bcd63196 at 17:02:55.240; run
+  // 116e7f2f failed native_continuation_requires_reconciliation / native_session_supervisor_busy at 17:03:01.125;
+  // the sweep said "send it again" (34c2eae7) at 17:03:18.616 (+23.4 s) while the system's own automatic
+  // recovery (hold dec9f5fa, then restored wake 2d70a014 / run 9be2ca0f at 17:04:19) was on its way.
+  describe("automatic recovery pending: no resend advice while the system's own recovery is on its way", () => {
+    const CODE = "native_continuation_requires_reconciliation";
+    const pending = (f: { companyId: string; issueId: string }, runId: string) =>
+      pendingModule.automaticRecoveryPending(db, { companyId: f.companyId, issueId: f.issueId, runId });
+    const recoveringText = () => (sweepModule as Record<string, unknown>).UNANSWERED_MESSAGE_RECOVERING_TEXT;
+
+    /** The live gate-1 rows up to the run's failure, on the real clock: the sweep runs at base + `sweepAtMs`. */
+    async function gate1(sweepAtMs = 23_376) {
+      const f = await fixture();
+      const base = Date.now() - sweepAtMs; // 17:02:55.240
+      const messageId = await f.message("TEST_CARD_C: Before replying, use your ask_user tool.");
+      await db.update(issueComments).set({ createdAt: new Date(base) }).where(eq(issueComments.id, messageId));
+      const runId = await f.run({ commentId: messageId, status: "failed", errorCode: CODE, error: "native_session_supervisor_busy" });
+      await db.update(heartbeatRuns).set({ createdAt: new Date(base + 63), startedAt: new Date(base + 211), finishedAt: new Date(base + 5_885),
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [randomUUID()] } },
+        contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: messageId, wakeCommentIds: [messageId] } })
+        .where(eq(heartbeatRuns.id, runId));
+      return { ...f, messageId, runId, base };
+    }
+    type G = Awaited<ReturnType<typeof gate1>>;
+    const noReplay = (g: G) => ({ policy: "preserve_without_replay_v1", runId: g.runId, replay: "blocked", actionOutcome: "unknown",
+      recordedAt: new Date(g.base + 3_299).toISOString() });
+    /** dec9f5fa as written at 17:02:58.539 (legacy-execution-recovery.ts:237-265): the no-replay hold. */
+    async function hold(g: G, values: Partial<typeof issueRecoveryActions.$inferInsert> = {}, evidence: Record<string, unknown> = {}) {
+      const [row] = await db.insert(issueRecoveryActions).values({ companyId: g.companyId, sourceIssueId: g.issueId,
+        kind: "active_run_watchdog", status: "resolved", outcome: "blocked", ownerType: "board", cause: CODE,
+        fingerprint: `native-workspace:${g.runId}`, attemptCount: 1, nextAction: "The task's saved files could not be put back after the run stopped.",
+        resolvedAt: new Date(g.base + 3_299), createdAt: new Date(g.base + 3_276), ...values,
+        evidence: { runId: g.runId, originalFailureCode: CODE, workspaceRestoreFailure: "restore_failed",
+          workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [randomUUID()] },
+          continuationDelivery: "invalidated", automaticRecovery: noReplay(g), ...evidence } }).returning();
+      return row!.id;
+    }
+    /** dec9f5fa as the brief reads its final row at 17:02:58.5: resolved restored, system-owned, no delivery written. */
+    const restoredNoDelivery = (g: G, evidence: Record<string, unknown> = {}) => hold(g, { outcome: "restored", ownerType: "system",
+      returnOwnerAgentId: g.agentId, resolutionNote: "continued_fresh_from_last_saved",
+      nextAction: "The previous run was cut off. Paperclip continues the task in a fresh run from its last saved work." },
+    { continuationDelivery: undefined, automaticRecovery: undefined, automaticRecoveryHistory: noReplay(g), ...evidence });
+    /** 17:04:07.208: the fresh continuation records its delivery (fresh-continuation-fallback.ts:933-948). */
+    const recordDelivery = async (g: G, actionId: string, extra: Record<string, unknown> = {}) => {
+      const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      const recordedAt = new Date(g.base + 71_968).toISOString();
+      const { automaticRecovery, ...rest } = row!.evidence as Record<string, unknown>;
+      await db.update(issueRecoveryActions).set({ outcome: "restored", ownerType: "system", returnOwnerAgentId: g.agentId,
+        resolutionNote: "continued_fresh_from_last_saved", evidence: { ...rest,
+          ...(automaticRecovery ? { automaticRecoveryHistory: automaticRecovery } : {}),
+          executionReconciliation: { runId: g.runId, actorId: "fresh-continuation", recordedAt, actionOutcome: "mixed", providerStopped: true },
+          freshContinuation: { schema: "paperclip.fresh-continuation.v1", trigger: "held_recovery", delivery: "recorded",
+            isolation: "writer_ended", recordedAt, failureCode: CODE, sourceRunId: g.runId, chainAttempt: 1, chainRootRunId: g.runId },
+          continuationDelivery: "pending", ...extra } }).where(eq(issueRecoveryActions.id, actionId));
+    };
+    const at = (g: G, ms: number) => settleUnansweredPersonMessage(db, { companyId: g.companyId, issueId: g.issueId,
+      now: new Date(g.base + ms) });
+    /** The restored run (9be2ca0f: wake issue_recovery_action_restored, carrying the message), created at base + ms. */
+    const restoredRun = async (g: G, status: string, ms: number, errorCode: string | null = null) => {
+      const id = await g.run({ commentId: g.messageId, status, errorCode, wakeReason: "issue_recovery_action_restored", retryOfRunId: g.runId });
+      await db.update(heartbeatRuns).set({ createdAt: new Date(g.base + ms), startedAt: new Date(g.base + ms + 122),
+        finishedAt: ["running", "queued"].includes(status) ? null : new Date(g.base + ms + 41_989) }).where(eq(heartbeatRuns.id, id));
+      return id;
+    };
+    const replyAt = async (g: G, runId: string, ms: number) => {
+      await g.reply(runId);
+      await db.update(issueComments).set({ createdAt: new Date(g.base + ms) }).where(and(eq(issueComments.issueId, g.issueId),
+        eq(issueComments.createdByRunId, runId)));
+    };
+
+    it("RED A-live (gate 1, code-derived state at +23 s): the no-replay hold with saved-work recovery scheduled -> no resend text; the restore answers -> nothing visible", async () => {
+      const g = await gate1();
+      const actionId = await hold(g, {}, { systemRecovery: { schema: "paperclip.system-recovery.v1", policyVersion: 1,
+        sourceRunId: g.runId, phase: "verify_execution", state: "scheduled", attempts: 1, retriesUsed: 1,
+        failure: { code: "agent_stop_unconfirmed", retryClass: "recheck_evidence" }, firstFailureAt: g.base + 18_567,
+        nextAttemptAt: g.base + 48_444 } });
+      expect(await pending(g, g.runId)).toBe(true);
+      await at(g, 23_376); // 17:03:18.616, the sweep's live notice time
+      expect((await g.visible()).map(note => note.body)).toEqual([]); // base: [NOT_ANSWERED] (34c2eae7)
+      await recordDelivery(g, actionId, { systemRecovery: { state: "complete" } }); // 17:04:07.208
+      await at(g, 72_000);
+      expect(await g.visible()).toHaveLength(0);
+      // 17:04:19.151: restored wake 2d70a014 and run 9be2ca0f, carrying bcd63196, started at once.
+      const restored = await restoredRun(g, "running", 83_911);
+      await db.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+        continuationDelivery: "delivered", continuationRunId: restored })}::jsonb` }).where(eq(issueRecoveryActions.id, actionId));
+      await at(g, 84_000);
+      expect(await g.visible()).toHaveLength(0);
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(g.base + 125_900) }).where(eq(heartbeatRuns.id, restored));
+      await replyAt(g, restored, 125_000);
+      await at(g, 130_000);
+      expect(await g.visible()).toHaveLength(0);
+    });
+
+    it("RED A-live (gate 1, as the brief reads dec9f5fa): resolved restored, delivery not recorded, NO wake -> no resend text at +23 s; the true waiting note after the grace", async () => {
+      const g = await gate1();
+      const actionId = await restoredNoDelivery(g);
+      expect(await pending(g, g.runId)).toBe(true);
+      await at(g, 23_376);
+      expect((await g.visible()).map(note => note.body)).toEqual([]); // base: [NOT_ANSWERED]
+      // Past the existing short grace while the recovery is still on its way: the TRUE waiting note.
+      await at(g, 23_376 + PENDING_WAIT_BOUND_MS + 1_000);
+      const notes = await g.visible();
+      expect(notes.map(note => note.body)).toEqual([recoveringText()]);
+      expect(codeOf(notes[0]!)).toBeUndefined();
+      // The restore delivers and answers: the waiting note is superseded.
+      await recordDelivery(g, actionId);
+      const restored = await restoredRun(g, "succeeded", 23_376 + PENDING_WAIT_BOUND_MS + 1_500);
+      await replyAt(g, restored, 23_376 + PENDING_WAIT_BOUND_MS + 2_000);
+      await at(g, 23_376 + PENDING_WAIT_BOUND_MS + 50_000);
+      expect(await g.visible()).toHaveLength(0);
+    });
+
+    it("bound kept: a recovery that never delivers -> the SAME waiting note becomes the true failure notice at the start bound", async () => {
+      const g = await gate1();
+      await restoredNoDelivery(g);
+      await at(g, 23_376);
+      await at(g, 23_376 + PENDING_WAIT_BOUND_MS + 1_000);
+      const [waiting] = await g.visible();
+      expect(waiting?.body).toBe(recoveringText());
+      await at(g, 23_376 + PENDING_WAIT_START_BOUND_MS + 1_000);
+      const notes = await g.visible();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.id).toBe(waiting!.id);
+      expect(notes[0]!.body).toBe(NOT_ANSWERED);
+    });
+
+    // Keep: gate 3 s1, chat 253cb37f: run adca2f56 failed native_continuation_requires_reconciliation; the held
+    // writer's notice 21d735a4 (16:42:17.115) came 66 ms BEFORE hold cbfe9c96 existed (16:42:17.181). The only
+    // action then was 7ae251e4, board-owned execution_stop_pending, ESCALATED, for the PREDECESSOR cbacae5f.
+    it("RED B-live (gate 3, predicate): the run failed with the auto-reconciled code and NO action exists yet -> pending; through delivery -> pending; the restored run starts -> not", async () => {
+      const g = await gate1(60_000);
+      const predecessor = await g.run({ status: "cancelled", errorCode: "cancelled" });
+      await db.insert(issueRecoveryActions).values({ companyId: g.companyId, sourceIssueId: g.issueId, kind: "active_run_watchdog",
+        status: "escalated", ownerType: "board", cause: "execution_stop_pending", fingerprint: `execution_stop_pending:${predecessor}`,
+        attemptCount: 1, maxAttempts: 1, nextAction: "Stop pending (execution_stop_pending): Paperclip cannot confirm that the previous execution stopped.",
+        evidence: { runId: predecessor, stopPending: { code: "execution_stop_pending", escalation: "board", automaticAttemptsExhausted: true,
+          runIds: [predecessor], schema: "paperclip.task-stop-pending.v1" } } });
+      expect(await pending(g, g.runId)).toBe(true); // 16:42:17.115, the writer's moment
+      expect(await pending(g, predecessor)).toBe(false); // the escalated board-owned stop stays manual
+      const actionId = await hold(g); // 16:42:17.181 / .230
+      expect(await pending(g, g.runId)).toBe(true);
+      await recordDelivery(g, actionId); // 16:43:39.048
+      expect(await pending(g, g.runId)).toBe(true);
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: g.companyId, agentId: g.agentId, source: "automation",
+        reason: "issue_recovery_action_restored", status: "queued", requestedByActorType: "system", requestedByActorId: "execution-recovery",
+        payload: { issueId: g.issueId, recoveryActionId: actionId } }).returning(); // 2f24af49, 16:43:43.887
+      await db.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"delegated"}'::jsonb` })
+        .where(eq(issueRecoveryActions.id, actionId));
+      expect(await pending(g, g.runId)).toBe(true); // (c) the restored wake alone
+      const restored = await restoredRun(g, "running", 50_000);
+      await db.update(agentWakeupRequests).set({ status: "claimed", runId: restored }).where(eq(agentWakeupRequests.id, wake!.id));
+      await db.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+        continuationDelivery: "delivered", continuationRunId: restored })}::jsonb` }).where(eq(issueRecoveryActions.id, actionId));
+      expect(await pending(g, g.runId)).toBe(false); // 79822d12 started: it, not the predicate, owns the answer now
+    });
+
+    it("RED B-live (gate 3, writer moment): the failing run is not terminal yet but its coordinator recorded the auto-reconciled code, no action -> pending", async () => {
+      const g = await gate1(60_000);
+      await db.update(heartbeatRuns).set({ status: "running", errorCode: null, error: null, finishedAt: null }).where(eq(heartbeatRuns.id, g.runId));
+      expect(await pending(g, g.runId)).toBe(false);
+      await db.insert(nativeRunFinalizations).values({ companyId: g.companyId, issueId: g.issueId, runId: g.runId,
+        phase: "terminal_failure", failureCode: CODE });
+      expect(await pending(g, g.runId)).toBe(true);
+    });
+
+    it.each([
+      ["the no-replay hold resolved cancelled", { outcome: "cancelled" }, {}],
+      ["the fallback found the hold person-owned", {}, { freshContinuationCheck: { kind: "person_owned", reason: "in_review" } }],
+      ["saved-work recovery exhausted", {}, { systemRecovery: { state: "exhausted" } }],
+      ["a person reconciled it (human gate)", {}, { executionReconciliation: { runId: "x", actorId: "user-1" } }],
+    ] as const)("guard: %s -> ONE true notice (the predicate never hides a dead recovery)", async (_name, values, evidence) => {
+      const g = await gate1();
+      await hold(g, values as Partial<typeof issueRecoveryActions.$inferInsert>, evidence);
+      expect(await pending(g, g.runId)).toBe(false);
+      await at(g, 23_376);
+      expect((await g.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+      await at(g, 23_376 + PENDING_WAIT_BOUND_MS + 1_000);
+      expect(await g.visible()).toHaveLength(1);
+    });
+
+    it("guard: the restore's delivery FAILED (invalidated) -> ONE true notice", async () => {
+      const g = await gate1();
+      const actionId = await restoredNoDelivery(g);
+      await recordDelivery(g, actionId, { continuationDelivery: "invalidated", continuationInvalidatedReason: "in_review" });
+      expect(await pending(g, g.runId)).toBe(false);
+      await at(g, 23_376);
+      expect((await g.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+    });
+
+    it("guard: the restored run FAILED -> ONE true notice", async () => {
+      const g = await gate1(200_000);
+      const actionId = await restoredNoDelivery(g);
+      await recordDelivery(g, actionId);
+      const restored = await restoredRun(g, "failed", 84_000, "adapter_failed");
+      await db.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+        continuationDelivery: "delivered", continuationRunId: restored })}::jsonb` }).where(eq(issueRecoveryActions.id, actionId));
+      expect(await pending(g, g.runId)).toBe(false);
+      expect(await pending(g, restored)).toBe(false);
+      await at(g, 200_000);
+      expect((await g.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+    });
+
+    it("guard: a board-owned ESCALATED action for the run (7ae251e4 shape) keeps today's notice", async () => {
+      const g = await gate1();
+      await hold(g, { status: "escalated", outcome: null, resolvedAt: null, nextAction: "Stop pending: inspect the bound runs." },
+        { automaticRecovery: undefined, continuationDelivery: undefined });
+      expect(await pending(g, g.runId)).toBe(false);
+      await at(g, 23_376);
+      const notes = await g.visible();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).not.toBe(recoveringText());
+    });
+
+    it("guard: a failure code the system does not reconcile automatically, with no action -> today's resend notice", async () => {
+      const g = await gate1();
+      await db.update(heartbeatRuns).set({ errorCode: "adapter_failed", error: "Native session failed" }).where(eq(heartbeatRuns.id, g.runId));
+      expect(await pending(g, g.runId)).toBe(false);
+      await at(g, 23_376);
+      expect((await g.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+    });
+
+    it("guard: a deferred restored continuation wake for the run's action -> pending", async () => {
+      const g = await gate1();
+      const actionId = await restoredNoDelivery(g, { continuationDelivery: "delegated" });
+      expect(await pending(g, g.runId)).toBe(false);
+      await db.insert(agentWakeupRequests).values({ companyId: g.companyId, agentId: g.agentId, source: "automation",
+        reason: "issue_recovery_action_restored", status: "deferred_issue_execution", requestedByActorType: "system",
+        requestedByActorId: "execution-recovery", payload: { issueId: g.issueId, recoveryActionId: actionId } });
+      expect(await pending(g, g.runId)).toBe(true);
+    });
+  });
 });

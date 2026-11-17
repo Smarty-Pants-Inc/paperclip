@@ -31,6 +31,7 @@ import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-re
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 import { personStoppedCarrierSql, runStartedAnswering, stoppedBySender } from "./person-stopped-message.js";
 import { AGENT_LIFECYCLE_STOP_REASON } from "../governance-pause-stop.js";
+import { automaticRecoveryPending } from "./automatic-recovery-pending.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -83,7 +84,13 @@ const PAUSE_STOPPED_CODE = "agent_pause_stopped";
 /** Setup completes by itself; a stalled setup gets one factual waiting note. */
 export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
 export const SETUP_WAIT_BOUND_MS = 10 * 60_000;
-const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE]);
+/** The system's own automatic recovery of the message's run is on its way
+ * (automaticRecoveryPending): a waiting-kind note, never resend advice. */
+export const UNANSWERED_MESSAGE_RECOVERING_CODE = "automatic_recovery_pending";
+export const UNANSWERED_MESSAGE_RECOVERING_TEXT =
+  "The run answering your message was cut off. Paperclip is recovering it and will continue by itself; your message is saved.";
+const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE,
+  UNANSWERED_MESSAGE_RECOVERING_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
@@ -708,6 +715,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   }
 
   let code: string;
+  let recovering = false;
   if (settingUp) {
     code = UNANSWERED_MESSAGE_AGENT_SETUP_CODE;
   } else if (agentPaused) {
@@ -752,6 +760,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     const due = (run.finishedAt ?? run.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
+    // The system's own automatic recovery of this run is on its way: no
+    // resend advice. The same short grace, then the true waiting note, and
+    // the existing start bound: past it, today's notice below.
+    if (run.status !== "succeeded" && !boardHold
+      && await automaticRecoveryPending(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) {
+      const wait = await bounded(now.getTime() + 30_000);
+      if (wait) return wait;
+      const startDeadline = (waitT0 ?? now.getTime()) + PENDING_WAIT_START_BOUND_MS;
+      if (startDeadline > now.getTime()) {
+        if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_RECOVERING_CODE) {
+          return { kind: "pending", recheckAt: startDeadline };
+        }
+        recovering = true;
+      }
+    }
     if (run.issueCommentStatus === "retry_queued") {
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
@@ -814,7 +837,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     }
     // An intentional pause cancellation is not an unanswered failed attempt.
     // Resume does not replay operator-stopped work: give the true manual remedy.
-    code = run.status === "cancelled" && run.errorCode === "agent_paused" ? PAUSE_STOPPED_CODE
+    code = recovering ? UNANSWERED_MESSAGE_RECOVERING_CODE
+      : run.status === "cancelled" && run.errorCode === "agent_paused" ? PAUSE_STOPPED_CODE
       : run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
   }
 
@@ -872,6 +896,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const body = settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName)
     : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
+    : code === UNANSWERED_MESSAGE_RECOVERING_CODE ? UNANSWERED_MESSAGE_RECOVERING_TEXT
     : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : cardAnswer ? UNANSWERED_CARD_ANSWER_TEXT
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
@@ -881,7 +906,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused`
-        : pauseStopped ? `${pausedName} was paused before it answered` : waiting ? "Your message is waiting to start"
+        : pauseStopped ? `${pausedName} was paused before it answered`
+        : code === UNANSWERED_MESSAGE_RECOVERING_CODE ? "Paperclip is recovering this run"
+        : waiting ? "Your message is waiting to start"
         : cardAnswer ? "Your answer wasn't acted on" : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
