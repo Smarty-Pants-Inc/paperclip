@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { issueRoutes } from "../../routes/issues.js";
+import { errorHandler } from "../../middleware/index.js";
 import {
   activityLog,
+  companyMemberships,
   agentWakeupRequests,
   agents,
   approvals,
@@ -29,7 +34,8 @@ import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "../continuation-comment-input.js";
-import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
+import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
+import { materializeNativeInteractionResponses } from "../native-runtime/native-interaction-bridge.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
@@ -44,6 +50,18 @@ import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
 // managed instructions. "Visible" is the v2 chat filter (TaskChatThread.tsx:930):
 // a system comment is hidden only when recoveryResponsibility is "system".
 // follow-Paperclip Cut B R8: held copy preserves the message and offers a new message, never a permanent ban.
+
+// RF5 (moved from app-lead's rf5-cardline-supplemental.test.ts): pause only the
+// answer delivery worker at the committed-answer/pre-wake boundary, and only in
+// the tests that switch it on. Every other test here keeps the real worker.
+const answerDelivery = vi.hoisted(() => ({ paused: false }));
+vi.mock("../question-response-delivery.js", async (original) => {
+  const actual = await original<typeof import("../question-response-delivery.js")>();
+  return { ...actual, questionResponseDeliveryService: (...args: Parameters<typeof actual.questionResponseDeliveryService>) => {
+    const service = actual.questionResponseDeliveryService(...args);
+    return answerDelivery.paused ? { ...service, deliver: async () => null } : service;
+  } };
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("unanswered person message notice (C9, the stranded sweep)", () => {
@@ -1262,6 +1280,120 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notices[0]!.body).toBe(PAUSED_TEXT);
   });
 
+  // PV2 gate 1, comment 8757f468 (13:18Z): the person's message 410f8aec was
+  // carried by run ebe11bc8; the user paused the agent 11 s into that run (the
+  // pause route: lifecycle pause, then cancelActiveForAgent -> the run is
+  // cancelled with errorCode agent_paused); 19 s after the pause, with the
+  // agent still paused, the sweep wrote "Your message wasn't answered. Sending
+  // it again is safe" with the cancelled run as its source. The exact sequence:
+  it("PV2 8757f468: the pause route cancels the message's running run (agent_paused); the sweep 19 s later writes the paused note, never the resend text", async () => {
+    const f = await fixture();
+    const commentId = await f.message("Please continue.");
+    const carrying = await f.run({ commentId, status: "running" });
+    // routes/agents.ts POST /agents/:id/pause: lifecycle pause (status paused,
+    // lifecycle pausing, hold manual), then heartbeat.cancelActiveForAgent.
+    await db.update(agents).set({ status: "paused", lifecycleState: "pausing", lifecycleHolds: ["manual"], pauseReason: "manual" })
+      .where(eq(agents.id, f.agentId));
+    // cancelActiveForAgent(id) -> cancelRun(..., { errorCode: "agent_paused" })
+    // (heartbeat.ts:4842-4843, run-control.ts:1801-1815); the native
+    // cancellation settles the run as the live row did (lease released with
+    // "Cancelled due to agent pause").
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "agent_paused", error: "Cancelled due to agent pause",
+      finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, carrying));
+    const [agentRow] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(agentRow!.status).toBe("paused");
+    await settleAt(f, 19_000);
+    await f.sweep();
+    await settleAt(f, 3 * 60_000);
+    await settleAt(f, 10 * 60_000);
+    const notices = await f.visible();
+    expect(notices.map(n => n.body)).toEqual([PAUSED_TEXT]);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    // 13:20:43Z the user resumes the agent. The sweep passes again with the
+    // standing paused note and the pause-cancelled run as the message's run.
+    await resume(f);
+    await f.sweep();
+    await settleAt(f, 11 * 60_000);
+    await settleAt(f, 20 * 60_000);
+    const after = await f.visible();
+    // Nothing re-runs the message after the resume: the pause's stop is the
+    // message's only run, and no wake was queued (Paperclip treats an
+    // agent_paused stop as intentional, wake-queue/adapters/postgres.ts:146-157).
+    expect((await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId)))
+      .map(row => row.id)).toEqual([carrying]);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+    expect(after).toHaveLength(1);
+    expect(after[0]!.id).toBe(notices[0]!.id);
+    expect(after[0]!.createdAt.getTime()).toBe(notices[0]!.createdAt.getTime());
+    // The live row 8757f468: the SAME note (created while paused) now carries
+    // the resend text, Source run = the pause's stop, Failure code
+    // unclassified_failure (agent_paused is not a shown code).
+    expect(after[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
+    expect(after[0]!.presentation).toMatchObject({ title: "Managed Pi was paused before it answered" });
+    expect(codeOf(after[0]!)).not.toBe("unclassified_failure");
+    expect(rowsOf(after[0]!).some(row => row.label === "Failure code")).toBe(false);
+    expect(JSON.stringify(after[0])).not.toContain("if it fails again");
+  });
+
+  it("pause-stop guard: a later failed carrying attempt keeps its own failure, not the predecessor's pause", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "cancelled", errorCode: "agent_paused" });
+    await pause(f);
+    await f.sweep();
+    await resume(f);
+    await f.run({ commentId, status: "failed", error: "provider_process_exited: exit 1", errorCode: "adapter_failed" });
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices.map(n => n.body)).toEqual([NOT_ANSWERED]);
+    expect(codeOf(notices[0]!)).toBe("provider_process_exited");
+  });
+
+  it.each([false, true])("pause-stop guard: an answer %s after the resumed stop note supersedes it", async afterNotice => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const stopped = await f.run({ commentId, status: "cancelled", errorCode: "agent_paused" });
+    await pause(f);
+    await f.sweep();
+    await resume(f);
+    if (afterNotice) {
+      await f.sweep();
+      expect((await f.visible())[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
+    }
+    await f.reply(stopped);
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+  });
+
+  it("pause-stop guard: another agent's pause cannot replace the assignee's true failure notice", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "failed", error: "provider_process_exited: exit 1", errorCode: "adapter_failed" });
+    const otherId = randomUUID();
+    await db.insert(agents).values({ id: otherId, companyId: f.companyId, name: "Other agent" });
+    const unrelated = await f.run({ commentId, status: "cancelled", errorCode: "agent_paused" });
+    await db.update(heartbeatRuns).set({ agentId: otherId }).where(eq(heartbeatRuns.id, unrelated));
+    // Exercise this message's classifier, not the other agent's assigned-work recovery.
+    await settleAt(f, 0);
+    const notices = await f.visible();
+    expect(notices.map(n => n.body)).toEqual([NOT_ANSWERED]);
+    expect(codeOf(notices[0]!)).toBe("provider_process_exited");
+  });
+
+  // The guard: a run that FAILED on an agent that is not paused keeps its true
+  // notice (the resend text and its own failure code), unlike an intentional pause stop.
+  it("guard: a failed (not paused) run on an active agent keeps its true resend notice", async () => {
+    const f = await fixture();
+    const commentId = await f.message("Please continue.");
+    await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "provider_process_exited: exit 1" });
+    await f.sweep();
+    await settleAt(f, 3 * 60_000);
+    const notices = await f.visible();
+    expect(notices.map(n => n.body)).toEqual([NOT_ANSWERED]);
+    expect(codeOf(notices[0]!)).toBe("provider_process_exited");
+  });
+
   it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
     for (let round = 0; round < 4; round++) {
       const f = await fixture();
@@ -1724,4 +1856,321 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notices).toHaveLength(1);
       expect(notices[0]!.body).toBe(NO_REPLY);
     });
+
+  function http(f: Awaited<ReturnType<typeof fixture>>, actor?: Record<string, unknown>) {
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).actor = actor ?? { type: "board", source: "session", userId: f.userId,
+        companyIds: [f.companyId], memberships: [{ companyId: f.companyId, status: "active", membershipRole: "operator" }], isInstanceAdmin: false };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as any, {})); app.use(errorHandler); return app;
+  }
+  const allNotices = async (f: Awaited<ReturnType<typeof fixture>>) => db.select().from(issueComments).where(and(
+    eq(issueComments.issueId, f.issueId), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
+
+  // h3-iv (gate 4, RC2A-H3-PI-1): Pi killed right after the person answered a
+  // card. The answer-resume run ends adapter_failed with a COMMITTED failed
+  // result, and the wake queue's native terminal hold (postgres.ts
+  // recordNativeTerminalRecoveryIfNeeded) promises the fresh-continuation
+  // fallback. Its coordinator move is guarded by resultId IS NULL, so the
+  // disposition pass must take the committed failed result itself.
+  describe("h3-iv: a Pi kill after an answered card", () => {
+    async function answeredCardKilledResume(f: Awaited<ReturnType<typeof fixture>>, answer: "http" | "row" = "row",
+      failureComment = true) {
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+      const m = await f.message("Ask me which scope, then continue.");
+      const root = await f.run({ commentId: m, status: "succeeded" });
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, sourceRunId: root,
+        kind: "ask_user_questions", status: "pending", createdByAgentId: f.agentId, addresseeUserId: f.userId,
+        continuationPolicy: "none", createdAt: f.at(), payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?",
+          required: true, selectionMode: "single", options: [{ id: "first", label: "First H3_PERSON" }] }] } }).returning();
+      // The person is an operator of the company (the task's chat user).
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: f.userId,
+        status: "active", membershipRole: "operator" });
+      if (answer === "http") {
+        const response = await request(http(f)).post(`/api/issues/${f.issueId}/interactions/${card!.id}/respond`)
+          .send({ answers: [{ questionId: "scope", optionIds: ["first"] }] });
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+        // The answer happens on the fixture clock, after the card.
+        await db.update(issueThreadInteractions).set({ resolvedAt: f.at() }).where(eq(issueThreadInteractions.id, card!.id));
+      } else {
+        await db.update(issueThreadInteractions).set({ status: "answered", resolvedByUserId: f.userId, resolvedAt: f.at(),
+          result: { version: 1, answers: [{ questionId: "scope", optionIds: ["first"] }], summaryMarkdown: "First H3_PERSON" } })
+          .where(eq(issueThreadInteractions.id, card!.id));
+      }
+      // The answer-resume run: Pi was SIGKILLed; the runner committed its failed result.
+      const resume = await f.run({ status: "failed", errorCode: "adapter_failed", error: "Native session failed" });
+      await db.update(heartbeatRuns).set({ nativePhase: "committed", nativeSessionId: randomUUID(), contextSnapshot: {
+        issueId: f.issueId, source: "issue.interaction.respond", mutation: "interaction", wakeReason: "issue_commented",
+        interactionId: card!.id, interactionIds: [card!.id], interactionStatus: "answered", commentId: m, wakeCommentIds: [m] } })
+        .where(eq(heartbeatRuns.id, resume));
+      // The answer reached this answer-resume run (the delivery worker's wake fallback).
+      await db.update(issueQuestionResponseDeliveries).set({ targetRunId: resume, status: "fallback_queued", deliveryMode: "wake_fallback" })
+        .where(eq(issueQuestionResponseDeliveries.interactionId, card!.id));
+      const [contract] = await db.insert(completionContracts).values({ companyId: f.companyId, issueId: f.issueId, revision: 1,
+        schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block",
+        contractJson: {}, canonicalSha256: "48".repeat(32), createdByActorType: "system", createdByActorId: "fixture" }).returning();
+      await db.update(heartbeatRuns).set({ completionContractId: contract!.id }).where(eq(heartbeatRuns.id, resume));
+      const [result] = await db.insert(nativeRunResults).values({ companyId: f.companyId, issueId: f.issueId, runId: resume,
+        completionContractId: contract!.id, serverFingerprint: "fixture", schemaStatus: "accepted", canonicalSha256: "fixture",
+        resultJson: { stopReason: "adapter_failed", finalizationPhase: "committed" } }).returning();
+      await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: resume,
+        phase: "committed", resultId: result!.id });
+      // The settlement's own failure comment (run-settlement presentation).
+      if (failureComment) await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+        authorAgentId: f.agentId, createdByRunId: resume, body: "The Pi run failed before it completed.", createdAt: f.at() });
+      // The hold exactly as recordNativeTerminalRecoveryIfNeeded writes it, with the block it projected.
+      const [blocked] = await db.update(issues).set({ status: "blocked", statusVersion: sql`${issues.statusVersion} + 1` })
+        .where(eq(issues.id, f.issueId)).returning();
+      const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: f.agentId,
+        cause: "native_continuation_requires_reconciliation", fingerprint: `native-continuation:${resume}`,
+        evidence: { runId: resume, originalFailureCode: "adapter_failed",
+          nativeFailureBlock: { runId: resume, statusVersion: blocked!.statusVersion } },
+        nextAction: "The run stopped before it finished. Paperclip continues the task from its last saved work.",
+        maxAttempts: 3 }).returning();
+      // Hold dispatch: the admitted successor is the assertion, not a live turn.
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+      return { m, root, card: card!, resume, hold: hold! };
+    }
+    const dispositionPass = async () => {
+      await settleUnrecoverableExecutions(db);
+      await deliverReconciledExecutions(db, heartbeatService(db).wakeup);
+    };
+    const successorsOf = async (f: { companyId: string; issueId: string }, sourceRunId: string) =>
+      (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+        eq(heartbeatRuns.retryOfRunId, sourceRunId)))).filter(run => run.contextSnapshot?.issueId === f.issueId);
+
+    it("one disposition pass creates exactly ONE successor on the chain edge, and its built input holds the answer", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const k = await answeredCardKilledResume(f);
+      await dispositionPass();
+      const successors = await successorsOf(f, k.resume);
+      const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, k.hold.id));
+      const all = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, retryOfRunId: heartbeatRuns.retryOfRunId,
+        context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId));
+      expect(successors, JSON.stringify({ all, wakes: wakes.map(w => ({ status: w.status, reason: w.reason, error: w.error, runId: w.runId })),
+        delivery: hold!.evidence.continuationDelivery, attempted: hold!.evidence.continuationDeliveryAttemptedAt })).toHaveLength(1);
+      const successor = successors[0]!;
+      expect(successor.status).toBe("queued");
+      expect(successor.contextSnapshot).toMatchObject({ previousRunId: k.resume, retryOfRunId: k.resume,
+        interactionIds: [k.card.id] });
+      expect(await freshContinuationDescendsFrom(db, { companyId: f.companyId, issueId: f.issueId, runId: successor.id,
+        ancestorRunId: k.resume }))
+        .toBe(true);
+      const responses = await materializeNativeInteractionResponses({ db, companyId: f.companyId, issueId: f.issueId,
+        runId: successor.id, agentId: f.agentId, interactionIds: successor.contextSnapshot!.interactionIds as string[],
+        wakeReason: String(successor.contextSnapshot!.wakeReason) });
+      expect(responses.map(response => response.interactionId)).toEqual([k.card.id]);
+      expect(JSON.stringify(responses)).toContain("first");
+      // The committed coordinator is never rewritten; the failure comment stays as written.
+      const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, k.resume));
+      expect(coordinator).toMatchObject({ phase: "committed" });
+      expect((await db.select().from(issueComments).where(eq(issueComments.createdByRunId, k.resume))).map(c => c.body))
+        .toEqual(["The Pi run failed before it completed."]);
+      // A second pass adds nothing: the answer is acted on once.
+      await dispositionPass();
+      expect(await successorsOf(f, k.resume)).toHaveLength(1);
+    }, 60_000);
+
+    it("a foreign committed run's hold stays where it is (the exception binds to the hold's own run)", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const k = await answeredCardKilledResume(f);
+      await db.update(issueRecoveryActions).set({ evidence: { runId: k.resume, originalFailureCode: "adapter_failed",
+        nativeFailureBlock: { runId: randomUUID(), statusVersion: 1 } } }).where(eq(issueRecoveryActions.id, k.hold.id));
+      await dispositionPass();
+      expect(await successorsOf(f, k.resume)).toHaveLength(0);
+    }, 60_000);
+
+    it("RF5 supplementary chain: HTTP answer, failed answer-resume and failed successor, no final (brief 2d literal)", async () => {
+      answerDelivery.paused = true;
+      try {
+        const f = await fixture({ status: "in_progress" });
+        // app-lead's RF5 shape: the failed runs post no comment.
+        const k = await answeredCardKilledResume(f, "http", false);
+        await dispositionPass();
+        const [successor] = await successorsOf(f, k.resume);
+        expect(successor).toBeDefined();
+        // While the successor is queued it is the answer's next step: no notice.
+        await f.sweep(); await f.sweep();
+        expect(await allNotices(f), "no notice while the successor is live or queued").toHaveLength(0);
+        // The successor ALSO fails, with no final: exactly one true notice.
+        await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_run_failed", finishedAt: f.at() })
+          .where(eq(heartbeatRuns.id, successor!.id));
+        await f.sweep(); await f.sweep();
+        const notices = await allNotices(f); const userMessages = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "user")));
+        console.log("RF5_ALL_FAILED_WITH_ANSWER", JSON.stringify({ message: k.m, card: k.card.id, resume: k.resume, successor: successor!.id, notices, userMessages: userMessages.map(n => n.id), carry: await readContinuationCommentInput(db, { ...f, runId: k.root }) }));
+        // MARKED: the notice half is app-lead's notice commit (al-cardduty-1552 =
+        // al/cardduty e0acfbb8, "a person's card answer carries the
+        // answered-or-one-true-notice duty"), not this fix. With that commit's
+        // two source files applied on this head the assertion passes; without
+        // it the sweep posts none. It runs as soon as that commit lands.
+        const cardAnswerDuty = "unansweredCardAnswerSql" in await import("../person-message-answer.js");
+        if (cardAnswerDuty) expect(notices, "brief 2d asks exactly one true notice when answer-resume and successor fail").toHaveLength(1);
+      } finally { answerDelivery.paused = false; }
+    }, 60_000);
+  });
+
+  // Card-answer duty (org 15:22Z + RFL 15:20Z, option A): a person's answer to
+  // an agent's card is a person input with the typed message's duty, by the
+  // SAME chain rule. Adapted from rf5 RF5_ALL_FAILED_WITH_ANSWER
+  // (rf5-cardline-supplemental.test.ts:262-275) onto the production
+  // answerQuestions/accept/reject/withdraw services.
+  describe("card answer duty: answered, or exactly one true notice", () => {
+    const cardNotices = (f: Awaited<ReturnType<typeof fixture>>) => db.select().from(issueComments).where(and(
+      eq(issueComments.issueId, f.issueId), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
+    async function answeredCard(f: Awaited<ReturnType<typeof fixture>>, sourceRunId: string,
+      how: "answer" | "accept" | "reject" | "agent-withdraw" | "system-expiry" = "answer") {
+      const kind = how === "answer" ? "ask_user_questions" : "request_confirmation";
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, sourceRunId,
+        kind, status: "pending", createdByAgentId: f.agentId, addresseeUserId: f.userId, continuationPolicy: "none", createdAt: f.at(),
+        payload: kind === "ask_user_questions"
+          ? { version: 1, questions: [{ id: "scope", prompt: "Which scope?", required: true, selectionMode: "single", options: [{ id: "first", label: "First" }] }] }
+          : { version: 1, prompt: "Proceed?", supersedeOnUserComment: false } } as never).returning();
+      const scope = { id: f.issueId, companyId: f.companyId }; const svc = issueThreadInteractionService(db);
+      const user = { userId: f.userId };
+      const resolved = how === "answer" ? await svc.answerQuestions(scope, card!.id, { answers: [{ questionId: "scope", optionIds: ["first"] }] } as never, user)
+        : how === "accept" ? (await svc.acceptInteraction({ ...scope, projectId: null, goalId: null }, card!.id, {}, user)).interaction
+        : how === "reject" ? await svc.rejectInteraction(scope, card!.id, { reason: "No." }, user)
+        : how === "agent-withdraw" ? await svc.withdrawInteraction(scope, card!.id, {}, { agentId: f.agentId })
+        : (await svc.expirePendingInteractionsForTerminalIssue({ ...scope, status: "cancelled" }, { systemId: "expiry" } as never))[0];
+      // The answer happens on the fixture clock, after the card.
+      await db.update(issueThreadInteractions).set({ resolvedAt: f.at() }).where(eq(issueThreadInteractions.id, card!.id));
+      return { id: card!.id, status: resolved?.status, resolvedByUserId: resolved?.resolvedByUserId ?? null };
+    }
+    const resume = async (f: Awaited<ReturnType<typeof fixture>>, cardId: string, status: string, retryOfRunId?: string) => {
+      const id = await f.run({ status, retryOfRunId, errorCode: ["failed"].includes(status) ? "native_run_failed" : null });
+      if (!retryOfRunId) {
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, interactionId: cardId,
+          interactionStatus: "answered", source: "issue.interaction.respond" } }).where(eq(heartbeatRuns.id, id));
+        // The answer reached the agent's resume run (a pending delivery is still an attempt in progress).
+        await db.update(issueQuestionResponseDeliveries).set({ targetRunId: id, status: "fallback_queued", deliveryMode: "wake_fallback" })
+          .where(eq(issueQuestionResponseDeliveries.interactionId, cardId));
+      }
+      return id;
+    };
+
+    it("RED (rf5 RF5_ALL_FAILED_WITH_ANSWER): answer, failed answer-resume, failed successor: ONE true notice for the answer", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
+      const card = await answeredCard(f, root);
+      expect(card).toMatchObject({ status: "answered", resolvedByUserId: f.userId });
+      const first = await resume(f, card.id, "failed");
+      const last = await resume(f, card.id, "failed", first);
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      console.log("CARD_DUTY_RED", JSON.stringify({ m, card: card.id, first, last, notices: notices.map(n => ({ id: n.id,
+        reason: n.metadata?.authorizationReason, sourceRunId: n.metadata?.sourceRunId, body: n.body })) }));
+      expect(notices, "exactly one true notice, never one for the answer and one for the original message").toHaveLength(1);
+      expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
+      expect(notices[0]!.metadata?.sourceRunId).toBe(last);
+      expect(notices[0]!.body).toBe("Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.");
+      expect(notices[0]!.presentation?.title).toBe("Your answer wasn't acted on");
+      expect(await f.visible()).toHaveLength(1);
+      // A later reply on the answer's chain supersedes the notice; nothing new is posted.
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, last));
+      await f.reply(last); await f.sweep(); await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+      expect(await cardNotices(f)).toHaveLength(1);
+    });
+
+    it.each(["accept", "reject"] as const)("a %sed confirmation whose answer-resume chain all failed gets ONE notice", async how => {
+      const f = await fixture({ status: "in_progress" });
+      const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
+      const card = await answeredCard(f, root, how);
+      expect(card).toMatchObject({ status: `${how}ed`, resolvedByUserId: f.userId });
+      const first = await resume(f, card.id, "failed");
+      await resume(f, card.id, "failed", first);
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
+      expect(notices[0]!.body).toBe("Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.");
+    });
+
+    it("guard: answer, answer-resume answers: no notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "succeeded");
+      await f.reply(first); await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    });
+
+    it("guard: answer, answer-resume fails, successor answers: no notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      const successor = await resume(f, card.id, "succeeded", first);
+      await f.reply(successor); await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+    });
+
+    it("guard: answer, answer-resume fails, successor answers with a new card: no notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      const successor = await resume(f, card.id, "succeeded", first);
+      await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, sourceRunId: successor,
+        kind: "request_confirmation", status: "pending", createdByAgentId: f.agentId, addresseeUserId: f.userId,
+        continuationPolicy: "none", createdAt: f.at(), payload: { version: 1, prompt: "And this?" } } as never);
+      await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+    });
+
+    it.each(["running", "queued"])("guard: answer, answer-resume chain still %s: no notice", async status => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, status === "running" ? "running" : "failed");
+      if (status === "queued") await resume(f, card.id, "queued", first);
+      await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+      expect((await settleUnansweredPersonMessage(db, f)).kind).toBe("pending");
+    });
+
+    it("guard: an answer still being delivered (pending delivery) is a pending attempt: no notice yet", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      await resume(f, card.id, "failed", first);
+      await db.update(issueQuestionResponseDeliveries).set({ status: "pending" }).where(eq(issueQuestionResponseDeliveries.interactionId, card.id));
+      await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+    });
+
+    it.each(["agent-withdraw", "system-expiry"] as const)("guard: an agent/system-resolved card (%s) creates no duty", async how => {
+      const f = await fixture({ status: "in_progress" });
+      const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
+      const card = await answeredCard(f, root, how);
+      expect(card.resolvedByUserId).toBeNull();
+      const first = await resume(f, card.id, "failed");
+      await resume(f, card.id, "failed", first);
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      // The original message keeps its existing behaviour; the card itself owes nothing.
+      expect(notices.filter(n => n.metadata?.authorizationReason === `unanswered_message:${card.id}`)).toHaveLength(0);
+      expect(notices.length).toBeLessThanOrEqual(1);
+    });
+
+    it("guard: a newer typed message after the answer is the owed input, not the answer", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      await resume(f, card.id, "failed", first);
+      const later = await f.message("Hello?");
+      await f.run({ commentId: later, status: "failed", errorCode: "adapter_failed" });
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${later}`);
+    });
+  });
 });

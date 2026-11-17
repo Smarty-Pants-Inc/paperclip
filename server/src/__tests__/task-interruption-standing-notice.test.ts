@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 import { HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
 import { EXECUTION_BLOCKER_PERSON_RETRY_ACTION, getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "../services/execution-control-deadline.js";
@@ -79,6 +81,44 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
       .toMatchObject({ source: "held", text: HELD_PREDECESSOR_NOTICE });
     // No recovery action here, so there is no execution blocker to refuse Retry.
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  it("card-answer notice: the all-failed answer-resume chain keeps the existing Retry offered beside the exact notice", async () => {
+    const f = await conversation("native_run_failed");
+    const userId = `user-${randomUUID()}`;
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: userId, body: "Which scope should we use?", createdAt: next() }).returning();
+    const [root] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "succeeded", runtimeMode: "native", createdAt: next(), finishedAt: next(),
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: message!.id } }).returning();
+    // Persisted person answer, followed by its failed resume and failed successor.
+    // No pending question/delivery or automatic continuation remains in this state.
+    const [answer] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      sourceRunId: root!.id, kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId,
+      addresseeUserId: userId, resolvedByUserId: userId, createdAt: next(), resolvedAt: next(),
+      continuationPolicy: "none", payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?",
+        required: true, selectionMode: "single", options: [{ id: "first", label: "First" }] }] },
+      result: { version: 1, answers: [{ questionId: "scope", optionIds: ["first"] }] } }).returning();
+    const [resume] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "failed", runtimeMode: "native", errorCode: "native_run_failed",
+      createdAt: next(), finishedAt: next(), contextSnapshot: { issueId: f.issueId, interactionId: answer!.id,
+        interactionStatus: "answered", source: "issue.interaction.respond" } }).returning();
+    const [last] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "failed", runtimeMode: "native", errorCode: "native_run_failed",
+      retryOfRunId: resume!.id, createdAt: next(), finishedAt: next(), contextSnapshot: { issueId: f.issueId } }).returning();
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed" });
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
+    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      eq(issueComments.authorType, "system")));
+    const presentation = await card(f);
+    console.log("CARD_ANSWER_RETRY", JSON.stringify({ answerId: answer!.id, lastRunId: last!.id,
+      notice: notes.map(note => ({ body: note.body, sourceRunId: note.metadata?.sourceRunId })), presentation }));
+    // This is the real server projection consumed by ExecutionBlockerNotice, not a fabricated canRetry prop.
+    expect(presentation).toMatchObject({ state: "failed", canRetry: true, observedRunId: last!.id });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.metadata).toMatchObject({ authorizationReason: `unanswered_message:${answer!.id}`, sourceRunId: last!.id });
+    expect(notes[0]!.body).toBe("Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.");
   });
 
   it("(b) no notice: unchanged generic failure with Retry", async () => {
