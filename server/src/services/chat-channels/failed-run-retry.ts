@@ -15,7 +15,10 @@ import { readChatAuthorizationRun } from "./authorization-run-read.js";
 import { selectTaskRetryInput, claimTaskRetryInput, settleTaskRetryInput, releaseUnadmittedTaskRetryInput, taskRetryInputSchema, type TaskRetryInput } from "./task-retry-input.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { taskRetryMutationAllowed } from "../task-retry.js";
-import { retryRefusedBeforeAdmission } from "../task-retry-eligibility.js";
+import { retryHeldBehindRestore, retryRefusedBeforeAdmission } from "../task-retry-eligibility.js";
+
+/** fam-retry2: how soon a chat Retry held behind a restore hold is looked at again. */
+const FAILED_RUN_RETRY_RESTORE_HOLD_RECHECK_MS = 30_000;
 import { z } from "zod";
 import type { TaskRetryWakeAuthority } from "./github/task-retry-authorization.js";
 
@@ -1983,6 +1986,16 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       const resumeTaskRetry = typeof claimed.payload.taskRetryIntentId === "string" &&
         existing[0]?.status === "deferred_issue_execution" && !existing[0].runId &&
         existing[0].payload?.taskRetryRequestId === claimed.payload.taskRetryIntentId;
+      // fam-retry2 (upstream's restore-hold semantics): the one authority's
+      // accept-held outcome. The chat Retry stays accepted (issued, attempts not
+      // spent) with the hold's words and starts no wake now; it is looked at again
+      // and wakes once the files are back. A repeat lands here again: no 2nd wake.
+      const heldBehindRestore = !existing.length || resumeTaskRetry
+        ? await retryHeldBehindRestore(db, { companyId: scope.companyId, issueId: scope.issueId }) : null;
+      if (heldBehindRestore) return settle("issued", { code: "failed_chat_retry_held", attemptCount: previousAttemptCount,
+        held: { reason: heldBehindRestore.reason, message: heldBehindRestore.cardText }, userAction: heldBehindRestore.userAction,
+        message: heldBehindRestore.cardText, nextAction: heldBehindRestore.nextAction,
+        retryAt: new Date(Date.now() + FAILED_RUN_RETRY_RESTORE_HOLD_RECHECK_MS).toISOString() });
       if (!existing.length || resumeTaskRetry) {
         const context = {
           issueId: source.issueId,

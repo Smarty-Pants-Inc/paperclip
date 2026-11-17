@@ -18,6 +18,7 @@ export function taskRetryNotStartedReason(result: RetryResult): string | null {
   if (!result.accepted && result.refused) return result.refused.message;
   if (!result.accepted && result.alreadyMovedOn) return ALREADY_MOVED_ON_MESSAGE;
   if (!result.accepted) return STALE_TASK_RETRY_MESSAGE;
+  if (result.held) return result.held.message;
   const outcome = result.scheduledRetry?.outcome;
   if (outcome && outcome !== "promoted" && outcome !== "already_promoted") return result.scheduledRetry!.message;
   return null;
