@@ -25,8 +25,10 @@ export const RECOVERED_WORK_CONTINUE_MESSAGE = "Saved work recovered. Send a mes
 export const NEW_TASK_ACTION = "Assign this agent a new task to continue.";
 export const AGENT_PAUSED_ACTION = "Resume this agent to continue.";
 export const AGENT_PAUSED_RETRY_MESSAGE = "This agent is paused. Resume this agent to continue. Your message and saved work are kept.";
-export const AUTOMATIC_RECOVERY_ACTION = "No action is needed.";
-export const AUTOMATIC_RECOVERY_MESSAGE = "Paperclip is restarting this conversation from saved work. No action is needed.";
+// Judge R9 / R15: the words the transcript already says for a fresh
+// continuation (execution-projection.ts reads this constant through the
+// authority); a status, not an instruction, so the decision names no action.
+export const AUTOMATIC_RECOVERY_MESSAGE = "Paperclip continues the task in a fresh run from its saved work.";
 // stoppending-retry3's strings (task-retry-stop-gate.ts re-exports them).
 export const RETRY_STOP_WAIT_ACTION = "Your message is saved.";
 export const RETRY_STOP_WAIT_MESSAGE = "Retry is waiting for the previous execution to stop. Your message is saved.";

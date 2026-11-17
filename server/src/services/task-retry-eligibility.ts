@@ -1,7 +1,7 @@
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { agents, agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import {
-  AGENT_PAUSED_ACTION, AGENT_PAUSED_RETRY_MESSAGE, AUTOMATIC_RECOVERY_ACTION, AUTOMATIC_RECOVERY_MESSAGE, HELD_PREDECESSOR_NOTICE,
+  AGENT_PAUSED_ACTION, AGENT_PAUSED_RETRY_MESSAGE, AUTOMATIC_RECOVERY_MESSAGE, HELD_PREDECESSOR_NOTICE,
   HELD_RECOVERED_WORK_MESSAGE, NEW_TASK_ACTION, NO_SAVED_WORK_NEW_TASK_MESSAGE, NO_SAVED_WORK_RETRY_ACTION, NO_SAVED_WORK_RETRY_MESSAGE,
   RECOVERED_WORK_CONTINUE_MESSAGE, RECOVERED_WORK_MESSAGE, RECOVERED_WORK_RETRY_ACTION, RECOVERED_WORK_RETRY_MESSAGE,
   RETRY_STOP_UNPROVEN_ACTION, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_WAIT_ACTION, RETRY_STOP_WAIT_MESSAGE, SEND_MESSAGE_ACTION,
@@ -100,7 +100,7 @@ function decision(userAction: RetryUserAction, reason: string, text: string | nu
  */
 export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority {
   if (facts.agentPaused) return decision("resume", "agent_paused", AGENT_PAUSED_RETRY_MESSAGE, AGENT_PAUSED_ACTION);
-  if (facts.automaticRecovery) return decision("wait", "automatic_recovery", AUTOMATIC_RECOVERY_MESSAGE, AUTOMATIC_RECOVERY_ACTION);
+  if (facts.automaticRecovery) return decision("wait", "automatic_recovery", AUTOMATIC_RECOVERY_MESSAGE, null);
   if (facts.stopGate === "waiting") return decision("wait", "execution_settling", RETRY_STOP_WAIT_MESSAGE, RETRY_STOP_WAIT_ACTION);
   if (facts.stopGate === "expired")
     return decision("new_task", "execution_stop_unproven", RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_ACTION);
