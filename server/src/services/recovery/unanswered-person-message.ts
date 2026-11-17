@@ -591,9 +591,17 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
   if (!boardHold && !agentPaused && !settingUp) {
+    // A wake already bound to a run that has ENDED is not a further attempt:
+    // that run was the attempt, and it is judged above as the message's run
+    // (a fresh successor that failed unanswered must restore the instruction,
+    // not wait on its own spent wake). The wake claim takes only unbound wakes
+    // (heartbeat/queue.ts claim: run_id is null).
     const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-      inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
+      inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+      sql`not exists (select 1 from ${heartbeatRuns} r where r.company_id = ${agentWakeupRequests.companyId}
+        and (r.id = ${agentWakeupRequests.runId} or r.wakeup_request_id = ${agentWakeupRequests.id})
+        and r.status in (${sql.join(TERMINAL.map(status => sql`${status}`), sql`, `)}))`));
     if (wakes.some(wake => wakeCarriesIssue(wake.payload, issue.id))) {
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
