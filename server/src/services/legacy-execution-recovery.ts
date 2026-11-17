@@ -48,6 +48,11 @@ export const WORKSPACE_RESTORE_PENDING_KEY = "workspaceRestorePending";
 export function workspaceRestoreHoldNextAction(evidence: Record<string, unknown> | null | undefined): string {
   return evidence?.[WORKSPACE_RESTORE_PENDING_KEY] === true ? RECOVERING_SAVED_WORK_NEXT_ACTION : UNRESTORED_FILES_NEXT_ACTION;
 }
+/** For producers that pin a source before any restore: the files are only owed
+ * unless the run already records a real restore/copy-back failure. */
+export function workspaceRestoreOnlyOwed(run: Pick<Run, "resultJson">): boolean {
+  return !hasWorkspaceRestoreFailure(run.resultJson);
+}
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 const unusedReconciliationContextKeys = [

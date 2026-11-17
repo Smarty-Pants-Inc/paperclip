@@ -220,6 +220,7 @@ import type { instanceSettingsService } from "../instance-settings.js";
 import type { createRunDispatch } from "../../modules/run-dispatch/index.js";
 import { hasRetainedExternalChatRetry, type PostCommitEffect as WakeQueuePostCommitEffect, type createWakeQueue } from "../../modules/wake-queue/index.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
+import { retryUnlessTransactionBound } from "../transaction-retry.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type QueuedRunCandidate = Pick<HeartbeatRun, "id" | "companyId" | "agentId" | "status" | "invocationSource" | "createdAt"
@@ -3541,7 +3542,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const issueActivityPublications: ActivityPublication[] = [];
       const issuePostCommitActions: IssuePostCommitAction[] = [];
 
-      const outcome = await db
+      // The wake insert sites below run in this one admission transaction. A
+      // deadlock (40P01) or serialization failure (40001) rolls all of it
+      // back, so the admission is retried from a fresh transaction with the
+      // same request (same comment, idempotency key and receipt), bounded by
+      // withTransactionRetry. A person's message is never dropped on a lost
+      // lock race (Hold50 RFL: the route's fire-and-forget wakeup only logs).
+      const contextBeforeAdmission = { ...enrichedContextSnapshot };
+      const payloadBeforeAdmission = payload;
+      const operatorBeforeAdmission = operatorResponsibleUserId;
+      const outcome = await retryUnlessTransactionBound(db, async attempt => {
+        if (attempt > 1) {
+          cancelledRunsToEmit.length = 0;
+          issueActivityPublications.length = 0;
+          issuePostCommitActions.length = 0;
+          for (const key of Object.keys(enrichedContextSnapshot)) delete enrichedContextSnapshot[key];
+          Object.assign(enrichedContextSnapshot, contextBeforeAdmission);
+          payload = payloadBeforeAdmission;
+          operatorResponsibleUserId = operatorBeforeAdmission;
+          logger.warn({ agentId, issueId, attempt }, "wake admission lost a lock race; retrying from a fresh transaction");
+        }
+        return db
         .transaction(withDurableChatAdmission(durableRequest, async (tx) => {
           await lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent);
           await tx.execute(
@@ -5333,6 +5354,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "deferred" as const };
           throw error;
         });
+      });
 
       // The admission has committed. What follows is dispatch of saved rows.
       if (outcome.kind !== "deferred" && outcome.kind !== "skipped") admission?.saved();
