@@ -311,7 +311,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await readFile(join(f.box, "task.txt"), "utf8")).toBe(EDIT);
     expect(f.stoppedRunProfile?.nativeCancelledWarmExport).toMatchObject({ state: "unproven", reason: "export_failed" });
     expect(f.events.find(event => event.eventType === "workspace_export_deferred")).toMatchObject({ level: "warn",
-      message: expect.stringContaining("the warm box stays protected") });
+      message: expect.stringContaining("The box is kept, so nothing on it is lost.") });
   }, 60_000);
 
   it("a Stop whose cancellation is NOT settled runs no export", async () => {
