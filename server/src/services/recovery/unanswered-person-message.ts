@@ -656,8 +656,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // the Retry remedy, even when classified as system-owned recovery. Do not
   // contradict it with "send the message again". A hold alone, a deleted
   // notice, an older run's notice, or an automatic continuation is not enough.
+  // Require the producer's affirmative "Press Retry" sentence, not merely
+  // "retry": a stale card says "do not retry from this older card".
   // This decision is re-read unchanged under the issue fence before writing.
-  if (run && activeRecovery && /\bretry\b/i.test(activeRecovery.nextAction)) {
+  if (run && activeRecovery && /(?:^|[.!?]\s+)Press Retry\b/i.test(activeRecovery.nextAction)) {
     const recoveryNotices = await q.select({ metadata: issueComments.metadata }).from(issueComments).where(and(
       eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
