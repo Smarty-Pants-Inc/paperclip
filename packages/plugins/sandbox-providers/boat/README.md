@@ -1,5 +1,24 @@
 # Boat sandbox provider 0.1.16-spare (unreleased)
 
+## Held run lease auto-stop TTL
+
+Boat's [auto-stop timer](https://docs.boat.dev/long-running-tasks/auto-stop)
+counts from create, resume, or extend, not exec/SSH activity. After a successful
+run acquire, or resume carrying the host's `runId`, the plugin renews the held
+box with the existing `PATCH /sandboxes/{id}` `{ttlSeconds}` path every
+`max(60 seconds, effective TTL / 3)`. Each PATCH sets the remaining time from
+now to the environment's effective TTL, including existing warm/reconnect floors.
+It never disables auto-stop, creates a sandbox, or resumes one.
+
+Only one RUN renewal may be in flight per account/box. Failures emit a closed
+`Boat run lease TTL refresh` warning and retry at the next tick. Release, stop,
+destroy, shutdown, or a missing/terminal box ends renewal and drains active work.
+The existing release policy still performs confirmed stop-and-retain immediately;
+it does not leave a released box running until TTL. If the worker disappears,
+Boat's last finite TTL remains the fallback. Legacy warm handoffs without
+`runId` retain their existing one-shot `Boat warm lease TTL refresh`, with no
+idle RUN timer. This behavior is fixture-tested, not live Boat qualification.
+
 ## Ready spare pool
 
 The Boat plugin's company-scoped instance settings are `spares` (0–3, default 0),
