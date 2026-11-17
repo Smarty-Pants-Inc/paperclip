@@ -350,6 +350,42 @@ const support = await getEmbeddedPostgresTestSupport();
     } finally { vi.useRealTimers(); }
   }, 60_000);
 
+  it("U9 card3 Send-only: a receipt after the card never admits pre-Stop messages; Send then admits them once", async () => {
+    const f = await seed({ receipt: false });
+    const calls = { n: 0, runId: f.sourceRunId };
+    const cleanup = heartbeatService(db, { environmentRuntime: stuckRuntime(calls, 2) });
+    const t0 = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"], now: t0 });
+    try {
+      vi.setSystemTime(t0 + RETRY_MS);
+      await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });
+      expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(c => c.status)).toEqual(["escalated"]);
+      vi.setSystemTime(t0 + 2 * RETRY_MS + 1_000);
+      await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+      await heartbeatService(db).resumeRemoteStopComments(source);
+      expect(await successors(f)).toHaveLength(0);
+      expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      const queue = await readQueue(f);
+      expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: STOP_LINE });
+      const sent = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
+        .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
+      expect(sent.status, JSON.stringify(sent.body)).toBeLessThan(300);
+      vi.useRealTimers();
+      await vi.waitFor(async () => expect(await successors(f)).toHaveLength(1), { timeout: 15_000, interval: 200 });
+      const [successor] = await successors(f);
+      const envelope = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId,
+        agentId: f.agentId, runId: successor.id, context: successor.contextSnapshot!, summary: null, exposeLowTrustRaw: false });
+      expect(envelope.originCommentIds).toEqual(f.commentIds);
+      expect(new Set(envelope.originCommentIds).size).toBe(f.commentIds.length);
+      await heartbeatService(db).resumeRemoteStopComments(source);
+      expect(await successors(f)).toHaveLength(1);
+      expect((await wakeOf(f.queueId)).runId).toBe(successor.id);
+      await evidence(`card3SendOnly ${JSON.stringify({ preStopIds: f.commentIds, admittedOrigins: envelope.originCommentIds,
+        successorRunId: successor.id, wake: await wakeOf(f.queueId), sendLine: queue.executionWait })}`);
+    } finally { vi.useRealTimers(); }
+  }, 60_000);
+
   it("U9 card3: input sent AFTER the card is admitted once on receipt; pre-Stop input waits for Send, then is admitted once", async () => {
     const f = await seed({ receipt: false });
     const calls = { n: 0, runId: f.sourceRunId };
