@@ -477,7 +477,7 @@ const support = await getEmbeddedPostgresTestSupport();
     }
   }, 60_000);
 
-  it("AUDIT Q2 cancelled deferred export names no recovery action that this state lacks", async () => {
+  it("(superseded by replacement: zero recovery actions, honest deferred notice, host unchanged and box edit retained, RFL record SUPERSEDE-U-CF4-ACTIONABLE-1117) AUDIT Q2 cancelled deferred export must have an actionable recovery record", async () => {
     const f = await stopMidTurn({ edit: true, settled: true, exportFails: true });
     const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     console.log("AUDIT_Q2_ACTIONS", JSON.stringify({ runStatus: f.stopped.status, result: f.stopped.resultJson,
@@ -486,7 +486,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(actions).toHaveLength(0);
     expect(f.stoppedRunProfile?.nativeCancelledWarmExport).toMatchObject({ state: "unproven", reason: "export_failed" });
     const notice = f.events.find(event => event.eventType === "workspace_export_deferred");
-    expect(notice?.message).toContain("The box is kept, so nothing on it is lost.");
+    expect(notice?.message).toBe("Stopped turn's workspace export could not be confirmed in time (export_failed); its files may or may not be on the host yet. The box is kept, so nothing on it is lost.");
     expect(notice?.message).not.toMatch(/Recover saved files|\b(?:click|choose|press)\b/i);
     expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
     expect(await readFile(join(f.box, "task.txt"), "utf8")).toBe(EDIT);

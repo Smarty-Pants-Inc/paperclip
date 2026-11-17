@@ -1,5 +1,11 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Db } from "@paperclipai/db";
+import type { EnvironmentLease } from "@paperclipai/shared";
+import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { activityLog, agents, agentWakeupRequests, caseEvents, caseHandoffs, cases, companies, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -32,6 +38,8 @@ import { nativeSha256 } from "../native-runtime/canonical.js";
 import { callbacks, runControlPostgresSupport, setupRunControlDatabase } from "./__tests__/run-control-fixtures.js";
 import { LEASE_RELEASE_FAST_ATTEMPTS, LEASE_RELEASE_SLOW_RETRY_MS } from "../environment-lease-release-deferral.js";
 import { agentExecutionStopBlocker } from "../agent-execution-stop.js";
+import { finishCancelledWarmWorkspaceExport } from "./cancelled-warm-workspace-export.js";
+import { prepareNativeWorkspaceSync, readNativeWorkspaceSyncReference } from "../native-runtime/native-workspace-sync.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 vi.mock("../acknowledged-native-stop.js", async (importOriginal) => {
@@ -903,31 +911,75 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].status).toBe("in_progress");
   }, 15_000);
 
-  it("keeps a warm sandbox running when a board cancel leaves prepared native files", async () => {
+  it("(superseded by replacement: export finalized before stop_and_retain release with files present on the host, RFL record SUPERSEDE-U-CF4-ACTIONABLE-1117) keeps a warm sandbox running when a board cancel leaves prepared native files", async () => {
     const { company, agent } = await fixture();
-    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Cancel keeps warm",
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Stop exports and retains files",
       status: "in_progress", assigneeAgentId: agent.id }).returning();
     const runId = randomUUID(), leaseId = randomUUID(), providerLeaseId = randomUUID();
-    await db.insert(heartbeatRuns).values({ id: runId, companyId: company.id, agentId: agent.id,
-      issueId: issue.id, nativeIssueId: issue.id, runtimeMode: "native", status: "cancelled", finishedAt: new Date(),
-      errorCode: "cancelled",
-      runnerProfileJson: { nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v3", state: "prepared",
-        descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null,
-        workspaceId: randomUUID(), leaseId, providerLeaseId, remoteCwd: "/work", resourceDisposition: "keep_running" } },
-      resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator" },
-    });
-    await db.insert(environmentLeases).values({ id: leaseId, companyId: company.id, heartbeatRunId: runId,
-      issueId: issue.id, provider: "daytona", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
-      metadata: { driver: "sandbox", pluginId: randomUUID(), sandboxProviderPlugin: true, remoteCwd: "/work" } });
-    const deps = callbacks(db), control = createHeartbeatRunControl(db, deps);
-    await control.releaseEnvironmentLeasesForRun({ runId, companyId: company.id, agentId: agent.id,
-      status: "cancelled", providerResourceDisposition: "keep_running" });
-    expect(deps.envOrchestrator.releaseForRun).toHaveBeenCalledWith(expect.objectContaining({
-      heartbeatRunId: runId, providerResourceDisposition: "keep_running",
-    }));
-    expect(deps.envOrchestrator.releaseForRun).not.toHaveBeenCalledWith(expect.objectContaining({
-      providerResourceDisposition: "stop_and_retain",
-    }));
+    const root = await mkdtemp(join(tmpdir(), "run-control-stop-export-"));
+    const host = join(root, "host"), box = join(root, "box"), edit = "the stopped turn's file edit\n";
+    let sync: Awaited<ReturnType<typeof prepareNativeWorkspaceSync>> = null;
+    try {
+      await mkdir(host);
+      await mkdir(box);
+      await writeFile(join(host, "task.txt"), "before the turn\n");
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: company.id, agentId: agent.id,
+        issueId: issue.id, nativeIssueId: issue.id, runtimeMode: "native", status: "cancelled", finishedAt: new Date(),
+        errorCode: "cancelled", runnerProfileJson: { nativeResourceDisposition: "keep_running" },
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator", nativeCancellation: {
+          schema: "paperclip.native-cancellation.v1", runId, companyId: company.id, issueId: issue.id,
+          scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+          intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+        } },
+      });
+      await db.insert(nativeRunFinalizations).values({ runId, companyId: company.id, issueId: issue.id,
+        phase: "terminal_failure", failureCode: "native_retry_cancelled" });
+      const [lease] = await db.insert(environmentLeases).values({ id: leaseId, companyId: company.id, heartbeatRunId: runId,
+        issueId: issue.id, provider: "daytona", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
+        metadata: { driver: "sandbox", pluginId: randomUUID(), sandboxProviderPlugin: true, remoteCwd: box } }).returning();
+      // Only the provider transport is doubled: actual sync commands run against a local box directory.
+      const target: AdapterSandboxExecutionTarget = { kind: "remote", transport: "sandbox", providerKey: "test",
+        leaseId, remoteCwd: box, timeoutMs: 30_000, sandboxLeaseAcquisition: { outcome: "created", providerLeaseId },
+        runner: { execute: input => new Promise((resolve, reject) => {
+          const child = execFile(input.command, input.args ?? [], { cwd: input.cwd,
+            env: { ...process.env, ...input.env }, timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024,
+          }, (error, stdout, stderr) => resolve({ exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0,
+            signal: error?.signal ?? null, timedOut: error?.killed ?? false, stdout, stderr, pid: null, startedAt: null }));
+          child.stdin?.on("error", (error: NodeJS.ErrnoException) => { if (error.code !== "EPIPE") reject(error); });
+          child.stdin?.end(input.stdin ?? "");
+        }) },
+      };
+      sync = await prepareNativeWorkspaceSync({ db, runId, companyId: company.id, workspaceId: randomUUID(),
+        workspaceLocalDir: host, target, lease: lease as unknown as EnvironmentLease, resourceDisposition: "keep_running" });
+      expect(sync?.reference.state).toBe("prepared");
+      await writeFile(join(box, "task.txt"), edit);
+      const deps = callbacks(db), control = createHeartbeatRunControl(db, deps);
+      let atRelease: unknown;
+      vi.mocked(deps.envOrchestrator.releaseForRun).mockImplementationOnce(async () => {
+        // Capture at the release boundary; assert outside the callback because run-control catches provider errors.
+        const stopped = await deps.getRun(runId);
+        atRelease = { reference: readNativeWorkspaceSyncReference(stopped?.runnerProfileJson?.nativeWorkspaceSync),
+          export: stopped?.runnerProfileJson?.nativeCancelledWarmExport,
+          hostText: await readFile(join(host, "task.txt"), "utf8"), boxText: await readFile(join(box, "task.txt"), "utf8") };
+        return { released: [], errors: [] };
+      });
+      // The runtime cancellation boundary finishes copyback before run-control releases the lease.
+      expect(await finishCancelledWarmWorkspaceExport({ db, runId, companyId: company.id, nativeWorkspaceSync: sync }))
+        .toEqual({ outcome: "finalized" });
+      await control.releaseEnvironmentLeasesForRun({ runId, companyId: company.id, agentId: agent.id,
+        status: "cancelled", providerResourceDisposition: "keep_running" });
+      expect(deps.envOrchestrator.releaseForRun).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        heartbeatRunId: runId, providerResourceDisposition: "stop_and_retain",
+      }));
+      expect(atRelease).toMatchObject({
+        reference: { state: "finalized", finalHostSha256: expect.stringMatching(/^[0-9a-f]{64}$/) },
+        export: { state: "finalized" }, hostText: edit, boxText: edit,
+      });
+      expect(await readFile(join(host, "task.txt"), "utf8")).toBe(edit);
+    } finally {
+      await sync?.cleanup();
+      await rm(root, { recursive: true, force: true });
+    }
   }, 15_000);
 
   async function deferralFixture(runtimeMode: "legacy" | "native") {
