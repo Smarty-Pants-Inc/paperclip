@@ -604,6 +604,24 @@ describe("buildIssueChatMessages", () => {
     expect(JSON.stringify(messages[0])).not.toContain("Sensitive deleted body");
   });
 
+  it("leaves no placeholder for a superseded system notice, but keeps a deleted person's and agent's", () => {
+    // S1 b69ce542: the API returns a superseded unanswered-message notice with body "".
+    const deletedAt = new Date("2026-11-17T18:10:30.000Z");
+    const messages = buildIssueChatMessages({
+      comments: [
+        createComment({ id: "notice", authorType: "system", authorUserId: null, body: "", deletedAt, createdAt: new Date("2026-11-17T18:10:03.000Z") }),
+        createComment({ id: "person", body: "", deletedAt, deletedByType: "user", deletedByUserId: "user-1", createdAt: new Date("2026-11-17T18:10:04.000Z") }),
+        createComment({ id: "agent", authorAgentId: "agent-1", authorUserId: null, body: "", deletedAt, createdAt: new Date("2026-11-17T18:10:05.000Z") }),
+      ],
+      timelineEvents: [],
+      linkedRuns: [],
+      liveRuns: [],
+      currentUserId: "user-1",
+    });
+    expect(messages.map((message) => message.id)).toEqual(["person", "agent"]);
+    expect(messages.every((message) => message.metadata.custom.deletedAt === deletedAt.toISOString())).toBe(true);
+  });
+
   it("preserves low-trust source metadata on comment messages", () => {
     const messages = buildIssueChatMessages({
       comments: [
