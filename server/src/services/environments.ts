@@ -1756,16 +1756,21 @@ export function environmentService(db: Db) {
         failureReason?: string;
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
         remoteExecutionTermination?: Record<string, unknown>;
+        /** The agent-file destroy claim token of the destroy this settlement completes. */
+        destroyClaim?: string;
       },
     ) => {
       const now = new Date();
-      // Confirmed destruction ends every agent-file destroy claim on this lease:
-      // its bytes are gone, so no hold or collection pin can need the claim.
+      // Only the settlement of the destroy that holds the agent-file destroy
+      // claim ends it (atomically with its receipt). Any other receipt, even a
+      // "destroyed" one, leaves a live claim alone.
+      const baseMetadata = options?.destroyClaim
+        ? sql`(case when ${environmentLeases.metadata}->>${AGENT_FILE_DESTROY_CLAIM_KEY}::text = ${options.destroyClaim}::text
+            then ${environmentLeases.metadata} - ${AGENT_FILE_DESTROY_CLAIM_KEY}::text else ${environmentLeases.metadata} end)`
+        : sql`${environmentLeases.metadata}`;
       const releaseMetadata = options?.remoteExecutionTermination
-        ? options.remoteExecutionTermination.state === "destroyed"
-          ? sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - ${AGENT_FILE_DESTROY_CLAIM_KEY}::text) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
-          : sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
-        : sql`${environmentLeases.metadata} - 'remoteExecutionTermination'`;
+        ? sql`coalesce(${baseMetadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
+        : sql`${baseMetadata} - 'remoteExecutionTermination'`;
       const cleanupSettled = options?.expectedPendingCleanupAttemptId && options.cleanupStatus === "success"
         && status !== "pending_cleanup";
       const row = await db.transaction(async tx => {
