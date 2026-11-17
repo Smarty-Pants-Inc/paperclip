@@ -8368,7 +8368,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   isRetainedWorkspaceExportCause(issue.executionBlocker.cause) &&
                   retainedRecoveryOwnsRetry)}
               onRetry={taskRetry.retry}
-              optimistic={taskRetry.optimistic} takingLonger={taskRetry.takingLonger} error={taskRetry.error} />
+              optimistic={taskRetry.optimistic} takingLonger={taskRetry.takingLonger} error={taskRetry.error} held={taskRetry.held} />
           )}
 
           {issue.status === "in_review" && issue.externalConversationState === "waiting" && (

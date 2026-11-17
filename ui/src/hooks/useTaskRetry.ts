@@ -30,7 +30,7 @@ export function useTaskRetry(issue: Issue | undefined) {
   const [optimistic, setOptimistic] = useState(false);
   const [takingLonger, setTakingLonger] = useState(false);
   const [reconcile, setReconcile] = useState<{ refs: string[]; sourceRunId: string | null } | null>(null);
-  const [notStarted, setNotStarted] = useState<{ error: Error; state: string | null; observedRunId: string | null } | null>(null);
+  const [notStarted, setNotStarted] = useState<{ error: Error; state: string | null; observedRunId: string | null; held?: boolean } | null>(null);
   const mutation = useMutation({
     mutationFn: ({ issueId, identifier: _identifier, ...body }: RetryRequest) =>
       issuesApi.retryTask(issueId, body),
@@ -41,8 +41,10 @@ export function useTaskRetry(issue: Issue | undefined) {
       if (isCurrent && result.accepted) setReconcile({ refs, sourceRunId: variables.observedRunId });
       if (isCurrent) {
         const reason = taskRetryNotStartedReason(result);
+        // fam-retry4: an accepted, held Retry is the authority's held state
+        // (the hold's words), not an error beside a second Retry.
         setNotStarted(reason ? { error: new Error(reason), state: result.presentation?.state ?? null,
-          observedRunId: result.presentation?.observedRunId ?? null } : null);
+          observedRunId: result.presentation?.observedRunId ?? null, held: Boolean(result.accepted && result.held) } : null);
       }
       {
         for (const ref of refs) queryClient.setQueryData<Issue>(queryKeys.issues.detail(ref), current =>
@@ -106,7 +108,12 @@ export function useTaskRetry(issue: Issue | undefined) {
     setOptimistic(true);
     setTakingLonger(false);
     mutation.mutate(request.current);
-  }, optimistic, takingLonger, error: mutation.error ?? (notStarted
-    && (issue?.interruption?.state ?? null) === notStarted.state
-    && (issue?.interruption?.observedRunId ?? null) === notStarted.observedRunId ? notStarted.error : null) };
+  }, optimistic, takingLonger, ...(() => {
+    const shown = notStarted
+      && (issue?.interruption?.state ?? null) === notStarted.state
+      && (issue?.interruption?.observedRunId ?? null) === notStarted.observedRunId ? notStarted : null;
+    return { error: mutation.error ?? (shown && !shown.held ? shown.error : null),
+      /** The accepted, held Retry's words (the hold's), rendered as the held state. */
+      held: !mutation.error && shown?.held ? shown.error.message : null };
+  })() };
 }
