@@ -1745,6 +1745,31 @@ function renderThread(props: ComponentProps<typeof TaskChatThread>) {
   render(<TaskChatThread {...props} />);
 }
 
+// fam-retry4 (rf-3 finding 3), chat mode: a held note posted while Retry was
+// offered must not say "Press Retry" beside the paused agent's "Resume agent".
+describe("fam-retry4 held note", () => {
+  it("a held note beside a paused agent shows one instruction (chat)", () => {
+    const pausedAgent = { id: "agent", name: "Assistant", status: "paused", pauseReason: "manual" } as Agent;
+    const held = "Your message and saved work are kept, but the previous run of this conversation did not finish. "
+      + "Press Retry to continue in a fresh run with this conversation's history.";
+    renderThread({
+      agentMap: new Map([[pausedAgent.id, pausedAgent]]),
+      currentAssigneeValue: `agent:${pausedAgent.id}`,
+      onResumeAssignee: vi.fn(),
+      issueStatus: "in_progress",
+      onAdd: async () => {},
+      comments: [{ id: "held-note", companyId: "company", issueId: "issue", authorType: "system", authorAgentId: null,
+        authorUserId: null, body: held, createdByRunId: null,
+        createdAt: new Date("2026-11-17T10:00:00Z"), updatedAt: new Date("2026-11-17T10:00:00Z"),
+        presentation: { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true },
+        metadata: { version: 1, authorizationReason: "native_prior_owner_held:session-1", sections: [] } } as never],
+    });
+    expect(container.textContent).toContain("the previous run of this conversation did not finish.");
+    expect(container.textContent).not.toContain("Press Retry");
+    expect(container.querySelector('[data-testid="issue-assignee-paused-resume"]')?.textContent).toBe("Resume agent");
+  });
+});
+
 describe("TaskChatThread draft pass-through", () => {
   it.each(["original", "changed"])("groups PAP-2525 native image uploads with %s receipt wording", async (wording) => {
     const comment = (id: string, body: string, runId?: string) => ({
