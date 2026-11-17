@@ -94,6 +94,8 @@ export interface TaskChatQueuedMessagesProps {
   editingCommentId?: string | null;
   /** Steer eligible queued messages automatically after this delay; null keeps every message queued. */
   autoSteerDelayMs?: number | null;
+  /** Agent Chat: steer automatically only the first queued message, keeping the sent order. */
+  steerHeadOnly?: boolean;
 }
 
 function SortableQueuedMessage({
@@ -296,6 +298,7 @@ export function TaskChatQueuedMessages({
   onDiscard,
   editingCommentId = null,
   autoSteerDelayMs = null,
+  steerHeadOnly = false,
 }: TaskChatQueuedMessagesProps) {
   const [entries, setEntries] = useState(queue.entries);
   // Automatic steering: Cancel keeps a message queued for this view; each
@@ -359,14 +362,14 @@ export function TaskChatQueuedMessages({
     if (autoSteerDelayMs === null) return deadlines;
     for (const entry of autoSteerEntries) {
       if (queuedMessageAutoSteerEligible({ queue, entry, cancelledIds: cancelledAutoSteer,
-        attemptedKeys: attemptedAutoSteer.current, editingCommentId })) {
+        attemptedKeys: attemptedAutoSteer.current, editingCommentId, headOnly: steerHeadOnly })) {
         const key = queuedMessageAutoSteerKey(entry);
         if (!firstEligibleAt.current.has(key)) firstEligibleAt.current.set(key, Date.now());
         deadlines.set(entry.comment.id, queuedMessageAutoSteerDeadline(entry, firstEligibleAt.current.get(key)!, autoSteerDelayMs));
       }
     }
     return deadlines;
-  }, [autoSteerEntries, queue, cancelledAutoSteer, editingCommentId, autoSteerDelayMs, autoSteerAttempts]);
+  }, [autoSteerEntries, queue, cancelledAutoSteer, editingCommentId, autoSteerDelayMs, autoSteerAttempts, steerHeadOnly]);
 
   // Announce a new countdown once; the ticking text itself is not a live region.
   const announcedCountdowns = useRef(new Set<string>());

@@ -1768,7 +1768,7 @@ Connected task Retry can continue a failed legacy setup before provider dispatch
 
 An explicit recovery action is a typed liveness repair path for a source issue. It is the recovery primitive; the action can be rendered directly on the source issue or backed by a separate recovery issue when the repair needs its own work item.
 
-A terminal native failure can retain a result accepted before checkpoint or cleanup failed. That result is historical evidence, not a live controller. New user input may start a fresh turn after the controller and execution environment have stopped and ordinary admission checks pass. Preserve the failed run, its result, and its recovery budget. Do not commit the old result, infer action outcomes, or replay the failed turn. A message saved while cleanup is pending must be reconsidered after verified cleanup and delivered once. External chat messages retain their original inbound action, wake receipt and actor. Cleanup delegates reconsideration to the live inbound owner, which revalidates the endpoint, conversation generation, principal and exact saved source before normal admission. The existing stranded-queue sweep uses the same owner after a lost callback or restart; it cannot substitute a generic assignment wake. A rejected source must not prevent other saved messages from being reconsidered. Admission must consume its deferred receipt in the same transaction that creates the new run, including in agent chat, where later messages keep their separate turns. Completing that run must not promote the consumed receipt again. Workspace-export repair retains its separate saved-result recovery path.
+A terminal native failure can retain a result accepted before checkpoint or cleanup failed. That result is historical evidence, not a live controller. New user input may start a fresh turn after the controller and execution environment have stopped and ordinary admission checks pass. Preserve the failed run, its result, and its recovery budget. Do not commit the old result, infer action outcomes, or replay the failed turn. A message saved while cleanup is pending must be reconsidered after verified cleanup and delivered once. External chat messages retain their original inbound action, wake receipt and actor. Cleanup delegates reconsideration to the live inbound owner, which revalidates the endpoint, conversation generation, principal and exact saved source before normal admission. The existing stranded-queue sweep uses the same owner after a lost callback or restart; it cannot substitute a generic assignment wake. A rejected source must not prevent other saved messages from being reconsidered. Admission must consume its deferred receipt in the same transaction that creates the new run, including in agent chat. There, a message never joins the running turn: the owner's plain messages sent during a turn share one ordered deferred wake, which the next turn answers together, while a `/new` reset always keeps its own wake, so no message merges across it. Completing that run must not promote the consumed receipt again. Workspace-export repair retains its separate saved-result recovery path.
 
 When a native run's accepted result reports a failed turn without a classified provider error (`run_failed_partial_evidence_preserved`, for example an OpenCode server that was killed or ended without an answer), the status decision keeps the task's status and queues one same-agent `schedule_retry` wake. The wake dispatcher accepts that committed decision effect as the continuation's provenance, exactly like an `enqueue_continuation` effect, so the task always has queued work, and the retry answers the same external chat conversation. The automatic continuation is used once per chain: if the run started from that wake fails the same way, the decision is `native_run_failed_continuation_exhausted`, the task is blocked with a board blocker, and the visible Retry starts the next attempt.
 
@@ -5848,6 +5848,19 @@ PRP event persistence. It locks and rereads the run after acknowledgement before
 merging the receipt, preserving concurrent provider updates.
 If the run stops during that wait, the request fails with a stale-target error
 and retains the queued input for continuation.
+
+Agent Chat steers like any native task, with the live session probe deciding
+`available`, and steer is the default through the same 5 s auto-steer. Only the
+chat owner may steer, as for Interrupt; a manager agent may not. Only the first
+queued message of the chat is eligible, in the browser and on the server: a
+later message, a `/new` reset and anything queued behind a `/new` are refused
+(409) without contacting the provider, and so is a turn from an earlier chat
+session generation. A steered message is recorded as carried by the turn that
+took it (its comment id joins that run's `wakeCommentIds`, and for a chat it
+becomes the run's reply boundary), so settlement and the answered-message check
+treat it like the turn's own input. A runner that cannot take a mid-turn steer
+reports `unsupported` or `temporarily_unavailable` through the probe; the
+message stays queued and is delivered at the turn boundary.
 
 ### Preserve work across handoff and deliver requested files
 
