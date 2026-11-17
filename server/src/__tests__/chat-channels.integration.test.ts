@@ -66368,6 +66368,41 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       } finally { await f.service.shutdown(); }
     },
   );
+  it("retry-fold4 (R8, rf-3 A/B): a Boat-remote, agent_files, pi_rpc chat whose conversation is held: the Retry route answers 409 with the card's one instruction and starts nothing", async () => {
+    const f = await currentGitHubTaskRetryFixture();
+    const companyId = f.fixture.companyId, issueId = f.issue.id;
+    // The Paul-shaped agent: pi_rpc on a Boat sandbox, managed instructions (agent_files).
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", instructionsBundleMode: "managed" } })
+      .where(eq(agents.id, f.fixture.assignedAgentId));
+    await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: f.runId, provider: "boat",
+      providerLeaseId: randomUUID(), status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      leasePolicy: "reuse_by_environment", metadata: {} });
+    // The executor's durable HELD notice: the same thread meets the same
+    // prior-owner fence on every Retry; the card offers no Retry.
+    await db.insert(issueComments).values({ companyId, issueId, authorType: "system",
+      body: "Your message and saved work are kept, but this conversation cannot continue. Assign this agent a new task to continue.",
+      metadata: { version: 1, authorizationReason: `native_prior_owner_held:${randomUUID()}`,
+        sections: [{ rows: [{ type: "run_link", runId: f.runId, agentId: f.fixture.assignedAgentId }] }] } });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { req.actor = boardActor(companyId); next(); });
+    app.use("/api", issueRoutes(db, createStorageService().storage, { chatRunRetries: f.service }));
+    app.use(errorHandler);
+    f.wakeup.mockClear();
+    const wakesBefore = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).length;
+    const card = await taskInterruptionPresentation(db, (await readIssuesById(issueId))[0]);
+    expect(card?.canRetry).toBe(false);
+    // Production entry point: POST /api/issues/:id/retry (routes/issues.ts -> task-retry.ts requestTaskRetry).
+    const response = await request(app).post(`/api/issues/${issueId}/retry`).send({ observedRunId: f.runId, idempotencyKey: randomUUID() });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body).toMatchObject({ details: { code: "retry_not_available", reason: "conversation_held",
+      userAction: "new_task", nextAction: "Assign this agent a new task to continue." } });
+    expect(String(response.body.error)).toContain(response.body.details.nextAction);
+    expect(f.wakeup).not.toHaveBeenCalled();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).length).toBe(wakesBefore);
+    expect(await db.select().from(chatActions).where(and(eq(chatActions.companyId, companyId), eq(chatActions.kind, "failed_run_retry")))).toEqual([]);
+  });
+
   it.each(["settled", "pending_at_intake", "source_edited", "operator_stopped", "unknown_stop", "live_owner", "absent_sandbox"] as const)(
     "keeps the admitted chat Retry queued until its source lease cleanup settles: %s", async mode => {
     const f = await currentGitHubTaskRetryFixture();
