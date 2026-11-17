@@ -1,4 +1,5 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { anchorParkedWakePayloadSql, parkedWakeExpiredSql } from "./parked-wake-deadline.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
@@ -2078,10 +2079,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(companies.status, "active"),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
         stoppedInterrupt ? undefined : lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
+        // S124: past its first park's deadline a parked Send is not retried
+        // silently; the receipt worker writes its one note instead.
+        sql`not ${parkedWakeExpiredSql(agentWakeupRequests.payload)}`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const wake of pendingInterrupts) {
-      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+      // This rewrite moves updatedAt (the 30 s cadence); the park's first
+      // time is kept once in payload.firstParkedAt (S124).
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(),
+        payload: anchorParkedWakePayloadSql(agentWakeupRequests.payload, agentWakeupRequests.updatedAt) }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
       await resumeQueuedCommentInterrupt(wake.companyId, wake.id).catch(err => {
