@@ -4,12 +4,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { agents, authUsers, companies, createDb, environmentLeases, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "./heartbeat.js";
-import { readFreshThreadStopProof } from "./native-runtime/fresh-thread-stop-gate.js";
 import { prepareInspectedSourceSandboxStop, readStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 
 // Keep: F1-1 target E, a data-safety/trust boundary. Exercise the retained
 // stop-and-keep owner directly, not the removed fresh-admission stop producer.
-// Started-note cardinality lives at actual selection in fresh-thread-stop-gate-refresh-codes.test.ts.
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
   let db: Db;
@@ -43,7 +41,6 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
       expect(await prepareInspectedSourceSandboxStop(db, f.lease, result)).toBeNull();
       await hb.sweepPendingCleanupLeases();
       expect(await f.readLease()).toEqual(f.lease);
-      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
     }
     expect(stop).not.toHaveBeenCalled();
     expect(await f.notes()).toHaveLength(0);
@@ -80,13 +77,11 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     expect((pending.metadata?.sandboxStopAndRetain as Record<string, unknown>)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
     expect(pending.status).toBe("pending_cleanup");
     expect(await f.notes()).toHaveLength(0);
-    expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
     for (let n = 0; n < 3; n++) await hb.sweepPendingCleanupLeases();
     expect(stop).toHaveBeenCalledOnce();
     expectRestored(f.lease, await f.readLease());
     await expectStorageRestored(f);
-    expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
   }, 60_000);
 
@@ -99,7 +94,6 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     expect(readStopOnlyCleanup(pending)).not.toBeNull();
     expect(pending.metadata?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
     expect(await f.notes()).toHaveLength(0);
-    expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
     const stop = vi.fn(async () => ({ providerLeaseId: f.lease.providerLeaseId!, state: "stopped" })), hb = f.cleanup(stop);
     await hb.sweepPendingCleanupLeases();
     await hb.sweepPendingCleanupLeases();
@@ -108,7 +102,6 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     expectRestored(f.lease, settled);
     await expectStorageRestored(f);
     expect(readStopOnlyCleanup(settled)).toBeNull();
-    expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
   }, 60_000);
 
@@ -135,13 +128,11 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     if (laterProof) {
       expectRestored(f.lease, await f.readLease());
       await expectStorageRestored(f);
-      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
       expect(await f.notes()).toHaveLength(0);
     } else {
       const pending = await f.readLease();
       expect(pending.status).toBe("pending_cleanup");
       expect((pending.metadata?.sandboxStopAndRetain as Record<string, unknown>)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
-      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
       expect(await f.notes()).toHaveLength(0); // cleanup cannot narrate a thread selection
     }
   }, 60_000);
@@ -171,14 +162,11 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
       expectRestored(f.lease, restored);
       await expectStorageRestored(f);
       expect(readStopOnlyCleanup(restored)).toBeNull();
-      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
       expect(await f.notes()).toHaveLength(0);
       // Snapshot and time checks must not become a broad bad-time exception.
       await db.update(environmentLeases).set({ failureReason: "tampered" }).where(eq(environmentLeases.id, f.lease.id));
-      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
       await db.update(environmentLeases).set({ failureReason: restored.failureReason, metadata: { ...restored.metadata,
         remoteExecutionTermination: { ...(restored.metadata?.remoteExecutionTermination as object), confirmedAt: new Date(Date.now() + 60000).toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
-      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
     } finally { await restarted.drainActiveRunExecutions(); await restartedDb.$client.end(); }
   }, 60_000);
 });

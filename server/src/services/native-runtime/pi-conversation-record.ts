@@ -105,15 +105,9 @@ export async function selectPiConversation(db: Db, input: {
     let legacyId = session?.sessionParamsJson?.sessionId;
     if (legacyId != null && !uuid(legacyId)) throw new Error("pi_conversation_record_invalid");
     const legacyProvenanceId = legacyId;
-    const { readFreshContinuationSessionBoundary } = await import("../fresh-continuation-fallback.js");
-    const fresh = await readFreshContinuationSessionBoundary(tx, run, input.issueId);
-    // Consume only the recorded, fenced fallback for the thread we still own.
-    // Once rotated, sourceSessionId no longer matches, including later turns
-    // and same-run replays. Generic freshness/config flags never authorize it.
-    const freshBoundary = fresh && (previous?.id ?? legacyId ?? run.nativeSessionId) === fresh.sourceSessionId ? fresh : null;
     let legacyUnverified = false;
     if (previous && legacyId && legacyId !== previous.id) throw new Error("pi_conversation_identity_conflict");
-    if (!previous && uuid(legacyId) && !freshBoundary) {
+    if (!previous && uuid(legacyId)) {
       const [lastRun] = session?.lastRunId ? await tx.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, session.lastRunId), eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
       )) : [run.nativeSessionId === legacyId ? run : undefined];
@@ -141,12 +135,7 @@ export async function selectPiConversation(db: Db, input: {
         reason: "adopted_existing_conversation", previousId: null, runId: owner.id };
     }
     if (!previous && input.boundary.provider !== "pi_rpc") throw new Error("pi_conversation_record_missing");
-    const reason = freshBoundary ? `fresh_continuation:${freshBoundary.recoveryActionId}` : null;
-    if (reason && (run.nativeSessionId || run.runnerProfileJson?.nativeExecutionInput !== undefined
-      || run.runnerProfileJson?.sessionCheckpoint != null || run.runnerProfileJson?.nativeControllerRecovery != null
-      || run.processPid !== null || run.processGroupId !== null || run.processStartedAt !== null || run.sessionIdAfter !== null)) {
-      throw new Error("pi_conversation_admitted_boundary_changed");
-    }
+    const reason: string | null = null; // Boundary generation policy is installed separately.
     if (run.nativeSessionId && previous && run.nativeSessionId !== previous.id) throw new Error("pi_conversation_identity_conflict");
     // A replay of this immutable run cannot reinterpret newly edited settings.
     if (previous?.runId === input.runId && reason) throw new Error("pi_conversation_admitted_boundary_changed");
@@ -154,21 +143,13 @@ export async function selectPiConversation(db: Db, input: {
     if (!uuid(id)) throw new Error("pi_conversation_identity_missing");
     const record: PiConversationRecord = previous && !reason ? previous : {
       schema: "paperclip.pi-conversation.v1", id, generation: (previous?.generation ?? 0) + 1,
-      boundary: input.boundary, previousId: previous?.id ?? (freshBoundary ? freshBoundary.sourceSessionId : null),
+      boundary: input.boundary, previousId: previous?.id ?? null,
       reason: reason ?? (legacyUnverified ? "legacy_binding_unverified" : legacyId || run.nativeSessionId ? "adopted_existing_conversation" : "first_message"), runId: input.runId,
     };
     const sessionParamsJson = { ...session?.sessionParamsJson, sessionId: id, [PI_CONVERSATION_KEY]: record };
     if (session) await tx.update(agentTaskSessions).set({ sessionParamsJson, updatedAt: new Date() }).where(eq(agentTaskSessions.id, session.id));
     else await tx.insert(agentTaskSessions).values({ companyId: input.companyId, agentId: input.agentId,
       adapterType: "paperclip_runner", taskKey: input.issueId, sessionParamsJson });
-    if (freshBoundary) {
-      const { supersedeHeldConversationNotice, writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
-      const authorizationReason = `fresh_provider_thread:${freshBoundary.recoveryActionId}`;
-      await writePiSessionHistoryLossNotice(db, tx, { ...input, authorizationReason, replaceExisting: true,
-        body: freshBoundary.startedNote });
-      await supersedeHeldConversationNotice(tx, { companyId: input.companyId, issueId: input.issueId,
-        heldSessionId: freshBoundary.sourceSessionId, reason: authorizationReason });
-    }
     if (legacyUnverified) {
       // The issue lock and this transaction make the notice and first recorded
       // conversation atomic. Replays/later turns read the record, not the legacy
@@ -179,47 +160,6 @@ export async function selectPiConversation(db: Db, input: {
         body: "My earlier conversation could not be restored (it predates conversation records). Starting a new one." });
     }
     return record;
-  });
-}
-
-/** Non-Pi providers consume the SAME durable fresh-continuation settlement.
- * This is not generic config/skill freshness and cannot bypass a checkpoint.
- * Persist the new normalized id under the existing admission locks so replay
- * never mints another thread, even before task-session publication. */
-export async function selectFreshContinuationThread(db: Db, input: {
-  companyId: string; agentId: string; issueId: string; runId: string;
-}): Promise<string | null> {
-  return db.transaction(async tx => {
-    const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("no key update");
-    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
-      eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.id, input.runId))).for("update");
-    if (!issue || !run || run.status !== "running" || run.resultJson?.startupCancellation
-      || (run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId) !== issue.id
-      || (issue.conversationAgentId && (issue.conversationAgentId !== input.agentId
-        || run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration))) return null;
-    if (run.nativeSessionId) return run.nativeSessionId;
-    if (run.runnerProfileJson?.nativeExecutionInput || run.runnerProfileJson?.sessionCheckpoint
-      || run.processPid !== null || run.processGroupId !== null || run.processStartedAt !== null) return null;
-    const { readFreshContinuationSessionBoundary } = await import("../fresh-continuation-fallback.js");
-    const fresh = await readFreshContinuationSessionBoundary(tx, run, issue.id);
-    if (!fresh) return null;
-    const scope = and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId),
-      eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, issue.id));
-    const [session] = await tx.select().from(agentTaskSessions).where(scope).for("update");
-    const previous = session?.sessionParamsJson?.sessionId;
-    if (previous && previous !== fresh.sourceSessionId) return null;
-    const id = randomUUID();
-    if (session) await tx.update(agentTaskSessions).set({ sessionParamsJson: { ...session.sessionParamsJson, sessionId: id },
-      updatedAt: new Date() }).where(eq(agentTaskSessions.id, session.id));
-    else await tx.insert(agentTaskSessions).values({ companyId: input.companyId, agentId: input.agentId,
-      adapterType: "paperclip_runner", taskKey: issue.id, sessionParamsJson: { sessionId: id } });
-    await tx.update(heartbeatRuns).set({ nativeSessionId: id }).where(eq(heartbeatRuns.id, run.id));
-    const { supersedeHeldConversationNotice, writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
-    const authorizationReason = `fresh_provider_thread:${fresh.recoveryActionId}`;
-    await writePiSessionHistoryLossNotice(db, tx, { ...input, authorizationReason, body: fresh.startedNote, replaceExisting: true });
-    await supersedeHeldConversationNotice(tx, { companyId: input.companyId, issueId: input.issueId,
-      heldSessionId: fresh.sourceSessionId, reason: authorizationReason });
-    return id;
   });
 }
 

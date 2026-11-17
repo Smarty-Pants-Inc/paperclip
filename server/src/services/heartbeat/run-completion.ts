@@ -1,7 +1,6 @@
-import { freshThreadRefusalCode } from "../native-runtime/runner-reconciliation-refusal.js";
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
-import { providerFailureFromError, runnerPrepareRefusalCode } from "../../vendor/paperclip-runner/index.js";
+import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
 import { GENERIC_RUN_FAILURE_CODES, NATIVE_PRE_DISPATCH_FAILURE_CODE, NATIVE_PRE_DISPATCH_FAILURE_KEY, NATIVE_PRE_DISPATCH_FAILURE_RECORD, failureCauseFromAdapterResult, failureCauseFromError,
   hasNativePreDispatchFailureRecord, isNativePreDispatchTransientFailure } from "./run-failure-cause.js";
 import { INTERRUPTED_PREPARATION_RETRY_REASON } from "../execution-recovery-attempt.js";
@@ -1337,9 +1336,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       ? { ...exactResumeCause, originalMessage: redactFailureText(exactResumeCause.originalMessage) }
       : null;
     const storageUnavailable = isStorageUnavailableError(err);
-    const freshRefusal = freshThreadRefusalCode(err);
     const failureErrorCode =
-      freshRefusal ??
       workspaceValidationFailure?.code ??
       configurationIncompleteFailure?.code ??
       nonRetryablePreflightFailureCode(err) ??
@@ -1410,9 +1407,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         resultJson: {
           ...parseObject(stopSnapshot?.resultJson),
           ...(failureCause && !stoppedDuringFailure ? { failureCause } : {}),
-          ...(freshRefusal ? { nativeFreshContinuationRefusal: { code: freshRefusal,
-            ...(runnerPrepareRefusalCode(err) ? { prepareRefusalCode: runnerPrepareRefusalCode(err) } : {}),
-            waitForTurn: (err as { waitForTurn?: unknown })?.waitForTurn === true } } : {}),
           ...(providerFailure ? { providerFailure: { ...providerFailure,
             message: redactCurrentUserText(identityRedactor.redact(providerFailure.message), currentUserRedactionOptions) } } : {}),
           ...(interruptedExactResume ? { nativeExactResumeRefusal: {
@@ -1464,7 +1458,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const settleAgent = () => finalizeAgentStatus(agent.id, "failed", message, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       keepIdleOnFailure:
-        Boolean(freshRefusal) || Boolean(nonRetryablePreflightFailureCode(err)) ||
+        Boolean(nonRetryablePreflightFailureCode(err)) ||
         isWorkspaceSyncConflictFailure(thrownMessage),
     });
     await setWakeupStatus(run.wakeupRequestId, "failed", {
@@ -1668,7 +1662,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         (await getRun(runId).catch(() => null))?.errorCode,
       );
     const nonRetryablePreflightCode =
-      freshThreadRefusalCode(outerErr) ?? nonRetryablePreflightFailureCode(outerErr);
+      nonRetryablePreflightFailureCode(outerErr);
     const workspaceGitScanFailure = isWorkspaceGitScanError(outerErr) ? outerErr : null;
     const remoteWorkspacePreparationTimeout = !providerDispatchStarted && run.runtimeMode === "legacy"
       && run.nativeSessionId === null && run.runnerInstanceId === null && outerErr instanceof RemoteWorkspacePreparationTimeoutError
@@ -1765,12 +1759,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           )
         : null);
     const connectionFailure = readGitConnectionFailure(outerErr);
-    const setupFreshRefusal = freshThreadRefusalCode(outerErr);
     const setupFailureResultJson = {
       ...setupFailureDetails,
-      ...(setupFreshRefusal ? { nativeFreshContinuationRefusal: { code: setupFreshRefusal,
-        ...(runnerPrepareRefusalCode(outerErr) ? { prepareRefusalCode: runnerPrepareRefusalCode(outerErr) } : {}),
-        waitForTurn: (outerErr as { waitForTurn?: unknown })?.waitForTurn === true } } : {}),
       ...(failureCause ? { failureCause } : {}),
       ...(repositoryCatalogUnavailable ? { errorFamily: "transient_upstream",
         ...(repositoryCatalogUnavailable.retryAt ? { retryNotBefore: new Date(repositoryCatalogUnavailable.retryAt).toISOString() } : {}),

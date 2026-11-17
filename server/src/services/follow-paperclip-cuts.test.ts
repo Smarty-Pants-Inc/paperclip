@@ -20,7 +20,6 @@ import {
 } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_SETTLE_MS } from "./recovery/unanswered-person-message.js";
@@ -117,7 +116,6 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
   describe("A-5: a follow-up acquisition with boot-source drift; the held message is still answered", () => {
     it.each(["destroyed", "failed", "void", "no_custody"] as const)("%s", async variant => {
       await company();
-      expect(isFreshThreadRefusal({ errorCode: TYPED })).toBe(true);
       const issueId = randomUUID(), messageId = randomUUID(), oldRunId = randomUUID(), followUpId = randomUUID();
       const environmentId = randomUUID(), pluginId = randomUUID(), oldLeaseId = randomUUID();
       const t0 = new Date(Date.now() - 3600_000);

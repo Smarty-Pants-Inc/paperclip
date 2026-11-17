@@ -2313,13 +2313,12 @@ impl CodexCommandExecutor {
         if next != state.config {
             return Ok(None);
         }
-        // This is a refusal, not a tool grant. Do not reconcile the old tool
-        // bridge; normal admitted preparation still validates its full set.
+        // Only a genuinely live turn refuses. A closed turn's deferred Pi
+        // terminal or unsettled tool callback is settled by the ordinary
+        // restore path (maintain_deferred_pi_terminal), as for any follow-up.
         let active = state.active_provider_turn_id.is_some()
-            || state.pi_deferred_terminal.is_some()
             || state.ambiguous_turn_start_pending
-            || state.startup_attempt.is_some()
-            || state.tool_bridge.pending_calls().next().is_some();
+            || state.startup_attempt.is_some();
         let descendants = !state.descendant_thread_ids.is_empty();
         let goal = state
             .goal

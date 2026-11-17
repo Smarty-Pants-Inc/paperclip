@@ -90,7 +90,6 @@ export interface NativeSessionRecoveryResult {
   failureClass?: HarnessSessionRecoveryResult["failureClass"];
   resumeStateUnavailable?: HarnessSessionRecoveryResult["resumeStateUnavailable"];
   runnerExitConfirmed?: HarnessSessionRecoveryResult["runnerExitConfirmed"];
-  refreshWaitForTurn?: HarnessSessionRecoveryResult["refreshWaitForTurn"];
   prepareRefusalCode?: HarnessSessionRecoveryResult["prepareRefusalCode"];
   recoveryRefusalCode?: HarnessSessionRecoveryResult["recoveryRefusalCode"];
 }

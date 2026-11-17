@@ -4788,11 +4788,10 @@ export function environmentRuntimeService(
       return predecessorSandboxRecordFromObservation(observation, lease.providerLeaseId);
     },
 
-    async inspectLeaseResource(leaseId: string, options?: { freshThreadStop?: true }): Promise<PluginEnvironmentLeaseObservation | undefined> {
+    async inspectLeaseResource(leaseId: string): Promise<PluginEnvironmentLeaseObservation | undefined> {
       const lease = await environmentsSvc.getLeaseById(leaseId);
       if (!lease || !lease.providerLeaseId) return undefined;
-      const stopVerification = options?.freshThreadStop === true
-        || lease.status === "pending_cleanup" && readStopOnlyCleanup(lease) !== null;
+      const stopVerification = lease.status === "pending_cleanup" && readStopOnlyCleanup(lease) !== null;
       if (!stopVerification && (lease.status !== "failed" || lease.leasePolicy !== "ephemeral")) return undefined;
       const environment = lease.environmentId ? await environmentsSvc.getById(lease.environmentId) : null;
       // Legacy Cloud leases can lack a credential version that permits a
@@ -4800,7 +4799,7 @@ export function environmentRuntimeService(
       // organization and signs only exact absence; no replacement key or
       // cleanup label is treated as proof. Explicit provider answers win.
       const observation = await getDriver(getLeaseDriverKey(lease, environment))?.inspectLeaseResource?.({ environment, lease });
-      // Cleanup-manager absence is cleanup authority only. Fresh-thread proof
+      // Cleanup-manager absence is cleanup authority only. Stop verification
       // requires the recorded provider's exact-resource observation.
       return observation ?? (stopVerification ? undefined : await inspectCloudSandboxCleanupAbsence(lease));
     },

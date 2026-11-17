@@ -24,8 +24,6 @@ import type { NativeSessionRecoveryResult, PersistedNativeSession } from "./cont
 import {
   PROVIDER_ATTACH_REFUSED,
   PROVIDER_LAUNCH_PROFILE_MISMATCH,
-  PROVIDER_REFRESH_REQUIRED,
-  NativeRunnerRefreshRequiredError,
   NativeRunnerLaunchProfileMismatchError,
   PROVIDER_SIDE_EFFECT_PENDING,
   PROVIDER_STATE_INCOMPATIBLE,
@@ -2818,9 +2816,6 @@ export async function executeNativeSession(
       }
       if (recovery.failureClass === PROVIDER_ATTACH_REFUSED) {
         throw new NativeProviderStateIncompatibleError(recovery.reason ?? "unknown");
-      }
-      if (recovery.failureClass === PROVIDER_REFRESH_REQUIRED) {
-        throw new NativeRunnerRefreshRequiredError(recovery.refreshWaitForTurn === true, recovery.prepareRefusalCode);
       }
       const governedWaitFollowUpLostState = !replacementAllowed && await governedWaitFollowUpMayStartFresh({
         input,

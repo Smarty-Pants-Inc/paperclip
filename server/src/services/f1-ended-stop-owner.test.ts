@@ -3,8 +3,6 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, authUsers, companies, createDb, environmentLeases, heartbeatRuns, issueComments, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
-import { readFreshThreadStopProof } from "./native-runtime/fresh-thread-stop-gate.js";
-import { settleStoppedRemoteNativeOwner } from "./native-runtime/native-failed-run-owner-release.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { prepareInspectedSourceSandboxStop, readStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { heartbeatService } from "./heartbeat.js";
@@ -12,7 +10,6 @@ import { heartbeatService } from "./heartbeat.js";
 // Keep reason: receipt-less historical idle releases from SEED-B, and the
 // provider/DB ownership boundary. Retained cleanup preparation, fenced settlement
 // and real cleanup sweep; no removed fresh-gate inspection/stop orchestration.
-// Exactly-one started-note coverage moved to actual selection in fresh-thread-stop-gate-refresh-codes.test.ts.
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("F1 ended allocation stop owner", () => {
   let db: Db;
@@ -54,7 +51,6 @@ describe.skipIf(!support.supported)("F1 ended allocation stop owner", () => {
           expect(await prepareInspectedSourceSandboxStop(db, f.lease, result)).toBeNull();
           await hb.sweepPendingCleanupLeases();
           expect(await f.readLease()).toEqual(f.lease);
-          expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
         }
         expect(stop).not.toHaveBeenCalled();
         const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issue.id), eq(issueComments.authorType, "system")));
@@ -74,7 +70,6 @@ describe.skipIf(!support.supported)("F1 ended allocation stop owner", () => {
         expect(await prepareInspectedSourceSandboxStop(db, await f.readLease(), result)).toBeNull();
         await hb.sweepPendingCleanupLeases();
         expect(readStopOnlyCleanup(await f.readLease())!.requestId).toBe(requestId);
-        expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
       }
       expect(stop.mock.calls.length).toBeGreaterThan(0);
       expect(stop.mock.calls.length).toBeLessThanOrEqual(5);
@@ -83,23 +78,4 @@ describe.skipIf(!support.supported)("F1 ended allocation stop owner", () => {
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
   }, 60_000);
 
-  it.each(["released", "expired"] as const)("%s: observed-owner positive inspection settles without reopening or stop dispatch", async status => {
-    for (const state of ["stopped", "destroyed"] as const) {
-      const f = await fixture(status, true);
-      const inspect = vi.fn(async () => {
-        expect(await f.readLease()).toEqual(f.lease);
-        await db.transaction(async tx => { await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issue.id)).for("update", { noWait: true }); });
-        return { providerLeaseId: f.lease.providerLeaseId!, state };
-      });
-      expect(await settleStoppedRemoteNativeOwner(db, f.run.id, new Date(), inspect)).toBe(true);
-      expect(inspect).toHaveBeenCalledOnce();
-      const settled = await f.readLease();
-      expect(settled.status).toBe(status);
-      expect(hasRemoteTerminationReceipt(settled)).toBe(true);
-      expect(readStopOnlyCleanup(settled)).toBeNull();
-      expect(settled.metadata).toMatchObject({ leaseController: f.lease.metadata!.leaseController, historicalEvidence: "must survive", remoteExecutionTermination: { state, leaseId: f.lease.id } });
-      const [owner] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id));
-      expect(owner).toMatchObject({ phase: "terminal_failure", controllerGeneration: 8, leaseOwner: null });
-    }
-  }, 60_000);
 });

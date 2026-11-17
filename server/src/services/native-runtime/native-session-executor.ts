@@ -1,6 +1,3 @@
-import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal, type FreshThreadRefusalCode,
-  RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE, RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON, restoreUnavailableOnNewBoxCode,
-  LAUNCH_PROFILE_MISMATCH_CODE, LAUNCH_PROFILE_CHANGED_REASON } from "./runner-reconciliation-refusal.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
@@ -365,7 +362,7 @@ import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
-  readUnsupersededHeldConversationNotice, writeRestoreUnavailableContinuationNotice } from "./pi-session-recovery-notice.js";
+  readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
 import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
@@ -7883,7 +7880,7 @@ async function restorePerTurnRunnerdController(input: {
     } else {
       if (recovered.kind === "waiting_for_owner") throw new NativeControllerRecoveryWaitingError(recovered.deadline);
       if (recovered.kind !== "unsupported" && recovered.kind !== "no_prior_execution") {
-        throw nativeReconciliationError(`native_controller_recovery_${recovered.kind}:${"reason" in recovered ? recovered.reason : "prior_reference"}`);
+        throw new Error(`native_controller_recovery_${recovered.kind}:${"reason" in recovered ? recovered.reason : "prior_reference"}`);
       }
       const restored = await restoreNativeRunnerCheckpoint(input.db,
         { companyId: input.execution.binding.companyId, issueId: input.execution.binding.issueId, runId: reference.runId },
@@ -8018,7 +8015,7 @@ export { HELD_PREDECESSOR_NOTICE };
 // cleanup is still quarantined (it guards process ownership of that session),
 // a predecessor Runner whose termination could not be confirmed, and a warm
 // attachment to a predecessor Runner that had already exited.
-const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch: (?:legacy_)?prior_owner_|native_controller_recovery_missing_evidence:retained_sandbox_binding|native_session_cleanup_quarantined:|runner_process_termination_unconfirmed:|native_runner_warm_attachment_runner_exited:)/;
+const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch: (?:legacy_)?prior_owner_|native_session_cleanup_quarantined:|runner_process_termination_unconfirmed:|native_runner_warm_attachment_runner_exited:)/;
 
 /**
  * A conversation held because its previous run ended without a result (a
@@ -8030,9 +8027,6 @@ const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch
  */
 /** Exported for the notice-writer regression only. */
 export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution: NativeExecutionInput }, error: unknown): Promise<void> {
-  // D10 disposition owns both waiting and fresh-history notices for typed
-  // refusals; the legacy held writer must not add a competing dead-chat note.
-  if (freshThreadRefusalCode(error)) return;
   const message = error instanceof Error ? error.message : String(error);
   if (!HELD_PREDECESSOR_REFUSAL.test(message)) return;
   const { companyId, issueId, agentId, runId } = input.execution.binding;
@@ -8250,7 +8244,7 @@ async function restoreNativeControllerProjections(db: Db, execution: NativeExecu
   if (recovered.kind === "waiting_for_owner") {
     throw new NativeControllerRecoveryWaitingError(recovered.deadline);
   }
-  if (recovered.kind !== "recoverable") throw nativeReconciliationError(`native_controller_recovery_${recovered.kind}:${recovered.reason}`, { cause: recovered.cause });
+  if (recovered.kind !== "recoverable") throw new Error(`native_controller_recovery_${recovered.kind}:${recovered.reason}`, { cause: recovered.cause });
   recovered.checkpoint.restoreSessionDirectory(root);
   if (execution.session.lifecyclePolicy.mode === "warm") {
     persistWarmNativeCheckpoint(execution, recovered.metadata.configDigest, recovered.snapshot,
@@ -9455,9 +9449,6 @@ export function nativeSessionFailureDisposition(
   sourceFailureCode?: ReturnType<typeof nativeSessionFailureSourceCode>,
 ) {
   const permanentFailure =
-    // A same-run retry would meet the same unretired owner on the same sandbox;
-    // the next run starts on a fresh one instead.
-    isFreshThreadRefusal({ errorCode: sourceFailureCode }) ||
     sourceFailureCode === NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE ||
     sourceFailureCode === NATIVE_ADDRESSED_INTERACTION_FAILED ||
     sourceFailureCode === "runner_task_admission_rejected" ||
@@ -9702,10 +9693,7 @@ export function nativeSessionFailureSourceCode(
   | "local_runtime_api_listener_unavailable"
   | typeof NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE
   | typeof NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE
-  | "native_session_interrupted"
-  | FreshThreadRefusalCode {
-  const freshRefusal = freshThreadRefusalCode(error);
-  if (freshRefusal) return freshRefusal;
+  | "native_session_interrupted" {
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
   if (findNativePredecessorRetirementUnproven(error)) return NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE;
   if (findNativeFailedBeforeProviderTurn(error)) return NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE;
@@ -19538,7 +19526,7 @@ async function createRunnerdBackendWithinSessionClaim(
                       } else if ((state.incompleteReason !== "unavailable" && !provenRestart) || backupAvailable ||
                           !(await claimUntouchedRemoteSession())) {
                         const code = `runner_harness_state_mismatch: resumed_${state.incompleteReason}`;
-                        throw state.incompleteReason === "unavailable" ? nativeReconciliationError(code) : new Error(code);
+                        throw new Error(code);
                       } else if (!provenRestart) {
                         await noteFreshProviderSessionOnNewBox();
                       }
@@ -19603,7 +19591,7 @@ async function createRunnerdBackendWithinSessionClaim(
                       // A continuation that has a durable backup but no recorded reusable
                       // lease was not provider-confirmed lost. Never silently create a new
                       // provider session from that ambiguous state.
-                      throw nativeReconciliationError("runner_harness_state_mismatch: backup_without_reusable_lease");
+                      throw new Error("runner_harness_state_mismatch: backup_without_reusable_lease");
                     } else if (restartableBootstrapState(state)) {
                       if (!(await moveInterruptedBootstrapSessionAside()
                         && takeRemoteBootstrapRestartProof(input.execution.binding.runId)
@@ -20149,110 +20137,6 @@ async function createRunnerdBackendWithinSessionClaim(
     providerPackAuthority = selectProviderPackAuthority(false);
     expectedProviderPackManifest = providerPackAuthority?.manifest ?? null;
     providerPackVerified = false;
-  };
-  // J3-22 member (a) (SMA-60, RFL 09:55Z). Host preparation on a created box
-  // refused a current backup with RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE: its
-  // source is not provably retired, so the backup must not be restored here.
-  // Today that run fails and only the automatic retry answers, on a fresh
-  // thread. Take that same fresh thread in THIS run: set the session's
-  // continuity state aside (archiveContinuityState, as the runtime's
-  // replacement does; the source box and its files are kept), note the break
-  // for this box, write one continuation note, and let the caller open a fresh
-  // provider session. After it opens, the step is recorded through J3-17's
-  // lineage append (reason resume_failed_on_new_box). At most once per backend.
-  // The fresh open carries no run authority of the old thread: a recovered
-  // checkpoint is taken only in the idle REBOUND shape (loadWarmNativeCheckpoint
-  // clears exactly these fields for a new run); any turn, terminal, result,
-  // runtime request, governed wait, disposition recovery or goal keeps the
-  // named refusal. A checkpoint the runtime itself may replace
-  // (allow_replacement_after_resume_failure) is left to the runtime.
-  let restoreUnavailableFreshThread: { previousIdentity: Record<string, unknown> | null } | null = null;
-  const remoteProviderStateSettled = async (): Promise<boolean> => {
-    if (!remoteCommandRunner || !remoteStateDirectory) return false;
-    try {
-      const state = await readRemoteRunnerProviderState({ runner: remoteCommandRunner,
-        stateDirectory: remoteStateDirectory, execution: input.execution });
-      const goal = state.goal && typeof state.goal === "object" ? state.goal as Record<string, unknown> : null;
-      return (state.activeProviderTurnId ?? null) === null && (state.piDeferredTerminal ?? null) === null
-        && state.ambiguousTurnStartPending !== true && goal?.status !== "active" && goal?.workingNow !== true;
-    } catch { return false; }
-  };
-  const takeRestoreUnavailableFreshThread = async (failure: unknown, previous?: PersistedNativeSession,
-    path: "open" | "recover" = "recover"): Promise<boolean> => {
-    // F20 (gate-6 dress): on the OPEN path only, the runner's launch-profile
-    // refusal of the box's legacy state is taken the same way. An open means
-    // no checkpoint of this run (NSR session === null), so the fresh session
-    // gets NSR's saved-history handoff. The recover path keeps it: NSR's
-    // in-run replacement owns that refusal there.
-    const launchProfile = path === "open" && restoreUnavailableOnNewBoxCode(failure) === null
-      && freshThreadRefusalCode(failure) === LAUNCH_PROFILE_MISMATCH_CODE;
-    const code = launchProfile ? LAUNCH_PROFILE_MISMATCH_CODE : restoreUnavailableOnNewBoxCode(failure);
-    if (code === null || restoreUnavailableFreshThread || remoteTarget?.transport !== "sandbox"
-      || !remoteCommandRunner || !sandboxLeaseAcquisition?.providerLeaseId
-      || (!launchProfile && sandboxLeaseAcquisition.outcome !== "created")) return false;
-    // The box's own state must be settled: a turn in flight, an active or
-    // working goal, a deferred terminal or an ambiguous turn start keeps the
-    // refusal (unreadable state keeps it too).
-    if (launchProfile && !(await remoteProviderStateSettled())) return false;
-    const reason = launchProfile ? LAUNCH_PROFILE_CHANGED_REASON : RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON;
-    if (previous && (previous.activeTurnId != null || (previous.pendingRuntimeRequests?.length ?? 0) > 0
-      || previous.semanticResult != null || previous.terminal != null || (previous.terminalTurns?.length ?? 0) > 0
-      || previous.governedWait != null || previous.dispositionOnlyRecoveryConsumed === true
-      || previous.dispositionOnlyRecoveryTurnId != null
-      || (previous as { goal?: unknown }).goal != null)) return false;
-    // A checkpoint whose policy already lets the RUNTIME replace the session
-    // (NSR replacementAllowed) is left to that existing replacement: it
-    // archives the same state, reports the continuity break and hands the
-    // fresh session its saved-history handoff.
-    if (previous?.providerRecoveryPolicy === "allow_replacement_after_resume_failure"
-      && !("homeMode" in input.execution && input.execution.homeMode === "preconfigured")) return false;
-    const previousIdentity = compatibleNativeHarnessBackupManifests({ root, execution: input.execution,
-      runnerInstanceId: input.runnerInstanceId })[0]?.manifest.providerSessionIdentity ?? null;
-    await archiveContinuityState(previous);
-    restoreUnavailableFreshThread = { previousIdentity: previousIdentity ? record(previousIdentity) : null };
-    const scope = providerIdentityLineageScope(input.execution);
-    if (!(await noteProviderIdentityBreak(input.db, scope, launchProfile ? "config_changed" : "resume_failed_on_new_box",
-      input.execution.binding.runId,
-      sandboxLeaseAcquisition.providerLeaseId))) {
-      await input.onLog?.("stderr", "[paperclip-runner] the fresh provider thread on this sandbox could not be noted durably; "
-        + "it is recorded once the thread opens.\n");
-    }
-    const atMs = Date.now();
-    await input.trace?.record({ name: "provider.session.restore_unavailable_fresh_thread", startedAtMs: atMs, endedAtMs: atMs,
-      attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
-        refusalCode: code, reason } });
-    await input.onLog?.("stdout", launchProfile
-      ? `[paperclip-runner] continuing in a fresh provider thread: the runner's launch profile changed (${code}); `
-        + `this run continues the conversation in a fresh provider thread with its saved history (${reason}).\n`
-      : `[paperclip-runner] continuing in a fresh provider thread: the backup could not be restored on this `
-        + `new sandbox (${code}); this run continues the conversation in a fresh provider thread (${reason}).\n`);
-    const { companyId, issueId, agentId, runId } = input.execution.binding;
-    await writeRestoreUnavailableContinuationNotice(input.db, { companyId, issueId, agentId, runId, code,
-      reason }).catch(async (error: unknown) => {
-      await input.onLog?.("stderr", `[paperclip-runner] continuation note not written: ${
-        redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 256)}\n`);
-    });
-    return true;
-  };
-  /** The fresh session opened: append the old thread -> the box's new thread. */
-  const recordRestoreUnavailableFreshThread = async () => {
-    const taken = restoreUnavailableFreshThread;
-    if (!taken?.previousIdentity || !remoteCommandRunner || !remoteStateDirectory) return;
-    try {
-      const providerState = await readRemoteRunnerProviderState({ runner: remoteCommandRunner,
-        stateDirectory: remoteStateDirectory, execution: input.execution });
-      const identity = providerSessionIdentityFromDurableProviderState({ execution: input.execution, providerState });
-      // Not readable yet: the pending note stays, and J3-17's first suspended
-      // read of this box appends the same step.
-      if (!providerSessionIdentityIsPresent(identity)) return;
-      const recorded = await recordedProviderIdentityTransitionIsAllowed({ db: input.db,
-        scope: providerIdentityLineageScope(input.execution), previous: taken.previousIdentity, current: identity,
-        providerLeaseId: sandboxLeaseAcquisition?.providerLeaseId ?? null });
-      if (!recorded) await input.onLog?.("stderr", "[paperclip-runner] fresh provider thread not yet recorded on the conversation lineage\n");
-    } catch (error) {
-      await input.onLog?.("stderr", `[paperclip-runner] fresh provider thread not yet recorded on the conversation lineage: ${
-        redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 256)}\n`);
-    }
   };
   const localRecoveryProcess =
     input.restartRecovery?.kind === "reattach_existing_runner"
@@ -20902,17 +20786,7 @@ async function createRunnerdBackendWithinSessionClaim(
     openSession: async (sessionInput) => {
       cursorCloudRuntime?.register();
       try {
-        let session: NativeSession;
-        try { session = await backend.openSession(sessionInput); }
-        catch (error) {
-          // J3-22 member (a): a refused restore continues in this run on a
-          // fresh thread. The runtime opens (not recovers) only when it loaded
-          // no checkpoint of this run (NSR session === null), so no turn,
-          // request or goal of the old thread can ride on this open.
-          if (!await takeRestoreUnavailableFreshThread(error, undefined, "open")) throw error;
-          session = await backend.openSession(sessionInput);
-          await recordRestoreUnavailableFreshThread();
-        }
+        const session = await backend.openSession(sessionInput);
         const managed = wrapManagedSession(session);
         await recordAdmittedProviderPack(managed, sessionInput.identity, Boolean(adoptedProcess));
         return managed;

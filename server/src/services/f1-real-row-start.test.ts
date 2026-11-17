@@ -8,7 +8,6 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { hasConfirmedSandboxStopAndRetain, prepareHistoricalSandboxStopVerification } from "./sandbox-stop-and-retain.js";
 import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
-import { readFreshThreadStopProof } from "./native-runtime/fresh-thread-stop-gate.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import type { Environment } from "@paperclipai/shared";
 
@@ -80,15 +79,13 @@ describe.skipIf(!support.supported)("F1 actual SEED-B released row at follow-up 
     const confirmedRelease = hasRemoteTerminationReceipt(f.lease) && Number.isFinite(confirmedAt)
       && confirmedAt >= f.lease.acquiredAt.getTime() && f.lease.releasedAt !== null && confirmedAt <= f.lease.releasedAt.getTime()
       && f.lease.metadata?.pendingCleanupInFlight !== true;
-    const proof = await readFreshThreadStopProof(db, f.followUp, f.issueId);
-    await record({ test: "predicate", wall, lease: f.lease, hasConfirmedSandboxStopAndRetain: hasConfirmedSandboxStopAndRetain(f.lease), hasRemoteTerminationReceipt: hasRemoteTerminationReceipt(f.lease), confirmedRelease, proof });
+    await record({ test: "predicate", wall, lease: f.lease, hasConfirmedSandboxStopAndRetain: hasConfirmedSandboxStopAndRetain(f.lease), hasRemoteTerminationReceipt: hasRemoteTerminationReceipt(f.lease), confirmedRelease });
     expect(termination).not.toHaveProperty("kind");
     expect(termination.confirmedAt).toBe(f.lease.releasedAt!.toISOString());
     expect(hasBoundRemoteStopReceipt(f.lease)).toBe(true);
     expect(hasRemoteTerminationReceipt(f.lease)).toBe(true);
     expect(hasConfirmedSandboxStopAndRetain(f.lease)).toBe(true);
     expect(confirmedRelease).toBe(true);
-    expect(proof.gone).toBe(true);
     expect(await row()).toEqual(f.lease);
   });
 

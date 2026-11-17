@@ -79,7 +79,7 @@ import type {
   HarnessRuntimeRequestResolution,
   PersistedHarnessProviderIdentity,
 } from "../contracts/harness-driver.js";
-import { RUNNER_PREPARE_REFUSAL_CODES, type RunnerPrepareRefusalCode, NativeRunnerRefreshRequiredError, isRunnerResumeStateUnavailable, NativeRunnerResumeStateUnavailableError, NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
+import { RUNNER_PREPARE_REFUSAL_CODES, type RunnerPrepareRefusalCode, isRunnerResumeStateUnavailable, NativeRunnerResumeStateUnavailableError, NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
 import {
   DurablePrpControlPlane,
   inspectStagedRunAttachment,
@@ -7022,10 +7022,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const preparation = core.store.state.commands.findLast(command => command.type === "run.prepare");
     const decision = record(record(preparation?.result).result);
     if (decision.refusalCode === "provider_refresh_required" && ["refresh_wait", "refresh_fresh"].includes(String(decision.status))) {
+      // A plain prepare refusal: this contender opened no provider, and the
+      // server's ordinary failure path (Paperclip's fresh-continuation
+      // fallback) decides what follows. No typed refresh family.
       this.#refreshAdmissionRefused = true;
       const prepareRefusalCode = (RUNNER_PREPARE_REFUSAL_CODES as readonly unknown[]).includes(decision.prepareRefusalCode)
         ? decision.prepareRefusalCode as RunnerPrepareRefusalCode : "provider_prepare_refused";
-      throw new NativeRunnerRefreshRequiredError(decision.waitForTurn === true, prepareRefusalCode);
+      const refusal = new Error(`PRP command run.prepare refused: ${prepareRefusalCode}`) as RunnerCommandFailure;
+      Object.defineProperty(refusal, "runnerCommandResult", { value: { commandType: "run.prepare", status: "failed",
+        result: { code: "command_execution_failed", refusalCode: prepareRefusalCode } }, enumerable: false });
+      throw refusal;
     }
     if (!unclaimedBootstrap) {
       const opening = core.queueCommand("session.open", { reuse: "same_session" }, undefined, true);

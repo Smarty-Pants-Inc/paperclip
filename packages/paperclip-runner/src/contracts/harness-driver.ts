@@ -524,8 +524,6 @@ export const PROVIDER_LAUNCH_PROFILE_MISMATCH = "provider_launch_profile_mismatc
  * result. Replacing the session could repeat or lose that external action. */
 export const PROVIDER_SIDE_EFFECT_PENDING = "provider_side_effect_pending";
 
-export const PROVIDER_REFRESH_REQUIRED = "provider_refresh_required";
-
 export class NativeRunnerLaunchProfileMismatchError extends Error {
   readonly code = "native_runner_launch_profile_mismatch";
   constructor(reason: string) {
@@ -534,21 +532,11 @@ export class NativeRunnerLaunchProfileMismatchError extends Error {
   }
 }
 
-/** Prepare refused; its typed code, never diagnostic prose, owns the wait. */
-export class NativeRunnerRefreshRequiredError extends Error {
-  readonly code = "native_runner_refresh_required";
-  constructor(readonly waitForTurn: boolean, readonly prepareRefusalCode?: RunnerPrepareRefusalCode) {
-    super("native_runner_refresh_required");
-    this.name = "NativeRunnerRefreshRequiredError";
-  }
-}
-
 export type RunnerRecoveryFailureClass =
   | typeof PROVIDER_STATE_INCOMPATIBLE
   | typeof PROVIDER_ATTACH_REFUSED
   | typeof PROVIDER_SIDE_EFFECT_PENDING
-  | typeof PROVIDER_LAUNCH_PROFILE_MISMATCH
-  | typeof PROVIDER_REFRESH_REQUIRED;
+  | typeof PROVIDER_LAUNCH_PROFILE_MISMATCH;
 
 const RUNNER_RECOVERY_FAILURE_CLASSES: ReadonlySet<string> = new Set([
   PROVIDER_STATE_INCOMPATIBLE,
@@ -586,13 +574,6 @@ export function isRunnerResumeStateUnavailable(error: unknown, depth = 0): boole
   return isRunnerResumeStateUnavailable((error as { cause?: unknown }).cause, depth + 1);
 }
 
-export function runnerRefreshWaitForTurn(error: unknown, depth = 0): boolean {
-  if (!error || typeof error !== "object" || depth > 5) return false;
-  if (error instanceof NativeRunnerRefreshRequiredError) return error.waitForTurn;
-  return runnerPrepareRefusalCode(error) === "provider_active_turn"
-    || runnerRefreshWaitForTurn((error as { cause?: unknown }).cause, depth + 1);
-}
-
 export interface HarnessSessionRecoveryResult {
   recovered: boolean;
   session?: HarnessSession;
@@ -604,7 +585,6 @@ export interface HarnessSessionRecoveryResult {
    * the checkpoint had no turn or runtime request in flight. */
   resumeStateUnavailable?: true;
   runnerExitConfirmed?: true;
-  refreshWaitForTurn?: true;
   prepareRefusalCode?: RunnerPrepareRefusalCode;
   /** Server-authored restoration refusal; diagnostics are not authority. */
   recoveryRefusalCode?: "runner_remote_state_unavailable"
@@ -642,22 +622,8 @@ export const RUNNER_PREPARE_REFUSAL_CODES = [
 ] as const;
 export type RunnerPrepareRefusalCode = typeof RUNNER_PREPARE_REFUSAL_CODES[number];
 
-/** Codes emitted only by the Runner's skill/instruction refresh admission.
- * Provider config/contract drift can refuse preparation but is not proof that a
- * skill/instruction update took effect. */
-export function isInstructionRefreshPrepareCode(code: unknown): boolean {
-  return code === "provider_active_turn"
-    || code === "provider_live_descendants"
-    || code === "provider_active_goal"
-    || code === "provider_contract_changed";
-}
-
-export const INSTRUCTION_REFRESH_PREPARE_CODES = RUNNER_PREPARE_REFUSAL_CODES
-  .filter(isInstructionRefreshPrepareCode);
-
 export function runnerPrepareRefusalCode(error: unknown, depth = 0): RunnerPrepareRefusalCode | undefined {
   if (!error || typeof error !== "object" || depth > 5) return undefined;
-  if (error instanceof NativeRunnerRefreshRequiredError && error.prepareRefusalCode) return error.prepareRefusalCode;
   const value = error as Record<string, unknown>;
   // Runtime recovery preserves C1's specific code beside the closed
   // controller refusal. Accept only a matching pair, never an arbitrary field.
@@ -671,7 +637,6 @@ export function runnerPrepareRefusalCode(error: unknown, depth = 0): RunnerPrepa
   const detail = record(receipt.result);
   if (["run.attach", "run.prepare"].includes(String(receipt.commandType)) && receipt.status === "failed"
     && detail.code === "command_execution_failed") {
-    if (detail.refusalCode === PROVIDER_REFRESH_REQUIRED) return "provider_prepare_refused";
     return (RUNNER_PREPARE_REFUSAL_CODES as readonly unknown[]).includes(detail.refusalCode)
       ? detail.refusalCode as RunnerPrepareRefusalCode : "provider_prepare_refused";
   }
@@ -682,10 +647,7 @@ export function runnerPrepareRefusalCode(error: unknown, depth = 0): RunnerPrepa
 export function runnerReconciliationFailureClass(error: unknown, depth = 0): RunnerRecoveryFailureClass | undefined {
   if (!error || typeof error !== "object" || depth > 5) return undefined;
   if (error instanceof NativeRunnerLaunchProfileMismatchError) return PROVIDER_LAUNCH_PROFILE_MISMATCH;
-  if (error instanceof NativeRunnerRefreshRequiredError) return PROVIDER_REFRESH_REQUIRED;
-  const refusal = runnerPrepareRefusalCode(error);
-  if (refusal === PROVIDER_LAUNCH_PROFILE_MISMATCH) return PROVIDER_LAUNCH_PROFILE_MISMATCH;
-  if (refusal) return PROVIDER_REFRESH_REQUIRED;
+  if (runnerPrepareRefusalCode(error) === PROVIDER_LAUNCH_PROFILE_MISMATCH) return PROVIDER_LAUNCH_PROFILE_MISMATCH;
   return runnerRecoveryFailureClass(error) ?? runnerReconciliationFailureClass((error as { cause?: unknown }).cause, depth + 1);
 }
 

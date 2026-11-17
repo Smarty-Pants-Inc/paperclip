@@ -28,8 +28,6 @@ import { readRunCancellation } from "./run-cancellation.js";
 import { PERMANENT_SOURCE_RETRY_CLASSES, UNVERIFIABLE_SOURCE_CODES, readSystemRecovery } from "./system-recovery-state.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
 export { freshContinuationChain } from "./fresh-continuation-chain.js";
-import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
-import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.js";
 import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuationCauseIsSystemOwnedSql, continuesAutomaticallySql,
   isPersonOwnedFailureCode, recoveryRunSql } from "./continuation-cause.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
@@ -44,8 +42,8 @@ export { AUTOMATIC_CONTINUATION_WAKE_REASONS, PERSON_OWNED_FAILURE_CODES, isPers
  * When a run ended without finishing its work and nothing exact follows it
  * (no resumed session, no replacement, no scheduled retry, no saved input),
  * `ensureFreshContinuation` starts the task again in a fresh session from its
- * last verified saved workspace and its conversation. The generic isolated
- * fallback needs no person and no proof that the old executor stopped:
+ * last verified saved workspace and its conversation. It needs no person and
+ * no proof that the old executor stopped:
  *
  * - The old run keeps its own fencing. Its remote workspace epoch is abandoned
  *   when it still owns it, so its writer can never publish again and the next
@@ -57,9 +55,9 @@ export { AUTOMATIC_CONTINUATION_WAKE_REASONS, PERSON_OWNED_FAILURE_CODES, isPers
  *   side effect.
  *
  * Eligibility is by classification, not by an allowlist: every failure is
- * eligible except a permanent conversation refusal or a cause a person must
- * resolve (`PERSON_OWNED_FAILURE_CODES` and `personOwnedTaskWait`). A failure
- * code added later falls back without a change here.
+ * eligible except the causes a person must resolve (`PERSON_OWNED_FAILURE_CODES`
+ * and the task-level waits in `personOwnedTaskWait`). A failure code added
+ * later falls back without a change here.
  *
  * Idempotent per source run: the task row lock serializes callers on every
  * server, and the recorded `freshContinuation.sourceRunId` (or any newer run of
@@ -346,84 +344,6 @@ export async function readFreshContinuationReadiness(db: Db, run: Pick<typeof he
   return { mode: "fresh_isolated_workspace" as const, retryIntentId: recordId, sourceRunId, retainedSourceIds: [] as string[] };
 }
 
-async function hasAnswerSinceSettlement(db: Pick<Db, "select">, source: typeof heartbeatRuns.$inferSelect,
-  issueId: string, recordedAt: string, currentRunId = source.id): Promise<boolean> {
-  if (!source.nativeSessionId) return false;
-  const [answer] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, source.companyId), eq(heartbeatRuns.agentId, source.agentId),
-    eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.nativeSessionId, source.nativeSessionId),
-    sql`${heartbeatRuns.id} not in (${source.id}, ${currentRunId})`,
-    // Completing the step that preceded a refused follow-up is not an answer
-    // to that follow-up. A turn admitted AFTER this obligation may supersede
-    // its settlement, even if admitted before recordedAt and answered later.
-    sql`${heartbeatRuns.createdAt} >= ${source.createdAt.toISOString()}::timestamptz`,
-    sql`greatest(${heartbeatRuns.createdAt}, ${heartbeatRuns.finishedAt}) >= ${recordedAt}::timestamptz`,
-    sql`(${heartbeatRuns.status} = 'succeeded' or ${heartbeatRuns.sessionIdAfter} is not null
-      or jsonb_typeof(${heartbeatRuns.resultJson}->'nativeResult') = 'object')`,
-  )).limit(1);
-  return answer !== undefined;
-}
-
-/** Read the existing fallback owner's decision, not a caller's force-fresh flag.
- * The source has lost write authority and the decision records the workspace
- * isolation. Consumers may leave that source's provider thread exactly once:
- * only while their current thread still equals sourceSessionId. No execution
- * or snapshot proof is relaxed by this authorization. Every rotation also
- * refuses a settlement answered since it was recorded. Caller holds the task
- * lock, serializing this decision with
- * admission, Stop and chat resets. */
-export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select" | "selectDistinctOn">,
-  run: typeof heartbeatRuns.$inferSelect, issueId: string) {
-  // A turn with a bound identity/input has already crossed admission. Its
-  // running thread is immutable; a late settlement belongs to the NEXT turn.
-  if (run.nativeSessionId || run.runnerProfileJson?.nativeExecutionInput !== undefined
-    || run.runnerProfileJson?.sessionCheckpoint != null || run.runnerProfileJson?.nativeControllerRecovery != null
-    || run.processPid !== null || run.processGroupId !== null || run.processStartedAt !== null || run.sessionIdAfter !== null) return null;
-  const [record] = await db.select({ action: issueRecoveryActions, source: heartbeatRuns })
-    .from(issueRecoveryActions).innerJoin(heartbeatRuns, and(
-      eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
-      sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}'`,
-    )).where(and(eq(issueRecoveryActions.companyId, run.companyId),
-      eq(issueRecoveryActions.sourceIssueId, issueId), eq(issueRecoveryActions.status, "resolved"),
-      eq(issueRecoveryActions.outcome, "restored"), eq(issueRecoveryActions.ownerType, "system"),
-      eq(issueRecoveryActions.returnOwnerAgentId, run.agentId),
-      sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,schema}' = ${FRESH_CONTINUATION_SCHEMA}`,
-      eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.nativeIssueId, issueId),
-      eq(heartbeatRuns.runtimeMode, "native"),
-      sql`${heartbeatRuns.id} <> ${run.id}`,
-      sql`${heartbeatRuns.createdAt} < (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})`,
-      sql`(${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}')::timestamptz <= (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})`,
-    )).orderBy(desc(sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}'`), desc(issueRecoveryActions.id)).limit(1);
-  if (!record) return null;
-  const { action, source } = record;
-  const fresh = object(action.evidence.freshContinuation);
-  const settlement = object(action.evidence.freshContinuationSettlement);
-  const reconciliation = object(action.evidence.executionReconciliation);
-  const context = object(run.contextSnapshot);
-  if (fresh.schema !== FRESH_CONTINUATION_SCHEMA || settlement.schema !== FRESH_CONTINUATION_SCHEMA
-    || fresh.sourceRunId !== source.id || settlement.sourceRunId !== source.id
-    || settlement.actorType !== "system" || settlement.actorId !== FRESH_CONTINUATION_ACTOR
-    || settlement.decision !== "continue_in_fresh_run" || settlement.replay !== "none"
-    || reconciliation.actorId !== FRESH_CONTINUATION_ACTOR || reconciliation.runId !== source.id
-    || !["remote_epoch", "writer_ended", "fresh_isolated_workspace"].includes(String(fresh.isolation))
-    || settlement.isolation !== fresh.isolation
-    || (fresh.isolation === "fresh_isolated_workspace" && context.freshContinuationIsolation !== action.id)
-    || (fresh.isolation === "writer_ended" ? fresh.stopProof !== "writer_ended"
-      : !["unproven_epoch_abandoned", "unproven_isolated"].includes(String(fresh.stopProof)))
-    || typeof fresh.recordedAt !== "string" || source.resultJson?.[FRESH_CONTINUATION_SUPERSEDED_KEY] !== fresh.recordedAt
-    || !UNFINISHED_STATUSES.includes(source.status) || !source.finishedAt || !source.nativeSessionId
-    || source.contextSnapshot?.conversationSessionGeneration !== context.conversationSessionGeneration
-    || (context.recoveryActionId != null && context.recoveryActionId !== action.id)
-    || (action.evidence.continuationRunId != null && action.evidence.continuationRunId !== run.id)
-    || !["pending", "not_requested", "delivered"].includes(String(action.evidence.continuationDelivery))) return null;
-  // A settlement is consumable only while it is still the thread's latest
-  // unanswered boundary. This includes turns admitted before recordedAt but
-  // answered afterwards. Caller holds the issue lock used by turn admission.
-  if (await hasAnswerSinceSettlement(db, source, issueId, fresh.recordedAt, run.id)) return null;
-  return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId,
-    startedNote: await freshThreadStartedNote(db, source) };
-}
-
 /**
  * True when a wake continues a cut-off run in a new isolated workspace. The
  * fallback cleared the task's workspace binding on purpose, and the run
@@ -459,88 +379,7 @@ export async function freshContinuationIsolatesRun(db: Db, input: { companyId: s
 }
 
 export async function ensureFreshContinuation(db: Db, input: Input): Promise<FreshContinuationResult> {
-  // A stranded observed predecessor still owns its running claim even after
-  // cleanup records physical stop. Ask that existing fenced owner to settle
-  // before taking continuation locks; the proof reader cannot retire it.
-  const [source] = await db.select().from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
-  if (source && isFreshThreadRefusal(source) && source.nativeIssueId && source.nativeSessionId) {
-    const predecessors = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, source.agentId),
-      eq(heartbeatRuns.nativeIssueId, source.nativeIssueId), eq(heartbeatRuns.nativeSessionId, source.nativeSessionId),
-      eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
-      eq(heartbeatRuns.errorCode, "native_execution_ownership_unverified"),
-      sql`${heartbeatRuns.createdAt} < ${source.createdAt.toISOString()}::timestamptz`,
-      sql`coalesce(${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration', '0'::jsonb)
-        = ${JSON.stringify(object(source.contextSnapshot).conversationSessionGeneration ?? 0)}::jsonb`));
-    if (predecessors.length) {
-      const { settleStoppedRemoteNativeOwner } = await import("./native-runtime/native-failed-run-owner-release.js");
-      for (const predecessor of predecessors) await settleStoppedRemoteNativeOwner(db, predecessor.id);
-    }
-  }
   return db.transaction(tx => continueFreshInTransaction(tx as unknown as Db, input));
-}
-
-/**
- * Whether the run exact recovery would restore died before the controller:
- * no finalization owner row and no controller recovery metadata (#20925). For
- * a fresh-thread refusal that is the run it tried to recover (its retry
- * source, else the previous run of the same conversation); otherwise the run
- * itself. Such a run left no provider thread or controller state to restore.
- */
-async function exactRecoverySourceDiedBeforeController(tx: Db, run: typeof heartbeatRuns.$inferSelect,
-  coordinator: typeof nativeRunFinalizations.$inferSelect | null): Promise<boolean> {
-  if (run.runtimeMode !== "native") return false;
-  let target = run;
-  if (isFreshThreadRefusal(run)) {
-    const [source] = run.retryOfRunId
-      ? await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId),
-        eq(heartbeatRuns.id, run.retryOfRunId)))
-      : run.nativeSessionId && run.nativeIssueId ? await tx.select().from(heartbeatRuns).where(and(
-        eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
-        eq(heartbeatRuns.nativeIssueId, run.nativeIssueId), eq(heartbeatRuns.nativeSessionId, run.nativeSessionId),
-        sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) < (${run.createdAt.toISOString()}::timestamptz, ${run.id}::uuid)`))
-        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1) : [];
-    if (!source || source.agentId !== run.agentId || source.runtimeMode !== "native") return false;
-    target = source;
-  } else if (coordinator) return false;
-  if (!UNFINISHED_STATUSES.includes(target.status) || !target.finishedAt
-    || target.runnerProfileJson?.nativeControllerRecovery != null) return false;
-  if (target.id === run.id) return true;
-  const [owner] = await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
-    .where(and(eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, target.id))).limit(1);
-  return !owner;
-}
-
-/** Durable physical settlement, not expiry or a failed status, identifies an
- * older owner whose system hold may belong to a later refused follow-up. */
-function stoppedRemoteOwnerCondition() {
-  return and(eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "failed"),
-    eq(nativeRunFinalizations.phase, "terminal_failure"), isNull(nativeRunFinalizations.leaseOwner),
-    isNull(nativeRunFinalizations.resultId),
-    sql`${nativeRunFinalizations.failureDetail}#>>'{releasedOwner,reason}' = 'stopped_remote_owner'`)!;
-}
-
-/** Caller holds the task lock. A settlement wake names the retired owner, but
- * the unanswered message belongs to the latest refusal in that SAME thread.
- * Do not skip newer work, a reset, reassignment, or a genuinely live owner. */
-async function waitingSourceAfterStoppedOwner(tx: Db, companyId: string, issueId: string, runId: string) {
-  const [stopped] = await tx.select({ run: heartbeatRuns }).from(heartbeatRuns).innerJoin(nativeRunFinalizations, and(
-    eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId), eq(nativeRunFinalizations.runId, heartbeatRuns.id)))
-    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId), stoppedRemoteOwnerCondition()));
-  if (!stopped?.run.nativeSessionId) return runId;
-  const [latest] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
-    or(eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.issueId, issueId),
-      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
-    sql`not coalesce(${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.startedAt} is null
-      and ${heartbeatRuns.errorCode} = 'execution_reconciliation_required', false)`))
-    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-  return latest && latest.runtimeMode === "native" && latest.agentId === stopped.run.agentId
-    && latest.nativeSessionId === stopped.run.nativeSessionId
-    && (object(latest.contextSnapshot).conversationSessionGeneration ?? 0)
-      === (object(stopped.run.contextSnapshot).conversationSessionGeneration ?? 0)
-    && UNFINISHED_STATUSES.includes(latest.status) && latest.finishedAt && isFreshThreadRefusal(latest)
-    ? latest.id : runId;
 }
 
 /**
@@ -559,60 +398,22 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   const issueId = peek.nativeIssueId ?? peek.issueId ?? (typeof contextIssueId === "string" ? contextIssueId : null);
   if (!issueId) return { kind: "not_applicable", reason: "run_has_no_task" };
   const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).for("update");
-  const sourceRunId = await waitingSourceAfterStoppedOwner(tx, companyId, issueId, input.runId);
   const [coordinator] = await tx.select().from(nativeRunFinalizations).where(and(
-    eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, sourceRunId))).for("update");
+    eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, input.runId))).for("update");
   const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
-    eq(heartbeatRuns.id, sourceRunId))).for("update");
+    eq(heartbeatRuns.id, input.runId))).for("update");
   if (!issue || !run) return { kind: "not_applicable", reason: "run_missing" };
   if (!UNFINISHED_STATUSES.includes(run.status) || !run.finishedAt) return { kind: "not_applicable", reason: "run_not_unfinished" };
   if (!issue.assigneeAgentId || issue.assigneeAgentId !== run.agentId || issue.assigneeUserId
     || ["done", "cancelled"].includes(issue.status)) return { kind: "not_applicable", reason: "task_changed" };
 
-  // A later refusal can have NO hold of its own. Include only physically
-  // settled predecessors in this conversation, so their stale system actions
-  // cannot veto the follow-up. Human gates and unrelated Blocked decisions
-  // remain intact.
-  const stoppedPredecessors = isFreshThreadRefusal(run) && run.nativeSessionId
-    ? await tx.select({ run: heartbeatRuns }).from(heartbeatRuns).innerJoin(nativeRunFinalizations, and(
-      eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId), eq(nativeRunFinalizations.runId, heartbeatRuns.id)))
-      .where(and(stoppedRemoteOwnerCondition(), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, run.agentId),
-        eq(heartbeatRuns.nativeSessionId, run.nativeSessionId), eq(nativeRunFinalizations.issueId, issue.id),
-        sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) < (${run.createdAt.toISOString()}::timestamptz, ${run.id}::uuid)`,
-        sql`coalesce(${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration', '0'::jsonb)
-          = ${JSON.stringify(object(run.contextSnapshot).conversationSessionGeneration ?? 0)}::jsonb`)) : [];
-  const holdSources = [run, ...stoppedPredecessors.map(row => row.run)];
   const holds = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issue.id),
-    or(inArray(sql`${issueRecoveryActions.evidence}->>'runId'`, holdSources.map(source => source.id)),
-      inArray(sql`${issueRecoveryActions.evidence}->>'sourceRunId'`, holdSources.map(source => source.id)))))
+    or(sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`, sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${run.id}`)))
     .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)).for("update");
-  const ownsBlockedStatus = (hold: typeof issueRecoveryActions.$inferSelect) => holdOwnsBlockedStatus(hold, issue,
-    holdSources.find(source => source.id === holdRunId(hold.evidence)) ?? run);
   const prior = holds.find(hold => object(hold.evidence.freshContinuation).sourceRunId === run.id);
-  // Do not narrate a restart after the conversation has moved on: a newer
-  // run, or an answer since this run started, already follows it.
-  if (isFreshThreadRefusal(run) && !prior) {
-    const [newer] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id} <> ${run.id}`,
-      or(eq(heartbeatRuns.nativeIssueId, issue.id), eq(heartbeatRuns.issueId, issue.id),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
-      sql`not coalesce(${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.startedAt} is null
-        and ${heartbeatRuns.errorCode} = 'execution_reconciliation_required', false)`,
-      sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${run.createdAt.toISOString()}::timestamptz, ${run.id}::uuid)`)).limit(1);
-    if (newer || await hasAnswerSinceSettlement(tx, run, issue.id, run.createdAt.toISOString())
-      || typeof object(coordinator?.failureDetail).successorRunId === "string"
-      || holds.some(hold => hold !== prior && hold.evidence.executionReconciliation
-        && ["pending", "delivered", "delegated"].includes(String(hold.evidence.continuationDelivery))))
-      return { kind: "successor_exists" };
-  }
   if (prior) {
-    const recordedAt = object(prior.evidence.freshContinuation).recordedAt;
-    if (typeof recordedAt === "string" && await hasAnswerSinceSettlement(tx, run, issue.id, recordedAt)) {
-      return { kind: "successor_exists" };
-    }
-    await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now,
-      ownsBlock: holds.filter(isOwnedReconciliationHold).some(ownsBlockedStatus) });
+    await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now });
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
   const chain = await freshContinuationChain(tx, { companyId, issueId: issue.id, runId: run.id });
@@ -695,9 +496,6 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   // Exact recovery that is still under way keeps its chance, for a bounded
   // number of checks; each owner below also bounds itself.
   const recheck = new Date(now.getTime() + EXACT_RECOVERY_RECHECK_MS);
-  // A run that died before the controller (for example in workspace
-  // preparation) left nothing for exact recovery to restore (#20925).
-  const nothingToRecover = await exactRecoverySourceDiedBeforeController(tx, run, coordinator ?? null);
   const waits: Array<FreshContinuationResult | null> = [];
   if (adapterExecutionControls.has(run.id)) waits.push(pending("execution_settling", recheck));
   if (coordinator?.leaseOwner || (coordinator?.resultId && coordinator.phase !== "committed")
@@ -715,12 +513,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     if (recovery && EXACT_RECOVERY_STATES.includes(recovery.state))
       waits.push(pending("saved_work_recovery_running",
         new Date(Math.max(recheck.getTime(), recovery.nextAttemptAt ?? 0))));
-    if (!isOwnedReconciliationHold(hold) && isRestoreHold(hold) && blocksExecution(hold) && recovery?.state !== "complete") {
-      // Nothing exact to restore and no saved-work recovery under way: skip
-      // straight to the isolated fresh continuation (as past the bound).
-      if (nothingToRecover && !(recovery && EXACT_RECOVERY_STATES.includes(recovery.state))) waitSkipped = true;
-      else waits.push(pending("workspace_recovery_owns_restore", recheck));
-    }
+    if (!isOwnedReconciliationHold(hold) && isRestoreHold(hold) && blocksExecution(hold) && recovery?.state !== "complete")
+      waits.push(pending("workspace_recovery_owns_restore", recheck));
     const retainedCheck = object(hold.evidence.retainedSourceFallbackCheck);
     if (recovery?.state === "exhausted" && typeof retainedCheck.nextCheckAt === "number" && retainedCheck.nextCheckAt > now.getTime())
       waits.push(pending("retained_source_fallback_pending", new Date(retainedCheck.nextCheckAt)));
@@ -757,7 +551,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   if (issue.status === "blocked") {
     const receipts = holds.filter(hold => hold.evidence.nativeFailureBlock !== undefined || hold.evidence.legacyCancellationBlock !== undefined
       || hold.evidence.nativeBootstrapFailureBlock !== undefined);
-    ownsBlock = (receipts.length ? receipts : holds).some(ownsBlockedStatus)
+    ownsBlock = (receipts.length ? receipts : holds).some(hold => holdOwnsBlockedStatus(hold, issue, run))
       || receipts.some(hold => [hold.evidence.legacyCancellationBlock, hold.evidence.nativeBootstrapFailureBlock]
         .some(block => object(block).runId === run.id && object(block).statusVersion === Number(issue.statusVersion)))
       // A run that left no hold: its terminal failure set the block and nothing changed it since.
@@ -845,7 +639,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
         eq(agentWakeupRequests.reason, "task_retry"), eq(agentWakeupRequests.requestedByActorType, "user"), isNull(agentWakeupRequests.runId),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`));
   }
-  const ownerHold = owned.find(ownsBlockedStatus) ?? owned.at(-1);
+  const ownerHold =owned.find(hold => issue.status === "blocked" && holdOwnsBlockedStatus(hold, issue, run)) ?? owned.at(-1);
 
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionReplacement);
@@ -920,13 +714,13 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
 }
 
 async function settleLateHolds(tx: Db, input: { companyId: string; issue: typeof issues.$inferSelect; run: typeof heartbeatRuns.$inferSelect;
-  prior: typeof issueRecoveryActions.$inferSelect; holds: Array<typeof issueRecoveryActions.$inferSelect>; now: Date; ownsBlock: boolean }) {
+  prior: typeof issueRecoveryActions.$inferSelect; holds: Array<typeof issueRecoveryActions.$inferSelect>; now: Date }) {
   const { companyId, issue, run, prior, holds, now } = input;
   if (!holds.length) return;
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
   await notifyStatusCardIssueChange(tx, companyId);
   await notifyRoutineExecutionStatus(tx, issue.id, companyId);
-  const ownsBlock = input.ownsBlock;
+  const ownsBlock = issue.status === "blocked" && holds.some(hold => holdOwnsBlockedStatus(hold, issue, run));
   const delivery = String(prior.evidence.continuationDelivery);
   const followed = ["delivered", "invalidated"].includes(delivery) ? delivery : "coalesced";
   for (const hold of holds) {
@@ -1006,7 +800,7 @@ export function heldExecutionsAwaitingFreshContinuation(db: Db, now: Date, limit
  * through restart recovery and the disposition pass, not through this list.
  */
 export const BACKLOG_CONTINUATION_MAX_AGE_MS = 24 * 60 * 60_000;
-export const BACKLOG_CONTINUATION_SOURCE_CODES = [...FRESH_THREAD_REFUSAL_CODES, ...RESTART_CLASS_FAILURE_CODES] as const;
+export const BACKLOG_CONTINUATION_SOURCE_CODES = RESTART_CLASS_FAILURE_CODES;
 /** At most this many backlog continuations per server per rolling minute, and per pass. */
 export const BACKLOG_CONTINUATIONS_PER_MINUTE = 10;
 const BACKLOG_CONTINUATIONS_PER_PASS = 5;
@@ -1050,11 +844,8 @@ function interruptionEligibility(input: { now: Date; companyId: SQL; issueId: SQ
     and lost.evidence#>>'{systemRecovery,state}' = 'exhausted'
     and lost.evidence#>>'{systemRecovery,failure,code}' in (${sqlList(UNVERIFIABLE_SOURCE_CODES)})
     and lost.evidence#>>'{systemRecovery,failure,retryClass}' in (${sqlList(PERMANENT_SOURCE_RETRY_CLASSES)}))`;
-  // Fork (Cut B 928c3f802, c2 2c38e470): the closed fresh-thread refusal family
-  // stays a backlog source beside upstream's system-owned/saved-files-lost causes.
   const recent = source(sql`(${continuesAutomaticallySql("source")} or ${systemRetriedSource}
-      or (${continuationCauseIsSystemOwnedSql("source")} and ${savedFilesLost})
-      or source.error_code in (${sql.join(FRESH_THREAD_REFUSAL_CODES.map(code => sql`${code}`), sql`, `)}))
+      or (${continuationCauseIsSystemOwnedSql("source")} and ${savedFilesLost}))
     and greatest(source.finished_at, (select max(held.finished_at) from ${heartbeatRuns} held where ${refusedLater})) > ${since}`);
   return { recent, personAsked };
 }
@@ -1084,8 +875,7 @@ export function resetBacklogContinuationPacingForTests(db?: Db) {
 let lastLeftAloneLogAt = 0;
 const LEFT_ALONE_LOG_INTERVAL_MS = 10 * 60_000;
 
-/** Held reconciliation records of the latest unfinished obligation, including
- * a stopped predecessor whose hold must route to that obligation. */
+/** Held reconciliation records of a task's latest unfinished run (joined to its task). */
 export function heldExecutionWhere(options: { includeActive?: boolean } = {}) {
   return and(
       inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
@@ -1105,8 +895,7 @@ export function heldExecutionWhere(options: { includeActive?: boolean } = {}) {
       isNull(issueRecoveryActions.ownerUserId),
       sql`${issues.status} not in ('done', 'cancelled')`,
       sql`${issues.assigneeAgentId} is not null`,
-      // Latest unfinished work, or a physically settled predecessor whose only
-      // later work is a refused follow-up in the same conversation.
+      // Only the task's latest run, unfinished and still its assignee's: other
       sql`exists (select 1 from ${heartbeatRuns} source where source.company_id = ${issueRecoveryActions.companyId}
         and source.id = ${sourceRunKey(heldRunIdSql())}
         and source.status in ('failed', 'timed_out', 'interrupted', 'cancelled') and source.finished_at is not null
@@ -1114,21 +903,7 @@ export function heldExecutionWhere(options: { includeActive?: boolean } = {}) {
         and not exists (select 1 from ${heartbeatRuns} newer where newer.company_id = source.company_id and newer.id <> source.id
           and (newer.native_issue_id = ${issues.id} or newer.issue_id = ${issues.id} or newer.context_snapshot->>'issueId' = ${issues.id}::text)
           and not ${cancelledAtDispatch("newer")}
-          and (newer.created_at, newer.id) > (source.created_at, source.id)
-          and not coalesce((newer.runtime_mode = 'native' and newer.agent_id = source.agent_id
-            and newer.native_session_id = source.native_session_id
-            and coalesce(newer.context_snapshot->'conversationSessionGeneration', '0'::jsonb)
-              = coalesce(source.context_snapshot->'conversationSessionGeneration', '0'::jsonb)
-            and newer.status in ('failed', 'timed_out', 'interrupted', 'cancelled') and newer.finished_at is not null
-            and (newer.error_code in (${sql.join(FRESH_THREAD_REFUSAL_CODES.map(code => sql`${code}`), sql`, `)})
-              or newer.error in (${sql.join(FRESH_THREAD_REFUSAL_CODES.map(code => sql`${code}`), sql`, `)})
-              or newer.result_json#>>'{nativeFreshContinuationRefusal,code}' in (${sql.join(FRESH_THREAD_REFUSAL_CODES.map(code => sql`${code}`), sql`, `)}))
-            and exists (select 1 from ${nativeRunFinalizations} stopped where stopped.company_id = source.company_id
-              and stopped.run_id = source.id and stopped.issue_id = ${issues.id} and stopped.phase = 'terminal_failure'
-              and stopped.lease_owner is null and stopped.result_id is null
-              and stopped.failure_detail#>>'{releasedOwner,reason}' = 'stopped_remote_owner')), false)))`,
-      // An earlier live turn is not a successor. Inspect its strict stop gate
-      // so the saved message gets one waiting note; admission still refuses it.
+          and (newer.status in ('queued', 'running', 'scheduled_retry') or (newer.created_at, newer.id) > (source.created_at, source.id))))`,
   )!;
 }
 

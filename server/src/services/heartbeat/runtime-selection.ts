@@ -28,7 +28,7 @@ import type { buildExecutionContinuation } from "../execution-continuation.js";
 import type { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHash, randomUUID } from "node:crypto";
 import { nativeSha256 } from "../native-runtime/canonical.js";
-import { selectFreshContinuationThread, selectPiConversation } from "../native-runtime/pi-conversation-record.js";
+import { selectPiConversation } from "../native-runtime/pi-conversation-record.js";
 import type { FailedNativePredecessorProbe } from "../native-runtime/native-provider-work-proof.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -566,11 +566,8 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
           },
         }) : null;
 
-    const freshThreadId = !piConversation ? await selectFreshContinuationThread(db, {
-      companyId: agent.companyId, agentId: agent.id, issueId: issueRef.id, runId: run.id,
-    }) : null;
     const requestedNativeSessionId =
-      run.nativeSessionId ?? piConversation?.id ?? freshThreadId ?? resumableTaskSessionId;
+      run.nativeSessionId ?? piConversation?.id ?? resumableTaskSessionId;
     // A task-session lastRunId can lag a failed turn or point at an older
     // normalized session. Find the newest exact-session authority instead.
     // Rows that already acquired provider authority are progress barriers,
@@ -598,7 +595,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         ? previousNativeRun.runnerInstanceId
         : (run.runnerInstanceId ?? randomUUID());
     let nativeSessionId =
-      run.nativeSessionId ?? piConversation?.id ?? freshThreadId ?? resumableTaskSessionId ?? randomUUID();
+      run.nativeSessionId ?? piConversation?.id ?? resumableTaskSessionId ?? randomUUID();
     let nativeResumeCheckpoint: ReturnType<
       typeof rebindNativeSessionCheckpoint
     > = null;
