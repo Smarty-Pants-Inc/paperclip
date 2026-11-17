@@ -1,6 +1,6 @@
 import { UserPlus, Lightbulb, ShieldAlert, ShieldCheck } from "lucide-react";
 import { MarkdownBody } from "./MarkdownBody";
-import { formatCents } from "../lib/utils";
+import { formatCents, formatConfiguredCents } from "../lib/utils";
 
 export const typeLabel: Record<string, string> = {
   hire_agent: "Hire Agent",
@@ -139,7 +139,7 @@ export function BudgetOverridePayload({ payload }: { payload: Record<string, unk
       <PayloadField label="Metric" value={payload.metric} />
       {(budgetAmount !== null || observedAmount !== null) ? (
         <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          Limit {budgetAmount !== null ? formatCents(budgetAmount) : "—"} · Observed {observedAmount !== null ? formatCents(observedAmount) : "—"}
+          Limit {budgetAmount !== null ? formatConfiguredCents(budgetAmount) : "—"} · Observed {observedAmount !== null ? formatCents(observedAmount) : "—"}
         </div>
       ) : null}
       {!!payload.guidance && (
