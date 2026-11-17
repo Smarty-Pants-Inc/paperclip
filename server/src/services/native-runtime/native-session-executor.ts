@@ -825,9 +825,22 @@ export type WarmNativeSessionCloseResult = {
   failures: WarmNativeSessionCloseFailure[];
 };
 
+/** The harness-storage fence's permanent refusal of a predecessor's checkpoint:
+ * the task's execution (or a newer backup) already belongs to a later run and
+ * this owner never committed (native-harness-backup-storage.ts fence()). */
+function isSupersededCheckpointRefusal(error: unknown): boolean {
+  for (let current = error, depth = 0; current instanceof Error && depth < 8; current = current.cause, depth++) {
+    if (current.message === "native_harness_storage_owner_superseded") return true;
+  }
+  return false;
+}
+
 async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, options?: {
   preserveInstructionsForRunId?: string;
   discardUnsettledSession?: boolean;
+  /** Retirement by a successor: a checkpoint the fence refused as superseded
+   * is discarded like an unsettled session, under the same stop proofs. */
+  discardSupersededCheckpoint?: boolean;
   onForcedStopFailed?: (error: unknown) => void;
 }) {
   if (entry.controllerDetachedForRestart) return detachReleasedWarmNativeSession(entry);
@@ -848,7 +861,11 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
       // outlived the close grace: the old journal lives in the discarded
       // session's own state root, and its Runner is stopped. Without a task
       // owner, other close errors can mean controller authority is still live.
-      const discardable = options?.discardUnsettledSession === true;
+      // A successor's own claim supersedes a cancelled owner's checkpoint for
+      // good (a person's Stop or Interrupt, then the next message): no retry
+      // of this close can save it, so only containment decides, as above.
+      const discardable = options?.discardUnsettledSession === true
+        || (options?.discardSupersededCheckpoint === true && isSupersededCheckpointRefusal(error));
       const owner = discardable ? pluginTaskSessionOwners.get(entry.session) : undefined;
       const retiredWithoutCheckpoint = discardable && (owner
         ? owner.isRetired() || await owner.retireSupersededTask().catch(stopError => {
@@ -919,7 +936,7 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
   const directoryWaitDeadline = Date.now() + warmRetirementDirectoryWait.timeoutMs;
   for (;;) {
     try {
-      await closeWarmNativeSession(entry, reason, options);
+      await closeWarmNativeSession(entry, reason, { ...options, discardSupersededCheckpoint: true });
       return;
     } catch (error) {
       if (error instanceof AgentDirectoryOperationBusyError) {
