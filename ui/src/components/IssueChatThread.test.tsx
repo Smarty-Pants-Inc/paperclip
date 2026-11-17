@@ -459,6 +459,25 @@ describe("IssueChatThread", () => {
     markdownBodyRenderMock.mockClear();
   });
 
+  it.each([true, false])("chat: person-Stop=%s keeps its own header, not another escalation's", (personStop) => {
+    const root = createRoot(container);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    act(() => root.render(<QueryClientProvider client={client}><MemoryRouter><IssueChatThread
+      comments={[]} onAdd={async () => {}} enableLiveTranscriptPolling={false} recoveryAction={{
+      id: "stop-card", companyId: "company-1", sourceIssueId: "issue-1", kind: "active_run_watchdog",
+      cause: "execution_stop_pending", status: "escalated", ownerType: "board", ownerAgentId: null,
+      attemptCount: 1, maxAttempts: 1, outcome: "escalated", wakePolicy: null,
+      evidence: { stopPending: { personStop } }, nextAction: "Your Stop is not confirmed yet.",
+      createdAt: "2026-11-17T22:00:00Z", updatedAt: "2026-11-17T22:00:00Z",
+    } as NonNullable<ComponentProps<typeof IssueChatThread>["recoveryAction"]>} /></MemoryRouter></QueryClientProvider>));
+    const card = container.querySelector('[data-recovery-kind="active_run_watchdog"]');
+    expect(card).not.toBeNull();
+    expect(card!.textContent).toContain(personStop ? "STOP PENDING" : "RECOVERY ESCALATED");
+    if (personStop) expect(card!.textContent).not.toMatch(/recovery escalated/i);
+    act(() => root.unmount());
+    client.clear();
+  });
+
   it("offers Stop for a run still waiting in line and calls the task's stop action", async () => {
     const root = createRoot(container);
     const onCancelRun = vi.fn(async () => {});

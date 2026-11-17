@@ -49,13 +49,14 @@ const support = await getEmbeddedPostgresTestSupport();
   }
 
   // M2-M4 held behind a running turn, then the person's Stop on a warm handed-off box.
-  async function seed(options: { receipt?: boolean; person?: boolean } = {}) {
+  async function seed(options: { receipt?: boolean; person?: boolean; conversation?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sourceRunId = randomUUID();
     const stoppedAt = new Date(Date.now() - 60_000);
     await db.insert(companies).values({ id: companyId, name: "Warm Stop", defaultResponsibleUserId: "board", issuePrefix: `W${companyId.replaceAll("-", "")}` });
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board", status: "active", membershipRole: "owner" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Native", role: "engineer", adapterType: "paperclip_runner", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
-    await db.insert(issues).values({ id: issueId, companyId, title: "Chat", status: "in_progress", assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: "board", conversationState: "active" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Daily work", status: "in_progress", assigneeAgentId: agentId,
+      ...(options.conversation === false ? {} : { conversationAgentId: agentId, conversationUserId: "board", conversationState: "active" }) });
     await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native",
       status: "cancelled", errorCode: "cancelled", contextSnapshot: { issueId }, finishedAt: stoppedAt,
       runnerProfileJson: { nativeResourceDisposition: "keep_running" },
@@ -268,7 +269,7 @@ const support = await getEmbeddedPostgresTestSupport();
     (await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceRunId)))[0]!;
 
   it("U9 BOUND: the receipt never arrives: at 5 min the Stop-pending card + its true line; Send then shows no 'will start automatically'", async () => {
-    const f = await seed({ receipt: false });
+    const f = await seed({ receipt: false, conversation: false });
     const nextId = await heldAfterStop(f);
     const calls = { n: 0, runId: f.sourceRunId };
     const service = heartbeatService(db);
@@ -293,7 +294,11 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(atBound.cards).toEqual([CARD]);
       const [card] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
       trail.push({ cardLine: card!.nextAction });
-      expect(card!.nextAction).toBe("Stop pending: Paperclip cannot confirm that the previous execution stopped. Messages you send are saved and will be sent once the stop is confirmed.");
+      expect(card!.nextAction).toBe("Stop pending: Paperclip cannot confirm that the previous execution stopped. New messages you send now are saved and will start once the stop is confirmed. Messages waiting from before Stop still need Send.");
+      const feed = await import("./attention.js").then(({ attentionService }) => attentionService(db).list(f.companyId, { userId: "board" }));
+      const projected = feed.items.find(item => item.sourceKind === "recovery_action" && item.subject.id === card!.id);
+      expect(projected?.subject.metadata?.personStop).toBe(true);
+      expect(projected?.whyNow).toBe("Your Stop is not confirmed yet.");
       expect(card!.nextAction).not.toMatch(/explicit decision|stays held until Stop is proved/);
       expect(atBound.status).toBe("deferred_issue_execution");
       // The person presses Send at the bound.
@@ -342,6 +347,69 @@ const support = await getEmbeddedPostgresTestSupport();
       await evidence(`receiptAfterCard ${JSON.stringify({ attempts: calls.n, ...after, successors: (await successors(f)).length })}`);
       expect(after.cards).toEqual(["execution_stop_pending:resolved"]);
       expect(after.status).not.toBe("deferred_issue_execution");
+    } finally { vi.useRealTimers(); }
+  }, 60_000);
+
+  it("U9 card3: input sent AFTER the card is admitted once on receipt; pre-Stop input waits for Send, then is admitted once", async () => {
+    const f = await seed({ receipt: false });
+    const calls = { n: 0, runId: f.sourceRunId };
+    const cleanup = heartbeatService(db, { environmentRuntime: stuckRuntime(calls, 2) });
+    const t0 = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"], now: t0 });
+    try {
+      vi.setSystemTime(t0 + RETRY_MS);
+      await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });
+      expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(c => c.status)).toEqual(["escalated"]);
+      const posted = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/comments`)
+        .send({ body: "New input after the Stop-pending card", clientRequestId: randomUUID() });
+      expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+      const nextCommentId = posted.body.id as string;
+      let nextId = "";
+      await vi.waitFor(async () => {
+        const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+        nextId = wakes.find(wake => wake.payload?.commentId === nextCommentId)?.id ?? "";
+        expect(nextId).not.toBe("");
+      }, { timeout: 15_000, interval: 100 });
+      await evidence(`card3BeforeReceipt ${JSON.stringify({ preStopWake: await wakeOf(f.queueId),
+        postCardWake: await wakeOf(nextId), lease: await leaseOf(f),
+        successors: (await successors(f)).map(run => ({ id: run.id, status: run.status, runtimeMode: run.runtimeMode,
+          context: run.contextSnapshot, result: run.resultJson, errorCode: run.errorCode })) })}`);
+      expect(await successors(f)).toHaveLength(0);
+      vi.setSystemTime(t0 + 2 * RETRY_MS + 1_000);
+      await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });
+      vi.useRealTimers();
+      await vi.waitFor(async () => expect(await successors(f)).toHaveLength(1), { timeout: 15_000, interval: 200 });
+      const [first] = await successors(f);
+      const delivered = async (run: typeof first) => (await buildExecutionContinuation({ db,
+        companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, runId: run.id,
+        context: run.contextSnapshot!, summary: null, exposeLowTrustRaw: false }));
+      const admitted = async (run: typeof first) => (await delivered(run)).originCommentIds;
+      expect((await wakeOf(nextId)).runId).toBe(first.id);
+      expect((await admitted(first)).filter(id => id === nextCommentId)).toHaveLength(1);
+      expect((await admitted(first)).filter(id => f.commentIds.includes(id))).toEqual([]);
+      expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect((await readQueue(f)).executionWait).toEqual({ reason: "stopped_by_person", message: STOP_LINE });
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+      await heartbeatService(db).resumeRemoteStopComments(source);
+      expect(await successors(f)).toHaveLength(1); // Repeated receipt delivery is idempotent.
+      expect((await wakeOf(f.queueId)).runId).toBeNull();
+      const queue = await readQueue(f);
+      const sent = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
+        .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
+      expect(sent.status).toBeLessThan(300);
+      await vi.waitFor(async () => expect(await successors(f)).toHaveLength(2), { timeout: 15_000, interval: 200 });
+      const second = (await successors(f)).find(run => run.id !== first.id)!;
+      expect((await admitted(second)).filter(id => f.commentIds.includes(id))).toEqual(f.commentIds);
+      expect((await admitted(second)).filter(id => id === nextCommentId)).toEqual([]);
+      await heartbeatService(db).resumeRemoteStopComments(source);
+      expect(await successors(f)).toHaveLength(2);
+      // messages is full task history (execution-continuation.ts:352), NOT admission.
+      // Keep this visible in evidence: held pre-Stop input still appears in that history.
+      await evidence(`card3 ${JSON.stringify({ firstRunId: first.id, firstOrigins: await admitted(first),
+        firstHistory: (await delivered(first)).messages.map(m => m.id), secondRunId: second.id,
+        secondOrigins: await admitted(second), secondHistory: (await delivered(second)).messages.map(m => m.id),
+        preStopIds: f.commentIds, postCardId: nextCommentId,
+        preStopWake: await wakeOf(f.queueId), postCardWake: await wakeOf(nextId) })}`);
     } finally { vi.useRealTimers(); }
   }, 60_000);
 
