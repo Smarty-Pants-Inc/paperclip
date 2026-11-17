@@ -16,10 +16,13 @@
 // "Boat POST /sandboxes/<id>/resume failed (<status>): http_error (<words>)"
 // with the safe status/errno in the resume-error envelope; frozen4 sends text only.
 import { JsonRpcCallError, environmentResumeErrorData } from "@paperclipai/plugin-sdk";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, plugins } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeHarnessBackups, plugins } from "@paperclipai/db";
 import type { Environment } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
@@ -27,12 +30,14 @@ import { environmentRuntimeService } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 
-// Durable harness-backup verification has its own tests. Here it is a boundary:
-// a lease-bound stamp verifies, a missing stamp does not.
-vi.mock("../services/native-runtime/native-harness-backup-storage.js", () => ({
-  verifyRecoverableNativeHarnessBackup: vi.fn(async (input: { stamp: unknown; providerLeaseId: string }) =>
-    Boolean(input.stamp && (input.stamp as { authorizedProviderLeaseId?: unknown }).authorizedProviderLeaseId === input.providerLeaseId)),
-}));
+import * as backupStorage from "../services/native-runtime/native-harness-backup-storage.js";
+import * as config from "../config.js";
+import * as storage from "../storage/index.js";
+import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
+import { createStorageService } from "../storage/service.js";
+
+// The original resume-policy cases stub this boundary in beforeEach. The
+// never-OK cases below restore the real verifier and exercise durable storage.
 
 const externalTestDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_ENVIRONMENT_RUNTIME_TEST_DATABASE_URL");
 const embeddedPostgresSupport = externalTestDatabaseUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -54,6 +59,7 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
   let connectionString: string;
+  const ownedStores: string[] = [];
 
   beforeAll(async () => {
     if (externalTestDatabaseUrl) connectionString = externalTestDatabaseUrl;
@@ -63,9 +69,16 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
       connectionString = started.connectionString;
     }
   });
-  beforeEach(() => { db = createDb(connectionString); });
+  beforeEach(() => {
+    db = createDb(connectionString);
+    vi.spyOn(backupStorage, "verifyRecoverableNativeHarnessBackup").mockImplementation(async input =>
+      Boolean(input.stamp && (input.stamp as { authorizedProviderLeaseId?: unknown }).authorizedProviderLeaseId === input.providerLeaseId));
+  });
   afterEach(async () => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    for (const root of ownedStores.splice(0)) await rm(root, { recursive: true, force: true });
+    await db.delete(nativeHarnessBackups);
     await db.delete(heartbeatRunEvents);
     await db.delete(environmentLeases);
     await db.delete(heartbeatRuns);
@@ -291,6 +304,61 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
     const lease = await environmentService(db).getLeaseById(seeded.lease.id);
     expect(lease).toMatchObject({ status: "retained", providerLeaseId: BOX });
     expect(lease?.metadata?.reusableSandboxKeptAfterReplacement).toBeUndefined();
+  });
+
+  // Data-safety/trust-boundary regression: a syntactically lease-bound stamp
+  // alone must never authorize rotation away from the only copy of history.
+  it.each(["CORRUPT", "PARTIAL"] as const)("never rotates the archived box with a %s durable harness backup (real verifier)", async failure => {
+    vi.mocked(backupStorage.verifyRecoverableNativeHarnessBackup).mockRestore();
+    expect(vi.isMockFunction(backupStorage.verifyRecoverableNativeHarnessBackup)).toBe(false);
+    const seeded = await seed();
+    const root = await mkdtemp(join(tmpdir(), "s4-real-backup-"));
+    ownedStores.push(root);
+    const store = createStorageService(createLocalDiskStorageProvider(root));
+    vi.spyOn(config, "loadConfig").mockReturnValue({ ...config.loadConfig(), storageProvider: "s3" });
+    vi.spyOn(storage, "getStorageService").mockReturnValue(store);
+    // The cloud path requires durable custody, not an incidental local copy.
+    vi.stubEnv("PAPERCLIP_EPHEMERAL_SERVER", "true");
+    const stamp = seeded.lease.metadata!.nativeHarnessBackup as {
+      sessionScopeSha256: string; manifestSha256: string;
+    };
+    const backupId = randomUUID();
+    const objectKey = `${seeded.companyId}/native-harness-backups/${stamp.sessionScopeSha256}/${backupId}.pchn`;
+    const body = Buffer.from("saved provider-session history");
+    await store.putFile({ companyId: seeded.companyId, namespace: "native-harness-backups", objectKey,
+      originalFilename: null, contentType: "application/octet-stream", body });
+    await db.insert(nativeHarnessBackups).values({ id: backupId, companyId: seeded.companyId,
+      scopeDigest: stamp.sessionScopeSha256, issueId: seeded.issueId, runId: seeded.previousRunId,
+      manifestSha256: stamp.manifestSha256, status: "current", reference: {
+        schema: "paperclip.native-harness-object.v1", id: backupId, companyId: seeded.companyId,
+        scopeDigest: stamp.sessionScopeSha256, manifestSha256: stamp.manifestSha256, objectKey,
+        sha256: createHash("sha256").update(body).digest("hex"), byteSize: body.length, material: {},
+      } });
+    // Prove the real store/row is accepted before injecting the fault. This is
+    // a verifier test, not an archive restore test (the payload is opaque here).
+    await expect(backupStorage.verifyRecoverableNativeHarnessBackup({ db, companyId: seeded.companyId,
+      stamp, providerLeaseId: BOX })).resolves.toBe(true);
+    if (failure === "CORRUPT") {
+      await environmentService(db).updateLeaseMetadata(seeded.lease.id, { ...seeded.lease.metadata,
+        nativeHarnessBackup: { ...stamp, manifestSha256: `sha256:${"c".repeat(64)}` } });
+    } else {
+      // A valid stamp survived, but its durable publication/copy did not.
+      await db.delete(nativeHarnessBackups).where(eq(nativeHarnessBackups.id, backupId));
+      await store.deleteObject(seeded.companyId, objectKey);
+    }
+    const { call, runtime } = worker(seeded, async () => { throw boatRefusal(410, "snapshot_data_expired"); });
+
+    // Match the head's missing-stamp behavior exactly: one strict refusal,
+    // not a promise of automatic recovery or permission to discard history.
+    await expect(acquire(seeded, runtime)).rejects.toThrow(
+      /the lease was preserved and no replacement was created\.$/);
+    expect(call.mock.calls.filter(([, method]) => method === "environmentResumeLease")).toHaveLength(1);
+    expect(call.mock.calls.filter(([, method]) => method === "environmentAcquireLease")).toHaveLength(0);
+    expect(destroyCalls(call)).toHaveLength(0);
+    const leases = await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, seeded.companyId));
+    expect(leases).toHaveLength(1);
+    expect(leases[0]).toMatchObject({ id: seeded.lease.id, status: "retained", providerLeaseId: BOX, cleanupStatus: null });
+    expect(leases[0].metadata?.reusableSandboxKeptAfterReplacement).toBeUndefined();
   });
 
   it("leaves the archived box eligible for the next attempt when the new box cannot be created", async () => {
