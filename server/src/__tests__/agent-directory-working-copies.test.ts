@@ -1135,6 +1135,86 @@ describe("persistent agent directories", () => {
         } finally { await handle.close(); }
       }, 90_000);
 
+      // Ported from the round-3 judge (judge-overlays.patch: judge-promotion and
+      // judge-cleared-unsaved-hold), plus a held shape. The promotion of the
+      // delivery's aside manifest into notes-aside fails; its copies stay in the
+      // hidden delivery scratch .paperclip-runtime/notes-<id>/aside, and a late
+      // fd write lands there. The stopped save must surface and save those bytes,
+      // or keep the source under the same hold; never report 'unchanged' and
+      // delete the root (nor clear an earlier failed-save hold doing so).
+      it.each(["promotion", "cleared-unsaved-hold", "held-unsurfaced"] as const)("JUDGE NEVER-OK (%s): a failed retention promotion cannot discard late fd bytes at stopped collection", async shape => {
+        await paulBundle();
+        const f = "memory/judge-promotion.md";
+        await fs.writeFile(path.join(root, f), "checkpoint baseline\n");
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: { ...boat.executionTarget } }))?.state).toBe("warm_saved");
+        const handle = await fs.open(path.join(chatA.executionRoot, f), "a");
+        try {
+          await boat.siblingSavesRemote(f, "sibling F'\n");
+          const actual = executionTargetTools.runAdapterExecutionTargetShellCommand;
+          let refusedPromotions = 0;
+          const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand").mockImplementation((runId, t, command, options) => {
+            if (command.includes("const [aside,retain,staging]")) {
+              refusedPromotions++;
+              return Promise.resolve({ exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "JUDGE transient retained-directory rename EIO" } as never);
+            }
+            return actual(runId, t, command, options);
+          });
+          let turn2: Awaited<ReturnType<typeof boat.prepare>>;
+          try { turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId }); }
+          finally { shell.mockRestore(); }
+          expect(refusedPromotions).toBe(1);
+          expect(turn2!.executionRoot).toBe(chatA.executionRoot);
+          await handle.write("JUDGE-RETENTION-PROMOTION-LATE\n"); await handle.sync();
+          const before = await textsContaining(chatA.executionRoot, "JUDGE-RETENTION-PROMOTION-LATE");
+          expect(before).toHaveLength(1);
+          expect(before[0]).toMatch(/^\.paperclip-runtime\/notes-[0-9a-f-]{36}\/aside\/0$/);
+          const target = () => ({ ...boat.executionTarget });
+          // held-unsurfaced: the hidden source's sweep fails throughout, so it is
+          // never accounted for until the last collection below.
+          const surfaceFails = () => vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand").mockImplementation((runId, t, command, options) =>
+            command.endsWith(" surface") ? Promise.resolve({ exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "JUDGE surface EIO" } as never)
+              : actual(runId, t, command, options));
+          let earlierHold: unknown = null;
+          if (shape !== "promotion") {
+            const capture = vi.spyOn(checkpointsModule, "captureAgentFileCheckpoint").mockRejectedValue(new Error("JUDGE first stopped capture EIO"));
+            const surface = shape === "held-unsurfaced" ? surfaceFails() : null;
+            try {
+              const held = await copies.collectStopped({ companyId, runId: turn2!.runId, target: target() });
+              expect(held).toMatchObject({ state: "unavailable", receipt: { savePending: { code: "AGENT_FILES_SAVE_FAILED", failures: 1 } } });
+              earlierHold = held?.receipt?.savePending;
+            } finally { capture.mockRestore(); surface?.mockRestore(); }
+          }
+          if (shape === "held-unsurfaced") {
+            // The visible tree now saves, but the hidden source is still not
+            // accounted for: the earlier hold may not simply clear, and the
+            // root is not released.
+            const surface = surfaceFails();
+            let held: Awaited<ReturnType<typeof copies.collectStopped>>;
+            try { held = await copies.collectStopped({ companyId, runId: turn2!.runId, target: target() }); }
+            finally { surface.mockRestore(); }
+            console.log("JUDGE_HELD_UNSURFACED", JSON.stringify({ state: held?.state, receipt: held?.receipt }));
+            expect(held).toMatchObject({ state: "pending_collection", errorCode: "AGENT_FILES_ASIDE_UNSURFACED", receipt: { savePending: { code: "AGENT_FILES_ASIDE_UNSURFACED" } } });
+            expect(agentFileSaveHeld(held)).toBe(true);
+            expect(await textsContaining(chatA.executionRoot, "JUDGE-RETENTION-PROMOTION-LATE")).toEqual(before);
+            expect(await textsContaining(root, "JUDGE-RETENTION-PROMOTION-LATE")).toEqual([]);
+          }
+          const stopped = await copies.collectStopped({ companyId, runId: turn2!.runId, target: target() });
+          const after = await textsContaining(root, "JUDGE-RETENTION-PROMOTION-LATE");
+          const rootExists = await fs.stat(chatA.executionRoot).then(() => true, () => false);
+          console.log("JUDGE_PROMOTION_FAILURE", JSON.stringify({ shape, refusedPromotions, before, after, rootExists, earlierHold, state: stopped?.state, receipt: stopped?.receipt }));
+          expect(after.length > 0 || rootExists, "late fd bytes must be saved or their source retained").toBe(true);
+          // At head the hidden copy is surfaced and saved, so the hold ends and the root is released.
+          expect(stopped?.state).toBe("saved");
+          expect(stopped?.receipt?.savePending).toBeUndefined();
+          expect(after).toHaveLength(1);
+          expect(after[0]).toMatch(new RegExp(`^${f}\\.aside-notes-[0-9a-f-]{36}$`));
+          expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
+          expect(rootExists).toBe(false);
+        } finally { await handle.close(); }
+      }, 90_000);
+
       // A stopped copy whose aside surfacing failed: the shared fixture for the
       // unsurfaced-hold tests below. failFirstCapture first fails the stopped
       // save itself (a real held save), so the next collection's verified save

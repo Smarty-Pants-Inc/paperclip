@@ -50,7 +50,7 @@ export const AGENT_FILES_ASIDE_UNSURFACED = "AGENT_FILES_ASIDE_UNSURFACED";
 export function agentFileHoldInstruction(row: Pick<Copy, "receipt" | "executionRoot" | "location"> | null | undefined): string {
   if ((row?.receipt?.savePending as { code?: unknown } | undefined)?.code !== AGENT_FILES_ASIDE_UNSURFACED) return AGENT_FILES_SAVE_PENDING_INSTRUCTION;
   const asideRoot = path.posix.join(row!.executionRoot, ".paperclip-runtime", "notes-aside");
-  return `Agent note copies retained during note delivery could not be checked, so this agent directory was not released. To keep them, copy ${asideRoot} from the sandbox (${row!.location}) into the agent's folder.`;
+  return `Agent note copies retained during note delivery could not be checked, so this agent directory was not released. To keep them, copy ${asideRoot} from the sandbox (${row!.location}) into the agent's folder, and any ${path.posix.join(row!.executionRoot, ".paperclip-runtime", "notes-*", "aside")} a failed retention left behind.`;
 }
 /** Cleanup authority. An unavailable receipt settles only when no save is held:
  * preparation failed before provider use, or exact destruction was proven. */
@@ -179,7 +179,9 @@ if(kept.length)process.stderr.write("agent bytes kept aside: "+JSON.stringify(ke
 /** Runs on the remote target after a GREEN post-check: moves the delivery's
  * aside directory (only when it lists retained copies) to
  * <root>/.paperclip-runtime/notes-aside/<epoch>-<id>, then removes the rest of
- * the upload scratch. A failure keeps the whole scratch. */
+ * the upload scratch. A failure keeps the whole scratch, manifest included:
+ * notesAsideProgram sweeps that unpromoted notes-<id>/aside too, and the
+ * caller records it (notesAside) exactly like a promoted one. */
 const retainWarmNotesAsideProgram = `const fs=require("node:fs"),path=require("node:path");const [aside,retain,staging]=process.argv.slice(1);
 const retained=fs.existsSync(path.join(aside,"retained.json"));if(retained){fs.mkdirSync(path.dirname(retain),{recursive:true,mode:0o700});if(fs.existsSync(retain))throw new Error("notes aside exists");fs.renameSync(aside,retain);}
 fs.rmSync(staging,{recursive:true,force:true});process.stdout.write(JSON.stringify({retained}));`;
@@ -192,7 +194,10 @@ fs.rmSync(staging,{recursive:true,force:true});process.stdout.write(JSON.stringi
  * collects it and any later write through that fd lands in the tree. Mode
  * "clean" (AFTER the checkpoint is recorded): an unchanged copy is removed; a
  * copy that changed since "surface" stays for the next checkpoint. Never drops a
- * changed copy. Prints {surfaced, kept, remaining}. */
+ * changed copy. Prints {surfaced, kept, remaining}. An UNPROMOTED delivery
+ * manifest (.paperclip-runtime/notes-<id>/aside/retained.json, left when the
+ * promotion into notes-aside failed) is swept the same way and counts in
+ * remaining: a hidden source is never read as 'no copies'. */
 const notesAsideProgram = String.raw`const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");const [root,mode]=process.argv.slice(1);
 const base=path.join(root,".paperclip-runtime","notes-aside"),out={surfaced:[],kept:[],remaining:0};
 const sha=f=>crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
@@ -200,8 +205,10 @@ const tree=(p,rel,o)=>{const s=fs.lstatSync(p,{throwIfNoEntry:false});if(!s)retu
 const same=(p,expect)=>{const got=tree(p,"",{});return JSON.stringify(Object.keys(got).sort().map(k=>[k,got[k]]))===JSON.stringify(Object.keys(expect).filter(k=>expect[k]!=="absent").sort().map(k=>[k,expect[k]]));};
 const safe=name=>typeof name==="string"&&name&&!name.startsWith("/")&&name.split("/").every(p=>p&&p!=="."&&p!==".."&&p!==".paperclip-runtime");
 const realParent=t=>{let c=root;for(const seg of path.relative(root,path.dirname(t)).split(path.sep).filter(Boolean)){c=path.join(c,seg);const s=fs.lstatSync(c,{throwIfNoEntry:false});if(!s){fs.mkdirSync(c,{mode:0o700});continue;}if(!s.isDirectory()||s.isSymbolicLink())throw new Error("unsafe aside parent");}};
-let dirs=[];try{dirs=fs.readdirSync(base).sort();}catch(e){if(e.code!=="ENOENT")throw e;}
-for(const d of dirs){const dir=path.join(base,d),manifest=path.join(dir,"retained.json");let list;
+let dirs=[];try{dirs=fs.readdirSync(base).sort().map(d=>[d,path.join(base,d),null]);}catch(e){if(e.code!=="ENOENT")throw e;}
+const rt=path.join(root,".paperclip-runtime");let scratch=[];try{scratch=fs.readdirSync(rt).filter(s=>/^notes-[0-9a-f-]{36}$/.test(s)&&fs.lstatSync(path.join(rt,s,"aside","retained.json"),{throwIfNoEntry:false})).sort();}catch(e){if(e.code!=="ENOENT")throw e;}
+for(const s of scratch)dirs.push([s,path.join(rt,s,"aside"),path.join(rt,s)]);
+for(const [d,dir,scratchDir] of dirs){const manifest=path.join(dir,"retained.json");let list;
 try{list=JSON.parse(fs.readFileSync(manifest,"utf8"));if(!Array.isArray(list))throw 0;}catch{out.kept.push(d);out.remaining++;continue;}
 for(const m of list){const a=path.join(dir,String(m.a));const s=fs.lstatSync(a,{throwIfNoEntry:false});if(!s||m.done)continue;
 if(mode==="surface"){if(m.surfaced||!safe(m.name)||same(a,m.expect))continue;
@@ -211,7 +218,7 @@ else{try{fs.linkSync(a,t);}catch(e){if(e.code!=="EEXIST")throw e;continue;}fs.un
 if(m.surfaced)out.surfaced.push(m.surfaced);else out.kept.push(d+"/"+m.a);}
 else{if(!m.surfaced&&same(a,m.expect)){fs.rmSync(a,{recursive:true,force:true});m.done=true;}else out.kept.push(d+"/"+m.a);}}
 if(mode==="surface"||list.some(m=>!m.done&&fs.lstatSync(path.join(dir,String(m.a)),{throwIfNoEntry:false}))){fs.writeFileSync(manifest+".tmp",JSON.stringify(list),{mode:0o600});fs.renameSync(manifest+".tmp",manifest);out.remaining++;}
-else fs.rmSync(dir,{recursive:true,force:true});}
+else fs.rmSync(scratchDir??dir,{recursive:true,force:true});}
 if(mode==="clean"&&!out.remaining)fs.rmSync(base,{recursive:true,force:true});
 process.stdout.write(JSON.stringify(out));`;
 function actor(row: Copy): AuthorizationActor {
@@ -326,17 +333,21 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // .paperclip-runtime/notes-aside/<epoch>-<id> and stay until the next
     // verified checkpoint (checkpoint() below) re-hashes them: an fd write
     // that landed after the swap is surfaced and collected, never dropped.
-    // Returns true when a manifest-listed aside directory was retained.
-    const retainAside = async () => {
+    // Returns "retained" when a manifest-listed aside directory was promoted,
+    // "none" when there was nothing to retain, and "failed" when the promotion
+    // did not run: the manifest then stays in the delivery scratch, where the
+    // same sweep finds it. "failed" is never read as "none": the caller records
+    // notesAside, so the next checkpoint surfaces and the stopped save holds.
+    const retainAside = async (): Promise<"retained" | "none" | "failed"> => {
       const retainAt = path.posix.join(row.executionRoot, ".paperclip-runtime", "notes-aside", `${Date.now()}-${id.slice(0, 8)}`);
       const retained = await runAdapterExecutionTargetShellCommand(row.runId, target,
         `node -e ${quote(retainWarmNotesAsideProgram)} ${quote(plan.aside)} ${quote(retainAt)} ${quote(remoteStaging)}`, { cwd: target.remoteCwd, env: {}, timeoutSec: 15 })
         .catch(error => ({ exitCode: 1, timedOut: false, stdout: "", stderr: String(error) }));
       if (retained.exitCode !== 0 || retained.timedOut) {
         logger.warn({ runId: row.runId, stderr: retained.stderr?.trim().slice(0, 500) }, "Warm note aside copies kept in the delivery scratch");
-        return false;
+        return "failed";
       }
-      try { return JSON.parse(retained.stdout || "{}").retained === true; } catch { return false; }
+      try { return JSON.parse(retained.stdout || "{}").retained === true ? "retained" : "none"; } catch { return "failed"; }
     };
     let upload: PreparedAdapterExecutionTargetRuntime | undefined;
     try {
@@ -353,7 +364,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // path or as a visible <name>.aside-<epoch>) in aside/retained.json BEFORE
       // it throws. Retain those for THIS owner's stopped collection, exactly
       // like a delivery's own aside copies: never left unmanifested in scratch.
-      if (await retainAside()) {
+      if (await retainAside() !== "none") {
         await patch(row, { receipt: { ...row.receipt, notesAside: true } })
           .catch(patchError => logger.warn({ err: patchError, runId: row.runId }, "Retained warm note aside copies not recorded; they stay on the box"));
       }
@@ -376,9 +387,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       }
       throw new AgentDirectoryReuseInvalidatedError("Warm agent directory note refresh could not be verified");
     }
-    await retainAside();
+    // What is on the box decides: a failed promotion still holds manifest-listed
+    // copies (in the delivery scratch), so it is recorded like a promoted one.
+    const kept = await retainAside();
     return { baseHash: directorySnapshotSha256(canonical), baseline: serializeDirectorySnapshot(canonical), checkpointManifest: verified,
-      notesAside: anyAside };
+      notesAside: kept !== "none" };
   }
   async function transport(row: Copy, target: AdapterExecutionTarget, recovering: boolean) {
     if (target.kind !== "remote" || row.location !== `remote:${target.environmentId ?? ""}`) throw new Error("Agent directory environment changed");
