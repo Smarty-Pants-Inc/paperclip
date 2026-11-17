@@ -37,7 +37,7 @@ import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
-import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT } from "./recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT, UNANSWERED_MESSAGE_REASON_PREFIX, UNANSWERED_MESSAGE_TEXT } from "./recovery/unanswered-person-message.js";
 import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";
 import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
@@ -495,6 +495,28 @@ suite("fresh-continuation fallback", () => {
     expect(notes.filter(note => !note.metadata?.supersededByCommentId).map(note => note.body))
       .toEqual([FRESH_THREAD_STARTED_NOTE]);
     expect(currentNotices(notes, [held])).toHaveLength(1);
+  });
+
+  it("one notice: the fresh-thread note supersedes the standing unanswered-message notice and keeps its obligation (gate 3 GAT-393)", async () => {
+    // Gate 3: the "wasn't answered" notice (09:06:47) and the fresh-thread note
+    // (09:07:44) were both current. The fresh-thread note is the one current
+    // notice; the unanswered notice stays as history and still keys its message.
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, f.runId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Repeat the 3 facts.", createdAt: new Date(Date.now() - 120_000) }).returning();
+    const [unanswered] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "system",
+      body: UNANSWERED_MESSAGE_TEXT, metadata: { version: 1, authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${message!.id}`,
+        sections: [{ rows: [{ type: "key_value", label: "Failure code", value: "adapter_failed" }] }] } }).returning();
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "continued" });
+    await selectFreshSuccessor(f);
+    const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+      .filter(note => note.authorType === "system");
+    expect(currentNotices(notes, [unanswered]).map(note => note.body)).toEqual([FRESH_THREAD_STARTED_NOTE]);
+    // Never cleared silently: the obligation's keyed row is retained, not deleted.
+    expect(notes.find(note => note.id === unanswered!.id)).toMatchObject({ deletedAt: null,
+      metadata: { authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${message!.id}`, supersededByCommentId: expect.any(String) } });
   });
 
   it.each([
