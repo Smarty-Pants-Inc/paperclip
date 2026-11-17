@@ -37,6 +37,7 @@ import {
   queuedMessageAutoSteerEligible,
   queuedMessageAutoSteerKey,
 } from "./queued-message-auto-steer";
+import { isQueuedInterruptHandoff } from "@/lib/issue-queued-comment-queue";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -45,13 +46,16 @@ import {
 } from "@/components/ui/dropdown-menu";
 
 type QueueAction = "steer" | "interrupt" | "discard" | null;
+export const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
+export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting: Send them, or delete any first.";
 
 export function reorderQueuedMessageEntries(
   entries: IssueQueuedCommentEntry[],
   activeId: string,
   overId: string,
 ) {
-  if (entries.some((entry) => entry.source?.kind === "interaction")) return null;
+  if (entries.some((entry) => entry.source?.kind === "interaction") ||
+      new Set(entries.map((entry) => entry.queueId)).size > 1) return null;
   const from = entries.findIndex((entry) => entry.comment.id === activeId);
   const to = entries.findIndex((entry) => entry.comment.id === overId);
   if (from < 0 || to < 0 || from === to) return null;
@@ -69,6 +73,13 @@ export function queuedMessageLabel(entry: IssueQueuedCommentEntry): string {
   if (entry.source?.kind !== "interaction") return entry.comment.body;
   const summary = entry.source.summary?.trim();
   return summary || entry.comment.body.split("\n")[0] || "Saved response";
+}
+
+/** The server's own words for a refusal the person can act on (a paused chat). */
+function queueActionErrorText(error: unknown): string | null {
+  const body = typeof error === "object" && error !== null ? (error as { body?: unknown }).body : null;
+  const text = typeof body === "object" && body !== null ? (body as { error?: unknown }).error : null;
+  return typeof text === "string" && text.trim() ? text : null;
 }
 
 function queueActionErrorCode(error: unknown): string | null {
@@ -101,6 +112,7 @@ function SortableQueuedMessage({
   queue,
   busy,
   queueMutationDisabled,
+  reorderDisabled,
   action,
   autoSteerSecondsLeft,
   onEdit,
@@ -108,11 +120,13 @@ function SortableQueuedMessage({
   onInterrupt,
   onDiscard,
   onCancelAutoSteer,
+  sendOnLine = false,
 }: {
   entry: IssueQueuedCommentEntry;
   queue: IssueQueuedCommentQueue;
   busy: boolean;
   queueMutationDisabled: boolean;
+  reorderDisabled: boolean;
   action: QueueAction;
   /** Seconds until this message is steered automatically, or null when it waits in the queue. */
   autoSteerSecondsLeft: number | null;
@@ -121,15 +135,20 @@ function SortableQueuedMessage({
   onInterrupt?: () => void;
   onDiscard: () => void;
   onCancelAutoSteer: () => void;
+  /** The queue's one Send is on its status line (after a person's Stop). */
+  sendOnLine?: boolean;
 }) {
   const immutableResponse = entry.source?.kind === "interaction";
+  // This UI still mutates the head wake. Later wakes remain visible, but must
+  // never send their edits/deletes with the head's queue identity or revision.
+  const laterWake = Boolean(entry.queueId && entry.queueId !== queue.queueId);
   const body = queuedMessageLabel(entry);
   const images = extractImageRefs(body).filter(image =>
     /^\/api\/(?:attachments|assets)\/[^/?#\\]+\/content(?:\?[^#\\]*)?$/.test(image.url));
   const label = stripStandaloneImageEmbeds(body);
   const sortable = useSortable({
     id: entry.comment.id,
-    disabled: queueMutationDisabled || immutableResponse,
+    disabled: queueMutationDisabled || reorderDisabled || immutableResponse,
   });
   const style = {
     transform: CSS.Transform.toString(sortable.transform),
@@ -160,7 +179,8 @@ function SortableQueuedMessage({
         ref={sortable.setActivatorNodeRef}
         {...sortable.attributes}
         {...sortable.listeners}
-        disabled={queueMutationDisabled || immutableResponse}
+        disabled={queueMutationDisabled || reorderDisabled || immutableResponse}
+        title={reorderDisabled ? "Messages in separate turns cannot be reordered together" : undefined}
         aria-label={`Reorder queued message: ${label || "Images"}`}
         className="flex h-7 w-7 shrink-0 cursor-grab items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:bg-accent hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40"
       >
@@ -186,7 +206,11 @@ function SortableQueuedMessage({
         </div> : null}
       </div>
 
-      {autoSteerSecondsLeft !== null ? (
+      {laterWake ? <span className="text-xs text-muted-foreground">
+        Edit and delete are available when this message reaches the front.
+      </span> : null}
+
+      {sendOnLine ? null : autoSteerSecondsLeft !== null ? (
         <span className="flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
           <span className="px-1 text-xs text-muted-foreground tabular-nums">
             Sending in {autoSteerSecondsLeft}s
@@ -194,7 +218,7 @@ function SortableQueuedMessage({
           <button
             type="button"
             onClick={onEdit}
-            disabled={!entry.canEdit}
+            disabled={laterWake || !entry.canEdit}
             title="Edit before it is sent"
             className="flex h-7 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
             data-testid={`task-chat-queued-auto-steer-edit-${entry.comment.id}`}
@@ -217,7 +241,7 @@ function SortableQueuedMessage({
           type="button"
           onClick={onInterrupt}
           aria-label={!queue.targetRunId ? "Send queued messages" : undefined}
-          disabled={busy || !queue.queueId || !onInterrupt}
+          disabled={laterWake || busy || !queue.queueId || !onInterrupt}
           title={queue.targetRunId ? "Interrupt the active turn and send queued messages" : "Send queued messages now"}
           className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
           data-testid={`task-chat-queued-interrupt-${entry.comment.id}`}
@@ -250,7 +274,7 @@ function SortableQueuedMessage({
       <button
         type="button"
         onClick={onDiscard}
-        disabled={busy || !entry.canDiscard}
+        disabled={laterWake || busy || !entry.canDiscard}
         title="Discard queued message"
         aria-label={`Discard queued message: ${label}`}
         className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
@@ -346,6 +370,7 @@ export function TaskChatQueuedMessages({
     () => entries.map((entry) => entry.comment.id),
     [entries],
   );
+  const hasLaterWakes = entries.some((entry) => entry.queueId && entry.queueId !== queue.queueId);
 
   // Send decisions read the current queue snapshot, not the local copy that a
   // sync effect updates one render later: a saved edit must get its new
@@ -407,7 +432,8 @@ export function TaskChatQueuedMessages({
       !over ||
       active.id === over.id ||
       reordering ||
-      pending
+      pending ||
+      hasLaterWakes
     )
       return;
     const previous = entries;
@@ -448,6 +474,7 @@ export function TaskChatQueuedMessages({
     if (
       pending ||
       reordering ||
+      entries.some((entry) => entry.comment.id === commentId && entry.queueId && entry.queueId !== queue.queueId) ||
       (!queue.queueId && action !== "interrupt" && action !== "discard")
     ) {
       return;
@@ -474,7 +501,8 @@ export function TaskChatQueuedMessages({
       if (action === "steer") await onSteer(commentId, queue.revision);
       else if (action === "interrupt") {
         const updatedQueue = await onInterrupt?.();
-        if (updatedQueue?.state === "deferred") {
+        // The stopped turn is handing off to these messages: they are sent.
+        if (updatedQueue?.state === "deferred" && !isQueuedInterruptHandoff(updatedQueue)) {
           for (const entry of updatedQueue.entries) optimisticDeliveryIds.current.delete(entry.comment.id);
           setEntries(updatedQueue.entries.filter(entry => !optimisticDeliveryIds.current.has(entry.comment.id)));
           setDeferredStatus({ queueId: updatedQueue.queueId, message: updatedQueue.executionWait?.message ?? "Messages are still queued. They will send when the task is ready." });
@@ -512,7 +540,8 @@ export function TaskChatQueuedMessages({
           : action === "steer"
             ? "Couldn’t steer. Message is still queued."
             : action === "interrupt"
-              ? queue.targetRunId ? "Couldn’t interrupt. Message is still queued." : "Couldn’t send. Message is still queued."
+              ? code === "queued_comment_chat_paused" ? queueActionErrorText(error) ?? "Couldn’t send. Message is still queued."
+              : queue.targetRunId ? "Couldn’t interrupt. Message is still queued." : "Couldn’t send. Message is still queued."
               : code === "queued_comment_revision_conflict"
                 ? "The queue changed in another session. Review it and try again."
                 : "Couldn’t discard. Message is still queued.",
@@ -528,6 +557,11 @@ export function TaskChatQueuedMessages({
   const statusMessage = deferredStatus?.message
     ?? (queue.state === "deferred" && !queue.queueId && !queue.targetRunId && entries.length > 0
       ? queue.executionWait?.message ?? null : null);
+
+  // Stop means stop (org 11-17): after a person's Stop the chat's waiting
+  // messages are not sent until the person sends them (or deletes some first).
+  const stoppedByPerson = queue.executionWait?.reason === CHAT_STOPPED_BY_PERSON_REASON &&
+    Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0 && Boolean(onInterrupt);
 
   if (entries.length === 0 && !visibleError && !statusMessage) return null;
 
@@ -552,7 +586,7 @@ export function TaskChatQueuedMessages({
               pending?.commentId === entry.comment.id ? pending.action : null;
             const busy = Boolean(pending || reordering);
             const queueMutationDisabled = Boolean(
-              !queue.queueId || pending || reordering,
+              !queue.queueId || pending || reordering || (entry.queueId && entry.queueId !== queue.queueId),
             );
             return (
               <SortableQueuedMessage
@@ -561,6 +595,7 @@ export function TaskChatQueuedMessages({
                 queue={queue}
                 busy={busy}
                 queueMutationDisabled={queueMutationDisabled}
+                reorderDisabled={hasLaterWakes}
                 action={action}
                 autoSteerSecondsLeft={(() => {
                   const deadline = autoSteerDeadlines.get(entry.comment.id);
@@ -575,6 +610,7 @@ export function TaskChatQueuedMessages({
                     : undefined
                 }
                 onDiscard={() => void runRowAction(entry.comment.id, "discard")}
+                sendOnLine={stoppedByPerson}
               />
             );
           })}
@@ -582,6 +618,25 @@ export function TaskChatQueuedMessages({
         </SortableContext>
       </DndContext>
       {statusMessage ? <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground">{statusMessage}</p> : null}
+      {stoppedByPerson ? (
+        <div
+          className="flex flex-wrap items-center gap-2 border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
+          data-testid="task-chat-queued-stopped"
+        >
+          <p role="status" className="min-w-0 flex-1">{CHAT_STOPPED_BY_PERSON_LINE}</p>
+          <button
+            type="button"
+            className="flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-border px-2.5 text-xs font-medium text-foreground transition-colors hover:bg-accent disabled:opacity-40"
+            disabled={Boolean(pending || reordering)}
+            onClick={() => void runRowAction(entries[0]!.comment.id, "interrupt")}
+            aria-label="Send the waiting messages"
+            data-testid="task-chat-queued-stopped-send"
+          >
+            {pending?.action === "interrupt" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
+            Send
+          </button>
+        </div>
+      ) : null}
       {visibleError ? (
         <div
           role="status"

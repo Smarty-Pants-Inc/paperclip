@@ -1,4 +1,4 @@
-import { agentWakeupRequests, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRuns, type Db } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
@@ -38,6 +38,17 @@ export async function notifyDeferredWakesForIssue(tx: object, scope: { companyId
     sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}`,
   )).limit(25);
   for (const wake of wakes) await notifyDeferredExecutionWork(tx, { companyId: scope.companyId, requestId: wake.id });
+}
+
+/** S8q: a run's teardown released one of its stop gates (controller lease,
+ * environment lease). Hint its task's saved wakes by id, so an Interrupt's
+ * successor is reconsidered now rather than after the company reconstruction. */
+export async function notifyDeferredWakesForRun(tx: object, scope: { companyId: string; runId: string }) {
+  const [run] = await (tx as Pick<Db, "select">).select({
+    issueId: sql<string | null>`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId')`,
+  }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.id, scope.runId))).limit(1);
+  if (run?.issueId && /^[0-9a-f-]{36}$/i.test(run.issueId))
+    await notifyDeferredWakesForIssue(tx, { companyId: scope.companyId, issueId: run.issueId });
 }
 
 export async function notifyNativeStatusWakeWork(tx: object, scope: DeferredExecutionScope) {

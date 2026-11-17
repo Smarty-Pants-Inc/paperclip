@@ -2,7 +2,7 @@ import { notifyNativeResultCommit } from "../native-result-commit-notifications.
 import { notifyNativeWorkspaceFinalization, releaseNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
 import { notifyNativeStatusReassessment } from "../native-status-reassessment-notifications.js";
 import { notifyQueuedRunDispatch } from "../run-dispatch-notifications.js";
-import { notifyDeferredExecutionWork } from "../deferred-execution-notifications.js";
+import { notifyDeferredExecutionWork, notifyDeferredWakesForRun } from "../deferred-execution-notifications.js";
 import { beginRunPhase } from "../execution-preparation-timing.js";
 import { logActivity } from "../activity-log.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -359,6 +359,7 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
           await notifyQueuedRunDispatch(tx, { companyId: input.companyId });
           // Saved messages also wait on this owner after the run finished.
           await notifyDeferredExecutionWork(tx, { companyId: input.companyId });
+          await notifyDeferredWakesForRun(tx, { companyId: input.companyId, runId: input.runId });
           await tx.update(heartbeatRuns).set({
             runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) - ${OWNER_KEY}`,
           }).where(owned);

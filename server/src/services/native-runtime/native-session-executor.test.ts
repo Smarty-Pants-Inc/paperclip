@@ -13147,6 +13147,100 @@ describe("native warm session supervision", () => {
     expect(await closeIdleWarmNativeSessionsForRestart()).toMatchObject({ closed: 1, failed: 0 });
   });
 
+  describe("nativeHarnessBackupMissing custody after idle close", () => {
+    // Keep: data safety. Exercise the real timer/close paths and PostgreSQL SET/WHERE,
+    // while the established executor fixture supplies only coordinator/provider execution.
+    let proofDb: Db;
+    let cleanup: (() => Promise<void>) | undefined;
+    beforeAll(async () => {
+      const { startRecoveryPostgres } = await import("../../__tests__/helpers/recovery-postgres.js");
+      const { createDb } = await import("@paperclipai/db");
+      const database = await startRecoveryPostgres("backup-missing-close-");
+      cleanup = database.cleanup;
+      proofDb = createDb(database.connectionString);
+    }, 180_000);
+    afterAll(async () => { await proofDb?.$client.end(); await cleanup?.(); });
+
+    it.each(["close_failed", "release_without_checkpoint", "retries_exhausted"] as const)(
+      "writes %s with every field on only the exact retained lease", async reason => {
+        const { companies, agents, environments } = await import("@paperclipai/db");
+        const { logger } = await import("../../middleware/logger.js");
+        const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), environmentId = randomUUID();
+        const sessionId = randomUUID(), leaseId = randomUUID(), providerLeaseId = `box-${randomUUID()}`;
+        await proofDb.insert(companies).values({ id: companyId, name: "Missing backup close", issuePrefix: `B${companyId.slice(0, 7)}` });
+        await proofDb.insert(agents).values({ id: agentId, companyId, name: "Fixture", adapterType: "paperclip_runner" });
+        await proofDb.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "succeeded", nativeSessionId: sessionId });
+        await proofDb.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+        const leaseValues = { companyId, environmentId, heartbeatRunId: runId, provider: "fixture", providerLeaseId,
+          status: "retained", leasePolicy: "reuse_by_environment", metadata: { preserved: "keep" } };
+        const otherRunId = randomUUID();
+        await proofDb.insert(heartbeatRuns).values({ id: otherRunId, companyId, agentId, status: "succeeded" });
+        await proofDb.insert(environmentLeases).values([
+          { ...leaseValues, id: leaseId },
+          { ...leaseValues, id: randomUUID() }, // same box AND run, but not the admitted lease
+          { ...leaseValues, id: randomUUID(), heartbeatRunId: otherRunId },
+          { ...leaseValues, id: randomUUID(), providerLeaseId: `${providerLeaseId}-other` },
+        ]);
+        const current = { ...execution, binding: { ...execution.binding, companyId, agentId, runId, executionWorkspaceId: runId },
+          session: { ...execution.session, normalizedSessionId: sessionId, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 20 } },
+        } as NativeExecutionInputV1;
+        const base = leaseDb(current), finished = leaseDb(current, {}, {}, [], {}, "succeeded");
+        let executionFinished = false;
+        const wrap = (handle: Db): Db => ({ ...handle,
+          select: ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => table === environmentLeases
+            ? proofDb.select(fields as never).from(environmentLeases)
+            : (executionFinished && table === heartbeatRuns ? finished : handle).select(fields as never).from(table as never) })) as unknown as Db["select"],
+          update: ((table: unknown) => table === environmentLeases ? proofDb.update(environmentLeases) : handle.update(table as never)) as Db["update"],
+          transaction: ((operation: (tx: Db) => Promise<unknown>) => handle.transaction(tx => operation(wrap(tx as unknown as Db)))) as unknown as Db["transaction"],
+        }) as Db;
+        const db = wrap(base);
+        const close = vi.fn<() => Promise<void>>(async () => {
+          if (reason === "close_failed") throw new RemoteRunnerRecoveryError({ stage: "process_verification", reason: "process_not_running" });
+          if (reason === "release_without_checkpoint") throw refusedSuspend();
+          throw new Error("native_runner_checkpoint_owner_lost");
+        });
+        const fake = fakeRetainedRunnerSandbox({ runId, normalizedSessionId: sessionId, remoteCwd: `/tmp/${sessionId}` });
+        state.execute.mockReset().mockImplementationOnce(async options => {
+          await options.onSession?.({ close });
+          return { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" },
+            turnId: runId, normalizedSessionId: sessionId, providerSessionId: sessionId, driverKind: "test", driverVersion: "1",
+            nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+        });
+        const warning = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+        try {
+          await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: sessionId,
+            runnerExecutionTarget: { kind: "remote", transport: "sandbox", environmentId, leaseId,
+              remoteCwd: `/tmp/${sessionId}`, sandboxLeaseAcquisition: { outcome: "created", providerLeaseId }, runner: fake.runner } as never });
+          executionFinished = true;
+          await vi.waitFor(async () => {
+            const [row] = await proofDb.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+            expect(row.metadata?.nativeHarnessBackupMissing).toEqual({ runId, sessionId,
+              sessionRootDigest: createHash("sha256").update(sessionId).digest("hex"), reason, at: expect.any(String) });
+          }, { timeout: 25_000, interval: 25 });
+          const rows = await proofDb.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId));
+          const marker = rows.find(row => row.id === leaseId)!.metadata?.nativeHarnessBackupMissing;
+          expect(Number.isFinite(Date.parse((marker as { at: string }).at))).toBe(true);
+          expect(rows.find(row => row.id === leaseId)!.metadata?.preserved).toBe("keep");
+          for (const row of rows.filter(row => row.id !== leaseId)) expect(row.metadata).not.toHaveProperty("nativeHarnessBackupMissing");
+          if (reason === "retries_exhausted") {
+            expect(close).toHaveBeenCalledTimes(1 + WARM_IDLE_CLOSE_MAX_RETRIES);
+            expect(warning).toHaveBeenCalledWith(expect.objectContaining({ runId, providerLeaseId }),
+              "idle warm native session close retries exhausted; native harness backup missing");
+          }
+        } finally {
+          warning.mockRestore();
+          close.mockResolvedValue(undefined);
+          await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "test cleanup", db });
+          await proofDb.delete(environmentLeases).where(eq(environmentLeases.companyId, companyId));
+          await proofDb.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+          await proofDb.delete(agents).where(eq(agents.companyId, companyId));
+          await proofDb.delete(companies).where(eq(companies.id, companyId));
+          await proofDb.delete(environments).where(eq(environments.id, environmentId));
+        }
+      }, 45_000,
+    );
+  });
+
   it("retries a failed idle warm close a bounded number of times", async () => {
     const name = "warm-idle-close-retry";
     const current = { ...execution,

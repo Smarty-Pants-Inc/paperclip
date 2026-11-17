@@ -3,7 +3,7 @@ import { withAccountingTransaction } from "../accounting-transaction.js";
 import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 export { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { writeDeferredExecutionWait } from "../deferred-execution-wait.js";
+import { isWellFormedExecutionWait, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
 import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
@@ -685,17 +685,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         !(await recordedLocalExecutionStopped(db, run))) return;
     const issueId = run.nativeIssueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
     if (!issueId) return;
-    const currentRun = run.runtimeMode === "native" ? await readNativeStopExecutionEvidence(db, run.companyId, run.id) : null;
-    const [coordinator] = currentRun ? await db.select({ phase: nativeRunFinalizations.phase,
-      leaseOwner: nativeRunFinalizations.leaseOwner }).from(nativeRunFinalizations).where(and(
-      eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
-    )) : [];
     // The ordinary path still enforces task holds, ownership, and native session
     // cleanup before starting a provider.
-    const stoppedNativeExecution = currentRun && isAcknowledgedNativeStop(currentRun) &&
-      !activeRunExecutions.has(run.id) && !coordinator?.leaseOwner &&
-      ["terminal_failure", "applied"].includes(coordinator?.phase ?? "") &&
-      await acknowledgedNativeStopExecutionHasStopped(db, currentRun);
+    const stoppedNativeExecution = run.runtimeMode === "native" && await nativeStopExecutionProven(run.companyId, run.id);
     if (stoppedNativeExecution) await observeStoppedWorkspaceRecovery(db, { companyId: run.companyId, issueId, runId: run.id });
     const stoppedNativeContinuation = stoppedNativeExecution && !(await getExecutionBlocker(db, run.companyId, issueId));
     const legacyContinuation = run.runtimeMode === "legacy" &&
@@ -791,6 +783,88 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         idempotencyKey: `remote-stop-comment:${run.id}:${wake.id}` }, wake.id);
       break;
     }
+  }
+
+  /** One writer per native session: the acknowledged Stop, a released
+   * controller (no executor, no coordinator lease owner, terminal phase) and
+   * the provider's recorded stop. Nothing may start a successor before this. */
+  async function nativeStopExecutionProven(companyId: string, runId: string) {
+    const currentRun = await readNativeStopExecutionEvidence(db, companyId, runId);
+    if (!currentRun) return false;
+    const [coordinator] = await db.select({ phase: nativeRunFinalizations.phase,
+      leaseOwner: nativeRunFinalizations.leaseOwner }).from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, runId),
+    ));
+    return isAcknowledgedNativeStop(currentRun) && !activeRunExecutions.has(runId) &&
+      !adapterExecutionControls.has(runId) && !coordinator?.leaseOwner &&
+      ["terminal_failure", "applied"].includes(coordinator?.phase ?? "") &&
+      await acknowledgedNativeStopExecutionHasStopped(db, currentRun);
+  }
+
+  /** Hold50: a person's message saved behind a native Stop (a non-interrupt
+   * executionWait wake) whose exact source run has S8q's stop proof. The
+   * source is the task's latest run for this agent: a cancelled native run
+   * with an acknowledged Stop, no executor or adapter control, a released
+   * coordinator in terminal_failure/applied and the provider's recorded stop
+   * (nativeStopExecutionProven). Stop means stop: a wake requested no later
+   * than that Stop is old input and keeps both 30 s gates. A FAILED run has no
+   * acknowledged Stop (isAcknowledgedNativeStop requires status cancelled),
+   * so it is not covered and keeps the gates. Returns the source run or null;
+   * admission still rechecks every gate under its locks. */
+  async function executionWaitSourceStopped(companyId: string, requestId: string) {
+    const [wake] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, requestId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      eq(agentWakeupRequests.requestedByActorType, "user"),
+      // The executor's own wait shape (deferred-execution-wait.ts), not just
+      // "some JSON": JSON null, false, a string, an array or {} never qualify.
+      wellFormedExecutionWaitSql(agentWakeupRequests.payload),
+      sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+      sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
+    ));
+    const issueId = readNonEmptyString(wake?.payload?.issueId);
+    if (!wake || !isWellFormedExecutionWait(wake.payload?.executionWait) || !issueId || !isUuidLike(issueId)) return null;
+    const [latest] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, wake.agentId),
+      or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, eq(heartbeatRuns.nativeIssueId, issueId)),
+    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+    const source = latest ? await getRunExecutionWait(companyId, latest.id) : null;
+    if (!source || source.runtimeMode !== "native" || source.status !== "cancelled" || !source.finishedAt) return null;
+    const stoppedAt = userStopBoundaryAt(source);
+    if (!stoppedAt || wake.requestedAt.getTime() <= stoppedAt.getTime()) return null;
+    return await nativeStopExecutionProven(companyId, source.id) ? source : null;
+  }
+
+  /** S8q: the native run this Interrupt click stopped has finished teardown.
+   * Its end-of-teardown hint may then deliver the saved messages at once
+   * instead of waiting out the 30 s fallback age gate. The proof must be this
+   * press's own: the run it recorded as its target, stopped by its actor for
+   * this queue, no earlier than the press. A later press that stopped nothing
+   * never inherits an earlier press's proof. */
+  async function queuedCommentInterruptTargetStopped(companyId: string, queueId: string) {
+    const [wake] = await db.select({ agentId: agentWakeupRequests.agentId, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, queueId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
+    ));
+    const press = wake?.payload?.queuedCommentInterrupt as
+      { targetRunId?: unknown; actorId?: unknown; requestedAt?: unknown } | undefined;
+    const pressedAt = typeof press?.requestedAt === "string" ? Date.parse(press.requestedAt) : NaN;
+    if (!wake || typeof press?.targetRunId !== "string" || !/^[0-9a-f-]{36}$/i.test(press.targetRunId) ||
+        typeof press.actorId !== "string" ||
+        !Number.isFinite(pressedAt)) return false;
+    const [target] = await db.select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt,
+      resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, wake.agentId),
+      eq(heartbeatRuns.id, press.targetRunId),
+      eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "cancelled"),
+      sql`${heartbeatRuns.resultJson}->>'queuedCommentInterruptQueueId' = ${queueId}`,
+    )).limit(1);
+    const stoppedByThisPress = Boolean(target?.finishedAt && target.finishedAt.getTime() >= pressedAt) &&
+      target!.resultJson?.interruptionSource === "issue_comment_interrupt" &&
+      target!.resultJson?.interruptedByActorType === "user" && target!.resultJson?.interruptedByActorId === press.actorId;
+    return stoppedByThisPress && await nativeStopExecutionProven(companyId, target!.id);
   }
 
   async function resumeQueuedCommentInterrupt(companyId: string, queueId: string, opts?: { retryCleanup?: boolean }) {
@@ -963,6 +1037,13 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         sql`${agentWakeupRequests.payload}->'taskRetry'->>'queuedChatRequestId' is null`,
         notInArray(issues.status, ["done", "cancelled"])))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
+    // Hold50: an exact teardown-end hint for a person's message saved after a
+    // native Stop. Once that exact source run has the stop proof, reconsider
+    // the wake now instead of after the 30 s age gates (here and the receipt
+    // worker's). resumeRemoteStopComments re-proves the Stop and admission
+    // rechecks every gate. Every other wake keeps the gates below.
+    const stoppedSource = scope.companyId && scope.requestId
+      ? await executionWaitSourceStopped(scope.companyId, scope.requestId) : null;
     const chatEnabled = !retries.some(retry => retry.conversationAgentId)
       || (await instanceSettingsService(db).getExperimental()).enableAgentChat;
     for (const retry of retries) {
@@ -973,6 +1054,17 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       await resumeTaskRetry(retry.companyId, retry.id).catch(err => {
         scope.onError?.(err); logger.warn({ err, requestId: retry.id }, "Task retry dispatch deferred");
       });
+    }
+    if (stoppedSource && scope.requestId) {
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.id, scope.requestId), eq(agentWakeupRequests.companyId, stoppedSource.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      await resumeRemoteStopComments(stoppedSource, scope.requestId).catch(err => {
+        scope.onError?.(err);
+        logger.warn({ err, runId: stoppedSource.id }, "failed to resume a message saved after Stop");
+      });
+      return;
     }
     const waits = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
@@ -1773,7 +1865,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         await appendRunEvent(cancelled, {
           eventType: "lifecycle",
           stream: "system",
-          level: "warn",
+          level: readRunCancellation(cancelled.resultJson)?.expected ? "info" : "warn",
           message: options.eventMessage ?? "run cancelled",
           payload: { ...options.eventPayload, cancellation: readRunCancellation(cancelled.resultJson) },
         }).catch((eventErr) => {
@@ -1973,6 +2065,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     cancelRunInternal,
     resumeExecutionWaitComments,
     resumeQueuedCommentInterrupt,
+    queuedCommentInterruptTargetStopped,
+    executionWaitSourceStopped,
     resumeSavedLegacyComments: resumeSavedComments,
     resumeTaskRetry,
     cancelActiveForAgentInternal,

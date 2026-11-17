@@ -8,16 +8,15 @@ import { taskCollectionPreferencesStorageKey, TASK_COLLECTION_PREFERENCES_CHANGE
 type CollectionViewFlag = "showAgentCreatedTasks" | "showHiddenTasks";
 
 /**
- * The instance default for Show agent-created tasks (General setting
- * `taskListsShowAgentCreatedByDefault`). Off until the settings load, which
- * is upstream's hidden default.
+ * Agent-created tasks are shown unless an instance admin opts out. Missing
+ * settings and the initial loading state use the shown default too.
  */
 export function useAgentCreatedTasksDefault(): boolean {
   const { data } = useQuery({
     queryKey: queryKeys.instance.generalSettings,
     queryFn: () => instanceSettingsApi.getGeneral(),
   });
-  return data?.taskListsShowAgentCreatedByDefault === true;
+  return data?.taskListsShowAgentCreatedByDefault !== false;
 }
 
 /** Subscribe the collection's fetching owner to its persisted filter control. */
@@ -42,11 +41,12 @@ function useCollectionViewFlag(companyId: string | null, collectionKey: string, 
         && envelope.companyId === (companyId ?? "__unscoped__") && envelope.collectionKey === collectionKey;
       const view = valid ? envelope.viewState : legacy ? JSON.parse(legacy) : null;
       if (flag === "showHiddenTasks") return view?.showHiddenTasks === true;
-      // Only a recorded toggle is a choice; anything else uses the instance default.
-      return resolveAgentCreatedTasksDefault({
-        showAgentCreatedTasks: view?.showAgentCreatedTasks === true,
-        showAgentCreatedTasksExplicit: view?.showAgentCreatedTasksExplicit === true,
-      }, instanceDefault).showAgentCreatedTasks;
+      // Ignore the old Show control, even explicit false. Only a new Hide
+      // toggle is a choice; normalizers drop old fields on the next save.
+      return !resolveAgentCreatedTasksDefault({
+        hideAgentCreatedTasks: view?.hideAgentCreatedTasks === true,
+        hideAgentCreatedTasksExplicit: view?.hideAgentCreatedTasksExplicit === true,
+      }, instanceDefault).hideAgentCreatedTasks;
     } catch {
       return instanceDefault;
     }

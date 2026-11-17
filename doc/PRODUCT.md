@@ -201,17 +201,21 @@ and board-column membership keep their existing server order.
 Search and pagination apply the routine origin filter on the server. Creation-time
 sorting also runs before pagination, with task ID as a stable tie-breaker.
 
-Tasks and project lists hide agent-created and system-created tasks by default.
-The Filters menu's **Show agent-created tasks** checkbox includes routine runs,
-recovery/watchdog tasks, chat-channel tasks, and other automation. Channel tasks
-remain bot-created for this filter even when a human starts the conversation. The choice is saved per company
-and collection; Clear filters restores the hidden default. An instance admin can
-make these lists show agent-created tasks by default with the General setting
+Tasks and project lists show agent-created and system-created tasks by default.
+The Filters menu's **Hide agent-created tasks** checkbox is unchecked by default.
+Checking it hides routine runs, recovery/watchdog tasks, chat-channel tasks, and
+other automation. Channel tasks remain bot-created for this filter even when a
+human starts the conversation. The choice is saved per company and collection
+as `hideAgentCreatedTasks`, with `hideAgentCreatedTasksExplicit` marking a new
+choice. Old `showAgentCreatedTasks` preferences (including explicit false) are
+ignored on read and dropped when the collection next saves, so upgrading does
+not silently keep a person hiding tasks. Other saved filters and view choices
+are preserved. Clear filters restores the instance default, which is shown when
+no setting exists. An instance admin can still change the General setting
 **Show agent-created tasks in task lists by default**
 (`PATCH /api/instance/settings/general` with
-`{"taskListsShowAgentCreatedByDefault": true}`). A person's own choice in the
-Filters menu still wins, and Clear filters then restores the instance default.
-Choices saved before this setting existed are not treated as a choice. Nested lists preserve
+`{"taskListsShowAgentCreatedByDefault": false}` to opt out). A person's new
+Hide choice in the Filters menu still wins. Nested lists preserve
 ancestors and expandable subtasks as context without promoting unrelated automated
 work to independent results. Agent profiles, routine histories, and task-detail
 subtasks retain their full history.
@@ -242,8 +246,8 @@ checks preserve direct board comments on channel tasks. If both historical
 records are absent, the comment remains unclassified and keeps its previous
 behavior. A task origin alone cannot prove the source of an old comment.
 
-Inbox discovery searches and Blocked hide unrelated automatic tasks unless the
-checkbox is checked. The checkbox does not subscribe a person to automatic work.
+Inbox discovery searches and Blocked show automatic tasks unless Hide is checked.
+The checkbox does not subscribe a person to automatic work.
 Source feeds and project task lists retain their existing access rules.
 
 ### Company Skills and Policy
@@ -474,15 +478,21 @@ filters by name, title, or role; **+** starts or reopens a conversation.
 Selecting an agent opens their persistent conversation; it does not reset history
 or create a task until the existing first-write flow requires one.
 
-On an agent's chat page, **Mine | All members** switches between your conversation
-and a paginated list of that agent's shared conversations, with each owner's name
-and last activity. Only active company members who can read the agent may list
-these conversations. Private conversations (including inherited task/project
-privacy) stay out of this list, even for their owner or an instance administrator.
-Opening someone else's conversation is read-only: the composer says who can send,
-owner-only question/decision/handoff projections are not requested, and the
-conversation owner's read markers are untouched. Existing task read permissions
-and all owner-only chat write guards remain in force.
+Opening another active member's primary agent shows only that member's shared
+chat with it, titled **<Name>'s chat with <Agent>**, read-only and without a
+composer or member toggle. If no shared chat exists, the page says
+**<Name> hasn't chatted with <Agent> yet**. Your own primary, and agents that are
+nobody's primary, keep your interactive chat. If an agent is primary for you and
+another member, your own interactive chat takes precedence.
+
+The board-only `GET /companies/:companyId/primary-agents` read returns active
+members' primary assignments (`userId`, `agentId`) for agents the viewer may read.
+Only active company members who can read the agent may list shared conversations.
+Private conversations (including inherited task/project privacy) stay out of this
+list, even for their owner or an instance administrator. Owner-only
+question/decision/handoff projections are not requested in another member's chat,
+and the conversation owner's read markers are untouched. Existing task read
+permissions and all owner-only chat write guards remain in force.
 
 The opt-in API is `GET /companies/:companyId/chats?agentId=<uuid>&members=all`,
 with `limit` (1–100, default 50) and `offset` (default 0). Omitting `members=all`

@@ -11,7 +11,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -54,6 +54,7 @@ import {
 import { classifyIssueGraphLiveness } from "../services/recovery/issue-graph-liveness.js";
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "../services/native-runtime/status-arbiter.js";
 import { runningProcesses } from "../adapters/index.js";
+import { CONVERSATION_CONTINUATION_POLICY } from "../services/conversation-continuation.js";
 import {
   buildPaperclipTaskMarkdown,
   buildPaperclipWakePayload,
@@ -747,6 +748,226 @@ import {
         await rm(cwd, { recursive: true, force: true });
       }
     }, 30000);
+    // Stop row, S10 Option B (org 11-17 08:11Z, "Stop means stop"): a person
+    // queues A, B, C behind a long chat turn and presses the square Stop.
+    // Nothing is sent: the messages stay listed, with one line and a Send.
+    // The owner's Send starts ONE turn with the waiting messages, in order,
+    // each once; a message deleted first is not sent. A paused or held chat
+    // refuses Send with its reason and runs nothing until it is resumed. A
+    // task keeps its rule: a Stop holds its queued comments for the next wake.
+    it.each(["task", "send", "delete-then-send", "agent-paused", "chat-held"] as const)("after a person's Stop nothing is sent; the owner's Send starts one turn with the waiting messages (%s)", async (variant) => {
+      const chatMode = variant !== "task";
+      const runtimeCompany = randomUUID();
+      const runtimeAgent = randomUUID();
+      await db.insert(companies).values({ id: runtimeCompany, name: "Stop row",
+        issuePrefix: { task: "STPT", send: "STPS", "delete-then-send": "STPD", "agent-paused": "STPA", "chat-held": "STPH" }[variant], requireBoardApprovalForNewAgents: false });
+      const turns: { runId: string; commentIds: string[] }[] = [];
+      const app = express();
+      app.use(express.json());
+      let issueId = "";
+      app.post("/respond", async (req, res) => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, req.body.runId));
+        const context = (run.contextSnapshot ?? {}) as Record<string, unknown>;
+        const ids = Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds.map(String)
+          : typeof context.wakeCommentId === "string" ? [context.wakeCommentId] : [];
+        turns.push({ runId: run.id, commentIds: ids });
+        // The first turn is the long run the person stops.
+        if (turns.length === 1) { res.json({ hold: true }); return; }
+        await issueService(db).addComment(issueId, `Answer to ${ids.join(",")}`, { agentId: runtimeAgent, runId: run.id });
+        res.json({ hold: false });
+      });
+      const listener = app.listen(0, "127.0.0.1");
+      await new Promise<void>((resolve) => listener.once("listening", resolve));
+      const address = listener.address() as { port: number };
+      const cwd = await mkdtemp(join(tmpdir(), "chat-stop-row-"));
+      const script = `fetch("http://127.0.0.1:${address.port}/respond", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({runId:process.env.PAPERCLIP_RUN_ID})}).then(async r=>{if(!r.ok){console.error(r.status,await r.text());process.exitCode=1;return}const j=await r.json();if(j.hold)setInterval(()=>{},1000)})`;
+      await db.insert(agents).values({ id: runtimeAgent, companyId: runtimeCompany, name: "Stop row runtime",
+        role: "engineer", status: "idle", adapterType: "process",
+        adapterConfig: { command: process.execPath, args: ["-e", script], cwd },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } });
+      const issue = chatMode
+        ? await issueService(db).create(runtimeCompany, { title: "Stop row chat", conversationAgentId: runtimeAgent,
+          conversationUserId: "local-board", assigneeAgentId: runtimeAgent, conversationState: "waiting", status: "in_review" })
+        : await issueService(db).create(runtimeCompany, { title: "Stop row task", assigneeAgentId: runtimeAgent, status: "todo" });
+      issueId = issue.id;
+      const heartbeat = heartbeatService(db);
+      // The board routes the chat uses: the owner is the local board user.
+      const routes = (userId: string | null) => {
+        const routeApp = express();
+        routeApp.use(express.json());
+        if (!userId) routeApp.use(actorMiddleware(db, { deploymentMode: "local_trusted" }));
+        else routeApp.use((req, _res, next) => {
+          req.actor = { type: "board", source: "session", userId, companyIds: [runtimeCompany] } as never;
+          next();
+        });
+        routeApp.use("/api", issueRoutes(db, { wakeup: async () => null } as never));
+        routeApp.use(errorHandler);
+        return routeApp;
+      };
+      const queuePath = `/api/issues/${issue.id}/queued-comments`;
+      const send = async (body: string) => {
+        if (chatMode) {
+          const response = await request(routes(null)).post(`/api/issues/${issue.id}/comments`)
+            .send({ body, clientRequestId: randomUUID() }).expect(201);
+          return response.body;
+        }
+        const comment = await issueService(db).addComment(issue.id, body, { userId: "local-board" },
+          { clientRequestId: randomUUID() });
+        await heartbeat.wakeup(runtimeAgent, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+          requestedByActorType: "user", requestedByActorId: "local-board",
+          payload: { issueId: issue.id, commentId: comment.id },
+          contextSnapshot: { issueId: issue.id, taskKey: issue.id, commentId: comment.id, wakeCommentId: comment.id,
+            wakeCommentIds: [comment.id], source: "issue.comment" } });
+        return comment;
+      };
+      const waitFor = async (label: string, done: () => Promise<boolean>, attempts = 200) => {
+        for (let i = 0; i < attempts; i += 1) {
+          if (await done()) return;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, runtimeAgent));
+        const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, runtimeAgent));
+        const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+        throw new Error(`${label}: ${JSON.stringify({ turns, runs: runs.map((run) => ({ id: run.id, status: run.status,
+          errorCode: run.errorCode, result: run.resultJson })), wakes: wakes.map((wake) => ({ status: wake.status,
+          runId: wake.runId, payload: wake.payload })), actions: actions.map((action) => action.cause) })}`);
+      };
+      const heldIds = async () => (await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, runtimeAgent), eq(agentWakeupRequests.status, "deferred_issue_execution"))))
+        .flatMap((wake) => {
+          const ids = (wake.payload as Record<string, any>)?._paperclipWakeContext?.wakeCommentIds;
+          return Array.isArray(ids) ? ids : [];
+        });
+      const liveRuns = async () => db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.agentId, runtimeAgent), inArray(heartbeatRuns.status, ["queued", "running"])));
+      try {
+        await send("Run the long job");
+        await waitFor("long turn started", async () => turns.length === 1);
+        const stoppedRunId = turns[0]!.runId;
+        const queued = [await send("A"), await send("B"), await send("C")];
+        const queuedIds = queued.map((comment) => comment.id);
+        // All three are saved behind the running turn, none dispatched yet.
+        expect(await heldIds()).toEqual(queuedIds);
+        expect(turns).toHaveLength(1);
+        if (chatMode) {
+          // FALLBACK 2 gives each posted message its own wake. The read must
+          // show the whole waiting list even BEFORE Stop gathers those wakes.
+          const busyQueue = (await request(routes(null)).get(queuePath).expect(200)).body;
+          expect(busyQueue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
+          expect(busyQueue.entries.map((entry: { comment: { body: string } }) => entry.comment.body)).toEqual(["A", "B", "C"]);
+          expect(busyQueue.entries.slice(1).every((entry: { queueId?: string; queueRevision?: string }) =>
+            entry.queueId && entry.queueId !== busyQueue.queueId && entry.queueRevision)).toBe(true);
+          expect(new Set([busyQueue.queueId, ...busyQueue.entries.slice(1).map((entry: { queueId: string }) => entry.queueId)]).size).toBe(3);
+        }
+
+        // Gate 5 runs a conversation runtime. A legacy conversation adapter
+        // records this policy on its run; the bare process adapter used here
+        // keeps the process recovery contract (an uncertain-effects
+        // reconciliation hold), which is not the Stop row, so stamp it.
+        const [running] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stoppedRunId));
+        await db.update(heartbeatRuns).set({ resultJson: { ...(running.resultJson ?? {}),
+          conversationContinuation: CONVERSATION_CONTINUATION_POLICY } }).where(eq(heartbeatRuns.id, stoppedRunId));
+        // The square Stop, and nothing else.
+        await heartbeat.cancelRun(stoppedRunId, "Cancelled by a board operator",
+          { resultJson: { cancelledByActorType: "user", cancelledByUserId: "local-board" } });
+        const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stoppedRunId));
+        expect(stopped.status).toBe("cancelled");
+
+        // Stop means stop: nothing is sent and nothing is lost, for a chat
+        // and a task alike. The queued messages stay saved and deferred.
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        expect(turns).toHaveLength(1);
+        expect(await liveRuns()).toHaveLength(0);
+        expect(await heldIds()).toEqual(queuedIds);
+        if (!chatMode) return;
+
+        // The list and its one line, and a reload reads the same.
+        const owner = routes(null);
+        const readQueue = async () => {
+          const response = await request(owner).get(queuePath);
+          expect(response.status).toBe(200);
+          return response.body;
+        };
+        let queue = await readQueue();
+        expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
+        expect(queue.entries.every((entry: { queueId?: string }) => !entry.queueId || entry.queueId === queue.queueId)).toBe(true);
+        expect(queue.executionWait).toEqual({ reason: "stopped_by_person",
+          message: "Stopped. These messages are waiting: Send them, or delete any first." });
+        const reloaded = await readQueue();
+        expect(reloaded.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
+        expect(reloaded.executionWait?.reason).toBe("stopped_by_person");
+        const sendBody = () => ({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
+
+        // Only the chat's owner can Send.
+        const colleague = randomUUID();
+        await db.insert(companyMemberships).values({ companyId: runtimeCompany, principalType: "user",
+          principalId: colleague, status: "active", membershipRole: "operator" });
+        await ensureHumanRoleDefaultGrants(db, { companyId: runtimeCompany, principalId: colleague,
+          membershipRole: "operator", grantedByUserId: null });
+        expect((await request(routes(colleague)).post(`${queuePath}/interrupt`).send(sendBody())).status).toBe(403);
+
+        let expected = queuedIds;
+        if (variant === "delete-then-send") {
+          const deleted = await request(owner).delete(`${queuePath}/${queuedIds[1]}`)
+            .send({ queueId: queue.queueId, revision: queue.revision });
+          expect(deleted.status).toBe(200);
+          expected = [queuedIds[0]!, queuedIds[2]!];
+          queue = await readQueue();
+          expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(expected);
+          expect(queue.executionWait?.reason).toBe("stopped_by_person");
+        }
+        if (variant === "agent-paused" || variant === "chat-held") {
+          const [hold] = variant === "chat-held"
+            ? await db.insert(issueTreeHolds).values({ companyId: runtimeCompany, rootIssueId: issue.id, mode: "pause",
+              status: "active", createdByActorType: "user", createdByUserId: "local-board",
+              releasePolicy: { strategy: "manual", note: "leaf_pause" } }).returning()
+            : [null];
+          if (variant === "agent-paused") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, runtimeAgent));
+          const refused = await request(owner).post(`${queuePath}/interrupt`).send(sendBody());
+          expect(refused.status).toBe(409);
+          expect(refused.body.error).toBe(variant === "agent-paused"
+            ? "This agent is paused. Resume it to send these messages."
+            : "This chat is paused. Resume it to send these messages.");
+          // The successor never runs while paused; the messages stay waiting.
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          expect(turns).toHaveLength(1);
+          expect(await liveRuns()).toHaveLength(0);
+          expect(await heldIds()).toEqual(queuedIds);
+          expect((await readQueue()).entries).toHaveLength(3);
+          // Resumed, the same Send goes.
+          if (hold) await db.update(issueTreeHolds).set({ status: "released", releasedAt: new Date() })
+            .where(eq(issueTreeHolds.id, hold.id));
+          else await db.update(agents).set({ status: "idle" }).where(eq(agents.id, runtimeAgent));
+          queue = await readQueue();
+        }
+
+        const sent = await request(owner).post(`${queuePath}/interrupt`).send(sendBody());
+        expect(sent.status).toBe(200);
+        await waitFor("waiting messages answered after Send", async () => {
+          const answered = turns.slice(1).flatMap((turn) => turn.commentIds);
+          if (!expected.every((id) => answered.includes(id))) return false;
+          return (await liveRuns()).length === 0;
+        });
+        // A repeated Send of the same queue neither doubles nor reopens it.
+        expect((await request(owner).post(`${queuePath}/interrupt`).send(sendBody())).status).toBe(409);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        // ONE successor turn carries the waiting messages once, in order; the
+        // stopped turn stays stopped and is not re-run.
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stoppedRunId)))[0].status).toBe("cancelled");
+        expect(turns).toHaveLength(2);
+        expect(turns[1]!.runId).not.toBe(stoppedRunId);
+        expect(turns[1]!.commentIds).toEqual(expected);
+        const answers = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id),
+          eq(issueComments.authorAgentId, runtimeAgent)));
+        expect(answers.map((answer) => answer.createdByRunId)).toEqual([turns[1]!.runId]);
+        expect(await heldIds()).toEqual([]);
+        expect((await readQueue()).entries).toHaveLength(0);
+      } finally {
+        await heartbeat.cancelActiveForAgent(runtimeAgent).catch(() => undefined);
+        await new Promise<void>((resolve) => listener.close(() => resolve()));
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }, 60000);
     it("parks successful native interaction-only turns without consuming unrelated or stale gates", async () => {
       const chat = await create();
       const message = await issueService(db).addComment(chat.id, "Plan the work", { userId: "local-board" });
