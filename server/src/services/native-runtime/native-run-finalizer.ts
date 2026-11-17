@@ -1338,12 +1338,26 @@ async function recoverCommittedNativeChatResponseInScope(
         CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON
       )
         return false;
+      // The summary is a 12,000-character schema-capped preview of the reply
+      // event it cites. Present the WHOLE reply when the summary was cut from it.
+      const replyEventId = (Array.isArray(result.evidence) ? result.evidence : [])
+        .map((entry) => record(entry).ref).find((ref): ref is string => typeof ref === "string" && ref.startsWith("run-event:"))
+        ?.slice("run-event:".length);
+      const [replyRow] = replyEventId ? await tx.select({ payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents).where(and(
+          eq(heartbeatRunEvents.companyId, input.companyId),
+          eq(heartbeatRunEvents.runId, run.id),
+          eq(heartbeatRunEvents.sourceEventId, replyEventId),
+        )).limit(1) : [];
+      const replyPayload = record(record(record(replyRow?.payload).prpEvent).payload);
       const resolved = resolveHeartbeatRunResponse({
         resultJson: {
           nativeResult: result,
           finalizationPhase: "committed",
           finalizationReasonCode: decision.reasonCode,
         },
+        finalAgentMessage: replyEventId && replyPayload.kind === "agentMessage" && replyPayload.channel === "final"
+          && typeof replyPayload.text === "string" ? { text: replyPayload.text, sourceEventId: replyEventId, channel: "final" } : null,
         preferFinalResponseOverExistingComment: true,
         externalChatResponseWakeSummaryAuthorized: true,
         externalChatCommittedResponseWakeSummaryAuthorized: true,
