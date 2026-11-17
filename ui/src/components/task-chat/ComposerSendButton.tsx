@@ -117,7 +117,7 @@ export function ComposerSendButton({
       data-testid="task-chat-composer-send-menu"
       onClick={phone ? () => setSheetOpen(true) : undefined}
       className={cn(
-        "flex h-8 w-8 shrink-0 items-center justify-center rounded-r-full ring-1 ring-inset ring-background/25 transition-colors max-sm:h-11 max-sm:w-11",
+        "flex h-8 w-8 shrink-0 items-center justify-center rounded-r-full transition-colors max-sm:h-11 max-sm:w-11",
         pill,
       )}
     >
@@ -126,7 +126,7 @@ export function ComposerSendButton({
   );
 
   return (
-    <div className="flex shrink-0 items-stretch" role="group" aria-label="Send">
+    <div className="flex shrink-0 items-stretch gap-px" role="group" aria-label="Send">
       {sendButton}
       {phone ? (
         <>
