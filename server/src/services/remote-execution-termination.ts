@@ -1,6 +1,7 @@
-import { and, eq } from "drizzle-orm";
-import { environmentLeases, type Db } from "@paperclipai/db";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { environmentLeases, heartbeatRunEvents, type Db } from "@paperclipai/db";
 import { retiredReusableLeasePredecessors } from "./environment-lease-handoff.js";
+import { OWN_PROCESS_START_EVENT_TYPES } from "./native-process-start-events.js";
 
 type Lease = typeof environmentLeases.$inferSelect;
 
@@ -120,8 +121,29 @@ export async function stoppedRemoteCleanupScopes(db: Db, companyId: string, runI
 }
 
 /** Every lease of the run has stopped execution. Its resources can still be held. */
-export async function remoteExecutionHasStopped(db: Db, companyId: string, runId: string) {
-  return await stoppedRemoteCleanupScopes(db, companyId, runId) !== null;
+export async function remoteExecutionHasStopped(db: Db, companyId: string, runId: string, after?: Date) {
+  if (!after) return await stoppedRemoteCleanupScopes(db, companyId, runId) !== null;
+  const leases = await runRemoteLeases(db, companyId, runId);
+  const [launch] = await db.select({ createdAt: heartbeatRunEvents.createdAt }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, runId),
+    isNull(heartbeatRunEvents.sourceEventId), inArray(heartbeatRunEvents.eventType, [...OWN_PROCESS_START_EVENT_TYPES]),
+  )).orderBy(desc(heartbeatRunEvents.seq)).limit(1);
+  // A bound receipt for an old lease/process generation cannot settle a later
+  // failure or launch. Keep the normal cleanup contract unchanged for callers
+  // that do not need this stronger admission proof.
+  const now = Date.now();
+  return leases.length > 0 && leases.every(lease => {
+    // Workspace export may carry the same bound stop into pending destroy;
+    // that cleanup is not a new running process.
+    const recovered = hasRecoveredCleanupStopReceipt(lease);
+    const receipt = (recovered
+      ? (lease.metadata?.workspaceRecoveryCleanup as Record<string, unknown>).stopReceipt
+      : lease.metadata?.remoteExecutionTermination) as { confirmedAt?: unknown } | undefined;
+    const confirmedAt = typeof receipt?.confirmedAt === "string" ? Date.parse(receipt.confirmedAt) : NaN;
+    return (remoteLeaseExecutionStopped(lease) || recovered) && Number.isFinite(confirmedAt) && confirmedAt > after.getTime()
+      && confirmedAt >= lease.acquiredAt.getTime() && confirmedAt <= now
+      && (!launch || confirmedAt > launch.createdAt.getTime());
+  });
 }
 
 /** Every lease of the run was released with its termination receipt. */

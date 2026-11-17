@@ -5,6 +5,8 @@ import { conflict } from "../../errors.js";
 import { logActivity } from "../activity-log.js";
 import { FRESH_CONTINUATION_ACTOR, FRESH_CONTINUATION_CAUSE, FRESH_CONTINUATION_SCHEMA } from "../fresh-continuation-fallback.js";
 import { fenceSourceWorkspace } from "../remote-workspace-epoch-abandonment.js";
+import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
+import { remoteExecutionHasStopped } from "../remote-execution-termination.js";
 
 /** Execution admission, not a wake/notice policy. Every new successor passes
  * here before selecting a conversation, session or workspace. A terminal run
@@ -40,7 +42,13 @@ export async function fenceUnverifiedPredecessorsAtAdmission(db: Db, candidate: 
     )).orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).for("update");
     let context = run.contextSnapshot ?? {};
     let detachWorkspace = false;
+    let fencedAny = false;
     for (const source of predecessors) {
+      // Failure text is historical: recovery may have since proved this exact
+      // process stopped. A later launch invalidates either kind of receipt.
+      if (source.finishedAt && (await hasNativeLocalProcessStop(tx, source.companyId, source.id, source.finishedAt)
+        || await remoteExecutionHasStopped(tx, source.companyId, source.id, source.finishedAt))) continue;
+      fencedAny = true;
       const now = new Date(), recordedAt = now.toISOString();
       const fenced = await fenceSourceWorkspace(tx, source);
       // Without an epoch abandonment receipt, select a new isolated workspace.
@@ -80,7 +88,7 @@ export async function fenceUnverifiedPredecessorsAtAdmission(db: Db, candidate: 
         agentId: run.agentId, runId: run.id, details: { sourceRunId: source.id, recoveryActionId: action!.id,
           isolation, terminationConfirmed: false, ...(fenced ? { abandonedEpoch: fenced.abandonedEpoch, epoch: fenced.epoch } : {}) } });
     }
-    if (!predecessors.length) return run;
+    if (!fencedAny) return run;
     if (detachWorkspace && issue.executionWorkspaceId) {
       await tx.update(issues).set({ executionWorkspaceId: null,
         workspaceBindingRevision: sql`${issues.workspaceBindingRevision} + 1`, updatedAt: new Date() })
