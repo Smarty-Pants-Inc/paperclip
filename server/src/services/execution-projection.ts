@@ -16,7 +16,8 @@ import type { ExecutionProjection } from "@paperclipai/shared";
 import { EXECUTION_CONTROL_DEADLINE_MS } from "./execution-control-deadline.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
-import { workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
+import { readWorkspaceRecovery, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
+import { readUnsupersededHeldConversationNotices } from "./native-runtime/pi-session-recovery-notice.js";
 import { readTaskDrain } from "./task-admission.js";
 import { getStartupRecoveryState, startupQueuedRunPassOutstanding } from "../startup-recovery-state.js";
 import { hasPendingRunCleanup } from "./execution-blocker.js";
@@ -304,6 +305,12 @@ export async function executionProjectionsForRuns(
     const decisionId = coordinatorByRun.get(run.id)?.decisionId;
     return Boolean(issue && decisionId && issue.status === "in_progress" && issue.lastStatusDecisionId === decisionId);
   };
+  // The receipt's wording depends on an actual standing HELD notice, not a
+  // cancelled run status. Batch the read for recovered tasks only.
+  const recoveredIssueIds = [...new Set(recovery.filter(row => readWorkspaceRecovery(row.evidence)?.status === "recovered")
+    .map(row => row.issueId))];
+  const heldConversations = await read(() => readUnsupersededHeldConversationNotices(db,
+    { companyId, issueIds: recoveredIssueIds }));
   for (const run of runs) {
     const issueId = run.nativeIssueId ?? text(run.contextSnapshot?.issueId);
     const matching = recovery.filter(
@@ -329,6 +336,7 @@ export async function executionProjectionsForRuns(
         agentQueueByRun.get(run.id),
         run.status === "queued" && !run.startedAt ? routineHolderByIssue.get(issueIdOf(run) ?? "") : undefined,
         cleanupHeldRuns.has(run.id),
+        Boolean(issueId && heldConversations.has(issueId)),
       ),
     );
   }
@@ -361,6 +369,8 @@ export function projectExecution(
   routineHolder?: string,
   /** Admission holds this run while its task's previous native session cleanup is unsettled. */
   nativeCleanupHold = false,
+  /** A standing prior-owner notice, read in the batch above, not run status. */
+  heldConversation = false,
 ): ExecutionProjection {
   const detail = coordinator?.failureDetail ?? {};
   const successorRunId = text(detail.successorRunId);
@@ -395,7 +405,8 @@ export function projectExecution(
     Object.assign(projection, { phase, label });
   if (recoveryAction?.status === "resolved" && recoveryAction.evidence?.automaticRecovery) {
     projection.cause = recoveryAction.cause;
-    projection.nextAction = workspaceRecoveryDisplay(recoveryAction.evidence, run.id, { status: run.status, retryOffered: false })?.message
+    projection.nextAction = workspaceRecoveryDisplay(recoveryAction.evidence, run.id,
+      { status: run.status, retryOffered: false, heldConversation })?.message
       ?? recoveryAction.nextAction;
     const continuation = recoveryAction.evidence.explicitUserContinuation as
       { previousRunId?: unknown; runId?: unknown } | undefined;
