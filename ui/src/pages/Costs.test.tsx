@@ -5,8 +5,13 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Costs } from "./Costs";
+import { AgentCostsPanel } from "./AgentCostsPanel";
 import { CostByUserTable } from "../components/CostByUserTable";
 import { BudgetPolicyCard } from "../components/BudgetPolicyCard";
+import { ProviderQuotaCard } from "../components/ProviderQuotaCard";
+import { BillerSpendCard } from "../components/BillerSpendCard";
+import { QuotaBar } from "../components/QuotaBar";
+import type { CostByProviderModel } from "@paperclipai/shared";
 import { MemoryRouter } from "react-router-dom";
 
 const scopedAgentMock = vi.hoisted(() => vi.fn());
@@ -221,16 +226,22 @@ describe("Shared Costs surfaces", () => {
     queryClient.clear();
   });
 
-  it.each(["card", "plain"] as const)("shows the configured policy limit but masks observed and remaining spend in the %s variant", async (variant) => {
+  it.each((["card", "plain"] as const).flatMap(variant => ([
+    { scopeType: "company", status: "ok", paused: false, label: "Healthy" },
+    { scopeType: "agent", status: "warning", paused: false, label: "Warning" },
+    { scopeType: "project", status: "hard_stop", paused: false, label: "Hard stop" },
+    { scopeType: "project", status: "hard_stop", paused: true, label: "Paused" },
+  ] as const).map(state => ({ variant, ...state }))))("masks utilization but keeps $label in the $variant $scopeType policy", async ({ variant, scopeType, status, paused, label }) => {
     root = createRoot(container);
     await act(async () => root.render(<BudgetPolicyCard variant={variant} onSave={vi.fn()} summary={{
-      policyId: "policy", companyId: "company-1", scopeType: "agent", scopeId: "agent", scopeName: "Worker",
+      policyId: "policy", companyId: "company-1", scopeType, scopeId: "agent", scopeName: "Worker",
       metric: "billed_cents", windowKind: "calendar_month_utc", amount: 5000, warnPercent: 80,
       windowStart: new Date("2026-11-01T00:00:00Z"), windowEnd: new Date("2026-12-01T00:00:00Z"),
       hardStopEnabled: true, notifyEnabled: true, isActive: true, unpricedUsagePolicy: "block", reservationCents: "0",
       observedAmount: 800, remainingAmount: 4200, utilizationPercent: 16, unpricedEventCount: 0, pendingRunCount: 0,
-      status: "ok", paused: false, pauseReason: null,
+      status, paused, pauseReason: paused ? "budget" : null,
     }} />));
+    expect(container.textContent).toContain(label);
     const valueAfter = (label: string) => [...container.querySelectorAll("div, span")]
       .find(node => node.textContent === label)?.nextElementSibling?.textContent;
     expect(valueAfter("Budget")).toBe("$50.00");
@@ -238,6 +249,14 @@ describe("Shared Costs surfaces", () => {
     expect(valueAfter("Remaining")).toBe("—");
     expect(container.querySelector("input")?.value).toBe("50.00");
     expect(container.textContent).toContain("Update budget");
+    expect(container.textContent).toContain("— of limit");
+    expect(container.textContent).toContain("Soft alert at 80%");
+    expect(container.textContent).not.toContain("16%");
+    const progress = container.querySelector<HTMLElement>('[role="progressbar"]')!;
+    expect(progress.style.width).toBe("0%");
+    expect(progress.hasAttribute("aria-valuenow")).toBe(false);
+    expect(progress.getAttribute("aria-valuetext")).toBe("—");
+    expect(progress.getAttribute("aria-label")).toBe("Budget utilization: — used");
   });
 
   it.each([
@@ -357,8 +376,9 @@ describe("Shared Costs surfaces", () => {
     expect(card("API spend")?.textContent).toContain("—");
     subscriptionsMocks.report.mockResolvedValue({ ...report, activeCount: 1, monthlyTotals: [{ currency: "USD", amountCents: "2000", estimatedCount: 1 }], api: { ...report.api, costCents: "300" } });
     await act(async () => [...container.querySelectorAll("button")].find(button => button.textContent === "All Time")!.click());
-    await act(async () => { await vi.waitFor(() => expect(card("API spend")?.textContent).toContain("—")); });
-    expect(card("Subscriptions")?.textContent).toContain("$20.00/month");
+    // A masked API spend value is already "—" during loading; await the report itself.
+    await act(async () => { await vi.waitFor(() => expect(card("Subscriptions")?.textContent).toContain("$20.00/month")); });
+    expect(card("API spend")?.textContent).toContain("—");
     expect(subscriptionsMocks.report).toHaveBeenLastCalledWith("company-1", undefined, undefined);
     subscriptionsMocks.report.mockRejectedValue(new Error("private provider failure"));
     await act(async () => { await queryClient.invalidateQueries({ queryKey: ["cost-subscriptions"] }); });
@@ -378,8 +398,9 @@ describe("Shared Costs surfaces", () => {
     root = createRoot(container);
     await act(async () => root.render(<MemoryRouter><QueryClientProvider client={queryClient}><Costs /></QueryClientProvider></MemoryRouter>));
     const budgetCard = () => [...container.querySelectorAll("div")].find(node => node.textContent === "Budget")?.closest('[data-slot="card"]');
-    await act(async () => { await vi.waitFor(() => expect(budgetCard()?.textContent).toContain("20%")); });
+    await act(async () => { await vi.waitFor(() => expect(budgetCard()?.textContent).toContain("— of $10.00 this month")); });
     expect(budgetCard()?.textContent).toContain("— of $10.00 this month");
+    expect(budgetCard()?.textContent).not.toContain("20%");
     costsApiMocks.summary.mockResolvedValue({ spendCents: 12000, budgetCents: 1000, utilizationPercent: 1200, pricingComplete: true });
     const subscriptionReport = await subscriptionsMocks.report();
     subscriptionsMocks.report.mockResolvedValue({ ...subscriptionReport, api: { ...subscriptionReport.api, costCents: "12000" } });
@@ -411,11 +432,16 @@ describe("Shared Costs surfaces", () => {
       root = createRoot(container);
       await act(async () => root.render(<MemoryRouter><QueryClientProvider client={queryClient}><Costs {...props} initialTab="providers" /></QueryClientProvider></MemoryRouter>));
       await act(async () => { await vi.waitFor(() => expect(container.querySelectorAll('[aria-label^="Period spend:"]')).toHaveLength(2)); });
-      const bar = (percent: number) => container.querySelector(`[aria-label="Period spend: ${percent}%"]`)!.parentElement!;
-      expect(bar(10).querySelector(".bg-destructive")).toBeNull();
-      expect(bar(70).querySelector(".bg-destructive")).not.toBeNull();
-      expect(container.textContent).toContain("10% of company budget");
-      expect(container.textContent).toContain("70% of company budget");
+      const bars = [...container.querySelectorAll<HTMLElement>('[aria-label="Period spend: —"]')];
+      expect(bars).toHaveLength(2);
+      for (const bar of bars) {
+        expect(bar.style.width).toBe("0%");
+        expect(bar.hasAttribute("aria-valuenow")).toBe(false);
+        expect(bar.getAttribute("aria-valuetext")).toBe("—");
+        expect(bar.parentElement?.querySelector(".bg-destructive")).toBeNull();
+      }
+      expect(container.textContent).not.toMatch(/(?:10|70)% of company budget/);
+      expect(container.textContent).toContain("— of company budget");
       await act(async () => [...container.querySelectorAll("button")].find(button => button.textContent === "All Time")!.click());
       await act(async () => { await vi.waitFor(() => expect(container.querySelector('[aria-label^="Period spend:"]')).toBeNull()); });
     } finally { queryClient.clear(); vi.useRealTimers(); }
@@ -502,11 +528,77 @@ describe("Shared Costs surfaces", () => {
     await act(async () => card("Mixed").querySelector<HTMLElement>(".cursor-pointer")!.click());
     const breakdown = card("Mixed").querySelector(".border-l")!;
     expect(breakdown.textContent).toContain("gpt-6-astra");
+    expect(breakdown.textContent).toContain("(—)");
+    expect(breakdown.textContent).not.toContain("100%");
     expect(breakdown.querySelectorAll('[data-slot="badge"]')).toHaveLength(1);
     expect(breakdown.querySelector('[data-slot="badge"]')!.textContent).toBe("Estimated");
     // The count is for charges, not runs; it must not use apiRunCount or the
     // page-wide estimated count when determining whether a row is mixed.
     expect(breakdown.querySelector('[data-slot="badge"]')!.getAttribute("title")).toContain("1 estimated charge.");
+  });
+
+  it("masks provider cost shares and rolling spend fills without hiding tokens or configured weekly limits", async () => {
+    const row: CostByProviderModel = {
+      provider: "google", biller: "google", billingType: "metered_api", model: "small", costCents: 100,
+      inputTokens: 30, cachedInputTokens: 0, outputTokens: 0, apiRunCount: 1, subscriptionRunCount: 1,
+      subscriptionInputTokens: 10, subscriptionCachedInputTokens: 0, subscriptionOutputTokens: 0,
+    };
+    root = createRoot(container);
+    await act(async () => root.render(<ProviderQuotaCard provider="google" rows={[row, { ...row, model: "large", costCents: 300, inputTokens: 70 }]}
+      budgetMonthlyCents={43300} totalCompanySpendCents={400} weekSpendCents={200} showDeficitNotch
+      windowRows={[{ provider: "google", biller: "google", window: "5h", windowHours: 5, costCents: 200,
+        inputTokens: 25, cachedInputTokens: 0, outputTokens: 0 }]} />));
+    expect(container.textContent).toContain("~$100.00 / wk");
+    expect(container.textContent).toContain("20% of token usage via subscription");
+    const costOverlays = [...container.querySelectorAll<HTMLElement>('[title="— of provider cost"]')];
+    expect(costOverlays).toHaveLength(2);
+    for (const overlay of costOverlays) expect(overlay.style.width).toBe("0%");
+    expect(container.querySelector<HTMLElement>('[title="30% of provider tokens"]')?.style.width).toBe("30%");
+    const rollingTrack = [...container.querySelectorAll("span")].find(node => node.textContent === "5h")!.parentElement!.nextElementSibling!;
+    expect((rollingTrack.firstElementChild as HTMLElement).style.width).toBe("0%");
+    for (const bar of container.querySelectorAll<HTMLElement>('[role="progressbar"]')) {
+      expect(bar.style.width).toBe("0%");
+      expect(bar.hasAttribute("aria-valuenow")).toBe(false);
+      expect(bar.getAttribute("aria-valuetext")).toBe("—");
+      expect(bar.parentElement?.querySelector(".bg-destructive")).toBeNull();
+    }
+  });
+
+  it("masks cost shares on the agent-scoped model breakdown", async () => {
+    const base = { agentId: "worker", agentName: "Worker", costCents: 200, eventCount: 2, estimatedEventCount: 0,
+      unpricedEventCount: 0, inputTokens: 10, cachedInputTokens: 0, outputTokens: 2, apiRunCount: 1, subscriptionRunCount: 0 };
+    costsApiMocks.byAgent.mockResolvedValue([base]);
+    costsApiMocks.byAgentModel.mockResolvedValue([{ ...base, model: "share-model", costCents: 150,
+      provider: "google", biller: "google", billingType: "metered_api" }]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(<MemoryRouter><QueryClientProvider client={queryClient}>
+      <AgentCostsPanel agentId="worker" agentName="Worker" companyId="company-1" />
+    </QueryClientProvider></MemoryRouter>));
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("share-model")); });
+    expect(container.textContent).toContain("(—)");
+    expect(container.textContent).not.toContain("75%");
+    expect(container.textContent).toContain("12 tok");
+    queryClient.clear();
+  });
+
+  it("masks biller spend bars but leaves provider-reported quota bars unchanged", async () => {
+    root = createRoot(container);
+    await act(async () => root.render(<>
+      <BillerSpendCard row={{ biller: "google", costCents: 900, inputTokens: 10, cachedInputTokens: 0, outputTokens: 2,
+        apiRunCount: 1, subscriptionRunCount: 0, subscriptionInputTokens: 0, subscriptionCachedInputTokens: 0,
+        subscriptionOutputTokens: 0, providerCount: 1, modelCount: 1 }} budgetMonthlyCents={1000} weekSpendCents={900}
+        totalCompanySpendCents={900} providerRows={[]} />
+      <QuotaBar label="Provider quota" percentUsed={42} leftLabel="42% used" />
+    </>));
+    const spend = container.querySelector<HTMLElement>('[aria-label="Period spend: —"]')!;
+    expect(spend.style.width).toBe("0%");
+    expect(spend.getAttribute("aria-valuetext")).toBe("—");
+    expect(container.textContent).toContain("— of company budget");
+    const quota = container.querySelector<HTMLElement>('[aria-label="Provider quota: 42%"]')!;
+    expect(quota.style.width).toBe("42%");
+    expect(quota.getAttribute("aria-valuenow")).toBe("42");
+    expect(quota.hasAttribute("aria-valuetext")).toBe(false);
   });
 
   it.each(surfaces)("preserves the %s heading, breadcrumbs and tab navigation", async (name, props) => {
