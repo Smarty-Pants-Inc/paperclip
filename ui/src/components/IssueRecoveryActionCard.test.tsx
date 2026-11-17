@@ -139,6 +139,30 @@ describe("deriveRecoveryCardState", () => {
 });
 
 describe("IssueRecoveryActionCard", () => {
+  // adopt-stopu-card2 (rf-4 F12 b): a person's Stop card retires itself when the stop is
+  // confirmed (server clearTaskStopPending); its chrome must not promise a board decision.
+  it.each([true, false])("Stop-pending card chrome is true for a person's Stop (personStop=%s)", (personStop) => {
+    const node = render(<IssueRecoveryActionCard onResolve={() => {}} action={buildAction({
+      kind: "active_run_watchdog", cause: "execution_stop_pending", status: "escalated", ownerType: "board",
+      ownerAgentId: null, attemptCount: 1, maxAttempts: 1, outcome: "escalated", wakePolicy: null,
+      evidence: { runId: "run-1", stopPending: { schema: "paperclip.task-stop-pending.v1", code: "execution_stop_pending",
+        runIds: ["run-1"], ...(personStop ? { personStop: true } : {}) } },
+      nextAction: personStop
+        ? "Stop pending: Paperclip cannot confirm that the previous execution stopped. Messages you send are saved and will be sent once the stop is confirmed."
+        : "Stop pending (execution_stop_pending): Paperclip cannot confirm that the previous execution stopped. The task stays held until Stop is proved; starting a replacement or waiting longer is not proof.",
+    })} />);
+    const text = node.textContent ?? "";
+    if (personStop) {
+      expect(text).toContain("STOP PENDING");
+      expect(text).toContain("This card closes by itself once the stop is confirmed.");
+      for (const untrue of ["RECOVERY ESCALATED", "explicit decision", "needs a human decision", "stays held until Stop is proved"])
+        expect(text).not.toContain(untrue);
+    } else {
+      expect(text).toContain("RECOVERY ESCALATED");
+      expect(text).toContain("The card stays open until an explicit decision is recorded.");
+    }
+  });
+
   it.each(["running", "scheduled", "missed"] as const)("describes native %s finalization without claiming another agent turn", (state) => {
     const node = render(<IssueRecoveryActionCard action={buildAction({
       kind: "active_run_watchdog", cause: "native_finalization_invalid",
