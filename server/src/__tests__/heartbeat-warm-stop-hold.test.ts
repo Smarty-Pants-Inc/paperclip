@@ -69,7 +69,9 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
 
 import * as environmentOrchestrator from "../services/environment-run-orchestrator.js";
 import { heartbeatService } from "../services/heartbeat.js";
-import { preserveCancelledNativeWorkspaces } from "../services/native-runtime/native-failed-workspace-recovery.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { preserveCancelledNativeWorkspaces, registerCancelledWorkspacePreservationWork }
+  from "../services/native-runtime/native-failed-workspace-recovery.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 
@@ -135,7 +137,10 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
     return { companyId, agentId, runId, issueId };
   }
 
-  async function stopThenMessage(options: { warm: boolean; messageDelay: "immediate" | "after_sweep" }) {
+  async function stopThenMessage(options: { warm: boolean; messageDelay: "immediate" | "after_sweep";
+    // A second producer of the same hold that runs in the window between the run
+    // turning cancelled and the heartbeat's lease release (lease still active).
+    producer?: "worker" | "sweep" }) {
     fixture.warm = options.warm;
     fixture.calls = [];
     const f = await seed();
@@ -189,6 +194,8 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
         contextSnapshot: { issueId: f.issueId, commentId, wakeReason: "issue_commented" } });
     };
     let stopping: Promise<unknown> | undefined;
+    let windowLease: typeof environmentLeases.$inferSelect | undefined;
+    let windowHold: (typeof issueRecoveryActions.$inferSelect)[] | undefined;
     fixture.onFirst = async ({ runId }) => {
       // Mid tool call: the tool has written an agent file the turn has not synced.
       await fs.writeFile(unsynced, "unsynced agent notes\n");
@@ -204,6 +211,21 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
       });
       await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "native_retry_cancelled",
         leaseOwner: null }).where(eq(nativeRunFinalizations.runId, runId));
+      if (options.producer) {
+        // The real producers, before the heartbeat releases the lease: the
+        // event-driven worker (woken by the Stop acknowledgement) or the sweep.
+        [windowLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId!));
+        // The sweep walks candidates round-robin from a per-db cursor (5 per
+        // pass); a few passes cover this run whatever earlier tests left behind.
+        if (options.producer === "sweep") for (let pass = 0; pass < 3; pass++) await preserveCancelledNativeWorkspaces(db);
+        else {
+          const worker = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+          try { await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true).ready; }
+          finally { await worker.stop(); }
+        }
+        windowHold = await db.select().from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, f.companyId), eq(issueRecoveryActions.fingerprint, `native-workspace:${runId}`)));
+      }
       // +0 s: the person's message arrives once the Stop is visible as a
       // terminal run, while this turn is still unwinding.
       if (options.messageDelay === "immediate") {
@@ -227,7 +249,7 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
       const messageRuns = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
         sql`${heartbeatRuns.contextSnapshot}->>'commentId' = ${commentId}`));
       const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId!));
-      return { f, hold, messageRuns, lease, release, unsynced, unsyncedSha, calls: [...fixture.calls] };
+      return { f, hold, messageRuns, lease, release, unsynced, unsyncedSha, calls: [...fixture.calls], windowLease, windowHold };
     } finally {
       fixture.onFirst = undefined;
       factory.mockRestore();
@@ -260,4 +282,36 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
     expect(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "stop_and_retain" }));
     expect(createHash("sha256").update(await fs.readFile(r.unsynced)).digest("hex")).toBe(r.unsyncedSha);
   }, 120_000);
+
+  // CR7: the event-driven preservation worker and the cancelled-workspace sweep
+  // produce the same hold. They run here while the stopped warm turn's lease is
+  // still active (before the heartbeat release), and must classify an ordinary
+  // warm Stop as a handoff exactly as the heartbeat handler does.
+  it.each(["worker", "sweep"] as const)(
+    "the %s, racing the lease release, writes no hold for a warm keep_running Stop; the next message is admitted",
+    async producer => {
+      const r = await stopThenMessage({ warm: true, messageDelay: "immediate", producer });
+      expect(r.windowLease).toMatchObject({ status: "active", leasePolicy: "reuse_by_environment" });
+      expect.soft(r.windowHold).toEqual([]);
+      expect.soft(r.hold).toEqual([]);
+      expect.soft(r.release).not.toHaveBeenCalledWith(expect.objectContaining({ providerResourceDisposition: "stop_and_retain" }));
+      expect.soft(r.lease).not.toMatchObject({ leasePolicy: "retain_on_failure" });
+      expect.soft(r.messageRuns).toHaveLength(1);
+      expect.soft(r.messageRuns[0]?.errorCode).not.toBe("execution_reconciliation_required");
+      expect.soft(r.calls).toEqual([r.f.runId, r.messageRuns[0]?.id]);
+      expect.soft(createHash("sha256").update(await fs.readFile(r.unsynced)).digest("hex")).toBe(r.unsyncedSha);
+    },
+    120_000,
+  );
+
+  it.each(["worker", "sweep"] as const)(
+    "the %s still writes the hold for a non-warm Stop in the same window",
+    async producer => {
+      const r = await stopThenMessage({ warm: false, messageDelay: "immediate", producer });
+      expect(r.windowLease).toMatchObject({ status: "active" });
+      expect(r.windowHold).toEqual([expect.objectContaining({ cause: "native_continuation_requires_reconciliation" })]);
+      expect(r.hold).toEqual([expect.objectContaining({ cause: "native_continuation_requires_reconciliation" })]);
+    },
+    120_000,
+  );
 });
