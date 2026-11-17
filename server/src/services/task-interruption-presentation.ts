@@ -343,8 +343,14 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   }
   if (run.status === "scheduled_retry" && resourceWaitRetryReasons.has(run.scheduledRetryReason ?? "") && !system)
     return { ...base, state: "working" };
+  // An interrupted preparation's continuation did no provider work. Before it
+  // is due it shows its time (retry_scheduled below). Once due, its scheduler
+  // starts it at once (notified, else within its 30 s poll), so it is working
+  // only for that same no-work hand-off. A continuation that has not started
+  // by then is not about to: the failed attempt offers Retry.
   if (run.status === "scheduled_retry" && run.scheduledRetryReason === INTERRUPTED_PREPARATION_RETRY_REASON && !system
-      && (!run.scheduledRetryAt || now - run.scheduledRetryAt.getTime() < NATIVE_RESUME_DISPATCH_GRACE_MS))
+      && (!run.scheduledRetryAt || run.scheduledRetryAt.getTime() <= now
+        && now - run.scheduledRetryAt.getTime() < NO_WORK_CONTINUATION_HANDOFF_GRACE_MS))
     return { ...base, state: "working" };
   // The native coordinator resumes this same run by itself. A manual Retry
   // would race it, so show the resume until it is due and briefly while its
