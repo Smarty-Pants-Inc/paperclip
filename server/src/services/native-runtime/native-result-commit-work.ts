@@ -8,6 +8,7 @@ import { pendingNativeStatusEffectsCondition } from "./native-pending-effect-wor
 import { nativeRunnerOwnershipNotHeldCondition } from "./native-runner-ownership.js";
 import { finalizeNativeRun, NativeFinalizationDeferredError, recordNativeFinalizationFailure } from "./native-run-finalizer.js";
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
+import { completeNativeRunTerminal } from "./native-run-terminal.js";
 
 type Entry = { id: string; companyId: string; issueId: string; dueAt: number };
 
@@ -69,6 +70,7 @@ export function nativeResultCommitWork(db: Db, finalize = finalizeNativeRun) {
       await finalize({ db, runId: current.id, workspaceFinalizeStatus: "succeeded", projectRunStatus: true,
         onlyWhenDue: true, skipNativeResponsePresentation: true, skipNativeReviewResponse: true,
         preserveProviderAttempt: Boolean(readNativeWorkspaceSyncReference(run.profile?.nativeWorkspaceSync)),
+        skipRunTerminalCompletion: true,
       });
     } catch (error) {
 
@@ -76,6 +78,9 @@ export function nativeResultCommitWork(db: Db, finalize = finalizeNativeRun) {
         await recordNativeFinalizationFailure({ db, runId: current.id, error, projectRunStatus: true });
       }
     }
+    // This worker is the run's terminal writer; it has no live completion
+    // tail. Once, after the finalizer's transactions committed.
+    await completeNativeRunTerminal(db, current.id);
     const [remaining] = await candidates(scope);
     if (!remaining) return null;
     const next = entry(remaining);

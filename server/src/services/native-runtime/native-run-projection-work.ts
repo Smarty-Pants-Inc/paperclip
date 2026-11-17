@@ -1,5 +1,5 @@
 import { and, asc, eq, gt, not, or, sql } from "drizzle-orm";
-import { createHeartbeatAgentStatus } from "../heartbeat/agent-status.js";
+import { completeNativeRunTerminal } from "./native-run-terminal.js";
 import { heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
@@ -96,9 +96,9 @@ export function nativeRunProjectionWork(db: Db, project = projectCommittedRun,
     if (!run || !coordinator) return null;
     if (signal?.aborted) throw new Error("Native run projection stopped");
     await project({ db, run, coordinator, onlyWhenEffectsSettled: true });
-    // Recovery has no live completion tail to settle the agent. The projection
-    // transaction must finish before settlement takes the agent-row lock.
-    await createHeartbeatAgentStatus(db).settleAgentAfterCommittedRun(run);
+    // Recovery has no live completion tail. The projection transaction must
+    // finish before the shared terminal step takes the agent-row lock.
+    await completeNativeRunTerminal(db, run.id);
     return (await candidates(scope)).length ? { ...entry, dueAt: Date.now() + 30_000 } : null;
   }
   function register(coordinator: ReturnType<typeof createDeliveryWorkCoordinator>, canRun: () => boolean,
