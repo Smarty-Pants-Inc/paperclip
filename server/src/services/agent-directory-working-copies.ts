@@ -7,7 +7,7 @@ import { agents, environmentLeases, environments, agentInstructionWorkingCopies 
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
 import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
-import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory } from "./agent-file-store.js";
+import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory, type AgentFileConflict } from "./agent-file-store.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import { excludeAgentRuntimeFromGit } from "./agent-instruction-git-exclusion.js";
 import { resolveInstructionActor } from "./agent-instruction-authorization.js";
@@ -454,16 +454,16 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         const snapshot = checkpointSnapshot(captured.manifest);
         const nextHash = directorySnapshotSha256(snapshot);
         const changed = nextHash !== row.baseHash;
-        const { storageWarning } = changed
+        const { storageWarning, conflicts } = changed
           ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest }, actor(row))
           : await unchangedCheckpoint(row).then(() => ({
-            storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null,
+            storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null, conflicts: [],
           }));
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
           receipt: { ...row.receipt, baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
-            checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning } });
+            checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning, conflicts } });
         return row;
       } catch (error) {
         failure = error;
@@ -510,13 +510,14 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         const { snapshot } = inspected;
         const candidateHash = directorySnapshotSha256(snapshot);
         let storageWarning = inspected.storageWarning;
+        let conflicts: AgentFileConflict[] = [];
         if (candidateHash === row.baseHash) {
           row = await patch(row, { state: "unchanged", errorCode: null, errorMessage: null, nextAttemptAt: null });
         } else {
-          ({ storageWarning } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
+          ({ storageWarning, conflicts } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
           row = await patch(row, { state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null });
         }
-        row = await patch(row, { receipt: { ...row.receipt, storageWarning } });
+        row = await patch(row, { receipt: { ...row.receipt, storageWarning, conflicts } });
         break;
       } catch (error) {
         const retryable = !(error instanceof HttpError) || error.status >= 500;
@@ -589,6 +590,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       }
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
+        // The final save receipt keeps any file kept from another writer.
+        ...(Array.isArray(row.receipt?.conflicts) && row.receipt.conflicts.length ? { conflicts: row.receipt.conflicts } : {}),
         ...(row.receipt?.directoryRunId ? { directoryRunId: row.receipt.directoryRunId } : {}),
         ...(cleanupPending ? { cleanup: row.receipt?.cleanup, ...(destroyedOnly ? { cleanupDestroyedOnly: true } : {}) } : {}) },
         nextAttemptAt: cleanupPending ? new Date(Date.now() + 30_000) : null });

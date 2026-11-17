@@ -885,7 +885,7 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
   });
 
-  it("merges independent changes and uses the last synchronization for same-file edits", async () => {
+  it("merges independent changes and keeps a sibling's same-file save, with the later edit as a conflict copy", async () => {
     const a = await run(), b = await run();
     await fs.writeFile(path.join(a.localRoot, "a.txt"), "A");
     await fs.writeFile(path.join(b.localRoot, "b.txt"), "B");
@@ -897,15 +897,20 @@ describe("persistent agent directories", () => {
     await fs.writeFile(path.join(d.localRoot, "a.txt"), "D");
     await fs.writeFile(path.join(c.localRoot, "b.txt"), "new B");
     expect((await copies.collectStopped({ companyId, runId: c.runId }))?.state).toBe("saved");
-    expect((await copies.collectStopped({ companyId, runId: d.runId }))?.state).toBe("saved");
-    expect(await fs.readFile(path.join(root, "a.txt"), "utf8")).toBe("D");
+    const saved = await copies.collectStopped({ companyId, runId: d.runId });
+    expect(saved?.state).toBe("saved");
+    expect(await fs.readFile(path.join(root, "a.txt"), "utf8")).toBe("C");
+    const [kept] = saved?.receipt?.conflicts as Array<{ path: string; conflictCopy: string }>;
+    expect(kept).toMatchObject({ path: "a.txt", currentHash: fileHash(Buffer.from("C")), incomingHash: fileHash(Buffer.from("D")),
+      conflictCopy: expect.stringMatching(new RegExp(`^a\\.conflict-${d.runId.slice(0, 8)}-\\d+\\.txt$`)) });
+    expect(await fs.readFile(path.join(root, kept!.conflictCopy), "utf8")).toBe("D");
     expect(await fs.readFile(path.join(root, "b.txt"), "utf8")).toBe("new B");
     expect(await copies.list(companyId, agentId, board())).toEqual([]);
     for (const copy of [a, b, c, d]) await expect(fs.stat(path.dirname(copy.localRoot))).rejects.toMatchObject({ code: "ENOENT" });
     expect(await fs.readdir(path.join(path.dirname(root), "file-sync", "runs"))).toEqual([]);
   });
 
-  it("makes concurrent edit/delete races last-sync-wins and preserves unrelated new files", async () => {
+  it("keeps a concurrently saved edit over a stale deletion, applies a later edit over a deletion, and preserves unrelated new files", async () => {
     await fs.mkdir(path.join(root, "notes"));
     await fs.writeFile(path.join(root, "notes", "old.txt"), "old");
     const deleting = await run(), editing = await run();
@@ -913,8 +918,11 @@ describe("persistent agent directories", () => {
     await fs.writeFile(path.join(editing.localRoot, "notes", "old.txt"), "edited");
     await fs.writeFile(path.join(editing.localRoot, "notes", "new.txt"), "unrelated");
     await copies.collectStopped({ companyId, runId: editing.runId });
-    expect((await copies.collectStopped({ companyId, runId: deleting.runId }))?.state).toBe("saved");
-    await expect(fs.stat(path.join(root, "notes", "old.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    const deleted = await copies.collectStopped({ companyId, runId: deleting.runId });
+    expect(deleted?.state).toBe("saved");
+    expect(deleted?.receipt?.conflicts).toEqual([{ path: "notes/old.txt", baseHash: fileHash(Buffer.from("old")),
+      currentHash: fileHash(Buffer.from("edited")), incomingHash: null, conflictCopy: null }]);
+    expect(await fs.readFile(path.join(root, "notes", "old.txt"), "utf8")).toBe("edited");
     expect(await fs.readFile(path.join(root, "notes", "new.txt"), "utf8")).toBe("unrelated");
     const remove = await run(), change = await run();
     await fs.unlink(path.join(remove.localRoot, "notes", "new.txt"));
@@ -1355,7 +1363,7 @@ describe("persistent agent directories", () => {
   });
   // Exercise the production heartbeat callback consumed by the native executor,
   // rather than duplicating its saved-state-to-boolean expression in this test.
-  async function heartbeatCopy(copy: Awaited<ReturnType<typeof run>>) {
+  async function heartbeatCopy(copy: Awaited<ReturnType<typeof run>>, appendRunEvent = vi.fn(async (..._args: unknown[]) => {})) {
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     const [currentRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, copy.runId));
     type Input = Parameters<typeof createHeartbeatInstructionWorkingCopy>[0];
@@ -1363,7 +1371,7 @@ describe("persistent agent directories", () => {
       agent: agent!, readRun: () => currentRun!, context: {},
       session: { taskSession: null, taskSessionForRun: null, sessionConfigMetadata: {} as Input["session"]["sessionConfigMetadata"] },
       workspace: { executionTarget: null, executionWorkspace: { cwd: home } as Input["workspace"]["executionWorkspace"], persistedExecutionWorkspace: null },
-      appendRunEvent: vi.fn(async () => {}),
+      appendRunEvent,
     });
     type Prepare = Parameters<typeof lifecycle.prepare>[0];
     await lifecycle.prepare({ runtimeConfig: {}, hasInstructionFilesystem: true,
@@ -1372,6 +1380,35 @@ describe("persistent agent directories", () => {
     expect(lifecycle.instructionCopy?.runId).toBe(copy.runId);
     return lifecycle;
   }
+  it("keeps a sibling's saved note canonical when a parked chat's retirement checkpoint carries an older edit, and names both in the save event", async () => {
+    await fs.mkdir(path.join(root, "memory"));
+    await fs.writeFile(path.join(root, "memory", "x.md"), "C");
+    const parked = await run({ warm: true });
+    const appendRunEvent = vi.fn(async (..._args: unknown[]) => {});
+    const lifecycle = await heartbeatCopy(parked, appendRunEvent);
+    const sibling = await run();
+    await fs.writeFile(path.join(sibling.localRoot, "memory", "x.md"), "B");
+    expect((await copies.collectStopped({ companyId, runId: sibling.runId }))?.state).toBe("saved");
+    await fs.writeFile(path.join(parked.localRoot, "memory", "x.md"), "A");
+    await lifecycle.collectStoppedInstructions();
+    expect(await fs.readFile(path.join(root, "memory", "x.md"), "utf8")).toBe("B");
+    const hash = (text: string) => fileHash(Buffer.from(text));
+    const save = lifecycle.getInstructionSave() as { state?: string; conflicts?: Array<{ conflictCopy: string }> } | null;
+    expect(save).toMatchObject({ state: "saved", conflicts: [{ path: "memory/x.md", baseHash: hash("C"), currentHash: hash("B"), incomingHash: hash("A"),
+      conflictCopy: expect.stringMatching(/^memory\/x\.conflict-[0-9a-z]{8}-\d+\.md$/) }] });
+    const copyPath = save!.conflicts![0]!.conflictCopy;
+    expect(copyPath.startsWith(`memory/x.conflict-${parked.runId.slice(0, 8)}-`)).toBe(true);
+    expect(await fs.readFile(path.join(root, copyPath), "utf8")).toBe("A");
+    expect(await agentFileStore(db).read(companyId, agentId, copyPath, board())).toEqual(Buffer.from("A"));
+    const event = appendRunEvent.mock.calls.map(call => call[1] as { eventType: string; level: string; message: string; payload: Record<string, unknown> })
+      .find(entry => entry.eventType === "instruction_save");
+    expect(event).toMatchObject({ level: "warn", payload: { conflicts: save!.conflicts } });
+    for (const text of ["memory/x.md", hash("B"), hash("A"), copyPath]) expect(event!.message).toContain(text);
+    // A fresh chat starts from the sibling's note and sees the conflict copy.
+    const fresh = await run();
+    expect(await fs.readFile(path.join(fresh.localRoot, "memory", "x.md"), "utf8")).toBe("B");
+    expect(await fs.readFile(path.join(fresh.localRoot, copyPath), "utf8")).toBe("A");
+  });
   it("b13 RED: the executor-facing checkpointWarm callback returns true for an unchanged low-trust turn", async () => {
     await lowTrust();
     const copy = await run({ warm: true });

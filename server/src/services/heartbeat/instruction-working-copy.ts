@@ -6,6 +6,7 @@ import { adapterExecutionTargetEnablesSandboxDuplexBridge } from "@paperclipai/a
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "../agent-directory-working-copies.js";
+import type { AgentFileConflict } from "../agent-file-store.js";
 import { collectStoppedInstructionCopyWithRetries, instructionWorkingCopyGuidance, type agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { claimWarmNativeInstructionCopy, nativeSessionWorkspaceScope, reserveWarmNativeInstructionDirectory } from "../native-runtime/index.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
@@ -89,17 +90,22 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
       workspace: executionWorkspace,
     }), cwd: executionWorkspace.cwd,
   })).digest("hex");
+  const agentFileConflictMessage = (conflicts: AgentFileConflict[]) => `Agent files saved; ${conflicts.length} file${conflicts.length === 1 ? " was" : "s were"} also saved by another writer and kept. `
+    + conflicts.map(item => `${item.path}: kept ${item.currentHash}; this run's ${item.incomingHash ?? "deletion"} ${item.conflictCopy ? `saved as ${item.conflictCopy}` : "not applied"}.`).join(" ");
   const recordInstructionSave = async (saved: NonNullable<Awaited<ReturnType<typeof instructionCopies.get>>>) => {
     const receipt = parseObject(saved.receipt);
     const storageWarning = readNonEmptyString(receipt.storageWarning);
     const state = saved.errorCode === "AGENT_FILES_CHECKPOINT_UNSTABLE" ? "pending_collection"
       : saved.state === "warm_saved" ? readNonEmptyString(receipt.checkpointState) ?? "saved" : saved.state;
+    // A save that kept another writer's file names both versions, never just "saved".
+    const conflicts = state === "saved" && isAgentDirectoryCopy(saved) && Array.isArray(receipt.conflicts) ? receipt.conflicts as AgentFileConflict[] : [];
     instructionSave = { state, entryFile: saved.entryFile,
-      ...(isAgentDirectoryCopy(saved) ? { contract: "agent_files", appliedCandidateHash: saved.candidateHash, checkpointStats: receipt.checkpointStats }
+      ...(isAgentDirectoryCopy(saved) ? { contract: "agent_files", appliedCandidateHash: saved.candidateHash, checkpointStats: receipt.checkpointStats, conflicts }
         : { revisionId: parseObject(receipt.revision).id ?? null }), storageWarning, errorCode: saved.errorCode, errorMessage: saved.errorMessage };
     await appendRunEvent(readRun(), { eventType: "instruction_save", stream: "system",
-      level: !saved.errorCode && !storageWarning && ["saved", "unchanged", "resolved"].includes(state) ? "info" : "warn",
-      message: storageWarning ?? (state === "saved" ? "Agent files saved."
+      level: !saved.errorCode && !storageWarning && !conflicts.length && ["saved", "unchanged", "resolved"].includes(state) ? "info" : "warn",
+      message: conflicts.length ? [agentFileConflictMessage(conflicts), storageWarning].filter(Boolean).join(" ")
+        : storageWarning ?? (state === "saved" ? "Agent files saved."
         : state === "unchanged" ? "Instruction working copy is unchanged."
           : saved.errorMessage ?? "Instruction edits were not saved."), payload: instructionSave });
   };
