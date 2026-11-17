@@ -272,7 +272,7 @@ export function TaskChatRunnerTurn({
   }
   const final = finalRef.current.item;
   const responseReadIdentity = final && responseComment &&
-    final.text.trim().replace(/\s+/g, " ") === responseComment.text.trim().replace(/\s+/g, " ")
+    final.text === responseComment.text
     ? { id: responseComment.id, createdAtIso: responseComment.createdAtIso }
     : {};
   const timelineItems = paperclipRunnerTimelineItems(turnItems);
