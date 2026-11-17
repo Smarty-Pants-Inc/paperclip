@@ -26,8 +26,6 @@ import { notifyRoutineExecutionStatus } from "./routine-execution-status-notific
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { readRunCancellation } from "./run-cancellation.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
-import { freshContinuationChain } from "./fresh-continuation-chain.js";
-export { freshContinuationChain } from "./fresh-continuation-chain.js";
 import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.js";
 import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuesAutomaticallySql, isPersonOwnedFailureCode } from "./continuation-cause.js";
@@ -64,8 +62,6 @@ export { AUTOMATIC_CONTINUATION_WAKE_REASONS, PERSON_OWNED_FAILURE_CODES, isPers
  * the task) makes later calls a no-op. Bounded per task, not per failure: at
  * most `FRESH_CONTINUATIONS_PER_HOUR` continuations in a rolling hour, then it
  * backs off and is checked again; it never charges the task's failure budget.
- * Independently, each source-run chain gets at most two fresh continuations,
- * counted from durable recovery records without a time window.
  */
 
 export const FRESH_CONTINUATION_SCHEMA = "paperclip.fresh-continuation.v1" as const;
@@ -78,7 +74,6 @@ export const FRESH_CONTINUATION_CHECK_KEY = "freshContinuationCheck" as const;
 // Literal values (an import would be undefined under the heartbeat module's
 // import cycle); a test pins them to SERVER_RESTART_RETRY_MAX_ATTEMPTS/_WINDOW_MS.
 export const FRESH_CONTINUATIONS_PER_HOUR = 6;
-export const FRESH_CONTINUATIONS_PER_CHAIN = 2;
 export const FRESH_CONTINUATION_WINDOW_MS = 60 * 60_000;
 const PERSON_RECHECK_MS = 60 * 60_000;
 /** Consecutive pending checks (about 12 minutes) before the fallback stops waiting. */
@@ -612,9 +607,6 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
       ownsBlock: holds.filter(isOwnedReconciliationHold).some(ownsBlockedStatus) });
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
-  const chain = await freshContinuationChain(tx, { companyId, issueId: issue.id, runId: run.id });
-  if (chain.attempts >= FRESH_CONTINUATIONS_PER_CHAIN)
-    return { kind: "not_applicable", reason: "fresh_continuation_chain_exhausted" };
 
   // The holds this decision owns: reconciliation holds that still block the
   // task. Workspace restore/repair holds stay with workspace recovery, and
@@ -822,7 +814,6 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
         ? `The previous writer of run ${run.id} is not proven stopped, so the continuation starts in a new isolated workspace; no unverified files are applied.`
         : `The continuation of run ${run.id} starts from the task's last saved workspace; no unverified files are applied.` };
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: run.id, trigger: input.trigger,
-    chainRootRunId: chain.rootRunId, chainAttempt: chain.attempts + 1,
     failureCode: run.errorCode ?? null, delivery, recordedAt: now.toISOString(), isolation,
     stopProof: isolation === "writer_ended" ? "writer_ended" : fenced ? "unproven_epoch_abandoned" : "unproven_isolated",
     unverifiedActions: unverified, createdObjects: created, ...(fenced ? { workspace: fenced } : {}) };
