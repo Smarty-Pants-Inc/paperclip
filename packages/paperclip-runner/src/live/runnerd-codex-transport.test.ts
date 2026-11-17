@@ -1972,6 +1972,27 @@ it("settles a restored turn from the runner's reconciled result terminal", () =>
   expect(recovered([runTerminal], "turn-1")).toBeNull();
 });
 
+it("carries the provider-turn wait marker on a recovered turn terminal only when the PRP turn.completed has it", () => {
+  const { runnerdRecoveredTurnTerminal: recovered, runnerdPriorTurnTerminals: prior } = runnerdRecoveryInternals;
+  const event = (eventType: string, payload: Record<string, unknown>) => ({ eventType, envelope: { runId: "run-1", payload: { payload } } });
+  const awaited = event("turn.completed", { providerTurnId: "turn-1", awaitingProviderTurn: true });
+  const plain = event("turn.completed", { providerTurnId: "turn-1" });
+  const failed = event("turn.failed", { providerTurnId: "turn-1", awaitingProviderTurn: true });
+  const forged = event("turn.completed", { providerTurnId: "turn-1", awaitingProviderTurn: "true" });
+  expect(recovered([awaited], "turn-1")).toEqual({ status: "completed", error: null, awaitingProviderTurn: true });
+  expect(recovered([plain], "turn-1")).toStrictEqual({ status: "completed", error: null });
+  expect(recovered([failed], "turn-1")).toStrictEqual({ status: "failed", error: null });
+  expect(recovered([forged], "turn-1")).toStrictEqual({ status: "completed", error: null });
+  expect([...prior([awaited], "run-1", "turn-2").values()])
+    .toEqual([{ id: "turn-1", status: "completed", error: null, awaitingProviderTurn: true }]);
+  for (const unmarked of [plain, failed, forged]) {
+    expect([...prior([unmarked], "run-1", "turn-2").values()])
+      .toStrictEqual([{ id: "turn-1", status: unmarked.eventType.slice("turn.".length), error: null }]);
+  }
+  expect(prior([awaited], "run-1", "turn-1").size).toBe(0);
+  expect(prior([awaited], "run-other", "turn-2").size).toBe(0);
+});
+
 it("requires ACPX command results to preserve the requested turn identity", () => {
   expect(
     runnerdRecoveryInternals.turnStartCommandResultValid({
@@ -4921,7 +4942,7 @@ it("does not certify probe cleanup while owned credential preparation is unconfi
   }
 }, 15_000);
 
-it.each(["admission-only", "admission-only-mismatched-model", "complete", "api-key", "default-model", "mismatched-model", "model-refresh-error", "model-cleanup-error", "missing-model", "missing-runtime", "missing-completion", "late-bootstrap", "remote-complete", "remote-mismatched-model", "late-remote-preparation", "late-remote-release-error"] as const)("native Codex setup requires its daemon/app-server hello (%s)", async mode => {
+it.each(["admission-only", "admission-only-mismatched-model", "complete", "api-key", "default-model", "mismatched-model", "model-refresh-error", "model-cleanup-error", "missing-model", "missing-runtime", "missing-completion", "late-bootstrap", "remote-complete", "preconfigured", "remote-preconfigured", "remote-mismatched-model", "late-remote-preparation", "late-remote-release-error"] as const)("native Codex setup requires its daemon/app-server hello (%s)", async mode => {
   const root = await mkdtemp(join(tmpdir(), "runnerd-native-setup-"));
   const runtimeDirectory = join(root, "native-state");
   await mkdir(runtimeDirectory, { mode: 0o700 });
@@ -4930,6 +4951,8 @@ it.each(["admission-only", "admission-only-mismatched-model", "complete", "api-k
   await mkdir(sourceHome, { mode: 0o700 });
   await writeFile(join(sourceHome, "auth.json"), JSON.stringify({ OPENAI_API_KEY: mode === "api-key" ? "unrelated-login" : "selected-account" }), { mode: 0o600 });
   if (mode === "api-key") await writeFile(join(sourceHome, "config.toml"), 'model = "ambient-model"\n[mcp_servers.ambient]\ncommand = "untrusted-ambient-command"\n', { mode: 0o600 });
+  const preconfigured = mode.endsWith("preconfigured");
+  if (preconfigured) await writeFile(join(sourceHome, "config.toml"), 'model = "native-model"\n', { mode: 0o600 });
   const remote = mode.startsWith("remote-") || mode.startsWith("late-remote-");
   const remoteRoot = join(root, "assigned-remote-filesystem");
   const remoteFilesystem = join(remoteRoot, "filesystem");
@@ -4941,18 +4964,21 @@ it.each(["admission-only", "admission-only-mismatched-model", "complete", "api-k
     const probe = probeNativeRunnerEnvironment({
       runtimeDirectory, provider: "codex", model: mode === "default-model" ? null : "gpt-6.1-sol", reasoningEffort: "low",
       ...(mode.startsWith("admission-only") ? { admissionOnly: true } : {}),
-      environment: { PATH: process.env.PATH, OPENAI_API_KEY: mode === "api-key" ? "selected-account" : "", HOME: "/unrelated/home" },
+      environment: { PATH: process.env.PATH, OPENAI_API_KEY: mode === "api-key" ? "selected-account" : "", HOME: preconfigured ? root : "/unrelated/home", ...(preconfigured ? { CODEX_HOME: sourceHome } : {}) },
       timeoutMs: mode.startsWith("late-remote-") ? 800 : mode === "late-bootstrap" ? 100 : mode === "missing-completion" ? 1_000 : 10_000,
       ...(remote ? { workingDirectory: remoteWorkspace } : {}),
       transportOptions: {
+        ...(preconfigured ? { homeMode: "preconfigured" as const } : {}),
         ...(remote ? {
           runnerFilesystemRoot: remoteFilesystem, runnerStateDirectory: join(remoteRoot, "runner"),
           readRunnerState: async () => JSON.parse(await readFile(join(remoteRoot, "runner", "runner-state.json"), "utf8")),
           controlPlaneRegistration: async authority => {
             await mkdir(remoteWorkspace, { recursive: true, mode: 0o700 });
+            if (!preconfigured) {
             const remoteHome = join(remoteFilesystem, "codex-home");
             await mkdir(remoteHome, { mode: 0o700 });
             for (const name of ["auth.json", "config.toml"] as const) await cp(join(runtimeDirectory, "codex-home", name), join(remoteHome, name));
+            }
             if (mode.startsWith("late-remote-")) await new Promise(resolve => setTimeout(resolve, 1000));
             await authority.start();
             return { connectUrl: authority.connectUrl, release: async () => { registrationReleased = true; await authority.stop(); if (mode === "late-remote-release-error") throw new Error("PRP registration release failed"); } };
@@ -4966,7 +4992,7 @@ it.each(["admission-only", "admission-only-mismatched-model", "complete", "api-k
           ...(mode === "late-bootstrap" ? ["--thread-start-delay-ms", "1000"] : [])),
         sourceCodexHome: sourceHome,
       },
-      onCodexCredentialRefresh: async filename => {
+      onCodexCredentialRefresh: preconfigured ? undefined : async filename => {
         expect(filename).toBe(join(remote ? remoteFilesystem : runtimeDirectory, "codex-home", "auth.json"));
         expect(JSON.parse(await readFile(filename, "utf8"))).toEqual({ OPENAI_API_KEY: "selected-account" });
         if (mode === "api-key") {
@@ -4978,16 +5004,21 @@ it.each(["admission-only", "admission-only-mismatched-model", "complete", "api-k
         if (mode === "model-refresh-error") throw new Error("credential refresh failed after the native model error");
       },
       onCleanupConfirmed: async () => {
+        if (preconfigured) {
+          await expect(stat(join(runtimeDirectory, "codex-home"))).rejects.toMatchObject({ code: "ENOENT" });
+          if (remote) await expect(stat(join(remoteFilesystem, "codex-home"))).rejects.toMatchObject({ code: "ENOENT" });
+        }
         cleanupConfirmed = true;
-        expect(refreshed || mode === "missing-runtime" || mode === "late-bootstrap" || mode.startsWith("late-remote-")).toBe(true);
+        expect(preconfigured || refreshed || mode === "missing-runtime" || mode === "late-bootstrap" || mode.startsWith("late-remote-")).toBe(true);
         if (mode === "model-cleanup-error") throw new Error("owned temporary state cleanup failed");
         await rm(runtimeDirectory, { recursive: true, force: true });
       },
     });
-    if (mode === "admission-only" || mode === "complete" || mode === "api-key" || mode === "default-model" || mode === "remote-complete") {
+    if (preconfigured || mode === "admission-only" || mode === "complete" || mode === "api-key" || mode === "default-model" || mode === "remote-complete") {
       const observedModel = mode === "default-model" ? "gpt-test" : "gpt-6.1-sol";
       await expect(probe).resolves.toEqual({ provider: "codex", providerDriver: "codex_app_server", effectiveModel: observedModel, ...(mode === "admission-only" ? { helloProbePassed: false, admissionOnly: true, sessionAdmissionPassed: true } : { helloProbePassed: true }) });
-      expect(refreshed).toBe(true);
+      expect(refreshed).toBe(!preconfigured);
+      if (preconfigured) expect(await readFile(join(sourceHome, "config.toml"), "utf8")).toBe('model = "native-model"\n');
       if (remote) expect(registrationReleased).toBe(true);
       expect(cleanupConfirmed).toBe(true);
       await expect(stat(runtimeDirectory)).rejects.toThrow();
@@ -6690,15 +6721,17 @@ it.each([
   }
 }, 30_000);
 
-it.each(["claude", "codex"] as const)("keeps the explicitly assigned gateway in the %s runner environment", (agent) => {
+it.each([
+  ["acpx", "claude"], ["acpx", "codex"], ["acpx", "pi"], ["acpx", "cursor"], ["acpx", "copilot"], ["acpx", "kimi"], ["opencode", undefined],
+] as const)("drops a previous-release gateway binding from the %s %s runner environment", (provider, agent) => {
   const gateway = {
     PAPERCLIP_NATIVE_MCP_NAME: "paperclip-assigned",
-    PAPERCLIP_NATIVE_MCP_URL: "http://127.0.0.1:3100/mcp/gateway",
+    PAPERCLIP_NATIVE_MCP_URL: "http://127.0.0.1:3100/mcp/gateways/previous-release",
     PAPERCLIP_NATIVE_MCP_TOKEN: "fixture-scoped-gateway-token-1234567890",
   };
   const environment = createCapabilityRunnerdProviderEnvironment({
-    provider: "acpx",
-    options: { provider: "acpx", acpxAgent: agent, environment: {
+    provider,
+    options: { provider, ...(agent ? { acpxAgent: agent } : {}), environment: {
       PATH: "/bin", ...gateway, PAPERCLIP_API_KEY: "must-not-cross", DATABASE_URL: "must-not-cross",
     } },
     identity: { runnerInstanceId: "runner-1", environmentLeaseId: "lease-1", runId: "run-1",
@@ -6706,7 +6739,9 @@ it.each(["claude", "codex"] as const)("keeps the explicitly assigned gateway in 
     codexHome: "/isolated/home", runtimeContextPath: "/isolated/context.json", hasRuntimeContext: true,
     acpxSidecarPath: "/verified/provider-pack/dist/cli/acpx-runtime-sidecar.cjs",
   });
-  expect(environment).toMatchObject(gateway);
+  for (const name of Object.keys(gateway)) expect(environment).not.toHaveProperty(name);
+  expect(JSON.stringify(environment)).not.toContain("fixture-scoped-gateway-token");
+  expect(JSON.stringify(environment)).not.toContain("previous-release");
   expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
   expect(environment.DATABASE_URL).toBeUndefined();
 });
@@ -7704,3 +7739,140 @@ describe("a runnerd death between two turns of the same run (#20825 B)", () => {
     }
   }, 90_000);
 });
+
+const providerTurnStart = (turnId: string, origin: string | null = "provider") => ({ provider: "acpx", providerTurnId: turnId, status: "inProgress",
+  turn: { id: turnId, status: "inProgress" }, ...(origin ? { origin } : {}) });
+const providerTurnItem = (turnId: string) => ({ provider: "acpx", itemId: `message-${turnId}`, kind: "agentMessage", status: "completed", text: `${turnId} is done.` });
+const providerTurnTerminal = (turnId: string) => ({ provider: "acpx", providerTurnId: turnId, status: "completed", error: null });
+const optedInClaude = { provider: "acpx" as const, acpxAgent: "claude" as const, providerStartedTurns: true };
+
+async function deliverProviderTurnEventsAfterRestart(input: {
+  options: Record<string, unknown>;
+  resumeActiveTurnId?: string;
+  acknowledged: Array<[string, Record<string, unknown>]>;
+  redelivered: Array<[string, Record<string, unknown>]>;
+  removed?: number[];
+  finishCall?: boolean;
+}) {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-provider-turn-start-"));
+  const OriginalCore = durableControlPlane.DurablePrpControlPlane;
+  let callbacks!: ConstructorParameters<typeof OriginalCore>[0];
+  let core!: DurablePrpControlPlane;
+  const coreSpy = vi.spyOn(durableControlPlane, "DurablePrpControlPlane").mockImplementation(function (options) {
+    callbacks = options;
+    return core = new OriginalCore(options);
+  });
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: fakeCodex, codexArgs: fakeCodexArgs(stateDirectory), stateDirectory,
+    ...(input.resumeActiveTurnId ? { resumeActiveTurnId: input.resumeActiveTurnId } : {}),
+  });
+  const toolCalls: Array<Record<string, unknown>> = [];
+  bundle.transport.setServerRequestHandler(async request => {
+    toolCalls.push(structuredClone(request.params));
+    return { success: true, contentItems: [{ type: "inputText" as const, text: "{\"done\":true}" }] };
+  });
+  const delivered: Array<{ method: string; params: Record<string, any> }> = [];
+  try {
+    await bundle.transport.request("thread/start", { cwd: tmpdir() });
+    const reader = bundle.transport.notifications()[Symbol.asyncIterator]();
+    void (async () => { for (let next = await reader.next(); !next.done; next = await reader.next()) delivered.push(next.value); })().catch(() => undefined);
+    await new Promise(done => setTimeout(done, 100));
+    const before = delivered.length;
+    const transport = bundle.transport as unknown as { options: Record<string, unknown> };
+    transport.options = { ...transport.options, ...input.options };
+    const identity = core.store.state.identity;
+    const window = core.store.state.committedEvents;
+    const envelope = (eventType: string, payload: Record<string, unknown>) =>
+      ({ runId: identity.runId, turnId: identity.turnId, payload: { eventType, turnId: identity.turnId, payload } });
+    input.acknowledged.forEach(([eventType, payload], index) => {
+      const at = window.length - input.acknowledged.length + index;
+      window[at] = { ...window[at]!, eventType, envelope: envelope(eventType, payload) };
+    });
+    for (const at of [...input.removed ?? []].sort((left, right) => right - left)) window.splice(window.length - input.acknowledged.length + at, 1);
+    let seq = window.at(-1)!.sourceSeq;
+    const commit = (eventType: string, payload: Record<string, unknown>) => {
+      seq += 1;
+      window.push({ sourceSeq: seq, sourceEventId: `provider-turn-start-${seq}`, eventType, priority: 1,
+        envelope: envelope(eventType, payload), deliveryCount: 1, logicalEffectCount: 1 });
+      return `provider-turn-start-${seq}`;
+    };
+    for (const [eventType, payload] of input.redelivered) commit(eventType, payload);
+    (core.store as unknown as { onChange: (() => void) | null }).onChange?.();
+    if (input.finishCall) {
+      const sourceEventId = commit("tool.execution.started", { executionId: "exec-provider-finish", transport: "dynamic", name: "paperclip_finish", status: "running" });
+      const outcome = await callbacks.onSemanticToolInput!({ callId: "exec-provider-finish", operationId: "paperclip_finish",
+        input: { summary: "Done" }, sourceEventId, sourceEventType: "semantic_tool.input", correlation: identity });
+      expect(outcome.isError).not.toBe(true);
+    }
+    await new Promise(done => setTimeout(done, 200));
+    return { notifications: delivered.slice(before).filter(notification => notification.method.startsWith("turn/") || notification.method.startsWith("item/")), toolCalls };
+  } finally {
+    coreSpy.mockRestore();
+    await bundle.transport.close().catch(() => undefined);
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+}
+
+const notificationTurns = (notifications: Array<{ method: string; params: Record<string, any> }>) =>
+  notifications.map(notification => [notification.method, notification.params.turnId, notification.params.origin ?? null]);
+
+it("gives the driver a provider turn's start before its next event when the start was acknowledged before a restart", async () => {
+  const { notifications } = await deliverProviderTurnEventsAfterRestart({ options: optedInClaude,
+    acknowledged: [["turn.started", providerTurnStart("provider-1")]],
+    redelivered: [["item.completed", providerTurnItem("provider-1")], ["turn.completed", providerTurnTerminal("provider-1")]] });
+  expect(notificationTurns(notifications)).toEqual([["turn/started", "provider-1", "provider"], ["item/completed", "provider-1", null], ["turn/completed", "provider-1", null]]);
+  expect(notifications[0]!.params).toEqual(rehydrateRunnerdTurnNotification(providerTurnStart("provider-1"), notifications[1]!.params.threadId, "provider-1", "turn/started"));
+}, 20_000);
+
+it("gives the driver a provider turn's start before its next event when the window removed events after the start", async () => {
+  const { notifications } = await deliverProviderTurnEventsAfterRestart({ options: optedInClaude,
+    acknowledged: [["turn.started", providerTurnStart("provider-1")], ["item.completed", providerTurnItem("provider-1")], ["item.completed", providerTurnItem("provider-1")]],
+    removed: [1],
+    redelivered: [["item.completed", providerTurnItem("provider-1")], ["turn.completed", providerTurnTerminal("provider-1")]] });
+  expect(notificationTurns(notifications)).toEqual([["turn/started", "provider-1", "provider"], ["item/completed", "provider-1", null], ["turn/completed", "provider-1", null]]);
+}, 20_000);
+
+it("labels each provider turn's events with that turn when the recovery read names a later turn", async () => {
+  const { notifications } = await deliverProviderTurnEventsAfterRestart({ options: optedInClaude, resumeActiveTurnId: "provider-2",
+    acknowledged: [["turn.started", providerTurnStart("provider-1")]],
+    redelivered: [["item.completed", providerTurnItem("provider-1")], ["turn.completed", providerTurnTerminal("provider-1")],
+      ["turn.started", providerTurnStart("provider-2")], ["item.completed", providerTurnItem("provider-2")]] });
+  expect(notificationTurns(notifications)).toEqual([["turn/started", "provider-1", "provider"], ["item/completed", "provider-1", null],
+    ["turn/completed", "provider-1", null], ["turn/started", "provider-2", "provider"], ["item/completed", "provider-2", null]]);
+}, 20_000);
+
+it("gives no second start to the provider turn that the recovered driver already has as its active turn", async () => {
+  const { notifications } = await deliverProviderTurnEventsAfterRestart({ options: optedInClaude, resumeActiveTurnId: "provider-1",
+    acknowledged: [["turn.started", providerTurnStart("provider-1")]],
+    redelivered: [["item.completed", providerTurnItem("provider-1")], ["turn.completed", providerTurnTerminal("provider-1")]] });
+  expect(notificationTurns(notifications)).toEqual([["item/completed", "provider-1", null], ["turn/completed", "provider-1", null]]);
+}, 20_000);
+
+it("gives no second start to a provider turn whose start is delivered again", async () => {
+  const { notifications } = await deliverProviderTurnEventsAfterRestart({ options: optedInClaude, acknowledged: [],
+    redelivered: [["turn.started", providerTurnStart("provider-1")], ["item.completed", providerTurnItem("provider-1")], ["turn.completed", providerTurnTerminal("provider-1")]] });
+  expect(notificationTurns(notifications)).toEqual([["turn/started", "provider-1", "provider"], ["item/completed", "provider-1", null], ["turn/completed", "provider-1", null]]);
+}, 20_000);
+
+it.each([
+  ["not opted in", { provider: "acpx", acpxAgent: "claude" }, "provider"],
+  ["a non-Claude agent", { provider: "acpx", acpxAgent: "codex", providerStartedTurns: true }, "provider"],
+  ["another provider", { providerStartedTurns: true }, "provider"],
+  ["a controller-started turn", optedInClaude, null],
+] as const)("delivers a restarted turn's events as before for %s", async (_case, options, origin) => {
+  const { notifications } = await deliverProviderTurnEventsAfterRestart({ options, resumeActiveTurnId: "controller-turn",
+    acknowledged: [["turn.started", providerTurnStart("provider-1", origin)]],
+    redelivered: [["item.completed", providerTurnItem("provider-1")], ["turn.completed", providerTurnTerminal("provider-1")]] });
+  const threadId = notifications[0]!.params.threadId;
+  expect(notifications).toEqual([
+    { method: "item/completed", params: rehydrateRunnerdItemNotification(providerTurnItem("provider-1"), threadId, "controller-turn") },
+    { method: "turn/completed", params: rehydrateRunnerdTurnNotification(providerTurnTerminal("provider-1"), threadId, "controller-turn", "turn/completed") },
+  ]);
+}, 20_000);
+
+it("binds the finish call of a provider turn whose start was acknowledged before a restart to that turn", async () => {
+  const { notifications, toolCalls } = await deliverProviderTurnEventsAfterRestart({ options: optedInClaude, resumeActiveTurnId: "provider-2",
+    acknowledged: [["turn.started", providerTurnStart("provider-1")]], redelivered: [], finishCall: true });
+  expect(notificationTurns(notifications)).toEqual([["turn/started", "provider-1", "provider"]]);
+  expect(toolCalls).toEqual([expect.objectContaining({ turnId: "provider-1", tool: "paperclip_finish", callId: "exec-provider-finish" })]);
+}, 20_000);

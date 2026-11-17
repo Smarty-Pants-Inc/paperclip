@@ -9,6 +9,7 @@ import {
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
+import { readAgentReportingChain } from "./agent-reporting-chain.js";
 import { builtInAgentMarkersEqual, readBuiltInAgentMarker } from "./built-in-agent-metadata.js";
 import type { AuthorizationActor } from "../services/authorization.js";
 
@@ -20,7 +21,7 @@ export function createToken() {
   return `pcp_${randomBytes(24).toString("hex")}`;
 }
 
-const CONFIG_REVISION_FIELDS = [
+export const CONFIG_REVISION_FIELDS = [
   "name",
   "role",
   "title",
@@ -432,11 +433,11 @@ export function agentRecordQueries(db: Db) {
       .where(eq(agents.id, id))
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
-    const [companyRows, hydrated] = await Promise.all([
-      listCompanyAgentEligibilityRows(row.companyId),
+    const [chainRows, hydrated] = await Promise.all([
+      readAgentReportingChain(db, row),
       hydrateAgentSpend([row]).then((rows) => rows[0]!),
     ]);
-    return normalizeAgentRow(hydrated, companyRows);
+    return normalizeAgentRow(hydrated, chainRows);
   }
 
   async function ensureManager(companyId: string, managerId: string) {

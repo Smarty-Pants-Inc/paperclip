@@ -22,7 +22,7 @@ import { logger } from "../middleware/logger.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { chatActionDeadline } from "./chat-action-work.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
-import { isQueuedDependencyWait } from "./run-cancellation.js";
+import { isAcknowledgedLegacyUserStop, isQueuedDependencyWait, runStopPresentationJson } from "./run-cancellation.js";
 import { heldRetryOffersRetry } from "./task-retry-eligibility.js";
 import { exhaustedNativeFinalizationCondition, savedResultRetryPendingCondition } from "./native-runtime/exhausted-finalization-retry.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
@@ -184,6 +184,11 @@ const retryWaitMessages: Record<string, string> = {
   retry_source_changed: "Retry cannot continue because its saved message changed. Send a new message to continue from saved work.",
 };
 
+/** The stable text for a Retry admission refusal, as the task view shows it. */
+export function taskRetryWaitMessage(reason: string): string {
+  return retryWaitMessages[reason] ?? "Retry is waiting for execution checks. Your message is saved.";
+}
+
 const UNIDENTIFIED_RUNNER_STOP_MESSAGE = "Paperclip can't confirm that the previous run stopped. The server restarted after it started the agent but before it recorded the agent's process. "
   + "If no agent is still working on this task, a board operator can confirm that it stopped, and your Retry starts right away. Your message is saved.";
 
@@ -273,6 +278,7 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   // The task's existing dependency UI owns this wait. Keep actual recovery and
   // Retry preparation failures authoritative; this does not change admission.
   if (!action && !retryWait?.preparationStatus && isQueuedDependencyWait(run)) return base;
+  if (!wait && !action && isAcknowledgedLegacyUserStop(run)) return base;
   // Intentional Stop is not an unsuccessful attempt. This is presentation only;
   // physical containment and pending cleanup keep their execution-side gates.
   if (!wait && run.runtimeMode === "native" && run.companyId === issue.companyId && run.nativeIssueId === issue.id
@@ -435,8 +441,10 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   const requestedUuid = sql<string>`case when ${requestedIssueId} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     then ${requestedIssueId}::uuid else null end`;
   const legacyIssue = sql<string>`${heartbeatRuns.contextSnapshot}->>'issueId'`;
+  const attempt = sql`not (${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.startedAt} is null
+    and coalesce(${heartbeatRuns.errorCode}, '') in ('recovery_no_longer_needed', 'issue_closed_before_start'))`;
   const candidate = (condition: ReturnType<typeof and>) => db.select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt })
-    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), condition))
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), condition, attempt))
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
   const candidates = unionAll(
     candidate(eq(heartbeatRuns.nativeIssueId, requestedUuid)),
@@ -503,7 +511,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       setupFailureRunId: sql<string>`case when ${heartbeatRuns.resultJson}->'setupCommandFailure' is null
         and ${heartbeatRuns.status} = 'scheduled_retry' and ${heartbeatRuns.retryOfRunId} is not null
         then ${heartbeatRuns.retryOfRunId} else ${heartbeatRuns.id} end`,
-      resultJson: sql<Record<string, unknown>>`jsonb_build_object('configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete',
+      resultJson: sql<Record<string, unknown>>`${runStopPresentationJson(heartbeatRuns.resultJson)} || jsonb_build_object('configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete',
         'stopReason', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'stopReason'`, 80)},
         'timeoutSource', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'timeoutSource'`, 80)},
         'timeoutFired', coalesce(${heartbeatRuns.resultJson}->'timeoutFired' = 'true'::jsonb, false),
@@ -528,7 +536,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         'setupCommandFailure', coalesce(${heartbeatRuns.resultJson}->'setupCommandFailure', case when ${heartbeatRuns.status} = 'scheduled_retry'
           then (select predecessor.result_json->'setupCommandFailure' from ${heartbeatRuns} predecessor
             where predecessor.company_id = ${heartbeatRuns.companyId} and predecessor.id = ${heartbeatRuns.retryOfRunId}
-              and predecessor.error_code = 'setup_failed') end))`,
+              and predecessor.error_code = 'setup_failed') end))`.as("result_json"),
     }).from(requested).innerJoinLateral(latestRuns, sql`true`).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, latestRuns.id)))
       .leftJoin(agents, and(eq(agents.companyId, heartbeatRuns.companyId), eq(agents.id, heartbeatRuns.agentId)))
       .orderBy(requestedIssueId),
@@ -609,6 +617,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   }
   // A queued-message Interrupt records its queue on the stopped run. Newer
   // input can hide that wake from the latest-wait read, so load it by id.
+  // The click's recorded intent is the authority, not the wake's requester:
+  // a user's message can join an earlier automatic wake.
   const interruptQueueId = (run: typeof runs[number]) => {
     const id = run.status === "cancelled" ? run.resultJson?.queuedCommentInterruptQueueId : null;
     return typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id) ? id : null;
@@ -618,7 +628,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     requestedAt: agentWakeupRequests.requestedAt,
     queuedInterruptRequestedAt: boundedJsonString(sql`${agentWakeupRequests.payload}#>'{queuedCommentInterrupt,requestedAt}'`, 40) })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.id, interruptQueueIds),
-      eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.requestedByActorType, "user"))) : [];
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      sql`${agentWakeupRequests.payload}#>>'{queuedCommentInterrupt,actorId}' is not null`)) : [];
   const interruptWaitById = new Map(interruptWaits.map(wait => [wait.id, wait]));
   const runIds = runs.map(run => run.id);
   const actions = runIds.length ? await db.selectDistinctOn([issueRecoveryActions.sourceIssueId]).from(issueRecoveryActions).where(and(
@@ -924,4 +935,24 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
 
 export async function taskInterruptionPresentation(db: Db, issue: ProjectionIssue) {
   return (await taskInterruptionPresentations(db, issue.companyId, [issue])).get(issue.id) ?? null;
+}
+
+/**
+ * The refusal that admission recorded on this Retry request, when another
+ * click cannot change it. A Retry answer must name it instead of reporting
+ * the request as accepted: such a request starts no run by itself. The task
+ * view's projection says whether a quarantined session is still cleaning up.
+ */
+export async function taskRetryRefusal(db: Pick<Db, "select">, companyId: string, requestId: string,
+  presentation?: Pick<TaskInterruptionPresentation, "canRetry" | "retryWait"> | null):
+  Promise<{ reason: string; message: string } | null> {
+  const [wake] = await db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId,
+    reason: sql<string | null>`${agentWakeupRequests.payload}#>>'{executionWait,reason}'` })
+    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, requestId)));
+  if (!wake || wake.status !== "deferred_issue_execution" || wake.runId || !wake.reason) return null;
+  const shown = presentation?.retryWait?.reason === wake.reason ? presentation : null;
+  // A quarantined session that is still cleaning up is a refusal only while
+  // the task view hides Retry for it; every other reason has a fixed verdict.
+  if (heldRetryOffersRetry(wake.reason, wake.reason === "cleanup_quarantined" && shown?.canRetry === false)) return null;
+  return { reason: wake.reason, message: shown?.retryWait?.message ?? taskRetryWaitMessage(wake.reason) };
 }

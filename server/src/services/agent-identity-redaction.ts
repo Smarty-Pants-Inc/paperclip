@@ -1,6 +1,56 @@
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { isDigitValue, redactRegisteredSecretValues } from "./run-secret-redaction.js";
 
+export const MIN_SECRET_OUTPUT_VALUE_LENGTH = 8;
+const MIN_RESUMED_SUFFIX_LENGTH = 4;
+
+const PROTOCOL_KEY = /^(?:id|ids|ref|refs|schema|type|kind|status|state|outcome|phase|stream|channel|role|level|color|transport|operation|namespace|provider|model|biller|disposition|priority|mode|method)$|(?:Id|Ids|Ref|Refs|Type|Kind|State|Status|Code|Disposition|Revision|Version|Mode|Schema|Digest|Sha256|At)$|_(?:id|ids|type|kind|state|status|code)$/;
+
+export function secretEnvironmentValues(env: unknown, secretKeys: Iterable<string>): string[] {
+  if (!env || typeof env !== "object" || Array.isArray(env)) return [];
+  const record = env as Record<string, unknown>;
+  return [...new Set([...secretKeys].map(key => record[key]).filter((value): value is string => typeof value === "string" && value.length > 0))];
+}
+
+export function secretOutputForms(secrets: readonly string[]): string[] {
+  const forms = new Set<string>();
+  for (const value of secrets) {
+    const lines = /[\r\n]/.test(value) ? value.split(/\r?\n|\r/).map(line => line.trim()).filter(line => !line.startsWith("-----")) : [];
+    for (const form of [value, value.trim(), ...lines]) {
+      if (form.trim().length < MIN_SECRET_OUTPUT_VALUE_LENGTH) continue;
+      forms.add(form);
+      forms.add(JSON.stringify(form).slice(1, -1));
+    }
+  }
+  return [...forms].sort((a, b) => b.length - a.length);
+}
+
+function replaceValues(text: string, values: readonly string[]): string {
+  return values.reduce((result, value) => result.split(value).join(REDACTED_EVENT_VALUE), text);
+}
+
+function resumedSuffixLength(text: string, candidates: readonly string[]): number {
+  let longest = 0;
+  for (const value of candidates) {
+    for (let size = value.length - 1; size >= MIN_RESUMED_SUFFIX_LENGTH && size > longest; size--) {
+      const suffix = value.slice(-size);
+      if (text.startsWith(suffix)) { longest = size; break; }
+      if (text.length >= MIN_RESUMED_SUFFIX_LENGTH && text.length > longest && suffix.startsWith(text)) { longest = text.length; break; }
+    }
+  }
+  return longest;
+}
+
+function redactOutputSecretValues<T>(input: T, values: readonly string[], key?: string): T {
+  if (values.length === 0 || (key !== undefined && PROTOCOL_KEY.test(key))) return input;
+  if (typeof input === "string") return replaceValues(input, values) as T;
+  if (Array.isArray(input)) return input.map((entry) => redactOutputSecretValues(entry, values, key)) as T;
+  if (!input || typeof input !== "object" || input instanceof Date) return input;
+  return Object.fromEntries(Object.entries(input).map(([entryKey, entry]) =>
+    [entryKey, redactOutputSecretValues(entry, values, entryKey)])) as T;
+}
+
+/** Keep private material in memory only; do not copy it into run snapshots. */
 const MATERIAL_WINDOW = 32;
 const PEM_RUN_MIN = 40;
 const PRIVATE_KEY_MARKERS = ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "DSA PRIVATE KEY",
@@ -63,9 +113,11 @@ export function isRunSecretIdentifier(value: string, identifiers: ReadonlySet<st
  * is never indexed. An all-digit value is indexed but masks only where it stands
  * as a whole number (see redactRegisteredSecretValues), so ordinary numbers stay.
  */
-export function addRunSecretMaterial(redactor: { values: string[] }, secrets: Iterable<string>, identifiers: Iterable<string | null | undefined> = []) {
+export function addRunSecretMaterial(redactor: { values: string[]; runIdentifiers?: Set<string> }, secrets: Iterable<string>, identifiers: Iterable<string | null | undefined> = []) {
   const known = new Set(redactor.values);
   const ids = new Set([...identifiers].filter((id): id is string => typeof id === "string" && id.length > 0));
+  // The output-secret stage (#21341) applies the same id exemption to its values.
+  for (const id of ids) redactor.runIdentifiers?.add(id);
   for (const secret of new Set(secrets)) {
     if (typeof secret !== "string" || secret.length < MIN_RUN_SECRET_LENGTH || isRunSecretIdentifier(secret, ids)) continue;
     // Keep the whole secret; drop derived lines too short to mean anything
@@ -81,7 +133,8 @@ export function addRunSecretMaterial(redactor: { values: string[] }, secrets: It
 }
 
 /** Keep private material in memory only; do not copy it into run snapshots. */
-export function createAgentIdentityRedactor(privateKeyPem?: string) {
+export function createAgentIdentityRedactor(privateKeyPem?: string, secrets: readonly string[] = [],
+  options: { maskResumedSuffixes?: boolean } = {}) {
   const values = privateKeyPem ? [...new Set([
     privateKeyPem,
     privateKeyPem.trim(),
@@ -89,6 +142,17 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
     ...privateKeyPem.split(/\r?\n/).filter(line => line && !line.startsWith("-----")),
   ])].sort((a, b) => b.length - a.length) : [];
   const pending = new Map<string, string>();
+  // Upstream #21341 output secrets: a second stage after the fork's exact-value
+  // and key-material stage, with its own stream buffers. All-digit values and
+  // values equal to one of the run's own ids stay with the fork stage's rules
+  // (whole numbers only; never an id), so this stage skips them.
+  const secretSources: string[] = [];
+  const secretValues: string[] = [];
+  const runIdentifiers = new Set<string>();
+  const outputPending = new Map<string, string>();
+  const seenStreams = new Set<string>();
+  const maskedPending = new Map<string, number>();
+  const outputSecretValues = () => secretValues.filter(value => !isDigitValue(value.trim()) && !isRunSecretIdentifier(value, runIdentifiers));
   const materialStreams = new Map<string, MaterialStream>();
   const indexedValues = new Set<string>();
   const completePemValues: string[] = [];
@@ -207,7 +271,61 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       (state.marker.length >= 8 ? REDACTED_EVENT_VALUE : state.marker);
     return output;
   };
-  const hasPending = (stream: string) => pending.has(stream) || materialStreams.has(stream);
+  const hasPending = (stream: string) => pending.has(stream) || materialStreams.has(stream) || outputPending.has(stream) || maskedPending.has(stream);
+  const outputChunk = (stream: string, chunk: string): string => {
+      const text = (outputPending.get(stream) ?? "") + chunk;
+      const candidates = outputSecretValues();
+      const resumes = options.maskResumedSuffixes === true && !seenStreams.has(stream);
+      const resumed = Math.max(resumes ? resumedSuffixLength(text, candidates) : 0, maskedPending.get(stream) ?? 0);
+      if (resumes && resumed === 0 && text.length > 0 && text.length < MIN_RESUMED_SUFFIX_LENGTH
+        && candidates.some((value) => value.indexOf(text, 1) !== -1)) {
+        outputPending.set(stream, text);
+        return "";
+      }
+      const masked: Array<[number, number]> = resumed > 0 ? [[0, resumed]] : [];
+      let end = text.length;
+      for (let index = 0; index < text.length;) {
+        let matched = 0;
+        let partial = false;
+        for (const value of candidates) {
+          if (value.charCodeAt(0) !== text.charCodeAt(index)) continue;
+          if (text.startsWith(value, index)) { matched = value.length; break; }
+          if (text.length - index < value.length && value.startsWith(text.slice(index))) { partial = true; break; }
+        }
+        if (partial) { end = index; break; }
+        if (matched) {
+          masked.push([index, index + matched]);
+          index += matched;
+        } else index++;
+      }
+      if (end < text.length) outputPending.set(stream, text.slice(end));
+      else outputPending.delete(stream);
+      if (end < Math.min(resumed, text.length)) maskedPending.set(stream, Math.min(resumed, text.length) - end);
+      else maskedPending.delete(stream);
+      if (resumes && end > resumed) seenStreams.add(stream);
+      const merged: Array<[number, number]> = [];
+      for (const [from, to] of masked.sort((left, right) => left[0] - right[0])) {
+        const last = merged.at(-1);
+        if (last && from < last[1]) last[1] = Math.max(last[1], to);
+        else merged.push([from, to]);
+      }
+      let output = "";
+      let cursor = 0;
+      for (const [from, to] of merged) {
+        if (from >= end) break;
+        output += text.slice(cursor, from) + REDACTED_EVENT_VALUE;
+        cursor = Math.min(to, end);
+      }
+      return output + text.slice(cursor, end);
+    };
+  const outputFinish = (stream: string): string => {
+    const held = outputPending.get(stream);
+    const heldMasked = maskedPending.has(stream);
+    outputPending.delete(stream);
+    maskedPending.delete(stream);
+    if (held && heldMasked) return REDACTED_EVENT_VALUE;
+    return held ? (held.length < 8 ? held : REDACTED_EVENT_VALUE) : "";
+  };
   const redactMaterial = (value: unknown): unknown => {
     if (typeof value === "string") return scanMaterial(value, newMaterialStream(), true);
     if (value instanceof Date) return value;
@@ -221,7 +339,16 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
   }>();
   const redactor = {
     values,
-    redact<T>(value: T): T { return redactRegisteredSecretValues(redactMaterial(value), values) as T; },
+    secretSources,
+    secretValues,
+    runIdentifiers,
+    addSecretValues(secrets: readonly string[]) {
+      secretSources.splice(0, secretSources.length, ...new Set([...secretSources, ...secrets.filter(Boolean)]));
+      secretValues.splice(0, secretValues.length, ...secretOutputForms(secretSources));
+    },
+    redact<T>(value: T, key?: string): T {
+      return redactOutputSecretValues(redactRegisteredSecretValues(redactMaterial(value), values) as T, outputSecretValues(), key);
+    },
     // Hold only a suffix that could begin a secret. Separate buffers prevent
     // interleaved stdout/stderr from defeating matching across output chunks.
     chunk(stream: string, chunk: string): string {
@@ -264,7 +391,7 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       if (held && !/^[A-Za-z0-9+/=]/.test(text.slice(-held))) output += flushToken(state);
       if (state.context || state.token || state.marker || state.suppressed) materialStreams.set(stream, state);
       else materialStreams.delete(stream);
-      return redactRegisteredSecretValues(output, values);
+      return outputChunk(stream, redactRegisteredSecretValues(output, values));
     },
     /** True while `chunk` still holds text of this stream for its next piece. */
     holds(stream: string): boolean { return hasPending(stream); },
@@ -277,7 +404,8 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       // Both buffers are bounded: at most an exact-value prefix, 39 body chars,
       // and a private-key marker prefix. Never flush interrupted key material.
       const tail = state ? scanMaterial("", state, true) : "";
-      return tail + (held ? (held.length < 8 ? held : REDACTED_EVENT_VALUE) : "");
+      const settled = tail + (held ? (held.length < 8 ? held : REDACTED_EVENT_VALUE) : "");
+      return (settled ? outputChunk(stream, settled) : "") + outputFinish(stream);
     },
     /** Delta payloads can repeat output under text and provider-specific fields. */
     delta<T>(stream: string, value: T, itemId?: string): T {
@@ -288,7 +416,7 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       stream = JSON.stringify([stream, payload.itemId, payload.providerItemId, payload.channel, payload.stream]);
       const visit = (entry: unknown, path: string, field: string): unknown => {
         if (typeof entry === "string") {
-          if (!/^(text|delta|output|patch)$/.test(field)) return redactor.redact(entry);
+          if (!/^(text|delta|output|patch)$/.test(field)) return redactor.redact(entry, field || undefined);
           const key = `${stream}:${path}`;
           const output = redactor.chunk(key, entry);
           if (hasPending(key)) paths.push(key);
@@ -306,7 +434,7 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       }
       if (paths.length) deltaStreams.set(stream, { scope, itemId, paths,
         payload: Object.fromEntries(["itemId", "providerItemId", "kind", "channel", "stream"]
-          .filter(key => typeof payload[key] === "string").map(key => [key, redactor.redact(payload[key])])),
+          .filter(key => typeof payload[key] === "string").map(key => [key, redactor.redact(payload[key], key)])),
       });
       else deltaStreams.delete(stream);
       return result;
@@ -331,5 +459,6 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       ] } : payload;
     },
   };
+  redactor.addSecretValues(secrets);
   return redactor;
 }

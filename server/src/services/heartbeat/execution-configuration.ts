@@ -1,3 +1,4 @@
+import { supportsPaperclipRunnerPreconfiguredHome } from "../native-runtime/provider-profile.js";
 import { agentHarnessType } from "@paperclipai/shared";
 import { observabilitySecretValues } from "@paperclipai/adapter-utils/agent-observability";
 import { agentObservabilityService, unavailableAgentObservability, type ResolvedAgentObservability } from "../agent-observability.js";
@@ -12,7 +13,7 @@ import { readPaperclipSkillSyncPreference, resolvePaperclipDesiredSkillNames, re
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, extractWakeCommentIds, isNonAssigneeWorkspaceBusyRetry } from "../../modules/run-dispatch/index.js";
-import { addRunSecretMaterial, createAgentIdentityRedactor } from "../agent-identity-redaction.js";
+import { addRunSecretMaterial, createAgentIdentityRedactor, secretEnvironmentValues } from "../agent-identity-redaction.js";
 import { attachLiveRunSecretRedactor } from "../run-secret-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "../agent-identity.js";
 import { readAiConnectionConfigurationFailure, readAiCredentialAccessFailure } from "../ai-connection-configuration-failure.js";
@@ -119,9 +120,14 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   const time = createHeartbeatPreparationTiming(run.id);
   const { issueId, context, responsibleUserId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision, taskProjectContext, routineEnvContext, pinnedSkillTest } = input.task;
   const { selectedEnvironmentId, selectedEnvironmentForConfig, resolvedInstanceSettings, persistedNativeExecutionInput } = input.environment;
+  const useSshHostAuth = selectedEnvironmentForConfig?.driver === "ssh" && selectedEnvironmentForConfig.config.useHostAuth !== false && !persistedNativeExecutionInput;
+  let sshRunnerHomeMode: "isolated" | "preconfigured" | undefined;
+  if (agent.adapterType === "paperclip_runner" && selectedEnvironmentForConfig?.driver === "ssh" && !persistedNativeExecutionInput) {
+    sshRunnerHomeMode = useSshHostAuth && supportsPaperclipRunnerPreconfiguredHome(agent.adapterConfig, { companyId: agent.companyId }) ? "preconfigured" : "isolated";
+  }
   const sourceWorkspaceConfig = agent.adapterType === "paperclip_runner"
     ? { ...input.config.sourceWorkspaceConfig,
-        homeMode: bindHeartbeatRunnerHomeMode(parseObject(agent.adapterConfig), persistedNativeExecutionInput).homeMode }
+        homeMode: bindHeartbeatRunnerHomeMode({ ...parseObject(agent.adapterConfig), ...(sshRunnerHomeMode ? { homeMode: sshRunnerHomeMode } : {}) }, persistedNativeExecutionInput).homeMode }
     : input.config.sourceWorkspaceConfig;
   const preconfiguredHome = agent.adapterType === "paperclip_runner" && sourceWorkspaceConfig.homeMode === "preconfigured";
   if (preconfiguredHome && pinnedSkillTest) {
@@ -162,7 +168,12 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   // The executor keeps these values in its failure redactor before any later
   // preparation step can fail. Subsequent provider/identity values extend it.
   onFailureSecretsResolved(() => []);
-  const aiBinding = preconfiguredHome ? undefined : input.config.aiBinding;
+  const aiBinding = preconfiguredHome || useSshHostAuth ? undefined : input.config.aiBinding;
+  if (selectedEnvironmentForConfig?.driver === "ssh" && selectedEnvironmentForConfig.config.useHostAuth === false && !aiBinding && !persistedNativeExecutionInput) {
+    throw new ConfigurationIncompleteFailure("Select an AI account for this agent or enable authentication configured on the remote machine in the SSH environment's advanced settings.", {
+      configurationIncomplete: { reason: "ssh_ai_connection_required", actionUrl: `/agents/${agent.id}/runtime` },
+    });
+  }
   const { trustPreset } = input.policy;
   const { secretsSvc, companySkills, appendRunEvent, finalizeAiConnectionBusyDeferral } = input.services;
   let managedAiRuntime: ManagedAiRuntime | undefined;
@@ -230,6 +241,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   const resolvedEnv = parseObject(resolvedConfig.env);
   addRunSecretMaterial(identityRedactor, [...secretKeys].flatMap(key =>
     typeof resolvedEnv[key] === "string" && resolvedEnv[key] ? [resolvedEnv[key] as string] : []), runIdentifiers);
+  identityRedactor.addSecretValues(secretEnvironmentValues(resolvedConfig.env, secretKeys));
   if (useAgentGitHubEnv && !["GH_TOKEN", "GITHUB_TOKEN"].some(key => {
     const value = parseObject(resolvedConfig.env)[key];
     return typeof value === "string" && value.trim().length > 0;

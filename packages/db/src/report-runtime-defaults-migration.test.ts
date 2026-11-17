@@ -18,7 +18,7 @@ const permissionKey = "agents:configure-reports-runtime";
       await sql`INSERT INTO agents (id, company_id, name) VALUES (${id}, ${company!.id}, 'Standard report')`;
       await sql`INSERT INTO company_memberships (company_id, principal_type, principal_id, status, membership_role)
         VALUES (${company!.id}, 'agent', ${id}, 'active', 'member')`;
-      const content = await readFile(new URL("./migrations/0488_report_runtime_defaults.sql", import.meta.url), "utf8");
+      const content = await readFile(new URL("./migrations/0490_report_runtime_defaults.sql", import.meta.url), "utf8");
       const hash = createHash("sha256").update(content).digest("hex");
       await sql`DELETE FROM drizzle.__drizzle_migrations WHERE hash = ${hash}`;
       await applyPendingMigrations(database.connectionString);
@@ -82,7 +82,7 @@ const permissionKey = "agents:configure-reports-runtime";
       await sql`INSERT INTO principal_permission_grants (company_id, principal_type, principal_id, permission_key, scope)
         VALUES (${company!.id}, 'agent', ${ids.get("Scoped configure")!}, 'agents:configure', ${sql.json(scope)}),
         (${company!.id}, 'agent', ${ids.get("Scoped runtime")!}, ${permissionKey}, ${sql.json(scope)})`;
-      const content = await readFile(new URL("./migrations/0488_report_runtime_defaults.sql", import.meta.url), "utf8");
+      const content = await readFile(new URL("./migrations/0490_report_runtime_defaults.sql", import.meta.url), "utf8");
       const hash = createHash("sha256").update(content).digest("hex");
       await sql`DELETE FROM drizzle.__drizzle_migrations WHERE hash = ${hash}`;
       await applyPendingMigrations(database.connectionString);

@@ -23,6 +23,7 @@ function withoutSqlRunError<T>(value: T): T {
 }
 
 const REGISTRY_KEY = "paperclipSecretRedactions";
+const OUTPUT_SECRET_KEY = "paperclipOutputSecretRedactions";
 // Project only the registry: run contexts can contain megabytes of prompt data.
 const registrySnapshot = sql`jsonb_build_object('paperclipSecretRedactions', ${heartbeatRuns.contextSnapshot} -> 'paperclipSecretRedactions')`;
 // Read identity scalars alongside the registry, never the full prompt snapshot.
@@ -46,6 +47,10 @@ function indexedRunSecretValues(values: Iterable<string>, identifiers: Iterable<
   return index.values;
 }
 
+export function runSecretRedactionVersionSql() {
+  return sql<string>`md5(coalesce((${heartbeatRuns.contextSnapshot}->${REGISTRY_KEY})::text, ''))`;
+}
+
 type RegistryEntry = {
   fingerprintSha256: string;
   material: StoredSecretVersionMaterial;
@@ -57,9 +62,9 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function registryEntries(contextSnapshot: unknown): RegistryEntry[] {
+function registryEntries(contextSnapshot: unknown, key = REGISTRY_KEY): RegistryEntry[] {
   const context = asRecord(contextSnapshot);
-  const raw = context?.[REGISTRY_KEY];
+  const raw = context?.[key];
   if (!Array.isArray(raw)) return [];
   return raw.flatMap((value) => {
     const entry = asRecord(value);
@@ -94,7 +99,7 @@ export function redactRegisteredSecretValues<T>(input: T, values: string[], cred
   if (!record) return input;
   return Object.fromEntries(
     Object.entries(record)
-      .filter(([key]) => key !== REGISTRY_KEY && key !== "nativeControllerRecovery" && key !== "nativeTaskSessionPublication" && key !== "legacyProcessSettlement")
+      .filter(([key]) => key !== REGISTRY_KEY && key !== OUTPUT_SECRET_KEY && key !== "nativeControllerRecovery" && key !== "nativeTaskSessionPublication" && key !== "legacyProcessSettlement")
       .map(([key, value]) => [key, key === "credentialAccess"
         ? (credentialConnectionName ? { connectionName: redactText(credentialConnectionName, values) } : {})
         : redactRegisteredSecretValues(value, values, credentialConnectionName)]),
@@ -144,6 +149,60 @@ function addLiveRunSecretValue(companyId: string, runId: string, value: string) 
   }
 }
 
+async function registerEncryptedValues(db: Db, key: string, companyId: string, runId: string, values: readonly string[]) {
+  const provider = getSecretProvider("local_encrypted");
+  const fingerprints = new Map(values.filter(Boolean).map((value) =>
+    [createHash("sha256").update(value).digest("hex"), value] as const));
+  if (fingerprints.size === 0) return;
+  await db.transaction(async (tx) => {
+    const row = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (!row) throw new Error("Heartbeat run redaction registration failed");
+    const registered = new Set(registryEntries(row.contextSnapshot, key).map((entry) => entry.fingerprintSha256));
+    const added: RegistryEntry[] = [];
+    for (const [fingerprintSha256, value] of fingerprints) {
+      if (registered.has(fingerprintSha256)) continue;
+      const prepared = await provider.createSecret({ value });
+      added.push({ fingerprintSha256, material: prepared.material });
+    }
+    if (added.length === 0) return;
+    const contextSnapshot = asRecord(row.contextSnapshot) ?? {};
+    const currentEntries = Array.isArray(contextSnapshot[key])
+      ? contextSnapshot[key]
+      : [];
+    await tx.update(heartbeatRuns)
+      .set({
+        contextSnapshot: { ...contextSnapshot, [key]: [...currentEntries, ...added] },
+        updatedAt: new Date(),
+      })
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+  });
+}
+
+export function withRunRedactionHistory<T extends Record<string, unknown>>(next: T, current: unknown): T {
+  const locked = asRecord(current) ?? {};
+  const preserved = [REGISTRY_KEY, OUTPUT_SECRET_KEY].filter((key) => Array.isArray(locked[key]));
+  return preserved.length === 0 ? next : { ...next, ...Object.fromEntries(preserved.map((key) => [key, locked[key]])) };
+}
+
+export function createRunOutputSecretStore(db: Db) {
+  const provider = getSecretProvider("local_encrypted");
+  const snapshot = sql`jsonb_build_object('paperclipOutputSecretRedactions', ${heartbeatRuns.contextSnapshot} -> 'paperclipOutputSecretRedactions')`;
+  return {
+    registerAll: (companyId: string, runId: string, values: readonly string[]) =>
+      registerEncryptedValues(db, OUTPUT_SECRET_KEY, companyId, runId, values),
+    valuesForRun: async (companyId: string, runId: string) => {
+      const rows = await db.select({ contextSnapshot: snapshot }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+      return Promise.all(rows.flatMap((row) => registryEntries(row.contextSnapshot, OUTPUT_SECRET_KEY))
+        .map((entry) => provider.resolveVersion({ material: entry.material, externalRef: null })));
+    },
+  };
+}
+
 export function createRunSecretRedactionRegistry(db: Db) {
   const provider = getSecretProvider("local_encrypted");
 
@@ -191,30 +250,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
       // The run's live output redactors mask the value from now on, before the
       // caller can hand it to the agent.
       addLiveRunSecretValue(companyId, runId, value);
-      const fingerprintSha256 = createHash("sha256").update(value).digest("hex");
-      await db.transaction(async (tx) => {
-        const row = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
-          .from(heartbeatRuns)
-          .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)))
-          .for("update")
-          .then((rows) => rows[0] ?? null);
-        if (!row) throw new Error("Heartbeat run redaction registration failed");
-        if (registryEntries(row.contextSnapshot).some((entry) => entry.fingerprintSha256 === fingerprintSha256)) {
-          return;
-        }
-        const prepared = await provider.createSecret({ value });
-        const entry: RegistryEntry = { fingerprintSha256, material: prepared.material };
-        const contextSnapshot = asRecord(row.contextSnapshot) ?? {};
-        const currentEntries = Array.isArray(contextSnapshot[REGISTRY_KEY])
-          ? contextSnapshot[REGISTRY_KEY]
-          : [];
-        await tx.update(heartbeatRuns)
-          .set({
-            contextSnapshot: { ...contextSnapshot, [REGISTRY_KEY]: [...currentEntries, entry] },
-            updatedAt: new Date(),
-          })
-          .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
-      });
+      await registerEncryptedValues(db, REGISTRY_KEY, companyId, runId, [value]);
     },
     redactForRuns: async <T extends { id: string }>(companyId: string, runs: T[], viewerUserId: string | null = null): Promise<T[]> => {
       if (runs.length === 0) return [];

@@ -10,6 +10,7 @@ import type {
   NativeSessionBackend,
   NativeSessionBackendDescriptor,
   NativeSessionRecoveryOptions,
+  NativeSessionSnapshotOptions,
   OpenNativeSessionInput,
   PersistedNativeSession,
 } from "../contracts/native-session-backend.js";
@@ -153,6 +154,7 @@ export class HarnessDriverBackend implements NativeSessionBackend {
       pendingRuntimeRequests: snapshot.pendingRuntimeRequests ?? [],
       goal: snapshot.goal ?? null,
       lineage: snapshot.lineage ?? [],
+      ...(snapshot.awaitingProviderTurn === true ? { awaitingProviderTurn: true } : {}),
     };
     const recoveryOptions: HarnessSessionRecoveryOptions = {
       signal: options.signal,
@@ -422,10 +424,11 @@ class HarnessNativeSession implements NativeSession {
     throw this.#protocolIntegrityFailure;
   }
 
-  async #harnessSnapshot(): Promise<PersistedHarnessSession> {
+  async #harnessSnapshot(sourceSeq?: number): Promise<PersistedHarnessSession> {
     this.#assertProtocolIntegrity();
     try {
-      const snapshot = await this.#session.snapshot();
+      const boundary = sourceSeq === undefined ? null : this.#session.boundarySnapshot?.(sourceSeq) ?? null;
+      const snapshot = boundary ?? await this.#session.snapshot();
       this.#assertProtocolIntegrity();
       return snapshot;
     } catch (error) {
@@ -635,7 +638,7 @@ class HarnessNativeSession implements NativeSession {
           const disposition =
             snapshot.semanticResult?.result.reportedWorkDisposition ??
             "yielded";
-          this.#terminal = {
+          if (event.payload.awaitingProviderTurn !== true) this.#terminal = {
             schema: "paperclip.prp.terminal.v1",
             turnTerminalState:
               event.eventType === "turn.completed"
@@ -876,9 +879,9 @@ class HarnessNativeSession implements NativeSession {
     };
   }
 
-  async snapshot(): Promise<PersistedNativeSession> {
+  async snapshot(options?: NativeSessionSnapshotOptions): Promise<PersistedNativeSession> {
     this.#assertProtocolIntegrity();
-    const snapshot = await this.#harnessSnapshot();
+    const snapshot = await this.#harnessSnapshot(options?.sourceSeq);
     return {
       backendKind: "runner",
       driverKind: snapshot.driverKind,
@@ -921,6 +924,7 @@ class HarnessNativeSession implements NativeSession {
       pendingRuntimeRequests: snapshot.pendingRuntimeRequests ?? [],
       goal: snapshot.goal ?? null,
       lineage: snapshot.lineage ?? [],
+      ...(snapshot.awaitingProviderTurn === true ? { awaitingProviderTurn: true } : {}),
     };
   }
 

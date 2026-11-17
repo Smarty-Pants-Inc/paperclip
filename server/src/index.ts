@@ -1,9 +1,11 @@
+import { tailscaleNetworks } from "./services/connectors/tailscale/network.js";
 import type { IdleDeadlineOwners } from "./services/idle-deadline-types.js";
 import { drainAgentFileCheckpoints, pendingAgentFileCheckpointCount } from "./services/agent-directory-working-copies.js";
 import { closeProcessRunAdmission, isProcessRunAdmissionClosed } from "./services/heartbeat/run-admission.js";
 import { registerReattachPhaseWork } from "./services/heartbeat/reattach-phase.js";
 import { createRunStartHandover, registerRunStartHandover } from "./services/run-start-handover.js";
 import { registerOwnershipReconciliationWork } from "./services/native-runtime/native-finalization-reconciler.js";
+import { registerPersonCommentWaitWork } from "./services/native-runtime/native-provider-turn-wait.js";
 import { bindIdleDeadlineOwner } from "./services/idle-deadline-owner.js";
 import { readIdleRetrySchedule } from "./services/heartbeat/idle-retry-schedule.js";
 import { readIdleQuotaSchedule } from "./services/heartbeat/idle-quota-schedule.js";
@@ -132,6 +134,7 @@ import {
   closeLivenessDb,
   closeCheckpointDb,
   closeFileStorageDb,
+  closeDedicatedDbConnections,
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
@@ -763,7 +766,7 @@ async function startServerWithDatabaseTeardown(
   const closeDatabaseClients = async () => {
     setSentryRunLinkResolver(null);
     const clients = pluginMigrationDb === db ? [db] : [db, pluginMigrationDb];
-    await Promise.all([...clients.map((client) => endDatabaseClient(client, 5)), closeLivenessDb(db, 5), closeCheckpointDb(db, 5), closeFileStorageDb(db, 5)]);
+    await Promise.all([...clients.map((client) => endDatabaseClient(client, 5)), closeLivenessDb(db, 5), closeCheckpointDb(db, 5), closeFileStorageDb(db, 5), closeDedicatedDbConnections(db, 5)]);
   };
   startupDatabase.close = closeDatabaseClients;
   startupTimeline.mark("database");
@@ -1511,6 +1514,8 @@ async function startServerWithDatabaseTeardown(
   server.on("close", () => { void budgetEnforcementWorker.stop(); });
   const accountingWorker = registerCostAccountingWork(db, deliveryWork, accountingHeartbeat.reconcileCostAccounting);
   server.on("close", accountingWorker.stop);
+  const personCommentWaitWorker = registerPersonCommentWaitWork(db, deliveryWork);
+  server.on("close", personCommentWaitWorker.stop);
   skillSourceSync.start(deliveryWork);
   idleDeadlineOwners.skills = bindIdleDeadlineOwner(skillSourceSync.reconciliationSnapshot, readIdleSkillSourceSchedule,
     () => ({ coverage: { kind: "skill_sources" } }));
@@ -1636,7 +1641,7 @@ async function startServerWithDatabaseTeardown(
       () => !isIdleTaskDrainActive() && !heartbeatSchedulerStopped && !isWarmStandby()).ready)
     .catch((err: unknown) => logger.error({ err }, "startup provider task recovery failed"))));
   trackHeartbeatSchedulerWork(startupTimeline.background("delivery_workers", () => timeStartupRecovery("delivery_workers",
-    () => Promise.all([budgetEnforcementWorker, accountingWorker, fastResponseWorker, ...deliveryWorkers].map(worker => worker.ready)))));
+    () => Promise.all([budgetEnforcementWorker, accountingWorker, personCommentWaitWorker, fastResponseWorker, ...deliveryWorkers].map(worker => worker.ready)))));
   trackHeartbeatSchedulerWork(startupTimeline.background("github_connections",
     () => Promise.all([githubEventWorker.ready, githubContinuityWorker.ready])));
 
@@ -2423,7 +2428,7 @@ async function startServerWithDatabaseTeardown(
         try { await appShutdown?.(); } finally {
           await runStartHandover?.stop().catch(() => {});
           registerRunStartHandover(null);
-          await stopControllerInstanceLease();
+          try { await tailscaleNetworks.close(); } finally { await stopControllerInstanceLease(); }
         }
       },
       closeHttpListener: () =>

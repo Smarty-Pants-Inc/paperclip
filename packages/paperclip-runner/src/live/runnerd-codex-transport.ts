@@ -3,6 +3,7 @@ import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../drivers/pi/pi-thinking-catal
 import { admitPiProbeSession, probePiNativeEnvironment, PiEnvironmentProbeCleanupError, PI_PROBE_CLEANUP_BUDGET_MS } from "../drivers/pi/pi-environment-probe.js";
 import { resolvePiNativeConfig } from "../drivers/pi/pi-native-config.js";
 import { parsePiRpcProfile, parsePiThinkingLevel, QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
+import { providerTurnStartBefore, providerTurnToolCallSourceSeq } from "./provider-turn-tool-order.js";
 import type { RunnerAttachmentDownloadGrant } from "../contracts/harness-driver.js";
 import { readProviderFailure } from "../contracts/provider-failure.generated.js";
 import { confirmAntigravityProbeNativeRetirement } from "../drivers/acpx/antigravity-probe-retirement.js";
@@ -108,14 +109,13 @@ import type {
   NativeAcpxPermissionMode,
   NativeOpenCodePermissionMode,
 } from "../contracts/native-execution.js";
-import { nativeMcpLaunchBinding } from "../drivers/native-mcp.js";
 import {
   prepareIsolatedCodexHome,
   prepareIsolatedCodexRecoveryHome,
   releaseMaterializedNativeRuntimeSkills,
 } from "../drivers/runtime-context-materializer.js";
 import { resolvePackagedRunnerBinary, resolvePackagedRunnerBinaryAsync } from "./runner-binary.js";
-import { RUNNERD_CANONICAL_ITEM, RUNNERD_RUNTIME_ACTIVITY } from "../drivers/codex/codex-driver-values.js";
+import { RUNNERD_CANONICAL_ITEM, RUNNERD_RUN_TERMINAL, RUNNERD_RUNTIME_ACTIVITY } from "../drivers/codex/codex-driver-values.js";
 import { crashPoint } from "../crash-point.js";
 import { isTerminalOperation, settleEarlierToolCalls, staleTerminalCallResult } from "./terminal-call-freshness.js";
 
@@ -985,7 +985,34 @@ function turnStartResponseReady(input: {
 type RunnerdRecoveredTurnTerminal = {
   status: "completed" | "failed" | "interrupted" | "cancelled";
   error: unknown;
+  awaitingProviderTurn?: true;
 };
+
+function awaitingProviderTurnMarker(eventType: string, payload: Record<string, unknown>): { awaitingProviderTurn?: true } {
+  return eventType === "turn.completed" && payload.awaitingProviderTurn === true ? { awaitingProviderTurn: true } : {};
+}
+
+function runnerdPriorTurnTerminals(
+  events: readonly Pick<DurableRecoveryCommittedEvent, "eventType" | "envelope">[],
+  runId: string | undefined,
+  boundTurnId: string,
+): Map<string, Record<string, unknown>> {
+  const priorTerminals = new Map<string, Record<string, unknown>>();
+  for (const event of events) {
+    if (event.envelope.runId !== runId ||
+        !["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"].includes(event.eventType)) continue;
+    const payload = record(record(event.envelope.payload).payload);
+    const turnId = payload.providerTurnId ?? payload.turnId ?? record(payload.turn).id;
+    if (typeof turnId !== "string" || !turnId || turnId === boundTurnId) continue;
+    priorTerminals.set(turnId, {
+      id: turnId,
+      status: event.eventType.slice("turn.".length),
+      error: payload.error ?? record(payload.turn).error ?? null,
+      ...awaitingProviderTurnMarker(event.eventType, payload),
+    });
+  }
+  return priorTerminals;
+}
 
 const RUNNERD_TURN_TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled"]);
 
@@ -1015,7 +1042,8 @@ function runnerdRecoveredTurnTerminal(
       // Reconciliation must retain the cause, including the runner's explicit
       // process-loss marker, rather than inventing error:null.
       terminal = { status: event.eventType.slice("turn.".length) as RunnerdRecoveredTurnTerminal["status"],
-        error: payload.error ?? record(payload.turn).error ?? null };
+        error: payload.error ?? record(payload.turn).error ?? null,
+        ...awaitingProviderTurnMarker(event.eventType, payload) };
       reconciledEndedTurn = false;
     } else if (event.eventType === "run.terminal" && reconciledEndedTurn) {
       const status = String(payload.turnTerminalState);
@@ -1779,6 +1807,7 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   recoveryLaunch?: { requirements: RunnerProviderLaunchRequirements };
   opencodePermissionMode?: NativeOpenCodePermissionMode;
   acpxAgent?: QualifiedAcpxAgent;
+  providerStartedTurns?: boolean;
   /** Explicit evaluation-only candidate selection, never derived from persisted session input. */
   acpxCandidateProfile?: "pi" | "cursor" | "copilot" | "kimi";
   /** Server/operator authority; never derived from persisted agent or provider input. */
@@ -4031,16 +4060,10 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     const providerPackageAuthority = acpxProviderPackageAuthority(
       sidecarPath, packageRoot, input.options.acpxAgent,
     );
-    // This is the trusted runner/sidecar boundary. The provider sandbox still
-    // uses createSanitizedAcpxSpawnInput and does not inherit gateway tokens.
-    const assignedGateway = nativeMcpLaunchBinding(input.options.environment ?? {});
     const credentialBinding = createAcpxCredentialBinding(
       input.options.environment, input.options.acpxAgent ?? "codex", input.identity.normalizedSessionId,
     );
     return {
-      ...(assignedGateway ? {
-        PAPERCLIP_NATIVE_MCP_TOKEN: assignedGateway.token,
-      } : {}),
       ...createSanitizedAcpxSpawnInput(
         input.options.environment,
         input.options.acpxAgent ?? "codex",
@@ -4139,9 +4162,6 @@ const OPEN_CODE_RUNNER_ENVIRONMENT_KEYS = new Set([
   "WINDIR",
   "RUST_BACKTRACE",
   "OPENROUTER_API_KEY",
-  "PAPERCLIP_NATIVE_MCP_NAME",
-  "PAPERCLIP_NATIVE_MCP_URL",
-  "PAPERCLIP_NATIVE_MCP_TOKEN",
 ]);
 
 function createSanitizedOpenCodeRunnerEnvironment(
@@ -4362,6 +4382,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   } | null = null;
   #checkpointProviderIdentityConfirmed = false;
   #turnId = "";
+  readonly #deliveredProviderTurnStarts = new Set<string>();
   #turnStartResponsePending = false;
   #turnStartResponseSettled: Promise<void> = Promise.resolve();
   #turnStartResponseEpoch = 0;
@@ -4552,6 +4573,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     void this.#failureSignal.catch(() => undefined);
     this.#ownsRoot = options.stateDirectory === undefined;
     this.#turnId = options.resumeActiveTurnId ?? "";
+    if (options.resumeActiveTurnId) this.#deliveredProviderTurnStarts.add(options.resumeActiveTurnId);
     this.#root =
       options.stateDirectory ??
       mkdtempSync(resolve(tmpdir(), "paperclip-runner-lab-prp-"));
@@ -4852,19 +4874,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // Keep its prior terminal as the history anchor, so driver recovery can
       // adopt the later accepted turn instead of submitting it again. Items
       // remain lazy and fail closed if their start left the retained window.
-      const priorTerminals = new Map<string, Record<string, unknown>>();
-      for (const event of this.#core?.store.state.committedEvents ?? []) {
-        if (event.envelope.runId !== this.#core?.store.state.identity.runId ||
-            !["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"].includes(event.eventType)) continue;
-        const payload = record(record(event.envelope.payload).payload);
-        const turnId = payload.providerTurnId ?? payload.turnId ?? record(payload.turn).id;
-        if (typeof turnId !== "string" || !turnId || turnId === this.#turnId) continue;
-        priorTerminals.set(turnId, {
-          id: turnId,
-          status: event.eventType.slice("turn.".length),
-          error: payload.error ?? record(payload.turn).error ?? null,
-        });
-      }
+      const priorTerminals = runnerdPriorTurnTerminals(
+        this.#core?.store.state.committedEvents ?? [], this.#core?.store.state.identity.runId, this.#turnId);
       recoveredTurns.unshift(...priorTerminals.values());
       this.#recoveryTurnBindingPending = false;
       this.#pumpEvents();
@@ -6578,7 +6589,6 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         apiKey:
           this.options.environment?.CODEX_API_KEY ??
           this.options.environment?.OPENAI_API_KEY,
-        nativeMcp: nativeMcpLaunchBinding(this.options.environment),
       });
     }
     this.#assertStartupOpen();
@@ -7860,7 +7870,6 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         await prepareIsolatedCodexRecoveryHome({
           ...auth,
           observability: this.options.observability,
-          nativeMcp: nativeMcpLaunchBinding(this.options.environment),
         });
       } else {
         await releaseMaterializedNativeRuntimeSkills(resolve(localCodexHome, "skills"));
@@ -7869,7 +7878,6 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ...auth,
           context: sourceRuntimeContext,
           observability: this.options.observability,
-          nativeMcp: nativeMcpLaunchBinding(this.options.environment),
         });
       }
     }
@@ -8190,6 +8198,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#closedSignal.then(() => { throw new SemanticToolNotDispatchedError(); }),
       ]).catch(() => { throw new SemanticToolNotDispatchedError(); });
     }
+    if (this.#providerStartedTurns()) {
+      const providerTurnCallSeq = providerTurnToolCallSourceSeq(core?.store.state.committedEvents ?? [], call.sourceEventId);
+      if (providerTurnCallSeq !== null) await this.#deliverNotificationsBefore(providerTurnCallSeq);
+    }
     try {
       this.#throwIfFailed();
     } catch {
@@ -8254,6 +8266,36 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         (call.operationId === "paperclip_finish" || call.operationId === "paperclip_block"),
     );
     return this.#bindSemanticToolOutcome(call, outcome);
+  }
+
+  #providerStartedTurns() {
+    return this.options.providerStartedTurns === true && this.options.provider === "acpx" && this.options.acpxAgent === "claude";
+  }
+
+  async #deliverNotificationsBefore(sourceSeq: number) {
+    while (this.#eventSourceSeq < sourceSeq - 1 || this.#deferredTurnStartEvents.some(event => event.sourceSeq < sourceSeq)) {
+      if (this.#closed || this.#failure) throw new SemanticToolNotDispatchedError();
+      this.#pumpEvents();
+      await new Promise<void>(resolveWait => setTimeout(resolveWait, 10));
+    }
+    this.#deliverProviderTurnStart(this.#core?.store.state.committedEvents ?? [], sourceSeq);
+    let delivered!: () => void;
+    const barrier = new Promise<void>(resolveBarrier => { delivered = resolveBarrier; });
+    this.#queue.pushControl({ id: `provider-turn-order:${sourceSeq}`, method: "paperclip/providerTurnOrder", params: {} }, () => delivered());
+    await Promise.race([
+      barrier,
+      this.#failureSignal,
+      this.#closedSignal.then(() => { throw new SemanticToolNotDispatchedError(); }),
+    ]).catch(() => { throw new SemanticToolNotDispatchedError(); });
+  }
+
+  #deliverProviderTurnStart(events: readonly DurableRecoveryCommittedEvent[], sourceSeq: number) {
+    const start = providerTurnStartBefore(events, sourceSeq);
+    if (start === null) return;
+    this.#turnId = start.turnId;
+    if (this.#deliveredProviderTurnStarts.has(start.turnId)) return;
+    this.#deliveredProviderTurnStarts.add(start.turnId);
+    this.#queue.push({ method: "turn/started", params: rehydrateRunnerdTurnNotification(start.payload, this.#threadId, start.turnId, "turn/started") });
   }
 
   #bindSemanticToolOutcome(call: { operationId: string; callId: string }, outcome: { result: unknown; isError?: boolean }) {
@@ -8425,6 +8467,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ...((this.options.provider ?? "codex") === "codex" && params.effort !== undefined ? { effort: params.effort } : {}),
           ...(reasoningMode === undefined ? {} : { reasoningMode }),
           ...(skills.length ? { skills } : {}),
+          ...(!compactionTurn && this.#providerStartedTurns() ? { providerStartedTurns: true } : {}),
           turnId: pendingTurnId,
         },
         commandDeadline,
@@ -8921,6 +8964,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#applyProviderIdentityEvent(event);
         continue;
       }
+      if (this.#providerStartedTurns() && event.eventType !== "turn.started") this.#deliverProviderTurnStart(events, event.sourceSeq);
       if (event.eventType === "session.capabilities.updated" && this.options.provider === "acpx") {
         const capabilities = record(record(event.envelope.payload).payload);
         if (capabilities.turnControls !== undefined) {
@@ -9028,6 +9072,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           } } : {}),
         });
         continue;
+      }
+      if (event.eventType === "run.terminal" && this.#providerStartedTurns()) {
+        this.#queue.push({ method: "paperclip/runTerminal", params: { [RUNNERD_RUN_TERMINAL]: true, threadId: this.#threadId } });
       }
       const sessionUpdatePayload = record(eventPayload);
       const canonicalMethod = runnerdCanonicalNotificationMethod(
@@ -9152,6 +9199,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           }
           if (typeof providerTurnId === "string" && providerTurnId.length > 0) {
             this.#turnId = providerTurnId;
+            this.#deliveredProviderTurnStarts.add(providerTurnId);
             if (this.#turnStartResponsePending) {
               this.#observedTurnStartEpoch = this.#turnStartResponseEpoch;
             }
@@ -10094,6 +10142,7 @@ export async function probeNativeRunnerEnvironment(options: {
   const environment = { ...options.environment };
   const remoteFilesystemRoot = options.transportOptions?.runnerFilesystemRoot;
   const ownsPreparation = options.transportOptions?.prepareLaunch !== undefined;
+  const preconfiguredHome = options.transportOptions?.homeMode === "preconfigured";
   if (options.workingDirectory !== undefined && !remoteFilesystemRoot && !ownsPreparation) throw new Error("Native setup remote working directory requires a remote runner filesystem.");
   const workingDirectory = options.workingDirectory ?? resolve(options.runtimeDirectory, "workspace");
   if (!remoteFilesystemRoot && !ownsPreparation) mkdirSync(workingDirectory, { mode: 0o700 });
@@ -10115,9 +10164,9 @@ export async function probeNativeRunnerEnvironment(options: {
   };
   let registrationCleanupConfirmed = true;
   const cleanupBudget = probeCleanupBudget(options.cleanupTimeoutMs);
-  const sourceCodexHome = ownsPreparation ? undefined : options.transportOptions?.sourceCodexHome ?? resolveSourceCodexHome(environment);
+  const sourceCodexHome = ownsPreparation || preconfiguredHome ? undefined : options.transportOptions?.sourceCodexHome ?? resolveSourceCodexHome(environment);
   delete environment.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX;
-  if (!ownsPreparation) {
+  if (!ownsPreparation && !preconfiguredHome) {
     environment.HOME = resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "probe-home");
     environment.CODEX_HOME = resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "codex-home");
   }
@@ -10433,6 +10482,7 @@ export const runnerdRecoveryInternals = Object.freeze({
   localRunnerStateArchive,
   rotateAuthorityEpoch,
   rotateLocalPiOpenAuthority,
+  runnerdPriorTurnTerminals,
   runnerdRecoveredTurnTerminal,
   runnerdTerminalProviderTurnId,
   terminalMayBelongToPendingTurnStart,

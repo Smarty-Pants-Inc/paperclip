@@ -80,7 +80,7 @@ export async function preparePluginWorkspace(
     mode: string;
     strategy: string;
     selectedProviderPluginId?: string | null;
-    environment?: Pick<import("@paperclipai/shared").Environment, "driver" | "config" | "name"> | null;
+    environment?: Pick<import("@paperclipai/shared").Environment, "id" | "driver" | "config" | "name"> | null;
     branchMode?: "create" | "existing";
     branchName?: string | null;
     baseRef?: string | null;
@@ -134,7 +134,8 @@ export async function preparePluginWorkspace(
           ),
         )
     : [];
-  if (prior && prior.providerType !== "plugin" && !priorBinding && !prior.metadata?.workspaceProviderOwner) return null;
+  // A fresh attempt starts from the project source, so storage the provider does not own does not decide it.
+  if (!input.fresh && prior && prior.providerType !== "plugin" && !priorBinding && !prior.metadata?.workspaceProviderOwner) return null;
   const owner = priorBinding?.pluginId ?? prior?.metadata?.workspaceProviderOwner ??
     (!existing && input.selectedProviderPluginId !== undefined ? input.selectedProviderPluginId :
       !existing && project ? (await effectiveProjectWorkspacePolicy(db, input.companyId, project.executionWorkspacePolicy, false))?.storageProviderPluginId : null);
@@ -404,6 +405,7 @@ export async function preparePluginWorkspace(
       runId: input.runId,
       agentId: input.agentId,
       taskLease,
+      environment: input.environment,
       assertOwned: replacement?.assertOwned ?? input.assertOwned,
       operation: {
         kind: "prepare",

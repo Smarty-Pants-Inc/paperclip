@@ -1,4 +1,5 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { notifyTerminalWorkspaceWork } from "../terminal-workspace-work.js";
 import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
 import { isContextCompactionRun } from "../context-compaction.js";
@@ -61,6 +62,7 @@ import {
   isConversationAdapter,
 } from "../conversation-continuation.js";
 import { terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
+import { retryTransientLockContention } from "../transient-lock-contention.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
 import { randomUUID } from "node:crypto";
@@ -290,6 +292,9 @@ const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
   WORKSPACE_VALIDATION_FAILURE_CODE,
   ...NON_RETRYABLE_PREFLIGHT_FAILURE_CODES,
 ]);
+
+/** Each attempt waits at most the 1s task-row lock_timeout, so a Stop stays prompt. */
+const LEGACY_TERMINALIZATION_LOCK_ATTEMPTS = 3;
 
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
 
@@ -1153,6 +1158,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       if (previous && isHeartbeatRunTerminalStatus(status))
         await notifyRetainedNativeSessionCleanup(tx, { companyId: previous.companyId, runId: previous.id });
       if (isHeartbeatRunTerminalStatus(status)) await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, companyId);
+      const runIssueId = previous ? previous.nativeIssueId ?? previous.issueId ?? readNonEmptyString(parseObject(previous.contextSnapshot).issueId) : null;
+      if (previous && isHeartbeatRunTerminalStatus(status) && runIssueId) await notifyTerminalWorkspaceWork(tx, `issue:${runIssueId}`);
       await notifyExecutionRunWork(tx, previous ? { companyId: previous.companyId, runId: previous.id,
         issueId: previous.nativeIssueId ?? previous.issueId ?? readNonEmptyString(parseObject(previous.contextSnapshot).issueId) ?? undefined } : undefined);
       if (previous) await notifyChatRunMilestones(tx, { companyId: previous.companyId, runId: previous.id,
@@ -1315,7 +1322,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         },
       };
     }
-    const updated = await writeRunStatus(status, previousStatus, async writer => {
+    const legacyTerminalization = previousStatus?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(status);
+    const write = () => writeRunStatus(status, previousStatus, async writer => {
       if (options?.setupFailure && previousStatus?.runtimeMode === "native" && previousStatus.nativeIssueId) {
         await writer.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
           .where(and(eq(nativeRunFinalizations.runId, runId),
@@ -1328,7 +1336,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
             eq(nativeRunFinalizations.companyId, previousStatus.companyId)))
           .for("update");
       }
-      return previousStatus && previousStatus.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(status)
+      return previousStatus && legacyTerminalization
         ? terminalizeLegacyExecution({
             db: writer,
             run: previousStatus,
@@ -1383,6 +1391,12 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
               throw error;
             });
     });
+    // Legacy terminalization takes the task row under a short lock_timeout so
+    // it never queues behind a slow task writer. Losing that race rolls back
+    // the whole transaction, so a bounded fresh attempt is safe.
+    const updated = legacyTerminalization
+      ? await retryTransientLockContention(write, LEGACY_TERMINALIZATION_LOCK_ATTEMPTS)
+      : await write();
 
     if (updated) {
       publishLiveEvent({
@@ -1588,11 +1602,15 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
   ) {
     if (!wakeupRequestId) return;
     await db.transaction(async tx => {
-      const [current] = await tx.select({ companyId: agentWakeupRequests.companyId, agentId: agentWakeupRequests.agentId, status: agentWakeupRequests.status })
+      const [current] = await tx.select({ companyId: agentWakeupRequests.companyId, agentId: agentWakeupRequests.agentId, status: agentWakeupRequests.status,
+        runId: agentWakeupRequests.runId, issueId: sql<string | null>`${agentWakeupRequests.payload}->>'issueId'` })
         .from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId)).for("update");
       if (!current || current.status === "cancelled") return;
       if (current.status !== (patch?.status ?? status) || patch?.payload !== undefined || patch?.runId !== undefined) {
-        await notifyExternalConversationSettlement(tx, { companyId: current.companyId });
+        const runId = patch?.runId ?? current.runId;
+        const issueId = current.issueId && /^[0-9a-f-]{36}$/i.test(current.issueId) ? current.issueId : undefined;
+        await notifyExternalConversationSettlement(tx, issueId || runId
+          ? { companyId: current.companyId, issueId, runId: runId ?? undefined } : { companyId: current.companyId });
       }
       await notifyStrandedAgentStatus(tx, { companyId: current.companyId, agentId: current.agentId });
       await tx.update(agentWakeupRequests)
@@ -2639,7 +2657,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         .returning()
         .then((rows) => rows[0]);
 
-      await notifyRunDispatch(tx, { companyId: run.companyId });
+      await notifyRunDispatch(tx, { companyId: run.companyId, issueId });
       const queuedRun = await tx
         .insert(heartbeatRuns)
         .values({
