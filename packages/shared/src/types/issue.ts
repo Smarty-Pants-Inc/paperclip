@@ -935,6 +935,8 @@ export interface Issue {
   createdFrom?: IssueCreationSource | null;
   /** Create/update responses only: present when the requested parent was not used as-is. */
   parentAdjusted?: IssueParentAdjustment | null;
+  /** Agent-readable create/update warning when the hierarchy limit changed the requested parent. */
+  parentAdjustmentWarning?: string;
   title: string;
   description: string | null;
   descriptionTruncated?: boolean;

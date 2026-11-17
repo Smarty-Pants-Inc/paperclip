@@ -12,6 +12,7 @@ import type {
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -64,7 +65,8 @@ type TransitionResult = {
 /**
  * Consecutive agent-initiated changes-requested rounds tolerated on one stage
  * before the pending review escalates to the responsible human. Policies can
- * override via `maxReviewRounds`; human decisions always reset the counter.
+ * override via `maxReviewRounds`; operators can set the server default with
+ * `PAPERCLIP_DEFAULT_MAX_REVIEW_ROUNDS`. Human decisions always reset the counter.
  */
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
 
@@ -445,7 +447,9 @@ function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecuti
 
 function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
   const configured = policy?.maxReviewRounds;
-  return typeof configured === "number" && configured > 0 ? configured : DEFAULT_MAX_REVIEW_ROUNDS;
+  return typeof configured === "number" && configured > 0
+    ? configured
+    : readPositiveIntegerEnvironment(process.env, "PAPERCLIP_DEFAULT_MAX_REVIEW_ROUNDS", DEFAULT_MAX_REVIEW_ROUNDS);
 }
 
 /**
