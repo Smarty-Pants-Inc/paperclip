@@ -1191,6 +1191,62 @@ suite("fresh-continuation fallback", () => {
     expect((await others()).map(r => r.id), "a second press and later passes start nothing").toEqual([fresh[0]!.id]);
   }, 120_000);
 
+  // fix12 item 2b (rf-3 22:23Z): the external-bot gate (heartbeat/queue.ts claimQueuedRun
+  // canStartNewExternalBotWork) holds a person's run for an external agent with no ready binding.
+  // The card names it: no failed, no Retry, at +10 min and later.
+  it("fix12 external-bot gate: the card names the hold, never failed + Retry", async () => {
+    const f = await judgeQueued(), heartbeat = heartbeatService(db);
+    await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    const [before] = await db.select().from(agents).where(eq(agents.id, agentId));
+    await db.update(agents).set({ adapterConfig: { provider: "grok_bot", externalBindingId: randomUUID() } }).where(eq(agents.id, agentId));
+    try {
+      await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+      const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      expect(row, "the dispatcher's external-bot gate keeps it queued").toMatchObject({ status: "queued", startedAt: null });
+      vi.useFakeTimers({ toFake: ["Date"] });
+      for (const later of [0, 600_001, 3_600_000]) {
+        vi.setSystemTime(Date.now() + later);
+        const card = await taskInterruptionPresentation(db, await issue(f.issueId));
+        console.info(JSON.stringify({ fix12ExternalBot: { later, card: card && { state: card.state, canRetry: card.canRetry, retryWait: card.retryWait } } }));
+        expect(card, `the named hold (+${later})`).toMatchObject({ state: "working", canRetry: false, observedRunId: f.queued.id,
+          retryWait: { reason: "external_agent_setup", message: expect.stringMatching(/^Waiting: this external agent/) } });
+      }
+    } finally {
+      vi.useRealTimers();
+      await db.update(agents).set({ adapterConfig: before!.adapterConfig }).where(eq(agents.id, agentId));
+    }
+  }, 120_000);
+
+  // fix12 item 2b clock (rf-3 22:23Z): a 20-min hold (the task's previous run, on another agent, still
+  // running, its sandbox cleanup pending) clears; the dispatcher is slow. The card is working for 10 min
+  // from the CLEAR, not from enqueue, then failed + Retry if the run is still untaken.
+  it("fix12 clock from the clear: a 20-min hold clears, a slow dispatcher shows working for 10 min after the clear", async () => {
+    const f = await judgeQueued();
+    const enqueued = new Date(Date.now() - 1_500_000);
+    await db.update(heartbeatRuns).set({ createdAt: enqueued }).where(eq(heartbeatRuns.id, f.queued.id));
+    const [previousAgent] = await db.insert(agents).values({ companyId, name: "Previous owner", status: "running", adapterType: "paperclip_runner" }).returning();
+    await db.update(heartbeatRuns).set({ agentId: previousAgent!.id, status: "running", finishedAt: null, errorCode: null }).where(eq(heartbeatRuns.id, f.source.id));
+    await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const card = async () => taskInterruptionPresentation(db, await issue(f.issueId));
+      expect(await card(), "held 25 min: the named hold").toMatchObject({ state: "working", canRetry: false, retryWait: { reason: "previous_run_running" } });
+      // The hold clears: the previous run ends and its sandbox cleanup settles.
+      const clear = new Date();
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: clear }).where(eq(heartbeatRuns.id, f.source.id));
+      await db.update(environmentLeases).set({ cleanupStatus: "success", updatedAt: clear }).where(eq(environmentLeases.id, f.lease.id));
+      const seen: Array<{ after: number; state: string | undefined; canRetry: boolean | undefined }> = [];
+      for (const after of [1_000, 300_000, 599_999, 600_000]) {
+        vi.setSystemTime(clear.getTime() + after);
+        const c = await card();
+        seen.push({ after, state: c?.state, canRetry: c?.canRetry });
+      }
+      console.info(JSON.stringify({ fix12ClockFromClear: { enqueued, clear, seen } }));
+      expect(seen.slice(0, 3).map(s => s.state), "working for 10 min after the clear").toEqual(["working", "working", "working"]);
+      expect(seen[3], "still untaken 10 min after the clear: failed + Retry").toMatchObject({ state: "failed", canRetry: true });
+    } finally { vi.useRealTimers(); }
+  }, 120_000);
+
   it.each(["issue_owner_cleanup", "issue_owner_running", "agent_setup", "budget_accounting", "budget_hard_stop", "case_handoff", "native_cleanup"] as const)("JUDGE named hold %s has its own truthful card, not a Retry requeue loop", async hold => {
     const { budgetPolicies, cases, caseHandoffs } = await import("@paperclipai/db");
     const f = await judgeQueued(), heartbeat = heartbeatService(db);
