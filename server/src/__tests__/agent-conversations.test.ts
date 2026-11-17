@@ -11,7 +11,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -54,6 +54,7 @@ import {
 import { classifyIssueGraphLiveness } from "../services/recovery/issue-graph-liveness.js";
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "../services/native-runtime/status-arbiter.js";
 import { runningProcesses } from "../adapters/index.js";
+import { CONVERSATION_CONTINUATION_POLICY } from "../services/conversation-continuation.js";
 import {
   buildPaperclipTaskMarkdown,
   buildPaperclipWakePayload,
@@ -747,6 +748,134 @@ import {
         await rm(cwd, { recursive: true, force: true });
       }
     }, 30000);
+    // Stop row (testing-lead 11-17): a person queues A, B, C behind a long
+    // chat turn, then presses the square Stop and nothing else. The queued
+    // messages must start the next turn by themselves, in order, each
+    // answered once. A task keeps its existing rule: a Stop holds its queued
+    // comments until the next explicit wake.
+    it.each([true, false])("after a person's Stop, messages queued behind the stopped turn start the next turn in order (chat=%s)", async (chatMode) => {
+      const runtimeCompany = randomUUID();
+      const runtimeAgent = randomUUID();
+      await db.insert(companies).values({ id: runtimeCompany, name: "Stop row",
+        issuePrefix: chatMode ? "STOPC" : "STOPT", requireBoardApprovalForNewAgents: false });
+      const turns: { runId: string; commentIds: string[] }[] = [];
+      const app = express();
+      app.use(express.json());
+      let issueId = "";
+      app.post("/respond", async (req, res) => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, req.body.runId));
+        const context = (run.contextSnapshot ?? {}) as Record<string, unknown>;
+        const ids = Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds.map(String)
+          : typeof context.wakeCommentId === "string" ? [context.wakeCommentId] : [];
+        turns.push({ runId: run.id, commentIds: ids });
+        // The first turn is the long run the person stops.
+        if (turns.length === 1) { res.json({ hold: true }); return; }
+        await issueService(db).addComment(issueId, `Answer to ${ids.join(",")}`, { agentId: runtimeAgent, runId: run.id });
+        res.json({ hold: false });
+      });
+      const listener = app.listen(0, "127.0.0.1");
+      await new Promise<void>((resolve) => listener.once("listening", resolve));
+      const address = listener.address() as { port: number };
+      const cwd = await mkdtemp(join(tmpdir(), "chat-stop-row-"));
+      const script = `fetch("http://127.0.0.1:${address.port}/respond", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({runId:process.env.PAPERCLIP_RUN_ID})}).then(async r=>{if(!r.ok){console.error(r.status,await r.text());process.exitCode=1;return}const j=await r.json();if(j.hold)setInterval(()=>{},1000)})`;
+      await db.insert(agents).values({ id: runtimeAgent, companyId: runtimeCompany, name: "Stop row runtime",
+        role: "engineer", status: "idle", adapterType: "process",
+        adapterConfig: { command: process.execPath, args: ["-e", script], cwd },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } });
+      const issue = chatMode
+        ? await issueService(db).create(runtimeCompany, { title: "Stop row chat", conversationAgentId: runtimeAgent,
+          conversationUserId: "local-board", assigneeAgentId: runtimeAgent, conversationState: "waiting", status: "in_review" })
+        : await issueService(db).create(runtimeCompany, { title: "Stop row task", assigneeAgentId: runtimeAgent, status: "todo" });
+      issueId = issue.id;
+      const heartbeat = heartbeatService(db);
+      const send = async (body: string) => {
+        const comment = await issueService(db).addComment(issue.id, body, { userId: "local-board" },
+          { clientRequestId: randomUUID() });
+        if (chatMode) await deliverConversationComments(db, issue, heartbeat.wakeup);
+        else await heartbeat.wakeup(runtimeAgent, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+          requestedByActorType: "user", requestedByActorId: "local-board",
+          payload: { issueId: issue.id, commentId: comment.id },
+          contextSnapshot: { issueId: issue.id, taskKey: issue.id, commentId: comment.id, wakeCommentId: comment.id,
+            wakeCommentIds: [comment.id], source: "issue.comment" } });
+        return comment;
+      };
+      const waitFor = async (label: string, done: () => Promise<boolean>, attempts = 200) => {
+        for (let i = 0; i < attempts; i += 1) {
+          if (await done()) return;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, runtimeAgent));
+        const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, runtimeAgent));
+        const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+        throw new Error(`${label}: ${JSON.stringify({ turns, runs: runs.map((run) => ({ id: run.id, status: run.status,
+          errorCode: run.errorCode, result: run.resultJson })), wakes: wakes.map((wake) => ({ status: wake.status,
+          runId: wake.runId, payload: wake.payload })), actions: actions.map((action) => action.cause) })}`);
+      };
+      try {
+        await send("Run the long job");
+        await waitFor("long turn started", async () => turns.length === 1);
+        const stoppedRunId = turns[0]!.runId;
+        const queued = [await send("A"), await send("B"), await send("C")];
+        const queuedIds = queued.map((comment) => comment.id);
+        // All three are saved behind the running turn, none dispatched yet.
+        const parked = await db.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.agentId, runtimeAgent), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+        expect(parked.length).toBeGreaterThan(0);
+        expect(turns).toHaveLength(1);
+
+        // Gate 5 runs a conversation runtime. A legacy conversation adapter
+        // records this policy on its run; the bare process adapter used here
+        // keeps the process recovery contract (an uncertain-effects
+        // reconciliation hold), which is not the Stop row, so stamp it.
+        const [running] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stoppedRunId));
+        await db.update(heartbeatRuns).set({ resultJson: { ...(running.resultJson ?? {}),
+          conversationContinuation: CONVERSATION_CONTINUATION_POLICY } }).where(eq(heartbeatRuns.id, stoppedRunId));
+        // The square Stop, and nothing else.
+        await heartbeat.cancelRun(stoppedRunId, "Cancelled by a board operator",
+          { resultJson: { cancelledByActorType: "user", cancelledByUserId: "local-board" } });
+        const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stoppedRunId));
+        expect(stopped.status).toBe("cancelled");
+
+        if (!chatMode) {
+          // Guard: a task keeps its existing Stop rule. Its queued comments
+          // stay saved and deferred for the next explicit wake.
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          expect(turns).toHaveLength(1);
+          const held = await db.select().from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.agentId, runtimeAgent), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+          expect(held.flatMap((wake) => {
+            const ids = (wake.payload as Record<string, any>)?._paperclipWakeContext?.wakeCommentIds;
+            return Array.isArray(ids) ? ids : [];
+          })).toEqual(queuedIds);
+          return;
+        }
+
+        await waitFor("queued messages answered after Stop", async () => {
+          const answered = turns.slice(1).flatMap((turn) => turn.commentIds);
+          if (!queuedIds.every((id) => answered.includes(id))) return false;
+          const live = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.agentId, runtimeAgent), inArray(heartbeatRuns.status, ["queued", "running"])));
+          return live.length === 0;
+        });
+        // The stopped turn stays stopped; A starts the next turn and B and C
+        // follow in order (merged into one turn per the conversation batch).
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stoppedRunId)))[0].status).toBe("cancelled");
+        const delivered = turns.slice(1).flatMap((turn) => turn.commentIds);
+        expect(delivered).toEqual(queuedIds);
+        expect(turns.slice(1).every((turn) => turn.runId !== stoppedRunId)).toBe(true);
+        // Each successor turn answered once; nothing lost or doubled.
+        const answers = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id),
+          eq(issueComments.authorAgentId, runtimeAgent)));
+        expect(answers).toHaveLength(turns.length - 1);
+        expect(new Set(answers.map((answer) => answer.createdByRunId)).size).toBe(answers.length);
+        expect(await db.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.agentId, runtimeAgent), eq(agentWakeupRequests.status, "deferred_issue_execution")))).toHaveLength(0);
+      } finally {
+        await heartbeat.cancelActiveForAgent(runtimeAgent).catch(() => undefined);
+        await new Promise<void>((resolve) => listener.close(() => resolve()));
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }, 60000);
     it("parks successful native interaction-only turns without consuming unrelated or stale gates", async () => {
       const chat = await create();
       const message = await issueService(db).addComment(chat.id, "Plan the work", { userId: "local-board" });
