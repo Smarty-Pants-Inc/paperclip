@@ -20,6 +20,7 @@ import {
 } from "@paperclipai/adapter-utils/ssh";
 import {
   activityLog,
+  agentInstructionWorkingCopies,
   workspaceOperations,
   costEvents,
   agents,
@@ -75,6 +76,7 @@ import { createNativeHarnessBackupStamp } from "../services/native-runtime/nativ
 import { retiredSourceAuthorizesNativeBackupRestore } from "../services/native-runtime/native-retired-backup-source.ts";
 import { retiredReusableLeasePredecessors } from "../services/environment-lease-handoff.ts";
 import { environmentRunOrchestrator } from "../services/environment-run-orchestrator.js";
+import { createAgentFileRetirementCollector } from "../services/heartbeat/instruction-working-copy.js";
 import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
 import { NATIVE_PREPARATION_FENCING_VERSION } from "../services/native-runtime/native-active-runs.js";
 
@@ -6177,6 +6179,95 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       cleanupStatus: "success",
       failureReason: "lease_fingerprint_mismatch",
     });
+  });
+
+  // CR6 (rc2a gate 4): a box-only agent file written after the last turn-end
+  // save must be collected by the Stop collector before a source change
+  // retires the warm box. Unsaved fails closed: the provider destroy never runs.
+  it.each(["saved", "held", "unreadable"] as const)("collects box-only agent files before a source-change retirement destroys the box (%s)", async outcome => {
+    const pluginId = randomUUID();
+    const { companyId, agentId, environment: baseEnvironment, runId } = await seedEnvironment();
+    const providerConfig = { provider: "fake-plugin", image: "template-a", region: "eu", timeoutMs: 1234, reuseLease: true };
+    const environment: Environment = { ...baseEnvironment, name: "Reusable Plugin Sandbox", driver: "sandbox", config: providerConfig };
+    await environmentService(db).update(environment.id, { driver: "sandbox", name: environment.name, config: providerConfig });
+    await insertSandboxProviderPlugin(pluginId, {
+      pluginKey: "acme.fake-sandbox-provider", packageName: "@acme/fake-sandbox-provider", displayName: "Fake Sandbox Provider",
+      description: "Test schema-driven provider",
+      environmentDrivers: [{ driverKey: "fake-plugin", kind: "sandbox_provider", displayName: "Fake Plugin", supportsReusableLeases: true,
+        configSchema: { type: "object", properties: { image: { type: "string" }, timeoutMs: { type: "number" }, reuseLease: { type: "boolean" } } } }],
+    });
+    const executionWorkspaceId = randomUUID();
+    const projectId = randomUUID();
+    await insertReusableProject(projectId, companyId);
+    await insertReusableExecutionWorkspace(executionWorkspaceId, companyId, projectId);
+    // The warm box: its agent directory holds a file written after the last finalize.
+    const box = new Map([["notes.md", "written after the last finalize"]]);
+    const serverSide = new Map<string, string>();
+    const events: string[] = [];
+    let acquisitions = 0;
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        events.push(method);
+        if (method === "environmentAcquireLease") {
+          return { providerLeaseId: `lease-${params.config.image}${++acquisitions > 1 ? "-replacement" : ""}`,
+            metadata: { provider: "fake-plugin", image: params.config.image, timeoutMs: params.config.timeoutMs, reuseLease: true, remoteCwd: "/workspace" } };
+        }
+        if (method === "environmentDestroyLease") { box.clear(); return undefined; }
+        if (method === "environmentReleaseLease") return undefined;
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] })),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const first = await runtimeWithPlugin.acquireRunLease({ companyId, environment, issueId: null, agentId, adapterType: "process",
+      heartbeatRunId: runId, persistedExecutionWorkspace: { id: executionWorkspaceId, mode: "shared_workspace" } });
+    await runtimeWithPlugin.releaseRunLeases(runId);
+    // The run's warm copy: its last turn-end checkpoint did not include notes.md.
+    await db.insert(agentInstructionWorkingCopies).values({ runId, companyId, agentId, responsibleUserId: "user-1", entryFile: "AGENTS.md",
+      baseHash: "base", localRoot: "/tmp/cr6/live", executionRoot: "/workspace/.paperclip-runtime/agent-files/x", location: `remote:${environment.id}`,
+      state: "warm_saved", receipt: { schema: "paperclip.agent-files.v1", warm: true, cleanup: { leaseId: first.lease.id, remoteCwd: "/workspace" } } });
+    // The Stop collector (the heartbeat wiring), aimed at the retiring box.
+    const collectStopped = vi.fn(async (input: { companyId: string; runId: string; target?: any }) => {
+      events.push("collectStopped");
+      expect(input.target).toMatchObject({ kind: "remote", leaseId: first.lease.id, environmentId: environment.id });
+      if (outcome === "unreadable") throw new Error("box unreadable");
+      const [row] = outcome === "saved"
+        ? (box.forEach((value, name) => serverSide.set(name, value)), await db.update(agentInstructionWorkingCopies)
+          .set({ state: "saved", processStoppedAt: new Date() }).where(eq(agentInstructionWorkingCopies.runId, input.runId)).returning())
+        : await db.update(agentInstructionWorkingCopies).set({ state: "unavailable", processStoppedAt: new Date(),
+          receipt: { schema: "paperclip.agent-files.v1", warm: true, cleanup: { leaseId: first.lease.id, remoteCwd: "/workspace" },
+            savePending: { since: new Date().toISOString(), code: "AGENT_FILES_SAVE_FAILED", reason: "store down", failures: 1 } } })
+          .where(eq(agentInstructionWorkingCopies.runId, input.runId)).returning();
+      return row as any;
+    });
+    runtimeWithPlugin.bindAgentFileRetirementCollector?.(createAgentFileRetirementCollector({ db,
+      instructionCopies: { collectStopped } as any, environmentRuntime: runtimeWithPlugin }));
+
+    const nextRunId = randomUUID();
+    await insertRunningManualRun(nextRunId, companyId, agentId);
+    const updatedEnvironment: Environment = { ...environment, config: { ...providerConfig, region: "us" } };
+    await environmentService(db).update(environment.id, { config: updatedEnvironment.config });
+    events.length = 0;
+    const second = await runtimeWithPlugin.acquireRunLease({ companyId, environment: updatedEnvironment, issueId: null, agentId,
+      adapterType: "process", heartbeatRunId: nextRunId, persistedExecutionWorkspace: { id: executionWorkspaceId, mode: "shared_workspace" } });
+    expect(second.lease.providerLeaseId).toBe("lease-template-a-replacement");
+    // Collected while the box was live, before any retirement.
+    expect(collectStopped).toHaveBeenCalledWith(expect.objectContaining({ companyId, runId }));
+    expect(events[0]).toBe("collectStopped");
+    if (outcome === "saved") {
+      expect(serverSide.get("notes.md")).toBe("written after the last finalize");
+      expect(events.indexOf("environmentDestroyLease")).toBeGreaterThan(events.indexOf("collectStopped"));
+      await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+        status: "expired", cleanupStatus: "success", failureReason: "lease_fingerprint_mismatch" });
+    } else {
+      // Fail closed: the box that holds the only copy is never destroyed.
+      expect(events).not.toContain("environmentDestroyLease");
+      expect(box.get("notes.md")).toBe("written after the last finalize");
+      expect((await environmentService(db).getLeaseById(first.lease.id))?.failureReason).not.toBe("lease_fingerprint_mismatch");
+      const [copy] = await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, runId));
+      if (outcome === "held") expect(copy?.receipt).toHaveProperty("savePending");
+    }
   });
 
   it("does not resume released reusable plugin sandbox leases after secret version drift", async () => {
