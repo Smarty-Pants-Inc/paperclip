@@ -7,6 +7,7 @@ import { recoveryPostgresSupport, startRecoveryPostgres } from "../../__tests__/
 import { preserveCancelledNativeWorkspaces } from "./native-failed-workspace-recovery.js";
 import { recordRequiredWorkspaceRestoreFailure, UNRESTORED_FILES_NEXT_ACTION } from "../legacy-execution-recovery.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
+import { taskInterruptionPresentation } from "../task-interruption-presentation.js";
 import { requestWorkspaceRecovery } from "../workspace-recovery.js";
 
 // The person-facing text for files that are still owed (no restore was tried).
@@ -96,6 +97,19 @@ const RECOVERING_TEXT = "Recovering your saved work; your message is kept and ru
     expect(blocker!.nextAction).not.toContain("could not be put back");
     expect(holdShape(blocker)).toEqual({ cause: "native_continuation_requires_reconciliation", canRetry: false,
       canContinue: false, workspaceRepairRequired: true, canRecordWorkspaceRepair: true });
+  }, 120_000);
+
+  // retry-fold5 (RESTORE HOLD): the card reads restore-card's words through the
+  // one Retry authority (decideRetryAuthority delegates to
+  // workspaceRestoreHoldNextAction); no second mapping says something else.
+  it("(a2) retry-fold5: the card for a restore hold whose files are only owed says the hold's own words, offers no Retry", async () => {
+    const f = await seed();
+    await preserveCancelledNativeWorkspaces(db);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const card = await taskInterruptionPresentation(db, issue!);
+    expect(card?.canRetry).toBe(false);
+    expect(card?.retryWait?.message).toBe(RECOVERING_TEXT);
+    expect(JSON.stringify(card)).not.toContain("could not be put back");
   }, 120_000);
 
   it("(b) a recorded restore failure keeps the 'could not be put back ... Retry' words and the same hold", async () => {

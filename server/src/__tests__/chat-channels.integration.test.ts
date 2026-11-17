@@ -47,6 +47,7 @@ import { readFreshWorkspaceReadiness } from "../services/fresh-workspace-continu
 import { requestTaskRetry, reconcileTaskChatRetryReceipts } from "../services/task-retry.js";
 import * as taskRetryModule from "../services/task-retry.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
+import { AGENT_PAUSED_ACTION, AGENT_PAUSED_RETRY_MESSAGE, HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
 import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.js";
 import { createSystemRecovery } from "../services/system-recovery-state.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
@@ -65373,39 +65374,46 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     );
 
-    it("retry-fold4 (rf-3 B): refuses a prepared chat Retry once the conversation is held, as the task Retry API does (one authority)", async () => {
+    // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z; follow-Paperclip Cut B R8): a held
+    // conversation never withholds Retry; the chat accepts it as the card and API do.
+    it("supersedes: retry-fold4 (rf-3 B): refuses a prepared chat Retry once the conversation is held, as the task Retry API does (one authority)", async () => {
       const context = await fixture(true);
       try {
         await context.resolve().expect(200);
-        const [retry] = await db
-          .select()
-          .from(chatActions)
-          .where(
-            and(
-              eq(chatActions.endpointId, context.endpoint.id),
-              eq(chatActions.kind, "failed_run_retry"),
-            ),
-          );
+        const [retry] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, context.endpoint.id),
+          eq(chatActions.kind, "failed_run_retry")));
         expect(retry).toMatchObject({ status: "issued" });
-        expect(retry!.payload.sourceAuthorizationPending).not.toBe(true);
-        // The executor's durable HELD notice: the same thread meets the same
-        // prior-owner fence on every Retry; the card offers no Retry.
-        await db.insert(issueComments).values({
-          companyId: context.fixture.companyId,
-          issueId: context.issue.id,
-          authorType: "system",
-          body: "Your message and saved work are kept, but this conversation cannot continue. Assign this agent a new task to continue.",
-          metadata: {
-            version: 1,
-            authorizationReason: `native_prior_owner_held:${randomUUID()}`,
-            sections: [{ rows: [{ type: "run_link", runId: context.runId, agentId: context.fixture.assignedAgentId }] }],
-          },
-        });
+        await db.insert(issueComments).values({ companyId: context.fixture.companyId, issueId: context.issue.id, authorType: "system",
+          body: HELD_PREDECESSOR_NOTICE, metadata: { version: 1, authorizationReason: `native_prior_owner_held:${randomUUID()}`,
+            sections: [{ rows: [{ type: "run_link", runId: context.runId, agentId: context.fixture.assignedAgentId }] }] } });
+        await context.service.processFailedChatRunRetry(retry!.id);
+        expect(context.wakeup).toHaveBeenCalledTimes(1);
+        expect(await readAgentWakeupRequestsById(retry!.id)).toHaveLength(1);
+      } finally {
+        await context.cleanup();
+      }
+    });
+
+    // CHAT (rf-3, retry-fold5): a refused chat Retry says the authority's ONE
+    // instruction (the card's words), not failed-run-retry.ts's "Retry continues
+    // the task from its saved work". Through /recovery-actions/resolve and
+    // processFailedChatRunRetry.
+    it("retry-fold5: a chat Retry refused because the agent is paused carries the card's one instruction (Resume), never 'Retry continues the task'", async () => {
+      const context = await fixture(true);
+      try {
+        await context.resolve().expect(200);
+        const [retry] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, context.endpoint.id),
+          eq(chatActions.kind, "failed_run_retry")));
+        expect(retry).toMatchObject({ status: "issued" });
+        await db.update(agents).set({ status: "paused" }).where(eq(agents.id, context.fixture.assignedAgentId));
+        const card = await taskInterruptionPresentation(db, (await readIssuesById(context.issue.id))[0]);
+        expect(card).toMatchObject({ canRetry: false, userAction: "resume" });
         await context.service.processFailedChatRunRetry(retry!.id).catch(() => undefined);
-        await deliverReconciledExecutions(db, context.genericWake);
         expect(context.wakeup).not.toHaveBeenCalled();
-        expect(context.genericWake).not.toHaveBeenCalled();
-        expect(await readAgentWakeupRequestsById(retry!.id)).toEqual([]);
+        const [settled] = await db.select().from(chatActions).where(eq(chatActions.id, retry!.id));
+        expect(settled?.result).toMatchObject({ code: "failed_chat_retry_not_authorized", userAction: "resume",
+          message: AGENT_PAUSED_RETRY_MESSAGE, nextAction: AGENT_PAUSED_ACTION });
+        expect(JSON.stringify(settled?.result)).not.toContain("Retry continues the task");
       } finally {
         await context.cleanup();
       }
@@ -66368,7 +66376,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       } finally { await f.service.shutdown(); }
     },
   );
-  it("retry-fold4 (R8, rf-3 A/B): a Boat-remote, agent_files, pi_rpc chat whose conversation is held: the Retry route answers 409 with the card's one instruction and starts nothing", async () => {
+  // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z; follow-Paperclip Cut B R8): one
+  // decision for card, API and chat: a held conversation is offered Retry, the
+  // notice names Retry, and the route ACCEPTS it (PV2's retry-fresh rotation).
+  // Production entry point: POST /api/issues/:id/retry, routes/issues.ts:10429.
+  it("supersedes: retry-fold4 (R8, rf-3 A/B): a Boat-remote, agent_files, pi_rpc chat whose conversation is held: the Retry route answers 409 with the card's one instruction and starts nothing", async () => {
     const f = await currentGitHubTaskRetryFixture();
     const companyId = f.fixture.companyId, issueId = f.issue.id;
     // The Paul-shaped agent: pi_rpc on a Boat sandbox, managed instructions (agent_files).
@@ -66380,7 +66392,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // The executor's durable HELD notice: the same thread meets the same
     // prior-owner fence on every Retry; the card offers no Retry.
     await db.insert(issueComments).values({ companyId, issueId, authorType: "system",
-      body: "Your message and saved work are kept, but this conversation cannot continue. Assign this agent a new task to continue.",
+      body: HELD_PREDECESSOR_NOTICE,
       metadata: { version: 1, authorizationReason: `native_prior_owner_held:${randomUUID()}`,
         sections: [{ rows: [{ type: "run_link", runId: f.runId, agentId: f.fixture.assignedAgentId }] }] } });
     const app = express();
@@ -66390,17 +66402,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     app.use(errorHandler);
     f.wakeup.mockClear();
     const wakesBefore = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).length;
+    // The card (read before the click) offers Retry and its held notice names that same single action.
     const card = await taskInterruptionPresentation(db, (await readIssuesById(issueId))[0]);
-    expect(card?.canRetry).toBe(false);
-    // Production entry point: POST /api/issues/:id/retry (routes/issues.ts -> task-retry.ts requestTaskRetry).
+    // Production entry point first: POST /api/issues/:id/retry (routes/issues.ts:10429 -> task-retry.ts requestTaskRetry).
     const response = await request(app).post(`/api/issues/${issueId}/retry`).send({ observedRunId: f.runId, idempotencyKey: randomUUID() });
-    expect(response.status, JSON.stringify(response.body)).toBe(409);
-    expect(response.body).toMatchObject({ details: { code: "retry_not_available", reason: "conversation_held",
-      userAction: "new_task", nextAction: "Assign this agent a new task to continue." } });
-    expect(String(response.body.error)).toContain(response.body.details.nextAction);
-    expect(f.wakeup).not.toHaveBeenCalled();
-    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).length).toBe(wakesBefore);
-    expect(await db.select().from(chatActions).where(and(eq(chatActions.companyId, companyId), eq(chatActions.kind, "failed_run_retry")))).toEqual([]);
+    expect(response.status, JSON.stringify(response.body)).toBeLessThan(300);
+    expect(response.body).toMatchObject({ accepted: true });
+    expect(response.body?.details?.reason).not.toBe("conversation_held");
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).length
+      + (await db.select().from(chatActions).where(and(eq(chatActions.companyId, companyId), eq(chatActions.kind, "failed_run_retry")))).length)
+      .toBeGreaterThan(wakesBefore);
+    expect(card).toMatchObject({ canRetry: true, notice: { code: "native_prior_owner_held", text: HELD_PREDECESSOR_NOTICE } });
+    expect(card?.notice?.text).toContain("Press Retry");
+    expect(card?.notice?.text).not.toMatch(/send a new message|new task|cannot continue/i);
   });
 
   it.each(["settled", "pending_at_intake", "source_edited", "operator_stopped", "unknown_stop", "live_owner", "absent_sandbox"] as const)(
