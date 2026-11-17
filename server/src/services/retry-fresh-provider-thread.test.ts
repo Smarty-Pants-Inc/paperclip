@@ -28,6 +28,9 @@ import os from "node:os";
 import { PI_CONVERSATION_KEY, selectPiConversation } from "./native-runtime/pi-conversation-record.js";
 import { findNativeSessionResumeRun } from "./native-runtime/native-session-resume.js";
 import { requestTaskRetry } from "./task-retry.js";
+import { readFreshContinuationSessionBoundary, recordRetryFreshProviderThread } from "./fresh-continuation-fallback.js";
+import { freshContinuationTimes, sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
+import { taskAutomaticAttempts } from "./recovery/task-automatic-attempts.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("native Retry routed to a fresh isolated workspace", () => {
@@ -193,5 +196,149 @@ const support = await getEmbeddedPostgresTestSupport();
       reason: expect.stringMatching(/^fresh_continuation:/) });
     expect((await systemNotes(f)).filter(note => String(note.metadata?.authorizationReason ?? "").startsWith("fresh_provider_thread:")))
       .toHaveLength(1);
+  }, 60_000);
+
+  // The Retry, or an automatic resume filed through the same Retry path, as
+  // queue admission runs it: the request, then admission with its successor
+  // in one transaction, then the successor's first conversation selection.
+  async function retryThroughQueue(f: Awaited<ReturnType<typeof seed>>,
+    automatic: Partial<Parameters<typeof requestTaskRetry>[0]> = {}) {
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "board",
+      idempotencyKey: randomUUID(), observedRunId: f.sourceRunId, ...automatic });
+    expect(receipt).toMatchObject({ accepted: true });
+    const admitted = await db.transaction(async tx => {
+      await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+      const continuation = await admitExplicitNativeContinuation({ db: tx as unknown as typeof db, companyId: f.companyId,
+        issueId: f.issueId, agentId: f.agentId, actorType: "user", actorId: "board", reason: "task_retry", commentId: null,
+        successorRunId: f.successorRunId, taskRetryRequestId: receipt.requestId! });
+      await tx.insert(heartbeatRuns).values({ id: f.successorRunId, companyId: f.companyId, agentId: f.agentId,
+        nativeIssueId: f.issueId, runtimeMode: "native", status: "queued", invocationSource: "on_demand",
+        contextSnapshot: { issueId: f.issueId, wakeReason: "task_retry", forceFreshSession: true,
+          previousRunId: continuation?.previousRunId, explicitUserContinuation: continuation } });
+      return continuation;
+    });
+    expect(admitted?.readiness).toMatchObject({ mode: "fresh_isolated_workspace", sourceRunId: f.sourceRunId });
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, f.successorRunId));
+    const conversation = await selectPiConversation(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+      runId: f.successorRunId, boundary: { provider: "pi_rpc", cwd: "/workspaces/new-box", remoteCwd: null, workspaceId: null, trust: "trust" } });
+    const [record] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
+      eq(issueRecoveryActions.fingerprint, `fresh-continuation:retry:${f.successorRunId}`)));
+    return { conversation, record: record! };
+  }
+
+  const automaticCount = async (f: { companyId: string; issueId: string }) => {
+    const at = new Date(Date.now() + 1_000);
+    return { fresh: (await freshContinuationTimes(db, f.companyId, f.issueId, new Date(Date.now() - 3_600_000))).length,
+      shared: (await sharedContinuationAttempts(db, f.companyId, f.issueId, at)).length,
+      started: (await taskAutomaticAttempts(db, f.companyId, f.issueId, at)).started.length };
+  };
+
+  it("a person's Retry into a fresh workspace is labelled person_retry and is NOT counted as an automatic attempt", async () => {
+    const f = await seed("not_task_owned");
+    const { conversation, record } = await retryThroughQueue(f);
+    expect(conversation.id).not.toBe(f.sessionId);
+    expect(record.evidence).toMatchObject({ freshContinuation: { trigger: "person_retry" },
+      freshContinuationSettlement: { requestedBy: "person_retry" } });
+    expect(await automaticCount(f)).toEqual({ fresh: 0, shared: 0, started: 0 });
+  }, 60_000);
+
+  // Restart recovery, the provider-limit reset and the budget resume file the
+  // Retry for the person (requestedByActorType "user"); they are automatic and
+  // must count against the automatic cap, or they could loop uncapped.
+  it.each([
+    ["restart recovery", { initiatedBy: "restart_recovery" }, "retry_restart_recovery"],
+    ["provider-limit reset", { initiatedBy: "provider_limit_reset" }, "retry_provider_limit_reset"],
+    ["budget resume", { resumedBy: "budget_resume" }, "retry_budget_resume"],
+  ] as const)("an automatic resume (%s) into a fresh workspace opens a new thread, is NOT labelled person_retry, and IS counted", async (_name, automatic, trigger) => {
+    const f = await seed("not_task_owned");
+    const { conversation, record } = await retryThroughQueue(f, automatic as Partial<Parameters<typeof requestTaskRetry>[0]>);
+    expect(conversation.id).not.toBe(f.sessionId);
+    expect(conversation).toMatchObject({ previousId: f.sessionId, runId: f.successorRunId,
+      reason: `fresh_continuation:${record.id}` });
+    expect(record.evidence).toMatchObject({ freshContinuation: { trigger },
+      freshContinuationSettlement: { requestedBy: "system" } });
+    expect(await automaticCount(f)).toEqual({ fresh: 1, shared: 1, started: 1 });
+  }, 60_000);
+
+  it("honours the Retry's record only for the run it is bound to, with that run's fresh readiness and a Retry trigger", async () => {
+    const f = await seed("not_task_owned");
+    await pressRetry(f);
+    const [action] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
+      eq(issueRecoveryActions.fingerprint, `fresh-continuation:retry:${f.successorRunId}`)));
+    const evidence = action!.evidence as Record<string, unknown>;
+    const fresh = evidence.freshContinuation as Record<string, unknown>;
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.successorRunId));
+    const context = successor!.contextSnapshot as Record<string, unknown>;
+    const continuation = context.explicitUserContinuation as Record<string, unknown>;
+    const readiness = continuation.readiness as Record<string, unknown>;
+    const boundary = async (change: { evidence?: Record<string, unknown>; readiness?: Record<string, unknown> } = {}) => {
+      await db.update(issueRecoveryActions).set({ evidence: change.evidence ?? evidence })
+        .where(eq(issueRecoveryActions.id, action!.id));
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...context, explicitUserContinuation: { ...continuation,
+        readiness: change.readiness ?? readiness } } }).where(eq(heartbeatRuns.id, f.successorRunId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.successorRunId));
+      return readFreshContinuationSessionBoundary(db, run!, f.issueId);
+    };
+    // The record as admitted: its own successor takes the fresh thread.
+    expect(await boundary()).toMatchObject({ recoveryActionId: action!.id, sourceRunId: f.sourceRunId,
+      sourceSessionId: f.sessionId });
+    // Another run's record (M3): bound to a different run, or to none.
+    expect(await boundary({ evidence: { ...evidence, continuationRunId: randomUUID() } })).toBeNull();
+    const { continuationRunId: _bound, ...unbound } = evidence;
+    expect(await boundary({ evidence: unbound })).toBeNull();
+    // Another trigger (M4), without the run's isolation context, is ignored.
+    expect(await boundary({ evidence: { ...evidence, freshContinuation: { ...fresh, trigger: "held_recovery" } } })).toBeNull();
+    const { trigger: _trigger, ...untriggered } = fresh;
+    expect(await boundary({ evidence: { ...evidence, freshContinuation: untriggered } })).toBeNull();
+    // A non-fresh admitted readiness (M2): the run reused the box, so its thread is kept.
+    expect(await boundary({ readiness: { ...readiness, mode: "reuse_issue_workspace" } })).toBeNull();
+    expect(await boundary({ readiness: { ...readiness, sourceRunId: randomUUID() } })).toBeNull();
+    // Restored, the record is honoured again: each refusal above was the change alone.
+    expect(await boundary()).toMatchObject({ recoveryActionId: action!.id });
+  }, 60_000);
+
+  it("a second Retry that reuses the box, after a first fresh one, keeps its session and posts no second note", async () => {
+    const f = await seed("not_task_owned");
+    const { admitted, select } = await pressRetry(f);
+    const first = await select();
+    expect(first.id).not.toBe(f.sessionId);
+    // The first Retry's run ends; the task now owns a box the second Retry reuses.
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), nativeSessionId: first.id })
+      .where(eq(heartbeatRuns.id, f.successorRunId));
+    const secondRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: secondRunId, companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, runtimeMode: "native", status: "running", invocationSource: "on_demand",
+      createdAt: new Date(Date.now() + 1_000), contextSnapshot: { issueId: f.issueId, wakeReason: "task_retry",
+        forceFreshSession: true, previousRunId: f.successorRunId, explicitUserContinuation: { ...admitted,
+          readiness: { mode: "reuse_issue_workspace", sourceRunId: f.successorRunId, workspaceId: f.workspaceId } } } });
+    const [second] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, secondRunId));
+    expect(await readFreshContinuationSessionBoundary(db, second!, f.issueId)).toBeNull();
+    const conversation = await selectPiConversation(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+      runId: secondRunId, boundary: { provider: "pi_rpc", cwd: "/workspaces/new-box", remoteCwd: null,
+        workspaceId: f.workspaceId, trust: "trust" } });
+    // The same thread the first Retry opened: no second rotation for this run.
+    expect(conversation).toMatchObject({ id: first.id, generation: first.generation, reason: first.reason });
+    expect((await systemNotes(f)).filter(note => String(note.metadata?.authorizationReason ?? "").startsWith("fresh_provider_thread:")))
+      .toHaveLength(1);
+  }, 60_000);
+
+  it.each([
+    ["still running", { status: "running", finishedAt: null }],
+    ["failed but not yet finished", { status: "failed", finishedAt: null }],
+    ["finished with success", { status: "succeeded", finishedAt: new Date() }],
+  ] as const)("a Retry whose source is %s writes no fresh-thread record and leaves the source's authority", async (_name, state) => {
+    const f = await seed("not_task_owned");
+    await db.update(heartbeatRuns).set(state).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(await recordRetryFreshProviderThread(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+      sourceRunId: f.sourceRunId, successorRunId: f.successorRunId, trigger: "person_retry" })).toBeNull();
+    expect(await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
+      eq(issueRecoveryActions.fingerprint, `fresh-continuation:retry:${f.successorRunId}`)))).toHaveLength(0);
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(source!.resultJson ?? {}).not.toHaveProperty("freshContinuationSupersededAt");
+    // Control: the finished cut-off source does get the record.
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(await recordRetryFreshProviderThread(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+      sourceRunId: f.sourceRunId, successorRunId: f.successorRunId, trigger: "person_retry" })).toEqual(expect.any(String));
   }, 60_000);
 });
