@@ -34,6 +34,50 @@ configuration is redacted. This field does not contain driver configuration,
 environment variables, or credentials. An agent with no default inherits the
 instance default.
 
+## Discard one unsaved agent-file hold
+
+```
+POST /api/companies/{companyId}/agent-file-holds/{runId}/discard
+{"reason": "Permanent storage failure; discard this unsaved copy"}
+```
+
+This destructive operator action uses the same authority as environment deletion:
+local implicit board access or a signed-in instance administrator with access to
+this company. Agents and ordinary board members cannot discard saves. `reason`
+is required (1–1000 characters after trimming).
+
+Only the named run's stopped held save is resolved. The server records the actor,
+reason and timestamp atomically in the activity log (`agent_files.save_discarded`)
+and the copy's `receipt.discard`. It does **not** claim a save or change canonical
+files. The response is the current working-copy row with
+`errorCode: "AGENT_FILES_SAVE_DISCARDED"`. Cleanup uses the existing directory and
+environment recovery workers; `receipt.cleanupPending` can remain true if the
+remote collector is unavailable. Other holds on the allocation still block its
+destruction. Missing copies return 404; an already settled or non-held copy
+returns 409. No bulk discard is supported.
+
+## Clear a crashed collector's lease pin
+
+```
+POST /api/companies/{companyId}/environment-leases/{leaseId}/collection-pins/clear
+{
+  "copyKey": "{companyId}:{runId}:{agentId}",
+  "token": "{exact token from lease.metadata.agentFileCollectionPins}",
+  "collectorStopped": true,
+  "reason": "Collector process exited; no collection remains in flight"
+}
+```
+
+Uses the discard endpoint's environment-DELETE operator authorization and company
+access check. First independently establish that the collector is gone: clearing
+a live pin could allow destruction while its collection is still running. The
+server requires that acknowledgment, an exact token, and a reason (1–1000
+characters). It atomically clears **one** pin and logs the operator, reason and
+time (`agent_files.collection_pin_cleared`); other pins and durable save holds
+remain effective. A replacement token or an absent pin returns 409. No provider
+command runs and no save or discard is claimed by this action. Existing cleanup
+workers are notified to reconsider the allocation.
+
 ## Get Current Agent
 
 ```
