@@ -14,9 +14,10 @@
  */
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -30,6 +31,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { createAdapterExecutionControl } from "./adapter-execution-control.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./heartbeat/runtime-execution.js";
+import { finishCancelledWarmWorkspaceExport } from "./heartbeat/cancelled-warm-workspace-export.js";
+import { withNativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
 import * as nativeExecutor from "./native-runtime/native-session-executor.js";
 import { nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
@@ -62,10 +65,32 @@ const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 const BASE = "base contents\n";
 const EDIT = "edited on the box by the stopped turn\n";
 
+type BoxState = { fail: boolean; calls: number; inflight?: number; held?: number;
+  /** A command matching `match` is held until `until` resolves, then runs (a held command that joins late). */
+  gate?: { match: (script: string) => boolean; until: Promise<void> } | null };
+
 /** The "box": commands run locally against its directory. */
-function boxRunner(state: { fail: boolean; calls: number }): CommandManagedRuntimeRunner {
+function boxRunner(state: BoxState): CommandManagedRuntimeRunner {
   return {
-    execute: (input) => new Promise((resolve, reject) => {
+    execute: async (input) => {
+      state.inflight = (state.inflight ?? 0) + 1;
+      try {
+        const gate = state.gate;
+        if (gate && gate.match((input.args ?? []).join(" "))) {
+          state.held = (state.held ?? 0) + 1;
+          await gate.until;
+        }
+        return await runOnBox(state, input);
+      } finally {
+        state.inflight -= 1;
+      }
+    },
+  };
+}
+
+function runOnBox(state: BoxState, input: Parameters<CommandManagedRuntimeRunner["execute"]>[0]) {
+  return {
+    run: () => new Promise<Awaited<ReturnType<CommandManagedRuntimeRunner["execute"]>>>((resolve, reject) => {
       state.calls += 1;
       if (state.fail) {
         resolve({ exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "box unreachable", pid: null, startedAt: null });
@@ -80,7 +105,18 @@ function boxRunner(state: { fail: boolean; calls: number }): CommandManagedRunti
       child.stdin?.on("error", (error: NodeJS.ErrnoException) => { if (error.code !== "EPIPE") reject(error); });
       child.stdin?.end(input.stdin ?? "");
     }),
-  };
+  }.run();
+}
+
+const STAMP = [".paperclip-runtime", "paperclip-runner", "workspace-sync-v1.json"];
+const DEFERRED_FIXTURE = fileURLToPath(new URL(
+  "../../../ui/src/components/transcript/fixtures/cancelled-warm-export-deferred.json", import.meta.url));
+async function waitFor(check: () => boolean, ms = 10_000) {
+  const until = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > until) throw new Error("waitFor timed out");
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
 }
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -140,7 +176,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: 1, eventType: "turn.started", stream: "system" });
     const [leaseRow] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
 
-    const runnerState = { fail: false, calls: 0 };
+    const runnerState: BoxState = { fail: false, calls: 0 };
     const target: AdapterSandboxExecutionTarget = {
       kind: "remote", transport: "sandbox", providerKey: "test", leaseId, remoteCwd: box,
       runner: boxRunner(runnerState), timeoutMs: 30_000,
@@ -219,7 +255,8 @@ const support = await getEmbeddedPostgresTestSupport();
     const excluded = await nativeWorkspaceExportPendingForResource(db, retained, successorRunId);
     const events = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId)));
     return { root, host, box, companyId, workspaceId, leaseId, providerLeaseId, runnerState, callsAtStop, stopped,
-      reference, excluded, successorRunId, retained, events, runId, stoppedRunProfile: stopped.runnerProfileJson };
+      reference, excluded, successorRunId, retained, events, runId, stoppedRunProfile: stopped.runnerProfileJson,
+      sync, agentId, issueId, sessionId };
   }
 
   async function successorOnSameBox(f: Awaited<ReturnType<typeof stopMidTurn>>) {
@@ -280,5 +317,63 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(f.stoppedRunProfile?.nativeCancelledWarmExport).toBeUndefined();
     expect(f.events.filter(event => event.eventType.startsWith("workspace_export_"))).toEqual([]);
     expect(f.excluded).toBe(true);
+  }, 60_000);
+
+  // ---- pl/cancel-finalize2: rf-4's three findings ----
+  /** Settles a Stop that executeHeartbeatRuntime saw unsettled, so the bounded export can be driven directly. */
+  async function settleLater(f: Awaited<ReturnType<typeof stopMidTurn>>) {
+    const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...current.runnerProfileJson,
+      nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1",
+        companyId: f.companyId, issueId: f.issueId, runId: f.runId, sessionId: f.sessionId, bootId: "boot", generation: 1 } },
+    }).where(eq(heartbeatRuns.id, f.runId));
+  }
+
+  it("aggregate bound + late stamp: a stamp write held past the deadline publishes nothing; the lock is free at the deadline", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
+    await settleLater(f);
+    let release!: () => void;
+    f.runnerState.gate = { match: script => script.includes("workspace-sync-v1.json.tmp") && script.includes("base64 -d"),
+      until: new Promise<void>(resolve => { release = resolve; }) };
+    const timeoutMs = 3_000;
+    const startedAt = Date.now();
+    const outcome = await finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+      nativeWorkspaceSync: f.sync, timeoutMs });
+    const waitedMs = Date.now() - startedAt;
+    expect(outcome).toEqual({ outcome: "unproven", reason: "timed_out" });
+    expect(f.runnerState.held).toBe(1);
+    expect(waitedMs).toBeLessThan(timeoutMs + 2_000);
+    // (1) The finalization lock session is released at the deadline, while the remote command is still held.
+    const probe = await withNativeWorkspaceFinalizationOwnership({ db, companyId: f.companyId, runId: f.runId },
+      async () => "free");
+    expect(probe).toMatchObject({ acquired: true });
+    // (2) The held command joins after the timeout: it writes nothing visible.
+    release();
+    await waitFor(() => f.runnerState.inflight === 0);
+    await new Promise(resolve => setTimeout(resolve, 1_000));
+    await waitFor(() => f.runnerState.inflight === 0);
+    await expect(stat(join(f.box, ...STAMP))).rejects.toMatchObject({ code: "ENOENT" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync))
+      .toMatchObject({ state: "prepared", finalHostSha256: null });
+    expect(run.runnerProfileJson?.nativeCancelledWarmExport).toMatchObject({ state: "unproven", reason: "timed_out" });
+    expect(run.status).toBe("cancelled");
+  }, 60_000);
+
+  it("the honest line: the rows the helper writes are exactly the fixture the real transcript consumer renders as ONE entry", async () => {
+    const f = await stopMidTurn({ edit: true, settled: true, exportFails: true });
+    const fixture = JSON.parse(await readFile(DEFERRED_FIXTURE, "utf8")) as { run: { id: string }; events: Array<Record<string, any>> };
+    // Normalized: the run id and the clock are the only per-run values.
+    const normalize = (row: Record<string, any>, runId: string) => {
+      const payload = JSON.parse(JSON.stringify(row.payload ?? null).replaceAll(runId, "RUN"));
+      if (payload?.prpEvent) payload.prpEvent.emittedAt = "AT";
+      if (typeof payload?.detail === "string") payload.detail = "DETAIL";
+      return { eventType: row.eventType, stream: row.stream, level: row.level, message: row.message, payload };
+    };
+    const written = f.events.filter(event => event.seq > 1).sort((a, b) => a.seq - b.seq)
+      .filter(event => event.eventType === "workspace_export_deferred" || event.eventType === "provider.notice.recorded");
+    expect(written.map(row => normalize(row, f.runId)))
+      .toEqual(fixture.events.map(row => normalize(row, fixture.run.id)));
+    // ui/src/components/transcript/native-run-events.test.ts feeds the fixture to nativeRunEventsToTranscript.
   }, 60_000);
 });
