@@ -11,6 +11,7 @@ import { verifiedUnchangedRestoredSnapshot, verifiedWorkspaceSnapshotReuse } fro
 import { isAbandonedPreparedRemoteWorkspace } from "./remote-workspace-abandoned-preparation.js";
 import { RECOVERED_WORK_RETRY_MESSAGE } from "./native-runtime/held-predecessor-notice-text.js";
 import { decideRetryAuthority } from "./task-retry-eligibility.js";
+import { owedRestoreAdoptionBlocked } from "./workspace-restore-recovery-state.js";
 
 export const workspaceRecoverySchema = z.object({
   schema: z.literal("paperclip.workspace-recovery.v1"),
@@ -103,8 +104,11 @@ export function savedWorkOffersRetry(state: { status: string; canRetry: boolean 
 
 export function workspaceRecoveryDisplay(evidence: Record<string, unknown>, runId: string | null,
   run?: { status: string | null; retryOffered: boolean; heldConversation?: boolean; agentPaused?: boolean }): ExecutionBlocker["workspaceRecovery"] {
-  const state = readWorkspaceRecovery(evidence);
-  if (!state || state.runId !== runId) return undefined;
+  const stored = readWorkspaceRecovery(evidence);
+  if (!stored || stored.runId !== runId) return undefined;
+  // restore-card8 (J9): a blocked adoption of owed files is still queued (the
+  // run projection's rule, workspace-restore-recovery-state.ts), never failed.
+  const state = owedRestoreAdoptionBlocked(evidence) ? { ...stored, status: "queued" as const } : stored;
   return { status: state.status, stage: state.stage,
     canRetry: state.status === "blocked" && state.retryable === true && !exhaustedStopWait(readSystemRecovery(evidence), evidence),
     message: state.status === "queued" || state.status === "recovering" ? "Recovering saved work…"
