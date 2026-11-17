@@ -36,14 +36,9 @@ const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("h
 const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
 const completed = new Set(["saved", "unchanged", "resolved"]);
 const MAX_COLLECTION_ATTEMPTS = 3;
-export const INSTRUCTION_COPY_RETRY_MS = 30_000;
-export const INSTRUCTION_COPY_MAX_RETRY_MS = 6 * 60 * 60_000;
+import { instructionCopyRetryAt, INSTRUCTION_COPY_RETRY_MS } from "./instruction-copy-retry.js";
+export { instructionCopyRetryAt, INSTRUCTION_COPY_RETRY_MS, INSTRUCTION_COPY_MAX_RETRY_MS } from "./instruction-copy-retry.js";
 const settledStates = new Set(["saved", "unchanged", "resolved", "unavailable", "conflict"]);
-
-export function instructionCopyRetryAt(waitingSince: Date, now = Date.now()) {
-  const waited = Math.max(0, now - waitingSince.getTime());
-  return new Date(now + Math.min(INSTRUCTION_COPY_MAX_RETRY_MS, Math.max(INSTRUCTION_COPY_RETRY_MS, Math.floor(waited / 2))));
-}
 
 // Only orchestration can register a live target; tools and HTTP callers cannot
 // supply one. These handles are optional: durable captured bytes survive restart.

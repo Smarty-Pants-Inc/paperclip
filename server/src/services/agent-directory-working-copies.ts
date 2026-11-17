@@ -1,4 +1,5 @@
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
+import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
 import { agentFileHoldWriteCondition, pinLeaseForCollection, unpinLeaseForCollection } from "./agent-file-save-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -46,11 +47,6 @@ export function agentFileSaveHeld(row: Pick<Copy, "state" | "receipt"> | null | 
  * preparation failed before provider use, or exact destruction was proven. */
 function settled(row: Copy): boolean {
   return completed.has(row.state) || row.state === "unavailable" && !agentFileSaveHeld(row);
-}
-const SAVE_RETRY_MS = 30_000;
-const SAVE_MAX_RETRY_MS = 6 * 60 * 60_000;
-function saveRetryAt(since: Date, now = Date.now()) {
-  return new Date(now + Math.min(SAVE_MAX_RETRY_MS, Math.max(SAVE_RETRY_MS, Math.floor(Math.max(0, now - since.getTime()) / 2))));
 }
 function withoutSaveHold(receipt: Record<string, unknown> | null | undefined) {
   const { savePending: _savePending, ...rest } = receipt ?? {};
@@ -510,7 +506,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   function retryHeldSave(row: Copy) {
     const since = (row.receipt?.savePending as { since?: string } | undefined)?.since;
     return patch(row, { errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
-      nextAttemptAt: saveRetryAt(typeof since === "string" ? new Date(since) : row.processStoppedAt ?? row.createdAt) });
+      nextAttemptAt: instructionCopyRetryAt(typeof since === "string" ? new Date(since) : row.processStoppedAt ?? row.createdAt) });
   }
   function holdUnsaved(row: Copy, errorCode: string, failure: unknown, storageWarning: string | null, mirrorHash?: string) {
     const stoppedAt = row.processStoppedAt ?? new Date();
@@ -518,7 +514,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
     const reason = failure instanceof HttpError || failure instanceof AgentFileLimitError || failure instanceof Error ? failure.message : String(failure);
     return patch(row, { state: "unavailable", processStoppedAt: stoppedAt, errorCode, errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
-      nextAttemptAt: saveRetryAt(since),
+      nextAttemptAt: instructionCopyRetryAt(since),
       receipt: { ...row.receipt, storageWarning, savePending: { since: since.toISOString(), code: errorCode, reason: reason.slice(0, 500),
         failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}) } } },
       // Same lease row lock as every destroy claim; refused once a destroy is claimed.
