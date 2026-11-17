@@ -10811,8 +10811,18 @@ done
                 .collect::<Vec<_>>();
                 let actual =
                     normalize_provider_notification(&mut state, "item/completed", &params).unwrap();
-                assert_eq!(actual, expected, "{provider} {channel}");
                 assert_eq!(actual[0].payload["channel"], "progress");
+                // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z):
+                // was assert_eq!(actual, expected) and a 4,000-character text
+                // ("…[truncated]") for every provider, pi_rpc included. A Pi
+                // progress message is shown in the person's task chat: it now
+                // arrives whole. Other providers keep the codex preview.
+                if provider == "pi_rpc" {
+                    assert_eq!(actual[0].payload["text"], "x".repeat(5_000));
+                    assert!(!actual[0].payload.to_string().contains("truncat"));
+                    continue;
+                }
+                assert_eq!(actual, expected, "{provider} {channel}");
                 assert_eq!(
                     actual[0].payload["text"].as_str().unwrap().chars().count(),
                     4_000

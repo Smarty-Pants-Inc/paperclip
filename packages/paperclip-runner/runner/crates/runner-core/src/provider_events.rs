@@ -2663,6 +2663,45 @@ mod tests {
         assert!(!reply.payload["text"].as_str().unwrap().contains("/runner"));
     }
 
+    // Paul NOTE 5: a Pi progress message and a failed Pi item's message reach
+    // the person's task chat and transcript; neither is cut at 4,000
+    // characters with "…[truncated]".
+    #[test]
+    fn pi_progress_message_and_failed_item_message_arrive_whole() {
+        let long = format!(
+            "token=pi-secret {}",
+            "Checking the next file, then the tests. ".repeat(250)
+        );
+        assert!(long.chars().count() > 4_000);
+        let progress = normalize_pi_notification_in(
+            "item/completed",
+            &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:note",
+                "kind":"agentMessage", "channel":"progress",
+                "item":{"id":"turn:note", "type":"agentMessage", "text": long, "phase":"commentary"}}),
+            None,
+        );
+        let note = progress
+            .iter()
+            .find(|event| event.event_type == "item.completed")
+            .unwrap();
+        assert_eq!(note.payload["channel"], "progress");
+        assert_eq!(
+            note.payload["text"],
+            long.replace("pi-secret", "[REDACTED]")
+        );
+        let failed = normalize_pi_notification_in(
+            "item/failed",
+            &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:tool",
+                "kind":"commandExecution", "message": long}),
+            None,
+        );
+        assert_eq!(
+            failed[0].payload["message"],
+            long.replace("pi-secret", "[REDACTED]")
+        );
+        assert!(!failed[0].payload.to_string().contains("truncat"));
+    }
+
     #[test]
     fn pi_compaction_keeps_each_native_identity_reason_and_typed_measurements() {
         let compaction = |id: &str| {

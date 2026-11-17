@@ -4706,10 +4706,16 @@ mod tests {
     #[test]
     fn keeps_the_complete_final_answer_instead_of_a_display_preview() {
         let config = config(PathBuf::from("unused"));
-        let mut state = DurableState::new(&config);
         let answer = format!("token=secret-value {}", "Every open task. ".repeat(400));
         assert!(answer.len() > 4_096);
-        for (channel, complete) in [("final", true), ("progress", false)] {
+        // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was
+        // [("final", true), ("progress", false)]: a progress message (shown in
+        // the person's task chat) kept the 4,096-byte preview ending
+        // "…[truncated]". Now it is kept whole when it fits a frame, like the
+        // final answer.
+        for (channel, complete) in [("final", true), ("progress", true)] {
+            // One outbox per channel: two whole answers exceed the test outbox.
+            let mut state = DurableState::new(&config);
             state
                 .enqueue_event(
                     &config,
@@ -4797,6 +4803,36 @@ mod tests {
             Some(whole.len() as u64)
         );
         assert_eq!(std::fs::read_to_string(path).unwrap(), whole);
+    }
+
+    // Paul NOTE 5: a failed Pi item's message is shown in the person's
+    // transcript (ui adapters/paperclip-runner index.ts item.failed); it is kept
+    // whole when it fits a frame, never the 4,096-byte "…[truncated]" preview.
+    #[test]
+    fn pi_failed_item_message_leaves_the_outbox_whole() {
+        let frame = config(PathBuf::from("unused"));
+        let mut state = DurableState::new(&frame);
+        let message = format!(
+            "token=secret-value {}",
+            "Pi tool failed: line\n".repeat(500)
+        );
+        assert!(message.len() > 4_096);
+        state
+            .enqueue_event(
+                &frame,
+                "item.failed",
+                EventPriority::P1,
+                json!({"provider": "pi_rpc", "kind": "commandExecution", "status": "failed",
+                    "channel": "detail", "message": message}),
+            )
+            .unwrap();
+        let shown = state.outbox[0]
+            .envelope
+            .pointer("/payload/payload/message")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(shown, message.replace("secret-value", "[REDACTED]"));
+        assert!(!shown.contains("truncat"));
     }
 
     // Paul NOTE 5: a projector's agent-facing reference to an answer longer
