@@ -759,20 +759,20 @@ async function bindWorkspaceSeedGitArchive(input: {
   sourcePath: string; targetPath: string; directory: string;
   git: GitWorkspaceSnapshot | null; repositories: NonNullable<GitWorkspaceSnapshot["repositories"]>;
 }): Promise<void> {
-  await fs.copyFile(input.sourcePath, input.targetPath, fsConstants.COPYFILE_FICLONE);
+  await hostMutation(() => fs.copyFile(input.sourcePath, input.targetPath, fsConstants.COPYFILE_FICLONE));
   const entries: string[] = [];
   const bind = async (relative: string, snapshot: GitWorkspaceSnapshot) => {
     if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(snapshot.headCommit)) throw new Error("workspace_seed_git_head_invalid");
     const headPath = path.posix.join(relative, ".git", "HEAD");
-    await fs.mkdir(path.dirname(path.join(input.directory, headPath)), { recursive: true });
-    if (snapshot.branchName === null) await fs.writeFile(path.join(input.directory, headPath), `${snapshot.headCommit}\n`);
+    await hostMutation(() => fs.mkdir(path.dirname(path.join(input.directory, headPath)), { recursive: true }));
+    if (snapshot.branchName === null) await hostMutation(() => fs.writeFile(path.join(input.directory, headPath), `${snapshot.headCommit}\n`));
     else {
       await execFile("git", ["check-ref-format", "--branch", snapshot.branchName]);
       const ref = `refs/heads/${snapshot.branchName}`;
       const refPath = path.posix.join(relative, ".git", ref);
-      await fs.mkdir(path.dirname(path.join(input.directory, refPath)), { recursive: true });
-      await fs.writeFile(path.join(input.directory, refPath), `${snapshot.headCommit}\n`);
-      await fs.writeFile(path.join(input.directory, headPath), `ref: ${ref}\n`);
+      await hostMutation(() => fs.mkdir(path.dirname(path.join(input.directory, refPath)), { recursive: true }));
+      await hostMutation(() => fs.writeFile(path.join(input.directory, refPath), `${snapshot.headCommit}\n`));
+      await hostMutation(() => fs.writeFile(path.join(input.directory, headPath), `ref: ${ref}\n`));
       entries.push(refPath);
     }
     entries.push(headPath);
@@ -785,7 +785,7 @@ async function bindWorkspaceSeedGitArchive(input: {
   if (input.git) await bind("", input.git);
   else for (const repository of input.repositories) await bindChild("", repository);
   const list = path.join(input.directory, "entries.nul");
-  await fs.writeFile(list, entries.join("\0") + "\0");
+  await hostMutation(() => fs.writeFile(list, entries.join("\0") + "\0"));
   await execTar(["-rf", input.targetPath, "-C", input.directory, "--null", "-T", list]);
 }
 
@@ -901,7 +901,7 @@ async function copyDurableSeedArchive(input: {
   ) {
     throw new Error("workspace_durable_seed_digest_mismatch");
   }
-  await fs.copyFile(input.sourcePath, input.targetPath, fsConstants.COPYFILE_FICLONE);
+  await hostMutation(() => fs.copyFile(input.sourcePath, input.targetPath, fsConstants.COPYFILE_FICLONE));
 }
 
 async function persistDurableSeedArchive(input: {
@@ -909,7 +909,7 @@ async function persistDurableSeedArchive(input: {
   targetPath: string;
 }): Promise<void> {
   const parent = path.dirname(input.targetPath);
-  await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+  await hostMutation(() => fs.mkdir(parent, { recursive: true, mode: 0o700 }));
   const parentStat = await fs.lstat(parent);
   if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
     throw new Error("workspace_durable_seed_root_invalid");
@@ -925,11 +925,11 @@ async function persistDurableSeedArchive(input: {
     `.${path.basename(input.targetPath)}.${randomUUID()}.tmp`,
   );
   try {
-    await fs.copyFile(input.sourcePath, temporary, fsConstants.COPYFILE_FICLONE);
-    await fs.chmod(temporary, 0o600);
-    await fs.rename(temporary, input.targetPath);
+    await hostMutation(() => fs.copyFile(input.sourcePath, temporary, fsConstants.COPYFILE_FICLONE));
+    await hostMutation(() => fs.chmod(temporary, 0o600));
+    await hostMutation(() => fs.rename(temporary, input.targetPath));
   } finally {
-    await fs.rm(temporary, { force: true }).catch(() => undefined);
+    await hostCleanup(() => fs.rm(temporary, { force: true }).catch(() => undefined));
   }
 }
 
@@ -970,7 +970,7 @@ export async function createTarballFromDirectory(input: {
     const excludeArgs = ["._*", ...(input.exclude ?? [])]
       .flatMap((entry) => ["--exclude", entry, ...(explicitEntries ? ["--exclude", `${entry}/*`] : [])]);
     const list = path.join(directory, "entries.nul");
-    const file = await fs.open(list, "wx", 0o600);
+    const file = await hostMutation(() => fs.open(list, "wx", 0o600));
     const ancestors = new Set<string>();
     const writeEntries = async (relative = ""): Promise<void> => {
       const localPath = path.join(input.localDir, relative);
@@ -983,7 +983,7 @@ export async function createTarballFromDirectory(input: {
         for await (const entry of await fs.opendir(localPath)) {
           const name = relative ? path.posix.join(relative, entry.name) : entry.name;
           if (ownedPaths.has(name)) continue;
-          await file.writeFile(`${name}\0`);
+          await hostMutation(() => file.writeFile(`${name}\0`));
           if (explicitEntries && (entry.isDirectory() || (input.followSymlinks && entry.isSymbolicLink()
             && (await fs.stat(path.join(input.localDir, name))).isDirectory()))) {
             await writeEntries(name);
@@ -1056,7 +1056,7 @@ export async function exportSandboxWorkspaceSnapshot(input: {
   stagingDir: string;
   operationId: string;
 }): Promise<void> {
-  await fs.mkdir(input.stagingDir, { recursive: true });
+  await hostMutation(() => fs.mkdir(input.stagingDir, { recursive: true }));
   if ((await fs.readdir(input.stagingDir)).length) throw new Error("Workspace snapshot destination is not empty");
   const operations: SandboxSyncOperation[] = [{
     operationId: input.operationId,
@@ -1083,7 +1083,7 @@ export async function restoreVerifiedSnapshotArchive(input: {
   }
   if (size !== input.byteSize || hash.digest("hex") !== input.sha256)
     throw new Error("Workspace snapshot digest changed");
-  await fs.mkdir(input.localDir, { recursive: true });
+  await hostMutation(() => fs.mkdir(input.localDir, { recursive: true }));
   if ((await fs.readdir(input.localDir)).length) throw new Error("Workspace snapshot destination is not empty");
   await extractTarballToDirectory(input);
   await confineFullWorkspaceExport(input.localDir, true);
@@ -1095,28 +1095,29 @@ async function copyWorkspaceEntry(sourceRoot: string, targetRoot: string, relati
   const stats = await fs.lstat(sourcePath);
 
   if (stats.isDirectory()) {
-    await fs.mkdir(targetPath, { recursive: true });
+    await hostMutation(() => fs.mkdir(targetPath, { recursive: true }));
     return;
   }
 
-  await fs.mkdir(path.dirname(targetPath), { recursive: true });
-  await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
+  await hostMutation(() => fs.mkdir(path.dirname(targetPath), { recursive: true }));
+  await hostMutation(() => fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined));
   if (stats.isSymbolicLink()) {
     const linkTarget = await fs.readlink(sourcePath);
-    await fs.symlink(linkTarget, targetPath);
+    await hostMutation(() => fs.symlink(linkTarget, targetPath));
     return;
   }
 
   const stagedTargetPath = buildUniqueStagingPath({ targetPath, suffix: ".paperclip-copy" });
-  await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+  await hostCleanup(() => fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined));
   try {
-    await fs.copyFile(sourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
-      await fs.copyFile(sourcePath, stagedTargetPath);
+    await hostMutation(() => fs.copyFile(sourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE)).catch(async (error) => {
+      if ((error as { code?: unknown }).code === "HOST_MUTATION_REFUSED") throw error;
+      await hostMutation(() => fs.copyFile(sourcePath, stagedTargetPath));
     });
-    await fs.chmod(stagedTargetPath, stats.mode);
-    await fs.rename(stagedTargetPath, targetPath);
+    await hostMutation(() => fs.chmod(stagedTargetPath, stats.mode));
+    await hostMutation(() => fs.rename(stagedTargetPath, targetPath));
   } finally {
-    await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    await hostCleanup(() => fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined));
   }
 }
 
@@ -1125,7 +1126,7 @@ export async function mirrorDirectory(
   targetDir: string,
   options: { preserveAbsent?: string[] } = {},
 ): Promise<void> {
-  await fs.mkdir(targetDir, { recursive: true });
+  await hostMutation(() => fs.mkdir(targetDir, { recursive: true }));
   const preserveAbsent = new Set(options.preserveAbsent ?? []);
   const shouldPreserveAbsent = (relative: string) =>
     [...preserveAbsent].some((candidate) => isRelativePathOrDescendant(relative, candidate));
@@ -1137,7 +1138,7 @@ export async function mirrorDirectory(
       throw error;
     });
     if (!sourceExists) {
-      await fs.rm(path.join(targetDir, relative), { recursive: true, force: true }).catch(() => undefined);
+      await hostMutation(() => fs.rm(path.join(targetDir, relative), { recursive: true, force: true }).catch(() => undefined));
     }
   }
 
@@ -1166,7 +1167,7 @@ async function copySelectedWorkspaceEntries(input: {
   ignoredPaths?: WorkspacePaths;
   exclude: string[];
 }): Promise<void> {
-  await fs.mkdir(input.targetDir, { recursive: true });
+  await hostMutation(() => fs.mkdir(input.targetDir, { recursive: true }));
   const { sourceDir, dev, ino } = input.sourceRoot;
   const assertSourceRoot = async () => {
     const current = await fs.lstat(sourceDir);
@@ -1464,8 +1465,8 @@ export async function prepareSandboxManagedRuntime(input: {
     if (input.workspaceBaseline && input.workspaceBaseline !== baselineSnapshot) await disposeDirectorySnapshot(input.workspaceBaseline);
     await disposeGitWorkspaceSnapshot(gitSnapshot);
     if (!gitSnapshot) for (const repo of repositories) await disposeGitWorkspaceSnapshot(repo.snapshot);
-    if (managedIgnored) await fs.rm(path.dirname(managedIgnored.filePath), { recursive: true, force: true });
-    if (filesystemDeleted) await fs.rm(path.dirname(filesystemDeleted.filePath), { recursive: true, force: true });
+    if (managedIgnored) { const dir = path.dirname(managedIgnored.filePath); await hostCleanup(() => fs.rm(dir, { recursive: true, force: true })); }
+    if (filesystemDeleted) { const dir = path.dirname(filesystemDeleted.filePath); await hostCleanup(() => fs.rm(dir, { recursive: true, force: true })); }
   };
   try {
   // A selected subfolder has no cloneable Git snapshot, but its parent
@@ -1826,12 +1827,12 @@ export async function prepareSandboxManagedRuntime(input: {
                           const stat = await fs.lstat(parent).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
                           if (stat && !stat.isDirectory()) return false;
                         }
-                        await fs.rm(path.join(verifiedRoot, relative), { recursive: true, force: true });
+                        await hostMutation(() => fs.rm(path.join(verifiedRoot, relative), { recursive: true, force: true }));
                       }
                       const verified = await runStepSpan("workspace.seed_snapshot", () => captureWorkspaceSnapshot(verifiedRoot, { exclude: baselineSnapshot!.exclude, ignoredPaths: baselineSnapshot!.ignoredPaths, diskBacked: true }));
                       try { return directorySnapshotSha256(verified) === directorySnapshotSha256(baselineSnapshot!); }
                       finally { await disposeDirectorySnapshot(verified); }
-                    } finally { await runStepSpan("workspace.seed_cleanup", () => fs.rm(verifiedRoot, { recursive: true, force: true })); }
+                    } finally { await runStepSpan("workspace.seed_cleanup", () => hostCleanup(() => fs.rm(verifiedRoot, { recursive: true, force: true }))); }
                   }),
                 }));
             }
@@ -1900,7 +1901,7 @@ export async function prepareSandboxManagedRuntime(input: {
               ? Buffer.from(stageFile.contents)
               : stageFile.contents;
             const stageHostPath = path.join(tempDir, `${asset.key}.stage.${safeName}`);
-            await fs.writeFile(stageHostPath, stageBytes);
+            await hostMutation(() => fs.writeFile(stageHostPath, stageBytes));
             // A stage helper file (for example a merge script) is a read-only input
             // that the provision command reads; the agent does not change it and does
             // not keep it. So it is `access: "ro"` and never joins the writable set.
