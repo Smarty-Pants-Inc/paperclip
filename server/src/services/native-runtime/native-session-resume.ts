@@ -9,7 +9,8 @@ import type {
   PersistedNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
 import { canonicalNativeRuntimeContextDigest, parseNativeExecutionInput, type NativeRuntimeContextSnapshot } from "../../vendor/paperclip-runner/index.js";
-import { canBypassFailedNativePredecessor, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
+import { canBypassFailedNativePredecessor, refusedAtPriorOwnerFenceBeforeLaunch, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
+import { NATIVE_EXECUTION_START_EVENT_TYPES } from "../native-process-start-events.js";
 
 export type NativeToolExecutionTargetKind = "local" | "remote";
 
@@ -319,7 +320,8 @@ async function isUnstartedInheritedFollowUp(
         and prior.process_started_at is not distinct from ${heartbeatRuns.processStartedAt})`,
     processStart: sql<boolean>`exists (select 1 from ${heartbeatRunEvents} event
       where event.company_id = ${heartbeatRuns.companyId} and event.run_id = ${heartbeatRuns.id}
-        and event.event_type in ('native.process_identity_recorded', 'native.process_started'))`,
+        and (event.source_event_id is not null or event.source_instance_id is not null
+          or event.event_type in (${sql.join(NATIVE_EXECUTION_START_EVENT_TYPES.map(type => sql`${type}`), sql`, `)})))`,
     controllerCheckpoint: sql<boolean>`exists (select 1 from ${nativeRunnerCheckpoints}
       where ${nativeRunnerCheckpoints.companyId} = ${heartbeatRuns.companyId} and ${nativeRunnerCheckpoints.runId} = ${heartbeatRuns.id})`,
     result: sql<boolean>`exists (select 1 from ${nativeRunResults}
@@ -334,8 +336,13 @@ async function isUnstartedInheritedFollowUp(
       evidence.controllerCheckpoint || evidence.result || evidence.processStart) return false;
   const bootstrap = noProcess && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false && evidence.controllerPid === null;
   if (!bootstrap && !(piRecovery && (noProcess || evidence.inheritedProcess))) return false;
-  return canBypassFailedNativePredecessor(db, { companyId: input.companyId, runId: run.id,
-    predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime });
+  // A run the prior-owner fence refused inherited this checkpoint but never
+  // owned a runner or its recovery pointer: not a progress barrier. The
+  // caller still requires the source it walks back to to cover the same
+  // inherited checkpoint, and stops at the first attempt without either proof.
+  return await canBypassFailedNativePredecessor(db, { companyId: input.companyId, runId: run.id,
+    predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime })
+    || await refusedAtPriorOwnerFenceBeforeLaunch(db, { companyId: input.companyId, runId: run.id });
 }
 
 async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResumeSelection, skippedRunIds: string[]) {
