@@ -251,7 +251,18 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         const dump = gunzipSync(fs.readFileSync(backup.backupFile)).toString("utf8");
         fs.writeFileSync(backup.backupFile, gzipSync(dump.replaceAll(/^-- paperclip statement breakpoint .*$/gm, "")));
       }
-      const result = await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      const reportDir = createTempDir("existing-restore-report-");
+      const reportFile = path.join(reportDir, "violations.json");
+      const originalFile = path.join(reportDir, "original.json");
+      fs.writeFileSync(reportFile, "old public report", { mode: 0o644 });
+      fs.chmodSync(reportFile, 0o644);
+      fs.linkSync(reportFile, originalFile);
+      const result = await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile,
+        violationReportFile: reportFile });
+      expect(fs.statSync(reportFile).mode & 0o777).toBe(0o600);
+      // An existing public inode must never receive the private report content.
+      expect(fs.readFileSync(originalFile, "utf8")).toBe("old public report");
+      expect(fs.readdirSync(reportDir).sort()).toEqual(["original.json", "violations.json"]);
       expect(result).toMatchObject({ constraintViolations: [{
         schema: "public", table: "records", constraint: "required_value",
         definition: "CHECK ((value IS NOT NULL))", action: "not_valid", count: 8,
@@ -317,6 +328,64 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       expect(await targetSql`SELECT conname FROM pg_constraint WHERE conname IN ('no_overlap', 'unique_slot')`).toEqual([]);
       recordSchemaCatalogs(`invalid-exclusion-${engine}`, [...definitions], result);
       recordRestoreArtifacts(`invalid-exclusion-${engine}`, backup.backupFile, result.violationReportFile);
+    } finally {
+      await sourceSql.end();
+      await targetSql.end();
+    }
+  });
+
+  it.for(["javascript", "psql"])("restores temporal UNIQUE WITHOUT OVERLAPS violations through %s", { timeout: EMBEDDED_POSTGRES_TEST_TIMEOUT_MS }, async (engine, context) => {
+    if (engine === "psql" && !psqlAvailable) context.skip();
+    const previousPsql = process.env.PAPERCLIP_PSQL_PATH;
+    process.env.PAPERCLIP_PSQL_PATH = engine === "psql" ? testPsqlPath : "/bin/false";
+    cleanups.push(() => {
+      if (previousPsql === undefined) delete process.env.PAPERCLIP_PSQL_PATH;
+      else process.env.PAPERCLIP_PSQL_PATH = previousPsql;
+    });
+    const cluster = await createTempDatabase();
+    const source = await createSiblingDatabase(cluster, "temporal_source");
+    const target = await createSiblingDatabase(cluster, "temporal_restore");
+    const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+    const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+    try {
+      const [version] = await sourceSql`SELECT current_setting('server_version_num')::int AS version`;
+      if (version!.version < 180000) context.skip();
+      // RFL's temporal18.1 case: equal bucket, unequal but overlapping periods.
+      await sourceSql.unsafe(`
+        CREATE TABLE public.periods (id integer PRIMARY KEY, bucket int4range, period int4range,
+          CONSTRAINT temporal_unique UNIQUE (bucket, period WITHOUT OVERLAPS));
+        INSERT INTO public.periods VALUES (1, '[0,1)', '[1,3)'), (2, '[0,1)', '[3,5)');
+      `);
+      const [constraint] = await sourceSql`SELECT contype, conperiod, pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint WHERE conname = 'temporal_unique'`;
+      expect(constraint).toMatchObject({ contype: "u", conperiod: true });
+      const backup = await runDatabaseBackup({ connectionString: source,
+        backupDir: createTempDir("temporal-"), backupEngine: "javascript",
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      const cleanDump = gunzipSync(fs.readFileSync(backup.backupFile)).toString("utf8");
+      const throughEngine = (dump: string) => engine === "psql"
+        ? dump.replaceAll(/^-- paperclip statement breakpoint .*$/gm, "") : dump;
+      fs.writeFileSync(backup.backupFile, gzipSync(throughEngine(cleanDump)));
+      const cleanResult = await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      expect(cleanResult.constraintViolations).toEqual([]);
+      const sourceCatalog = await readSchemaCatalog(sourceSql);
+      const restoredCatalog = await readSchemaCatalog(targetSql);
+      expect(restoredCatalog).toEqual(sourceCatalog);
+      recordSchemaCatalogs(`temporal-clean-${engine}`, sourceCatalog, restoredCatalog);
+      expect(cleanDump).toContain("[3,5)");
+      fs.writeFileSync(backup.backupFile, gzipSync(throughEngine(cleanDump.replace("[3,5)", "[2,4)"))));
+      const result = await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      expect(result.constraintViolations).toEqual([{
+        schema: "public", table: "periods", constraint: "temporal_unique",
+        definition: constraint!.definition, action: "skipped", count: 2,
+        samplePrimaryKeys: [{ id: 1 }, { id: 2 }],
+      }]);
+      expect(await targetSql`SELECT id, period::text FROM public.periods ORDER BY id`).toEqual([
+        { id: 1, period: "[1,3)" }, { id: 2, period: "[2,4)" },
+      ]);
+      expect(await targetSql`SELECT conname FROM pg_constraint WHERE conname = 'temporal_unique'`).toEqual([]);
+      recordSchemaCatalogs(`temporal-invalid-${engine}`, { version, constraint }, result);
+      recordRestoreArtifacts(`temporal-invalid-${engine}`, backup.backupFile, result.violationReportFile);
     } finally {
       await sourceSql.end();
       await targetSql.end();
