@@ -5,7 +5,10 @@
 // history (retry-fresh). The notice names that same single action, never
 // "send a new message" or "assign a new task" beside an offered Retry.
 export const HELD_RETRY_ACTION = "Press Retry to continue in a fresh run with this conversation's history.";
-export const HELD_PREDECESSOR_NOTICE = `Your message and saved work are kept, but the previous run of this conversation did not finish. ${HELD_RETRY_ACTION}`;
+// retry-fold6 (rf-3 FAIL 3): the held condition; the instruction after it is the
+// one Retry authority's (task-retry-eligibility.ts heldConversationNoticeText).
+export const HELD_CONDITION = "Your message and saved work are kept, but the previous run of this conversation did not finish.";
+export const HELD_PREDECESSOR_NOTICE = `${HELD_CONDITION} ${HELD_RETRY_ACTION}`;
 export const HELD_RECOVERED_WORK_MESSAGE = `Saved work recovered, but the previous run of this conversation did not finish. ${HELD_RETRY_ACTION}`;
 // Only where Retry is NOT offered for another reason (Retry's own source check
 // refuses, e.g. a managing agent's Stop): the held thread meets the same fence

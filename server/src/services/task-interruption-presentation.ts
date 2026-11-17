@@ -23,7 +23,7 @@ import { canonicalExecutionUuid } from "./execution-identity.js";
 import { chatActionDeadline } from "./chat-action-work.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { isAcknowledgedLegacyUserStop, isQueuedDependencyWait, runStopPresentationJson } from "./run-cancellation.js";
-import { decideRetryAuthority, heldRetryOffersRetry, readRestoreHoldEvidence, readRetryAuthorityFacts } from "./task-retry-eligibility.js";
+import { decideRetryAuthority, heldConversationNoticeText, heldRetryOffersRetry, readRestoreHoldEvidence, readRetryAuthorityFacts } from "./task-retry-eligibility.js";
 import { readRetryStopGate, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON, RETRY_STOP_WAIT_MESSAGE } from "./task-retry-stop-gate.js";
 import { exhaustedNativeFinalizationCondition, savedResultRetryPendingCondition } from "./native-runtime/exhausted-finalization-retry.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
@@ -950,7 +950,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     // A restore hold that already withheld Retry gets its words from the
     // authority, which delegates to restore-card's exports (no veto added here).
     const restoreHold = presentation.canRetry ? null : await readRestoreHoldEvidence(db, { companyId, issueId });
-    const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId, issueId }), stopGate,
+    const facts = await readRetryAuthorityFacts(db, { companyId, issueId });
+    const authority = decideRetryAuthority({ ...facts, stopGate,
       automaticRecovery, restoreHold, retrySource: presentation.canRetry });
     if (authority.canRetry) continue;
     // Judge R9: Paperclip is continuing by itself; the card says so in the
@@ -961,7 +962,21 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     }
     presentation.canRetry = false;
     delete presentation.retryAction;
-    if (presentation.notice?.code === "native_prior_owner_held") delete presentation.notice;
+    // rf-3 FAIL 3: a standing held note names the instruction the authority gave
+    // when it was posted. Where the authority now gives another one (a paused
+    // agent: Resume), the card supersedes it with ONE note: the held condition
+    // and the authority's current instruction; nothing else says an action.
+    if (presentation.notice?.code === "native_prior_owner_held" || facts.heldConversation) {
+      if (authority.userAction === "resume" && authority.nextAction && presentation.state !== "working"
+        && (!presentation.retryWait || presentation.retryWait.reason === authority.reason)
+        && (!presentation.userAction || presentation.userAction === "resume")) {
+        presentation.notice = { code: "native_prior_owner_held", text: heldConversationNoticeText(authority) };
+        delete presentation.retryWait;
+        if (!presentation.userAction) presentation.userAction = "resume";
+        continue;
+      }
+      if (presentation.notice?.code === "native_prior_owner_held") delete presentation.notice;
+    }
     if (presentation.state === "working") continue;
     if (authority.userAction === "resume" && !presentation.userAction) presentation.userAction = "resume";
     // One instruction: a card that already asks the person for its own action
