@@ -1,6 +1,7 @@
 import { and, desc, eq, inArray, sql, type AnyColumn, type SQL } from "drizzle-orm";
 import { executionWorkspaces, executionWorkspaceSnapshots, heartbeatRuns, issueRecoveryActions, workspaceOperations, type Db } from "@paperclipai/db";
-import { readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type ExecutionBlocker } from "@paperclipai/shared";
+import { readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, WORKSPACE_RESTORE_PENDING_KEY,
+  WORKSPACE_RESTORE_PERSON_BOUND_MS, type ExecutionBlocker } from "@paperclipai/shared";
 import { z } from "zod";
 import { readNativeWorkspaceSyncReference, type NativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
@@ -62,10 +63,25 @@ export function recoveredWorkMessage(runStatus: string | null | undefined, retry
     : "Saved work recovered. Send a message to continue.";
 }
 
+/** The person bound (RFL 15:09Z): owed files the worker still has queued or
+ * recovering WORKSPACE_RESTORE_PERSON_BOUND_MS after the hold was written. The
+ * same rule as the run projection (workspace-restore-recovery-state.ts). */
+export function workspaceRestoreDelayed(state: { status: string } | undefined, evidence: Record<string, unknown>,
+  holdWrittenAt: Date | null | undefined, now = Date.now()) {
+  return Boolean(state && (state.status === "queued" || state.status === "recovering")
+    && evidence[WORKSPACE_RESTORE_PENDING_KEY] === true
+    && holdWrittenAt && holdWrittenAt.getTime() + WORKSPACE_RESTORE_PERSON_BOUND_MS <= now);
+}
+
 export function savedWorkOffersRetry(state: { status: string; canRetry: boolean } | undefined,
-  runStatus: string | null | undefined, workspaceRepairRequired: boolean, evidence: Record<string, unknown>) {
+  runStatus: string | null | undefined, workspaceRepairRequired: boolean, evidence: Record<string, unknown>,
+  holdWrittenAt?: Date | null) {
   if (!state || (runStatus !== "failed" && runStatus !== "timed_out")) return false;
   if (state.status === "recovered") return !workspaceRepairRequired;
+  // Past the person bound Retry is offered while the worker continues: the
+  // accepted Retry is a durable intent bound to this hold (task-retry.ts), so it
+  // continues from the last saved version and the hold keeps the files.
+  if (workspaceRestoreDelayed(state, evidence, holdWrittenAt)) return true;
   const ownerRecovery = evidence.workspaceOwnerRecovery as { state?: unknown } | undefined;
   const recovery = readSystemRecovery(evidence);
   return state.canRetry && !(ownerRecovery?.state === "operator_required" && evidence.workspaceOwnerStop == null)
