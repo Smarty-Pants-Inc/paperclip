@@ -272,6 +272,7 @@ import {
   sql,
 } from "drizzle-orm";
 import {
+  activityLog,
   agentWakeupRequests,
   documentRevisions,
   environments,
@@ -6799,6 +6800,90 @@ async function pendingLifecycleCommandsIssuedByStop(db: Db, root: string, identi
   }
 }
 
+/** Commands only the close of a warm owner queues: its suspension barrier and
+ * its drain (paperclip-runner runnerd-codex-transport.ts). */
+const CLOSE_ISSUED_LIFECYCLE_COMMAND_PREFIXES: Record<string, string> = {
+  "runner.suspend": "command_close_suspend_", "runner.drain": "command_close_drain_" };
+/** Close outcomes that mean the close ended with the Runner's suspend never
+ * acknowledged and the owner released (warmCloseFailureProvesOwnerGone). */
+const CLOSE_ENDED_UNSUSPENDED: ReadonlySet<string> = new Set(["release_without_checkpoint", "close_failed"]);
+
+/** s6409 TERM-before-ack (RFL + rf-3). The stopped warm owner's close ended
+ * without the Runner answering its runner.suspend, and that Runner generation
+ * was then retired. Its journal is frozen: no wait can settle it. The pending
+ * command does not count for the stopped run's direct successor only when all
+ * of these persisted facts hold, else the bounded wait below stays:
+ * (i) the close's own completion record on the stopped run's still-retained
+ *     lease row (environment_leases.metadata.nativeHarnessBackupMissing), and
+ *     every unsettled command is a pending command that close queued (its own
+ *     command id), journaled at or after the person's acknowledged Stop of
+ *     that run and no later than the close's record, in that run's own journal;
+ * (ii) the stopped run's retained-idle receipt (nativeRetainedIdleCheckpoint);
+ * (iii) that Runner generation proven gone: a TERM/KILL-confirmed holder
+ *     retirement of that run and Runner instance
+ *     (native.runner_port_holder_retired). An ended Boat lease or a stopped
+ *     generation already settles these commands in readSettledRunnerdProjection;
+ * (iv) this run is that run's direct successor: no other run of the same
+ *     conversation was created between them.
+ * Returns the journal projected without those commands, or null. */
+async function closedStopOwnerFrozenJournal(db: Db, root: string, identity: Record<string, unknown>,
+  execution: NativeExecutionInput): Promise<string | null> {
+  const { companyId, runId: successorRunId } = execution.binding;
+  const stoppedRunId = identity.runId, sessionId = identity.normalizedSessionId, runnerInstanceId = identity.runnerInstanceId;
+  if (typeof stoppedRunId !== "string" || typeof sessionId !== "string" || typeof runnerInstanceId !== "string") return null;
+  try {
+    const [stopped] = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, stoppedRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+    const stopAt = stopped ? acknowledgedUserStopRequestedAt(stopped) : null;
+    if (!stopped || stopAt === null) return null;
+    // (ii) The retained-idle receipt of this exact Stop.
+    const receipt = record(record(stopped.runnerProfileJson).nativeRetainedIdleCheckpoint);
+    if (receipt.schema !== "paperclip.native-retained-idle-checkpoint.v1" || receipt.runId !== stoppedRunId
+      || receipt.companyId !== companyId || receipt.sessionId !== sessionId) return null;
+    // (i) The close's own completion record on the stopped run's retained box.
+    const leases = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata }).from(environmentLeases)
+      .where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, stoppedRunId)));
+    const closedAt = leases.map(lease => lease.status === "retained" ? record(record(lease.metadata).nativeHarnessBackupMissing) : {})
+      .filter(marker => marker.runId === stoppedRunId && marker.sessionId === sessionId
+        && CLOSE_ENDED_UNSUSPENDED.has(String(marker.reason)) && typeof marker.at === "string")
+      .map(marker => Date.parse(String(marker.at))).filter(Number.isFinite).sort((left, right) => right - left)[0];
+    if (closedAt === undefined) return null;
+    const bytes = readBoundedNativeFile(resolve(root, "control-plane", "control-plane-state.json"),
+      NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8");
+    const control = record(JSON.parse(bytes));
+    if (record(control.identity).runId !== stoppedRunId || !Array.isArray(control.commands)) return null;
+    const commands = control.commands.map(record);
+    const unsettled = new Set(unsettledControllerCommands(commands));
+    const closeIssued = (command: Record<string, unknown>) => {
+      const prefix = CLOSE_ISSUED_LIFECYCLE_COMMAND_PREFIXES[String(command.type)];
+      const issuedAt = typeof command.issuedAt === "string" ? Date.parse(command.issuedAt) : Number.NaN;
+      return command.status === "pending" && prefix !== undefined && typeof command.commandId === "string"
+        && command.commandId.startsWith(prefix) && issuedAt >= stopAt && issuedAt <= closedAt;
+    };
+    if (unsettled.size === 0 || ![...unsettled].every(closeIssued)) return null;
+    // (iii) That exact Runner generation was stopped with TERM/KILL confirmed.
+    const [retired] = await db.select({ id: activityLog.id }).from(activityLog).where(and(eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "native.runner_port_holder_retired"),
+      sql`${activityLog.details}->>'holderRunId' = ${stoppedRunId}`,
+      sql`${activityLog.details}->>'holderRunnerInstanceId' = ${runnerInstanceId}`,
+      sql`${activityLog.details}->>'outcome' in ('stopped', 'killed')`)).limit(1);
+    if (!retired) return null;
+    // (iv) Direct successor: the newest run of this conversation before this one is the stopped run.
+    const [successor] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, successorRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+    if (!successor || successor.createdAt < stopped.createdAt) return null;
+    const [previous] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, stopped.agentId),
+        eq(heartbeatRuns.nativeSessionId, sessionId), ne(heartbeatRuns.id, successorRunId),
+        lt(heartbeatRuns.createdAt, successor.createdAt)))
+      .orderBy(desc(heartbeatRuns.createdAt)).limit(2);
+    if (previous?.id !== stoppedRunId) return null;
+    return JSON.stringify({ ...control, commands: commands.filter(command => !unsettled.has(command)) });
+  } catch {
+    return null;
+  }
+}
+
 /** A Runner lifecycle command that the person's acknowledged Stop issued is
  * still settling, not an unprovable owner. Wait for it through the same
  * predecessor-settle helper and bound as warm admission
@@ -6813,6 +6898,12 @@ async function retireAfterStopIssuedLifecycleCommands(input: Parameters<typeof i
   if (!refused.startsWith("journal_commands_unsettled(")
     || !await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
     return { retired: false, refused };
+  }
+  const frozen = await closedStopOwnerFrozenJournal(input.db, input.root, input.identity, input.execution);
+  if (frozen !== null) {
+    await input.onLog?.("stderr", `[paperclip-runner] run ${String(input.identity.runId)}'s closed Runner was retired; `
+      + "its Stop's unanswered lifecycle command no longer holds this conversation\n");
+    return retireFinishedPerTurnRunnerdOwner({ ...input, projectedControlBytes: frozen });
   }
   const deadline = predecessorSettleDeadline();
   await input.onLog?.("stderr", `[paperclip-runner] waiting for the Stop's runner lifecycle command of run ${String(input.identity.runId)}\n`);
