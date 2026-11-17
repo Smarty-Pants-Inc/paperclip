@@ -498,6 +498,8 @@ interface PiTurnState extends PiEventOrigin {
   projector: ReturnType<typeof createPiEventProjector>;
   lastText: string;
   lastErrorMessage?: string;
+  /** Provider-native Anthropic refusal, independent of its explanation text. */
+  policyRefused?: boolean;
   toolLimitFailure?: { code: string; message: string };
   hasToolCalls: boolean;
   /** Low-level agent_end is a continuation boundary, not prompt settlement. */
@@ -1661,6 +1663,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         // A real successful retry supersedes a transient failure. An empty
         // receipt is not proof of recovery and must not erase its diagnosis.
         turn.failed = false;
+        turn.policyRefused = false;
         turn.lastErrorMessage = undefined;
       }
       if (this.#streamTurn === turn) this.#streamTurn = null;
@@ -1707,7 +1710,8 @@ export class PiRpcHarnessSession implements HarnessSession {
       const providerMessage = (this.#resident?.context.api ?? this.#initialContext.api) === "anthropic-messages" && /\b413\b|request_too_large|request_body_too_large/i.test(providerCause)
         ? `${providerCause}\nRequest too large: reduce this agent's tools or ask the board. Paperclip did not trim tools or retry with a smaller catalog.` : providerCause;
       const error = turn.toolLimitFailure ?? (truncated ? { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false }
-        : turn.failed ? { code: "pi_provider_error", message: providerMessage }
+        : turn.failed ? { code: turn.policyRefused ? "provider_policy_refusal" : "pi_provider_error", message: providerMessage,
+          ...(turn.policyRefused ? { recoverable: false } : {}) }
         : empty ? { code: "opencode_empty_response", message: "Pi ended without a final answer or an accepted completion report.", recoverable: false } : undefined);
       await this.#finishTurn(turn, status, { piAgentSettled: true, ...(error && status === "failed" ? { error } : {}) });
       if (this.#nativeAbortSettled?.turn === turn) this.#nativeAbortSettled.resolve();
@@ -1918,6 +1922,7 @@ async function cleanPiPrivateDirectory(resident: Pick<PiResidentState, "socketPa
 
 function capturePiProviderFailure(turn: PiTurnState, message: Record<string, unknown>): void {
   turn.failed = true;
+  if (message.rawStopReason === "refusal") turn.policyRefused = true;
   turn.lastErrorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
     ? message.errorMessage : turn.lastErrorMessage ?? `Pi provider ended with ${typeof message.stopReason === "string" ? message.stopReason : "an error"}.`;
 }
