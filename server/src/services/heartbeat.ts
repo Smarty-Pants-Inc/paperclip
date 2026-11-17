@@ -3865,9 +3865,12 @@ export function heartbeatService(
         }
         if (err instanceof NativeCancellationPendingRecoveryError) {
           await preserveNativeWorkspaceOnFailure();
+          // Finish the Stop already recorded on the run, with its requested
+          // code and initiator (a person or an authorized managing agent).
           await cancelRunInternal(
             run.id,
             "Recovered durable native run cancellation",
+            { recoverRecordedCancellation: true },
           );
           return;
         }
