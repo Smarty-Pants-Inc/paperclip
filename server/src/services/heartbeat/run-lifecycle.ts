@@ -52,7 +52,9 @@ import {
   hasAcknowledgedNativeReassignmentStopIntent,
   hasAcknowledgedNativeLifecycleStopIntent,
   hasAcknowledgedNativeStopIntent,
+  hasAuthorizedManagementStopRecord,
   hasRecordedUserStopRequest,
+  recordedStopErrorCode,
   recordedUserStopRequestSql,
 } from "../acknowledged-native-stop.js";
 import { connectionIntentService } from "../connection-intents.js";
@@ -1449,7 +1451,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       }
 
       // Teardown can beat the cancellation finalizer. Preserve the acknowledged
-      // user intent instead of reporting an infrastructure interruption.
+      // user or authorized managing-agent intent instead of reporting an
+      // infrastructure interruption.
       if (hasRecordedUserStopRequest(run) || hasAcknowledgedNativeStopIntent(run) || hasAcknowledgedNativeReassignmentStopIntent(run)
         || hasAcknowledgedNativeLifecycleStopIntent(run)) terminalStatus = "cancelled";
 
@@ -1468,7 +1471,11 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
             run.errorCode ??
             (terminalStatus === "interrupted"
               ? "lease_released_before_terminal"
-              : null),
+              // An authorized managing agent's acknowledged Stop keeps the
+              // code it asked for (operator_interrupted), like its finalizer.
+              : terminalStatus === "cancelled" && hasAuthorizedManagementStopRecord(run) && hasAcknowledgedNativeStopIntent(run)
+                ? recordedStopErrorCode(run)
+                : null),
         },
         undefined,
         terminalStatus === "cancelled" ? undefined : not(recordedUserStopRequestSql()),
