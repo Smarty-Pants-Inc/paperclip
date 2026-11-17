@@ -44,7 +44,7 @@ import { CONTROLLER_LEASE_LOST_FAILURE_CODE, hasLiveLegacyController, legacyCont
 import { isCompletedOnboardingHandoffWake } from "../chat-completion-delivery.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { NATIVE_STATUS_COMMITTER_ACTOR_ID } from "../issue-rewake-throttle.js";
-import { isWaitingConversation, settleConversationTurnForRun, deliverConversationComments, latestPersonMessageTurnRunId, redeliverUnansweredConversationTurn } from "../agent-conversations.js";
+import { isWaitingConversation, settleConversationTurnForRun, deliverConversationComments, latestPersonMessageTurn, redeliverUnansweredConversationTurn } from "../agent-conversations.js";
 import {
   and,
   asc,
@@ -5029,10 +5029,11 @@ export function recoveryService(
         if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { result.skipped += 1; continue; }
         // A succeeded turn with no durable response did not answer its message (R-SILENT).
         // Keyed on the run that carried the person's latest message, not the latest
-        // run: an unrelated later success must not hide it (D129/D150/D151/D183).
-        const messageTurnRunId = await latestPersonMessageTurnRunId(db, issue);
-        if (messageTurnRunId && await redeliverUnansweredConversationTurn(db, issue, messageTurnRunId, deps.enqueueWakeup,
-          { onDeferredDeadline: opts?.onDeferredDeadline }) === "redelivered") {
+        // run: an unrelated later success must not hide it (D129/D150/D151/D183),
+        // nor hide upstream's failed-turn card for it.
+        const messageTurn = await latestPersonMessageTurn(db, issue);
+        if (messageTurn && await redeliverUnansweredConversationTurn(db, issue, messageTurn.runId, deps.enqueueWakeup,
+          { onDeferredDeadline: opts?.onDeferredDeadline, messageId: messageTurn.messageId }) === "redelivered") {
           result.continuationRequeued += 1;
           result.issueIds.push(issue.id);
           continue;

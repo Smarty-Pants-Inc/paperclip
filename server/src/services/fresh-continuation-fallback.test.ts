@@ -357,6 +357,26 @@ suite("fresh-continuation fallback", () => {
     expect(runs.map(r => r.contextSnapshot?.wakeCommentId)).toEqual([f.messageId]);
   }, 120_000);
 
+  // Item 2 boundary (stack135 r3): upstream keeps a failed turn while it is the
+  // task's latest attempt (the card offers Retry), and a person's Stop is never
+  // restarted. The redelivery re-offers only a failed turn the card no longer shows.
+  it.each(["failed_is_latest", "cancelled_then_unrelated_success"] as const)("a person's %s turn is left to its upstream owner, never redelivered", async shape => {
+    const t = new Date(Date.now() - 600_000);
+    const f = await silentConversationTurn(t);
+    await db.update(heartbeatRuns).set({ status: shape === "failed_is_latest" ? "failed" : "cancelled", errorCode: shape === "failed_is_latest" ? "adapter_failed" : "cancelled",
+      error: "adapter failed before an answer" }).where(eq(heartbeatRuns.id, f.runId));
+    if (shape !== "failed_is_latest") await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId, invocationSource: "timer",
+      status: "succeeded", createdAt: new Date(t.getTime() + 5_000), startedAt: new Date(t.getTime() + 10_000), finishedAt: new Date(t.getTime() + 20_000),
+      responsibleUserId: userId, contextSnapshot: { issueId: f.issueId, wakeReason: "heartbeat_timer", wakeSource: "timer" } });
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass++) await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    const card = await taskInterruptionPresentation(db, await issue(f.issueId));
+    console.info(JSON.stringify({ rSilentUpstreamOwner: { shape, redeliveries: (await f.redeliveries()).length, card: card && { state: card.state, canRetry: card.canRetry } } }));
+    expect(await f.redeliveries()).toHaveLength(0);
+    if (shape === "failed_is_latest") expect(card).toMatchObject({ state: "failed", canRetry: true });
+  }, 120_000);
+
   // RFL 12:36Z regression probes. Keep reasons: executor exclusion is a data
   // safety boundary; these reproduce the recorded D10 failure paths.
   it.each(["queued", "succeeded", "older_answer"])("RFL F1 checks %s before any stop or note", async shape => {
@@ -2627,4 +2647,71 @@ suite("fresh-continuation fallback", () => {
     expect(visible).not.toMatch(raw);
     expect(visible).not.toMatch(/\/srv\/|token/);
   }, 60_000);
+  // Judge-only: same accepted native-result schema as the five-pass hardened gate.
+  // Original message has a consumed durable outbox receipt; run chronology is real.
+  it.each(["failed_then_unrelated_success", "array_only_then_unrelated_success", "array_only_no_timer"] as const)("named gap hardened %s has a truthful outcome by 120 seconds", async (shape) => {
+    const { completionContracts, nativeRunResults } = await import("@paperclipai/db");
+    const t = new Date(Date.now()-600_000), failed=shape==="failed_then_unrelated_success";
+    const f=await silentConversationTurn(t);
+    await db.update(issues).set({createdAt:new Date(t.getTime()-120_000),updatedAt:t}).where(eq(issues.id,f.issueId));
+    await db.update(issueComments).set({clientRequestId:randomUUID(),updatedAt:new Date(t.getTime()-60_000)}).where(eq(issueComments.id,f.messageId));
+    const nativeSessionId=randomUUID();
+    await db.update(heartbeatRuns).set({invocationSource:"on_demand",nativeSessionId,sessionIdBefore:nativeSessionId,sessionIdAfter:nativeSessionId,
+      createdAt:new Date(t.getTime()-30_000),startedAt:new Date(t.getTime()-29_000),
+      finishedAt:t,updatedAt:t,status:failed?"failed":"succeeded",error:failed?"adapter failed before an answer":null,
+      errorCode:failed?"adapter_failed":null,nativePhase:failed?"terminal_failure":"committed",
+      contextSnapshot:failed?{issueId:f.issueId,wakeReason:"issue_commented",wakeCommentId:f.messageId}:
+        {issueId:f.issueId,wakeReason:"issue_commented",wakeCommentIds:[f.messageId]}}).where(eq(heartbeatRuns.id,f.runId));
+    const [wake]=await db.insert(agentWakeupRequests).values({companyId,agentId,source:"on_demand",reason:"issue_commented",
+      status:failed?"failed":"completed",requestedByActorType:"user",requestedByActorId:userId,
+      idempotencyKey:`conversation-comment:${f.messageId}`,payload:{issueId:f.issueId,commentId:f.messageId},
+      createdAt:new Date(t.getTime()-30_000),finishedAt:t,runId:f.runId}).returning();
+    await db.update(heartbeatRuns).set({wakeupRequestId:wake!.id}).where(eq(heartbeatRuns.id,f.runId));
+    if (!failed) {
+      const contractId=randomUUID(),resultId=randomUUID();
+      await db.insert(completionContracts).values({id:contractId,companyId,issueId:f.issueId,revision:1,
+        schemaVersion:"paperclip.completion-contract.v1",policyVersion:"rf3-silent-v1",risk:"standard",
+        completionAuthority:"server_arbiter",incompleteCriteriaPolicy:"preserve_non_terminal",
+        contractJson:{objective:"answer the accepted person message"},canonicalSha256:`contract-${contractId}`,
+        createdByActorType:"system",createdByActorId:"rf3-judge",createdAt:new Date(t.getTime()-50_000)});
+      await db.update(heartbeatRuns).set({completionContractId:contractId,resultJson:null}).where(eq(heartbeatRuns.id,f.runId));
+      await db.insert(nativeRunResults).values({id:resultId,companyId,issueId:f.issueId,runId:f.runId,
+        completionContractId:contractId,serverFingerprint:`result-${resultId}`,schemaStatus:"accepted",
+        resultJson:{},canonicalSha256:`result-${resultId}`,createdAt:new Date(t.getTime()-1_000)});
+      await db.update(nativeRunFinalizations).set({phase:"committed",resultId,recoveryState:null,
+        failureCode:null,failureDetail:null,nextAttemptAt:null,updatedAt:t}).where(eq(nativeRunFinalizations.runId,f.runId));
+    }
+    if (shape!=="array_only_no_timer") await db.insert(heartbeatRuns).values({companyId,agentId,issueId:f.issueId,
+      invocationSource:"timer",runtimeMode:"legacy",status:"succeeded",errorCode:null,error:null,
+      createdAt:new Date(t.getTime()+5_000),startedAt:new Date(t.getTime()+10_000),finishedAt:new Date(t.getTime()+20_000),
+      responsibleUserId:userId,contextSnapshot:{issueId:f.issueId,wakeReason:"heartbeat_timer",wakeSource:"timer"}});
+    await occupySlot();
+    vi.useFakeTimers({toFake:["Date"]});
+    try {
+      const heartbeat=heartbeatService(db);
+      for (const elapsed of [90_001,119_999,120_000]) {
+        vi.setSystemTime(t.getTime()+elapsed);
+        await heartbeat.reconcileStrandedAssignedIssues({companyId,issueId:f.issueId});
+      }
+      const card=await taskInterruptionPresentation(db,await issue(f.issueId));
+      const [message]=await db.select().from(issueComments).where(eq(issueComments.id,f.messageId));
+      const notes=(await db.select().from(issueComments).where(and(eq(issueComments.companyId,companyId),
+        eq(issueComments.issueId,f.issueId),eq(issueComments.authorType,"system")))).filter(c=>!c.deletedAt&&!(c.metadata as any)?.supersededByIncident);
+      const live=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`,inArray(heartbeatRuns.status,["queued","running","scheduled_retry"])));
+      const [actual]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,f.runId));
+      const [finalization]=await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId,f.runId));
+      const observation={shape,messageId:f.messageId,runId:f.runId,at:Date.now()-t.getTime(),body:message?.body,
+        authorUserId:message?.authorUserId,deletedAt:message?.deletedAt,actualStatus:actual?.status,
+        nativePhase:actual?.nativePhase,nativeSessionId:actual?.nativeSessionId,sessionIdAfter:actual?.sessionIdAfter,
+        finalizationPhase:finalization?.phase,card,
+        notes:notes.map(n=>({id:n.id,body:n.body})),live:live.map(r=>({id:r.id,status:r.status})),
+        redeliveries:(await f.redeliveries()).length,trueOutcomes:notes.length+live.length+(card&&["failed","retry_scheduled"].includes(card.state)?1:0)};
+      console.info(JSON.stringify({namedGapHardened:observation}));
+      if (process.env.RF3_OBSERVATIONS_PATH) (await import("node:fs")).appendFileSync(process.env.RF3_OBSERVATIONS_PATH,JSON.stringify({namedGapHardened:observation})+"\n");
+      expect(message).toMatchObject({body:"Please answer this accepted request.",authorUserId:userId,deletedAt:null});
+      expect(actual).toMatchObject({nativeSessionId,sessionIdBefore:nativeSessionId,sessionIdAfter:nativeSessionId});
+      expect(observation.trueOutcomes,"exactly one truth, never zero or two").toBe(1);
+    } finally {vi.useRealTimers();}
+  },120_000);
 });
