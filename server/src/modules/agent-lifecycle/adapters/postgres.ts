@@ -7,7 +7,7 @@ import { AgentLifecycleConflict, canConfigureAgentConnection, compatibilityStatu
 import type { LifecycleEffects } from "./effects.js";
 import type { LifecycleStore } from "../application/ports.js";
 import type { ActivityPublication } from "../../../types/activity-publication.js";
-import { lifecycleRetryDelay, LIFECYCLE_STOP_RETRY_REQUIRED } from "../application/retry.js";
+import { lifecycleRetryDelay, LIFECYCLE_STOP_RETRY_REQUIRED, LIFECYCLE_ENVIRONMENT_WAIT_MS, LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE } from "../application/retry.js";
 
 export function assertRootDatabase(db: Db) {
   if ("nestedIndex" in db) throw new AgentLifecycleConflict("Lifecycle commands require the root database connection");
@@ -39,6 +39,19 @@ export const pendingLifecycleWork = and(
   sql`coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') <> 'true'`,
   sql`not (${agents.lifecycleState} = 'verifying' and coalesce(${agents.lifecycleOperation}->>'waitingForSignal', 'false') = 'true')`,
 );
+
+/** An outstanding diagnostic has its own deadline, never permission to probe. */
+export const lifecycleEnvironmentWarningPending = and(
+  pendingLifecycleWork,
+  inArray(agents.lifecycleState, ["verifying", "resuming"]),
+  isNull(agents.lifecycleError),
+  sql`${agents.lifecycleOperation}->>'transientFailureSince' is not null`,
+  sql`coalesce(${agents.lifecycleOperation}->>'hostComplete', 'false') <> 'true'`,
+  sql`coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') <> 'true'`,
+);
+export const lifecycleEnvironmentWarningAt = sql`(
+  extract(epoch from (${agents.lifecycleOperation}->>'transientFailureSince')::timestamptz) * 1000
+  + ${LIFECYCLE_ENVIRONMENT_WAIT_MS})`;
 
 /** A bounded startup pass rechecks this saved wait once, without a timer. */
 export const lifecycleSignalWait = and(
@@ -117,7 +130,7 @@ export async function requestAgentLifecycleRecheckInTransaction(
     lifecycleOperation: owned
       ? sql`${agents.lifecycleOperation} || '{"recheckRequested":true}'::jsonb`
       : input.configurationRepaired
-        ? sql`${agents.lifecycleOperation} - 'waitingForSignal' - 'recheckRequested' - 'retryAt' - 'retryRequired' - 'verificationFailures'`
+        ? sql`${agents.lifecycleOperation} - 'waitingForSignal' - 'recheckRequested' - 'retryAt' - 'retryRequired' - 'verificationFailures' - 'transientFailureSince' - 'transientFailures'`
         : sql`${agents.lifecycleOperation} - 'waitingForSignal' - 'recheckRequested' - 'retryAt'`,
     updatedAt: new Date(),
   }).where(and(eq(agents.id, agent.id), eq(agents.companyId, input.companyId), eq(agents.lifecycleVersion, agent.lifecycleVersion)));
@@ -163,7 +176,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     }
     await effects.notifyWork(tx);
     const [updated] = await tx.update(agents).set({ lifecycleError: null,
-      lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt' - 'retryRequired' - 'verificationFailures' - 'stopFailures' - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'waitingForSignal' - 'recheckRequested'`, updatedAt: new Date() }).where(eq(agents.id, agent.id)).returning();
+      lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt' - 'retryRequired' - 'verificationFailures' - 'transientFailureSince' - 'transientFailures' - 'stopFailures' - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'waitingForSignal' - 'recheckRequested'`, updatedAt: new Date() }).where(eq(agents.id, agent.id)).returning();
     return updated;
   }
   if (command === "resume" && !["ready", "paused", "pausing", "resuming"].includes(agent.lifecycleState)) transition(agent.lifecycleState, command);
@@ -278,6 +291,14 @@ export async function applyAgentPolicyHoldsInTransaction(tx: Db, effects: Lifecy
 
 export function createLifecycleStore(db: Db, effects: LifecycleEffects): LifecycleStore {
   const get = (id: string) => db.select().from(agents).where(eq(agents.id, id)).then(rows => rows[0] ?? null);
+  // Evaluate visibility even between paid attempts. This changes only the line,
+  // never retryAt, the lease, or either failure/attempt count. SQL tests the
+  // current operation, so a concurrent repair/completion cannot restore a stale warning.
+  const surfaceEnvironmentWarning = async (now: Date, id?: string) => {
+    await db.update(agents).set({ lifecycleError: LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE })
+      .where(and(id ? eq(agents.id, id) : undefined, lifecycleEnvironmentWarningPending,
+        sql`${lifecycleEnvironmentWarningAt} <= ${now.getTime()}`));
+  };
   return {
     get,
     async change(id, command, options = {}) {
@@ -290,6 +311,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
       });
     },
     async claim(id, owner, now) {
+      await surfaceEnvironmentWarning(now, id);
       // leaseHolder names the claiming process, so restart recovery settles a dead holder's lease at once.
       const leaseHolder = effects.leaseHolder?.() ?? null;
       const [agent] = await db.update(agents).set({
@@ -320,7 +342,8 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     },
     async completeHost(agent, owner) {
       const rows = await db.update(agents).set({
-        lifecycleOperation: sql`jsonb_set(${agents.lifecycleOperation} - 'verificationFailures' - 'retryAt', '{hostComplete}', 'true'::jsonb)`,
+        lifecycleError: null,
+        lifecycleOperation: sql`jsonb_set(${agents.lifecycleOperation} - 'verificationFailures' - 'transientFailureSince' - 'transientFailures' - 'retryAt', '{hostComplete}', 'true'::jsonb)`,
       }).where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });
       return rows.length > 0;
@@ -337,7 +360,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     async defer(agent, owner, error, now, options) {
       if (options?.waitForSignal && agent.lifecycleState === "verifying") {
         const rows = await db.update(agents).set({ lifecycleError: null,
-          lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'waitingForSignal' - 'recheckRequested')
+          lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'waitingForSignal' - 'recheckRequested' - 'transientFailureSince' - 'transientFailures')
             || case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true'
               then '{}'::jsonb else '{"waitingForSignal":true}'::jsonb end`,
           updatedAt: now,
@@ -348,20 +371,30 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
       const previousPasses = (agent.lifecycleOperation as { pendingPasses?: unknown } | null)?.pendingPasses;
       const pendingPasses = options?.pendingReason ? (typeof previousPasses === "number" ? previousPasses : 0) + 1 : undefined;
       const failures = options?.verificationFailures;
-      const delay = failures !== undefined ? lifecycleRetryDelay(failures)
+      const transientFailureSince = options?.transientFailure
+        ? agent.lifecycleOperation?.transientFailureSince ?? now.toISOString() : undefined;
+      const transientFailures = options?.transientFailure
+        ? (agent.lifecycleOperation?.transientFailures ?? 0) + 1 : undefined;
+      const visibleError = transientFailureSince
+        ? now.getTime() - Date.parse(transientFailureSince) >= LIFECYCLE_ENVIRONMENT_WAIT_MS
+          ? LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE : null
+        : error;
+      const delay = transientFailures !== undefined ? lifecycleRetryDelay(transientFailures, 15 * 60_000)
+        : failures !== undefined ? lifecycleRetryDelay(failures)
         : error ? 60_000 : pendingPasses ? lifecyclePendingRetryDelayMs(pendingPasses) : 2_000;
       const retry: Partial<AgentLifecycleOperation> = options?.retryRequired && ["verifying", "resuming"].includes(agent.lifecycleState)
         ? { retryRequired: true }
         : { retryAt: new Date(now.getTime() + delay).toISOString() };
+      if (transientFailureSince) Object.assign(retry, { transientFailureSince, transientFailures });
       if (options?.pendingReason && pendingPasses) Object.assign(retry, { pendingReason: options.pendingReason, pendingPasses });
       if (options?.verificationFailures !== undefined && ["verifying", "resuming"].includes(agent.lifecycleState)) {
         retry.verificationFailures = options.verificationFailures;
       }
       const rows = await db.update(agents).set({
-        lifecycleError: sql`case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true' then null else ${error}::text end`,
+        lifecycleError: sql`case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true' then null else ${visibleError}::text end`,
         lifecycleOperation: sql`((case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true'
             then ${agents.lifecycleOperation} - 'verificationFailures' - 'stopFailures' else ${agents.lifecycleOperation} end)
-          - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'retryRequired' - 'waitingForSignal' - 'recheckRequested')
+          - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'retryRequired' - 'waitingForSignal' - 'recheckRequested' - 'transientFailureSince' - 'transientFailures')
           || case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true'
             then '{}'::jsonb else ${JSON.stringify(retry)}::jsonb end`,
         updatedAt: now,
@@ -370,6 +403,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
       return rows.length > 0;
     },
     async pending(limit, now) {
+      await surfaceEnvironmentWarning(now);
       return db.select({ id: agents.id }).from(agents).where(and(
         pendingLifecycleWork,
         sql`coalesce((${agents.lifecycleOperation}->>'leaseUntil')::timestamptz, '-infinity') <= ${now.toISOString()}::timestamptz`,
