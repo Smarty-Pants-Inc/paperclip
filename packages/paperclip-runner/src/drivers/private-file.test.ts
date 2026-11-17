@@ -17,8 +17,7 @@ import { PrivateFileVerificationError, writePrivateFile, type PrivateFileOperati
 // fusermount3) returns EXDEV from the kernel for a same-directory rename onto
 // a not-yet-local file. It needs Linux, /dev/fuse and fusermount3.
 const fixture = fileURLToPath(new URL("../../test/fixtures/lazy-hydration-fuse.py", import.meta.url));
-const fuseAvailable = process.platform === "linux"
-  && spawnSync("sh", ["-c", "test -c /dev/fuse && command -v fusermount3 && command -v python3"]).status === 0;
+const FUSE_MOUNT_TIMEOUT_MS = 10_000;
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { while (cleanups.length) await cleanups.pop()!(); });
@@ -29,24 +28,54 @@ async function temporaryDirectory(): Promise<string> {
   return directory;
 }
 
-/** Mounts the hydrating box: `name` exists on the lazy backing store. */
-async function hydratingMount(name: string, existing: string): Promise<string> {
-  const scratch = await temporaryDirectory();
+/** Mounts the hydrating box: `name` exists on the lazy backing store. Bounded: a
+ * denied or stuck mount rejects within FUSE_MOUNT_TIMEOUT_MS and leaves no process
+ * (the fixture and its fusermount3 share one process group) and no mount. */
+async function hydratingMount(name: string, existing: string, scratch?: string): Promise<string> {
+  scratch ??= await temporaryDirectory();
   const mountpoint = join(scratch, "mnt");
   await writeFile(join(scratch, "seed"), existing);
   await mkdir(mountpoint);
-  const child: ChildProcess = spawn("python3", [fixture, mountpoint, `${name}=${join(scratch, "seed")}`], { stdio: ["ignore", "pipe", "inherit"] });
-  await new Promise<void>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code) => reject(new Error(`FUSE fixture exited ${code}`)));
-    child.stdout!.on("data", (chunk: Buffer) => { if (chunk.toString().includes("ready")) resolve(); });
-  });
-  cleanups.push(async () => {
-    spawnSync("fusermount3", ["-u", mountpoint]);
-    if (child.exitCode === null) await new Promise((resolve) => child.once("exit", resolve));
-  });
+  const child: ChildProcess = spawn("python3", [fixture, mountpoint, `${name}=${join(scratch, "seed")}`], { stdio: ["ignore", "pipe", "pipe"], detached: true });
+  const exited = new Promise<void>((resolve) => { if (child.exitCode !== null || child.signalCode !== null) resolve(); else child.once("exit", () => resolve()); });
+  const stop = async () => {
+    spawnSync("fusermount3", ["-u", mountpoint], { timeout: FUSE_MOUNT_TIMEOUT_MS });
+    if (child.exitCode === null && child.signalCode === null) {
+      try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already gone */ }
+      await exited;
+    }
+  };
+  let stderr = "";
+  child.stderr!.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-2000); });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => reject(new Error(`FUSE fixture exited ${code ?? signal}: ${stderr.trim()}`)));
+      child.stdout!.on("data", (chunk: Buffer) => { if (chunk.toString().includes("ready")) resolve(); });
+      timer = setTimeout(() => reject(new Error(`FUSE mount not ready within ${FUSE_MOUNT_TIMEOUT_MS} ms: ${stderr.trim()}`)), FUSE_MOUNT_TIMEOUT_MS);
+    });
+  } catch (error) { await stop(); throw error; }
+  finally { clearTimeout(timer); }
+  cleanups.push(stop);
   return mountpoint;
 }
+
+/** Detect mount permission FIRST, with a bounded probe mount; a host that denies it
+ * skips the real-layout tests with the reason instead of hanging the suite. */
+async function probeFuse(): Promise<string | null> {
+  if (process.platform !== "linux") return "FUSE layout needs Linux";
+  if (spawnSync("sh", ["-c", "test -c /dev/fuse && command -v fusermount3 && command -v python3"]).status !== 0) return "needs /dev/fuse, fusermount3 and python3";
+  const scratch = await mkdtemp(join(tmpdir(), "private-file-probe-"));
+  try { await hydratingMount("probe", "probe\n", scratch); return null; }
+  catch (error) { return `FUSE mount denied on this host: ${(error as Error).message}`; }
+  finally {
+    while (cleanups.length) await cleanups.pop()!();
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+const fuseSkipReason = await probeFuse();
+if (fuseSkipReason) console.warn(`private-file FUSE tests skipped: ${fuseSkipReason}`);
 
 const instructions = (bytes: number) => "Refreshed Paperclip host instructions.\n".repeat(Math.ceil(bytes / 39)).slice(0, bytes);
 
@@ -61,7 +90,8 @@ describe("writePrivateFile", () => {
     expect(await readdir(directory)).toEqual(["session-1.instructions.md"]);
   });
 
-  it.skipIf(!fuseAvailable)("the hydrating layout really returns EXDEV for a same-directory rename (control)", async () => {
+  it("the hydrating layout really returns EXDEV for a same-directory rename (control)", async (context) => {
+    if (fuseSkipReason) return context.skip(fuseSkipReason);
     const name = "session-1-8b0f.instructions.md";
     const mountpoint = await hydratingMount(name, "old\n");
     await writeFile(join(mountpoint, `${name}.tmp-control`), "new\n");
@@ -69,7 +99,8 @@ describe("writePrivateFile", () => {
     await unlink(join(mountpoint, `${name}.tmp-control`));
   });
 
-  it.skipIf(!fuseAvailable)("completes a verified in-place write when rename returns EXDEV on a hydrating box (real FUSE layout)", async () => {
+  it("completes a verified in-place write when rename returns EXDEV on a hydrating box (real FUSE layout)", async (context) => {
+    if (fuseSkipReason) return context.skip(fuseSkipReason);
     const name = "session-1-8b0f.instructions.md";
     const mountpoint = await hydratingMount(name, "old instructions from the snapshot\n");
     const file = join(mountpoint, name);
