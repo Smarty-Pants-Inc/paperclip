@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   RunPresentationDecision,
   RunPresentationSource,
@@ -324,6 +325,14 @@ export function completedPlanProposalIds(rows: readonly { payload: unknown }[]):
   return ids;
 }
 
+/** Pi keeps a bounded display preview beside the identity of the WHOLE text. */
+function projectedFullTextReference(payload: Record<string, unknown>): { bytes: number; sha256: string } | null {
+  const fullText = record(payload.fullText);
+  return typeof fullText.bytes === "number" && Number.isSafeInteger(fullText.bytes) && fullText.bytes > 0
+    && typeof fullText.sha256 === "string" && /^[a-f0-9]{64}$/u.test(fullText.sha256)
+    ? { bytes: fullText.bytes, sha256: fullText.sha256 } : null;
+}
+
 export function readCompletedAssistantMessageCandidate(input: {
   seq: number;
   prpEvent: unknown;
@@ -347,6 +356,9 @@ export function readCompletedAssistantMessageCandidate(input: {
   const itemId = typeof prpEvent.itemId === "string" ? prpEvent.itemId
     : typeof payload.itemId === "string" ? payload.itemId : null;
   const proposed = itemId !== null && input.proposedItemIds?.has(itemId) === true;
+  // A projector preview is not the answer, even though it has a text field.
+  // The completed-or-truncated reader rebuilds and verifies its stored deltas.
+  if (projectedFullTextReference(payload)) return null;
   const text = readCommentText(
     typeof payload.text === "string" && proposed ? withoutProposedPlanBlock(payload.text) : payload.text,
   );
@@ -360,9 +372,71 @@ export function readCompletedAssistantMessageCandidate(input: {
   };
 }
 
-/** n5e's answer line (pi-event-projector.ts MAX_ANSWER_BYTES): above it the person gets the plain line and an excerpt. */
-export const FINAL_ANSWER_INLINE_MAX_BYTES = 250 * 1024;
-const FINAL_ANSWER_EXCERPT_BYTES = 16 * 1024;
+/** Maximum UTF-8 bytes per completion comment, including its label and fence repairs. */
+export const FINAL_ANSWER_COMMENT_MAX_BYTES = 250 * 1024;
+
+/**
+ * One splitter for completed finals and failed-turn prefixes. Answer content is
+ * never trimmed or excerpted. Prefer complete lines outside code fences; when a
+ * fence itself spans parts, close/reopen it for independent Markdown rendering.
+ * Only those synthetic fence wrappers and the part labels are added.
+ */
+export function splitFinalAnswerComments(text: string): string[] {
+  if (Buffer.byteLength(text) <= FINAL_ANSWER_COMMENT_MAX_BYTES) return [text];
+  type Fence = { marker: string; opening: string };
+  const breaks: { end: number; fence: Fence | null }[] = [];
+  let fence: Fence | null = null;
+  const lines = /[^\n]*\n|[^\n]+$/gu;
+  for (const match of text.matchAll(lines)) {
+    const line = match[0].replace(/\r?\n$/u, "");
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+    if (marker) {
+      if (!fence && !(marker[1]![0] === "`" && marker[2]!.includes("`"))) {
+        fence = { marker: marker[1]!, opening: line };
+      } else if (fence && marker[1]![0] === fence.marker[0] && marker[1]!.length >= fence.marker.length && !marker[2]!.trim()) {
+        fence = null;
+      }
+    }
+    breaks.push({ end: match.index + match[0].length, fence });
+  }
+  // Reserve enough for even the largest possible part numbers in a JS string.
+  const labelBudget = Buffer.byteLength(`part ${text.length} of ${text.length}\n`);
+  const fenceBudget = breaks.reduce((max, entry) => Math.max(max, entry.fence ? Buffer.byteLength(entry.fence.marker) + 1 : 0), 0);
+  const parts: string[] = [];
+  let start = 0, breakIndex = 0;
+  let startFence: Fence | null = null;
+  while (start < text.length) {
+    const prefix = startFence ? `${startFence.opening}\n` : "";
+    // A fence opened in this part may need a closing wrapper. Reserve the
+    // longest marker so that choosing a line boundary never exceeds the cap.
+    const budget = FINAL_ANSWER_COMMENT_MAX_BYTES - labelBudget - Buffer.byteLength(prefix) - fenceBudget;
+    if (budget < 4) throw new Error("Code fence delimiter or opening line exceeds the completion comment limit");
+    let low = start, high = Math.min(text.length, start + budget);
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (Buffer.byteLength(text.slice(start, middle)) <= budget) low = middle;
+      else high = middle - 1;
+    }
+    if (low < text.length && /[\uD800-\uDBFF]/u.test(text[low - 1]!)) low--;
+    let end = low;
+    let endFence: Fence | null = startFence;
+    let lastLine: (typeof breaks)[number] | undefined;
+    let lastOutside: (typeof breaks)[number] | undefined;
+    let cursor = breakIndex;
+    while (cursor < breaks.length && breaks[cursor]!.end <= low) {
+      lastLine = breaks[cursor++]!;
+      if (!lastLine.fence) lastOutside = lastLine;
+    }
+    const preferred = low === text.length ? null : (lastOutside ?? lastLine);
+    if (preferred && preferred.end > start) end = preferred.end;
+    while (breakIndex < breaks.length && breaks[breakIndex]!.end <= end) endFence = breaks[breakIndex++]!.fence;
+    const suffix = end < text.length && endFence ? `\n${endFence.marker}` : "";
+    parts.push(`${prefix}${text.slice(start, end)}${suffix}`);
+    start = end;
+    startFence = endFence;
+  }
+  return parts.map((part, index) => `part ${index + 1} of ${parts.length}\n${part}`);
+}
 
 /**
  * A completed agent message whose stored payload lost its text to a generic
@@ -373,7 +447,7 @@ const FINAL_ANSWER_EXCERPT_BYTES = 16 * 1024;
 export function readTruncatedCompletedAgentMessageItemId(prpEvent: unknown): string | null {
   const event = record(prpEvent);
   const payload = record(event.payload);
-  if (payload.truncated !== true || typeof payload.text === "string") return null;
+  if (!projectedFullTextReference(payload) && (payload.truncated !== true || typeof payload.text === "string")) return null;
   if (payload.kind !== undefined && payload.kind !== "agentMessage" && payload.kind !== "assistant_message") return null;
   if (payload.channel !== undefined && payload.channel !== "final") return null;
   return typeof event.itemId === "string" && event.itemId.length > 0 ? event.itemId : null;
@@ -402,20 +476,6 @@ export function reassembleAgentMessageFromDeltas(
   return text.trim() ? text : null;
 }
 
-/** The person's text for a final answer: whole up to n5e's line, else n5e's plain line and a labelled excerpt. */
-export function presentFinalAnswerText(text: string): string {
-  const bytes = Buffer.byteLength(JSON.stringify(text));
-  if (bytes <= FINAL_ANSWER_INLINE_MAX_BYTES) return text;
-  let low = 0, high = Math.min(text.length, FINAL_ANSWER_EXCERPT_BYTES);
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(JSON.stringify(text.slice(0, middle))) <= FINAL_ANSWER_EXCERPT_BYTES) low = middle;
-    else high = middle - 1;
-  }
-  if (low > 0 && /[\uD800-\uDBFF]/u.test(text[low - 1]!)) low--;
-  return `This answer is longer than one message (${Math.ceil(Buffer.byteLength(text) / 1000)} KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n${text.slice(0, low)}`;
-}
-
 /**
  * A final answer whose completed event was stored without text, rebuilt from
  * its deltas, so the semantic summary never wins over it (dl-n5-66k).
@@ -427,13 +487,18 @@ export function readTruncatedCompletedAssistantMessageCandidate(input: {
 }): CompletedFinalAgentMessageCandidate | null {
   const itemId = readTruncatedCompletedAgentMessageItemId(input.prpEvent);
   if (!itemId) return null;
-  const whole = reassembleAgentMessageFromDeltas(input.deltaRows, itemId);
+  const rebuilt = reassembleAgentMessageFromDeltas(input.deltaRows, itemId);
+  const reference = projectedFullTextReference(record(record(input.prpEvent).payload));
+  // A projected preview includes the whole text's receipt. Missing deltas must
+  // not turn a successful partial rebuild into an apparently complete answer.
+  const whole = rebuilt !== null && (!reference || (Buffer.byteLength(rebuilt) === reference.bytes
+    && createHash("sha256").update(rebuilt).digest("hex") === reference.sha256)) ? rebuilt : null;
   // dl-n5-cont2 C1: a truncated final exists but cannot be rebuilt whole (a
   // stored delta is itself cut). The summary never stands in for it: the
   // person gets ONE plain, true line.
   return {
     seq: input.seq,
-    text: whole ? presentFinalAnswerText(whole) : TRUNCATED_FINAL_UNDELIVERABLE_TEXT,
+    text: whole ?? TRUNCATED_FINAL_UNDELIVERABLE_TEXT,
     sourceEventId: readCommentText(record(input.prpEvent).sourceEventId),
     channel: "final",
     truncatedFinal: true,

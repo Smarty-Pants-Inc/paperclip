@@ -43,6 +43,13 @@ describe("committed response authority lifecycle", () => {
 
 
 describe("accepted response evidence selection", () => {
+  it("wakes presentation for a completed projected preview that must be rebuilt", () => {
+    const event = { itemId: "pi-final", payload: { kind: "agentMessage", channel: "final", text: "Display preview",
+      fullText: { bytes: 307200, sha256: "a".repeat(64), path: "/runner-private/spill.txt" } } };
+    expect(isNativeResponseEvidence("item.completed", event)).toBe(true);
+    expect(isNativeResponseEvidence("item.delta", event)).toBe(false);
+    expect(isNativeResponseEvidence("item.completed", { ...event, payload: { ...event.payload, channel: "analysis" } })).toBe(false);
+  });
   it.each([
     { type: "item.delta", kind: "agentMessage", channel: "final", expected: false },
     { type: "item.completed", kind: "agentMessage", channel: "analysis", expected: false },

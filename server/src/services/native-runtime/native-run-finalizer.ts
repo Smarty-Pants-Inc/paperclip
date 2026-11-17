@@ -1288,7 +1288,8 @@ async function recoverCommittedNativeChatResponseInScope(
             eq(heartbeatRunEvents.runId, run.id),
             eq(heartbeatRunEvents.eventType, "item.completed"),
             sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${accepted.turnId}`,
-            sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,truncated}' = 'true'`,
+            sql`(${heartbeatRunEvents.payload} #>> '{prpEvent,payload,truncated}' = 'true'
+              or jsonb_typeof(${heartbeatRunEvents.payload} #> '{prpEvent,payload,fullText}') = 'object')`,
           )).orderBy(desc(heartbeatRunEvents.seq)).limit(20);
         const rebuiltCandidates = [];
         for (const row of truncatedRows) {

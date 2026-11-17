@@ -3061,6 +3061,19 @@ Stream closure without a turn terminal is not proof of success. Event
 replay uses the existing source receipts and never repeats provider work merely
 to recover recorded output.
 
+Completed final answers are posted whole, regardless of answer size. The shared
+completion-comment writer uses comments of at most 250 KiB of UTF-8 text,
+including formatting. A single comment is unchanged and unlabelled; multiple
+comments start with `part k of N` and are inserted in order in the same
+issue-locked transaction. Completion is acknowledged only after every part is
+saved. Splitting prefers line boundaries outside fenced code. A code fence that
+spans parts is closed and reopened for independent rendering; those synthetic
+fence wrappers are formatting, not additional answer content. Stored deltas are
+rebuilt whole before this step. Only an answer that cannot be rebuilt from its
+stored items/deltas receives the undeliverable-answer line; size never selects
+an excerpt or an offer to retrieve the answer. Tool-output display bounds are
+separate and unchanged.
+
 In an Agent Chat conversation, a successful turn whose status decision committed
 posts its final answer to the conversation even when the task stays held: a
 pending or revision-requested approval, a pending execution stage, or a
