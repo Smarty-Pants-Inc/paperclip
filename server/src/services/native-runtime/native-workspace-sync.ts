@@ -99,7 +99,10 @@ export interface NativeWorkspaceSyncReference {
 export interface PreparedNativeWorkspaceSync {
   mode: WorkspaceInboundMode;
   reference: NativeWorkspaceSyncReference;
-  restoreWorkspace(assertOwnership?: () => Promise<void>): Promise<void>;
+  /** `signal` (pl/cancel-finalize2): once aborted, no further remote command,
+   * stamp or finalized descriptor is written; a copyback already in flight
+   * that joins later writes nothing. */
+  restoreWorkspace(assertOwnership?: () => Promise<void>, options?: { signal?: AbortSignal }): Promise<void>;
   cleanup(): Promise<void>;
 }
 
@@ -689,6 +692,10 @@ function shellQuote(value: string): string {
 async function writeRemoteStamp(input: {
   target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>;
   stamp: Record<string, unknown>;
+  /** pl/cancel-finalize2: when given, the stamp is written in two commands and
+   * this re-check runs AFTER the payload write returns and BEFORE the stamp is
+   * published (mv): a payload write held past the deadline publishes nothing. */
+  beforePublish?: () => Promise<void>;
 }): Promise<void> {
   if (!input.target.runner) {
     throw new Error("native_workspace_sync_runner_missing");
@@ -704,19 +711,27 @@ async function writeRemoteStamp(input: {
     `${canonicalJson(input.stamp)}\n`,
     "utf8",
   ).toString("base64");
-  const result = await input.target.runner.execute({
-    command: input.target.shellCommand ?? "sh",
-    args: [
-      "-c",
-      `umask 077; mkdir -p ${shellQuote(runtimeDir)} && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(tempPath)} && mv ${shellQuote(tempPath)} ${shellQuote(stampPath)}`,
-    ],
-    cwd: "/",
-    timeoutMs: 15_000,
-    bypassSession: true,
-  });
-  if (result.timedOut || result.exitCode !== 0) {
-    throw new Error("native_workspace_sync_remote_stamp_failed");
+  const write = `umask 077; mkdir -p ${shellQuote(runtimeDir)} && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(tempPath)}`;
+  const publish = `mv ${shellQuote(tempPath)} ${shellQuote(stampPath)}`;
+  const run = async (script: string) => {
+    const result = await input.target.runner!.execute({
+      command: input.target.shellCommand ?? "sh",
+      args: ["-c", script],
+      cwd: "/",
+      timeoutMs: 15_000,
+      bypassSession: true,
+    });
+    if (result.timedOut || result.exitCode !== 0) {
+      throw new Error("native_workspace_sync_remote_stamp_failed");
+    }
+  };
+  if (!input.beforePublish) {
+    await run(`${write} && ${publish}`);
+    return;
   }
+  await run(write);
+  await input.beforePublish();
+  await run(publish);
 }
 
 async function remoteStampMatches(input: {
@@ -856,13 +871,23 @@ async function finalizePreparedRuntime(input: {
   runtime: PreparedAdapterExecutionTargetRuntime;
   descriptor: NativeWorkspaceSyncDescriptor;
   assertOwnership?: () => Promise<void>;
+  signal?: AbortSignal;
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
 }): Promise<NativeWorkspaceSyncReference> {
+  // Ownership (and the caller's deadline) is re-checked AFTER every remote or
+  // long step, immediately before the next write: a held command that joins
+  // after the deadline must not lead to a remote stamp or a finalized descriptor.
+  const stillOwned = async () => {
+    input.signal?.throwIfAborted();
+    await input.assertOwnership?.();
+    input.signal?.throwIfAborted();
+  };
+  input.signal?.throwIfAborted();
   if (input.onPhase) await input.onPhase("workspace.restore", () => input.runtime.restoreWorkspace());
   else await input.runtime.restoreWorkspace();
   return measureRunPhase("execution.workspace_commit", async () => {
-    await input.assertOwnership?.();
+    await stillOwned();
     const finalSnapshot =
       await import("@paperclipai/adapter-utils/workspace-restore-merge").then(
         ({ captureDirectorySnapshotOffThread: captureDirectorySnapshot }) =>
@@ -878,14 +903,16 @@ async function finalizePreparedRuntime(input: {
       descriptor: input.descriptor,
       hostSha256: finalHostSha256,
     });
-    await writeRemoteStamp({ target: input.target, stamp });
+    // After the copyback and the host snapshot, before the remote stamp.
+    await stillOwned();
+    await writeRemoteStamp({ target: input.target, stamp, beforePublish: input.signal ? stillOwned : undefined });
     const finalizedDescriptor: NativeWorkspaceSyncDescriptor = {
       ...input.descriptor,
       state: "finalized",
       finalizedAt: new Date().toISOString(),
       finalHostSha256,
     };
-    await input.assertOwnership?.();
+    await stillOwned();
     const reference = await writeDescriptor(finalizedDescriptor);
     await persistRunReference(input.db, input.runId, reference);
     await persistLeaseStamp({
@@ -1126,7 +1153,7 @@ export async function prepareNativeWorkspaceSync(input: {
     get reference() {
       return reference;
     },
-    restoreWorkspace: async (assertOwnership) => {
+    restoreWorkspace: async (assertOwnership, options) => {
       if (!restorePromise) {
         restorePromise = finalizePreparedRuntime({
           db: input.db,
@@ -1135,6 +1162,7 @@ export async function prepareNativeWorkspaceSync(input: {
           runtime: preparedRuntime,
           descriptor,
           assertOwnership,
+          signal: options?.signal,
           onPhase: input.onPhase,
           onCheckpoint: input.onCheckpoint,
         })
