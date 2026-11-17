@@ -1,13 +1,15 @@
 // Keep: gateway routing must use Pi's persisted identity, never prompt-prefix matching.
 // Agreed offline request-boundary test: real Pi 1.5.2 client, no provider traffic.
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer, type IncomingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { validateBindRequest, type PiBindModel } from "./pi-bind-protocol.js";
 import { buildPiManagedModel } from "./pi-managed-model.js";
+import { PiRpcDriver, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
@@ -55,6 +57,78 @@ function bind(model: PiBindModel) {
 }
 
 describe("managed Pi session-affinity request headers", () => {
+  // KEEP: exercise the actual managed driver -> native Pi -> broker -> upstream
+  // on every protocol. Client-only captures missed rf-2's stripped routing header.
+  it.each(["messages", "chat", "responses"] as const)("delivers native Pi's session id through the %s broker", async protocol => {
+    const root = await mkdtemp(join(tmpdir(), "pi-affinity-wire-")); roots.push(root);
+    const home = join(root, "home"), agent = join(home, "agent"), workspace = join(root, "workspace");
+    await mkdir(agent, { recursive: true }); await mkdir(workspace);
+    const requests: Array<{ path?: string; headers: IncomingHttpHeaders; body: unknown }> = [];
+    const peer = createServer(async (req, res) => {
+      const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      requests.push({ path: req.url, headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString()) });
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const emit = (type: string, fields: Record<string, unknown> = {}) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`);
+      if (protocol === "messages") {
+        emit("message_start", { message: { id: "local", type: "message", role: "assistant", model: "affinity-proof", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } });
+        emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
+        emit("content_block_delta", { index: 0, delta: { type: "text_delta", text: "ok" } });
+        emit("content_block_stop", { index: 0 });
+        emit("message_delta", { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } });
+        emit("message_stop");
+      } else if (protocol === "responses") {
+        const base = { id: "resp_local", object: "response", created_at: 1, model: "affinity-proof", status: "in_progress", output: [], error: null, incomplete_details: null };
+        const item = { type: "message", id: "msg_local", role: "assistant", content: [], status: "in_progress" };
+        const part = { type: "output_text", text: "", annotations: [], logprobs: [] };
+        emit("response.created", { response: base });
+        emit("response.output_item.added", { output_index: 0, item });
+        emit("response.content_part.added", { output_index: 0, item_id: item.id, content_index: 0, part });
+        emit("response.output_text.delta", { output_index: 0, item_id: item.id, content_index: 0, delta: "ok", logprobs: [] });
+        emit("response.output_text.done", { output_index: 0, item_id: item.id, content_index: 0, text: "ok", logprobs: [] });
+        const finalItem = { ...item, status: "completed", content: [{ ...part, text: "ok" }] };
+        emit("response.content_part.done", { output_index: 0, item_id: item.id, content_index: 0, part: { ...part, text: "ok" } });
+        emit("response.output_item.done", { output_index: 0, item: finalItem });
+        emit("response.completed", { response: { ...base, status: "completed", output: [finalItem], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } } });
+      } else {
+        for (const chunk of [{ choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }]) {
+          res.write(`data: ${JSON.stringify({ id: "local", object: "chat.completion.chunk", ...chunk })}\n\n`);
+        }
+        res.write("data: [DONE]\n\n");
+      }
+      res.end();
+    });
+    await new Promise<void>(resolve => peer.listen(0, "127.0.0.1", resolve));
+    const address = peer.address(); if (!address || typeof address === "string") throw new Error("No offline listener");
+    let session: PiRpcHarnessSession | undefined;
+    const proof: Record<string, unknown> = { protocol, requests };
+    try {
+      session = await new PiRpcDriver({ command: join(runnerRoot, "node_modules/.bin/pi"), model: "paperclip/affinity-proof", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"),
+        environment: { PATH: process.env.PATH, HOME: home, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}${protocol === "messages" ? "" : "/v1"}`, PAPERCLIP_AI_PROVIDER_PROTOCOL: protocol, PAPERCLIP_AI_PROVIDER_AUTH: "none" },
+      }).openSession({ runId: "offline-wire", normalizedSessionId: "private-envelope", workingDirectory: workspace }) as PiRpcHarnessSession;
+      proof.ids = session.ids(); proof.pid = session.processPid();
+      const iterator = session.events()[Symbol.asyncIterator]();
+      await session.startTurn({ message: { role: "user", text: "Reply ok." } });
+      for (;;) {
+        const next = await iterator.next();
+        if (next.done) throw new Error("Native events ended before completion");
+        if (next.value.eventType === "turn.failed") throw new Error(JSON.stringify(next.value));
+        if (next.value.eventType === "turn.completed") { proof.terminal = next.value.eventType; break; }
+      }
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.path).toBe(protocol === "messages" ? "/v1/messages?beta=true" : protocol === "chat" ? "/v1/chat/completions" : "/v1/responses");
+      expect(requests[0]!.headers["x-session-id"]).toBe(session.ids().providerSessionId);
+      // Responses already uses Pi's identity as protocol cache metadata, not
+      // model-visible content. Preserve that native behavior without adding it
+      // to the prompt; Messages/Chat have no such field.
+      const { prompt_cache_key, ...promptBody } = requests[0]!.body as Record<string, unknown>;
+      if (protocol === "responses") expect(prompt_cache_key).toBe(session.ids().providerSessionId);
+      expect(JSON.stringify(promptBody)).not.toContain(session.ids().providerSessionId);
+    } finally {
+      await session?.close(); proof.exited = session?.processExited();
+      peer.closeAllConnections(); await new Promise<void>(resolve => peer.close(() => resolve()));
+      if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `affinity-wire-${protocol}.json`), JSON.stringify(proof, null, 2));
+    }
+  }, 60_000);
   it("sends the persisted Pi id across cold launches, isolates another session, and keeps identity out of prompts", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-affinity-")); roots.push(root);
     const model = await managed();
