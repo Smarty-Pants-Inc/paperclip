@@ -64,6 +64,7 @@ import { deliverConversationComments, heldConversationComments, isConversation, 
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
+import { recoveryActionInstructions } from "../services/recovery/recovery-action-instructions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
@@ -10393,7 +10394,7 @@ export function issueRoutes(
         actionId ? eq(issueRecoveryActions.id, actionId) : undefined,
       )).orderBy(desc(issueRecoveryActions.createdAt)).limit(actionId ? 1 : 20);
       if (actionId && !rows[0]) throw notFound("Recovery source not found.");
-      const actions = rows.map(issueRecoveryActionReadModel);
+      const actions = await recoveryActionInstructions(db, issue.companyId, issue.id, rows.map(issueRecoveryActionReadModel));
       const sourceInspection = actionId ? await inspectWorkspaceSource(db, {
         companyId: issue.companyId, issueId: issue.id, runId, actionId,
       }) : undefined;
@@ -10414,10 +10415,11 @@ export function issueRoutes(
         inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
       ))),
     )).orderBy(desc(issueRecoveryActions.createdAt));
+    const actions = await recoveryActionInstructions(db, issue.companyId, issue.id,
+      [...(active ? [active] : []), ...retainedHolds.filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel)]);
     res.json({
-      active,
-      actions: [...(active ? [active] : []), ...retainedHolds
-        .filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel)],
+      active: actions.find(action => action.id === active?.id) ?? null,
+      actions,
     });
   });
 

@@ -23,7 +23,8 @@ import { canonicalExecutionUuid } from "./execution-identity.js";
 import { chatActionDeadline } from "./chat-action-work.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { isAcknowledgedLegacyUserStop, isQueuedDependencyWait, runStopPresentationJson } from "./run-cancellation.js";
-import { heldRetryOffersRetry } from "./task-retry-eligibility.js";
+import { decideRetryAuthority, heldRetryOffersRetry, readRetryAuthorityFacts } from "./task-retry-eligibility.js";
+import { readRetryStopGate, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON, RETRY_STOP_WAIT_MESSAGE } from "./task-retry-stop-gate.js";
 import { exhaustedNativeFinalizationCondition, savedResultRetryPendingCondition } from "./native-runtime/exhausted-finalization-retry.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON } from "../modules/run-dispatch/index.js";
@@ -96,6 +97,8 @@ type ProjectionState = {
   approval: boolean;
   /** A board-owned workspace-owner fence on this run that no automatic proof has released. */
   ownerStopRequired?: boolean;
+  /** The previous run's Stop stayed unproven past the Retry bound (task-retry-stop-gate). */
+  retryStopUnproven?: boolean;
   unidentifiedLaunchConfirmable?: boolean;
   /** The latest wake for a task with no run yet, when admission refused it. */
   admissionWait?: { id: string; status: string; reason: string | null; agentId: string };
@@ -157,7 +160,7 @@ const retryWaitMessages: Record<string, string> = {
   remote_cleanup: "Retry is waiting for the previous environment to stop. Your message is saved.",
   local_cleanup: "Retry is waiting for the previous execution to finish cleanup. Your message is saved.",
   cleanup_pending: "Retry is waiting for the previous execution to finish cleanup. Your message is saved.",
-  execution_settling: "Retry is waiting for the previous execution to stop. Your message is saved.",
+  execution_settling: RETRY_STOP_WAIT_MESSAGE,
   controller_settling: "Retry is waiting for the previous execution to finish recovery. Your message is saved.",
   process_identity_missing: "Retry is waiting for Paperclip to verify that the previous execution stopped. Your message is saved.",
   process_running: "Retry is waiting for the previous execution to stop. Your message is saved.",
@@ -270,6 +273,9 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   // The previous controller cannot confirm its own stop. Name the one board
   // action instead of showing the fenced run as working (RC-47).
   if (input.ownerStopRequired) return { ...base, responsibility: "user", state: "waiting_for_user", userAction: "confirm_owner_stop" };
+  // Same predicate as admission and the Retry API: no Retry, one instruction.
+  if (input.retryStopUnproven) return { ...base, state: "failed", canRetry: false,
+    retryWait: { reason: RETRY_STOP_UNPROVEN_REASON, message: RETRY_STOP_UNPROVEN_MESSAGE } };
   // The task's existing dependency UI owns this wait. Keep actual recovery and
   // Retry preparation failures authoritative; this does not change admission.
   if (!action && !retryWait?.preparationStatus && isQueuedDependencyWait(run)) return base;
@@ -277,7 +283,9 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   // Intentional Stop is not an unsuccessful attempt. This is presentation only;
   // physical containment and pending cleanup keep their execution-side gates.
   if (!wait && run.runtimeMode === "native" && run.companyId === issue.companyId && run.nativeIssueId === issue.id
-      && isAcknowledgedNativeStop({ ...run, companyId: run.companyId, nativeIssueId: run.nativeIssueId })) return base;
+      && isAcknowledgedNativeStop({ ...run, companyId: run.companyId, nativeIssueId: run.nativeIssueId,
+        // The projection writes absent strings as JSON null; the Stop record reads absence.
+        resultJson: run.resultJson && Object.fromEntries(Object.entries(run.resultJson).filter(([, value]) => value !== null)) })) return base;
   // A queued-message Interrupt stops this run to deliver that exact message.
   // The stop is the user's intent and the message starts next, so show the
   // hand-off as working, not as a failed attempt.
@@ -513,6 +521,22 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         'projectAccessDenied', ${heartbeatRuns.resultJson}->'projectAccessDenied',
         'cancelledByActorType', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancelledByActorType'`, 32)},
         'cancelledByUserId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancelledByUserId'`, 160)},
+        -- An authorized managing agent's Stop (acknowledged-native-stop.ts hasAuthorizedManagementStopRecord).
+        'cancelledByAgentId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancelledByAgentId'`, 160)},
+        'managementStop', case when jsonb_typeof(${heartbeatRuns.resultJson}->'managementStop') = 'object' then jsonb_build_object(
+          'schema', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'managementStop'->'schema'`, 64)},
+          'runId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'managementStop'->'runId'`, 160)},
+          'companyId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'managementStop'->'companyId'`, 160)},
+          'actorAgentId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'managementStop'->'actorAgentId'`, 160)},
+          'targetAgentId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'managementStop'->'targetAgentId'`, 160)}) end,
+        'cancellation', case when jsonb_typeof(${heartbeatRuns.resultJson}->'cancellation') = 'object' then jsonb_build_object(
+          'source', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancellation'->'source'`, 64)},
+          'expected', ${heartbeatRuns.resultJson}->'cancellation'->'expected',
+          'initiator', jsonb_build_object(
+            'type', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancellation'->'initiator'->'type'`, 32)},
+            'id', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancellation'->'initiator'->'id'`, 160)}),
+          'reason', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancellation'->'reason'`, 512)},
+          'recordedAt', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancellation'->'recordedAt'`, 64)}) end,
         'queuedCommentInterruptQueueId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'queuedCommentInterruptQueueId'`, 160)},
         'nativeCancellation', jsonb_build_object(
           'schema', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'nativeCancellation'->'schema'`, 64)},
@@ -807,6 +831,11 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     [...runMap].flatMap(([issueId, run]) => run.errorCode === NATIVE_SESSION_CLEANUP_QUARANTINED ? [{ issueId, run }] : []));
   const confirmableLaunches = new Set(launchWaits.filter(entry => launchRefusals.get(entry.run.id) === null).map(entry => entry.issueId));
   const now = Date.now();
+  const retryStopUnproven = new Set<string>();
+  for (const [issueId, run] of runMap) {
+    if (run.runtimeMode === "native" && run.finishedAt && (await readRetryStopGate(db, { companyId, issueId, sourceRunId: run.id, now }))?.state === "expired")
+      retryStopUnproven.add(issueId);
+  }
   for (const issue of selected) {
     const required = requirements.get(issue.id);
     const denied = required?.projectIds.filter(projectId => currentAccess.get(`${issue.assigneeAgentId}:${projectId}`) !== true);
@@ -824,6 +853,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       agent: agentMap.get(issue.assigneeAgentId ?? ""), project: projectMap.get(issue.projectId ?? ""),
       company: companyRows[0], paused: pauses.has(issue.id), approval: approvalsSet.has(issue.id),
       ownerStopRequired: ownerStopRequired.has(`${issue.id}:${facts.run?.id}`),
+      retryStopUnproven: retryStopUnproven.has(issue.id),
       unidentifiedLaunchConfirmable: confirmableLaunches.has(issue.id),
       admissionWait: admissionWaitMap.get(issue.id),
       retryDependencies: retryDependencyMap.get(issue.id),
@@ -868,6 +898,24 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       if (!presentation.retryWait && blocker.workspaceRecovery && blocker.workspaceRecovery.status !== "recovered")
         presentation.retryWait = { reason: "workspace_repair_required", message: retryWaitMessages.workspace_repair_required! };
     }
+  }
+  // Retry fold: every card that still offers Retry asks the ONE authority
+  // (task-retry-eligibility.ts decideRetryAuthority) with the same facts the
+  // Retry API reads: a paused assignee, a standing held notice or the run's own
+  // prior-owner refusal, and a deferred Retry's recorded refusal.
+  const stillOffered = [...result].flatMap(([issueId, presentation]) => presentation?.canRetry ? [issueId] : []);
+  for (const issueId of stillOffered) {
+    const presentation = result.get(issueId)!;
+    const run = runMap.get(issueId);
+    const stopGate = run?.runtimeMode === "native" && run.finishedAt
+      ? (await readRetryStopGate(db, { companyId, issueId, sourceRunId: run.id, now }))?.state ?? null : null;
+    const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId, issueId }), stopGate,
+      retrySource: true });
+    if (authority.canRetry) continue;
+    presentation.canRetry = false;
+    delete presentation.retryAction;
+    if (!presentation.retryWait && !presentation.notice && authority.cardText)
+      presentation.retryWait = { reason: authority.reason, message: authority.cardText };
   }
   // Redact each explanation with the registry of the run that recorded it: the
   // workspace failure is the observed run's, while a scheduled retry's provider

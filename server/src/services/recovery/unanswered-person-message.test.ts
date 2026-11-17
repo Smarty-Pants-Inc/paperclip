@@ -475,6 +475,21 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(codeOf(notices[0]!)).toBe("runner_state_identity_mismatch");
   });
 
+  it("retry fold R12 F3: the sweep's HELD notice gives ONE instruction: its Next action is the body's own new-task action", async () => {
+    const f = await fixture();
+    await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
+      error: "runner_state_identity_mismatch: prior_owner_scope_mismatch" });
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(HELD);
+    const rows = notices[0]!.metadata!.sections!.flatMap(section => section.rows);
+    const nextAction = rows.find(row => row.type === "key_value" && row.label === "Next action");
+    expect(nextAction).toEqual({ type: "key_value", label: "Next action", value: "Assign this agent a new task to continue." });
+    expect(notices[0]!.body).toContain((nextAction as { value: string }).value);
+    expect(JSON.stringify(rows)).not.toMatch(/Send a new message/);
+  });
+
   it("G2: the first refusal after a good turn (prior_owner_active) -> one notice", async () => {
     const f = await fixture();
     await f.reply(await f.run({ commentId: await f.message("First question"), status: "succeeded" }));

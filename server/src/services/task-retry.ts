@@ -10,6 +10,8 @@ import { taskRetryRunAncestry } from "./recovery-run-ancestry.js";
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, chatActions, chatConversations, chatEndpoints, heartbeatRuns, issues, issueComments, runIdentityContexts, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { conflict, forbidden, notFound, HttpError } from "../errors.js";
+import { readRetryStopGate, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON } from "./task-retry-stop-gate.js";
+import { decideRetryAuthority, readRetryAuthorityFacts } from "./task-retry-eligibility.js";
 import { persistActivity } from "./activity-log.js";
 import { createSystemRecovery, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
 import { adoptSystemRecovery, updateSystemRecovery } from "./system-recovery.js";
@@ -326,6 +328,20 @@ function admitTaskRetry(input: TaskRetryRequest) {
         latest.agentId !== issue.assigneeAgentId || input.observedRunId !== latest.id) {
       return { requestId: null, accepted: false, stale: true, observedRunId: latest?.id ?? null, chatActionId: undefined };
     }
+    // Same predicate as admission and the card: past the bound an unproven
+    // Stop refuses Retry with its reason instead of accepting a dead end.
+    if ((await readRetryStopGate(db, { companyId: issue.companyId, issueId: issue.id, sourceRunId: latest.id }))?.state === "expired")
+      throw conflict(RETRY_STOP_UNPROVEN_MESSAGE, { code: RETRY_STOP_UNPROVEN_REASON, reason: "stop_unproven" });
+    // Retry fold (judge R8): accept only a Retry the dispatcher can run. Where
+    // the one authority says the conversation is held (a standing HELD notice,
+    // the run's own prior-owner refusal, or a deferred Retry refused by that
+    // fence), the same thread meets the same fence: refuse with the reason and
+    // the one instruction instead of a 202 that never gets a run.
+    const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId: issue.companyId,
+      issueId: issue.id }), retrySource: true });
+    if (authority.reason === "conversation_held")
+      throw conflict(authority.cardText!, { code: "retry_not_available", reason: authority.reason,
+        userAction: authority.userAction, nextAction: authority.nextAction });
     if (input.retryAction === "move_forward" && !["queued", "running"].includes(latest.status) &&
         !(await undeliveredContinuation(tx, { companyId: issue.companyId, issueId: issue.id })))
       return { requestId: null, accepted: false, stale: false, alreadyMovedOn: true, observedRunId: latest.id, chatActionId: undefined };

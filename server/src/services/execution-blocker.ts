@@ -8,14 +8,14 @@ import { z } from "zod";
 import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, toolConnections, workspaceOperations, type Db } from "@paperclipai/db";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
-import { heldRetryOffersRetry, heldTaskRetryRefusals } from "./task-retry-eligibility.js";
+import { decideRetryAuthority, readRetryAuthorityFacts } from "./task-retry-eligibility.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { EXECUTION_RECONCILIATION_CAUSES, readRunFailureCause, withoutSqlStatementText, type ExecutionBlocker } from "@paperclipai/shared";
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA, nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { unreconciledNativeExportPredicate } from "./native-runtime/native-workspace-reconstruction.js";
 import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
-import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, recoveredWorkMessage, savedWorkOffersRetry, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
+import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, recoveredWorkMessage, savedWorkOffersRetry, stoppedBeforeWorkWasSaved, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
@@ -467,16 +467,30 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   )).where(and(
     eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issueId),
   )).limit(1) : [];
-  const heldRefusal = canRetry ? (await heldTaskRetryRefusals(db, companyId, [issueId])).get(issueId) : undefined;
-  const retryOffered = canRetry && (!chatBinding || recoveredFailure) && heldRetryOffersRetry(heldRefusal);
+  // Retry fold: ONE authority picks the button and the words together.
+  const authorityFacts = await readRetryAuthorityFacts(db, { companyId, issueId });
+  // This receipt describes the source run, not deferred user messages. Read
+  // the coordinator's durable pre-provider evidence rather than inferring
+  // saved work from a recovery pass that may have had nothing to preserve.
+  const [sourceFailure] = workspaceRecoveryState?.status === "recovered" && run?.runtimeMode === "native"
+    && ["failed", "timed_out"].includes(run.status) ? await db.select({ failureDetail: nativeRunFinalizations.failureDetail })
+      .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, companyId),
+        eq(nativeRunFinalizations.issueId, issueId), eq(nativeRunFinalizations.runId, run.id))).limit(1) : [];
+  const authority = decideRetryAuthority({ ...authorityFacts, retrySource: canRetry && (!chatBinding || recoveredFailure),
+    savedWork: workspaceRecoveryState?.status === "recovered" ? "recovered" : null, runStatus: run?.status ?? null,
+    stoppedBeforeWork: stoppedBeforeWorkWasSaved(run?.status, sourceFailure?.failureDetail) });
+  const retryOffered = authority.canRetry;
   const workspaceRecovery = workspaceRecoveryState?.status === "recovered"
-    ? { ...workspaceRecoveryState, message: recoveredWorkMessage(run?.status, retryOffered) }
+    ? { ...workspaceRecoveryState, message: authority.cardText ?? recoveredWorkMessage(run?.status, retryOffered) }
     : workspaceRecoveryState && { ...workspaceRecoveryState, canRetry: workspaceRecoveryState.canRetry && retryOffered };
   let nextAction = action.status === "active" && action.cause === EXECUTION_FINALIZATION_DEADLINE_EXCEEDED
     ? EXECUTION_FINALIZATION_DEADLINE_MESSAGE : action.nextAction;
   // Retry is a person's control on this task. Say so, so an agent reading this
   // record points the person to it instead of re-running the work itself.
-  if (canRetry && heldRetryOffersRetry(heldRefusal) && !eligibleContinuation) nextAction += ` ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`;
+  if (canRetry && decideRetryAuthority({ ...authorityFacts, retrySource: true }).canRetry && !eligibleContinuation)
+    nextAction += ` ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`;
+  // A paused assignee: the one true action is Resume, on every surface.
+  if (authority.userAction === "resume" && authority.cardText) nextAction = authority.cardText;
   if (chatBinding && !restoreHold) {
     if (chatBinding.state === "endpoint_removed" || !chatBinding.endpointStatus || chatBinding.endpointStatus === "archived") {
       nextAction = "This chat connection was removed. Inspect the stopped run and create a new task to continue the work.";

@@ -8,6 +8,7 @@ import { validatePrpEvent } from "../vendor/paperclip-runner/index.js";
 import { nativeSha256 } from "./native-runtime/canonical.js";
 import { isConfirmedCursorCloudTerminalObservation } from "./native-runtime/cursor-cloud-runtime.js";
 import { isAgentLifecycleStopRecord } from "./governance-pause-stop.js";
+import { readRunCancellation } from "./run-cancellation.js";
 
 export function hasAcknowledgedNativeRunStopRequest(run: {
   id: string; companyId: string; status: string; nativeIssueId: string | null;
@@ -28,10 +29,39 @@ export function hasAcknowledgedNativeRunStopReceipt(run: Parameters<typeof hasAc
     (run.resultJson?.nativeCancellation as Record<string, unknown>).dispatched === true;
 }
 
-export function hasAcknowledgedNativeStopIntent(run: Parameters<typeof hasAcknowledgedNativeRunStopReceipt>[0]): boolean {
-  return run.resultJson?.cancelledByActorType === "user" &&
-    typeof run.resultJson.cancelledByUserId === "string" && Boolean(run.resultJson.cancelledByUserId) &&
-    hasAcknowledgedNativeRunStopReceipt(run);
+export const MANAGEMENT_STOP_SCHEMA = "paperclip.management-stop.v1";
+
+/** Durable record that a managing agent's Stop passed lifecycle authority.
+ * Only the authority fence in run control writes it, in the same transaction
+ * that rechecks authority. The initiator stays the agent: no user is implied. */
+export function hasAuthorizedManagementStopRecord(run: {
+  id: string; companyId: string; agentId?: string; resultJson: Record<string, unknown> | null;
+}): boolean {
+  const result = run.resultJson;
+  // A stored JSON null is no user (projections write absent fields as null).
+  if (result?.cancelledByActorType !== "agent" || (result.cancelledByUserId !== undefined && result.cancelledByUserId !== null)) return false;
+  const record = parseObject(result.managementStop);
+  const actorAgentId = record.actorAgentId;
+  if (record.schema !== MANAGEMENT_STOP_SCHEMA || record.runId !== run.id || record.companyId !== run.companyId ||
+      typeof actorAgentId !== "string" || !actorAgentId || typeof record.targetAgentId !== "string" || !record.targetAgentId ||
+      (run.agentId !== undefined && record.targetAgentId !== run.agentId) ||
+      result.cancelledByAgentId !== actorAgentId) return false;
+  const cancellation = readRunCancellation(result);
+  return cancellation?.expected === true && cancellation.initiator.type === "agent" && cancellation.initiator.id === actorAgentId;
+}
+
+/** An intentional Stop by an identified person, or by an authorized managing
+ * agent, proven by this run's exact bound native Stop acknowledgement. */
+export function hasAcknowledgedNativeStopIntent(run: Parameters<typeof hasAcknowledgedNativeRunStopReceipt>[0] & { agentId?: string }): boolean {
+  const userStop = run.resultJson?.cancelledByActorType === "user" &&
+    typeof run.resultJson.cancelledByUserId === "string" && Boolean(run.resultJson.cancelledByUserId);
+  return (userStop || hasAuthorizedManagementStopRecord(run)) && hasAcknowledgedNativeRunStopReceipt(run);
+}
+
+/** The error code the accepted Stop asked for (for example operator_interrupted). */
+export function recordedStopErrorCode(run: { resultJson: Record<string, unknown> | null }): string | null {
+  const code = parseObject(run.resultJson?.startupCancellation).errorCode;
+  return typeof code === "string" && code ? code : null;
 }
 
 export function hasRecordedUserStopRequest(run: { resultJson: Record<string, unknown> | null }): boolean {
