@@ -1,5 +1,5 @@
 import { and, eq, sql } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
@@ -10,13 +10,10 @@ import {
 } from "../native-runtime/native-workspace-finalization-ownership.js";
 
 /** pl/cancel-finalize: the longest a Stop's cancellation boundary waits for the
- * stopped turn's workspace export. The warm box's lease is only handed off
- * (status `retained`) after the boundary returns, and a queued Send / the
- * automatic resume wait for exactly that (handed-off-warm-lease.ts), so this
- * is also the longest the +0 successor waits behind the settlement. */
+ * stopped turn's workspace export. The box's stop_and_retain release runs only
+ * after the boundary returns, and the held message / Send wait for that
+ * release's stop receipt, so this is also the longest the +0 successor waits. */
 export const CANCELLED_WARM_EXPORT_TIMEOUT_MS = 30_000;
-
-const RETAINED_IDLE_CHECKPOINT_SCHEMA = "paperclip.native-retained-idle-checkpoint.v1";
 
 type PreparedSync = {
   readonly reference: { state: string };
@@ -38,31 +35,29 @@ function deferredLine(reason: string): string {
   return `Stopped turn's workspace export could not be confirmed in time (${reason}); its files may or may not be on the host yet, and the warm box stays protected, so nothing on it is lost. To copy them back, use Recover saved files on the task.`;
 }
 
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-/** The settled-cancellation proof: NSE writes this receipt only after Pi's
- * clean abort ladder, child cleanup, the acknowledged Stop and an idle
- * snapshot all succeeded, atomically with the coordinator's terminal settle
- * (native-session-executor.ts retainCancelledSession + the retained idle
- * receipt). Without it the cancellation is not settled: nothing is exported. */
-function hasSettledCancellationReceipt(run: Pick<typeof heartbeatRuns.$inferSelect,
-  "id" | "companyId" | "nativeIssueId" | "runnerProfileJson">): boolean {
-  const receipt = record(record(run.runnerProfileJson).nativeRetainedIdleCheckpoint);
-  return receipt.schema === RETAINED_IDLE_CHECKPOINT_SCHEMA && receipt.runId === run.id
-    && receipt.companyId === run.companyId && receipt.issueId === run.nativeIssueId;
+/** adopt-stopu (U1): the settled person's Stop. NSE settles an acknowledged
+ * Stop by moving the run's coordinator to terminal_failure /
+ * native_retry_cancelled (native-session-executor.ts, the cancellation settle
+ * transaction). Under stop_and_retain no retained idle receipt is written, so
+ * that settle (not nativeRetainedIdleCheckpoint) is the trigger. */
+async function hasSettledPersonStop(db: Db, run: typeof heartbeatRuns.$inferSelect): Promise<boolean> {
+  if (!hasAcknowledgedNativeStopIntent(run)) return false;
+  const [settled] = await db.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.companyId, run.companyId),
+    eq(nativeRunFinalizations.phase, "terminal_failure"),
+    eq(nativeRunFinalizations.failureCode, "native_retry_cancelled"))).limit(1);
+  return Boolean(settled);
 }
 
 /**
  * At the cancellation boundary of a person's Stop of a warm (keep_running)
  * turn, finish the run's own prepared native-workspace export under the run's
- * workspace-finalization ownership, BEFORE the warm box is handed off: copy the
- * box's files back to the host, write the finalized descriptor and the
- * remote/lease stamps. The run stays cancelled; no result is invented and
- * nothing is replayed. With the descriptor finalized, the existing reuse filter
- * (environment-runtime.ts nativeWorkspaceExportPendingForResource) passes and the
- * successor adopts the same box (adopt_remote): same files, same Pi thread.
+ * workspace-finalization ownership, BEFORE the box's stop_and_retain release
+ * (adopt-stopu): copy the box's files back to the host, write the finalized
+ * descriptor and the remote/lease stamps. The run stays cancelled; no result is
+ * invented and nothing is replayed. With the descriptor finalized, no preserve
+ * hold is written and the existing reuse filter (environment-runtime.ts
+ * nativeWorkspaceExportPendingForResource) passes for the stopped box.
  *
  * If the export cannot be proven within the bound, the descriptor stays
  * `prepared` (today's protection: the box remains a protected export source)
@@ -82,7 +77,7 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   )).limit(1);
   if (!run || run.runtimeMode !== "native"
     || admittedNativeResourceDisposition(run.runnerProfileJson) !== "keep_running") return { outcome: "not_applicable" };
-  if (!hasAcknowledgedNativeStopIntent(run) || !hasSettledCancellationReceipt(run)) return { outcome: "not_settled" };
+  if (!await hasSettledPersonStop(input.db, run)) return { outcome: "not_settled" };
 
   const timeoutMs = input.timeoutMs ?? CANCELLED_WARM_EXPORT_TIMEOUT_MS;
   // pl/cancel-finalize2: ONE aggregate bound for the whole export. At the
@@ -156,7 +151,7 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       stream: "system", level: reason ? "warn" : "info",
       message: reason
         ? deferredLine(reason)
-        : "Stopped turn's workspace exported to the host; the warm box stays reusable for the next message.",
+        : "Stopped turn's workspace exported to the host; the stopped box stays reusable for the next message.",
       payload: { reason, detail, timeoutMs },
     });
     if (reason) {

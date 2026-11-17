@@ -21,8 +21,9 @@ import { fileURLToPath } from "node:url";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agents, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, issues,
+  agents, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
+import { hasRemoteTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { captureDirectorySnapshot, directorySnapshotSha256 } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
@@ -192,7 +193,9 @@ const support = await getEmbeddedPostgresTestSupport();
     vi.spyOn(nativeExecutor, "executePaperclipNativeSession").mockImplementationOnce(async () => {
       // The agent's own tool edits the task workspace on the box, mid-turn.
       if (variant.edit) await writeFile(join(box, "task.txt"), EDIT);
-      // The person's Stop, acknowledged; NSE settles it (retained idle receipt) only after a clean cancellation.
+      // The person's Stop, acknowledged; NSE settles it (coordinator terminal_failure /
+      // native_retry_cancelled) after a clean cancellation. adopt-stopu: under
+      // stop_and_retain no retained idle receipt is written.
       const stoppedAt = new Date();
       const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", finishedAt: stoppedAt,
@@ -201,10 +204,10 @@ const support = await getEmbeddedPostgresTestSupport();
           nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId, companyId, issueId, scope: "run",
             reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
             intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } },
-        runnerProfileJson: { ...current.runnerProfileJson,
-          ...(variant.settled ? { nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1",
-            companyId, issueId, runId, sessionId, bootId: "boot", generation: 1 } } : {}) },
+        runnerProfileJson: { ...current.runnerProfileJson },
       }).where(eq(heartbeatRuns.id, runId));
+      if (variant.settled) await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId,
+        phase: "terminal_failure", failureCode: "native_retry_cancelled" });
       runnerState.fail = variant.exportFails;
       callsAtStop = runnerState.calls;
       throw stop;
@@ -239,13 +242,23 @@ const support = await getEmbeddedPostgresTestSupport();
       output: { identityRedactor: createAgentIdentityRedactor(), appendIdentityRedactedLog: noop,
         onLog: noop, onAdapterEvent: noop, onAdapterMeta: noop },
       services: {}, effects: { onUsageCaptureReady: () => {}, onNativeDispatchStarted: () => {},
-        onNativeSessionResumeScheduled: () => {} },
+        onNativeSessionResumeScheduled: () => {},
+        onNativeWorkspaceFinalizeScheduled: () => { finalizeScheduled = true; } },
     } as unknown as HeartbeatRuntimeExecutionInput;
+    let finalizeScheduled = false;
     await expect(executeHeartbeatRuntime(db, executionInput)).rejects.toBe(stop);
     executionControl.finish();
+    // adopt-stopu U1: what the heartbeat teardown sees at the release.
+    const [atRelease] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const referenceAtRelease = readNativeWorkspaceSyncReference(atRelease.runnerProfileJson?.nativeWorkspaceSync);
 
-    // Heartbeat teardown hands the warm box off (environment-runtime records it retained).
-    await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, leaseId));
+    // adopt-stopu: the heartbeat teardown releases the box stop_and_retain (as
+    // upstream); for a reuse lease environment-runtime records it `released` with
+    // the provider's bound stop receipt (environment-runtime.ts releaseRunLease).
+    const [active] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      metadata: { ...active.metadata, remoteExecutionTermination: remoteTerminationReceipt(active,
+        { providerLeaseId, state: "stopped" }) } }).where(eq(environmentLeases.id, leaseId));
     const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     const reference = readNativeWorkspaceSyncReference(stopped.runnerProfileJson?.nativeWorkspaceSync);
     const successorRunId = randomUUID();
@@ -254,7 +267,8 @@ const support = await getEmbeddedPostgresTestSupport();
     const [retained] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
     const excluded = await nativeWorkspaceExportPendingForResource(db, retained, successorRunId);
     const events = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId)));
-    return { root, host, box, companyId, workspaceId, leaseId, providerLeaseId, runnerState, callsAtStop, stopped,
+    return { referenceAtRelease, finalizeScheduled,
+      root, host, box, companyId, workspaceId, leaseId, providerLeaseId, runnerState, callsAtStop, stopped,
       reference, excluded, successorRunId, retained, events, runId, stoppedRunProfile: stopped.runnerProfileJson,
       sync, agentId, issueId, sessionId };
   }
@@ -309,6 +323,33 @@ const support = await getEmbeddedPostgresTestSupport();
       message: expect.stringContaining("the warm box stays protected") });
   }, 60_000);
 
+  // adopt-stopu U1 + U3 (BAR fam-stop-u): the export is keyed to the SETTLED Stop
+  // (no retained idle receipt exists under stop_and_retain), FINISHED before the
+  // stop_and_retain release, and the next message / Send acquisition (the same
+  // reuse filter) finds the stopped box with the edit present, sha-equal.
+  it.each([
+    ["with work", true],
+    ["no file", false],
+  ] as const)("U1/U3 %s: finalized before the stop_and_retain release; the next turn resumes the stopped box sha-equal", async (_label, edit) => {
+    const f = await stopMidTurn({ edit, settled: true, exportFails: false });
+    const expected = edit ? EDIT : BASE;
+    expect(f.stoppedRunProfile?.nativeRetainedIdleCheckpoint).toBeUndefined();
+    // U1: at the release the export is finished and nothing is scheduled.
+    expect({ state: f.referenceAtRelease?.state, finalizeScheduled: f.finalizeScheduled })
+      .toEqual({ state: "finalized", finalizeScheduled: false });
+    expect(sha(await readFile(join(f.host, "task.txt"), "utf8"))).toBe(sha(expected));
+    // U2/U5: released stop_and_retain with the bound stop receipt (the admission gate's remote_cleanup proof).
+    expect(f.retained).toMatchObject({ status: "released", cleanupStatus: "success" });
+    expect(hasRemoteTerminationReceipt(f.retained)).toBe(true);
+    // U3: the reuse filter passes; the successor resumes the SAME box (adopt_remote), edit present.
+    expect(f.excluded).toBe(false);
+    expect(await successorOnSameBox(f)).toBe("adopt_remote");
+    const record = { box: f.providerLeaseId, sameBox: true, hostSha: sha(await readFile(join(f.host, "task.txt"), "utf8")),
+      boxSha: sha(await readFile(join(f.box, "task.txt"), "utf8")) };
+    expect(record).toEqual({ box: f.providerLeaseId, sameBox: true, hostSha: sha(expected), boxSha: sha(expected) });
+    console.info(`[adopt-stopu U3 ${_label}] ${JSON.stringify(record)}`);
+  }, 60_000);
+
   it("a Stop whose cancellation is NOT settled runs no export", async () => {
     const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
     expect(f.runnerState.calls).toBe(f.callsAtStop);
@@ -323,10 +364,9 @@ const support = await getEmbeddedPostgresTestSupport();
   /** Settles a Stop that executeHeartbeatRuntime saw unsettled, so the bounded export can be driven directly. */
   async function settleLater(f: Awaited<ReturnType<typeof stopMidTurn>>) {
     const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
-    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...current.runnerProfileJson,
-      nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1",
-        companyId: f.companyId, issueId: f.issueId, runId: f.runId, sessionId: f.sessionId, bootId: "boot", generation: 1 } },
-    }).where(eq(heartbeatRuns.id, f.runId));
+    expect(current.status).toBe("cancelled");
+    await db.insert(nativeRunFinalizations).values({ runId: f.runId, companyId: f.companyId, issueId: f.issueId,
+      phase: "terminal_failure", failureCode: "native_retry_cancelled" });
   }
 
   it("aggregate bound + late stamp: a stamp write held past the deadline publishes nothing; the lock is free at the deadline", async () => {

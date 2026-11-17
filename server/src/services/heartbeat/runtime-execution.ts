@@ -1111,7 +1111,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       // Durable cancellation is settled by the outer recovery handler;
       // it does not imply a failed workspace or a persisted run result.
       // pl/cancel-finalize: a settled Stop of a warm turn first finishes its
-      // own prepared export (bounded), before the box is handed off.
+      // own prepared export (bounded), before the box's stop_and_retain release.
       await finishCancelledWarmWorkspaceExport({ db, runId: run.id, companyId: run.companyId, nativeWorkspaceSync })
         .catch((error) => logger.warn({ err: error, runId: run.id }, "cancelled warm workspace export failed"));
       throw adapterErr;
