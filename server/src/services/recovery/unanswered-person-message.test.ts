@@ -3878,6 +3878,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         requestedByActorId: "execution-recovery", payload: { issueId: g.issueId, recoveryActionId: actionId } });
       expect(await pending(g, g.runId)).toBe(true);
     });
+  });
 
   function http(f: Awaited<ReturnType<typeof fixture>>, actor?: Record<string, unknown>) {
     const app = express(); app.use(express.json());

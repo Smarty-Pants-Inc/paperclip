@@ -27,6 +27,8 @@ function carriesInputSql(id: SQL): SQL {
 }
 
 type CarryInput = { companyId: string; issueId: string; agentId: string; contextSnapshot: unknown;
+  /** The trusted source run (wake-queue predecessor, first-turn run): collecting candidates walks its chain. */
+  runId?: string;
   /** The source run's agent and id: another LIVE run of that agent owning a card answer blocks a second carry. */
   liveOwner?: { agentId: string; runId: string } };
 
@@ -71,9 +73,58 @@ export async function pendingContinuationCommentInput(db: Pick<Db, "select">, in
   return { ...typed, ...answered };
 }
 
+/** Carry-all (H3 cfebb132): the wake and first-turn input of the source run's continuation chain, within the
+ * same company, task, agent and conversation generation (a reset ends the lineage). Collecting candidates walks
+ * the chain; attributing an answer never does: every candidate still passes the ONE policy below. */
+async function continuationChainContexts(db: Pick<Db, "select">, input: CarryInput): Promise<Array<Record<string, unknown> | null>> {
+  const runId = input.runId ?? input.liveOwner?.runId;
+  if (!runId || !UUID.test(runId)) return [];
+  const context = heartbeatRuns.contextSnapshot;
+  const rows = await db.select({
+    wakeCommentIds: sql<unknown>`${context}->'wakeCommentIds'`,
+    wakeCommentId: sql<unknown>`${context}->'wakeCommentId'`,
+    commentId: sql<unknown>`${context}->'commentId'`,
+    queuedCommentSourceWakeIds: sql<unknown>`${context}->'queuedCommentSourceWakeIds'`,
+    firstTurnQueuedInput: sql<unknown>`jsonb_build_object('commentIds', ${context}#>'{firstTurnQueuedInput,commentIds}',
+      'wakeupRequestIds', ${context}#>'{firstTurnQueuedInput,wakeupRequestIds}')`,
+  }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+    sql`${heartbeatRuns.id} in (with recursive input_chain as (
+      select source.id, source.retry_of_run_id, source.context_snapshot->>'previousRunId' as previous_run_id,
+        source.context_snapshot->>'retryOfRunId' as context_retry_id, source.native_session_id, source.created_at,
+        coalesce(source.context_snapshot->'conversationSessionGeneration', '0'::jsonb) as generation
+      from heartbeat_runs source
+      where source.company_id = ${input.companyId} and source.agent_id = ${input.agentId} and source.id = ${runId}
+        and (source.issue_id = ${input.issueId} or source.native_issue_id = ${input.issueId}
+          or source.context_snapshot->>'issueId' = ${input.issueId})
+      union
+      select parent.id, parent.retry_of_run_id, parent.context_snapshot->>'previousRunId',
+        parent.context_snapshot->>'retryOfRunId', parent.native_session_id, parent.created_at,
+        coalesce(parent.context_snapshot->'conversationSessionGeneration', '0'::jsonb)
+      from input_chain child join heartbeat_runs parent on parent.company_id = ${input.companyId}
+        and parent.agent_id = ${input.agentId}
+        and (parent.issue_id = ${input.issueId} or parent.native_issue_id = ${input.issueId}
+          or parent.context_snapshot->>'issueId' = ${input.issueId})
+        and coalesce(parent.context_snapshot->'conversationSessionGeneration', '0'::jsonb) = child.generation
+        and (parent.id = child.retry_of_run_id
+          or parent.id::text = lower(child.previous_run_id)
+          or parent.id::text = lower(child.context_retry_id)
+          or (child.native_session_id is not null and parent.native_session_id = child.native_session_id
+            and (parent.created_at, parent.id) < (child.created_at, child.id)))
+    ) select id from input_chain)`,
+  ));
+  return rows;
+}
+
 /** Rebind the parent's wake comments and first-turn input ids, not its receipt. */
 async function pendingPersonCommentInput(db: Pick<Db, "select">, input: CarryInput, after?: Date): Promise<Record<string, unknown>> {
-  const carried = carryContinuationCommentInput(input.contextSnapshot);
+  const direct = carryContinuationCommentInput(input.contextSnapshot);
+  const directIds = (direct.wakeCommentIds as string[] | undefined)?.filter(id => UUID.test(id)) ?? [];
+  const chain = (await continuationChainContexts(db, input)).map(carryContinuationCommentInput);
+  const carried = carryContinuationCommentInput({
+    wakeCommentIds: [...directIds, ...chain.flatMap(context => (context.wakeCommentIds as string[] | undefined) ?? [])],
+    queuedCommentSourceWakeIds: [direct, ...chain].flatMap(context => (context.queuedCommentSourceWakeIds as string[] | undefined) ?? []),
+  });
   const candidates = (carried.wakeCommentIds as string[] | undefined)?.filter(id => UUID.test(id)) ?? [];
   if (candidates.length === 0) return {};
   const senderStopped = senderStoppedCheck(db, input);
@@ -81,6 +132,8 @@ async function pendingPersonCommentInput(db: Pick<Db, "select">, input: CarryInp
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     inArray(issueComments.id, candidates), isNull(issueComments.deletedAt),
     ...(after ? [gt(issueComments.createdAt, after)] : []),
+    // A chain ancestor contributes only a person's own comments; the source run's direct input is unchanged.
+    or(inArray(issueComments.id, directIds), eq(issueComments.authorType, "user")),
     // Only still-pending input: carry unless ANSWERED. A message a completed run's final answer answered (attributed
     // through that run's own pending input) is never re-presented, or every continuation re-answers it (org 19:48Z).
     // A failed run's progress reply is DELIVERED only: the message is still carried (RFL F1, 21:28Z).
