@@ -8750,6 +8750,63 @@ describe("native governed waits", () => {
     await observing;
     expect(delayedObservation.consume(replayedEvent)).toBeNull();
   });
+
+  it("does not park a Pi turn while a sibling tool from the same batch is still running", async () => {
+    // Pi runs one assistant message's tool calls as a batch: it reports every
+    // tool as started (kind "tool", or "commandExecution" for bash) before
+    // its host callbacks reach the Runner one at a time. When the question's
+    // callback answers first, parking on that answer stops the provider while
+    // the sibling still runs. Its callback then never gets a result, and the
+    // Runner's saved state keeps that call pending (a live-looking turn).
+    const waitResult = nativeGovernedWaitResult({
+      interaction: { id: "interaction-batch", title: "Answer the question", summary: null },
+      completionContract: {
+        revision: "contract-v1",
+        objective: "Ask, then continue",
+        criteria: [{ id: "objective", requirement: "Get the answer" }],
+      },
+    });
+    const observation = createGovernedWaitEventObservation(async () => waitResult);
+    let seq = 0;
+    const event = (eventType: PrpEvent["eventType"], itemId: string, payload: Record<string, unknown>): PrpEvent => {
+      seq += 1;
+      return {
+        schema: "paperclip.prp.event.v1" as const,
+        sourceInstanceId: "runner-pi",
+        sourceEventId: `runner-pi:event:${seq}`,
+        sourceSeq: seq,
+        sourceKind: "runner" as const,
+        runId: "run-pi",
+        normalizedSessionId: "session-pi",
+        turnId: "turn-pi",
+        itemId,
+        eventType,
+        schemaVersion: 1,
+        priority: 0 as const,
+        emittedAt: "2026-11-17T00:00:00.000Z",
+        payload,
+      };
+    };
+    const piTool = (name: string) => ({ kind: "tool", toolName: name });
+    // The executor observes every event; only item.completed is eligible.
+    const observe = async (next: PrpEvent) => {
+      await observation.observe(next, next.eventType === "item.completed");
+      return observation.consume(next);
+    };
+
+    expect(await observe(event("item.started", "pi-tool:question", piTool("request_human_input")))).toBeNull();
+    expect(await observe(event("item.started", "pi-tool:sibling", piTool("read_task_files")))).toBeNull();
+    // The question's host callback runs and answers; the sibling's callback
+    // has not reached the Runner yet.
+    expect(await observe(event("item.started", "call-question", { kind: "dynamicToolCall" }))).toBeNull();
+    expect(await observe(event("item.completed", "call-question", { kind: "dynamicToolCall" }))).toBeNull();
+    expect(await observe(event("item.completed", "pi-tool:question", piTool("request_human_input")))).toBeNull();
+    // The sibling's callback runs to its own result before the turn parks.
+    expect(await observe(event("item.started", "call-sibling", { kind: "dynamicToolCall" }))).toBeNull();
+    expect(await observe(event("item.completed", "call-sibling", { kind: "dynamicToolCall" }))).toBeNull();
+    // Once Pi reports the whole batch finished, the wait parks the turn.
+    expect(await observe(event("item.completed", "pi-tool:sibling", piTool("read_task_files")))).toEqual(waitResult);
+  });
 });
 
 type LeaseCoordinator = {
