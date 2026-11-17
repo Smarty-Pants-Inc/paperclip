@@ -5,7 +5,7 @@ import { carryContinuationCommentInput } from "../modules/wake-queue/domain/cont
 import { answeredPersonMessageSql } from "./person-message-answer.js";
 import { executionBlockerPredicate, NEW_TASK_CONTINUE_ACTION, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate,
   withoutUnavailableRetry } from "./execution-blocker.js";
-import { WORKSPACE_RESTORE_PENDING_KEY, workspaceRestoreHoldNextAction } from "./legacy-execution-recovery.js";
+import { RECOVERING_SAVED_WORK_NEXT_ACTION, WORKSPACE_RESTORE_PENDING_KEY, workspaceRestoreHoldNextAction } from "./legacy-execution-recovery.js";
 import { exhaustedStopWait, readSystemRecovery } from "./system-recovery-state.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import {
@@ -125,10 +125,11 @@ function decision(userAction: RetryUserAction, reason: string, text: string | nu
  * chooses the words, which name Retry's real effect (a fresh run with history).
  */
 export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority {
+  if (facts.agentPaused) return decision("resume", "agent_paused", AGENT_PAUSED_RETRY_MESSAGE, AGENT_PAUSED_ACTION);
   // fam-retry3: the message is answered above; a Retry is a no-op that says so.
+  // A paused agent still wins (R6 G): its refusal runs nothing either.
   if (facts.personMessageAnswered)
     return decision("message", PERSON_MESSAGE_ANSWERED_REASON, PERSON_MESSAGE_ANSWERED_MESSAGE, null);
-  if (facts.agentPaused) return decision("resume", "agent_paused", AGENT_PAUSED_RETRY_MESSAGE, AGENT_PAUSED_ACTION);
   if (facts.automaticRecovery) return decision("wait", "automatic_recovery", AUTOMATIC_RECOVERY_MESSAGE, null);
   if (facts.stopGate === "waiting") return decision("wait", "execution_settling", RETRY_STOP_WAIT_MESSAGE, RETRY_STOP_WAIT_ACTION);
   if (facts.stopGate === "expired")
@@ -147,8 +148,14 @@ export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority
   // message is kept and runs when it's back"); only a failed restore refuses.
   if (facts.restoreHold) {
     const text = workspaceRestoreHoldNextAction(facts.restoreHold);
+    // fam-retry3 ITEM B: a restore_failed hold whose files Paperclip's workspace
+    // recovery owns holds an ACCEPTED Retry; restore-card's "could not be put
+    // back... Create a new task" would be false there. It says the recovering
+    // words (the same constant a pending hold says); a failed restore with no
+    // recovery keeps restore-card's words and the new-task refusal.
+    const heldText = hasRequiredWorkspaceRecovery(facts.restoreHold) ? RECOVERING_SAVED_WORK_NEXT_ACTION : text;
     return restoreHoldHoldsRetry(facts.restoreHold)
-      ? { ...decision("wait", "workspace_repair_required", text, text), canRetry: true, admission: "held" }
+      ? { ...decision("wait", "workspace_repair_required", heldText, heldText), canRetry: true, admission: "held" }
       : decision("new_task", "workspace_repair_required", withoutUnavailableRetry(text, false), NEW_TASK_CONTINUE_ACTION);
   }
   const recovered = facts.savedWork === "recovered";
