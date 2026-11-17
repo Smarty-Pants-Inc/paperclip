@@ -852,7 +852,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       try {
         await lifecycle.pauseAgent(f.agentId); await worker.process(f.agentId);
         const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
-        expect(wake).toMatchObject({ status: "cancelled", runId: null, error: "Agent lifecycle stop requested",
+        expect(wake).toMatchObject({ status: "cancelled", runId: null, error: "Cancelled due to agent pause",
           reason: "issue_execution_deferred", payload: f.payload });
         expect(wake!.finishedAt).not.toBeNull();
         expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
@@ -883,11 +883,120 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       } finally { await worker.stop(); }
     });
 
+  // Keep: rf5 F1 regression — terminating a manager cancels the ready report's
+  // wake with the shared stop reason, but does not pause that report.
+  it("pausewake2 F1: terminating a MANAGER must not falsely call a ready report paused", async () => {
+    const f = await deferredMessageBeforePause();
+    await f.sweep(1); await f.sweep(5);
+    const managerId = randomUUID();
+    await db.insert(agents).values({ id: managerId, companyId: f.companyId, name: "Manager", status: "idle",
+      lifecycleState: "ready", adapterType: "paperclip_runner" });
+    await db.update(agents).set({ reportsTo: managerId }).where(eq(agents.id, f.agentId));
+    const lifecycle = createAgentLifecycle(db);
+    const driver = createLifecycleDriver(db, {} as never);
+    const worker = configureAgentLifecycle(db, { ...driver, requiredPluginIds: async () => [], runPlugin: async () => "complete" });
+    try {
+      f.advance(5.1); await lifecycle.terminateAgent(managerId); await worker.process(managerId);
+      const [manager] = await db.select().from(agents).where(eq(agents.id, managerId));
+      const [report] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      expect(manager!.lifecycleState).toBe("terminated");
+      expect(report).toMatchObject({ lifecycleState: "ready", status: "idle" });
+      expect(wake).toMatchObject({ status: "cancelled", runId: null, error: "Agent lifecycle stop requested" });
+      for (const minute of [7, 17]) {
+        const notes = await f.sweep(minute);
+        if (process.env.PAUSEWAKE_EVIDENCE_FILE) appendFileSync(process.env.PAUSEWAKE_EVIDENCE_FILE,
+          `${JSON.stringify({ row: "F1", minute, manager, report, wake, notes })}\n`);
+        expect(notes).toHaveLength(1);
+        expect.soft(notes[0]!.body, "No pause or resume was requested for this report").toBe(NO_RUN);
+        expect.soft(codeOf(notes[0]!)).toBe("no_run");
+      }
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+    } finally { await worker.stop(); }
+  });
+
+  // Keep: rf5 F2 — a new carrying queued wake after resume is pending work,
+  // just like a deferred carrying wake; old cancellation prose invites duplicates.
+  it.each(["queued", "deferred_issue_execution", "deferred"])(
+    "pausewake2 F2: NEW carrying %s wake after resume yields to waiting rules", async status => {
+      const f = await deferredMessageBeforePause();
+      await f.sweep(1); await f.sweep(5);
+      const lifecycle = createAgentLifecycle(db);
+      const driver = createLifecycleDriver(db, {} as never);
+      const worker = configureAgentLifecycle(db, { ...driver, requiredPluginIds: async () => [], runPlugin: async () => "complete" });
+      try {
+        f.advance(5.1); await lifecycle.pauseAgent(f.agentId); await worker.process(f.agentId);
+        const paused = await f.sweep(5.5);
+        expect(rowsOf(paused[0]!).find(row => row.label === "Waiting code")?.value).toBe("agent_paused");
+        const before = paused[0]!;
+        f.advance(6); await lifecycle.resumeAgent(f.agentId); await worker.process(f.agentId);
+        f.advance(6.1);
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+          source: "on_demand", reason: "issue_execution_deferred", status, payload: f.payload,
+          createdAt: new Date(), updatedAt: new Date() }).returning();
+        for (const minute of [7, 10.9]) {
+          const notes = await f.sweep(minute);
+          if (process.env.PAUSEWAKE_EVIDENCE_FILE) appendFileSync(process.env.PAUSEWAKE_EVIDENCE_FILE,
+            `${JSON.stringify({ row: "F2", status, minute, wake, notes })}\n`);
+          expect(notes).toHaveLength(1);
+          expect(notes[0]!.id).toBe(before.id);
+          expect(notes[0]!.createdAt.getTime()).toBe(before.createdAt.getTime());
+          expect.soft(notes[0]!.body).toBe(WAITING);
+          expect.soft(codeOf(notes[0]!)).toBeUndefined();
+          expect.soft(rowsOf(notes[0]!).find(row => row.label === "Waiting code")?.value).toBe("waiting_to_start");
+        }
+        const expired = await f.sweep(11.1);
+        expect(expired).toHaveLength(1);
+        expect(expired[0]!.id).toBe(before.id);
+        expect(expired[0]!.body).toBe(NO_RUN); // A newer wake does not restart the durable start bound.
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+      } finally { await worker.stop(); }
+    });
+
+  it.each(["older-queue", "later-failure", "message", "issue", "agent"] as const)(
+    "pausewake2 F2 guard: a queued wake cannot hide the latest terminal attempt (%s)", async control => {
+      const f = await deferredMessageBeforePause();
+      await f.sweep(1); await f.sweep(5);
+      f.advance(5.1);
+      await db.update(agentWakeupRequests).set({ status: "cancelled", error: "Cancelled due to agent pause",
+        finishedAt: new Date(), updatedAt: new Date() }).where(eq(agentWakeupRequests.id, f.wakeId));
+      const other = await fixture();
+      f.advance(control === "older-queue" ? 4 : 6);
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId,
+        agentId: control === "agent" ? other.agentId : f.agentId, source: "on_demand", status: "queued",
+        payload: { issueId: control === "issue" ? other.issueId : f.issueId,
+          commentId: control === "message" ? randomUUID() : f.commentId }, createdAt: new Date(), updatedAt: new Date() });
+      if (control === "later-failure") {
+        f.advance(6.5);
+        await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+          source: "on_demand", status: "failed", error: "A later wake failed", payload: f.payload,
+          createdAt: new Date(), updatedAt: new Date(), finishedAt: new Date() });
+      }
+      const notes = await f.sweep(7);
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toBe(control === "later-failure" ? NO_RUN
+        : "Managed Pi was paused before it answered your message. Send it again to continue.");
+    });
+
+  it("pausewake2 F2 guard: queued carrying work needs no deferred executionWait payload", async () => {
+    const f = await deferredMessageBeforePause();
+    await f.sweep(1); await f.sweep(5);
+    f.advance(5.1);
+    await db.update(agentWakeupRequests).set({ status: "cancelled", error: "Cancelled due to agent pause",
+      finishedAt: new Date(), updatedAt: new Date() }).where(eq(agentWakeupRequests.id, f.wakeId));
+    f.advance(6);
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "on_demand", status: "queued", payload: { issueId: f.issueId, commentId: f.commentId },
+      createdAt: new Date(), updatedAt: new Date() });
+    expect((await f.sweep(7)).map(note => note.body)).toEqual([WAITING]);
+  });
+
   it.each([
     { status: "cancelled", error: "Cancelled as delivered to another turn" },
     { status: "cancelled", error: "Cancelled because the company was archived" },
+    { status: "cancelled", error: "Agent lifecycle stop requested" }, // Shared reason is not pause proof.
     { status: "cancelled", error: null },
-    { status: "failed", error: "Agent lifecycle stop requested" },
+    { status: "failed", error: "Cancelled due to agent pause" },
   ])("pausewake guard: a wake cancelled for another reason or failed keeps no_run (%j)", async input => {
     const f = await deferredMessageBeforePause();
     f.advance(5);
@@ -908,7 +1017,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const other = await fixture();
       const otherCommentId = await other.message();
       const unrelatedRun = control === "linked-run" ? await f.run({ status: "succeeded" }) : null;
-      await db.update(agentWakeupRequests).set({ status: "cancelled", error: "Agent lifecycle stop requested",
+      await db.update(agentWakeupRequests).set({ status: "cancelled", error: "Cancelled due to agent pause",
         finishedAt: new Date(), updatedAt: new Date(), runId: unrelatedRun,
         ...(control === "agent" ? { agentId: other.agentId } : {}),
         payload: { ...f.payload, ...(control === "message" ? { commentId: otherCommentId } : {}),
