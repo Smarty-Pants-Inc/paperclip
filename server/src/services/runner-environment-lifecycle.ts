@@ -20,18 +20,13 @@ export function providerResourceDispositionForTerminalRun(
     return "stop_and_retain";
   }
   if (status === "succeeded") return desired;
-  // A person's Stop (cancelRun's errorCode, or the executor's stop fence) is
-  // not a warm handoff: as upstream, stop the box and retain it, so the stop
-  // receipt comes with this run's own teardown and the next turn resumes it.
-  if (status === "cancelled" && (errorCode === "cancelled" || errorCode === "native_retry_cancelled")) {
-    return "stop_and_retain";
-  }
   if (!["failed", "cancelled", "interrupted"].includes(status ?? "")) return "stop_and_retain";
   // These are ordinary run outcomes, not integrity/reconciliation failures.
   // In particular, native_restart_recovery_blocked, replay conflicts and
-  // quarantined cleanup retain their existing stop policy.
-  if (errorCode && !["adapter_failed", "adapter_error", "native_session_interrupted",
-    "native_retry_cancelled", "cancelled"].includes(errorCode)) {
+  // quarantined cleanup retain their existing stop policy. A person's Stop
+  // (cancelled / native_retry_cancelled) is not kept warm: as upstream
+  // run-control, a non-succeeded run stops and retains its box.
+  if (errorCode && !["adapter_failed", "adapter_error", "native_session_interrupted"].includes(errorCode)) {
     return "stop_and_retain";
   }
   return desired;
