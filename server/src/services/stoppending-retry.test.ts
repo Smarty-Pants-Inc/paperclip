@@ -287,4 +287,29 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(blockedWith?.reason).not.toBe("execution_stop_unproven");
     expect(blockedWith?.reason).not.toBe("execution_settling");
   });
+  it("C: the waiting Retry, once the stopped run releases the task and its hold is written, gets the full admission and continues (not consumed)", async () => {
+    const f = await seed("C");
+    const receipt = await press(f);
+    expect((await admit(f, receipt.requestId!)).blockedWith?.reason).toBe("execution_settling");
+    const now = Date.now();
+    // The stopped run settles: it releases the task, its coordinator is terminal, its box stopped, its hold is written.
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null, status: "blocked" }).where(eq(issues.id, f.issueId));
+    await db.insert(nativeRunFinalizations).values({ runId: f.sourceRunId, companyId: f.companyId, issueId: f.issueId,
+      phase: "terminal_failure", attempt: 1 } as typeof nativeRunFinalizations.$inferInsert);
+    const [environment] = await db.insert(environments).values({ name: `box-cs-${f.sourceRunId}`, driver: "sandbox" }).returning();
+    const identity = { id: randomUUID(), companyId: f.companyId, heartbeatRunId: f.sourceRunId, provider: "daytona", providerLeaseId: "sandbox-cs" };
+    await db.insert(environmentLeases).values({ ...identity, environmentId: environment!.id,
+      issueId: f.issueId, status: "released", leasePolicy: "ephemeral", releasedAt: new Date(now), cleanupStatus: "success",
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(identity, { providerLeaseId: "sandbox-cs", state: "destroyed" }) } });
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: f.agentId,
+      cause: "native_continuation_requires_reconciliation", fingerprint: `native-continuation:${f.sourceRunId}`,
+      evidence: { runId: f.sourceRunId, originalFailureCode: "cancelled" },
+      nextAction: "The run stopped before it finished. Paperclip continues the task from its last saved work.", maxAttempts: 3 });
+    const { admitted, blockedWith } = await admit(f, receipt.requestId!);
+    expect(blockedWith).toBeNull();
+    expect(admitted).toMatchObject({ previousRunId: f.sourceRunId, taskRetryRequestId: receipt.requestId });
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!));
+    expect(wake!.status).toBe("deferred_issue_execution");
+  }, 60_000);
 });
