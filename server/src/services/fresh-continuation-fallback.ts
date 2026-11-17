@@ -398,7 +398,9 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
       eq(heartbeatRuns.runtimeMode, "native"),
       sql`${heartbeatRuns.id} <> ${run.id}`,
       sql`${heartbeatRuns.createdAt} < (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})`,
-      sql`(${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}')::timestamptz <= (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})`,
+      sql`((${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}')::timestamptz <= (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})
+        or (${issueRecoveryActions.evidence}#>>'{freshContinuation,selectedAt}' = 'preparation'
+          and ${issueRecoveryActions.evidence}->>'continuationRunId' = ${run.id}::text))`,
     )).orderBy(desc(sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}'`), desc(issueRecoveryActions.id)).limit(1);
   if (!record) return null;
   const { action, source } = record;
@@ -436,9 +438,14 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
 function isRetryFreshProviderThread(action: typeof issueRecoveryActions.$inferSelect, sourceRunId: string,
   run: typeof heartbeatRuns.$inferSelect) {
   const readiness = object(object(object(run.contextSnapshot).explicitUserContinuation).readiness);
-  return RETRY_FRESH_THREAD_TRIGGERS.includes(object(action.evidence.freshContinuation).trigger as RetryFreshThreadTrigger)
+  const fresh = object(action.evidence.freshContinuation);
+  return RETRY_FRESH_THREAD_TRIGGERS.includes(fresh.trigger as RetryFreshThreadTrigger)
     && action.evidence.continuationRunId === run.id && action.evidence.continuationDelivery === "delivered"
-    && readiness.mode === "fresh_isolated_workspace" && readiness.sourceRunId === sourceRunId;
+    && action.fingerprint === `fresh-continuation:retry:${run.id}`
+    // Selected by admission (its readiness) or, for a Retry admission did not
+    // route, by this run's own workspace preparation (same record, same run).
+    && (readiness.mode === "fresh_isolated_workspace" && readiness.sourceRunId === sourceRunId
+      || fresh.selectedAt === "preparation" && fresh.sourceRunId === sourceRunId);
 }
 
 export const RETRY_FRESH_THREAD_TRIGGER = "person_retry" as const;
@@ -474,6 +481,8 @@ export function retryFreshThreadTrigger(intent: { initiatedBy?: "restart_recover
 export async function recordRetryFreshProviderThread(db: Db, input: {
   companyId: string; issueId: string; agentId: string; sourceRunId: string; successorRunId: string;
   trigger: RetryFreshThreadTrigger;
+  /** Run preparation chose the fresh workspace (no admission readiness). */
+  selectedAt?: "preparation";
 }): Promise<string | null> {
   const [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.agentId, input.agentId))).for("update");
@@ -484,7 +493,8 @@ export async function recordRetryFreshProviderThread(db: Db, input: {
   const recordedAt = new Date(Number(clock!.ms)).toISOString();
   const isolation: FreshContinuationIsolation = "fresh_isolated_workspace";
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: source.id, trigger: input.trigger,
-    failureCode: source.errorCode ?? null, delivery: "caller_owns", recordedAt, isolation, stopProof: "unproven_isolated" };
+    failureCode: source.errorCode ?? null, delivery: "caller_owns", recordedAt, isolation, stopProof: "unproven_isolated",
+    ...(input.selectedAt ? { selectedAt: input.selectedAt } : {}) };
   const reconciliation = { runId: source.id, providerStopped: true, providerStopProof: "isolated",
     workspaceRepairEvidence: `The Retry of run ${source.id} starts in a new isolated workspace; no unverified files are applied.`,
     actorId: FRESH_CONTINUATION_ACTOR, recordedAt };
