@@ -18,14 +18,19 @@ ends renewal without any recovery resume. The F-01 admission/lifecycle fences
 apply before every send; a late reply cannot re-arm a cancelled timer.
 
 The environment setting `runLeaseRenewCapSeconds` (integer 1–2592000, default
-**7800**) is an absolute renewal budget from acquire/resume entry, not a sliding
+**86400**) is an absolute renewal budget from acquire/resume entry, not a sliding
 idle window. The plugin SDK's acquire/resume/lease and runner-ingress contracts
-do not expose the RUN's timeout. The fallback default is 7200 seconds plus a
-600-second allowance; configure it to your RUN timeout plus one renewal cadence
-and a small margin. Duplicate same-RUN warm handoffs preserve the original cap;
+do not expose the RUN's timeout. The 24 h default accommodates agents with no run
+timeout: a hung run holds one small box for ≤1 day of renewals (~$0.43-$0.86), plus
+its last finite TTL. For timed RUNs, configure it to your RUN timeout plus one
+renewal cadence and a small margin. Duplicate same-RUN warm handoffs preserve the original cap;
 a new RUN may get a new budget. At the cap, even a never-released lease loses its
 refresher and the box expires on its last finite TTL (not necessarily at the cap).
 The cap is not a provider-side absolute expiry or a promise of zero charges.
+
+Validation returns only caller-supplied configuration keys, retaining existing
+canonicalization of supplied values; omitted defaults apply at read time, so an
+unrelated save does not materialize defaults and rotate retained conversations.
 
 Transient failures emit a closed `Boat run lease TTL refresh` warning and retry
 at the next tick within the cap. Release, stop, destroy, shutdown, or a missing/

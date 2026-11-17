@@ -29,7 +29,7 @@ import type {
 } from "@paperclipai/plugin-sdk";
 
 type Config = RunnerConfig & { provider: string; setupTimeoutSeconds: number; runLeaseRenewCapSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
-const DEFAULT_RUN_LEASE_RENEW_CAP_SECONDS = 7800;
+const DEFAULT_RUN_LEASE_RENEW_CAP_SECONDS = 86400;
 function validRunLeaseRenewCap(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 2_592_000;
 }
@@ -1778,8 +1778,12 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     if (!Number.isInteger(c.setupTimeoutSeconds) || c.setupTimeoutSeconds < 1 || c.setupTimeoutSeconds > 600) errors.push("setupTimeoutSeconds must be an integer from 1 through 600.");
     if (params.config.runLeaseRenewCapSeconds !== undefined && !validRunLeaseRenewCap(params.config.runLeaseRenewCapSeconds)) errors.push("runLeaseRenewCapSeconds must be an integer from 1 through 2592000.");
     if (Object.keys(c.labels).length > 15 || Object.entries(c.labels).some(([k,v]) => !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,62}$/.test(k) || typeof v !== "string" || new TextEncoder().encode(v).length > 256)) errors.push("labels must have valid Boat keys, values <=256 bytes, and at most 15 entries (ownership labels are added).");
+    // Storage must not materialize read-time defaults: even an unrelated save
+    // would change the lease fingerprint and rotate retained conversations.
     return errors.length ? { ok: false, errors } : { ok: true, normalizedConfig: {
-      ...c, ...(params.config.duplexCarrier === undefined ? {} : { duplexCarrier: params.config.duplexCarrier }),
+      ...params.config,
+      ...Object.fromEntries(Object.entries(c).filter(([key]) => Object.hasOwn(params.config, key))),
+      ...(params.config.duplexCarrier === undefined ? {} : { duplexCarrier: params.config.duplexCarrier }),
     } };
   },
   async onEnvironmentProbe(params: PluginEnvironmentProbeParams): Promise<PluginEnvironmentProbeResult> {
