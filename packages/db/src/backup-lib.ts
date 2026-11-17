@@ -2,7 +2,7 @@ import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
-import { open as openFile, writeFile } from "node:fs/promises";
+import { open as openFile, rename, unlink } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
@@ -908,11 +908,20 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
+    // conperiod was added in PostgreSQL 18. Do not even reference it on older
+    // servers: temporal UNIQUEs raise exclusion_violation and use overlap, not
+    // equality, for their final key. conexclop contains those exact operators.
+    const [constraintSupport] = await sql<{ temporal: boolean }[]>`
+      SELECT current_setting('server_version_num')::int >= 180000 AS temporal
+    `;
+    const constraintType = constraintSupport?.temporal
+      ? "CASE WHEN c.contype = 'u' AND c.conperiod THEN 'x' ELSE c.contype END"
+      : "c.contype";
     const allTableConstraints = await sql<TableConstraintDefinition[]>`
       SELECT c.conname AS constraint_name,
              n.nspname AS schema_name,
              t.relname AS tablename,
-             c.contype AS constraint_type,
+             ${sql.unsafe(constraintType)} AS constraint_type,
              pg_get_constraintdef(c.oid) AS definition,
              pg_get_expr(c.conbin, c.conrelid) AS check_expression,
              ARRAY(SELECT pg_get_indexdef(c.conindid, position, false)
@@ -1254,7 +1263,22 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
     const summary = `restored with ${constraintViolations.length} constraint violations${violationReportFile ? `: see ${violationReportFile}` : ""}`;
     const result = { constraintViolations, violationReportFile, summary };
     if (violationReportFile) {
-      await writeFile(violationReportFile, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });
+      // Never write client data through an existing, potentially public inode
+      // (or symlink). Publish a fresh private file atomically in the same dir.
+      const temporaryReportFile = `${violationReportFile}.${randomUUID()}.tmp`;
+      const report = await openFile(temporaryReportFile, "wx", 0o600);
+      try {
+        try {
+          await report.writeFile(`${JSON.stringify(result, null, 2)}\n`);
+        } finally {
+          await report.close();
+        }
+        await rename(temporaryReportFile, violationReportFile);
+      } finally {
+        await unlink(temporaryReportFile).catch(error => {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        });
+      }
       console.warn(summary);
     }
     return result;
