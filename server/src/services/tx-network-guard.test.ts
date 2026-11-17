@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createDb } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
 import { createPluginWorkerManager } from "./plugin-worker-manager.js";
+import { withWorkspaceSourceLocks } from "./workspace-source-lock.js";
 
 // RED for ad056b15's shape: a DB transaction that awaits a provider/runner network call.
 // The guard (packages/db/src/transaction-context.ts) must throw in tests (PAPERCLIP_TX_NETWORK_GUARD=throw).
@@ -30,5 +31,16 @@ const support = await getEmbeddedPostgresTestSupport();
     let later!: Promise<unknown>;
     await db.transaction(async () => { later = new Promise(resolve => setTimeout(resolve, 50)).then(call); });
     await expect(later).rejects.toThrow(/No worker registered/);
+  });
+
+  it("exempts exactly the dedicated finalization-lock session (workspace-source-lock.ts), not a transaction opened inside it", async () => {
+    const manager = createPluginWorkerManager();
+    const call = () => manager.call("boat", "environmentExecute", {} as never);
+    const lock = (action: () => Promise<unknown>) => withWorkspaceSourceLocks(db, { companyId: "c", issueIds: ["i"] }, action);
+    await expect(lock(() => call())).rejects.toThrow(/No worker registered/);
+    await expect(lock(() => db.transaction(async () => { await call(); }))).rejects.toThrow(/network_call_in_db_transaction/);
+    // A dedicated connection's transaction NOT opened by the lock helper is not exempt.
+    const { withDedicatedDbConnection } = await import("@paperclipai/db");
+    await expect(withDedicatedDbConnection(db, c => c.transaction(async () => { await call(); }))).rejects.toThrow(/network_call_in_db_transaction/);
   });
 });
