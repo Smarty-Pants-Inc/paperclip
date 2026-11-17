@@ -1,4 +1,5 @@
 import { AgentAvatar } from "@/components/AgentAvatar";
+import { isHiddenMoneyAction } from "../lib/cost-visibility";
 import { useMemo, useState, useRef, useCallback, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useVisibilityRefetchInterval } from "@/lib/polling";
@@ -403,6 +404,7 @@ export function ActivityFeed({ className }: ActivityFeedProps) {
   const processedItems = useMemo(() => {
     const events = (activity ?? [])
       .filter((evt) => {
+        if (isHiddenMoneyAction(evt.action)) return false;
         const tier = getEventTier(evt);
         if (!showAllActivity && tier === 3) return false;
         return matchesFilter(evt, filter);

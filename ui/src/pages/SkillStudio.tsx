@@ -58,6 +58,7 @@ import { agentsApi } from "@/api/agents";
 import { companySkillsApi } from "@/api/companySkills";
 import { ApiError } from "@/api/client";
 import { issuesApi } from "@/api/issues";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { queryKeys } from "@/lib/queryKeys";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { useCopyToast } from "@/lib/use-copy-action";
@@ -3003,10 +3004,10 @@ function RunHistoryRow({
       identifier={runShortId(run)}
       title={removed ? `${name} (removed)` : name}
       subtitle={relativeTime(run.createdAt)}
-      trailing={
+      trailing={!COST_BUDGET_UI_HIDDEN ?
         <span className="font-mono text-xs text-muted-foreground">
           {formatCents(run.cost.costCents)}
-        </span>
+        </span> : undefined
       }
       onClick={onSelect}
     />
@@ -3193,9 +3194,9 @@ function RunDetailView({
           <span className="font-mono text-xs text-muted-foreground">
             v{detail.skillVersion.revisionNumber}
           </span>
-          <span className="ml-auto font-mono text-xs text-muted-foreground">
+          {!COST_BUDGET_UI_HIDDEN && <span className="ml-auto font-mono text-xs text-muted-foreground">
             {formatCents(detail.cost.costCents)}
-          </span>
+          </span>}
         </div>
 
         {/* snapshot property block */}

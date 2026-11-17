@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { isWaitingToStart } from "../lib/agent-queue-wait";
 import {
   Inbox,
@@ -227,7 +228,7 @@ export function Sidebar() {
           <SidebarNavItem to="/org" label="Org" icon={Network} />
           {showApps ? <SidebarNavItem to="/apps" label="Connectors" icon={Unplug} /> : null}
           <SidebarNavItem to="/timeline" label="Timeline" icon={GanttChartSquare} />
-          <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />
+          {!COST_BUDGET_UI_HIDDEN && <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />}
           {/* One entry — /audit merged into the rich Activity feed (PAP-16302). */}
           <SidebarNavItem to="/activity" label="Activity" icon={History} />
           <SidebarNavItem to="/activity/commentary" label="Commentary" icon={History} />

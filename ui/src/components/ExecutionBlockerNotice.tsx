@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { describeError } from "../api/errors";
 import type { IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
 import { AlertCircle } from "lucide-react";
@@ -22,7 +23,7 @@ const recoveryStepText: Record<NonNullable<TaskInterruptionPresentation["recover
 /** A budget hard stop holds saved work. Only a task that already ran has an
  * attempt to report; a task refused before its first run just waits. */
 function budgetWaitText(presentation: TaskInterruptionPresentation) {
-  const wait = "It is waiting for the budget to allow new work. Raise the budget in Costs.";
+  const wait = COST_BUDGET_UI_HIDDEN ? "Work is paused. Your organization administrator can help." : "It is waiting for the budget to allow new work. Raise the budget in Costs.";
   const saved = carriedSavedLine(presentation);
   return presentation.observedRunId || presentation.sourceRunIds.length
     ? saved ? <>Couldn’t finish this attempt. <span data-testid="task-execution-carried">{saved}</span> {wait}</>
@@ -105,7 +106,7 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
       {presentation.notice && <p data-testid="task-execution-notice">{presentation.notice.text}</p>}
       {presentation.state !== "retry_scheduled" && <CarriedMessages presentation={presentation} as="p" />}
       {presentation.state === "retry_scheduled" && <p>{step ? `${step}. ${retryIn}` : "Paperclip will retry automatically."}</p>}
-      {isBudgetWait(presentation) && <p data-testid="task-execution-waiting">It is waiting for the budget to allow new work. Raise the budget in Costs.</p>}
+      {isBudgetWait(presentation) && <p data-testid="task-execution-waiting">{budgetWaitText(presentation)}</p>}
     </ProviderFailureNotice>;
   }
   if (step && presentation?.state === "working") return <div role="status" aria-label="Task status"

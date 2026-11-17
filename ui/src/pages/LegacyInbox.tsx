@@ -27,6 +27,7 @@ import { useCompany } from "../context/CompanyContext";
 import { useToastActions } from "../context/ToastContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useSidebar } from "../context/SidebarContext";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { queryKeys } from "../lib/queryKeys";
 import { useDialogActions } from "../context/DialogContext";
 import { useIssueExternalObjectSummaries } from "../hooks/useIssueExternalObjects";
@@ -1216,7 +1217,7 @@ export function Inbox() {
     [heartbeatRuns, dismissedAtByKey],
   );
   const approvalsToRender = useMemo(() => {
-    let filtered = getApprovalsForTab(approvals ?? [], tab, allApprovalFilter, currentUserId);
+    let filtered = getApprovalsForTab((approvals ?? []).filter(approval => !COST_BUDGET_UI_HIDDEN || approval.type !== "budget_override_required"), tab, allApprovalFilter, currentUserId);
     if (tab === "mine") {
       filtered = filtered.filter(
         (a) => !isInboxEntityDismissed(dismissedAtByKey, `approval:${a.id}`, a.updatedAt),
@@ -2259,6 +2260,7 @@ export function Inbox() {
     !hasRunFailures &&
     !dismissedAlerts.has("alert:agent-errors");
   const showBudgetAlert =
+    !COST_BUDGET_UI_HIDDEN &&
     showCompanyAlerts &&
     !!dashboard &&
     dashboard.costs.monthBudgetCents > 0 &&

@@ -20,6 +20,7 @@ import {
   describeRefreshPolicy,
   STATUS_CARD_LIFECYCLE_PRESENTATION,
 } from "@/lib/status-card-state";
+import { COST_BUDGET_UI_HIDDEN } from "@/lib/cost-visibility";
 import { formatCents, formatTokens } from "./format";
 import type { StatusCardView } from "./types";
 
@@ -80,7 +81,7 @@ export function StatusCardTile({
 
   const policyLabel = describeRefreshPolicy(card.refreshPolicy);
   const tokensLabel = formatTokens(card.todayTokens);
-  const costLabel = formatCents(card.todayCostCents);
+  const costLabel = COST_BUDGET_UI_HIDDEN ? null : formatCents(card.todayCostCents);
   const freshnessLabel = card.lastGeneratedAt ? relativeTime(card.lastGeneratedAt) : "no summary yet";
   const hasSummary = Boolean(card.summaryBody && card.summaryBody.trim().length > 0);
 

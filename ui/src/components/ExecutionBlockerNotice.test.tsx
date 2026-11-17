@@ -302,7 +302,7 @@ describe("the failure card names the messages the failed run carried", () => {
   it("the budget hold card names them in its one saved sentence", async () => {
     await render({ ...failed, state: "waiting_for_user", userAction: "budget", canRetry: false, carriedMessages });
     expect(container.textContent).toBe("Couldn’t finish this attempt. Your messages are saved: “Please rename the export”, “Also add a total row…”. "
-      + "It is waiting for the budget to allow new work. Raise the budget in Costs.");
+      + "Work is paused. Your organization administrator can help.");
   });
   it("a failed run carrying nothing person-authored => card unchanged", async () => {
     await render(failed);
@@ -311,6 +311,6 @@ describe("the failure card names the messages the failed run carried", () => {
     expect(line()).toBeNull();
     expect(container.textContent).toBe("Couldn’t finish this attempt. Your message is saved.Retry");
     await render({ ...failed, state: "waiting_for_user", userAction: "budget", canRetry: false });
-    expect(container.textContent).toBe("Couldn’t finish this attempt. Your message is saved. It is waiting for the budget to allow new work. Raise the budget in Costs.");
+    expect(container.textContent).toBe("Couldn’t finish this attempt. Your message is saved. Work is paused. Your organization administrator can help.");
   });
 });

@@ -75,6 +75,7 @@ import { SourceResolvedFoldCallout } from "../components/SourceResolvedFoldCallo
 import { SourceResolvedFoldBadge } from "../components/SourceResolvedFoldBadge";
 import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-fold";
 import { formatCents, formatConfiguredCents, formatSpendPercent, formatDate, relativeTime, formatTokens, visibleRunCostUsd, visibleRunTokenTotal, hasUnavailableProviderAccounting, supportsRawProviderTrace } from "../lib/utils";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { cn, COST_FIGURES_HIDDEN } from "../lib/utils";
 import { RunRetryDetails } from "../components/RunRetryDetails";
 import { Button } from "@/components/ui/button";
@@ -1034,7 +1035,7 @@ export function AgentDetail() {
           }
         >
           Ships with Paperclip and powers <strong>{builtInFeatureLabel}</strong>. Configure it like
-          any agent — model, instructions, budget. It can be paused but not deleted; pausing it
+          any agent — model, instructions{!COST_BUDGET_UI_HIDDEN && ", budget"}. It can be paused but not deleted; pausing it
           pauses {builtInFeatureLabel}.
         </InlineBanner>
       )}
@@ -1492,7 +1493,7 @@ export function AgentOverview({
           description={`${formatWindowCount(recentFailures)} failed in the last 2 days`}
           to={agentDetailHref(agentRef, "runs")}
         />
-        <AgentMetricTile
+        {!COST_BUDGET_UI_HIDDEN && <><AgentMetricTile
           icon={ReceiptText}
           value={formatCents(spent)}
           label="Costs"
@@ -1505,7 +1506,7 @@ export function AgentOverview({
           label="Budget used"
           description={budgetPercent === null ? "No monthly budget set" : `of ${formatConfiguredCents(budget)} this month`}
           to={agentDetailHref(agentRef, "budgets")}
-        />
+        /></>}
         <AgentPanel title="Profile" className="min-h-(--agent-detail-tile-min-h) sm:col-span-2" aria-label="Profile"
           meta={<span className={creatorFailed ? "text-destructive" : undefined}>
             {creatorFailed ? "Could not load creator" : creatorLabel ? `Created by ${creatorLabel} · ${formatDate(agent.createdAt)}` : `Created ${formatDate(agent.createdAt)}`}
@@ -2894,9 +2895,9 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
       )}
       {(metrics.usageUnavailable || (metrics.totalTokens ?? 0) > 0 || (metrics.cost ?? 0) > 0) && (
         <div className="flex items-center gap-2 pl-5.5 text-(length:--text-micro) text-muted-foreground tabular-nums">
-          {metrics.usageUnavailable && <span>Usage and cost unavailable</span>}
+          {metrics.usageUnavailable && <span>{COST_BUDGET_UI_HIDDEN ? "Usage unavailable" : "Usage and cost unavailable"}</span>}
           {metrics.totalTokens !== null && metrics.totalTokens > 0 && <span>{formatTokens(metrics.totalTokens)} tok</span>}
-          {metrics.cost !== null && metrics.cost > 0 && <span>{COST_FIGURES_HIDDEN ? "—" : `$${metrics.cost.toFixed(3)}`}</span>}
+          {!COST_BUDGET_UI_HIDDEN && metrics.cost !== null && metrics.cost > 0 && <span>{COST_FIGURES_HIDDEN ? "—" : `$${metrics.cost.toFixed(3)}`}</span>}
         </div>
       )}
     </Link>
@@ -3014,7 +3015,7 @@ export function RunAccountingMetrics({ run }: { run: HeartbeatRun }) {
     ["Output", metrics.output === null ? "Unavailable" : formatTokens(metrics.output)],
     ["Cached", metrics.cached === null ? "Unavailable" : formatTokens(metrics.cached)],
     ["Cost", COST_FIGURES_HIDDEN ? "—" : metrics.cost === null ? "Unavailable" : metrics.cost > 0 ? `$${metrics.cost.toFixed(4)}` : "-"],
-  ];
+  ].filter(([label]) => !COST_BUDGET_UI_HIDDEN || label !== "Cost");
   return (
     <div className="border-t sm:border-t-0 sm:border-l border-border p-4 grid grid-cols-2 gap-x-4 sm:gap-x-8 gap-y-3 content-center tabular-nums">
       {values.map(([label, value]) => (

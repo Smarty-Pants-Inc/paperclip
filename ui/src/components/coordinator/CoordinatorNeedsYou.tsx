@@ -1,3 +1,4 @@
+import { isHiddenMoneyAttentionItem } from "@/lib/cost-visibility";
 import { QueryErrorState, useQueryView } from "@/components/QueryView";
 import { useCallback, useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -170,6 +171,7 @@ export function CoordinatorNeedsYou() {
     }).map(([, item]) => item);
   }, [obligations, settling, settlingIds, recentItems, savedIds, feed.dataUpdatedAt]);
   const filtered = useMemo(() => pendingItems.filter((item) => {
+    if (isHiddenMoneyAttentionItem(item)) return false;
     const agentId = String(item.subject.metadata?.createdByAgentId ?? item.subject.metadata?.originAgentId ?? "");
     if (agentFilter && agentId !== agentFilter && item.originAgentName !== agentMap.get(agentFilter)?.name) return false;
     if (projectFilter && item.project?.id !== projectFilter) return false;

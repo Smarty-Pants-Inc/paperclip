@@ -7,6 +7,7 @@ import { approvalsApi } from "../api/approvals";
 import { getAdapterLabel } from "../adapters/adapter-display-registry";
 import { queryKeys } from "../lib/queryKeys";
 import { formatConfiguredCents } from "../lib/utils";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { NeedsYouPanel, NeedsYouPanelNote, NeedsYouPanelRow } from "./coordinator/NeedsYouCardKit";
 
 function payloadString(payload: Record<string, unknown> | undefined, key: string): string | null {
@@ -40,7 +41,7 @@ export function ApprovalCardPanel({ item, companyId, artifactRow, onViewDetails 
   const agents = useQuery({ queryKey: queryKeys.agents.list(companyId), queryFn: () => agentsApi.list(companyId), enabled: hire && !!reportsTo });
   if (artifactRow) return <NeedsYouPanel>{artifactRow}</NeedsYouPanel>;
   if (hire) {
-    const budget = typeof payload?.budgetMonthlyCents === "number" && payload.budgetMonthlyCents > 0 ? payload.budgetMonthlyCents : null;
+    const budget = !COST_BUDGET_UI_HIDDEN && typeof payload?.budgetMonthlyCents === "number" && payload.budgetMonthlyCents > 0 ? payload.budgetMonthlyCents : null;
     const name = payloadString(payload, "name") ?? item.subject.title ?? "New agent";
     const role = payloadString(payload, "role");
     const adapter = payloadString(payload, "adapterType");

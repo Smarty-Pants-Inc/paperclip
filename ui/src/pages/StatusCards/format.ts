@@ -1,4 +1,5 @@
 import type { StatusCardRefreshPolicy, StatusCardUpdate } from "@paperclipai/shared";
+import { COST_BUDGET_UI_HIDDEN } from "../../lib/cost-visibility";
 import { COST_FIGURES_HIDDEN } from "../../lib/utils";
 
 /** "1.1k tok" / "940 tok" — compact token count for footers and chips. */
@@ -97,7 +98,7 @@ export interface StatusCardCostEstimate {
  */
 export function estimateStatusCardCost(policy: StatusCardRefreshPolicy): StatusCardCostEstimate {
   if (policy.mode === "manual") {
-    const cost = `${formatCents(EST_FULL_CENTS)} · ${formatTokens(EST_FULL_TOKENS)}`;
+    const cost = COST_BUDGET_UI_HIDDEN ? formatTokens(EST_FULL_TOKENS)! : `${formatCents(EST_FULL_CENTS)} · ${formatTokens(EST_FULL_TOKENS)}`;
     return {
       cost,
       primary: `~1 rebuild per refresh ≈ ${cost}`,
@@ -126,7 +127,7 @@ export function estimateStatusCardCost(policy: StatusCardRefreshPolicy): StatusC
   const tokens = effective * EST_INCREMENTAL_TOKENS;
   const cents = effective * EST_INCREMENTAL_CENTS;
   const withinHours = policy.activeHours ? " during active hours" : "";
-  const cost = `${formatCents(cents)} · ${formatTokens(tokens)}`;
+  const cost = COST_BUDGET_UI_HIDDEN ? formatTokens(tokens)! : `${formatCents(cents)} · ${formatTokens(tokens)}`;
 
   return {
     cost,

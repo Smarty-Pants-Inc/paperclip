@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "@/lib/cost-visibility";
 import { useCallback, useEffect } from "react";
 import { History } from "lucide-react";
 import { EmptyState } from "@/components/EmptyState";
@@ -125,7 +126,7 @@ export function AuditHub({ section }: { section: AuditSection }) {
           navigate(auditSectionHref(next, scope));
         }}
       >
-        <PageTabBar items={AUDIT_SECTIONS} value={section} align="start" />
+        <PageTabBar items={AUDIT_SECTIONS.filter(item => !COST_BUDGET_UI_HIDDEN || (item.value !== "costs" && item.value !== "budgets"))} value={section} align="start" />
       </Tabs>
 
       {section === "commentary" ? (
@@ -155,7 +156,7 @@ export function AuditHub({ section }: { section: AuditSection }) {
         />
       ) : section === "runs" ? (
         <AuditRuns companyId={selectedCompanyId} routineId={routineId} />
-      ) : section === "budgets" ? (
+      ) : COST_BUDGET_UI_HIDDEN && (section === "costs" || section === "budgets") ? null : section === "budgets" ? (
         <Costs embedded initialTab="budgets" lockTab />
       ) : section === "timeline" ? (
         <Timeline embedded />

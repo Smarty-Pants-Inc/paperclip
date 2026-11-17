@@ -5,12 +5,17 @@ import { aiConnectionsApi } from "@/api/ai-connections";
 import { describeError } from "@/api/errors";
 import { Button } from "@/components/ui/button";
 import { QuotaBar } from "@/components/QuotaBar";
+import { COST_BUDGET_UI_HIDDEN } from "@/lib/cost-visibility";
 import { formatDateTime, formatNumber, COST_FIGURES_HIDDEN } from "@/lib/utils";
 
 const usageNumber = (value: number) => formatNumber(value, { maximumFractionDigits: 20 });
 const amount = (value: number, unit: string | null) => unit === "USD"
   ? (COST_FIGURES_HIDDEN ? "—" : formatNumber(value, { style: "currency", currency: "USD", minimumFractionDigits: 0, maximumFractionDigits: 20 }))
   : `${usageNumber(value)}${unit ? ` ${unit}` : ""}`;
+
+function isMoneyUnit(unit: string | null) {
+  return /^(usd|eur|gbp|cents?|dollars?|credits?)$/i.test(unit ?? "");
+}
 
 function limitLabel(window: AiConnectionUsageLimit) {
   const label = window.label.replace(/\b(\d+(?:\.\d+)?) hour limit\b/i, "$1h").replace(/\bweekly limit\b/i, "Weekly");
@@ -94,7 +99,7 @@ export function AiConnectionUsagePanel({ account, observation, cachedOnly = fals
       {usage?.status === "ok" && (
         <div className="space-y-3" aria-live="polite">
           {usage.limits.length === 0 && <p className="text-xs text-muted-foreground">Usage not reported.</p>}
-          {usage.limits.map((window) => {
+          {usage.limits.filter(window => !COST_BUDGET_UI_HIDDEN || !isMoneyUnit(window.unit)).map((window) => {
             const details = limitDetails(window);
             return <div key={window.id} className="space-y-1.5">
               {window.usedPercent != null ? <QuotaBar label={limitLabel(window)} percentUsed={window.usedPercent} leftLabel={limitValue(window)} />
@@ -105,7 +110,7 @@ export function AiConnectionUsagePanel({ account, observation, cachedOnly = fals
               {details && <p className="text-xs text-muted-foreground">{details}</p>}
             </div>;
           })}
-          {usage.overage && <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+          {!COST_BUDGET_UI_HIDDEN && usage.overage && <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
             <span className="text-muted-foreground">Overage</span>
             <span className="font-mono">{overageSummary(usage)}</span>
           </div>}

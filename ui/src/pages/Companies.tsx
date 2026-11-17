@@ -6,6 +6,7 @@ import { useDialogActions } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCloudInstance } from "../hooks/useCloudInstance";
 import { companiesApi } from "../api/companies";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { queryKeys } from "../lib/queryKeys";
 import { QueryErrorState } from "../components/QueryView";
 import { formatCents, formatConfiguredCents, formatSpendPercent, relativeTime } from "../lib/utils";
@@ -279,7 +280,7 @@ export function Companies() {
                     {issueCount} {issueCount === 1 ? "task" : "tasks"}
                   </span>
                 </div>
-                <div className="flex items-center gap-1.5 tabular-nums">
+                {!COST_BUDGET_UI_HIDDEN && <div className="flex items-center gap-1.5 tabular-nums">
                   <DollarSign className="h-3.5 w-3.5" />
                   <span>
                     {formatCents(company.spentMonthlyCents)}
@@ -287,7 +288,7 @@ export function Companies() {
                       ? <> / {formatConfiguredCents(company.budgetMonthlyCents)} <span className="text-xs">({formatSpendPercent(budgetPct)})</span></>
                       : <span className="text-xs ml-1">Unlimited budget</span>}
                   </span>
-                </div>
+                </div>}
                 <div className="flex items-center gap-1.5 ml-auto">
                   <Calendar className="h-3.5 w-3.5" />
                   <span>Created {relativeTime(company.createdAt)}</span>
