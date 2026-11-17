@@ -15711,7 +15711,12 @@ describe("native warm session supervision", () => {
     ] as const)("S8 186f55fc: a superseded owner on a terminal Boat lease is retired at once ($name)", async ({ name, closeError, receipt, proven }) => {
       const predecessorRunId = "4d6135ad-9fd6-44ce-a7cf-d13317133fda", successorRunId = "186f55fc-1e15-4dcb-ab94-f689095fef00";
       const { base: shape } = fixture(`s8-186f55fc-${name}`);
-      const base = { ...shape, binding: { ...shape.binding, runId: predecessorRunId } };
+      // Live shape: a Boat remote pi_rpc warm chat with an agent_files copy.
+      const base = { ...shape, binding: { ...shape.binding, runId: predecessorRunId },
+        provider: { kind: "pi_rpc", model: "paperclip/selected-model-exactly", profile: QUALIFIED_PI_RPC_PROFILE },
+        session: { ...shape.session, driverKind: "pi_rpc" } } as unknown as NativeExecutionInputV1;
+      const copy = (runId: string) => ({ runId, root: `/tmp/s8-${name}/agent-files`, preparationKey: "same",
+        hasChanges: async () => false, collectStopped: async () => undefined });
       const next = { ...base, binding: { ...base.binding, runId: successorRunId } };
       const environmentId = `s8-environment-${name}`, providerLeaseId = `bx_s8${name.replace(/-/g, "")}`;
       const close = vi.fn().mockRejectedValue(new Error(closeError));
@@ -15720,13 +15725,16 @@ describe("native warm session supervision", () => {
         options.onSession?.({ close }); return result;
       }).mockResolvedValue(result);
       const leaseRows: Array<Record<string, unknown>> = [];
-      const target = (leaseId: string) => ({ kind: "remote" as const, transport: "sandbox" as const,
-        environmentId, leaseId, remoteCwd: `/tmp/${environmentId}`,
-        sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId } });
+      // Live shape: the successor did not resume the dead lease (Boat said that
+      // lease is no longer active); it ran on a box created for it. Its
+      // providerLeaseId is not the predecessor's.
+      const target = (leaseId: string, onProviderLeaseId = providerLeaseId) => ({ kind: "remote" as const, transport: "sandbox" as const,
+        providerKey: "boat", environmentId, leaseId, remoteCwd: `/tmp/${environmentId}`,
+        sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: onProviderLeaseId } });
       const ownerDb = leaseDb(base, {}, {}, [], {}, "running", [], leaseRows);
       try {
         await executePaperclipNativeSession({ db: ownerDb, execution: base, runnerInstanceId: "runner", useRunnerd: false,
-          backend: {} as never, runnerExecutionTarget: target("previous-lease") });
+          backend: {} as never, runnerExecutionTarget: target("previous-lease"), instructionWorkingCopy: copy(predecessorRunId) });
         // Boat's typed teardown answer, bound to the predecessor's own lease.
         leaseRows.push({ id: "previous-lease", companyId: base.binding.companyId, environmentId, heartbeatRunId: predecessorRunId,
           provider: "boat", providerLeaseId, status: receipt ? "released" : "active", releasedAt: receipt ? new Date() : null,
@@ -15736,7 +15744,8 @@ describe("native warm session supervision", () => {
             providerLeaseId, state: receipt, confirmedAt: new Date().toISOString() } } : {} });
         release.mockClear();
         const successor = executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner",
-          useRunnerd: false, backend: {} as never, refreshTools: true, runnerExecutionTarget: target("new-lease") });
+          useRunnerd: false, backend: {} as never, refreshTools: true, runnerExecutionTarget: target("new-lease", `${providerLeaseId}-created`),
+          instructionWorkingCopy: copy(successorRunId) });
         if (proven) {
           await expect(successor).resolves.toBeDefined();
           // The successor ran its own provider turn; no failed run, no fallback.
