@@ -12,7 +12,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * successor seeds from the answer, never the asking turn's comment.
  * `agentId` is the predecessor run's agent, from trusted run state. */
 export async function pendingContinuationCommentInput(db: Pick<Db, "select">, input: {
-  companyId: string; issueId: string; agentId: string; contextSnapshot: unknown;
+  companyId: string; issueId: string; agentId: string; runId?: string; contextSnapshot: unknown;
 }): Promise<Record<string, unknown>> {
   const answered = await pendingContinuationInteractionInput(db, input);
   // An interaction-respond wake also names the asking turn's origin comment;
@@ -22,16 +22,64 @@ export async function pendingContinuationCommentInput(db: Pick<Db, "select">, in
   return pendingPersonCommentInput(db, input);
 }
 
+async function continuationChainContexts(db: Pick<Db, "select">, input: {
+  companyId: string; issueId: string; agentId: string; runId?: string;
+}): Promise<Array<Record<string, unknown> | null>> {
+  if (!input.runId || !UUID.test(input.runId)) return [];
+  const context = heartbeatRuns.contextSnapshot;
+  const rows = await db.select({
+    wakeCommentIds: sql<unknown>`${context}->'wakeCommentIds'`,
+    wakeCommentId: sql<unknown>`${context}->'wakeCommentId'`,
+    commentId: sql<unknown>`${context}->'commentId'`,
+    queuedCommentSourceWakeIds: sql<unknown>`${context}->'queuedCommentSourceWakeIds'`,
+    firstTurnQueuedInput: sql<unknown>`jsonb_build_object('commentIds', ${context}#>'{firstTurnQueuedInput,commentIds}',
+      'wakeupRequestIds', ${context}#>'{firstTurnQueuedInput,wakeupRequestIds}')`,
+  }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+    sql`${heartbeatRuns.id} in (with recursive input_chain as (
+      select source.id, source.retry_of_run_id, source.context_snapshot->>'previousRunId' as previous_run_id,
+        source.context_snapshot->>'retryOfRunId' as context_retry_id, source.native_session_id, source.created_at,
+        coalesce(source.context_snapshot->'conversationSessionGeneration', '0'::jsonb) as generation
+      from heartbeat_runs source
+      where source.company_id = ${input.companyId} and source.agent_id = ${input.agentId} and source.id = ${input.runId}
+        and (source.issue_id = ${input.issueId} or source.native_issue_id = ${input.issueId}
+          or source.context_snapshot->>'issueId' = ${input.issueId})
+      union
+      select parent.id, parent.retry_of_run_id, parent.context_snapshot->>'previousRunId',
+        parent.context_snapshot->>'retryOfRunId', parent.native_session_id, parent.created_at,
+        coalesce(parent.context_snapshot->'conversationSessionGeneration', '0'::jsonb)
+      from input_chain child join heartbeat_runs parent on parent.company_id = ${input.companyId}
+        and parent.agent_id = ${input.agentId}
+        and (parent.issue_id = ${input.issueId} or parent.native_issue_id = ${input.issueId}
+          or parent.context_snapshot->>'issueId' = ${input.issueId})
+        and coalesce(parent.context_snapshot->'conversationSessionGeneration', '0'::jsonb) = child.generation
+        and (parent.id = child.retry_of_run_id
+          or parent.id::text = lower(child.previous_run_id)
+          or parent.id::text = lower(child.context_retry_id)
+          or (child.native_session_id is not null and parent.native_session_id = child.native_session_id
+            and (parent.created_at, parent.id) < (child.created_at, child.id)))
+    ) select id from input_chain)`,
+  ));
+  return rows;
+}
+
 /** Rebind the parent's wake comments and first-turn input ids, not its receipt. */
 async function pendingPersonCommentInput(db: Pick<Db, "select">, input: {
-  companyId: string; issueId: string; contextSnapshot: unknown;
+  companyId: string; issueId: string; agentId: string; runId?: string; contextSnapshot: unknown;
 }): Promise<Record<string, unknown>> {
-  const carried = carryContinuationCommentInput(input.contextSnapshot);
+  const direct = carryContinuationCommentInput(input.contextSnapshot);
+  const directIds = (direct.wakeCommentIds as string[] | undefined)?.filter(id => UUID.test(id)) ?? [];
+  const chain = (await continuationChainContexts(db, input)).map(carryContinuationCommentInput);
+  const carried = carryContinuationCommentInput({
+    wakeCommentIds: [...directIds, ...chain.flatMap(context => (context.wakeCommentIds as string[] | undefined) ?? [])],
+    queuedCommentSourceWakeIds: [direct, ...chain].flatMap(context => (context.queuedCommentSourceWakeIds as string[] | undefined) ?? []),
+  });
   const candidates = (carried.wakeCommentIds as string[] | undefined)?.filter(id => UUID.test(id)) ?? [];
   if (candidates.length === 0) return {};
   const rows = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     inArray(issueComments.id, candidates), isNull(issueComments.deletedAt),
+    or(inArray(issueComments.id, directIds), eq(issueComments.authorType, "user")),
     // Only still-pending input: a comment with a PUBLISHED agent answer attributed to it (or to a later person
     // input) is never re-presented, or every continuation re-answers it (the re-wake loop, org 19:48Z).
     sql`not ${answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
@@ -73,11 +121,12 @@ export async function readContinuationCommentInput(db: Pick<Db, "select">, input
   const [source] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, agentId: heartbeatRuns.agentId })
     .from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId),
-    or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`),
+    or(eq(heartbeatRuns.issueId, input.issueId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`),
   )).limit(1);
   if (!source) return {};
   // A person's answer to the predecessor's question is pending input exactly as
   // a pending comment is: an automatic successor that drops it re-asks (RFL 09:35Z).
   return pendingContinuationCommentInput(db, { companyId: input.companyId, issueId: input.issueId,
-    agentId: source.agentId, contextSnapshot: source.contextSnapshot });
+    agentId: source.agentId, runId: input.runId, contextSnapshot: source.contextSnapshot });
 }

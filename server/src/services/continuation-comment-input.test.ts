@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "./continuation-comment-input.js";
 import { claimFirstTurnQueuedInput } from "./native-runtime/first-turn-queued-input.js";
 import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 import { requestTaskRetry } from "./task-retry.js";
 import { heartbeatService } from "./heartbeat.js";
+import { deliverReconciledExecutions } from "./execution-recovery-resolution.js";
 
 // DREA-31 / data safety: exercise persisted input and answer attribution, not SQL text.
 const support = await getEmbeddedPostgresTestSupport();
@@ -85,6 +86,101 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     // No source run is an initial assignment, not a comment continuation.
     expect(await readContinuationCommentInput(db, { ...f, runId: null })).toEqual({});
   });
+  it("a held refusal restores M13, M14 and M15 as pending once, in order, but never answered M12", async () => {
+    const f = await fixture(), sessionId = randomUUID();
+    const t0 = Date.now() - 60_000;
+    const at = (n: number) => new Date(t0 + n * 100);
+    const generation = { conversationSessionGeneration: 1 };
+    await db.update(issueComments).set({ body: "M12", createdAt: at(0) }).where(eq(issueComments.id, f.message.id));
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId, createdAt: at(1), finishedAt: at(2),
+      contextSnapshot: { ...f.run.contextSnapshot, ...generation } }).where(eq(heartbeatRuns.id, f.run.id));
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: f.run.id, body: "ACK M12", createdAt: at(3) });
+    const messages = await db.insert(issueComments).values([13, 14, 15].map(n => ({
+      companyId: f.companyId, issueId: f.issueId, authorType: "user" as const, authorUserId: "board", body: `M${n}`, createdAt: at(n),
+    }))).returning();
+    const [r13] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "native", nativeSessionId: sessionId, status: "failed", createdAt: at(20), finishedAt: at(21),
+      contextSnapshot: { issueId: f.issueId, ...generation, wakeCommentId: messages[0].id } }).returning();
+    const r14Id = randomUUID();
+    const [r14] = await db.insert(heartbeatRuns).values({ id: r14Id, companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "native", nativeSessionId: sessionId, status: "failed", createdAt: at(22), finishedAt: at(23),
+      contextSnapshot: { issueId: f.issueId, ...generation, firstTurnQueuedInput: { schema: "paperclip.first-turn-queued-input.v1",
+        runId: r14Id, commentIds: [messages[1].id, messages[0].id], wakeupRequestIds: [], claimedAt: at(22).toISOString() } } }).returning();
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "native", nativeSessionId: sessionId, status: "failed", createdAt: at(24), finishedAt: at(25),
+      errorCode: "native_controller_recovery_missing_evidence:snapshot_binding", retryOfRunId: r14.id,
+      contextSnapshot: { issueId: f.issueId, ...generation, wakeCommentId: messages[2].id } }).returning();
+    const [unrelated] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "board", body: "Not in this chain", createdAt: at(4) }).returning();
+    const [otherAgent] = await db.insert(agents).values({ companyId: f.companyId, name: "Other", adapterType: "process" }).returning();
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: otherAgent.id, nativeIssueId: f.issueId,
+      nativeSessionId: sessionId, createdAt: at(5), contextSnapshot: { issueId: f.issueId, ...generation, wakeCommentId: unrelated.id } });
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
+      status: "resolved", outcome: "restored", ownerType: "system", returnOwnerAgentId: f.agentId,
+      cause: "native_continuation_requires_reconciliation", fingerprint: `carry:${source.id}`, nextAction: "Continue from saved work.",
+      evidence: { runId: source.id, continuationDelivery: "pending", executionReconciliation: { runId: source.id },
+        freshContinuation: { schema: "paperclip.fresh-continuation.v1", sourceRunId: source.id, recordedAt: at(26).toISOString() } } });
+    await deliverReconciledExecutions(db, async () => null);
+    const restored: Array<typeof heartbeatRuns.$inferSelect> = [];
+    const wake: ReturnType<typeof heartbeatService>["wakeup"] = async (agentId, opts) => {
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId, nativeIssueId: f.issueId,
+        runtimeMode: "native", status: "queued", responsibleUserId: "board", contextSnapshot: opts?.contextSnapshot }).returning();
+      restored.push(run);
+      return run;
+    };
+    await deliverReconciledExecutions(db, wake);
+    await deliverReconciledExecutions(db, wake);
+    expect(restored).toHaveLength(1);
+    const successor = restored[0], expected = messages.map(m => m.id);
+    console.log("H3_CARRY_PENDING", JSON.stringify({ labels: messages.map(m => m.body), expected,
+      actual: successor.contextSnapshot?.wakeCommentIds, answeredM12: f.message.id, source: source.id, earlier: [r13.id, r14.id] }));
+    expect(successor.contextSnapshot).toMatchObject({ forceFreshSession: true, wakeReason: "issue_recovery_action_restored",
+      wakeCommentIds: expected, wakeCommentId: messages[2].id, commentId: messages[2].id, firstTurnQueuedInput: null });
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successor.id));
+    await db.update(issues).set({ executionRunId: successor.id }).where(eq(issues.id, f.issueId));
+    const binding = { ...f, runId: successor.id };
+    const text = await claimFirstTurnQueuedInput(db, binding);
+    expect(text).toContain("M13"); expect(text).toContain("M14"); expect(text).toContain("M15");
+    expect(text).not.toContain("M12"); expect(text).not.toContain(unrelated.body);
+    const [sealed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor.id));
+    expect(sealed.contextSnapshot?.firstTurnQueuedInput).toMatchObject({ runId: successor.id, commentIds: expected });
+    expect(await claimFirstTurnQueuedInput(db, binding)).toBe(text);
+    console.log("H3_CARRY_SEALED", JSON.stringify({ runId: successor.id, receipt: sealed.contextSnapshot?.firstTurnQueuedInput }));
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: successor.id, body: "ACK M13, M14, M15" });
+    expect(await readContinuationCommentInput(db, { ...f, runId: successor.id })).toEqual({});
+  });
+
+  it("follows previous/retry edges across fresh sessions without crossing company, task, agent or reset fences", async () => {
+    const f = await fixture(), foreign = await fixture();
+    const [otherAgent] = await db.insert(agents).values({ companyId: f.companyId, name: "Other", adapterType: "process" }).returning();
+    const [otherTask] = await db.insert(issues).values({ companyId: f.companyId, title: "Other task" }).returning();
+    const [pending, outside, reset] = await db.insert(issueComments).values(["Pending ancestor", "Outside chain", "Before reset"].map(body => ({
+      companyId: f.companyId, issueId: f.issueId, authorType: "user" as const, authorUserId: "board", body,
+      createdAt: new Date(f.message.createdAt.getTime() - 1_000),
+    }))).returning();
+    const [, otherTaskRun, otherAgentRun, resetRun] = await db.insert(heartbeatRuns).values([
+      { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, contextSnapshot: { wakeCommentId: outside.id } },
+      { companyId: f.companyId, agentId: f.agentId, issueId: otherTask.id, contextSnapshot: { wakeCommentId: outside.id } },
+      { companyId: f.companyId, agentId: otherAgent.id, issueId: f.issueId, contextSnapshot: { wakeCommentId: outside.id } },
+      { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+        contextSnapshot: { wakeCommentId: reset.id, conversationSessionGeneration: 2 } },
+    ]).returning();
+    const [ancestor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, retryOfRunId: otherAgentRun.id, contextSnapshot: { wakeCommentId: pending.id,
+        previousRunId: foreign.run.id, retryOfRunId: otherTaskRun.id } }).returning();
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      nativeSessionId: randomUUID(), retryOfRunId: resetRun.id, contextSnapshot: { issueId: f.issueId, wakeCommentId: f.message.id,
+        previousRunId: ancestor.id.toUpperCase(), retryOfRunId: otherTaskRun.id } }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...ancestor.contextSnapshot, retryOfRunId: source.id } })
+      .where(eq(heartbeatRuns.id, ancestor.id));
+    const input = await readContinuationCommentInput(db, { ...f, runId: source.id });
+    expect(input.wakeCommentIds).toEqual([pending.id, f.message.id]);
+    expect(await pendingContinuationCommentInput(db, { ...f, runId: source.id, contextSnapshot: source.contextSnapshot }))
+      .toEqual(input);
+  });
+
   // H3 (A), RFL verdict: the ONE shared seam carries a person's answer for every caller.
   async function answeredFixture() {
     const [c] = await db.insert(companies).values({ name: "SRA", issuePrefix: "SRA" + randomUUID().slice(0, 5) }).returning();
