@@ -23,6 +23,7 @@ import {
   issueTreeHolds,
   issueThreadInteractions,
   issues,
+  nativeRunFinalizations,
   type Db,
 } from "@paperclipai/db";
 
@@ -926,6 +927,14 @@ export async function redeliverUnansweredConversationTurn(
   // run's own finalization committed is still pending publication; committed-
   // response recovery owns that reply, so the turn is not re-offered.
   if (isPendingCommitPresentation((run.resultJson as Record<string, unknown> | null)?.presentationDecision)) return "none";
+  // RFL 19:17Z ruling 3 (D160): a native turn whose finalization is still
+  // workspace_pending can commit later, and committed-response recovery then
+  // publishes its reply. A re-offer before that is a second answer. The
+  // finalizer owns the turn, as for a pending-commit presentation.
+  const [finishing] = await db.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id),
+    eq(nativeRunFinalizations.phase, "workspace_pending"))).limit(1);
+  if (finishing) return "none";
   if (run.status !== "succeeded") {
     // Upstream still owns a failed turn that is the task's latest attempt (its
     // card shows failed + Retry, even past an approval that predates the

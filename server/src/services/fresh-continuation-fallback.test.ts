@@ -725,9 +725,17 @@ suite("fresh-continuation fallback", () => {
           eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.runId} is null`,
           inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
           sql`(${agentWakeupRequests.idempotencyKey} like 'conversation-comment%' and ${agentWakeupRequests.payload}->>'commentId' = ${latest.id})`));
-        const outcomes = notes.length + live.length + queuedWakes.length + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
+        // The message's own native turn still finishing (workspace_pending) is its finalizer's owned, pending
+        // publication: committed-response recovery posts its reply once it commits (D160, RFL 19:17Z ruling 3).
+        const finishing = await db.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
+          .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, nativeRunFinalizations.runId)).where(and(
+            eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.phase, "workspace_pending"),
+            sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${latest.id}`));
+        const outcomes = notes.length + live.length + queuedWakes.length + finishing.length
+          + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
         console.info(JSON.stringify({ f3PinRehome: { shape, elapsedMs: Date.now() - t.getTime(), card: card && { state: card.state, canRetry: card.canRetry },
-          notes: notes.length, live: live.map(r => r.contextSnapshot?.wakeCommentId ?? null), queuedWakes: queuedWakes.length, redeliveries: redeliveries.length, outcomes } }));
+          notes: notes.length, live: live.map(r => r.contextSnapshot?.wakeCommentId ?? null), queuedWakes: queuedWakes.length,
+          finishing: finishing.length, redeliveries: redeliveries.length, outcomes } }));
         expect(after).toMatchObject({ body: latest.body, authorUserId: userId, deletedAt: null });
         expect(outcomes, "exactly one truthful outcome, never zero or two").toBe(1);
         if (live.length) expect(live.map(r => r.contextSnapshot?.wakeCommentId)).toEqual([latest.id]);
@@ -735,6 +743,7 @@ suite("fresh-continuation fallback", () => {
       };
       for (const elapsed of [90_001, 119_999, 120_000]) await tick(elapsed);
       const first = await observe();
+      if (shape === "D160_workspace_pending") expect(first.redeliveries, "the finishing turn is not re-offered (D160)").toBe(0);
       if (shape === "D157_queued_wake_never_runs" || shape === "D168_carrying_queued_run_never_starts") {
         expect(first.card, "inside the start bound the person's queued run is working").toMatchObject({ state: "working" });
         // Enqueued at t - 59 s: the bound passes at t + 541 s.
