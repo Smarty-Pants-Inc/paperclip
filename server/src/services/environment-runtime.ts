@@ -138,6 +138,7 @@ import {
   type SandboxOrphanCleanupSpool,
 } from "./sandbox-orphan-cleanup-spool.js";
 import { logger } from "../middleware/logger.js";
+import { wakeAfterCleanupSettled } from "./native-runtime/cleanup-settled-wake.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
 // The constant error kind for the durable orphan-cleanup-write-failed log. The
@@ -4729,6 +4730,10 @@ export function environmentRuntimeService(
               "retained",
               { cleanupStatus: "success" },
             );
+            // S048: the retained/success release committed; wake a message
+            // parked behind this run's cleanup now (bounded, once per event).
+            if (lease && leaseRow.heartbeatRunId) void wakeAfterCleanupSettled({ companyId: leaseRow.companyId,
+              runId: leaseRow.heartbeatRunId, event: "lease_released" });
             if (lease) {
               released.push({
                 environment,

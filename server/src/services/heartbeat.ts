@@ -1,6 +1,7 @@
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
 import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, agentFileSaveHeld } from "./agent-directory-working-copies.js";
 import { registerCompletedTurnCleanupResumer } from "./native-runtime/completed-turn-cleanup-hold-settlement.js";
+import { registerCleanupSettledResumer } from "./native-runtime/cleanup-settled-wake.js";
 import { endStorageOutageWaitOn, reportStorageOutageWaitsTo, runInOwnStorageScope } from "../storage/storage-unavailable.js";
 import { createStorageWaitNotice } from "./heartbeat/storage-wait-notice.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
@@ -1582,6 +1583,7 @@ export function heartbeatService(
   };
   registerHeldPreparationResumer(resumeSettledRun);
   registerCompletedTurnCleanupResumer(resumeSettledRun);
+  registerCleanupSettledResumer(resumeSettledRun);
 
   function cancelRunInternal(...args: Parameters<typeof runControl.cancelRunInternal>) {
     return runControl.cancelRunInternal(...args);

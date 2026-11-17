@@ -1,6 +1,7 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
+import { wakeAfterCleanupSettled } from "../native-runtime/cleanup-settled-wake.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { admittedNativeResourceDisposition } from "../native-runtime/native-failed-workspace-recovery.js";
@@ -202,6 +203,9 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       "Stopped warm turn's workspace export unproven; the box stays a protected export source");
     return { outcome: "unproven", reason };
   }
+  // S048: the finalized mark is committed (no transaction here); wake a message
+  // parked behind this Stop's cleanup by this event, once, not by the re-poll.
+  await wakeAfterCleanupSettled({ companyId: input.companyId, runId: input.runId, event: "export_finalized" });
   return { outcome: "finalized" };
 }
 
