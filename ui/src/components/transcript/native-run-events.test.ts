@@ -1553,10 +1553,12 @@ describe("pl/cancel-finalize2: a Stop's unproven workspace export is visible", (
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({ kind: "provider_activity", family: "provider_notice" });
     const shown = JSON.stringify(entries[0]);
-    // pl/cancel-finalize3: only what is known (not confirmed; the box is kept) + today's recovery action.
+    // pl/cancel-finalize4: only what is known (not confirmed; the box is kept), and
+    // no action this state does not have (it creates no recovery action, so there
+    // is no "Recover saved files" button to name).
     expect(shown).toContain("could not be confirmed in time (export_failed)");
-    expect(shown).toContain("the warm box stays protected, so nothing on it is lost");
-    expect(shown).toContain("use Recover saved files on the task");
+    expect(shown).toContain("The box is kept, so nothing on it is lost.");
+    expect(shown).not.toContain("Recover saved files");
     expect(shown).not.toContain("not yet on the host");
   });
 });

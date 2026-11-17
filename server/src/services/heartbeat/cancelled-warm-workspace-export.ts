@@ -27,12 +27,14 @@ export type CancelledWarmExportOutcome =
   | { outcome: "unproven"; reason: string };
 
 function deferredLine(reason: string): string {
-  // pl/cancel-finalize3: say only what is known. The export was not CONFIRMED in
-  // time (the host may already hold some or all of the files); the box stays a
-  // protected export source; the person's recovery action today is the task's
-  // "Recover saved files" (ui WorkspaceExportRecovery.tsx -> POST
-  // /issues/:id/recovery-actions/recover-workspace -> resumeNativeWorkspaceSync).
-  return `Stopped turn's workspace export could not be confirmed in time (${reason}); its files may or may not be on the host yet, and the warm box stays protected, so nothing on it is lost. To copy them back, use Recover saved files on the task.`;
+  // pl/cancel-finalize4 (rf-4 02:16Z Q2): say only what is known and name no
+  // action that does not exist. The export was not CONFIRMED in time (the host
+  // may already hold some or all of the files); the descriptor stays `prepared`,
+  // so the box stays a protected export source (nativeWorkspaceExportPendingForResource).
+  // This state creates NO recovery action (issue_recovery_actions: none), so
+  // WorkspaceExportRecovery renders no "Recover saved files" button for it:
+  // the line names no button.
+  return `Stopped turn's workspace export could not be confirmed in time (${reason}); its files may or may not be on the host yet. The box is kept, so nothing on it is lost.`;
 }
 
 /** adopt-stopu (U1): the settled person's Stop. NSE settles an acknowledged
