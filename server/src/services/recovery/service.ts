@@ -33,7 +33,7 @@ import { pendingExternalConversationSettlement, settleSlackConversation } from "
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { isIssueReviewPathRecoveryRun } from "./review-path-recovery.js";
 import { escalateExhaustedIssueReviewPathRecovery } from "./review-path-recovery-escalation.js";
-import { executionRetryAccounting, INTERRUPTED_PREPARATION_RETRY_REASON } from "../execution-recovery-attempt.js";
+import { executionRetryAccounting, INTERRUPTED_PREPARATION_RETRY_REASON, NATIVE_BLOCKED_WAIT_REFUSED_ACTION } from "../execution-recovery-attempt.js";
 import { assignedWorkSweep, type AssignedWorkDeps } from "./assigned-work-sweep.js";
 import { isExplicitContinuationRetryClaim } from "../explicit-continuation-retry-claim.js";
 import {
@@ -1783,10 +1783,30 @@ export function recoveryService(
         current.executionRunId !== issue.executionRunId ||
         current.checkoutRunId !== issue.checkoutRunId ||
         current.updatedAt.getTime() !== issue.updatedAt.getTime() ||
-        current.hiddenAt ||
-        current.lastStatusDecisionId !== candidate.decisionId
+        current.hiddenAt
       )
         return false;
+      // The repair's refusal is its OUTCOME, recorded once per run (D122,
+      // rf-3 20:53Z): the task card shows failed + Retry from this record, never
+      // from elapsed time, so a repair that is merely waiting on the issue lock
+      // is not a false failure. Only the two permanent refusal families record:
+      // a later status decision and a changed carried message. A changed issue
+      // snapshot above is a race the next pass rereads, not a refusal.
+      const refuse = async (reason: "later_status_decision" | "carried_message_changed" | "later_message") => {
+        const [recorded] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
+          eq(activityLog.companyId, current.companyId), eq(activityLog.runId, latestRun.id),
+          eq(activityLog.action, NATIVE_BLOCKED_WAIT_REFUSED_ACTION))).limit(1);
+        if (!recorded) await logActivity(tx as unknown as Db, {
+          companyId: current.companyId, actorType: "system", actorId: "recovery",
+          action: NATIVE_BLOCKED_WAIT_REFUSED_ACTION, entityType: "issue", entityId: current.id,
+          runId: latestRun.id,
+          details: { source: "recovery.native_blocked_wait", reason, latestRunId: latestRun.id,
+            nativeResultId: candidate.resultId },
+        }, publications);
+        return false;
+      };
+      if (current.lastStatusDecisionId !== candidate.decisionId)
+        return refuse("later_status_decision");
 
       const source = await tx
         .select({
@@ -1896,7 +1916,7 @@ export function recoveryService(
         ) ||
         commentIds.some((id) => !comments.some((comment) => comment.id === id))
       )
-        return false;
+        return refuse(comments.some((comment) => !commentIds.includes(comment.id)) ? "later_message" : "carried_message_changed");
       const paths = await collectDispositionRepairSourceState(
         tx as unknown as Db,
         { issue: current },
@@ -1949,10 +1969,9 @@ export function recoveryService(
       );
       return true;
     });
-    if (repaired) {
-      for (const publication of publications) publishActivity(publication);
-      await executeIssuePostCommitActions(db, postCommitActions);
-    }
+    // A recorded refusal is published too, so the task view updates to its card.
+    for (const publication of publications) publishActivity(publication);
+    if (repaired) await executeIssuePostCommitActions(db, postCommitActions);
     return repaired;
   }
 

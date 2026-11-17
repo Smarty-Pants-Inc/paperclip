@@ -1,5 +1,5 @@
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
-import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON } from "./execution-recovery-attempt.js";
+import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON, NATIVE_BLOCKED_WAIT_REFUSED_ACTION } from "./execution-recovery-attempt.js";
 import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-setup-command-failure.js";
 import { and, desc, eq, inArray, isNull, not, notInArray, sql, type SQL } from "drizzle-orm";
 import { unidentifiedLocalLaunchRefusals } from "./native-local-process-stop.js";
@@ -51,11 +51,6 @@ const WAITING_CONTINUATION_MOVE_FORWARD_MS = 15 * 60_000;
 // only logs, and the assigned-work sweep's stalled test (recovery/stalled-queued-run-sql.ts:28,
 // QUEUED_RUN_AGING_MS = 60 min) needs an hour plus passed-over starts.
 const PERSON_QUEUED_RUN_START_BOUND_MS = 10 * 60_000;
-// The stranded sweep applies a native run's accepted blocked result to its
-// task (recovery/service.ts repairNativeBlockedWait). Past this, a task still
-// in progress under that result was refused the repair (an edited carried
-// message, a later status decision), and the card shows failed + Retry (D122).
-const NATIVE_BLOCKED_WAIT_REPAIR_GRACE_MS = 2 * 60_000;
 const FAILED_ATTEMPT_STATUSES = new Set(["failed", "timed_out"]);
 const NO_WORK_CONTINUATION_HANDOFF_GRACE_MS = 30_000;
 const NO_WORK_CONTINUATION_CAUSES = new Set(["native_predecessor_retirement_unproven", "native_failed_before_provider_turn"]);
@@ -85,6 +80,8 @@ type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
   nativeFinalizationRetryPending?: boolean;
   /** When this succeeded native run's accepted blocked result (with an unblock action) was committed. */
   nativeBlockedResultAt?: Date | null;
+  /** The stranded sweep REFUSED to apply that blocked result to the task (its recorded outcome). */
+  nativeBlockedRepairRefused?: boolean;
   /** The configured model id the provider rejected (native_provider_model_rejected only). */
   rejectedModel?: string | null;
   /** A cleanup-gate refusal after this run's own provider turn completed; its work is saved. */
@@ -277,10 +274,12 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   // Retry took effect: the saved result is being applied again.
   if (run.status === "succeeded" && run.nativeFinalizationRetryPending)
     return { ...base, state: "working", recoveryStep: "finishing_recovery" };
-  // An accepted blocked result the sweep never applied leaves the task in
+  // An accepted blocked result the sweep REFUSED to apply leaves the task in
   // progress with nothing running: a failed attempt, not a resolved one (D122).
-  if (run.status === "succeeded" && run.nativeBlockedResultAt && issue.status === "in_progress" && !run.nativeFinalizationRetry
-      && now - run.nativeBlockedResultAt.getTime() >= NATIVE_BLOCKED_WAIT_REPAIR_GRACE_MS)
+  // The sweep's recorded refusal is the authority, never elapsed time: a
+  // healthy repair waiting on the issue lock is not a failure (rf-3 20:53Z).
+  if (run.status === "succeeded" && run.nativeBlockedResultAt && run.nativeBlockedRepairRefused
+      && issue.status === "in_progress" && !run.nativeFinalizationRetry)
     return { ...base, state: "failed", canRetry: true };
   if (run.status === "succeeded" && !wait && !run.nativeFinalizationRetry) return base;
   const providerFailure = run.status === "failed" || run.status === "scheduled_retry"
@@ -568,6 +567,11 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
           and ${nativeRunResults.resultJson}#>>'{result,blocker,scope}' in ('current_track', 'task_wide')
           and nullif(btrim(${nativeRunResults.resultJson}#>>'{result,blocker,unblockAction}'), '') is not null
         limit 1)`.mapWith(value => value == null ? null : new Date(value)),
+      // The sweep's recorded refusal of this run's blocked result (recovery/service.ts
+      // repairNativeBlockedWait writes it once per run in the repair transaction).
+      nativeBlockedRepairRefused: sql<boolean>`coalesce(${heartbeatRuns.status} = 'succeeded' and ${heartbeatRuns.runtimeMode} = 'native'
+        and exists (select 1 from activity_log refused where refused.company_id = ${heartbeatRuns.companyId}
+          and refused.run_id = ${heartbeatRuns.id} and refused.action = ${NATIVE_BLOCKED_WAIT_REFUSED_ACTION}), false)`,
       // The run whose resultJson supplied providerFailure. A scheduled retry
       // shows its predecessor's reason, so redaction must use that run's registry.
       providerFailureRunId: sql<string>`case when ${heartbeatRuns.resultJson}->'providerFailure' is null

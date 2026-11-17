@@ -10,6 +10,10 @@ import { AGENT_DIRECTORY_BUSY_RETRY_REASON } from "../modules/run-dispatch/index
  * section F). Its own counter keeps a crash loop bounded, at the same limit
  * as the native controller-generation cap.
  */
+/** The stranded sweep's durable record that it REFUSED to apply a native run's
+ * accepted blocked result (recovery/service.ts repairNativeBlockedWait). The task
+ * card shows failed + Retry from this record, not from elapsed time (D122). */
+export const NATIVE_BLOCKED_WAIT_REFUSED_ACTION = "issue.native_blocked_wait_refused";
 export const INTERRUPTED_PREPARATION_RETRY_REASON = "interrupted_preparation";
 export const INTERRUPTED_PREPARATION_RETRY_MAX_ATTEMPTS = PROVIDER_ATTEMPT_CREDIT_GENERATION_LIMIT;
 export const AGENT_DIRECTORY_WAIT_RETRY_REASON = AGENT_DIRECTORY_BUSY_RETRY_REASON;
