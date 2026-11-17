@@ -247,7 +247,7 @@ async function executeWorkspaceToolInLane(root: string, name: string, raw: unkno
       // Decode after joining small output so UTF-8 split across pipe reads is
       // preserved. Large previews are two excerpts; the log always has raw bytes.
       const output = completeInline ? Buffer.concat([head.subarray(0, headBytes), tail.subarray(0, tailBytes)]).toString("utf8")
-        : `${head.toString("utf8")}\n\nFull output is saved in ${outputPath}. Read it for the complete command output. The end of the output follows:\n\n${tail.toString("utf8")}`;
+        : `${head.toString("utf8")}\n\nFull output is saved in ${outputPath}. Read it for the complete command output. Read a range or search it with workspace_run (for example \`sed -n 'A,Bp'\` or \`grep -n PATTERN\`) instead of paging the whole file. The end of the output follows:\n\n${tail.toString("utf8")}`;
       // Put the recovery path before the preview in serialized receipts too.
       resolve({ exitCode, signal, outputPath, outputBytes, output, stopped });
     });

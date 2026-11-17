@@ -74,7 +74,7 @@ describe("workspace_run lossless output (real child pipes; launcher replaced)", 
     expect(Buffer.byteLength(result.output)).toBeLessThan(40000);
     expect(result.output).toContain("START");
     expect(result.output).toContain("STDERR_END");
-    expect(result.output).toContain(result.outputPath);
+    expect(result.output).toContain(`Full output is saved in ${result.outputPath}. Read it for the complete command output. Read a range or search it with workspace_run (for example \`sed -n 'A,Bp'\` or \`grep -n PATTERN\`) instead of paging the whole file.`);
     const complete = await completeOutput(directory, result);
     expect(complete.length).toBe(5 + 272 * 65536 + 10);
     expect(complete.subarray(0, 5).toString()).toBe("START");
