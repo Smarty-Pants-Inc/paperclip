@@ -1616,4 +1616,54 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await quarantined()).toHaveLength(scenario === "live controller lease" ? 0 : expectedQuarantine);
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
+
+  // adopt-h6-defer (stack-lead s1 card 7ae251e4, 1 s after a person's Stop on
+  // a warm box): the real sweep runs once while the executor still owns the
+  // native_retry_cancelled settlement, before its idle-checkpoint receipt.
+  // That sweep defers to its recheck; no card is ever written, and the
+  // person's next message continues the same provider thread.
+  it("a sweep before a warm Stop's idle-checkpoint receipt writes no card and the successor keeps the thread", async () => {
+    const { recoveryService } = await import("../recovery/service.js");
+    const { nativeUserStopRecoveryHeld } = await import("./native-user-stop-settlement.js");
+    const prior = await seedRecoveredPriorRun();
+    await stopSettledOwner(prior, { leaseOwner: "stopping-controller", events: [
+      { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
+    ] });
+    await db.update(heartbeatRuns).set({ finishedAt: new Date() }).where(eq(heartbeatRuns.id, prior.runId));
+    // The person's Stop handed the warm box off: its reusable lease stays active.
+    const environmentId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: `warm-${environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId, issueId: prior.issueId, heartbeatRunId: prior.runId,
+      provider: "daytona", providerLeaseId: `sandbox-${prior.runId}`, status: "active", leasePolicy: "reuse_by_environment",
+      expiresAt: new Date(Date.now() + 900_000), metadata: { remoteCwd: "/workspace" } });
+    await db.update(issues).set({ checkoutRunId: prior.runId, executionRunId: prior.runId }).where(eq(issues.id, prior.issueId));
+    const sweep = () => recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks({ companyId, issueId: prior.issueId,
+      onDeferredDeadline: () => {} });
+    const cards = () => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, prior.issueId));
+    await sweep();
+    // Base: an escalated execution_stop_pending card that holds the owner.
+    expect(await cards()).toEqual([]);
+    expect(await nativeUserStopRecoveryHeld(db, { companyId, issueId: prior.issueId, runId: prior.runId })).toBe(false);
+    // The executor settles: coordinator released and receipt written together.
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, prior.runId));
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    await db.transaction(async tx => {
+      await tx.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+        .where(eq(nativeRunFinalizations.runId, prior.runId));
+      await tx.update(heartbeatRuns).set({ runnerProfileJson: { ...stopped!.runnerProfileJson,
+        nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1", companyId, issueId: prior.issueId,
+          runId: prior.runId, sessionId: stopped!.nativeSessionId, bootId: coordinator!.controllerBootId,
+          generation: coordinator!.controllerGeneration } } }).where(eq(heartbeatRuns.id, prior.runId));
+    });
+    // The person's next message reaches admission before the recheck.
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(ADMITTED);
+    expect(followUp.selectedRunId).toBe(prior.runId);
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    expect(next!.runnerProfileJson?.sessionCheckpoint).toMatchObject({ sessionId: prior.native.normalizedSessionId,
+      providerSessionId: "provider-session-before-recovery" });
+    // The recheck: still no card, in any status, ever.
+    await sweep();
+    expect(await cards()).toEqual([]);
+  }, 60_000);
 });

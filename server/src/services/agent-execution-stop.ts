@@ -56,10 +56,17 @@ function provedWarmTurnHandoff(run: Run, runLeases: Lease[], coordinator: Coordi
     && !!coordinator && coordinator.runId === run.id && coordinator.phase === "terminal_failure"
     && coordinator.failureCode === "native_retry_cancelled" && !coordinator.leaseOwner && !coordinator.resultId
     && receipt.bootId === coordinator.controllerBootId && receipt.generation === coordinator.controllerGeneration
-    && runLeases.length > 0 && runLeases.every(lease => !!lease.provider && lease.provider !== "local"
-      && lease.status === "active" && lease.leasePolicy === "reuse_by_environment" && !lease.releasedAt
-      && !lease.cleanupStatus && lease.metadata?.pendingCleanupInFlight !== true
-      && !readLeaseReleaseDeferral(lease.metadata) && !hasStopOnlyCleanup(lease));
+    && runLeases.length > 0 && runLeases.every(isRetainedWarmLease);
+}
+
+/** The retained warm box a keep_running Stop hands off: remote, active,
+ * reuse_by_environment, unreleased, no cleanup, no release deferral and no
+ * stop_and_retain. Shape only; it proves nothing about Stop by itself. */
+export function isRetainedWarmLease(lease: Lease): boolean {
+  return !!lease.provider && lease.provider !== "local"
+    && lease.status === "active" && lease.leasePolicy === "reuse_by_environment" && !lease.releasedAt
+    && !lease.cleanupStatus && lease.metadata?.pendingCleanupInFlight !== true
+    && !readLeaseReleaseDeferral(lease.metadata) && !hasStopOnlyCleanup(lease);
 }
 
 async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
