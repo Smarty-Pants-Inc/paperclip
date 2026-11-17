@@ -2301,6 +2301,30 @@ describe("TaskChatThread runtime transcript selection", () => {
     }
   });
 
+  // restore-card4: once the recovery worker saved the owed files the server
+  // projects workspaceRestoreRecovered; the run then reads recovered, not failed.
+  it("labels an owed run whose files the worker recovered as recovered", () => {
+    renderThread({
+      issueId: "issue-1",
+      comments: [],
+      onAdd: async () => {},
+      issueStatus: "blocked",
+      onRetryFailedRun: vi.fn(),
+      linkedRuns: [{
+        runId: "recovered-run", runtimeMode: "legacy", status: "failed", errorCode: "setup_failed",
+        agentId: "agent-1", agentName: "Runner", adapterType: "grok_local",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z", finishedAt: "2026-08-25T18:00:02.000Z",
+        resultJson: { workspaceRestoreFailure: "restore_failed", workspaceRestoreRecovered: true },
+      }],
+    });
+    const marker = container.querySelector('[data-testid="task-chat-collapsible-marker"]');
+    expect(marker).not.toBeNull();
+    flushSync(() => marker!.querySelector<HTMLButtonElement>('button[aria-expanded]')!.click());
+    expect(marker?.textContent).toContain("Saved work recovered");
+    expect(marker?.textContent).not.toContain("Recovering");
+    expect(marker?.textContent?.toLowerCase()).not.toContain("failed");
+  });
+
   it("uses neutral wording for an unclassified historical legacy failure", () => {
     renderThread({
       comments: [],
