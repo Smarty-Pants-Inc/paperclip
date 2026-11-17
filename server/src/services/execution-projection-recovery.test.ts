@@ -61,7 +61,7 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.label).toBe("Completed");
   });
 
-  it("(superseded by replacement: r4-hold HELD receipt, RFL record 03:52Z) reads recovered files on a cancelled run through the real batched query", async () => {
+  it("reads recovered files on a cancelled run through the real batched query", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Stopped workspace", issuePrefix: "SWP" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Reviewer", adapterType: "paperclip_runner" });
@@ -97,7 +97,7 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     await db.transaction(tx => writePiSessionHistoryLossNotice(db, tx, { companyId, issueId, runId, agentId,
       authorizationReason: `native_prior_owner_held:${sessionId}`, body: HELD_PREDECESSOR_NOTICE }));
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)).toMatchObject({
-      phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"], nextAction: "Saved work recovered, but this conversation cannot continue. Assign this agent a new task to continue." });
+      phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"], nextAction: "Saved work recovered." });
     expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).toMatchObject({ body: HELD_PREDECESSOR_NOTICE });
     // A committed success on another conversation (a new task) does not clear it;
     // one on the same conversation does.
@@ -108,7 +108,7 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
       await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: later, phase: "committed" });
     };
     await succeed(randomUUID());
-    expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction).toBe("Saved work recovered, but this conversation cannot continue. Assign this agent a new task to continue.");
+    expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction).toBe("Saved work recovered.");
     expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).not.toBeNull();
     await succeed(sessionId);
     expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).toBeNull();
