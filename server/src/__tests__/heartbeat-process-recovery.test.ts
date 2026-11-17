@@ -10550,7 +10550,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it("dispatches assigned todo work with no prior run as a normal assignment wake", async () => {
     const { companyId, agentId, issueId } =
       await seedAssignedTodoNoRunFixture();
-    const heartbeat = heartbeatService(db);
+    // The dispatched run executes in the background (queue.ts startClaimedRun)
+    // and its preparation checks the todo task out to in_progress. Hold run
+    // starts with the ordinary handover gate so the assertions below read what
+    // the dispatch itself wrote, not how far that background run has got.
+    let holdRunStarts = true;
+    const heartbeat = heartbeatService(db, {
+      runStartHandover: { isYielding: () => holdRunStarts, refreshIfStale: async () => {} },
+    });
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
     expect(result.assignmentDispatched).toBe(1);
@@ -10604,6 +10611,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const comments = await selectRecoveryCommentsForIssue(issueId);
     expect(comments).toHaveLength(0);
 
+    holdRunStarts = false;
+    await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
     if (runs[0]?.id) {
       await waitForRunToSettle(heartbeat, runs[0].id);
     }
