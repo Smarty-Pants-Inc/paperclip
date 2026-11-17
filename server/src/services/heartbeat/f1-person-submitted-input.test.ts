@@ -5,7 +5,11 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport } from "../../__tests__/helpers/embedded-postgres.js";
 import { registerLocalRuntimeApiServer } from "../../runtime-api.js";
-import { F1_HISTORY, F1_MESSAGE, F1_REFUSALS, f1PersonFlow } from "../../__tests__/helpers/f1-person-flow.js";
+import { F1_HISTORY, F1_MESSAGE, F1_REFUSALS, F1_REPLAY_ANSWER, F1_REPLAY_REQUEST, f1PersonFlow,
+} from "../../__tests__/helpers/f1-person-flow.js";
+
+const SR_ANSWER_TEXT = "SR-ANSWER: you said yes, so the word is ALDER-B.";
+const SR_PARKED_TEXT = "I re-asked you and I'm parked waiting for your answer.";
 
 let peerDb: Db;
 
@@ -22,7 +26,7 @@ vi.mock("../../vendor/paperclip-runner/index.js", async original => {
     let started!: () => void;
     const ready = new Promise<void>(resolve => { started = resolve; });
     const contract = execution.completionContract.contract as { revision: string; criteria: Array<{ id: string }> };
-    const result = { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Controlled input receipt.",
+    const result: Record<string, unknown> = { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Controlled input receipt.",
       completionClaim: { contractRevision: contract.revision, objectiveSatisfied: true,
         criteria: contract.criteria.map(criterion => ({ criterionId: criterion.id, status: "satisfied", evidenceRefs: [] })), remainingWork: [] },
       evidence: [], verification: [], artifacts: [], attentionRequests: [] };
@@ -34,8 +38,23 @@ vi.mock("../../vendor/paperclip-runner/index.js", async original => {
         const [run] = await peerDb.select({ runnerInstanceId: heartbeatRuns.runnerInstanceId })
           .from(heartbeatRuns).where(eq(heartbeatRuns.id, identity.runId));
         if (!run?.runnerInstanceId) throw new Error("F1 peer requires the selected runner identity");
+        // Silent-replay script (stands in for the live model, f5c33c68): it acts on
+        // the person's answer only when the turn's input carries it; otherwise it
+        // re-asks (rejected: the idempotency key exists). Output only; the RED
+        // assertions read the built input, not this script.
+        const replayTurn = text.includes(F1_REPLAY_REQUEST.slice(0, 40));
+        const answerSeen = (execution.interactionResponses ?? []).some(response => response.response.status === "answered");
+        const scripted: Array<{ eventType: string; itemId?: string; payload: Record<string, unknown> }> = !replayTurn ? [] : [
+          ...(!answerSeen ? [
+            { eventType: "item.started", itemId: "sr-reask", payload: { kind: "dynamicToolCall", item: { type: "dynamicToolCall", tool: "request_human_input" } } },
+            { eventType: "item.failed", itemId: "sr-reask", payload: { kind: "dynamicToolCall", error: "Interaction idempotency key already exists for a different request" } },
+          ] : []),
+        ];
+        if (replayTurn) Object.assign(result, { reportedWorkDisposition: "yielded", summary: answerSeen ? SR_ANSWER_TEXT : SR_PARKED_TEXT,
+          continuation: { kind: "response_wake", idempotencyKey: "sr-park-response-wake", summary: "Parked for the person's next message." } });
         const events = [
           { eventType: "turn.submitted", payload: { text } },
+          ...scripted,
           { eventType: "item.completed", payload: { kind: "agentMessage", channel: "final", text: result.summary } },
           { eventType: "run.result.proposed", payload: result },
           { eventType: "turn.completed", payload: {} },
@@ -108,4 +127,69 @@ describe.skipIf(!support.supported)("F1 automatic successor submitted input", ()
       // not a real model answer or live Boat qualification.
     } finally { await f.cleanup(); }
   }, 120_000);
+
+  // RED silent-replay INPUT side (RFL 10:21Z binding scope: (a) the carry + (a') the current-state
+  // contract; org 09:38Z/09:56Z). Replays gate 3's rows (db-f5c33c68.txt): the person answered
+  // question 1c287ff0; the run that answer woke (a37d4698, `f.source`, its nativeExecutionInput held the
+  // answer) was refused; the automatic successor (f5c33c68: forceFreshSession, wake
+  // issue_recovery_action_restored, retry_of a37d4698) is seeded by execution-recovery-resolution.ts
+  // -> continuation-comment-input.ts, built by heartbeat/runtime-selection.ts (materializer + contract)
+  // and heartbeat/session-preparation.ts -> native-session-handoff.ts (fresh history). Asserts read the
+  // successor's ACTUAL built input: nativeExecutionInput and the submitted model envelope.
+  it("silent-replay: the automatic successor's input is the person's answer, not the old turn", async () => {
+    const f = await f1PersonFlow(F1_REFUSALS[0], "advancing", "answered_question");
+    peerDb = f.db;
+    try {
+      await f.start();
+      let final = await f.untilSubmitted(true);
+      const isSuccessor = (runId: string) => ![f.owner.id, f.source.id, f.replay!.askerId].includes(runId);
+      // Wait for the successor's own submitted model envelope (bounded).
+      for (let i = 0; i < 40 && !final.events.some(event => isSuccessor(event.runId) && event.eventType === "turn.submitted"); i += 1) {
+        await vi.advanceTimersByTimeAsync(500);
+        await f.hb.drainActiveRunExecutions();
+        final = await f.snapshot();
+      }
+      await f.evidence("silent-replay");
+      const successors = final.runs.filter(run => isSuccessor(run.id));
+      expect(successors).toHaveLength(1);
+      const successor = successors[0];
+      const context = successor.contextSnapshot as Record<string, unknown>;
+      // The successor's live shape (f5c33c68.context_snapshot).
+      expect(context).toMatchObject({ forceFreshSession: true, wakeReason: "issue_recovery_action_restored", source: "execution.reconciled" });
+      const input = successor.runnerProfileJson?.nativeExecutionInput as { interactionResponses?: Array<{ interactionId: string;
+        response: { status: string } }>; task?: { prompt?: string }; completionContract?: { contract?: { criteria?: Array<{ requirement: string }> } } } | undefined;
+      const submitted = final.events.find(event => event.runId === successor.id && event.eventType === "turn.submitted");
+      const envelope = JSON.parse(String((submitted?.payload as { prpEvent?: { payload?: { text?: string } } } | undefined)
+        ?.prpEvent?.payload?.text ?? "{}")) as { task?: { prompt?: string }; completionContract?: { criteria?: Array<{ requirement: string }> } };
+      const modelPrompt = envelope.task?.prompt ?? "";
+      const wakeAt = modelPrompt.indexOf("## Paperclip Wake Payload");
+      const handoff = wakeAt > 0 ? modelPrompt.slice(0, wakeAt) : "";
+      const oldTurn = F1_REPLAY_REQUEST.slice(0, 40);
+      const observed = {
+        envelopeSubmitted: modelPrompt.length > 0,
+        retryOf: successor.retryOfRunId === f.source.id ? "source" : successor.retryOfRunId,
+        // (i) the person's answer is the successor's native input.
+        answer: input?.interactionResponses?.filter(response => response.interactionId === f.replay!.interactionId)
+          .map(response => response.response.status),
+        // (ii) neither the built prompt nor the completion contract re-requests the old turn.
+        contractReRequests: [...(input?.completionContract?.contract?.criteria ?? []), ...(envelope.completionContract?.criteria ?? [])]
+          .filter(criterion => criterion.requirement.includes(oldTurn)).length,
+        wakeReRequests: [input?.task?.prompt ?? "", wakeAt >= 0 ? modelPrompt.slice(wakeAt) : modelPrompt]
+          .filter(prompt => prompt.includes(oldTurn)).length,
+        // (iii) the fresh history is not cut at the old park comment: it holds the question and its answer.
+        handoffHasQuestion: handoff.includes("Repeat the word when I continue?"),
+        handoffHasAnswer: handoff.includes(F1_REPLAY_ANSWER),
+      };
+      await appendObserved({ observed, successorContext: Object.fromEntries(Object.entries(context).filter(([key]) =>
+        /^(source|wakeReason|retryOfRunId|previousRunId|forceFreshSession|commentId|wakeCommentId|wakeCommentIds|interactionIds?|interactionKind|conversationReplayThroughCommentId)$/.test(key))),
+      interactionResponses: input?.interactionResponses, criteria: input?.completionContract?.contract?.criteria, handoff });
+      expect(observed).toEqual({ envelopeSubmitted: true, retryOf: "source", answer: ["answered"], contractReRequests: 0, wakeReRequests: 0,
+        handoffHasQuestion: true, handoffHasAnswer: true });
+    } finally { await f.cleanup(); }
+  }, 120_000);
 });
+
+async function appendObserved(observed: unknown) {
+  const file = process.env.PAPERCLIP_SILENT_REPLAY_OBSERVED;
+  if (file) await (await import("node:fs/promises")).appendFile(file, `${JSON.stringify(observed)}\n`);
+}
