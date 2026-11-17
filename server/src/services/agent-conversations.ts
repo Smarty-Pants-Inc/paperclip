@@ -1,5 +1,6 @@
 import { isContextCompactionRun } from "./context-compaction.js";
 import { SETTLING_GRACE_MS } from "./recovery/settling-grace.js";
+import { isPendingCommitPresentation } from "./heartbeat-run-summary.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
@@ -833,7 +834,7 @@ export async function redeliverUnansweredConversationTurn(
   if (!issue.conversationAgentId) return "none";
   const now = options.now ?? new Date();
   const [run] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, agentId: heartbeatRuns.agentId,
-    finishedAt: heartbeatRuns.finishedAt, contextSnapshot: heartbeatRuns.contextSnapshot })
+    finishedAt: heartbeatRuns.finishedAt, contextSnapshot: heartbeatRuns.contextSnapshot, resultJson: heartbeatRuns.resultJson })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, issue.companyId)));
   if (!run || !REOFFERED_TURN_STATUSES.has(run.status) || run.agentId !== issue.conversationAgentId || !run.finishedAt) return "none";
   const context = run.contextSnapshot ?? {};
@@ -842,6 +843,10 @@ export async function redeliverUnansweredConversationTurn(
     ? (carried.includes(options.messageId) ? options.messageId : null)
     : carried[0] ?? null;
   if (!messageId || context.conversationReset === true) return "none";
+  // RFL DESIGN-F1 condition 3 (H3 stacked): a live `none` recorded before the
+  // run's own finalization committed is still pending publication; committed-
+  // response recovery owns that reply, so the turn is not re-offered.
+  if (isPendingCommitPresentation((run.resultJson as Record<string, unknown> | null)?.presentationDecision)) return "none";
   if (run.status !== "succeeded") {
     // Upstream still owns a failed turn that is the task's latest attempt, has
     // a successor, or has a recovery action.

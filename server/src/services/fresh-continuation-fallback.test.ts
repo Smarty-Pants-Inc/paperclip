@@ -22,6 +22,9 @@ import {
   freshContinuationNote, heldExecutionsAwaitingFreshContinuation, nextFreshContinuationCheckAt, recordFreshContinuationCheck, FRESH_CONTINUATION_PENDING_BOUND_MS, FRESH_CONTINUATION_PROGRESS_BOUND_MS, FRESH_CONTINUATION_SAVED_WORK_BOUND_MS,
 } from "./fresh-continuation-fallback.js";
 import { deriveTaskKeyWithHeartbeatFallback, heartbeatService, shouldResetTaskSessionForWake } from "./heartbeat.js";
+import { prepareHeartbeatSession } from "./heartbeat/session-preparation.js";
+import { getAdapterSessionCodec, normalizeSessionParams } from "./heartbeat/run-state.js";
+import { attachPaperclipSessionMetadataToSessionParams } from "./heartbeat/workspaces.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { currentProcessSpaceHash, observedProcessStartedAt } from "./controller-process-identity.js";
 import { executionControlSchedule } from "./execution-control-work.js";
@@ -254,29 +257,74 @@ suite("fresh-continuation fallback", () => {
   // SAME provider session as the silent run (the comment-wake path resumes the
   // task session keyed by the issue; nothing forces a fresh session), so the
   // model sees its own earlier turn and no tool of that turn runs again.
+  // Real seam: heartbeat/session-preparation.ts prepareHeartbeatSession (config
+  // freshness, wake reset, credential compatibility, isNativeSessionId) with a
+  // canonical native session UUID, as heartbeat.ts calls it at run start.
+  async function prepareSessionFor(run: typeof heartbeatRuns.$inferSelect, taskSession: typeof agentTaskSessions.$inferSelect | null) {
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const sessionCodec = getAdapterSessionCodec(agent!.adapterType);
+    const context = { ...(run.contextSnapshot ?? {}) } as Record<string, unknown>;
+    return prepareHeartbeatSession(db, {
+      run, agent: agent!,
+      task: { context, issueRef: { id: String(context.issueId) }, issueContext: null, taskProjectContext: null, workspaceProjectContext: null,
+        wakeCommentId: typeof context.wakeCommentId === "string" ? context.wakeCommentId : null,
+        acceptedPlanContinuationWake: false, acceptedPlanWakeRoutingDecision: null },
+      session: { taskSession, taskSessionDecodedParams: normalizeSessionParams(sessionCodec.deserialize(taskSession?.sessionParamsJson ?? null)),
+        explicitResumeSessionParams: null, explicitResumeSessionDisplayId: null, sessionCodec },
+      config: { runtimeConfig: (agent!.adapterConfig ?? {}) as Record<string, unknown>, agentIdentity: undefined, issueAssigneeOverrides: null,
+        originalAiIssueOverrides: null, managedAiRuntime: undefined, aiBinding: undefined, requestedAiBinding: undefined, secretManifest: [],
+        runtimeSkillEntries: [], routineEnvContext: { env: null } },
+      workspace: { requestedExecutionWorkspaceMode: "shared_workspace", effectiveExecutionWorkspaceMode: "shared_workspace",
+        projectExecutionWorkspacePolicy: null, issueExecutionWorkspaceSettings: null, executionPolicy: null,
+        requestedReusableExecutionWorkspaceConfig: null, reusableExistingExecutionWorkspace: null },
+      environment: { environmentResolution: { source: "default" } as never, selectedEnvironmentId: null, selectedEnvironmentForConfig: null },
+      getLatestAgentConfigRevision: async () => null as never,
+    });
+  }
+
   it("R-REPLAY: the redelivered turn resumes the silent run's provider session, never a fresh one", async () => {
     const f = await silentConversationTurn(new Date(Date.now() - 121_000));
-    const sessionId = `pi-session-${randomUUID()}`;
-    await db.update(heartbeatRuns).set({ sessionIdBefore: sessionId, sessionIdAfter: sessionId }).where(eq(heartbeatRuns.id, f.runId));
+    const sessionId = randomUUID(); // canonical native session id (isNativeSessionId)
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeSessionId: sessionId, sessionIdBefore: sessionId, sessionIdAfter: sessionId })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const [silent] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    // Stamp the task session the way the silent run's own start left it.
+    const stamp = await prepareSessionFor(silent!, null);
     await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner", taskKey: f.issueId,
-      sessionDisplayId: sessionId, sessionParamsJson: { sessionId }, lastRunId: f.runId });
+      sessionDisplayId: sessionId, lastRunId: f.runId,
+      sessionParamsJson: attachPaperclipSessionMetadataToSessionParams({ sessionId }, stamp.configuredModel, stamp.sessionConfigMetadata) });
     await occupySlot(); // keep the redelivered run queued, as admitted
     await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
     const [wake] = await f.redeliveries();
     const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, wake!.id));
-    const [silent] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
-    // The same resolvers heartbeat.ts uses at run start (taskKey -> getTaskSession; reset gate).
+    // The same resolvers heartbeat.ts uses at run start (taskKey -> getTaskSession -> prepareHeartbeatSession).
     const nextKey = deriveTaskKeyWithHeartbeatFallback(next!.contextSnapshot, null);
     expect(nextKey).toBe(deriveTaskKeyWithHeartbeatFallback(silent!.contextSnapshot, null));
-    expect(next!.contextSnapshot?.forceFreshSession).toBeUndefined();
     expect(shouldResetTaskSessionForWake(next!.contextSnapshot)).toBe(false);
-    const [resumed] = await db.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, companyId),
+    const [taskSession] = await db.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, companyId),
       eq(agentTaskSessions.agentId, agentId), eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, nextKey!)));
-    console.info(JSON.stringify({ rReplay: { silentSession: silent!.sessionIdAfter, redeliveredSession: resumed?.sessionDisplayId, nextRunId: next!.id } }));
-    expect(resumed?.sessionDisplayId).toBe(silent!.sessionIdAfter);
-    // session-preparation resumes only a session whose last run is another run.
-    expect(resumed?.lastRunId).toBe(f.runId);
-    expect(resumed?.lastRunId).not.toBe(next!.id);
+    const prepared = await prepareSessionFor(next!, taskSession ?? null);
+    console.info(JSON.stringify({ rReplay: { silentSession: silent!.sessionIdAfter, taskResumeSessionId: prepared.taskResumeSessionId,
+      reset: prepared.resetTaskSession, resetReason: prepared.sessionResetReason, nextRunId: next!.id } }));
+    expect(prepared.resetTaskSession).toBe(false);
+    expect(prepared.taskSessionCredentialCompatible).toBe(true);
+    // successor.session_id_before (the session the runner resumes) == silent.session_id_after
+    expect(prepared.taskResumeSessionId).toBe(silent!.sessionIdAfter);
+    expect(prepared.taskResumeSessionId).toBe(sessionId);
+  }, 120_000);
+
+  // RFL DESIGN-F1 condition 3, enforced with H3 stacked: a live `none` recorded
+  // before the run's own finalization committed (native_presentation_pending_commit)
+  // is committed-response recovery's to publish, so it is never redelivered.
+  it.each([true, false])("R-SILENT skips a turn whose presentation is pending commit (pending=%s)", async pending => {
+    const f = await silentConversationTurn(new Date(Date.now() - 121_000));
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "none",
+      reasonCodes: ["interaction_owns_conversation_response", ...(pending ? ["native_presentation_pending_commit"] : [])] } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass++) await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    expect(await f.redeliveries()).toHaveLength(pending ? 0 : 1);
   }, 120_000);
 
   // D109/D131 (isolation) + D159 (race), re-homed onto the R-SILENT owner: one
