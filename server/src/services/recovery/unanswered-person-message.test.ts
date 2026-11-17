@@ -106,16 +106,19 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   // Keep: recorded gate-1 catch: one setup_failed run had a Retry notice, then a contradictory resend note.
   async function setupFailureWithRetryNotice(input: { attempts?: number; actionStatus?: string; deleted?: boolean;
-    noticeRunId?: string; nextAction?: string; linkedActionId?: string; ownerType?: string } = {}) {
+    noticeRunId?: string; nextAction?: string; linkedActionId?: string; ownerType?: string;
+    wakePolicy?: Record<string, unknown> } = {}) {
     const f = await fixture({ status: "blocked", chat: false });
     const messageId = await f.message();
     const runId = await f.run({ commentId: messageId, status: "failed", errorCode: "setup_failed" });
     const actionId = await f.boardHold("stranded_assigned_issue", runId, "stranded_assigned_issue");
     await db.update(issueRecoveryActions).set({ status: input.actionStatus ?? "active", ownerType: input.ownerType ?? "board",
-      nextAction: input.nextAction ?? "Press Retry to start it again from the saved work." })
+      nextAction: input.nextAction ?? "Press Retry to start it again from the saved work.",
+      ...(input.wakePolicy ? { wakePolicy: input.wakePolicy } : {}) })
       .where(eq(issueRecoveryActions.id, actionId));
     const notice = buildStrandedRecoveryEscalationNotice({
-      seed: buildNoRunningExecutionNoticeSeed({ status: "in_progress", attempts: input.attempts ?? 1 }),
+      seed: input.nextAction ? { title: "Recovery needed", body: input.nextAction, nextAction: input.nextAction, tone: "danger" }
+        : buildNoRunningExecutionNoticeSeed({ status: "in_progress", attempts: input.attempts ?? 1 }),
       recoveryActionId: input.linkedActionId ?? actionId, recoveryOwner: null,
       sourceRun: { id: input.noticeRunId ?? runId, status: "failed", errorCode: "setup_failed" },
     });
@@ -179,6 +182,56 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notes).toHaveLength(1);
       expect(notes[0]!.id).toBe(f.commentId);
     }
+  });
+
+  // Keep: review-fleet-5 C1 DB catch: real producer remedies need not start a
+  // sentence with "Press Retry". Each row keeps the same-run notice/action fence.
+  it.each([
+    ["workspace repository access (service.ts)", "Paperclip could not copy the project's repository into the task's workspace. Restore access to the repository in the project settings, then press Retry."],
+    ["contained execution (execution-projection.ts)", "The original execution was contained and its action outcomes reviewed. Use Retry to request another attempt."],
+    ["preparation failure (native-recovery-preparation-failure.ts)", "Preparation failed before the provider was started again. Retry the task."],
+    ["released owner (native-failed-run-owner-release.ts)", "The run ended before it could resume its native provider session. Inspect the run failure, then explicitly retry the task."],
+    ["provider startup (native-session-executor.ts)", "The provider refused to start a session, so no provider work began. Read the provider message and fix its cause in the agent's environment or AI connection if needed, then Retry. Retry starts a new run with a fresh provider session."],
+  ])("one-note5 C1: %s has exactly one note after repeated settlement and sweeps", async (_producer, nextAction) => {
+    const f = await setupFailureWithRetryNotice({ nextAction });
+    for (let pass = 0; pass < 2; pass++) {
+      const outcome = await settleUnansweredPersonMessage(db, f);
+      await f.sweep();
+      const notes = await f.notes();
+      expect(notes.map(note => note.body)).toEqual([nextAction]);
+      expect(notes).toHaveLength(1);
+      expect(outcome).toEqual({ kind: "explained" });
+      expect(notes[0]!.id).toBe(f.commentId);
+      expect(notes[0]!.body).toBe(nextAction);
+      expect(notes[0]!.metadata?.sourceRunId).toBe(f.runId);
+      expect(notes[0]!.body).not.toContain("Sending it again");
+    }
+  });
+
+  it("one-note5 C1: a structured manual_retry remedy covers its run without depending on Retry copy", async () => {
+    const f = await setupFailureWithRetryNotice({ nextAction: "Request another attempt when the environment is available.",
+      ownerType: "system", wakePolicy: { type: "manual_retry", reason: "environment_provider_unavailable", preservesSourceAssignee: true } });
+    for (let pass = 0; pass < 2; pass++) {
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "explained" });
+      expect(await f.notes()).toHaveLength(1);
+      expect((await f.notes())[0]!.id).toBe(f.commentId);
+    }
+  });
+
+  it.each([
+    "Do not retry this attempt.",
+    "Automatic retry is stopped.",
+    "Automatic retries are stopped.",
+    "Retry is not available for this attempt.",
+    "Do not retry this attempt. Press Retry on the current task instead.",
+  ])("one-note5 C1: a negated remedy does not silence the message: %s", async nextAction => {
+    const f = await setupFailureWithRetryNotice({ nextAction });
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
+    const notes = await f.notes();
+    expect(notes).toHaveLength(2);
+    expect(notes.find(note => note.id !== f.commentId)!.body).toBe(NOT_ANSWERED);
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
+    expect(await f.notes()).toHaveLength(2);
   });
 
   it("one-note: a second failure keeps after 2 tries without a second remedy", async () => {
