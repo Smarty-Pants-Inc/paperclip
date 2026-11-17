@@ -1294,6 +1294,9 @@ describe("persistent agent directories", () => {
     } finally { open.mockRestore(); }
   });
 
+  // Authority for all six supersedes records below (seven cases): RFL's 11:16Z
+  // ruling, as cited in review-fleet-4's rc2 verdict (F5). The old deletion
+  // assertions are replaced by retained-source proofs, not dropped safety guards.
   // supersedes (fail-closed): the old test asserted the temporary copy was deleted
   // (ENOENT + compacted baseline) after an over-quota save. That discarded the only
   // copy of "changed instructions". It now asserts retention under a held save.
@@ -1391,6 +1394,10 @@ describe("persistent agent directories", () => {
     expect(result).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
     // supersedes (fail-closed): the limit reason moved from errorMessage to the held save receipt.
     expect((result?.receipt?.savePending as { reason?: string }).reason).toContain("2 GiB total storage limit");
+    expect(agentFileSaveHeld(result)).toBe(true);
+    expect(result?.nextAttemptAt).toBeInstanceOf(Date);
+    expect((await fs.stat(path.join(copy.localRoot, "part-0.bin"))).size).toBe(MAX_AGENT_FILE_BYTES);
+    expect(await fs.readFile(path.join(copy.localRoot, entryFile), "utf8")).toBe(initial);
     expect(await fs.readdir(root)).toEqual(["policy"]);
   });
 
