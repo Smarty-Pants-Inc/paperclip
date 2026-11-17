@@ -8,6 +8,7 @@ import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { hasAcknowledgedNativeStopIntent } from "./acknowledged-native-stop.js";
 import { hasStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
+import { retainedWarmHandoffLease } from "./native-runtime/handed-off-warm-lease.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
@@ -62,16 +63,14 @@ type Coordinator = typeof nativeRunFinalizations.$inferSelect;
  * controller boot/generation. A cancel ack or policy label is not this proof;
  * a missing/mismatched receipt or a stop_and_retain lease keeps the blocker. */
 function provedWarmTurnHandoff(run: Run, runLeases: Lease[], coordinator: Coordinator | undefined): boolean {
-  const value = run.runnerProfileJson?.nativeRetainedIdleCheckpoint;
-  const receipt = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  // adopt-h6-xred3: the receipt binding (run/company/issue/session + the settled
+  // coordinator's boot/generation) is the handoff marker of the shared
+  // retainedWarmHandoffLease, which accepts the lease before AND after release.
   return run.status === "cancelled" && run.runtimeMode === "native" && hasAcknowledgedNativeStopIntent(run)
-    && receipt.schema === "paperclip.native-retained-idle-checkpoint.v1"
-    && receipt.companyId === run.companyId && receipt.runId === run.id && receipt.issueId === run.nativeIssueId
-    && typeof receipt.sessionId === "string" && receipt.sessionId === run.nativeSessionId
     && !!coordinator && coordinator.runId === run.id && coordinator.phase === "terminal_failure"
     && coordinator.failureCode === "native_retry_cancelled" && !coordinator.leaseOwner && !coordinator.resultId
-    && receipt.bootId === coordinator.controllerBootId && receipt.generation === coordinator.controllerGeneration
-    && runLeases.length > 0 && runLeases.every(isRetainedWarmLease);
+    && runLeases.length > 0 && runLeases.every(lease => retainedWarmHandoffLease(run, lease, { kind: "idle_receipt",
+      nativeSessionId: run.nativeSessionId, bootId: coordinator.controllerBootId, generation: coordinator.controllerGeneration }));
 }
 
 /** The retained warm box a keep_running Stop hands off: remote, active,

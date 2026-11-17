@@ -32,6 +32,11 @@ import { createAdapterExecutionControl } from "./adapter-execution-control.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./heartbeat/runtime-execution.js";
 import { finishCancelledWarmWorkspaceExport } from "./heartbeat/cancelled-warm-workspace-export.js";
+import { issueRecoveryActions, nativeRunFinalizations } from "@paperclipai/db";
+import { recoveryService } from "./recovery/service.js";
+import { runExecutionsStoppedOrHandedOffWarm } from "./agent-execution-stop.js";
+import { environmentService } from "./environments.js";
+import { handedOffWarmLeaseSettled } from "./native-runtime/handed-off-warm-lease.js";
 import { withNativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
 import * as nativeExecutor from "./native-runtime/native-session-executor.js";
@@ -441,4 +446,74 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
     await expect(stat(join(f.box, ...STAMP))).rejects.toMatchObject({ code: "ENOENT" });
   }, 60_000);
+
+  // ---- adopt-h6-xred3: H6's Stop-pending card x cancel-finalize's held export (rf-3 19:10Z) ----
+  async function xredHeldExport(timeoutMs: number) {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
+    await settleLater(f);
+    // The settled coordinator the receipt is bound to (retainCancelledSession's one transaction).
+    await db.insert(nativeRunFinalizations).values({ runId: f.runId, companyId: f.companyId, issueId: f.issueId,
+      phase: "terminal_failure", failureCode: "native_retry_cancelled", controllerBootId: "boot", controllerGeneration: 1 });
+    // The box is NOT yet handed off: the release runs after the cancellation boundary returns.
+    await db.update(environmentLeases).set({ status: "active", cleanupStatus: null }).where(eq(environmentLeases.id, f.leaseId));
+    await db.update(issues).set({ checkoutRunId: f.runId, executionRunId: f.runId, executionLockedAt: new Date(),
+      conversationAgentId: f.agentId, conversationUserId: "board", conversationState: "active" }).where(eq(issues.id, f.issueId));
+    let release!: () => void;
+    f.runnerState.gate = { match: script => script.includes("workspace-sync-v1.json.tmp") && script.includes("base64 -d"),
+      until: new Promise<void>(resolve => { release = resolve; }) };
+    const exported = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId, nativeWorkspaceSync: f.sync, timeoutMs });
+    await waitFor(() => f.runnerState.held === 1, 20_000);
+    return { f, exported, release };
+  }
+  async function xredSweep(f: { companyId: string; issueId: string; runId: string }) {
+    await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    return { cards: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)),
+      claims: { checkoutRunId: task.checkoutRunId, executionRunId: task.executionRunId },
+      h6: await runExecutionsStoppedOrHandedOffWarm(db, f.companyId, [f.runId]) };
+  }
+
+  it("XRED: a sweep during the held export and after its finalize + release raises no card; the successor adopts the same lease", async () => {
+    const { f, exported, release } = await xredHeldExport(30_000);
+    // (1) Export HELD in progress (receipt landed, finalization ownership held, lease active).
+    const during = await xredSweep(f);
+    expect({ cards: during.cards.map(card => card.cause), h6: during.h6 }).toEqual({ cards: [], h6: true });
+    expect(during.claims).toEqual({ checkoutRunId: f.runId, executionRunId: f.runId });
+    const [leaseDuring] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    // (2) The export finalizes; the heartbeat teardown then hands the box off (the real release writer).
+    release();
+    expect(await exported).toEqual({ outcome: "finalized" });
+    await environmentService(db).releaseLease(f.leaseId, "retained", { cleanupStatus: "success" });
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    const after = await xredSweep(f);
+    expect({ cards: after.cards.map(card => card.cause), h6: after.h6 }).toEqual({ cards: [], h6: true });
+    expect(after.claims).toEqual({ checkoutRunId: f.runId, executionRunId: f.runId });
+    // Fields the export wrote on the lease: only metadata.nativeWorkspaceSync (+ updatedAt).
+    const changed = Object.keys(lease.metadata ?? {}).filter(key =>
+      JSON.stringify((lease.metadata ?? {})[key]) !== JSON.stringify((leaseDuring.metadata ?? {})[key]));
+    expect({ status: lease.status, cleanupStatus: lease.cleanupStatus, releasedAt: lease.releasedAt, changed })
+      .toEqual({ status: "retained", cleanupStatus: "success", releasedAt: null, changed: ["nativeWorkspaceSync"] });
+    // The Send gate admits the same lease once the s3 fence's runner-exit stamp is persisted.
+    await db.update(environmentLeases).set({ metadata: { ...lease.metadata,
+      handedOffWarmOwnerRunnerExited: { runId: f.runId, provenAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.leaseId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [stamped] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    expect(handedOffWarmLeaseSettled(run, stamped)).toBe(true);
+    expect(await nativeWorkspaceExportPendingForResource(db, stamped, f.successorRunId)).toBe(false);
+    expect(await successorOnSameBox(f)).toBe("adopt_remote");
+  }, 90_000);
+
+  it("XRED: the export TIMES OUT (unproven): what the sweep and the transcript show", async () => {
+    const { f, exported, release } = await xredHeldExport(2_000);
+    expect(await exported).toEqual({ outcome: "unproven", reason: "timed_out" });
+    release();
+    await environmentService(db).releaseLease(f.leaseId, "retained", { cleanupStatus: "success" });
+    const swept = await xredSweep(f);
+    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    const lines = events.map(event => event.message ?? "").filter(Boolean);
+    if (process.env.XRED_OUT) await writeFile(process.env.XRED_OUT, JSON.stringify({ cards: swept.cards.map(card => ({ cause: card.cause, status: card.status })),
+      h6: swept.h6, claims: swept.claims, lines }, null, 2));
+    expect(lines.some(line => /source does not match/i.test(line) || /new task/i.test(line))).toBe(false);
+    expect(lines.some(line => line.includes("could not be confirmed in time (timed_out)"))).toBe(true);
+  }, 90_000);
 });

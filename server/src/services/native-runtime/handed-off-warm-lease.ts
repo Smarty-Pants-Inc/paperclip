@@ -5,6 +5,7 @@ import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop
 import { hasStopOnlyCleanup, prepareSupersededWarmSandboxStop } from "../sandbox-stop-and-retain.js";
 import { warmSandboxExpiryCandidateCondition } from "../warm-sandbox-expiry.js";
 import { logger } from "../../middleware/logger.js";
+import { readLeaseReleaseDeferral } from "../environment-lease-release-deferral.js";
 
 /** Lease policies whose box a warm Stop can hand off (native-failed-workspace-recovery). */
 const reusableNativeLeasePolicies = ["reuse_by_environment", "reuse_by_execution_workspace"];
@@ -26,20 +27,70 @@ export function handedOffWarmLease(run: Run, lease: typeof environmentLeases.$in
       stopped: run.status === "cancelled" && hasAcknowledgedNativeRunStopRequest(run), source: lease }) !== "handoff");
 }
 
+/** The marker that ties a handed-off lease to THIS run's handoff (adopt-h6-xred3):
+ * - idle_receipt (H6's card proof): the run's nativeRetainedIdleCheckpoint names
+ *   this run/company/issue/session and the settled coordinator's boot/generation;
+ * - runner_exit (the Send gate): the lease's HANDED_OFF_WARM_EXIT_KEY stamp names
+ *   this run. A lease shape alone never passes. */
+export type WarmHandoffMarker =
+  | { kind: "idle_receipt"; nativeSessionId: string | null; bootId: string | null; generation: number | null }
+  | { kind: "runner_exit" };
+
+function handoffMarkerNamesRun(run: Pick<Run, "id" | "companyId" | "nativeIssueId" | "runnerProfileJson">,
+  lease: typeof environmentLeases.$inferSelect, marker: WarmHandoffMarker): boolean {
+  if (marker.kind === "runner_exit") {
+    const evidence = lease.metadata?.[HANDED_OFF_WARM_EXIT_KEY] as { runId?: unknown } | undefined;
+    return evidence?.runId === run.id;
+  }
+  const value = run.runnerProfileJson?.nativeRetainedIdleCheckpoint;
+  const receipt = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  return receipt.schema === "paperclip.native-retained-idle-checkpoint.v1"
+    && receipt.companyId === run.companyId && receipt.runId === run.id && receipt.issueId === run.nativeIssueId
+    && typeof receipt.sessionId === "string" && receipt.sessionId === marker.nativeSessionId
+    && marker.bootId !== null && receipt.bootId === marker.bootId
+    && marker.generation !== null && receipt.generation === marker.generation;
+}
+
+/** adopt-h6-xred3: ONE "retained warm handoff" lease predicate, used by H6's
+ * Stop-pending card proof (agent-execution-stop.ts provedWarmTurnHandoff) and
+ * the Send gate (handedOffWarmLeaseSettled below). It accepts BOTH states of the
+ * same handed-off lease: active and uncleaned before the release, and
+ * retained/success after it (environment-runtime.ts releaseLease("retained",
+ * { cleanupStatus: "success" }), releasedAt stays null), only when it is THIS
+ * run's lease and carries the caller's marker naming this run. It refuses a
+ * released/terminated lease, a stop receipt, a stop in flight, stop-only
+ * cleanup (stop_and_retain / export resume), a release deferral, a failed
+ * cleanup and a non-reusable or local lease. */
+export function retainedWarmHandoffLease(run: Pick<Run, "id" | "companyId" | "nativeIssueId" | "runnerProfileJson">,
+  lease: typeof environmentLeases.$inferSelect, marker: WarmHandoffMarker): boolean {
+  const state = (lease.status === "active" && !lease.cleanupStatus)
+    || (lease.status === "retained" && lease.cleanupStatus === "success");
+  return state && !lease.releasedAt && lease.companyId === run.companyId && lease.heartbeatRunId === run.id
+    && !!lease.provider && lease.provider !== "local" && reusableNativeLeasePolicies.includes(lease.leasePolicy)
+    && lease.metadata?.pendingCleanupInFlight !== true && !readLeaseReleaseDeferral(lease.metadata)
+    && !hasStopOnlyCleanup(lease) && lease.metadata?.sandboxStopAndRetainReceipt == null
+    && lease.metadata?.remoteExecutionTermination == null
+    && handoffMarkerNamesRun(run, lease, marker);
+}
+
 /** pl/send-after-stop: ONE predicate for a remote lease with no stop receipt
  * that a person's Stop of a warm (keep_running) turn handed off. It is settled
- * only when it is such a lease (handedOffWarmLease) and the s3 fence's own
- * proof says the stopped run's Runner exited. Shared by the explicit Send gate
+ * only when the Stop policy says handoff and the lease is this run's retained
+ * warm handoff (retainedWarmHandoffLease, either state) whose s3 fence proof
+ * says the stopped run's Runner exited. Shared by the explicit Send gate
  * (explicit-native-continuation.ts) and the automatic remote-stop resume
  * (acknowledgedNativeStopExecutionHasStopped). */
 export function handedOffWarmLeaseSettled(run: Run, lease: typeof environmentLeases.$inferSelect): boolean {
   // rf-4 row 22a: DB-only. The s3 fence's proof (handedOffWarmOwnerRunnerExited)
   // talks to the box's Runner, so it never runs here (callers hold a transaction
   // or a dryRun); proveHandedOffWarmLeases runs it outside any transaction and
-  // persists its answer, which is the only thing read here.
-  if (!handedOffWarmLease(run, lease)) return false;
-  const evidence = lease.metadata?.[HANDED_OFF_WARM_EXIT_KEY] as { runId?: unknown } | undefined;
-  return evidence?.runId === run.id;
+  // persists its answer, which is the only thing read here. That proof still
+  // runs only on a released (retained) lease (handedOffWarmLease), never during
+  // cancel-finalize's export, so before the release the stamp is normally absent.
+  return run.runtimeMode === "native" && nativeStopWorkspaceOutcome({
+    admittedDisposition: admittedNativeResourceDisposition(run.runnerProfileJson),
+    stopped: run.status === "cancelled" && hasAcknowledgedNativeRunStopRequest(run), source: lease }) === "handoff"
+    && retainedWarmHandoffLease(run, lease, { kind: "runner_exit" });
 }
 
 /** rf-4 row 22: persisted evidence that the s3 fence proved the stopped run's Runner exited. */
