@@ -598,7 +598,7 @@ async function withCanonicalDirectoryMergeLock<T>(
   }
 }
 
-async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry): Promise<void> {
+async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry, signal?: AbortSignal): Promise<void> {
   const sourcePath = path.join(sourceDir, relative);
   const targetPath = path.join(targetDir, relative);
 
@@ -631,6 +631,8 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
     const file = await fs.open(temporary, "r");
     try { await file.sync(); } finally { await file.close(); }
     const existing = await fs.lstat(targetPath).catch(() => null);
+    // An aborted owner publishes nothing more: check before the replace.
+    signal?.throwIfAborted();
     if (existing?.isDirectory()) await fs.rm(targetPath, { recursive: true, force: true });
     await fs.rename(temporary, targetPath);
   } finally { await fs.rm(temporary, { force: true }); }
@@ -764,13 +766,23 @@ export async function mergeDirectoryWithBaseline(input: {
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
   snapshots?: { source: DirectorySnapshot; current?: DirectorySnapshot };
+  /** The owner's abort signal (e.g. a lost or timed-out finalization
+   * ownership). Checked after the merge-lock wait and before every host
+   * mutation, so an aborted merge throws before it touches the target. Nothing
+   * already written is undone. Omitted: unchanged behaviour. */
+  signal?: AbortSignal;
 }): Promise<void> {
+  const signal = input.signal;
   const capture = input.workspaceSnapshotIsolation === "worker" ? captureDirectorySnapshotOffThread : captureDirectorySnapshot;
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
   const source = input.snapshots?.source ?? await capture(input.sourceDir, options);
   try {
+    signal?.throwIfAborted();
     await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
+      // The lock wait can outlast the owner: check after it, before any write.
+      signal?.throwIfAborted();
       await input.beforeApply?.();
+      signal?.throwIfAborted();
       if (!input.snapshots?.current && directorySnapshotsMatch(input.baseline, source)) {
         await input.afterApply?.();
         return;
@@ -787,18 +799,24 @@ export async function mergeDirectoryWithBaseline(input: {
         for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
           if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
+          signal?.throwIfAborted();
           await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
         }
         // Reverse path order visits descendants before their parent directory.
         for (const [relative, entry] of orderedEntries(input.baseline, true)) {
+          if (entry.kind === "dir" && !source.entries.has(relative)) signal?.throwIfAborted();
           if (entry.kind === "dir" && !source.entries.has(relative)) await fs.rmdir(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
             if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
           });
         }
         for (const [relative, entry] of orderedEntries(source)) {
           if (!entriesMatch(input.baseline.entries.get(relative), entry) &&
-              !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+              !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) {
+            signal?.throwIfAborted();
+            await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry, signal);
+          }
         }
+        signal?.throwIfAborted();
         await input.afterApply?.();
       } finally { await disposeDirectorySnapshot(current); }
     });

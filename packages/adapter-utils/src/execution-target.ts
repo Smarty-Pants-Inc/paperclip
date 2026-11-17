@@ -353,7 +353,9 @@ export interface PreparedAdapterExecutionTargetRuntime {
     repositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
   } | null;
   cleanupWorkspaceSnapshot?(): Promise<void>;
-  restoreWorkspace(onProgress?: RuntimeProgressSink): Promise<void>;
+  /** `options.signal`: see the sandbox-managed runtime; ignored by runtimes
+   * without a local host merge. */
+  restoreWorkspace(onProgress?: RuntimeProgressSink, options?: { signal?: AbortSignal }): Promise<void>;
 }
 
 export interface AdapterExecutionTargetProcessOptions {

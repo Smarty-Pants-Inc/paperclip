@@ -915,8 +915,12 @@ async function finalizePreparedRuntime(input: {
     input.signal?.throwIfAborted();
   };
   input.signal?.throwIfAborted();
-  if (input.onPhase) await input.onPhase("workspace.restore", () => input.runtime.restoreWorkspace());
-  else await input.runtime.restoreWorkspace();
+  // The same signal reaches the LOCAL restore (extraction + host merge): it is
+  // checked after the host merge-lock wait and before every host mutation, so
+  // an abandoned restore cannot overwrite the next owner's workspace.
+  const restoreOptions = input.signal ? { signal: input.signal } : undefined;
+  if (input.onPhase) await input.onPhase("workspace.restore", () => input.runtime.restoreWorkspace(undefined, restoreOptions));
+  else await input.runtime.restoreWorkspace(undefined, restoreOptions);
   return measureRunPhase("execution.workspace_commit", async () => {
     await stillOwned();
     const finalSnapshot =
@@ -945,7 +949,9 @@ async function finalizePreparedRuntime(input: {
     };
     await stillOwned();
     const reference = await writeDescriptor(finalizedDescriptor);
+    input.signal?.throwIfAborted();
     await persistRunReference(input.db, input.runId, reference);
+    input.signal?.throwIfAborted();
     await persistLeaseStamp({
       db: input.db,
       leaseId: input.descriptor.binding.leaseId,
