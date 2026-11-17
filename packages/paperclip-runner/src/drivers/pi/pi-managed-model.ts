@@ -31,7 +31,9 @@ export async function buildPiManagedModel(input: {
   const messages = new Set<string>();
   try {
     const configured = await configuredPiManagedModelSources(input.snapshot, input.id, input.originalModelsFile, input.api, message => messages.add(message));
-    return resolvePiManagedModel(configured, input.catalog, input.api, message => messages.add(message));
+    const model = resolvePiManagedModel(configured, input.catalog, input.api, message => messages.add(message));
+    // Managed gateway routing uses Pi's own session id, never prompt text.
+    return { ...model, compat: { ...model.compat, sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" } };
   } finally {
     reportDiagnostics(messages, input.warn ?? diagnose);
   }

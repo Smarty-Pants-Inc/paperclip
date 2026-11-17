@@ -18,6 +18,8 @@ const definition = {
   samplingParams: { temperature: 0.25 }, samplingParamsByThinkingLevel: { high: { top_p: 0.8 } },
   futureCapability: { nested: [false, null, "preserve-me"] },
 };
+const affinity = { sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" };
+const managedDefinition = { ...definition, compat: { ...definition.compat, ...affinity } };
 const environment = { PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1/v1", PAPERCLIP_AI_PROVIDER_AUTH: "none" };
 const injectedSampling = { ...definition.samplingParams, model: "x", reasoning_effort: "max" };
 const catalog: PiBuiltinModelCatalog = { getBuiltinProviders: () => ["openai"], getBuiltinModels: () => [{ ...definition, samplingParams: injectedSampling, provider: "openai", api, baseUrl: "https://never-copy.invalid", headers: { authorization: "never-copy" } }] };
@@ -27,12 +29,12 @@ it.each(["config", "catalog"])("diffs every non-routing field from the whole %s 
   const diagnostics: string[] = [];
   const model = await buildPiManagedModel({ snapshot: kind === "config" ? { providers: { native: { api, models: [source] } } } : {}, id: definition.id, api, catalog, warn: message => diagnostics.push(message) });
   // Full-object diff, not an enumerated allowlist: future metadata must survive.
-  expect(model).toEqual(definition);
+  expect(model).toEqual(managedDefinition);
   for (const key of ["model", "reasoning_effort"]) expect(diagnostics.filter(message => message.includes(`stripped protected sampling key "${key}"`))).toHaveLength(1);
   const binding = await createPiProviderBinding({ model: `paperclip/${definition.id}`, environment, modelConfiguration: model });
   try {
-    expect(binding.provider.models[0]).toEqual(definition);
-    expect(piManagedModelRegistration(binding.provider.models[0])).toEqual(definition);
+    expect(binding.provider.models[0]).toEqual(managedDefinition);
+    expect(piManagedModelRegistration(binding.provider.models[0])).toEqual(managedDefinition);
     expect(validateBindRequest({ schema: 1, type: "bind", nonce: "definition", sessionId: "definition", expectedPriorEpoch: 0, epoch: 1, runId: "definition", model: `paperclip/${definition.id}`, thinkingLevel: "high", instructions: "", tools: [], provider: binding.provider })).toBe(true);
     expect(binding.provider.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:/);
     expect(binding.provider.apiKey).not.toBe("never-copy");
@@ -42,7 +44,7 @@ it.each(["config", "catalog"])("diffs every non-routing field from the whole %s 
 it("keeps explicit config fields, including text-only input and false, ahead of the catalog", async () => {
   const overrides = { id: definition.id, name: "Explicit override", input: ["text"], reasoning: false, thinkingLevelMap: { max: null }, compat: {} };
   const actual = await buildPiManagedModel({ snapshot: { providers: { native: { api, models: [overrides] } } }, id: definition.id, api, catalog, warn: () => {} });
-  expect(actual).toEqual({ ...definition, ...overrides, thinkingLevelMap: { ...definition.thinkingLevelMap, ...overrides.thinkingLevelMap } });
+  expect(actual).toEqual({ ...definition, ...overrides, compat: affinity, thinkingLevelMap: { ...definition.thinkingLevelMap, ...overrides.thinkingLevelMap } });
 });
 
 it("drops API-shaped metadata from mismatched config without losing neutral metadata", () => {
@@ -55,7 +57,7 @@ it("uses canonical API-owner definition despite earlier conflicting catalog entr
   const actual = await buildPiManagedModel({ snapshot: {}, id: definition.id, api, catalog: {
     getBuiltinProviders: () => ["anthropic", "openai"], getBuiltinModels: owner => [{ ...definition, api: owner === "openai" ? api : "anthropic-messages", name: owner, compat: owner === "openai" ? { supportsStore: false } : { forceAdaptiveThinking: true } }],
   }, warn: () => {} });
-  expect(actual).toEqual({ ...definition, name: "openai", compat: { supportsStore: false } });
+  expect(actual).toEqual({ ...definition, name: "openai", compat: { supportsStore: false, ...affinity } });
 });
 
 it("takes an unknown model's explicit source-provider input, otherwise diagnoses text-only defaults once", async () => {
@@ -76,12 +78,12 @@ it.each(["provider", "baseUrl", "api", "apiKey", "headers", "authHeader", "auth"
 it("does not copy any foreign API-shaped catalog metadata when no canonical match exists", async () => {
   const actual = await buildPiManagedModel({ snapshot: {}, id: definition.id, api: "anthropic-messages", catalog, warn: () => {} });
   const { compat, samplingParams, samplingParamsByThinkingLevel, ...neutral } = definition;
-  expect(actual).toEqual(neutral);
+  expect(actual).toEqual({ ...neutral, compat: affinity });
 });
 
 it("does not share mutable nested metadata with either source", async () => {
   const source = structuredClone(definition);
   const actual = await buildPiManagedModel({ snapshot: { providers: { native: { api, models: [source] } } }, id: definition.id, api, warn: () => {} });
   source.input.push("text"); source.futureCapability.nested.push("changed"); source.cost.tiers[0]!.input = 999;
-  expect(actual).toEqual(definition);
+  expect(actual).toEqual(managedDefinition);
 });
