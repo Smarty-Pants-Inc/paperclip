@@ -36,7 +36,6 @@ import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
-import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT } from "./recovery/unanswered-person-message.js";
 import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";
 import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
@@ -868,7 +867,7 @@ suite("fresh-continuation fallback", () => {
     await refuseContinuation(next, error); await finishFailedWake(next);
     const lease = error === "native_controller_recovery_unsupported:metadata_format"
       ? await retainClass2Source({ runId: next.id, issueId: f.issueId }) : null;
-    // follow-Paperclip Cut B R1/R8: both refusal families get the remaining attempt; K=2 leaves one truthful message-bound note.
+    // Both refusal families get the remaining attempt; step 1 removes K=2 separately.
     await sweepFallback();
     const following = await successors(next.id);
     expect(following).toHaveLength(1);
@@ -876,19 +875,9 @@ suite("fresh-continuation fallback", () => {
     await refuseContinuation(last, error); await finishFailedWake(last);
     for (let pass = 0; pass < 3; pass++) {
       await sweepFallback();
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + 30_000) });
     }
     expect(await successors(last.id)).toHaveLength(0);
     if (lease) expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
-    const notices = currentNotices(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"))));
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(UNANSWERED_MESSAGE_BOUND_REACHED_TEXT);
-    expect(notices[0]!.body).not.toMatch(/sending it again is safe|assign.*new task/i);
-    expect(notices[0]!.metadata).toMatchObject({ sourceRunId: last.id, authorizationReason: `unanswered_message:${f.messageId}`,
-      recoveryResponsibility: "user" });
-    const rows = notices[0]!.metadata!.sections!.flatMap(section => section.rows);
-    expect(rows).toContainEqual({ type: "key_value", label: "Failure code", value: code });
-    expect(rows).toContainEqual({ type: "key_value", label: "Next action", value: "Send a new message to try again." });
   }, 60_000);
 
   it("delivers an older pending terminal fallback once without upgrading physical-stop proof", async () => {
@@ -2156,17 +2145,9 @@ suite("fresh-continuation fallback", () => {
     const f = await preparationDeathChain();
     const visible = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
       eq(issueComments.authorType, "system")))).filter(note => !note.deletedAt);
-    // The unanswered sweep may run before the held sweep, and again later
-    // while the continuation is still queued.
-    for (const ahead of [30_000, 3 * 60_000]) {
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + ahead) });
-    }
     await continueHeldExecutions(db);
     await occupySlot();
     await deliver();
-    for (const ahead of [30_000, 4 * 60_000]) {
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + ahead) });
-    }
     expect(await successors(f.refusedRunId)).toHaveLength(1);
     for (const note of await visible()) {
       expect(note.body.trim()).not.toBe("");

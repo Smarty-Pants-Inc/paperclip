@@ -45,7 +45,6 @@ import * as runnerTiming from "../services/native-runtime/runner-operation-timin
 import { parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
-import { UNANSWERED_MESSAGE_REASON_PREFIX, UNANSWERED_MESSAGE_SETTLE_MS, UNANSWERED_MESSAGE_TEXT } from "../services/recovery/unanswered-person-message.js";
 
 const enabled = process.env.PAPERCLIP_PI_LEASE_E2E === "1";
 const MISSING_FILE_NOTE = "My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.";
@@ -610,13 +609,9 @@ it.skipIf(!enabled).each(cases)(
       const first = await logOutcome(followup.id, 1);
       let restartAfterSweep: Record<string, unknown> | undefined;
       if (shape === "restart") {
-        // Run before admission assertions: a refusal BEFORE Pi selection must
-        // still face the production unanswered-message sweep, not fail early
-        // and leave the row with an unobserved zero-note outcome.
+        // Run upstream recovery before asserting admission and saved history.
         expect(followup.finishedAt).not.toBeNull();
-        const noticeDueAt = followup.finishedAt!.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
-        await waitFor("D-B8 person-message settle deadline", async () => Date.now() >= noticeDueAt ? true : null, UNANSWERED_MESSAGE_SETTLE_MS + 5_000);
-        const settledRecovery = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId, unanswered: true });
+        const settledRecovery = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
         restartAfterSweep = await logOutcome(followup.id, 1);
         recoveryObservation = { case: caseName, shape, trueProcessRestart: false, method: "real-idle-timer-fallback",
           settledRecovery, afterRecovery: restartAfterSweep };
@@ -686,7 +681,7 @@ it.skipIf(!enabled).each(cases)(
             record(entry.sessionRecovery).code === "pi_session_file_missing"), "D-B8 runner reports pi_session_file_missing").toBe(true);
         const notesBeforeReplay = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
           .filter(comment => comment.authorType === "system" && !comment.deletedAt).map(comment => comment.id);
-        await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId, unanswered: true });
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
         expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
           .filter(comment => comment.authorType === "system" && !comment.deletedAt).map(comment => comment.id), "D-B8 sweep replay does not add a second note").toEqual(notesBeforeReplay);
       } else if (followup.status === "succeeded") {
@@ -723,7 +718,7 @@ it.skipIf(!enabled).each(cases)(
           await waitFor("persisted heartbeat retry deadline", async () => Date.now() >= scheduled[0]!.scheduledRetryAt!.getTime() ? true : null);
         const promotion = await heartbeat.promoteDueScheduledRetries();
         const deferredDeadlines: number[] = [];
-        const strandedRecovery = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId, unanswered: true,
+        const strandedRecovery = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId,
           onDeferredDeadline: at => deferredDeadlines.push(at) });
         // The same dispatch worker also redrives durable queued admissions.
         const queuedDispatch = await heartbeat.resumeQueuedRunsAfterDrain({ companyId });
@@ -750,12 +745,8 @@ it.skipIf(!enabled).each(cases)(
           // Preservation makes observed terminal_failure/blocked
           // (native-failed-workspace-recovery.ts:166-176), not retryable_failure.
           // Never manufacture attempt:2 to make the successful-reply R2 pass.
-          // The issue-state recovery worker calls this same wrapper. Let its
-          // real 15s post-finish settle bound expire once, then drive its next
-          // pass. This is a failure notice, NOT a Pi history-loss note/reply.
-          const noticeDueAt = followup.finishedAt!.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
-          await waitFor("person-message failure notice settle deadline", async () => Date.now() >= noticeDueAt ? true : null, UNANSWERED_MESSAGE_SETTLE_MS + 5_000);
-          const settledRecovery = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId, unanswered: true });
+          // Drive upstream's recovery owner. A failure notice is not a history-loss reply.
+          const settledRecovery = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
           const afterRecovery = await readOutcome(followup.id, 1);
           const visibleComments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
           const visibleNotes = visibleComments.filter(comment => comment.authorType === "system" && !comment.deletedAt);
@@ -766,10 +757,7 @@ it.skipIf(!enabled).each(cases)(
           expect(beforeRecovery).toMatchObject({ phase: "terminal_failure", recoveryState: "blocked", nextAttemptAt: null });
           expect(nextLeases.every(lease => record(lease.metadata).replaceBeforeReuse === undefined), "no production replacement marker on B").toBe(true);
           expect(afterRecovery).toMatchObject({ status: "failed", answered: false, requestCount: 0, branch: "neither" });
-          expect(visibleNotes, "exactly the one person-visible unanswered-message failure note, not a fabricated history-loss note").toHaveLength(1);
-          expect(visibleNotes[0]!.body).toContain(UNANSWERED_MESSAGE_TEXT);
-          expect(visibleNotes[0]!.metadata).toMatchObject({ authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${response.id}` });
-          expect(visibleNotes[0]!.presentation).toMatchObject({ kind: "system_notice", tone: "warning" });
+          expect(visibleNotes, "exactly one upstream failure notice, not a fabricated history-loss reply").toHaveLength(1);
           expect(visibleComments.filter(comment => !comment.deletedAt).map(comment => comment.id).sort(),
             "the person sees the unchanged opening exchange, their unanswered message, and this one failure note")
             .toEqual([...comments.filter(comment => !comment.deletedAt).map(comment => comment.id), response.id, visibleNotes[0]!.id].sort());
@@ -778,7 +766,7 @@ it.skipIf(!enabled).each(cases)(
           expect(records).toHaveLength(1);
           // A second production pass proves notice deduplication, not just a
           // single successful write. It must neither retry nor add a note.
-          await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId, unanswered: true });
+          await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
           expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
             .filter(comment => comment.authorType === "system" && !comment.deletedAt).map(comment => comment.id)).toEqual([visibleNotes[0]!.id]);
           expect(await successorRuns()).toEqual([]);

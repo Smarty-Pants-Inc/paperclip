@@ -23,7 +23,6 @@ import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
-import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_SETTLE_MS } from "./recovery/unanswered-person-message.js";
 
 // Custody peer, the same rule as environment-runtime-reusable-resume-replacement.test.ts: a lease's backup verifies only when
 // its stamp authorizes that exact provider lease. Everything else in the module is the real implementation.
@@ -37,10 +36,6 @@ const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
 // A typed fresh-thread refusal (runner-reconciliation-refusal.ts FRESH_THREAD_REFUSAL_CODES).
 const TYPED = "runner_remote_state_unavailable";
-// B-2 (RFL ruled 05:51Z): the ONE bound is the fork's K=2 chain cap; this is the text the person sees when it is
-// reached. "Press Retry" only where the task view proves a Retry control in that state, so the ruled default applies.
-const BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, and both attempts failed. "
-  + "Your message and the saved work are kept. Send a new message to try again.";
 
 suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
   let db!: ReturnType<typeof createDb>;
@@ -270,9 +265,9 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
   // The kept held-notice writer returns early for the typed family (native-session-executor.ts noticeHeldUnfinishedPredecessor,
   // `if (freshThreadRefusalCode(error)) return`). After Cut B the typed family is an ordinary failure: the fallback continues it
   // (its user text is the recovery action's nextAction, no thread comment), and the ONE thread note owner is the unanswered-message
-  // sweep (recovery/unanswered-person-message.ts). B-2: the ONE bound is the K=2 chain cap; #21394's hourly window does not
+  // sweep (removed in delete-ours step 5). B-2: the ONE bound is the K=2 chain cap; #21394's hourly window does not
   // re-open it.
-  describe("B-5 / B-2: a typed chain that reaches the one bound gets exactly one note, from the unanswered-message sweep", () => {
+  describe("B-2: a typed chain reaches the one bound", () => {
     async function failContinuation(runId: string, issueId: string) {
       const now = new Date();
       const [task] = await db.update(issues).set({ status: "blocked", executionRunId: null, checkoutRunId: null, blockedTransitionAt: now })
@@ -293,7 +288,7 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
       return now;
     }
 
-    it("K=2 typed continuations, then the bound: no third run (even past the hourly window), one note within the settle time", async () => {
+    it("K=2 typed continuations, then the bound: no third run (even past the hourly window)", async () => {
       await company();
       const f = await heldTypedMessage();
       await occupySlot();
@@ -306,27 +301,16 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
         const next = await successors(source);
         expect(next, `continuation ${attempt} is delivered`).toHaveLength(1);
         expect(next[0]!.contextSnapshot).toMatchObject({ wakeCommentIds: [f.messageId] });
-        await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + 30_000) });
         expect.soft(await currentSystemNotes(f.issueId), `no thread note while continuation ${attempt} is owed`).toHaveLength(0);
         source = next[0]!.id as typeof source;
         await failContinuation(source, f.issueId);
       }
-      const endedAt = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source)))[0]!.finishedAt!;
       // B-2: the bound holds. Neither the held backlog nor delivery starts a third, even after #21394's hourly window.
       for (const at of [0, FRESH_CONTINUATION_WINDOW_MS + 60_000]) {
         await continueHeldExecutions(db, new Date(Date.now() + at));
         await deliver();
       }
       expect.soft(await successors(source), "the K=2 bound: no third continuation").toHaveLength(0);
-      // B-5: the one note, from the unanswered-message sweep, within its settle time after the last run ended.
-      const acceptance = endedAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS + 1_000;
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(acceptance) });
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(acceptance + 60_000) });
-      const notes = await currentSystemNotes(f.issueId);
-      expect(notes, `exactly one note, posted by ${UNANSWERED_MESSAGE_SETTLE_MS / 1000 + 1} s after the last run ended`).toHaveLength(1);
-      expect(notes[0]!.metadata).toMatchObject({ authorizationReason: `unanswered_message:${f.messageId}` });
-      expect(notes[0]!.body).toBe(BOUND_REACHED_TEXT);
-      expect(notes[0]!.createdAt.getTime() - endedAt.getTime()).toBeLessThan(UNANSWERED_MESSAGE_SETTLE_MS + 60_000);
     }, 60_000);
   });
 

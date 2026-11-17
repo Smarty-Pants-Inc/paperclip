@@ -59,7 +59,6 @@ import { heartbeatService } from "../heartbeat.js";
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
 import { claimFirstTurnQueuedInput } from "../native-runtime/first-turn-queued-input.js";
-import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -272,20 +271,6 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(replies.find(reply => reply.createdByRunId === run.id)?.body).toBe("Finished my own assigned work.");
   });
 
-  it.each([false, true])("carry-comment (d): B' notice remains only while the message is unanswered (answered=%s)", async answered => {
-    const f = await commentContinuationFixture();
-    const scope = { companyId: f.run.companyId, issueId: f.issue.id, now: new Date(Date.now() + 60 * 60_000) };
-    const first = await settleUnansweredPersonMessage(db, scope);
-    expect(first.kind).toBe("noticed");
-    if (answered) {
-      await f.start();
-      await f.finish("Your new recall word is COBALT.");
-    }
-    const outcome = await settleUnansweredPersonMessage(db, scope);
-    expect(outcome.kind).toBe(answered ? "answered" : "noticed_before");
-    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issue.id), eq(issueComments.authorType, "system")));
-    expect(notes.filter(note => !note.deletedAt && String(note.metadata?.authorizationReason).startsWith("unanswered_message:"))).toHaveLength(answered ? 0 : 1);
-  });
 
   // ===== RFL JUDGE TESTS (not builder code) =====
   const judgeLog = (tag: string, body: string) => { console.log(tag, body); judgeAppendFileSync(process.env.JUDGE_OUT ?? "/dev/null", `${tag} ${body}\n`); };
@@ -305,9 +290,8 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     await claimFirstTurnQueuedInput(db, { companyId: run.companyId, issueId: f.issue.id, runId: run.id, agentId: run.agentId });
     const replies = await f.finish("Migration finished: 14 tables moved, 0 errors.");
     const trace = await traceOf(run.id);
-    const note = await settleUnansweredPersonMessage(db, { companyId: f.run.companyId, issueId: f.issue.id, now: new Date(Date.now() + 60 * 60_000) });
     judgeLog("JUDGE-J1", JSON.stringify({ ctx: { commentContinuation: run.contextSnapshot?.commentContinuation, wakeCommentIds: run.contextSnapshot?.wakeCommentIds },
-      published: mineOf(replies, run.id), trace, bPrime: note.kind }));
+      published: mineOf(replies, run.id), trace }));
     expect(mineOf(replies, run.id)).toEqual(["Migration finished: 14 tables moved, 0 errors."]);
   });
 
@@ -320,8 +304,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     f.input.run = stripped;
     const replies = await f.finish("An answer from a continuation whose context predates the carry.");
     const trace = await traceOf(run.id);
-    const note = await settleUnansweredPersonMessage(db, { companyId: f.run.companyId, issueId: f.issue.id, now: new Date(Date.now() + 60 * 60_000) });
-    judgeLog("JUDGE-J2", JSON.stringify({ retryOfRunId: stripped.retryOfRunId, ctxKeys: Object.keys(old), published: mineOf(replies, run.id), trace, bPrime: note.kind }));
+    judgeLog("JUDGE-J2", JSON.stringify({ retryOfRunId: stripped.retryOfRunId, ctxKeys: Object.keys(old), published: mineOf(replies, run.id), trace }));
     expect(mineOf(replies, run.id)).toEqual(["An answer from a continuation whose context predates the carry."]);
   });
 
@@ -334,38 +317,11 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       authorAgentId: f.agent.id, createdByRunId: other.id, body: "Your new recall word is COBALT." });
     const replies = await f.finish("Your new recall word is COBALT (duplicate).");
     const trace = await traceOf(run.id);
-    const note = await settleUnansweredPersonMessage(db, { companyId: f.run.companyId, issueId: f.issue.id, now: new Date(Date.now() + 60 * 60_000) });
-    judgeLog("JUDGE-J3", JSON.stringify({ published: mineOf(replies, run.id), trace, bPrime: note.kind }));
+    judgeLog("JUDGE-J3", JSON.stringify({ published: mineOf(replies, run.id), trace }));
     expect(mineOf(replies, run.id)).toEqual([]);
     expect(trace.finalResponse).toBe("Your new recall word is COBALT (duplicate).");
   });
 
-  it("judge J4: suppressed and the person STILL waits (old-context continuation, message unanswered) -> the B' note is still raised", async () => {
-    const f = await commentContinuationFixture();
-    const run = await f.start();
-    const old: Record<string, unknown> = { ...(run.contextSnapshot ?? {}) };
-    for (const key of ["commentContinuation", "wakeCommentIds", "wakeCommentId", "commentId", "queuedCommentSourceWakeIds", "firstTurnQueuedInput"]) delete old[key];
-    const [stripped] = await db.update(heartbeatRuns).set({ contextSnapshot: old, status: "running" }).where(eq(heartbeatRuns.id, run.id)).returning();
-    f.input.run = stripped;
-    const replies = await f.finish("Turn one: ORANGE.");
-    const note = await settleUnansweredPersonMessage(db, { companyId: f.run.companyId, issueId: f.issue.id, now: new Date(Date.now() + 60 * 60_000) });
-    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issue.id), eq(issueComments.authorType, "system")));
-    judgeLog("JUDGE-J4", JSON.stringify({ published: mineOf(replies, run.id), bPrime: note.kind,
-      liveNotes: notes.filter(n => !n.deletedAt).length, deletedNotes: notes.filter(n => n.deletedAt).length }));
-    expect(mineOf(replies, run.id).length > 0 || note.kind === "noticed" || note.kind === "noticed_before").toBe(true);
-  });
-
-  it("judge J5 (B' note): 'gone once answered' = soft-delete (deleted_at set) or hard delete?", async () => {
-    const f = await commentContinuationFixture();
-    const scope = { companyId: f.run.companyId, issueId: f.issue.id, now: new Date(Date.now() + 60 * 60_000) };
-    expect((await settleUnansweredPersonMessage(db, scope)).kind).toBe("noticed");
-    await f.start();
-    await f.finish("Your new recall word is COBALT.");
-    const outcome = await settleUnansweredPersonMessage(db, scope);
-    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issue.id), eq(issueComments.authorType, "system")));
-    judgeLog("JUDGE-J5", JSON.stringify({ outcome: outcome.kind, rows: notes.length, softDeleted: notes.filter(n => n.deletedAt).length, live: notes.filter(n => !n.deletedAt).length }));
-    expect(outcome.kind).toBe("answered");
-  });
 
   it("judge J6 (two creators): two continuations of one parent both carry the id; only the first publishes an answer", async () => {
     const f = await commentContinuationFixture();
@@ -403,8 +359,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     });
     const replies = await f.finish("Retried as you asked: your recall word is COBALT.");
     const trace = await traceOf(retry.id);
-    const note = await settleUnansweredPersonMessage(db, { companyId: f.run.companyId, issueId: f.issue.id, now: new Date(Date.now() + 60 * 60_000) });
-    judgeLog("JUDGE-J7", JSON.stringify({ published: mineOf(replies, retry.id), reasonCodes: trace.presentationDecision?.reasonCodes, finalResponseKept: trace.finalResponse, bPrime: note.kind }));
+    judgeLog("JUDGE-J7", JSON.stringify({ published: mineOf(replies, retry.id), reasonCodes: trace.presentationDecision?.reasonCodes, finalResponseKept: trace.finalResponse }));
     expect(mineOf(replies, retry.id)).toEqual(["Retried as you asked: your recall word is COBALT."]);
   });
   it("judge J8 (agent-authored wake comment): a continuation of a run woken by ANOTHER AGENT's comment still publishes its result", async () => {

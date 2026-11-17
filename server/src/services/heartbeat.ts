@@ -15,7 +15,6 @@ import { registerDeferredReceiptWork } from "./heartbeat/deferred-receipt-work.j
 import { registerProviderLimitResumeWork, type PrepareChatRetry } from "./native-runtime/provider-limit-resume.js";
 import { reconcileTaskChatRetryReceipts } from "./task-retry.js";
 import { registerIssueRecoveryWork } from "./recovery/work.js";
-import { settleUnansweredPersonMessages, settleUnansweredPersonMessagesForTask } from "./recovery/unanswered-person-message.js";
 import { registerRunDispatchWork } from "./heartbeat/dispatch-work.js";
 import { listUndispatchedQueuedRuns } from "./queued-run-dispatch-liveness.js";
 import { NATIVE_RETAINED_OWNER_WAIT } from "./native-runtime/native-controller-recovery.js";
@@ -1728,25 +1727,11 @@ export function heartbeatService(
     void reportRunFailure(db, updated, failureReport);
   }
 
-  async function reconcileStrandedAssignedIssues(
-    opts?: Parameters<typeof recovery.reconcileStrandedAssignedIssues>[0] & { unanswered?: boolean },
-  ) {
-    const { unanswered, ...recoveryOpts } = opts ?? {};
-    const issueCreatedAtGte = await getWorktreeExecutionCutoff();
-    const result = await recovery.reconcileStrandedAssignedIssues({ ...recoveryOpts, issueCreatedAtGte });
-    // After recovery has queued whatever it will, a person's last message that
-    // nothing will answer gets its one notice (the conversation clause). The
-    // recovery worker already knows, from one batched query per page, which
-    // visited tasks have such a message: the others cost nothing here.
-    if (unanswered === false) return result;
-    const settled = unanswered === true && recoveryOpts.companyId && recoveryOpts.issueId
-      ? await settleUnansweredPersonMessagesForTask(db, { companyId: recoveryOpts.companyId, issueId: recoveryOpts.issueId,
-        issueCreatedAtGte, onDeferredDeadline: recoveryOpts.onDeferredDeadline,
-        nativeBlockedRepairApplies: recovery.nativeBlockedRepairApplies })
-      : await settleUnansweredPersonMessages(db, { companyId: recoveryOpts.companyId, issueId: recoveryOpts.issueId,
-        issueCreatedAtGte, onDeferredDeadline: recoveryOpts.onDeferredDeadline,
-        nativeBlockedRepairApplies: recovery.nativeBlockedRepairApplies });
-    return { ...result, unansweredMessagesNoticed: settled.noticed };
+  async function reconcileStrandedAssignedIssues(opts?: Parameters<typeof recovery.reconcileStrandedAssignedIssues>[0]) {
+    return recovery.reconcileStrandedAssignedIssues({
+      ...opts,
+      issueCreatedAtGte: await getWorktreeExecutionCutoff(),
+    });
   }
 
   async function sweepStaleIssueLocks(opts?: Parameters<typeof recovery.sweepStaleIssueLocks>[0]) {

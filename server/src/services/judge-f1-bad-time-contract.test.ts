@@ -37,10 +37,8 @@ import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
-import { settleUnansweredPersonMessagesForTask } from "./recovery/unanswered-person-message.js";
 import { FRESH_THREAD_STARTED_NOTE, freshThreadStartedNote, readFreshThreadStopProof } from "./native-runtime/fresh-thread-stop-gate.js";
 import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";
-import { UNANSWERED_MESSAGE_BOUND_REACHED_TEXT } from "./recovery/unanswered-person-message.js";
 import { prepareUnconfirmedSourceSandboxStop } from "./sandbox-stop-and-retain.js";
 import { createReusableLeaseHandoff } from "./environment-lease-handoff.js";
 
@@ -854,7 +852,7 @@ suite("fresh-continuation fallback", () => {
     await settleUnrecoverableExecutions(db);
     const next = await expectOneFreshSuccessor(f);
     await refuseContinuation(next, error); await finishFailedWake(next);
-    // follow-Paperclip Cut B R1/R4/R8: B' no longer defers typed refusals; it owns one unanswered-message note at the kept K=2 cap.
+    // The retained K=2 cap is deleted independently in step 1.
     await sweepFallback();
     const second = await successors(next.id);
     expect(second).toHaveLength(1);
@@ -862,20 +860,9 @@ suite("fresh-continuation fallback", () => {
     await refuseContinuation(second[0], error); await finishFailedWake(second[0]);
     for (let pass = 0; pass < 3; pass++) {
       await sweepFallback();
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + 30_000) });
     }
     expect(await successors(next.id)).toHaveLength(1);
     expect(await successors(second[0].id)).toHaveLength(0);
-    const notices = currentNotices(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"))));
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(UNANSWERED_MESSAGE_BOUND_REACHED_TEXT);
-    expect(notices[0]!.body).not.toMatch(/assign.*new task/i);
-    expect(notices[0]!.body).not.toMatch(/sending it again is safe/i);
-    expect(notices[0]!.metadata).toMatchObject({ sourceRunId: second[0].id, authorizationReason: `unanswered_message:${f.messageId}`,
-      recoveryResponsibility: "user" });
-    const rows = notices[0]!.metadata!.sections!.flatMap(section => section.rows);
-    expect(rows).toContainEqual({ type: "key_value", label: "Failure code", value: code });
-    expect(rows).toContainEqual({ type: "key_value", label: "Next action", value: "Send a new message to try again." });
     expect((await db.select().from(issueComments).where(eq(issueComments.id, f.messageId)))[0])
       .toMatchObject({ authorType: "user", body: "Please help with this task.", deletedAt: null });
   }, 60_000);

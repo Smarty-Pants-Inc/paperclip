@@ -44,13 +44,6 @@ import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { claimNativeSessionResumptions } from "./native-finalization-reconciler.js";
 import { FRESH_THREAD_STARTED_NOTE } from "./fresh-thread-stop-gate.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
-import {
-  PENDING_WAIT_ACTION,
-  PENDING_WAIT_BOUND_MS,
-  settleUnansweredPersonMessage,
-  unansweredMessageCode,
-  UNANSWERED_MESSAGE_TEXT,
-} from "../recovery/unanswered-person-message.js";
 
 /** The transport's own stall text (runnerd-codex-transport.ts describeRunnerCommandStall). */
 const PREPARE_NEVER_CONNECTED = "runner_ingress_unavailable: PRP command run.prepare timed out "
@@ -146,9 +139,7 @@ describe("a first start whose Runner never connected: what the person sees (rf4)
     return claims[0]!.leaseOwner;
   }
 
-  const unanswered = (seeded: Seeded, now: Date) => settleUnansweredPersonMessage(db, { companyId, issueId: seeded.issueId, now });
-
-  it("classifies the run as runner_ingress_startup_failed and posts no unanswered notice while attempt 2's retry is scheduled", async () => {
+  it("classifies the run as runner_ingress_startup_failed and schedules attempt 2's retry", async () => {
     const seeded = await seed({ userComment: true });
     await fail(seeded, new Error(PREPARE_NEVER_CONNECTED));
     let state = await read(seeded);
@@ -157,20 +148,12 @@ describe("a first start whose Runner never connected: what the person sees (rf4)
     expect(state.issue.status).toBe("in_progress");
     // The owner's code for this run: the shown code, not unclassified_failure.
     expect(state.run.errorCode).toBe("runner_ingress_startup_failed");
-    expect(unansweredMessageCode(state.run)).toBe("runner_ingress_startup_failed");
-    // Attempt 1's +16 s owner pass.
-    expect((await unanswered(seeded, new Date(Date.now() + 16_000))).kind).toBe("pending");
 
     // Attempt 2 fails; its retry is scheduled (jittered 48-72 s out).
     await fail(seeded, new Error(PREPARE_NEVER_CONNECTED), await claimRetry(seeded));
     state = await read(seeded);
     expect(state.coordinator).toMatchObject({ phase: "retryable_failure", attempt: 2 });
-    const [wait] = await db.select().from(activityLog).where(and(eq(activityLog.entityId, seeded.issueId),
-      eq(activityLog.action, PENDING_WAIT_ACTION)));
-    // The bounded 120 s wait from attempt 1 has expired; attempt 3 is still scheduled.
-    const pastBound = new Date((wait?.createdAt ?? new Date()).getTime() + PENDING_WAIT_BOUND_MS + 5_000);
-    expect(state.coordinator.nextAttemptAt!.getTime()).toBeGreaterThan(pastBound.getTime() - 5 * 60_000);
-    expect((await unanswered(seeded, pastBound)).kind).toBe("pending");
+    expect(state.coordinator.nextAttemptAt).toBeInstanceOf(Date);
     expect((await read(seeded)).notes).toEqual([]);
   });
 
@@ -190,11 +173,7 @@ describe("a first start whose Runner never connected: what the person sees (rf4)
       const truthful = String(state.coordinator.failureDetail?.nextAction);
       expect(truthful).toContain("3 attempts");
 
-      // Every owner gets its turn: the unanswered-message owner after its
-      // settle time, and the execution-disposition worker.
-      await unanswered(seeded, new Date(Date.now() + 16_000));
       await settleUnrecoverableExecutions(db, new Date(Date.now() + 20_000));
-      await unanswered(seeded, new Date(Date.now() + 10 * 60_000));
       state = await read(seeded);
 
       expect(state.notes.filter(note => note.body.includes(FRESH_THREAD_STARTED_NOTE))).toEqual([]);
@@ -206,9 +185,6 @@ describe("a first start whose Runner never connected: what the person sees (rf4)
       expect(state.continued[0]!.details).toMatchObject({ failureCode: "runner_ingress_startup_failed" });
       // The executor posts no note of its own beside the continuation's.
       expect(state.notes.filter(note => note.body === truthful)).toEqual([]);
-      // The continuation's run never started in this timeline, so the person's
-      // message gets the unanswered owner's bounded notice; nothing else.
-      expect(state.notes.map(note => note.body)).toEqual(userComment ? [UNANSWERED_MESSAGE_TEXT] : []);
       expect(state.issue.status).not.toBe("blocked");
     },
   );
@@ -228,10 +204,4 @@ describe("a first start whose Runner never connected: what the person sees (rf4)
     expect(state.continued[0]!.details).toMatchObject({ failureCode: "provider_session_open_rejected", trigger: "recovery_refused" });
   });
 
-  it("guard: other codes' unanswered-notice classification is unchanged", () => {
-    expect(unansweredMessageCode({ status: "failed", error: "provider_session_open_timeout: x", errorCode: "provider_session_open_timeout" }))
-      .toBe("provider_session_open_timeout");
-    expect(unansweredMessageCode({ status: "failed", error: "boom", errorCode: "runner_ingress_unavailable" })).toBe("unclassified_failure");
-    expect(unansweredMessageCode({ status: "failed", error: null, errorCode: "native_session_interrupted" })).toBe("native_session_interrupted");
-  });
 });

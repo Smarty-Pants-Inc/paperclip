@@ -12,7 +12,6 @@ import { continueHeldExecutions } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
-import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT } from "./recovery/unanswered-person-message.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -44,7 +43,7 @@ suite("fresh-continuation watchdog snapshot-binding chain", () => {
     }
   });
 
-  it("stops fresh resolved watchdog actions after two snapshot-binding fallbacks and publishes one real owner note", async () => {
+  it("stops fresh resolved watchdog actions after two snapshot-binding fallbacks", async () => {
     expect(isNativeContinuationRefusal({ errorCode: cause, error: failure })).toBe(false);
     const startedAt = new Date(Date.now() - 10 * 60_000);
     await db.insert(issues).values({ id: issueId, companyId, title: "Finish the requested work", status: "in_progress",
@@ -108,7 +107,6 @@ suite("fresh-continuation watchdog snapshot-binding chain", () => {
         attemptCount: 1, maxAttempts: null, cause, resolvedAt: action!.createdAt,
         evidence: { continuationDelivery: "delivered", continuationRunId: run.id,
           freshContinuation: { sourceRunId } } });
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId, now: new Date(Date.now() + 30_000) });
       expect(await systemNotes()).toHaveLength(0);
       delivered.push(run.id);
       sourceRunId = run.id;
@@ -121,7 +119,6 @@ suite("fresh-continuation watchdog snapshot-binding chain", () => {
         await settleUnrecoverableExecutions(restarted);
         await continueHeldExecutions(restarted);
         await deliver(restarted);
-        await settleUnansweredPersonMessagesForTask(restarted, { companyId, issueId, now: new Date(Date.now() + 30_000) });
       }
     } finally { await restarted.$client.end(); }
 
@@ -144,10 +141,5 @@ suite("fresh-continuation watchdog snapshot-binding chain", () => {
     }
     expect.soft(forbidden).toHaveLength(0);
     expect.soft(records).toHaveLength(2);
-    expect.soft(notes).toHaveLength(1);
-    // follow-Paperclip B-2 (RFL 05:51Z): the K=2 bound's one note reads the ruled bound text.
-    expect.soft(notes[0]?.body).toBe(UNANSWERED_MESSAGE_BOUND_REACHED_TEXT);
-    expect.soft(notes[0]?.metadata).toMatchObject({ authorizationReason: `unanswered_message:${messageId}`,
-      recoveryResponsibility: "user" });
   }, 60_000);
 });

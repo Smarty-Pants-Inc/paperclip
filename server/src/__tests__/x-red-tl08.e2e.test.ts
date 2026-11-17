@@ -40,7 +40,6 @@ import { canonicalNativeRuntimeContextDigest, configuredEnvironmentProjection } 
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { nativeSha256 } from "../services/native-runtime/canonical.js";
 import { selectPiConversation } from "../services/native-runtime/pi-conversation-record.js";
-import { PENDING_WAIT_BOUND_MS, UNANSWERED_MESSAGE_SETTLE_MS } from "../services/recovery/unanswered-person-message.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -223,12 +222,6 @@ function sourceLine(relative: string, needle: string): string {
 }
 function noteWriter(note: typeof issueComments.$inferSelect) {
   const reason = String(record(note.metadata).authorizationReason ?? "");
-  // The sweep may use the same held body as the executor; durable provenance,
-  // not identical prose, identifies which owner actually wrote the note.
-  if (reason.startsWith("unanswered_message:")) {
-    const writer = sourceLine("../services/recovery/unanswered-person-message.ts", "const comment = await issueService(tx as unknown as Db).addComment");
-    return { writer, caller: sourceLine("../services/heartbeat.ts", "? await settleUnansweredPersonMessagesForTask(db"), authorizationReason: reason };
-  }
   if (reason.startsWith("native_prior_owner_held:") || note.body === HELD_PREDECESSOR_NOTICE) {
     const writer = sourceLine("../services/native-runtime/native-session-executor.ts", "await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE");
     return { writer, caller: writer, authorizationReason: reason };
@@ -849,10 +842,8 @@ const runScenario = async (scenario: Scenario) => {
     const followupRequests = requests.filter(item => item.runId === next.runId);
     const answered = outcome.error == null && persisted?.error == null
       && record(outcome.result).exitCode === 0 && record(outcome.result).summary === `RECALLED_${fact}`;
-    // adopt-lead 15:44Z: 'no note' means no note AFTER the real 15 s unanswered-message sweep, as in
-    // RE4/RE5. This harness drives the executor directly, so it settles the refused run's row the
-    // way the heartbeat does (failed + finishedAt + the executor's error), waits the production
-    // settle bound, then runs the production sweep (heartbeat.reconcileStrandedAssignedIssues).
+    // This harness drives the executor directly. Settle a refused run as the
+    // heartbeat does, then drive upstream recovery and its returned deadlines.
     let sweep: unknown = null;
     const sweepPasses: Array<{ at: number; deferredDeadlines: number[]; result: unknown }> = [];
     if (!answered) {
@@ -860,26 +851,16 @@ const runScenario = async (scenario: Scenario) => {
       if (row && !row.finishedAt) await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
         error: row.error ?? (outcome.error == null ? null : String(outcome.error)),
         errorCode: row.errorCode ?? (outcome.errorCode == null ? null : String(outcome.errorCode)) }).where(eq(heartbeatRuns.id, next.runId));
-      const [settled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.runId));
-      const dueAt = settled!.finishedAt!.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
-      await new Promise(resolve => setTimeout(resolve, Math.max(0, dueAt - Date.now()) + 250));
-      // The executor can leave a real retryable_failure coordinator. The first
-      // sweep then records a durable wait T0, not a notice. Production's
-      // recovery/work.ts re-arms the earliest onDeferredDeadline; this direct
-      // fixture must consume that callback too. Never rewrite the coordinator
-      // as terminal or suppress its retry to manufacture the expected note.
-      // Drive only returned deadlines, with real time and a finite bound: a
-      // missing deadline or an unbounded product deferral still fails below.
-      const sweepStopAt = Date.now() + PENDING_WAIT_BOUND_MS + UNANSWERED_MESSAGE_SETTLE_MS;
+      // Keep the real coordinator unchanged; the live-row acceptance budget is two minutes.
+      const sweepStopAt = Date.now() + 2 * 60_000;
       let nextSweepAt: number | null = Date.now();
       for (let pass = 0; pass < 8 && nextSweepAt !== null && nextSweepAt <= sweepStopAt; pass += 1) {
         const delayMs = Math.max(0, nextSweepAt - Date.now()) + 250;
         await new Promise(resolve => setTimeout(resolve, delayMs));
         const at = Date.now(), deferredDeadlines: number[] = [];
-        sweep = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId, unanswered: true,
+        sweep = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId,
           onDeferredDeadline: deadline => { deferredDeadlines.push(deadline); } });
         sweepPasses.push({ at, deferredDeadlines, result: sweep });
-        if (Number(record(sweep).unansweredMessagesNoticed ?? 0) > 0) break;
         nextSweepAt = deferredDeadlines.length ? Math.min(...deferredDeadlines) : null;
       }
     }
@@ -904,8 +885,6 @@ const runScenario = async (scenario: Scenario) => {
       expect(notes, "refused route must write EXACTLY ONE readable note").toHaveLength(1);
       expect(notes[0]!.body.trim().length).toBeGreaterThan(30);
       expect(notes[0]!.body, "readable next step, not an internal error code").not.toMatch(/native_predecessor_retirement_unproven|runner_harness_state_mismatch|stack trace/);
-      // Case-insensitive: the sweep's existing text reads '…, assign this agent a new task.'
-      expect(notes[0]!.body, "working next step: assign a new task to this agent").toMatch(/assign this agent a new task/i);
       // Resolve that next step through the real authorized issue-create route,
       // with no assignee wake (the agent is paused for this route-only probe).
       await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));

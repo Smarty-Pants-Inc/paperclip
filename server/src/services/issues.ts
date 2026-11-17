@@ -239,7 +239,6 @@ import {
   DEFAULT_INSERT_CHUNK_ROWS,
   insertRowsInChunks,
 } from "./batch-insert.js";
-import { ISSUE_IMPORTED_ACTION } from "./person-message-answer.js";
 import type {
   ImportIssueRow,
   ImportIssueCommentRow,
@@ -11512,9 +11511,9 @@ export function issueService(db: Db) {
         await insertRowsInChunks(tx, issues, issueRows);
         // The per-task import arrival record (org 20:29Z): one row per created issue, in the import's own
         // transaction, so a failure fails the import. Person comments older than it are imported history
-        // (person-message-answer.ts), never re-presented to an agent and never noticed as unanswered.
+        // (continuation-comment-input.ts), never re-presented to an agent.
         await insertRowsInChunks(tx, activityLog, issueRows.map(row => ({ companyId, actorType: "system",
-          actorId: "company_import", action: ISSUE_IMPORTED_ACTION, entityType: "issue", entityId: row.id,
+          actorId: "company_import", action: "issue.imported", entityType: "issue", entityId: row.id,
           details: { originKind: "company_import" } })));
         await insertRowsInChunks(tx, issueLabels, labelRows);
       });
