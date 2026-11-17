@@ -398,6 +398,13 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // its baseline (baseHash), its materialization, and its last write
       // (updatedAt, as the worker's own claim). Anything else writes nothing.
       // 23l: the restore carries its audit record; only our own proof counts.
+      // 23m (route a): this CAS guards the ROW, not the files. A real file edit
+      // landing after the hash is only DEFERRED, as after any checkpoint's own
+      // capture: the restored copy keeps the same localRoot/executionRoot and
+      // the baseline it was proven against, so the next diff captures it. A
+      // same-root successor inherits both and its checkpoint saves it; with no
+      // successor, retirement or the worker's stopped collection checkpoints
+      // the warm tree before release (collectStopped). Pinned by the 23m (a) tests.
       const proof: AgentFileStopFlipRestore = { reason: STOP_FLIP_RESTORE_REASON, proofId: randomUUID(), baselineHash: row.baseHash,
         flippedErrorCode: "INSTRUCTION_STOP_UNCONFIRMED", observedDigest: observed.digest, materializationIdentity: observed.identity, provenAt: new Date().toISOString() };
       const restored = await patch(row, { state: "warm_saved", errorCode: null, errorMessage: null, nextAttemptAt: null, attempts: 0,

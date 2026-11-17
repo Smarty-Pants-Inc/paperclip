@@ -39,6 +39,7 @@ import * as checkpointsModule from "../services/agent-file-checkpoints.js";
 import * as probeModule from "../services/agent-directory-probe.js";
 import { collectStoppedInstructionCopyWithRetries } from "../services/agent-instruction-working-copies.js";
 import { HttpError } from "../errors.js";
+import { recordNativeLocalProcessStop } from "../services/native-local-process-stop.js";
 import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { heartbeatRunEvents, plugins } from "@paperclipai/db";
 import { PgDialect } from "drizzle-orm/pg-core";
@@ -2146,6 +2147,69 @@ describe("persistent agent directories", () => {
       expect(await copies.canReuseWarm(companyId, agentId, f.copy.runId)).toBe(false);
       await f.native.collectStopped();
       expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "unchanged" });
+    }, 60_000);
+    // Route (a): a REAL file edit landing after the hash and before the CAS
+    // write-back is retained but only DEFERRED: the copy keeps the same tree and
+    // the baseline it was proven against, so the next checkpoint diffs it.
+    async function lateFileEditRetained(bytes: string) {
+      const f = await stoppedTurnWithWorkerPass();
+      const observeReal = probeModule.observeLocalAgentDirectory;
+      const probe = vi.spyOn(probeModule, "observeLocalAgentDirectory").mockImplementationOnce(async (...args) => {
+        const observed = await observeReal(...args);
+        await fs.writeFile(path.join(f.copy.localRoot, "late-edit.md"), bytes);
+        return observed;
+      });
+      try { expect(await f.native.unchangedSinceBaseline?.()).toBe(true); } finally { probe.mockRestore(); }
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "warm_saved", errorCode: null, processStoppedAt: null,
+        baseHash: f.copy.baseHash, receipt: { checkpointState: "unchanged" } });
+      // Retained, not yet saved: canonical does not have it; the live tree does.
+      await expect(fs.readFile(path.join(root, "late-edit.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(path.join(f.copy.localRoot, "late-edit.md"), "utf8")).toBe(bytes);
+      return f;
+    }
+    it("23m (a) same root: a late file edit after the hash is retained and the successor's checkpoint saves its exact bytes", async () => {
+      const bytes = "late edit retained for successor";
+      const f = await lateFileEditRetained(bytes);
+      await copies.recoverStopped();
+      expect(await fs.readFile(path.join(f.copy.localRoot, "late-edit.md"), "utf8")).toBe(bytes);
+      expect(await copies.canReuseWarm(companyId, agentId, f.copy.runId)).toBe(true);
+      const next = await run({ warm: true, reuseRunId: f.copy.runId });
+      expect(next.localRoot).toBe(f.copy.localRoot);
+      expect(next.executionRoot).toBe(f.copy.executionRoot);
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "superseded", receipt: { successorRunId: next.runId } });
+      await f.native.collectStopped(); // the old owner's callback is fenced; it must not remove the successor's bytes
+      expect(await fs.readFile(path.join(next.localRoot, "late-edit.md"), "utf8")).toBe(bytes);
+      const saved = await copies.checkpointWarm({ companyId, runId: next.runId });
+      expect(saved).toMatchObject({ state: "warm_saved", errorCode: null, receipt: { checkpointState: "saved" } });
+      expect(await fs.readFile(path.join(root, "late-edit.md"), "utf8")).toBe(bytes);
+      await copies.collectStopped({ companyId, runId: next.runId });
+      expect(await fs.readFile(path.join(root, "late-edit.md"), "utf8")).toBe(bytes);
+    }, 60_000);
+    it("23m (a) no successor, owner retired: a late file edit after the hash is saved with its exact bytes by the stopped collection", async () => {
+      const bytes = "late edit, owner idled out";
+      const f = await lateFileEditRetained(bytes);
+      await copies.recoverStopped(); // the provider is alive: the worker only defers
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "warm_saved", processStoppedAt: null });
+      // The warm owner idles out / is retired: its lifecycle callback is the stopped collection.
+      await f.native.collectStopped();
+      const row = (await copies.get(companyId, f.copy.runId))!;
+      expect(row).toMatchObject({ state: "saved", errorCode: null });
+      expect(row.processStoppedAt).not.toBeNull();
+      expect(await fs.readFile(path.join(root, "late-edit.md"), "utf8")).toBe(bytes);
+    }, 60_000);
+    it("23m (a) no successor, owner gone: after local stop evidence the worker's collection saves the late edit's exact bytes", async () => {
+      const bytes = "late edit, owner gone before retirement";
+      const f = await lateFileEditRetained(bytes);
+      // The warm owner is gone (e.g. controller restart) and its process is proven stopped.
+      const child = (await import("node:child_process")).spawn(process.execPath, ["-e", ""]);
+      await new Promise(resolve => child.once("exit", resolve));
+      await db.update(heartbeatRuns).set({ processPid: child.pid!, processStartedAt: new Date() }).where(eq(heartbeatRuns.id, f.copy.runId));
+      const [runRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.copy.runId));
+      expect(await db.transaction(tx => recordNativeLocalProcessStop(tx as unknown as typeof db, runRow))).toBe(true);
+      await copies.recoverStopped();
+      const row = (await copies.get(companyId, f.copy.runId))!;
+      expect(row).toMatchObject({ state: "saved", errorCode: null });
+      expect(await fs.readFile(path.join(root, "late-edit.md"), "utf8")).toBe(bytes);
     }, 60_000);
     it("control 25eaaef3: a with-file Stop checkpointed by its write is saved and retained, never flipped", async () => {
       const copy = await run({ warm: true });
