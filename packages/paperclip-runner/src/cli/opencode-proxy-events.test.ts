@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -11,6 +12,22 @@ import {
 import { createOpenCodeProxyOutput } from "./opencode-proxy-output.js";
 
 describe("OpenCode runnerd proxy event boundary", () => {
+  // Keep: P1c3 renamed Pi's reasoning delta without updating Rust's consumer.
+  // The same wire fixture is normalized and enqueued by the Rust regression.
+  it("pins the whole Pi reasoning delta facade frame shared with runner-core", () => {
+    const text = "Checking the next file, then preserving the whole reasoning delta.\n".repeat(100)
+      + "é — complete reasoning tail.";
+    const fixture = JSON.parse(readFileSync(
+      new URL("../../test/fixtures/pi-facade-reasoning-delta.json", import.meta.url), "utf8",
+    ));
+    expect([...text].length).toBeGreaterThanOrEqual(6_000);
+    expect(Buffer.byteLength(text, "utf8")).toBeGreaterThan(text.length);
+    expect(openCodeProxyItemNotification({
+      eventType: "item.delta", threadId: "native", turnId: "turn", itemId: "stream",
+      payload: { kind: "reasoning", channel: "detail", text },
+    })).toEqual(fixture);
+  });
+
   it("drops only the duplicate session-scoped model item", () => {
     expect(shouldForwardOpenCodeProxyItem({ payload: { kind: "model" } })).toBe(false);
     expect(
