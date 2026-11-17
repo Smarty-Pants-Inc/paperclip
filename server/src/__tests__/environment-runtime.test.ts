@@ -6616,6 +6616,117 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(box.get("notes.md")).toBe("written after the last finalize");
   });
 
+  // rf-4 A2: collect-before-retire has ONE aggregate deadline. A collector that
+  // never settles cannot hold the person's next acquisition: on expiry the old
+  // box is stopped and kept WITHOUT collection, the copy keeps a durable
+  // savePending hold (its files are on the kept disk), and acquisition proceeds.
+  it("AF-COMPOSE deadline: a hanging retirement collector cannot hold the next acquisition; the box is stopped and kept with savePending", async () => {
+    const deadlineMs = 400;
+    const pluginId = randomUUID();
+    const { companyId, agentId, environment: baseEnvironment, runId } = await seedEnvironment();
+    const providerConfig = { provider: "fake-plugin", image: "template-a", region: "eu", timeoutMs: 1234, reuseLease: true };
+    const environment: Environment = { ...baseEnvironment, name: "Reusable Plugin Sandbox", driver: "sandbox", config: providerConfig };
+    await environmentService(db).update(environment.id, { driver: "sandbox", name: environment.name, config: providerConfig });
+    await insertSandboxProviderPlugin(pluginId, {
+      pluginKey: "acme.fake-sandbox-provider", packageName: "@acme/fake-sandbox-provider", displayName: "Fake Sandbox Provider",
+      description: "Test schema-driven provider",
+      environmentDrivers: [{ driverKey: "fake-plugin", kind: "sandbox_provider", displayName: "Fake Plugin", supportsReusableLeases: true,
+        configSchema: { type: "object", properties: { image: { type: "string" }, timeoutMs: { type: "number" }, reuseLease: { type: "boolean" } } } }],
+    });
+    const executionWorkspaceId = randomUUID();
+    const projectId = randomUUID();
+    await insertReusableProject(projectId, companyId);
+    await insertReusableExecutionWorkspace(executionWorkspaceId, companyId, projectId);
+    const box = new Map([["notes.md", "written after the last finalize"]]);
+    const events: string[] = [];
+    let acquisitions = 0;
+    let boxState = "running";
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        events.push(method);
+        if (method === "environmentAcquireLease") {
+          return { providerLeaseId: `lease-${params.config.image}${++acquisitions > 1 ? "-replacement" : ""}`,
+            metadata: { provider: "fake-plugin", image: params.config.image, timeoutMs: params.config.timeoutMs, reuseLease: true, remoteCwd: "/workspace" } };
+        }
+        if (method === "environmentDestroyLease") { box.clear(); return undefined; }
+        if (method === "environmentReleaseLease") return undefined;
+        if (method === "environmentStopLease") boxState = "stopped";
+        if (["environmentStopLease", "environmentInspectLease"].includes(method)) {
+          return { providerLeaseId: params.providerLeaseId, state: boxState };
+        }
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease",
+        "environmentStopLease", "environmentInspectLease"] })),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager,
+      agentFileRetirementCollectionDeadlineMs: deadlineMs } as any);
+    const first = await runtimeWithPlugin.acquireRunLease({ companyId, environment, issueId: null, agentId, adapterType: "process",
+      heartbeatRunId: runId, persistedExecutionWorkspace: { id: executionWorkspaceId, mode: "shared_workspace" } });
+    await runtimeWithPlugin.releaseRunLeases(runId);
+    const released = (await environmentService(db).getLeaseById(first.lease.id))!;
+    const { remoteExecutionTermination: _termination, sandboxStopAndRetainReceipt: _stopReceipt, ...warmMetadata } = released.metadata!;
+    await db.update(environmentLeases).set({ status: "retained", releasedAt: null, metadata: warmMetadata })
+      .where(eq(environmentLeases.id, first.lease.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(agentInstructionWorkingCopies).values({ runId, companyId, agentId, responsibleUserId: "user-1", entryFile: "AGENTS.md",
+      baseHash: "base", localRoot: "/tmp/cr6/live", executionRoot: "/workspace/.paperclip-runtime/agent-files/x", location: `remote:${environment.id}`,
+      state: "warm_saved", receipt: { schema: "paperclip.agent-files.v1", warm: true, cleanup: { leaseId: first.lease.id, remoteCwd: "/workspace" } } });
+    // The Stop collector hangs (a stuck transport) until the test releases it.
+    let releaseCollector!: () => void;
+    const gate = new Promise<void>(resolve => { releaseCollector = resolve; });
+    const collectStopped = vi.fn(async () => {
+      events.push("collectStopped");
+      await gate;
+      throw new Error("AF-COMPOSE: stuck transport failed after release");
+    });
+    runtimeWithPlugin.bindAgentFileRetirementCollector?.(createAgentFileRetirementCollector({ db,
+      instructionCopies: { collectStopped } as any, environmentRuntime: runtimeWithPlugin }));
+    const nextRunId = randomUUID();
+    await insertRunningManualRun(nextRunId, companyId, agentId);
+    const updatedEnvironment: Environment = { ...environment, config: { ...providerConfig, image: "template-b" } };
+    await environmentService(db).update(environment.id, { config: updatedEnvironment.config });
+    events.length = 0;
+    const startedAt = Date.now();
+    let completedAfterMs: number | null = null;
+    const acquisition = runtimeWithPlugin.acquireRunLease({ companyId, environment: updatedEnvironment, issueId: null, agentId,
+      adapterType: "process", heartbeatRunId: nextRunId, persistedExecutionWorkspace: { id: executionWorkspaceId, mode: "shared_workspace" } })
+      .then(result => { completedAfterMs = Date.now() - startedAt; return result; });
+    acquisition.catch(() => {});
+    try {
+      // Observation window: the deadline plus generous slack for the DB work.
+      await Promise.race([acquisition, new Promise(resolve => setTimeout(resolve, deadlineMs + 4_000))]).catch(() => {});
+      expect(completedAfterMs, "acquisition must not wait on a hanging collector beyond the aggregate deadline").not.toBeNull();
+      expect(completedAfterMs!).toBeLessThan(deadlineMs + 4_000);
+      const second = await acquisition;
+      expect(second.lease.providerLeaseId).toBe("lease-template-b-replacement");
+      expect(collectStopped).toHaveBeenCalledTimes(1);
+      // Stopped and kept without collection; never destroyed.
+      await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+        status: "pending_cleanup", failureReason: "sandbox_stop_pending",
+        metadata: { sandboxStopAndRetain: { reason: "sandbox_source_changed" } } });
+      const [copy] = await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, runId));
+      expect(copy?.receipt).toHaveProperty("savePending");
+      expect(copy?.receipt?.savePending).toMatchObject({ code: "AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT" });
+      expect(copy?.state).not.toBe("saved");
+      await heartbeatService(db, { environmentRuntime: runtimeWithPlugin, pluginWorkerManager: workerManager })
+        .sweepPendingCleanupLeases({ backoffMs: 0 });
+      expect(events).toContain("environmentStopLease");
+      expect(boxState).toBe("stopped");
+      expect(events).not.toContain("environmentDestroyLease");
+      expect(events).not.toContain("environmentResumeLease");
+      expect(box.get("notes.md")).toBe("written after the last finalize");
+    } finally {
+      releaseCollector();
+      await acquisition.catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    // The late failure never clears the hold.
+    const [after] = await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, runId));
+    expect(after?.receipt).toHaveProperty("savePending");
+  }, 60_000);
+
   it("does not resume released reusable plugin sandbox leases after secret version drift", async () => {
     const pluginId = randomUUID();
     const { companyId, agentId, environment: baseEnvironment, runId } = await seedEnvironment();
