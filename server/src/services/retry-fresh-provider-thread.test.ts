@@ -580,6 +580,9 @@ const support = await getEmbeddedPostgresTestSupport();
     const [successor, ...extra] = await carrying();
     expect(extra, "one Retry successor carries the answer").toHaveLength(0);
     expect(successor!.contextSnapshot).toMatchObject({ taskRetryRequestId: receipt.requestId, interactionIds: [card!.id] });
+    const liveSeed = await readContinuationCommentInput(db, { companyId: f.companyId, issueId: f.issueId, runId: f.sourceRunId });
+    console.log("JUDGE_CARD_LIVE_OWNER", JSON.stringify({ sourceRunId: f.sourceRunId, queuedSuccessorId: successor!.id, cardId: card!.id, seed: liveSeed }));
+    expect.soft(liveSeed.interactionIds ?? [], "a queued pending owner must block second promotion of the card").not.toContain(card!.id);
     // The Retry successor runs and ANSWERS (the live dcce6481 reply, H3_FINAL ... ALDER-B), then ends.
     await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, successor!.id));
     expect((await materializeNativeInteractionResponses({ db, companyId: f.companyId, issueId: f.issueId, runId: successor!.id,
@@ -600,6 +603,9 @@ const support = await getEmbeddedPostgresTestSupport();
     // The carry side: a seed from the answering run never carries the answered card again.
     const seedInput = await readContinuationCommentInput(db, { companyId: f.companyId, issueId: f.issueId, runId: successor!.id });
     expect(seedInput.interactionIds ?? [], "an answered card is not pending input for a later seed").not.toContain(card!.id);
+    const oldSourceSeed = await readContinuationCommentInput(db, { companyId: f.companyId, issueId: f.issueId, runId: f.sourceRunId });
+    console.log("JUDGE_CARD_ANSWERED_OLD_SOURCE", JSON.stringify({ failedSourceRunId: f.sourceRunId, succeededAnswerRunId: successor!.id, cardId: card!.id, answeringRunSeed: seedInput, oldSourceSeed }));
+    expect.soft(oldSourceSeed.interactionIds ?? [], "ANSWERED must suppress carry even when the seeding predecessor failed").not.toContain(card!.id);
     // The answer is posted once, and the sweep owes the card nothing.
     const posts = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent")));
     expect(posts.map(post => post.body)).toEqual(["H3_FINAL famh3-retry-2 ALDER-B"]);
