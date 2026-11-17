@@ -5,7 +5,7 @@ import { and, desc, eq, inArray, isNull, not, notInArray, sql, type SQL } from "
 import { unidentifiedLocalLaunchRefusals } from "./native-local-process-stop.js";
 import { nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
 import { agents, agentWakeupRequests, approvals, chatActions, companies, environmentLeases, heartbeatRuns, issueApprovals, issueRecoveryActions,
-  issues, issueTreeHoldMembers, issueTreeHolds, nativeRunFinalizations, nativeRunResults, projects, type Db } from "@paperclipai/db";
+  caseHandoffs, issues, issueTreeHoldMembers, issueTreeHolds, nativeRunFinalizations, nativeRunResults, projects, type Db } from "@paperclipai/db";
 import { unionAll } from "drizzle-orm/pg-core";
 import { EXECUTION_RECONCILIATION_CAUSES, HEARTBEAT_RUN_STATUSES, readProviderFailure, type TaskInterruptionPresentation } from "@paperclipai/shared";
 import { captureTaskInterruptionFailure } from "../sentry.js";
@@ -131,7 +131,21 @@ type ProjectionState = {
    * last freed at this time (RFL S9 queued-time rule). Absent while the agent is
    * busy, so a message waiting behind a turn is waiting, never failed. */
   queuedRunStartableSince?: number;
+  /** A TASK-level hold the dispatcher declines every start of this task for
+   * (heartbeat/queue.ts lockIssueExecutionClaim and claimQueuedRun), read from
+   * existing rows. A Retry's fresh run would be held the same way. */
+  taskStartHold?: TaskStartHold;
   recoveryHandedToPerson?: boolean;
+};
+
+/** Task-level start holds and their true line (rf-3 / RFL 20:46Z). Not a failed
+ * start, and no Retry: a fresh run would wait on the same hold. */
+type TaskStartHold = "previous_run_running" | "previous_run_cleanup" | "case_handoff" | "agent_setup";
+const taskStartHoldMessages: Record<TaskStartHold, string> = {
+  previous_run_running: "Waiting: the previous run on this task is still finishing. Your message is saved and starts after it.",
+  previous_run_cleanup: "Waiting: the previous run is still cleaning up. Your message is saved and starts when it finishes.",
+  case_handoff: "Waiting: this task is being handed off. Your message is saved and starts when the handoff completes.",
+  agent_setup: "Waiting: the agent is still being set up. Your message is saved and starts when setup finishes.",
 };
 
 // A task read reports the change that made a task fail, not every later read of
@@ -322,6 +336,13 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   // A person's run that never started is a failed start, with Retry, once it
   // has been startable for the bound; until then, and while the agent is busy
   // with another run, it is waiting and shows working (D157/D168, RFL S9).
+  // A task-level hold declines every start of this task, a Retry's fresh run
+  // included: name the hold, never failed + Retry (RFL 20:46Z). A hold on THIS
+  // run only (fix10b: its retryOfRunId predecessor's cleanup) is not read here
+  // and keeps failed + Retry, which a fresh run without that ancestry clears.
+  if (run.status === "queued" && input.personQueuedRun && input.taskStartHold)
+    return { ...base, state: "working", canRetry: false,
+      retryWait: { reason: input.taskStartHold, message: taskStartHoldMessages[input.taskStartHold] } };
   const startableSince = input.queuedRunStartableSince;
   if (run.status === "queued" && input.personQueuedRun && startableSince !== undefined
       && now - startableSince >= PERSON_QUEUED_RUN_START_BOUND_MS)
@@ -797,11 +818,13 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   //   finish (no previous run, or a slot was already free), startable since
   //   enqueue (heartbeat_runs.created_at).
   const queuedRunStartableSince = new Map<string, number>();
+  const agentRowsForHolds = new Map<string, typeof agents.$inferSelect>();
   const personQueued = runs.filter(run => personQueuedRunIds.has(run.id) && run.createdAt);
   if (personQueued.length) {
     const agentIds = [...new Set(personQueued.map(run => run.agentId))];
     const { parseHeartbeatPolicy } = await import("./heartbeat/timer-policy.js");
     const agentRows = await db.select().from(agents).where(and(eq(agents.companyId, companyId), inArray(agents.id, agentIds)));
+    for (const agent of agentRows) agentRowsForHolds.set(agent.id, agent);
     const maxRuns = new Map(agentRows.map(agent => [agent.id, parseHeartbeatPolicy(agent).maxConcurrentRuns]));
     const [runningRows, endRows] = await Promise.all([
       db.select({ agentId: heartbeatRuns.agentId, count: sql<number>`count(*)::int` }).from(heartbeatRuns)
@@ -824,6 +847,41 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     for (const run of personQueued) {
       if (busy.has(run.agentId)) continue;
       queuedRunStartableSince.set(run.id, Math.max(run.createdAt!.getTime(), endedAt.get(run.id) ?? 0));
+    }
+  }
+  // Task-level start holds for those person runs, read from the same rows the
+  // dispatcher's claim reads (heartbeat/queue.ts): the task's execution owner
+  // (issues.execution_run_id) still running, or terminal with its cleanup
+  // pending (hasPendingRunCleanup, unless a fresh continuation superseded it),
+  // a pending case handoff for another wake, or the agent awaiting setup.
+  const taskStartHolds = new Map<string, TaskStartHold>();
+  if (personQueued.length) {
+    const { hasPendingRunCleanup } = await import("./execution-blocker.js");
+    const { isAgentAwaitingSetup } = await import("../modules/agent-lifecycle/domain/policy.js");
+    for (const run of personQueued) {
+      const issue = selected.find(candidate => candidate.id === run.issueId);
+      const [task] = await db.select({ executionRunId: issues.executionRunId, assigneeAgentId: issues.assigneeAgentId,
+        wakeupRequestId: sql<string | null>`(select wakeup_request_id from heartbeat_runs queued where queued.id = ${run.id}::uuid)` })
+        .from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, run.issueId)));
+      if (!issue || !task) continue;
+      const ownerId = task.assigneeAgentId === run.agentId ? task.executionRunId : null;
+      if (ownerId && ownerId !== run.id) {
+        const [owner] = await db.select({ status: heartbeatRuns.status,
+          superseded: sql<boolean>`coalesce(${heartbeatRuns.resultJson} ? 'freshContinuationSupersededAt', false)` })
+          .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, ownerId)));
+        if (owner && !["succeeded", "failed", "timed_out", "cancelled"].includes(owner.status)) {
+          taskStartHolds.set(run.id, "previous_run_running"); continue;
+        }
+        if (owner && !owner.superseded && await hasPendingRunCleanup(db, companyId, ownerId)) {
+          taskStartHolds.set(run.id, "previous_run_cleanup"); continue;
+        }
+      }
+      const [handoff] = await db.select({ id: caseHandoffs.id }).from(caseHandoffs).where(and(eq(caseHandoffs.companyId, companyId),
+        eq(caseHandoffs.issueId, run.issueId), inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]),
+        sql`(${caseHandoffs.state} = 'awaiting_release' or ${caseHandoffs.wakeupRequestId} is distinct from ${task.wakeupRequestId}::uuid)`)).limit(1);
+      if (handoff) { taskStartHolds.set(run.id, "case_handoff"); continue; }
+      const agent = agentRowsForHolds.get(run.agentId);
+      if (agent && isAgentAwaitingSetup(agent)) taskStartHolds.set(run.id, "agent_setup");
     }
   }
   const waitingContinuationRunIds = new Set(continuationRows.map(row => row.runId));
@@ -958,6 +1016,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       waitingContinuation: waitingContinuationFor(facts.run),
       personQueuedRun: facts.run ? personQueuedRunIds.has(facts.run.id) : false,
       queuedRunStartableSince: facts.run ? queuedRunStartableSince.get(facts.run.id) : undefined,
+      taskStartHold: facts.run ? taskStartHolds.get(facts.run.id) : undefined,
       recoveryHandedToPerson: handedToPerson.has(issue.id),
       interruptWait: interruptWaitFor(issue.id),
       projectAccessAllowed: denied?.length === 0,
