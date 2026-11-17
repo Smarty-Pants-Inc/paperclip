@@ -2742,10 +2742,24 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     // even after the former 250-entry cap. Symlinks above remain excluded.
     await Promise.all(Array.from({ length: 253 }, (_, index) =>
       fs.mkdir(path.join(workspaceDir, `folder-${String(index).padStart(3, "0")}`))));
-    const complete = await svc.browseProjectWorkspace(companyId, { projectId, workspaceId });
-    expect(complete.entries).toHaveLength(254);
-    expect(complete.entries.at(-1)?.name).toBe("folder-252");
-    expect(complete.truncated).toBe(false);
+    const first = await svc.browseProjectWorkspace(companyId, { projectId, workspaceId });
+    expect(first.entries).toHaveLength(250);
+    expect(first.nextOffset).toBe(250);
+    expect(first.entries.at(-1)?.name).not.toBe("folder-252");
+    const last = await svc.browseProjectWorkspace(companyId, { projectId, workspaceId, offset: first.nextOffset!, limit: 250 });
+    expect(last.entries).toHaveLength(4);
+    expect(last.entries.at(-1)?.name).toBe("folder-252");
+    expect(last.nextOffset).toBeNull();
+    expect(new Set([...first.entries, ...last.entries].map(entry => entry.path)).size).toBe(254);
+    expect(first.truncated).toBe(false);
+    expect(last.truncated).toBe(false);
+    // The offset contract covers small pages and end-of-list reads too.
+    const small = await svc.browseProjectWorkspace(companyId, { projectId, workspaceId, offset: 250, limit: 2 });
+    expect(small.entries).toEqual(last.entries.slice(0, 2));
+    expect(small.nextOffset).toBe(252);
+    const end = await svc.browseProjectWorkspace(companyId, { projectId, workspaceId, offset: 254 });
+    expect(end.entries).toEqual([]);
+    expect(end.nextOffset).toBeNull();
 
     const imported = await svc.scanProjectWorkspaces(companyId, {
       projectIds: [projectId],

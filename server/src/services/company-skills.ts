@@ -5192,8 +5192,17 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       && entry.name !== "node_modules"
       && (entry.isDirectory() || entry.isFile())
     ));
+    // Sort before paging so directories stay first and offsets use one stable
+    // ordering. Only the selected page needs per-directory SKILL.md lookups.
+    visibleDirectoryEntries.sort((left, right) => {
+      if (left.isDirectory() !== right.isDirectory()) return left.isDirectory() ? -1 : 1;
+      return left.name.localeCompare(right.name);
+    });
+    const limit = Math.min(250, Math.max(1, Math.floor(input.limit ?? 250)));
+    const offset = Math.max(0, Math.floor(input.offset ?? 0));
+    const page = visibleDirectoryEntries.slice(offset, offset + limit);
     const entries: CompanySkillProjectBrowseResult["entries"] = [];
-    for (const entry of visibleDirectoryEntries) {
+    for (const entry of page) {
       const entryPath = normalizedPath === "." ? entry.name : `${normalizedPath}/${entry.name}`;
       entries.push({
         name: entry.name,
@@ -5204,10 +5213,6 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
           : entry.name === "SKILL.md",
       });
     }
-    entries.sort((left, right) => {
-      if (left.kind !== right.kind) return left.kind === "directory" ? -1 : 1;
-      return left.name.localeCompare(right.name);
-    });
     return {
       projectId: project.id,
       workspaceId: workspace.id,
@@ -5215,6 +5220,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       path: normalizedPath,
       parentPath: normalizedPath === "." ? null : path.posix.dirname(normalizedPath) || ".",
       entries,
+      nextOffset: offset + page.length < visibleDirectoryEntries.length ? offset + page.length : null,
       truncated: false,
     };
   }

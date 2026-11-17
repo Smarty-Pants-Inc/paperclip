@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   AlertTriangle,
@@ -799,17 +799,22 @@ function ProjectSkillBrowser({
   const initialWorkspace = workspaces.find((workspace) => workspace.isPrimary) ?? workspaces[0] ?? null;
   const [workspaceId, setWorkspaceId] = useState(initialWorkspace?.id ?? "");
   const [folderPath, setFolderPath] = useState(".");
-  const browseQuery = useQuery({
+  const browseQuery = useInfiniteQuery({
     queryKey: ["company-skills", "browse-project", companyId, project.id, workspaceId, folderPath],
-    queryFn: () => companySkillsApi.browseProject(companyId, {
+    queryFn: ({ pageParam }) => companySkillsApi.browseProject(companyId, {
       projectId: project.id,
       workspaceId,
       path: folderPath,
+      limit: 250,
+      offset: pageParam,
     }),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage) => lastPage.nextOffset ?? undefined,
     enabled: Boolean(workspaceId),
   });
   const browseView = useQueryView(browseQuery);
-  const result = browseQuery.data;
+  const result = browseQuery.data?.pages[0];
+  const entries = browseQuery.data?.pages.flatMap((page) => page.entries) ?? [];
 
   function changeWorkspace(nextWorkspaceId: string) {
     setWorkspaceId(nextWorkspaceId);
@@ -861,7 +866,7 @@ function ProjectSkillBrowser({
           <div className="flex items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" /> Loading folder…
           </div>
-        ) : browseView.kind === "error" ? (
+        ) : browseView.kind === "error" && entries.length === 0 ? (
           <QueryErrorState
             className="m-6"
             error={browseQuery.error}
@@ -869,9 +874,9 @@ function ProjectSkillBrowser({
             onRetry={browseView.retry}
             retrying={browseView.isFetching}
           />
-        ) : result?.entries.length ? (
+        ) : entries.length ? (
           <ul className="divide-y divide-border/60">
-            {result.entries.map((entry: CompanySkillProjectBrowseEntry) => {
+            {entries.map((entry: CompanySkillProjectBrowseEntry) => {
               const selectablePath = entry.kind === "file"
                 ? entry.path.toLowerCase() === "skill.md" ? "." : entry.path.slice(0, -"/SKILL.md".length)
                 : entry.path;
@@ -905,6 +910,26 @@ function ProjectSkillBrowser({
         ) : (
           <div className="p-8 text-center text-sm text-muted-foreground">This folder is empty.</div>
         )}
+        {browseQuery.isFetchNextPageError ? (
+          <QueryErrorState
+            className="m-5"
+            error={browseQuery.error}
+            action="load more entries"
+            onRetry={() => void browseQuery.fetchNextPage({ cancelRefetch: false })}
+            retrying={browseQuery.isFetchingNextPage}
+          />
+        ) : browseQuery.hasNextPage ? (
+          <div className="flex justify-center p-3">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={browseQuery.isFetchingNextPage}
+              onClick={() => void browseQuery.fetchNextPage({ cancelRefetch: false })}
+            >
+              {browseQuery.isFetchingNextPage ? "Loading…" : "Load more"}
+            </Button>
+          </div>
+        ) : null}
       </div>
     </div>
   );

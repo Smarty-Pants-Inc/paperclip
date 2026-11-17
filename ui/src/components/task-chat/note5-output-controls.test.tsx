@@ -38,6 +38,43 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
     expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')?.textContent).toContain("run log");
     expect(container.querySelector("pre")?.textContent).toBe(text);
   });
+  // RFL's four qualified production-component regressions (round 2).
+  it("RFL: canonical spilled tool shows one kept line, a run link and no private path", () => {
+    render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output: "FIRST\n[Full output: /tmp/private-spill.log (102400 bytes; sha256: abc123)]\nLAST" }} />);
+    expect(container.textContent?.match(/The full text is kept; ask me to show any part\./g)).toHaveLength(1);
+    expect(container.textContent).not.toContain("/tmp/private-spill.log");
+    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')).not.toBeNull();
+  });
+  it("RFL: unflagged ordinary output shows no kept line", () => {
+    render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output: "Complete output" }} />);
+    expect(container.textContent).not.toContain("The full text is kept");
+    expect(container.querySelector("pre")?.textContent).toBe("Complete output");
+  });
+  it("RFL: unflagged documentation mention must not invent a producer flag", () => {
+    const output = "The documentation describes the [Full output: marker syntax.";
+    render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output }} />);
+    expect(container.textContent).not.toContain("The full text is kept");
+    expect(container.querySelector("pre")?.textContent).toBe(output);
+  });
+  it("RFL: an indented spill box-path marker must not reach the person", () => {
+    render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: true, output: "FIRST\n  [Full output: /tmp/private-spill.log (102400 bytes; sha256: abc123)]\nLAST" }} />);
+    expect(container.textContent).not.toContain("/tmp/private-spill.log");
+    expect(container.querySelector("pre")?.textContent).toBe("FIRST\nLAST");
+  });
+  it.each([
+    ["\t[Full output: /tmp/private-spill.log (102400 bytes; sha256: abc123)]\r\n", ""],
+    ["  [Full output: /tmp/private-spill.log (102400 bytes; ask to read any part)]", ""],
+    [" [Full output: /tmp/private-spill.log (read it with offset/limit)]\n", ""],
+    [" [Full output: /tmp/private-spill.log (read with offset/limit)]\r\n", ""],
+    ["  [Full output: /tmp/private-spill.log (102400 bytes; sha256: abc123)]KEEP_SUFFIX\r\n", "KEEP_SUFFIX\r\n"],
+  ])("RFL grammar: hides marker but preserves suffix and other bytes (%s)", (marker, suffix) => {
+    const before = "  FIRST\t\r\n\r\n";
+    const after = "LAST\t ";
+    render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output: before + marker + after }} />);
+    expect(container.querySelector("pre")?.textContent).toBe(before + suffix + after);
+    expect(container.textContent?.match(/The full text is kept; ask me to show any part\./g)).toHaveLength(1);
+    expect(container.innerHTML).not.toContain("/tmp/private-spill.log");
+  });
   it("hides only the spill marker line in compact provider details", () => {
     const output = "  FIRST_BYTE\n\nLAST_BYTE\t \n";
     render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output: output + "[Full output: /tmp/compact-spill.log (102400 bytes; sha256: abc123)]\nAFTER_MARKER" }} />);
