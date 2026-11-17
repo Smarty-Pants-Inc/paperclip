@@ -34,6 +34,7 @@ import { renderFirstTurnQueuedInput } from "../services/native-runtime/first-tur
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { waitForPendingRunFailureReports } from "../services/run-failure-report.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { createPiEventProjector } from "../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -680,7 +681,9 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${b!.id}` },
       // Pi put B into the conversation: the model read it.
       ...(variant !== "unread" ? [{ eventType: "item.started", kind: "userMessage", itemId: "turn-1:steered" }] : []),
-      ...(variant === "read-answered" ? [{ eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:reply", text: "B: yes" }] : []),
+      // Pi streams the reply: its text STARTS (item.started), then completes.
+      ...(variant === "read-answered" ? [{ eventType: "item.started", kind: "agentMessage", itemId: "turn-1:reply", text: "" },
+        { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:reply", text: "B: yes" }] : []),
     ]);
     await personStop(chat);
     const expected = variant === "read-answered" ? [c!.id] : [b!.id, c!.id];
@@ -851,6 +854,139 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const answeringRuns = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId)))
       .filter((run) => ((run.contextSnapshot as any).wakeCommentIds ?? []).includes(b!.id));
     expect(answeringRuns.map((run) => run.id)).toEqual([successor!.id]);
+  });
+  // rf5 F1/F2 (never-OK): the answered rule reads what the REAL Pi projector (pi-event-projector.ts) emits.
+  // A streamed reply projects item.started agentMessage at its text_start, then item.completed (or
+  // item.failed) at message_end. A receipt with no streamed text (final-only) projects ONLY item.completed:
+  // nothing says when that text began, so it is no evidence of an answer after B's read.
+  const PI = {
+    user: (text: string, timestamp: number) => ["message_start", "message_end"].map((type) => ({ type,
+      message: { role: "user", timestamp, content: [{ type: "text", text }] } })),
+    tool: (id: string, responseId: string) => [
+      { type: "message_start", message: { role: "assistant" } },
+      { type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, id, toolName: "bash" } },
+      { type: "message_end", message: { role: "assistant", provider: "neutral", model: "model", timestamp: 3, responseId,
+        stopReason: "toolUse", content: [{ type: "toolCall", id, name: "bash", arguments: { command: "ls" } }] } },
+      { type: "tool_execution_start", toolCallId: id, toolName: "bash", args: { command: "ls" } },
+      { type: "tool_execution_end", toolCallId: id, toolName: "bash", result: { content: [{ type: "text", text: "ok" }] }, isError: false },
+    ],
+    reply: (text: string, responseId: string, options: { streamed: boolean; stopReason?: "stop" | "error" }) => [
+      { type: "message_start", message: { role: "assistant" } },
+      ...(options.streamed ? [
+        { type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } },
+        { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text } },
+      ] : []),
+      { type: "message_end", message: { role: "assistant", provider: "neutral", model: "model", timestamp: 4, responseId,
+        stopReason: options.stopReason ?? "stop", ...(options.stopReason === "error" ? { errorMessage: "provider error" } : {}),
+        content: [{ type: "text", text }] } },
+    ],
+  };
+  /** Replays native Pi events through the real projector into the run log; the steer ack is the (mocked) native steer transport's. */
+  async function piRunLog(chat: Chat, steps: Array<Record<string, unknown> | { ack: string } | { end: string }>) {
+    const projector = createPiEventProjector({ runId: chat.runId, turnId: "turn-1" });
+    const events = steps.flatMap((step): Array<{ eventType: string; itemId: string; payload: Record<string, unknown> }> => "ack" in step
+      ? [{ eventType: "item.completed", itemId: `turn-1:steer:${step.ack}`, payload: { kind: "steering_acknowledgement" } }]
+      : "end" in step ? [{ eventType: String(step.end), itemId: "turn-1:end", payload: {} }]
+        : projector.project(step).map(({ eventType, itemId, payload }) => ({ eventType, itemId: String(itemId), payload })));
+    const [allocated] = await db.update(heartbeatRuns)
+      .set({ nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + ${events.length}` })
+      .where(eq(heartbeatRuns.id, chat.runId)).returning({ next: heartbeatRuns.nextEventSeq });
+    const first = Number(allocated!.next) - events.length;
+    await db.insert(heartbeatRunEvents).values(events.map((event, index) => ({
+      companyId: chat.companyId, runId: chat.runId, agentId: chat.agentId, seq: first + index,
+      eventType: event.eventType, sourceEventId: randomUUID(),
+      payload: { prpEvent: { turnId: "turn-1", itemId: event.itemId, payload: event.payload } },
+    })));
+    return events.map((event) => `${event.eventType}:${(event.payload as any).kind ?? ""}`);
+  }
+
+  it.each([
+    // F1 RED: B is read at the tool boundary; the final reply is a receipt with no streamed start.
+    ["completion-only final", { streamed: false }, "succeeded"],
+    // F1 positive: the same final, streamed: its text STARTS after B's read and before the turn's end.
+    ["streamed final", { streamed: true }, "succeeded"],
+    // F2: the reply STARTED after B's read, then Pi's receipt failed it (item.failed); then nothing.
+    ["started then failed", { streamed: true, stopReason: "error" }, "failed"],
+  ] as const)("at a run end, the real Pi projector's %s answers B only from a started, completed text", async (shape, options, status) => {
+    const chat = await seedChat();
+    const [b] = await send(chat, ["B, steered mid-turn"]);
+    const [wake] = await deferredWakes(chat);
+    mocks.steer.mockResolvedValueOnce({ turnId: "turn-1" });
+    expect((await steer(chat, b!.id, wake!.id)).status).toBe(200);
+    const projected = await piRunLog(chat, [
+      ...PI.user("A", 1),
+      ...PI.tool("call-1", "r-1"),
+      { ack: b!.id },
+      ...PI.user("B, steered mid-turn", 2),
+      ...PI.reply(shape === "streamed final" ? "B: yes. A: done." : "A: done.", "r-2", options),
+      { end: status === "failed" ? "turn.failed" : "turn.completed" },
+    ]);
+    // The projector's own shapes: final-only text has no item.started; a failed receipt fails the started block.
+    const final = projected.slice(projected.lastIndexOf("item.started:userMessage") + 2, -1)
+      .filter((event) => event.endsWith(":agentMessage") && !event.startsWith("item.delta"));
+    expect(final).toEqual(shape === "completion-only final" ? ["item.completed:agentMessage"]
+      : shape === "streamed final" ? ["item.started:agentMessage", "item.completed:agentMessage"]
+        : ["item.started:agentMessage", "item.failed:agentMessage"]);
+    await finishTurn(chat, { status, log: false });
+    const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    const carriers = await carriersOf(chat, b!.id);
+    if (shape === "streamed final") {
+      expect(await answered(b!.id)).toBe(true);
+      expect((ended!.contextSnapshot as any).answeredSteeredCommentIds).toEqual([b!.id]);
+      expect(carriers.wakes.length + carriers.runs.length).toBe(0);
+      return;
+    }
+    // NOT answered: never marked answered with zero carriers; carried ONCE, and a repeated release never doubles it.
+    expect(await answered(b!.id)).toBe(false);
+    expect((ended!.contextSnapshot as any).answeredSteeredCommentIds ?? []).toEqual([]);
+    expect((ended!.resultJson as any).restoredSteeredCommentIds).toEqual([b!.id]);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    await releaseRun(chat);
+    const again = await carriersOf(chat, b!.id);
+    expect(again.wakes.length + again.runs.length).toBe(1);
+    const [twice] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect((twice!.resultJson as any).restoredSteeredCommentIds).toEqual([b!.id]);
+    await joinOwnedWork();
+  });
+
+  // rf5 F3 (R-ONCE "in order"): two steers whose acknowledgements share one timestamp are restored in the order
+  // they were steered, never re-sorted by JSONB key order. The person dragged the larger id to the head, so
+  // JSONB key order (shorter, then bytewise) disagrees with the steering order.
+  it("restores two unanswered steers with tied acknowledgement timestamps in their steered order, ahead of the waiting one", async () => {
+    const chat = await seedChat();
+    const sent = await send(chat, ["X", "Y", "D, waiting"]);
+    const [high, low] = [sent[0]!, sent[1]!].sort((left, right) => (left.id < right.id ? 1 : -1));
+    expect((await reorder(chat, [high!.id, low!.id, sent[2]!.id])).status).toBe(200);
+    for (const message of [high!, low!]) {
+      const [wake] = await deferredWakes(chat);
+      mocks.steer.mockResolvedValueOnce({ turnId: "turn-1" });
+      const response = await steer(chat, message.id, wake!.id);
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    }
+    // The same millisecond for both acknowledgements.
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    const acks = (run!.resultJson as any).queuedSteeringAcknowledgements;
+    const tied = acks[high!.id].acknowledgedAt;
+    await db.update(heartbeatRuns).set({ resultJson: { ...(run!.resultJson as any), queuedSteeringAcknowledgements: {
+      [low!.id]: { ...acks[low!.id], acknowledgedAt: tied }, [high!.id]: { ...acks[high!.id], acknowledgedAt: tied } } } })
+      .where(eq(heartbeatRuns.id, chat.runId));
+    expect((run!.contextSnapshot as any).steeredCommentIds).toEqual([high!.id, low!.id]);
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${high!.id}` },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${low!.id}` },
+      { eventType: "turn.completed", itemId: "turn-1:end" },
+    ]);
+    await finishTurn(chat, { status: "succeeded", log: false });
+    const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect((ended!.resultJson as any).restoredSteeredCommentIds).toEqual([high!.id, low!.id]);
+    // ONE carrier holds all three, in the person's order.
+    const carriers = await carriersOf(chat, high!.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    const carried = carriers.runs.length ? (carriers.runs[0]!.contextSnapshot as any).wakeCommentIds as string[]
+      : wakeCommentIds(carriers.wakes[0]!);
+    expect(carried.filter((id) => id !== chat.first.id)).toEqual([high!.id, low!.id, sent[2]!.id]);
+    await joinOwnedWork();
   });
   const RECEIVED_MID_TASK = "Received mid-task (while you were working):";
 
