@@ -46,7 +46,10 @@ function fixture(stdin: string, failure?: "http" | "network" | "url") {
       files.set(path, uploaded); return new Response(null, { status: 204 });
     }
     if (url === `${API}/commands` && init.method === "POST") {
-      events.push("command"); command = JSON.parse(String(init.body)).command;
+      events.push("command"); const sent = JSON.parse(String(init.body)).command as string;
+      // F-04: each send starts with its attempt marker, a shell no-op; the command after it is unchanged.
+      expect(sent).toMatch(/^: paperclip-attempt=[0-9a-f-]{36}; /);
+      command = sent.replace(/^: paperclip-attempt=[0-9a-f-]{36}; /, "");
       expect(command).toBe(`exec 'sh' '-s' < '${path}'`);
       expect(files.get(path)?.equals(bytes)).toBe(true);
       return json({ exitCode: 0, stdout: `consumed ${bytes.length} bytes`, stderr: "" });

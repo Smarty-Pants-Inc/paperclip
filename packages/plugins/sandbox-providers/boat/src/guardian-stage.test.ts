@@ -44,7 +44,8 @@ function mockBoat(options: { staged?: boolean; nodeVersion?: string; fail?: stri
       const file = JSON.parse(init.body as string); disk.set(file.path, Buffer.from(file.content)); return ok({ ok: true });
     }
     if (u.endsWith("/commands") && method === "POST") {
-      const command = JSON.parse(init.body as string).command;
+      // F-04: the fake Boat reads the command text after its attempt marker (a shell no-op).
+      const command = String(JSON.parse(init.body as string).command).replace(/^: paperclip-attempt=[0-9a-f-]{36}; /, "");
       commands.push(command);
       if (command.startsWith("cat '")) return ok({ exitCode: 0, stdout: disk.get(command.slice(5, -1))?.toString() ?? "" });
       if (options.fail && command.includes(`paperclip-guardian:${options.fail}`)) return ok({ exitCode: 1, stderr: secret, stdout: signedSecret });

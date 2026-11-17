@@ -160,7 +160,11 @@ describe("execute environment files", () => {
   });
   for (const env of [undefined, {}]) it(`empty env (${JSON.stringify(env)}): no file, command unchanged`, async () => {
     const f = fixture(); await plugin.definition.onEnvironmentExecute!({ ...params, command: "printf", args: ["a'b"], cwd: "/work space", env });
-    expect(f.puts).toEqual([]); expect(f.commands).toEqual([{ command: `cd '/work space' && exec 'printf' 'a'"'"'b'`, timeoutSeconds: 5, detached: false }]);
+    expect(f.puts).toEqual([]);
+    // F-04: the attempt marker (a shell no-op) is the only addition to the command text.
+    expect(f.commands.map(body => ({ ...body, command: body.command.replace(/^: paperclip-attempt=[0-9a-f-]{36}; /, "") })))
+      .toEqual([{ command: `cd '/work space' && exec 'printf' 'a'"'"'b'`, timeoutSeconds: 5, detached: false }]);
+    expect(f.commands[0].command).toMatch(/^: paperclip-attempt=[0-9a-f-]{36}; cd /);
   });
   it("combines stdin and env without mixing their content and cleans both", async () => {
     const f = fixture(undefined, true);

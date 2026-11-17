@@ -265,7 +265,8 @@ describe("Boat native hybrid file sync", () => {
       { operationId: "post", files: [{ sourcePath: one, targetPath: path.join(workspace, "file"), kind: "file" }], postUploadCommands: [{ command }] },
     ]));
     expect(await fs.readFile(target, "utf8")).toBe("2"); expect(await fs.readFile(path.join(remote, "marker"), "utf8")).toBe("done");
-    expect(commands.at(-1)).toBe(command); expect(result.operations.map(op => op.operationId)).toEqual(["first", "second", "post"]); await clean();
+    // F-04: the post-upload command runs verbatim after the attempt marker (a shell no-op); the real sh above ran the marked text.
+    expect(commands.at(-1)).toMatch(/^: paperclip-attempt=[0-9a-f-]{36}; /); expect(commands.at(-1)!.replace(/^: paperclip-attempt=[0-9a-f-]{36}; /, "")).toBe(command); expect(result.operations.map(op => op.operationId)).toEqual(["first", "second", "post"]); await clean();
   });
   it("rejects traversal and escaped post-upload cwd before any Boat call", async () => {
     await expect(sync({ sourcePath: "/host/../escape", targetPath: "/tmp/target", kind: "file" })).rejects.toThrow("confined");

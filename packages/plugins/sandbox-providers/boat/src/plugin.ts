@@ -15,6 +15,8 @@ import { acquireRunnerIngress, DEFAULT_WARM_RUNNER_IDLE_TIMEOUT_MS, effectiveTtl
   privateRunnerEndpoint, resumeSentinelMetadata, runnerIngressGenerationStore, verifyWorkspaceSentinel,
   workspaceDirectory, writeWorkspaceSentinel, type RunnerConfig } from "./runner-support.js";
 import { closedTransportCode, isOwnDeadline, TRANSPORT_ERROR_CODES, transientWords } from "./provider-error-codes.js";
+import { BOAT_RESTORING, BOAT_RESTORING_RESEND_MS, boatDirectFields, classifyDirectFailure, COMMAND_HISTORY_READ_MS, commandEvidence,
+  commandPossiblyRanError, withCommandNonce, type BoatDirectFields, type PossiblyRanReason } from "./command-outcome.js";
 import { definePlugin, PluginEnvironmentCreationCleanupError, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams, PluginEnvironmentDestroyLeaseParams, PluginEnvironmentExecuteParams,
@@ -371,15 +373,19 @@ type RequestErrorCategory = "request_error" | "network_error" | "http_error" | "
  * `status` (integer HTTP status) and `code` (closed errno only) are the structure
  * the host's transient-retry classification reads through the SDK diagnostic;
  * the transient words serve the server's text-only resume retry. */
-function requestError(config: Config, method: string, path: string, httpStatus: number | null, category: RequestErrorCategory, code?: string, boat409?: Boat409Fields): Error & { httpStatus: number | null; category: RequestErrorCategory; status?: number; code?: string } & Boat409Fields {
-  const redact = (text: string) => config.apiKey ? text.split(config.apiKey).join("[REDACTED]") : text;
+function redactKey(config: Config, text: string): string { return config.apiKey ? text.split(config.apiKey).join("[REDACTED]") : text; }
+function requestError(config: Config, method: string, path: string, httpStatus: number | null, category: RequestErrorCategory, code?: string, boat409?: Boat409Fields, direct?: BoatDirectFields): Error & { httpStatus: number | null; category: RequestErrorCategory; status?: number; code?: string } & Boat409Fields & BoatDirectFields {
+  const redact = (text: string) => redactKey(config, text);
   const closedCode = code !== undefined && TRANSPORT_ERROR_CODES.has(code) ? code : undefined;
   const words = transientWords(httpStatus, closedCode);
   // #20974: which 409, from Boat's closed fields only, so a run records it.
   const conflict = httpStatus === 409 && boat409 ? boat409Fields({ code: boat409.boatCode, state: boat409.boatState, retryable: boat409.boatRetryable }) : {};
   const conflictText = Object.keys(conflict).length ? ` [boat 409${conflict.boatCode ? ` code=${conflict.boatCode}` : ""}${conflict.boatState ? ` state=${conflict.boatState}` : ""}${conflict.boatRetryable !== undefined ? ` retryable=${conflict.boatRetryable}` : ""}]` : "";
-  const error = Object.assign(new Error(redact(`Boat ${method} ${path} failed (${httpStatus ?? "unavailable"}): ${category}${words ? ` (${words})` : ""}${conflictText}`)),
-    { httpStatus, category }, Number.isInteger(httpStatus) ? { status: httpStatus as number } : {}, closedCode ? { code: closedCode } : {}, conflict);
+  // F-04: Boat's closed 5xx fields (code, retryable, the restoring token) only.
+  const failed: BoatDirectFields = httpStatus !== null && httpStatus >= 500 && direct ? direct : {};
+  const failedText = Object.keys(failed).length ? ` [boat ${httpStatus}${failed.boatCode ? ` code=${failed.boatCode}` : ""}${failed.boatRetryable !== undefined ? ` retryable=${failed.boatRetryable}` : ""}${failed.boatMessage ? ` message=${failed.boatMessage}` : ""}]` : "";
+  const error = Object.assign(new Error(redact(`Boat ${method} ${path} failed (${httpStatus ?? "unavailable"}): ${category}${words ? ` (${words})` : ""}${conflictText}${failedText}`)),
+    { httpStatus, category }, Number.isInteger(httpStatus) ? { status: httpStatus as number } : {}, closedCode ? { code: closedCode } : {}, conflict, failed);
   if (error.stack) error.stack = redact(error.stack);
   return error;
 }
@@ -393,12 +399,25 @@ type RequestOptions = {
   sendGuard?: () => void;
   /** Our own stop: it ends the box's lifecycle and is never revoked by it. */
   ownStop?: boolean;
+  /** F-04: the POST /commands payload. Each send marks its command text with its own attempt nonce. */
+  command?: Record<string, unknown> & { command: string };
 };
 async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false, responseOptions: RequestOptions = {}): Promise<any> {
   let category: RequestErrorCategory = "request_error";
   let httpStatus: number | null = null;
   let signal: AbortSignal | undefined;
   let boat409: Boat409Fields | undefined;
+  // F-04 (boat-commands-table.md lines 12-18; boat-command-history.md line 18):
+  // a POST /commands whose send was under way when it failed, or that Boat
+  // answered with a 5xx other than 'did not run', possibly ran. It is never sent
+  // again; it surfaces as boat_command_possibly_ran with history evidence.
+  const commandSend = (init.method ?? "GET").toUpperCase() === "POST" && /^\/sandboxes\/[^/?]+\/commands$/.test(path);
+  let commandInFlight = false;
+  let possiblyRan: PossiblyRanReason | undefined;
+  let attemptNonce: string | undefined;
+  let direct: BoatDirectFields | undefined;
+  // The evidence read is a read of the same box: never after our stop of it or a closed admission.
+  let evidenceAllowed = () => false;
   try {
     if (init.method && init.method !== "GET") assertBoatActivityAdmission();
     const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
@@ -418,6 +437,10 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       // recovery resume or a retry after a late ready observation.
       callSignal.throwIfAborted();
       if (Date.now() >= deadline) throw new DOMException("Boat call budget expired.", "TimeoutError");
+    };
+    evidenceAllowed = () => {
+      if (boxKey && boxLifecycle(boxKey) !== generation) return false;
+      try { assertBoatActivityAdmission(); return true; } catch { return false; }
     };
     const maxSends = Math.max(1, Math.min(BOAT_MAX_ATTEMPTS, responseOptions.maxSends ?? BOAT_MAX_ATTEMPTS));
     const headers = new Headers(init.headers);
@@ -461,6 +484,11 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     const retryableStart = retryable429Routes.some(route => route.method === method && route.pattern.test(path));
     // #20974: the command and files calls Boat holds or refuses with a 409 while a box starts.
     const commandOrFilesCall = /^\/sandboxes\/[^/?]+\/(?:commands|files)(?:[/?]|$)/.test(path);
+    // F-04: GET and PUT /files: 'A file read or write gives the same result again'
+    // (boat-commands-table.md line 17), so a did-not-run 502 is sent again under the
+    // command rules. A network failure on them keeps frozen8's behaviour: the table
+    // gives no other rule for it, so it is surfaced, not sent again.
+    const filesCall = (method === "GET" || method === "PUT") && /^\/sandboxes\/[^/?]+\/files(?:\?|$)/.test(path);
     const resumeCall = method === "POST" && /^\/sandboxes\/[^/?]+\/resume$/.test(path);
     let resumeRecoveryUsed = false;
     for (let attempt = 1; ; attempt++) {
@@ -469,8 +497,40 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       category = "network_error";
       httpStatus = null;
       boat409 = undefined;
-      response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal: callSignal });
+      direct = undefined;
+      // F-04: this send's own nonce, a shell no-op at the START of the command text
+      // (Boat's history keeps the first 64 KiB of it: boat-command-history.md line 41).
+      let sendBody = requestBody;
+      if (responseOptions.command) {
+        attemptNonce = randomUUID();
+        sendBody = JSON.stringify({ ...responseOptions.command, command: withCommandNonce(responseOptions.command.command, attemptNonce) });
+      }
+      commandInFlight = commandSend;
+      response = await fetch(`${API}${path}`, { ...init, body: sendBody, headers, redirect: "error", signal: callSignal });
+      commandInFlight = false;
       httpStatus = response.status;
+      if ((commandSend || filesCall) && response.status >= 500) {
+        category = "http_error";
+        direct = boatDirectFields(await response.clone().json().catch(() => null));
+        if (classifyDirectFailure(response.status, direct) === "did_not_run") {
+          // Did not run (table lines 17-18): send again inside this call's budget and
+          // send cap; sendGuard checks lifecycle, admission, signal and deadline first.
+          // sandbox_restoring: 'Retry after 1-3 seconds' (line 18).
+          const waitMs = direct.boatMessage === BOAT_RESTORING ? BOAT_RESTORING_RESEND_MS : 0;
+          if (!isStreamBody && attempt < maxSends && !callSignal.aborted && waitMs < deadline - Date.now()) {
+            duplexLogger?.warn(`Boat API ${response.status}`, { method, route, attempt: `${attempt}/${maxSends}`, action: "send_again", ...direct });
+            await response.body?.cancel();
+            if (waitMs) await delay(waitMs, undefined, { signal: callSignal });
+            continue;
+          }
+        } else if (commandSend) {
+          // 'A command with a different message possibly ran ... When retryable is
+          // false, the command can still be running. Do not run it again without a
+          // check.' (line 17); a 500 is no better. Never sent again.
+          possiblyRan = "http_5xx";
+        }
+        break;
+      }
       if (response.status === 409) {
         category = "http_error";
         boat409 = boat409Fields(await response.clone().json().catch(() => null));
@@ -552,18 +612,34 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     }
     category = "parse_error";
     const body = response.status === 204 ? null : await response.json().catch(error => {
-      if (responseOptions.requireJson) throw error;
+      // F-04: Boat answered 2xx, so the command ran, but its answer was lost.
+      if (commandSend) possiblyRan = "unreadable_response";
+      if (responseOptions.requireJson || commandSend) throw error;
       return null;
     });
     if (responseOptions.requireJson && body === null) throw new Error(category);
     return body;
   } catch (error) {
     if (error && typeof error === "object" && (error as { code?: unknown }).code === "boat_ip_rate_limit_paused") throw error;
+    if (commandSend && (commandInFlight || possiblyRan)) {
+      const reason: PossiblyRanReason = possiblyRan
+        ?? (isOwnDeadline(error, signal) ? "timeout" : signal?.aborted ? "aborted" : "network_error");
+      // EVIDENCE ONLY, never a resend trigger: Boat's docs promise no time by which
+      // the record is visible (boat-command-history.md lines 37-63), so an absent
+      // record is 'unknown'. One bounded GET, none after our stop of the box.
+      const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)![1];
+      const evidence = await commandEvidence(evidenceAllowed() ? attemptNonce : undefined, () =>
+        request(config, `/sandboxes/${allocation}/command-history?limit=20&mode=commands`,
+          { signal: AbortSignal.timeout(COMMAND_HISTORY_READ_MS) }, false, { maxSends: 1 }));
+      const outcome = commandPossiblyRanError(redactKey(config, `Boat POST ${path}`), httpStatus, category, reason, evidence, direct);
+      if (outcome.stack) outcome.stack = redactKey(config, outcome.stack);
+      throw outcome;
+    }
     // Without a definite HTTP refusal, keep only a closed errno from the fetch
     // failure; our own call deadline is ETIMEDOUT. The failure itself is dropped.
     const code = httpStatus !== null && httpStatus >= 400 ? undefined
       : isOwnDeadline(error, signal) ? "ETIMEDOUT" : closedTransportCode(error);
-    throw requestError(config, init.method ?? "GET", path, httpStatus, category, code, boat409);
+    throw requestError(config, init.method ?? "GET", path, httpStatus, category, code, boat409, direct);
   }
 }
 /**
@@ -874,10 +950,14 @@ async function ensurePrivateEnvDirectory(config: Config, id: string, roots: stri
 }
 async function runCommand(config: Config, id: string, command: string, timeoutMs: number, cwd?: string, signal?: AbortSignal): Promise<PluginEnvironmentExecuteResult> {
   const timeoutSeconds = Math.max(1, Math.min(600, Math.ceil(timeoutMs / 1000)));
+  const payload = { command, timeoutSeconds, detached: timeoutMs > 600_000, ...(cwd !== undefined ? { cwd } : {}) };
+  // F-04: request() puts each send's attempt nonce at the start of the command
+  // text (command-outcome.ts withCommandNonce); a possibly-ran failure throws
+  // boat_command_possibly_ran and is never sent again.
   const started = await request(config, `/sandboxes/${encodeURIComponent(id)}/commands`, {
     method: "POST", signal: signal ?? AbortSignal.timeout(timeoutMs > 600_000 ? 30_000 : timeoutSeconds * 1000 + 5_000),
-    body: JSON.stringify({ command, timeoutSeconds, detached: timeoutMs > 600_000, ...(cwd !== undefined ? { cwd } : {}) }),
-  });
+    body: JSON.stringify(payload),
+  }, false, { command: payload });
   if (!started.processId) return {
     exitCode: Number.isInteger(started.exitCode) ? started.exitCode : null,
     timedOut: started.timedOut === true,

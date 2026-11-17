@@ -46,12 +46,16 @@ describe("Boat 429 retry", () => {
   it.each([500, 409, 404])("does not retry HTTP %s", async status => {
     const fetch = vi.fn().mockResolvedValue(response({}, status)); vi.stubGlobal("fetch", fetch);
     await expect(plugin.definition.onEnvironmentExecute!({ driverKey: "boat", companyId: "c", environmentId: "e", config, lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000 })).rejects.toMatchObject({ httpStatus: status });
-    expect(fetch).toHaveBeenCalledTimes(1);
+    // F-04: one command send; a 500 possibly ran, so its only other call is the evidence-only history GET.
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method !== "POST").map(([url]) => new URL(String(url)).pathname)).toEqual(status === 500 ? [`/api/v1/sandboxes/${id}/command-history`] : []);
   });
   it("does not retry a network error", async () => {
     const fetch = vi.fn().mockRejectedValue(new Error("secret")); vi.stubGlobal("fetch", fetch);
-    await expect(plugin.definition.onEnvironmentExecute!({ driverKey: "boat", companyId: "c", environmentId: "e", config, lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000 })).rejects.toMatchObject({ httpStatus: null, category: "network_error" });
-    expect(fetch).toHaveBeenCalledTimes(1);
+    await expect(plugin.definition.onEnvironmentExecute!({ driverKey: "boat", companyId: "c", environmentId: "e", config, lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000 })).rejects.toMatchObject({ httpStatus: null, category: "network_error", code: "boat_command_possibly_ran" });
+    // F-04: one command send; the only other call is the evidence-only history GET.
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method !== "POST").map(([url]) => new URL(String(url)).pathname)).toEqual([`/api/v1/sandboxes/${id}/command-history`]);
   });
 
   it("waits exactly Retry-After before retrying start-limit 429s", async () => {

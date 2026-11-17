@@ -110,7 +110,8 @@ describe("Boat Runner contract", () => {
     const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: "bx_runner", requestedCwd: remoteCwd, leaseMetadata: metadata });
     expect(resumed).toMatchObject({ providerLeaseId: "bx_runner", metadata: { remoteCwd, workspaceSentinel: { path: `${original}/.paperclip-runtime/reusable-sandbox-lease.json`, result: "matched", token: (lease.metadata!.workspaceSentinel as any).token } } });
     expect(resumed.metadata!.workspaceAllocationFiles).toEqual(lease.metadata!.workspaceAllocationFiles);
-    const commands = f.network.mock.calls.filter(([url]) => String(url).endsWith("/commands")).map(([, init]) => JSON.parse(String(init?.body)).command);
+    // F-04: compare the command text after its attempt marker (a shell no-op).
+    const commands = f.network.mock.calls.filter(([url]) => String(url).endsWith("/commands")).map(([, init]) => String(JSON.parse(String(init?.body)).command).replace(/^: paperclip-attempt=[0-9a-f-]{36}; /, ""));
     expect(commands).toContain(`cat '${original}/.paperclip-runtime/reusable-sandbox-lease.json'`);
     expect(commands.some(command => command.includes(`${remoteCwd}/.paperclip-runtime`))).toBe(false);
   });
