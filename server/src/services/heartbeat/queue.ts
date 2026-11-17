@@ -4817,6 +4817,33 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
+          // S8 order (Paul note 6): a person's new message never runs before the
+          // messages their own live Interrupt is sending. The press is live while
+          // its wake waits and the issue's latest run is the one it stopped.
+          if (!activeExecutionRun && opts.requestedByActorType === "user" && wakeCommentId && !opts.queuedCommentInterruptId &&
+              !executionWaitRequestId && !durableRequest?.failedRunRetry && !caseRequest && !reconciledSourceRunId) {
+            const [livePress] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+              sql`exists (select 1 from (select r.id, r.status, r.result_json from heartbeat_runs r
+                where r.company_id = ${issue.companyId} and r.context_snapshot ->> 'issueId' = ${issue.id}
+                order by r.created_at desc limit 1) latest where latest.status = 'cancelled'
+                and latest.result_json ->> 'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text
+                and coalesce(agent_wakeup_requests.payload -> 'queuedCommentInterrupt' ->> 'targetRunId', latest.id::text) = latest.id::text
+                and agent_wakeup_requests.payload -> 'queuedCommentInterrupt' is not null)`,
+            )).limit(1);
+            if (livePress) {
+              await tx.insert(agentWakeupRequests).values({ ...durableReceiptFields,
+                companyId: agent.companyId, agentId, source, triggerDetail, reason,
+                payload: withQueuedCommentIdsInWakePayload({ ...payload, issueId: issue.id,
+                  [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot }, [wakeCommentId]),
+                status: "deferred_issue_execution", requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null, idempotencyKey: opts.idempotencyKey ?? null });
+              return { kind: "deferred" as const, admitted: true };
+            }
+          }
+
           if (activeExecutionRun) {
             // The case ledger owns retry. Do not place its exact receipt in a
             // generic deferred queue that cannot retain handoff authority.
