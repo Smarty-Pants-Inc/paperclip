@@ -117,8 +117,9 @@ describe("Boat held RUN lease TTL", () => {
   });
   it.each(["archived", "stopped", "cancelled"])("R2: terminal box state %s ends refresh without a start", async state => {
     await acquire(); fake.state(state); await vi.advanceTimersByTimeAsync(100_000);
-    expect(fake.patches).toHaveLength(1); await vi.advanceTimersByTimeAsync(900_000);
-    expect(fake.patches).toHaveLength(1); expect(fake.starts).toEqual(["/sandboxes"]);
+    // Renewal observes a terminal box before extending it; PATCH cannot wake it.
+    expect(fake.patches).toHaveLength(0); await vi.advanceTimersByTimeAsync(900_000);
+    expect(fake.patches).toHaveLength(0); expect(fake.starts).toEqual(["/sandboxes"]);
   });
   it("R2: inspect's terminal observation cancels renewal without waiting for its next tick", async () => {
     await acquire(); fake.state("archived");
