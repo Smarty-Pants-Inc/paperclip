@@ -496,6 +496,15 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
       if (changed.length) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
         actorType: "system", actorId: "task-recovery", action: "issue.fresh_workspace_selected",
         entityType: "issue", entityId: issueId, runId: run.id, details: { ...readiness } });
+      // The new box cannot restore the old box's provider thread. Admission
+      // records this for the Retries it routes; this Retry was routed here, so
+      // record it here, before the run binds a session, or its first run would
+      // restore the old checkpoint into the new scope (prior_owner_scope_mismatch).
+      if (changed.length) {
+        const { recordRetryFreshProviderThread, retryFreshThreadTrigger } = await import("./fresh-continuation-fallback.js");
+        await recordRetryFreshProviderThread(tx as unknown as Db, { companyId: run.companyId, issueId, agentId: run.agentId,
+          sourceRunId: source.id, successorRunId: run.id, trigger: retryFreshThreadTrigger(intent), selectedAt: "preparation" });
+      }
     });
     return readiness;
   }
