@@ -7868,7 +7868,9 @@ export function issueRoutes(
     // The user's Interrupt click is delivering these messages. Its stopped run
     // settling is not something to read about under the composer; the task
     // notice owns any wait that needs the user.
-    const interruptHandoff = queueState?.state === "deferred" && readObject(wake?.payload).queuedCommentInterrupt != null;
+    // adopt-stopu-bound2: a Send held by the Stop-pending card is not "Sending".
+    const interruptHandoff = queueState?.state === "deferred" && readObject(wake?.payload).queuedCommentInterrupt != null
+      && wait.reason !== "execution_stop_pending";
     const queue = buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
       executionWait: interruptHandoff ? QUEUED_INTERRUPT_HANDOFF_WAIT
