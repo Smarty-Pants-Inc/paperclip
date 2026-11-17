@@ -17,10 +17,12 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // recovery, cancellation preservation, execution blocker nor wake admission is
 // mocked. Only the provider turn is scripted, as in heartbeat-warm-stop-hold.
 const providerTurns = vi.hoisted(() => [] as string[]);
+const providerInputs = vi.hoisted(() => new Map<string, unknown>());
 vi.mock("../services/native-runtime/native-session-executor.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>();
   return { ...actual, executePaperclipNativeSession: (async input => {
     providerTurns.push(input.execution.binding.runId);
+    providerInputs.set(input.execution.binding.runId, input.execution);
     throw new Error("row20_successor_provider_turn_reached");
   }) as typeof actual.executePaperclipNativeSession };
 });
@@ -276,6 +278,7 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
           for (let pass = 0; pass < 12; pass += 1) {
             vi.setSystemTime(at);
             const atMin = (at - t0) / 60_000;
+            const [leaseBeforePass] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
             const work = await reconcileRetainedWorkspaces(db, runtime as never, run => heartbeat.resumeRemoteStopComments(run));
             await Promise.all(work ?? []);
             await heartbeat.resumeQueuedRuns();
@@ -292,6 +295,17 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
                   deadlineInMin: sr.deadlineAt ? (sr.deadlineAt - t0) / 60_000 : null } : null };
             }), blocker: current ? { nextAction: current.nextAction, canRetry: current.canRetry,
               workspaceRepairRequired: current.workspaceRepairRequired } : null, messageRuns: runs.length });
+            if (actions.some(action => (action.evidence as Record<string, any>).systemRecovery?.state === "exhausted")) {
+              const [leaseAfterPass] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+              // Retry may refresh a stop receipt/timestamps, never disposition,
+              // allocation, cleanup state or reachability at budget exhaustion.
+              const disposition = (lease: typeof leaseBeforePass) => ({ status: lease.status, leasePolicy: lease.leasePolicy,
+                provider: lease.provider, providerLeaseId: lease.providerLeaseId, cleanupStatus: lease.cleanupStatus,
+                remoteCwd: lease.metadata?.remoteCwd, stopState: (lease.metadata?.remoteExecutionTermination as Record<string, unknown>)?.state,
+                kept: lease.metadata?.reusableSandboxKeptAfterReplacement ?? null });
+              expect(disposition(leaseAfterPass)).toEqual(disposition(leaseBeforePass));
+            }
+            if (runs.length === 0) expect(current?.nextAction).toBe("Recovering saved work…");
             const next = actions.map(action => (action.evidence as Record<string, any>).systemRecovery?.nextAttemptAt)
               .find((value): value is number => typeof value === "number");
             if (runs.length > 0 || next === undefined) break;
@@ -301,16 +315,27 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
         await heartbeat.drainActiveRunExecutions();
         console.log("ITEMB_TRAIL", JSON.stringify(trail));
         if (process.env.ITEMB_EVIDENCE_FILE) await fs.appendFile(process.env.ITEMB_EVIDENCE_FILE, `${JSON.stringify(trail)}\n`);
-        // The BOUND (system-recovery-state.ts:8-12, :117-122): 1 attempt + at most
-        // 5 retries 30 s * 2^(n-1) * [0.8, 1.2] apart = <= 18.6 min, inside the 30 min
-        // window; then the exhausted hold admits the message (workspace-recovery.ts
-        // recoverRunAction -> onRecovered). While held, the line promises nothing.
+        // Person-Stop budget: 1 attempt + 4 retries, <= 9 min of saved jittered
+        // delays. Admission must be <= 10 min and must say the files are absent.
         const admitted = trail.find(row => (row.messageRuns as number) > 0);
         expect(admitted, JSON.stringify(trail)).toBeDefined();
-        expect(admitted!.atMin as number).toBeLessThanOrEqual(18.6);
+        expect.soft(admitted!.atMin as number).toBeLessThanOrEqual(10);
         expect(admitted!.blocker).toBeNull();
         for (const row of trail) expect(JSON.stringify(row.blocker ?? "")).not.toContain("will start automatically");
         expect(destroy.mock.calls.filter(([input]) => input.providerLeaseId === providerLeaseId)).toHaveLength(0);
+        expect(await fs.readFile(owedFile).then(sha)).toBe(expectedSha);
+        const notices = await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId),
+          eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
+        const notice = "Couldn't restore the files from the stopped turn; they're kept on the previous machine. This reply runs without them.";
+        expect.soft(notices.map(row => row.body)).toContain(notice);
+        expect(notices.map(row => row.body).join("\n")).not.toContain("Recovering saved work");
+        const successor = [...providerInputs].find(([id]) => id !== runId && providerTurns.includes(id));
+        expect(successor).toBeDefined();
+        const providerInput = JSON.stringify(successor![1]);
+        expect.soft(providerInput).not.toMatch(/\brestored\b/i);
+        console.log("CAP5_EXHAUSTED_EVIDENCE", JSON.stringify({ noticeBodies: notices.map(row => row.body),
+          providerInput: successor![1], lease: (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0],
+          sourceSha: await fs.readFile(owedFile).then(sha), expectedSha }));
         return;
       }
       expect(executed || actionable,
