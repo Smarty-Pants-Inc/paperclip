@@ -835,6 +835,15 @@ export type AdmitWakeBehindIssueExecutionInput = {
   issueExecutionAgentNameKey: string | null;
   activeExecutionRun: WakeAdmissionActiveExecutionRun;
   allowRunCoalescing?: boolean;
+  /**
+   * `allowRunCoalescing: false` means both "never join the active run" and
+   * "never merge into a deferred wake". Agent Chat keeps the first for every
+   * message and sets this for a plain person message (never a /new reset):
+   * it may then join only the issue's latest deferred wake, and only when that
+   * wake holds plain person messages, so a merge never reorders messages or
+   * crosses a reset.
+   */
+  conversationDeferredMerge?: boolean;
   durableReceipt?: DurableWakeAdmissionReceipt;
   reason?: string | null;
   /** Tracks which runs are still live in this process, for the zombie-run filter. */
@@ -956,13 +965,14 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     }
 
     const existingDeferred =
-      (interactionReceipt || input.allowRunCoalescing === false)
+      (interactionReceipt || (input.allowRunCoalescing === false && input.conversationDeferredMerge !== true))
         ? null
         : await deps.reader.findExistingDeferredWake(scope, {
             companyId: input.companyId,
             agentId: input.agentId,
             issueId: input.issueId,
             chatConversationId: readWakeChatConversationId(input.contextSnapshot),
+            ...(input.conversationDeferredMerge === true ? { conversationTail: true } : {}),
             ...(input.durableReceipt
               ? {
                   durableActor: {
