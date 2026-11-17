@@ -20,6 +20,7 @@ import { createNativeControllerRecovery, NativeControllerRecoveryWaitingError, r
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { persistActivity } from "../activity-log.js";
 import { recordTaskStopPending } from "../recovery/stop-pending.js";
 import { recoveryService } from "../recovery/service.js";
 import { nativeUserStopRecoveryHeld } from "./native-user-stop-settlement.js";
@@ -102,7 +103,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result"
     | "pending-stop-suspend" = "settled",
     options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
-      lifecycle?: "warm"; governedWait?: boolean; issueId?: string } = {}) {
+      lifecycle?: "warm"; governedWait?: boolean; issueId?: string; closeSuspend?: boolean } = {}) {
     const issueId = options.issueId ?? randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
     if (!options.issueId) await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: agentId, status: "in_progress" });
     const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
@@ -150,7 +151,11 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       const answered = answers as Record<string, unknown>;
       // A warm Runner stays ready after its turn: its controller sends no suspend.
       const commands = ["run.prepare", "session.open", ...(control in answered ? ["turn.start"] : []), "turn.start",
-        ...(options.lifecycle === "warm" && control !== "pending-stop-suspend" ? [] : ["runner.suspend"])].map(type => controller.queueCommand(type));
+        ...(options.lifecycle === "warm" && control !== "pending-stop-suspend" ? [] : ["runner.suspend"])].map(type =>
+        // closeSuspend: the close's own suspension barrier names its command
+        // (runnerd-codex-transport.ts awaitRunnerSuspensionBarrier).
+        type === "runner.suspend" && options.closeSuspend
+          ? controller.queueCommand(type, {}, `command_close_suspend_${randomUUID().replaceAll("-", "")}`) : controller.queueCommand(type));
       // pending-stop-suspend: the close after a person's Stop journaled
       // runner.suspend and the Runner has not answered it yet.
       for (const command of control === "pending-command" || control === "pending-stop-suspend" ? commands.slice(0, -1) : commands) {
@@ -1366,8 +1371,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
    * runner.suspend after the acknowledged Stop and the Runner had not answered;
    * the stopped box's lease is still retained and the successor runs on a
    * created box. */
-  async function seedStoppedOwnerWithPendingSuspend(stop: "before suspend" | "after suspend" = "before suspend") {
-    const prior = await seedRecoveredPriorRun("pending-stop-suspend", { provider: "pi_rpc", lifecycle: "warm" });
+  async function seedStoppedOwnerWithPendingSuspend(stop: "before suspend" | "after suspend" = "before suspend",
+    seed: { closeSuspend?: boolean } = {}) {
+    const prior = await seedRecoveredPriorRun("pending-stop-suspend", { provider: "pi_rpc", lifecycle: "warm", ...seed });
     const followUp = await admitFollowUp(prior);
     await db.insert(environments).values({ id: followUp.environmentId, name: `stopped-${followUp.environmentId}`, driver: "sandbox" });
     await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
@@ -1430,6 +1436,94 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   it("keeps refusing a pending runner.suspend that the acknowledged Stop did not issue", async () => {
     const { followUp } = await seedStoppedOwnerWithPendingSuspend("after suspend");
     expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
+    expect(followUp.logs.join("")).not.toContain("waiting for the Stop's runner lifecycle command");
+  }, 60_000);
+
+  /** s6409 OPEN case, TERM before ack (RFL + rf-3): the close of the stopped
+   * warm owner finished with its box retained and its runner.suspend never
+   * acknowledged (environment_leases.metadata.nativeHarnessBackupMissing on the
+   * stopped run's lease row), the retained-idle receipt is on the stopped run,
+   * and the holder retirement TERMed that exact Runner generation
+   * (native.runner_port_holder_retired). The journal is frozen: no wait can
+   * settle it. Each option removes or bends exactly one of those proofs. */
+  async function seedClosedStoppedOwner(options: { suspend?: "after Stop" | "before Stop"; closeOf?: "own" | "foreign";
+    generation?: "retired" | "unproven"; successor?: "direct" | "not direct"; receipt?: boolean } = {}) {
+    const { prior, followUp } = await seedStoppedOwnerWithPendingSuspend(options.suspend === "before Stop" ? "after suspend" : "before suspend",
+      { closeSuspend: true });
+    const closeRunId = options.closeOf === "foreign" ? (await db.insert(heartbeatRuns)
+      .values({ companyId, agentId, status: "cancelled", runtimeMode: "native" }).returning())[0]!.id
+      : prior.runId;
+    if (options.receipt !== false) {
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { ...stopped.runnerProfileJson, nativeRetainedIdleCheckpoint: {
+        schema: "paperclip.native-retained-idle-checkpoint.v1", companyId, issueId: prior.issueId, runId: prior.runId,
+        sessionId: prior.native.normalizedSessionId, bootId: randomUUID(), generation: 1 } } }).where(eq(heartbeatRuns.id, prior.runId));
+    }
+    // The close finished: warmCloseFailureProvesOwnerGone -> markNativeHarnessBackupMissing on the retained row.
+    await db.update(environmentLeases).set({ metadata: { remoteCwd: "/workspace", nativeHarnessBackupMissing: {
+      runId: closeRunId, sessionId: prior.native.normalizedSessionId,
+      sessionRootDigest: createHash("sha256").update(prior.native.normalizedSessionId).digest("hex"),
+      reason: "release_without_checkpoint", at: new Date(Date.now() + 1_000).toISOString() } } })
+      .where(eq(environmentLeases.heartbeatRunId, prior.runId));
+    if (options.generation !== "unproven") {
+      // The production writer of a TERM/KILL-confirmed holder retirement (sandbox-runner-port-holders.ts).
+      await persistActivity(db, { companyId, actorType: "system", actorId: "native-runtime", agentId,
+        action: "native.runner_port_holder_retired", entityType: "heartbeat_run", entityId: followUp.runId, runId: followUp.runId,
+        details: { holderRunId: closeRunId, holderRunnerInstanceId: prior.native.runnerInstanceId, holderStatus: "cancelled",
+          outcome: "stopped", providerLeaseId: `sandbox-${prior.runId}` } });
+    }
+    if (options.successor === "not direct") {
+      // Another run of the same conversation came between the Stop and this one.
+      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+      await db.insert(heartbeatRuns).values({ companyId, agentId, status: "failed", runtimeMode: "native",
+        nativeIssueId: prior.issueId, nativeSessionId: prior.native.normalizedSessionId, contextSnapshot: { issueId: prior.issueId },
+        createdAt: new Date(successor.createdAt.getTime() - 1) });
+    }
+    return { prior, followUp };
+  }
+
+  async function startWithBound(followUp: Awaited<ReturnType<typeof admitFollowUp>>, timeoutMs: number) {
+    const bound = warmSessionReleaseWait.timeoutMs;
+    warmSessionReleaseWait.timeoutMs = timeoutMs;
+    const startedAt = Date.now();
+    try {
+      return { outcome: await followUp.start(), elapsedMs: Date.now() - startedAt };
+    } finally {
+      warmSessionReleaseWait.timeoutMs = bound;
+    }
+  }
+
+  it("admits the direct successor at once when the stopped owner's close finished, its Runner generation was retired "
+    + "and only that close's post-Stop runner.suspend is pending in the frozen journal", async () => {
+    const { prior, followUp } = await seedClosedStoppedOwner();
+    const { outcome, elapsedMs } = await startWithBound(followUp, 5_000);
+    expect(outcome).toBe(ADMITTED);
+    expect(elapsedMs).toBeLessThan(5_000);
+    expect(followUp.logs.join("")).not.toContain("waiting for the Stop's runner lifecycle command");
+    expect(await quarantined()).toEqual([]);
+    expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    expect((successor.runnerProfileJson?.sessionCheckpoint as Record<string, unknown>).providerSessionId)
+      .toBe("provider-session-before-recovery");
+  }, 60_000);
+
+  it.each([
+    ["the Runner generation is not proven gone", { generation: "unproven" }],
+    ["the close record and holder retirement name another run", { closeOf: "foreign" }],
+    ["the successor is not the stopped run's direct successor", { successor: "not direct" }],
+    ["the stopped run has no retained-idle receipt", { receipt: false }],
+  ] as const)("keeps the bounded wait for the Stop's pending runner.suspend when %s", async (_name, options) => {
+    const { followUp } = await seedClosedStoppedOwner(options);
+    const { outcome } = await startWithBound(followUp, 300);
+    expect(outcome).toBe("native_controller_recovery_waiting_for_owner");
+    expect(followUp.failures.at(-1)).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect(followUp.logs.join("")).toContain("waiting for the Stop's runner lifecycle command");
+    expect(await quarantined()).toEqual([]);
+  }, 60_000);
+
+  it("keeps refusing a closed owner's pending runner.suspend journaled before the person's Stop", async () => {
+    const { followUp } = await seedClosedStoppedOwner({ suspend: "before Stop" });
+    expect((await startWithBound(followUp, 300)).outcome).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
     expect(followUp.logs.join("")).not.toContain("waiting for the Stop's runner lifecycle command");
   }, 60_000);
 
