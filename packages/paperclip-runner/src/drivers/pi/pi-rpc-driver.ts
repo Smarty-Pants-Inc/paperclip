@@ -1899,6 +1899,20 @@ function sameJson(a: unknown, b: unknown): boolean {
   try { return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b)); } catch { return false; }
 }
 
+/**
+ * The runtime context as the MODEL sees it. `mcp.bindingId` is minted per RUN
+ * (`native-mcp:<runId>`) and is runner authority only: no tool argument, prompt or
+ * model-facing contract reads it (launch admission, ACPX and the native-session
+ * runtime read the structured `runtimeContext`, which keeps it). Inside the host
+ * instructions it changed the system prompt on every run of the same native
+ * session and missed the provider prompt cache on cold relaunch.
+ */
+function modelVisibleRuntimeContextJson(context: unknown): string {
+  if (!isRecord(context) || !isRecord(context.mcp) || !("bindingId" in context.mcp)) return JSON.stringify(context);
+  const { bindingId: _runScoped, ...mcp } = context.mcp;
+  return JSON.stringify({ ...context, mcp });
+}
+
 function bindingContext(baseInstructions: string, tools: readonly Readonly<Record<string, unknown>>[] | readonly PiDynamicTool[] | undefined, runtimeContext: unknown, previous?: PiRunContext,
   delivery: { api?: PiBindProvider["api"]; nativeToolCount: number } = { api: previous?.api, nativeToolCount: previous?.nativeToolCount ?? 0 }): PiRunContext {
   if (typeof baseInstructions !== "string" || (tools !== undefined && !Array.isArray(tools))) throw new Error("Pi binding context rejected");
@@ -1911,7 +1925,8 @@ function bindingContext(baseInstructions: string, tools: readonly Readonly<Recor
     ? { tools: previous.tools, toolNames: previous.toolNames, diagnostics: previous.diagnostics, catalog: previous.catalog }
     : normalizePiDynamicTools(tools ?? previous?.catalog ?? [], delivery.api, delivery.nativeToolCount);
   const limitNote = normalized.diagnostics.find(diagnostic => diagnostic.code === "pi_dynamic_tool_limit");
-  const instructions = contextJson === undefined ? baseInstructions : `${baseInstructions}\n\n<runtime_context>\n${contextJson}\n</runtime_context>`;
+  const visibleJson = contextJson === undefined ? undefined : modelVisibleRuntimeContextJson(frozenContext);
+  const instructions = visibleJson === undefined ? baseInstructions : `${baseInstructions}\n\n<runtime_context>\n${visibleJson}\n</runtime_context>`;
   return { baseInstructions, runtimeContext: frozenContext, api: delivery.api, nativeToolCount: delivery.nativeToolCount,
     instructions: limitNote ? `${instructions}\n\n<tool_delivery_notice>\n${limitNote.message} Do not claim these omitted tools were delivered; permissions are unchanged.\n</tool_delivery_notice>` : instructions, ...normalized };
 }
