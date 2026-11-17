@@ -1,104 +1,84 @@
 import { randomUUID } from "node:crypto";
-import { agents, companies, completionContracts, createDb, heartbeatRuns, issueComments, issues, nativeRunFinalizations,
-  nativeRunResults } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { agents, companies, createDb, heartbeatRuns, issueComments, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { and, eq, isNull } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
-import { HELD_PREDECESSOR_NOTICE, noticeHeldUnfinishedPredecessor } from "./native-session-executor.js";
-import { readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
+import { HELD_PREDECESSOR_NOTICE } from "./held-predecessor-notice-text.js";
+import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
+import { readStandingRunNotice } from "../standing-run-notice.js";
 
-it.each([
-  "runner_harness_state_mismatch: backup_without_reusable_lease",
-  "native_controller_recovery_missing_evidence:retained_sandbox_binding",
-])("D10b leaves typed refusal notices exclusively to proven-stop disposition (%s)", async code => {
-  const select = vi.fn(() => { throw new Error("Legacy notice owner must not read"); });
-  await noticeHeldUnfinishedPredecessor({ db: { select } as never, execution: {} as never },
-    Object.assign(new Error(code), { code }));
-  expect(select).not.toHaveBeenCalled();
-});
-
+// #21066, rf5 18:20Z: replaces the deleted executor writer's assertions with
+// the sweep's real persisted notice. Same exact text/open/once-only assertions;
+// classification and refusal safety stay in the executor and completion suites.
 const support = await getEmbeddedPostgresTestSupport();
-describe.skipIf(!support.supported)("held predecessor notice writer", () => {
+describe("held predecessor notice: sweep sole-owner replacement", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   beforeAll(async () => {
-    database = await startEmbeddedPostgresTestDatabase("held-predecessor-notice-writer-");
+    expect(support.supported, support.reason).toBe(true);
+    database = await startEmbeddedPostgresTestDatabase("held-predecessor-sweep-");
     db = createDb(database.connectionString);
   }, 60_000);
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
-  it.each(["runner_state_identity_mismatch: legacy_prior_owner_terminal_state_indeterminate",
-    "native_runner_warm_attachment_runner_exited: runner exited before authority rotation"])("holds visibly on %s", async message => {
+  async function fixture(error: string) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();
+    const end = Date.now();
     await db.insert(companies).values({ id: companyId, name: "Held refusal", issuePrefix: companyId.slice(0, 8) });
     await db.insert(agents).values({ id: agentId, companyId, name: "Held agent", adapterType: "paperclip_runner", status: "active" });
     await db.insert(issues).values({ id: issueId, companyId, title: "Held task", status: "in_progress", assigneeAgentId: agentId });
-    for (const status of ["failed", "running"] as const) {
-      await new Promise(resolve => setTimeout(resolve, 5));
-      const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, status, runtimeMode: "native", nativeIssueId: issueId,
-        nativeSessionId: sessionId }).returning();
-      if (status === "running") await noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
-        binding: { companyId, agentId, issueId, runId: row!.id }, session: { normalizedSessionId: sessionId } } as never }, new Error(message));
-    }
-    const notices = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
-      .filter(comment => String((comment.metadata as Record<string, unknown> | null)?.authorizationReason ?? "")
-        === `native_prior_owner_held:${sessionId}`);
+    const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "person",
+      body: "Continue the saved work.", createdAt: new Date(end - 3_000) }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "failed", runtimeMode: "native",
+      nativeIssueId: issueId, nativeSessionId: sessionId, errorCode: "adapter_failed", error,
+      contextSnapshot: { issueId, commentId: message!.id }, createdAt: new Date(end - 2_000), finishedAt: new Date(end) }).returning();
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: run!.id, phase: "terminal_failure",
+      failureCode: "native_pre_dispatch_failure", resultId: null });
+    const settle = () => settleUnansweredPersonMessage(db, { companyId, issueId, now: new Date(end + 2 * 60_000) });
+    const visible = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
+    return { companyId, agentId, issueId, sessionId, message: message!, run: run!, end, settle, visible };
+  }
+  it.each([
+    "runner_state_identity_mismatch: prior_owner_scope_mismatch",
+    "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate",
+    "runner_state_identity_mismatch: legacy_prior_owner_terminal_state_indeterminate",
+    "native_session_cleanup_quarantined: prior session cleanup remains incomplete",
+    "runner_process_termination_unconfirmed: replacement runner health could not be verified",
+    "native_runner_warm_attachment_runner_exited: runner exited before authority rotation",
+  ])("non-auto held refusal gets ONE open sweep notice: %s", async error => {
+    const f = await fixture(error);
+    expect(await f.visible()).toHaveLength(0);
+    await f.settle(); await f.settle();
+    const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    // RFL 20:36Z: a note the person must read is written open, not folded behind a chevron.
-    expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice", detailsDefaultOpen: true });
+    expect(notices[0]!).toMatchObject({ body: HELD_PREDECESSOR_NOTICE,
+      presentation: { kind: "system_notice", detailsDefaultOpen: true },
+      metadata: { authorizationReason: `unanswered_message:${f.message.id}`, sourceRunId: f.run.id } });
+    expect(await readStandingRunNotice(db, f)).toMatchObject({ source: "unanswered", text: HELD_PREDECESSOR_NOTICE });
   });
-
-  it("writes one notice per hold: none while it stands, one new notice after the same session continued", async () => {
-    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID(), contractId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Held writer", issuePrefix: companyId.slice(0, 8) });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Held agent", adapterType: "paperclip_runner", status: "active" });
-    await db.insert(issues).values({ id: issueId, companyId, title: "Held task", status: "in_progress", assigneeAgentId: agentId });
-    await db.insert(completionContracts).values({ id: contractId, companyId, issueId, revision: 1,
-      schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block",
-      contractJson: {}, canonicalSha256: "45".repeat(32), createdByActorType: "system", createdByActorId: "fixture" });
-    // Rows take the database clock in insertion order, like the notice itself.
-    const run = async (status: "failed" | "running" | "succeeded", committed = false) => {
-      await new Promise(resolve => setTimeout(resolve, 5));
-      const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, status, runtimeMode: "native", nativeIssueId: issueId,
-        nativeSessionId: sessionId, completionContractId: contractId }).returning();
-      const [result] = committed ? await db.insert(nativeRunResults).values({ companyId, issueId, runId: row!.id,
-        completionContractId: contractId, serverFingerprint: "fixture", schemaStatus: "accepted", resultJson: {},
-        canonicalSha256: "fixture" }).returning() : [];
-      await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: row!.id,
-        phase: committed ? "committed" : "terminal_failure", resultId: result?.id ?? null });
-      return row!.id;
-    };
-    // The executor's own refusal handling, for a message refused behind its unfinished predecessor.
-    const refuse = (runId: string) => noticeHeldUnfinishedPredecessor({ db, execution: {
-      provider: { kind: "pi_rpc" }, binding: { companyId, agentId, issueId, runId }, session: { normalizedSessionId: sessionId },
-    } as never }, new Error("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate"));
-    const notices = async () => (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
-      .filter(comment => String((comment.metadata as Record<string, unknown> | null)?.authorizationReason ?? "")
-        === `native_prior_owner_held:${sessionId}`);
-
-    // Hold: the first refused message behind the failed predecessor posts the notice.
-    await run("failed");
-    const firstRefused = await run("running");
-    await refuse(firstRefused);
-    expect(await notices()).toHaveLength(1);
-    expect((await notices())[0]!.body).toBe(HELD_PREDECESSOR_NOTICE);
-    // A second refusal while that notice stands adds none.
-    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, firstRefused));
-    await refuse(await run("running"));
-    expect(await notices()).toHaveLength(1);
-
-    // The same session continues: a later run succeeds with a committed result.
-    await run("succeeded", true);
-    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).toBeNull();
-
-    // Held again: exactly ONE new notice, which stands again.
-    await run("failed");
-    const heldAgain = await run("running");
-    await refuse(heldAgain);
-    expect(await notices()).toHaveLength(2);
-    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).not.toBeNull();
-    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, heldAgain));
-    await refuse(await run("running"));
-    expect(await notices()).toHaveLength(2);
+  it("writes once per unanswered message, clears on its answer, and writes once for a later held message", async () => {
+    const f = await fixture("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate");
+    await f.settle(); await f.settle();
+    expect(await f.visible()).toHaveLength(1);
+    const [answerRun] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "succeeded", runtimeMode: "native", nativeIssueId: f.issueId, nativeSessionId: f.sessionId,
+      retryOfRunId: f.run.id, contextSnapshot: { issueId: f.issueId, commentId: f.message.id },
+      createdAt: new Date(f.end + 1_000), finishedAt: new Date(f.end + 2_000) }).returning();
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: answerRun!.id, body: "Continued the saved work.", createdAt: new Date(f.end + 3_000) });
+    await f.settle();
+    expect(await f.visible()).toHaveLength(0);
+    expect(await readStandingRunNotice(db, f)).toBeNull();
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", body: "Continue the next part.", createdAt: new Date(f.end + 4_000) }).returning();
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "failed", runtimeMode: "native",
+      nativeIssueId: f.issueId, nativeSessionId: f.sessionId, errorCode: "adapter_failed", error: f.run.error,
+      contextSnapshot: { issueId: f.issueId, commentId: message!.id }, createdAt: new Date(f.end + 5_000),
+      finishedAt: new Date(f.end + 6_000) });
+    await f.settle(); await f.settle();
+    expect(await f.visible()).toHaveLength(1);
+    expect((await f.visible())[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message!.id}`);
+    expect((await f.visible())[0]!.body).toBe(HELD_PREDECESSOR_NOTICE);
   });
 });

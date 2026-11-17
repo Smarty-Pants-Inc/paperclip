@@ -203,6 +203,65 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   }
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
 
+  // Six boundary probes from held-writer-del: refusal classification is decided
+  // after executor failure. All non-auto variants must get the sweep's ONE true notice.
+  it.each([
+    "runner_state_identity_mismatch: prior_owner_scope_mismatch",
+    "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate",
+    "runner_state_identity_mismatch: legacy_prior_owner_terminal_state_indeterminate",
+    "native_session_cleanup_quarantined: prior session cleanup remains incomplete",
+    "runner_process_termination_unconfirmed: replacement runner health could not be verified",
+    "native_runner_warm_attachment_runner_exited: runner exited before authority rotation",
+  ])("held-writer precondition diagnostic: unprepared native run preserves non-auto classification for %s", async message => {
+    const f = await fixture({ runtimeMode: "native", runnerProfileJson: {} });
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Held class diagnostic",
+      assigneeAgentId: f.agent.id, status: "in_progress" }).returning();
+    const sessionId = randomUUID();
+    const [personMessage] = await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: issue.id,
+      authorType: "user", authorUserId: "boundary-person", body: "Continue the saved work.",
+      createdAt: new Date(f.run.createdAt.getTime() - 1_000) }).returning();
+    const [current] = await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, nativeSessionId: sessionId,
+      contextSnapshot: { issueId: issue.id, commentId: personMessage.id } })
+      .where(eq(heartbeatRuns.id, f.run.id)).returning();
+    const [prior] = await db.insert(heartbeatRuns).values({ companyId: f.run.companyId, agentId: f.agent.id,
+      status: "failed", runtimeMode: "native", nativeIssueId: issue.id, nativeSessionId: sessionId,
+      createdAt: new Date(current.createdAt.getTime() - 10_000), finishedAt: new Date(current.createdAt.getTime() - 5_000) }).returning();
+    await db.insert(nativeRunFinalizations).values([
+      { companyId: f.run.companyId, issueId: issue.id, runId: f.run.id, phase: "observed", attempt: 0, resultId: null, leaseOwner: null },
+      { companyId: f.run.companyId, issueId: issue.id, runId: prior.id, phase: "terminal_failure", resultId: null, leaseOwner: null },
+    ]);
+    expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id),
+      eq(issueComments.authorType, "system")))).toHaveLength(0);
+    const { preserveNativeFailedWorkspace } = await import("../native-runtime/native-failed-workspace-recovery.js");
+    await preserveNativeFailedWorkspace(db, current, { allowPreterminal: true });
+    const failure = { ...f.failure(new Error(message)), run: current, issueId: issue.id, issueRef: issue,
+      nativeDispatchMayHaveStarted: false, requiredWorkspaceRestoreEvidence: null };
+    await f.completion.failRun(failure);
+    const failed = await read(f.run.id);
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id));
+    const { AUTO_RECONCILED_FAILURE_CODES } = await import("../recovery/automatic-recovery-pending.js");
+    expect(failed).toMatchObject({ status: "failed", errorCode: "adapter_failed" });
+    expect(coordinator).toMatchObject({ phase: "terminal_failure", failureCode: "native_pre_dispatch_failure" });
+    expect(AUTO_RECONCILED_FAILURE_CODES).not.toContain(failed.errorCode);
+    expect(AUTO_RECONCILED_FAILURE_CODES).not.toContain(coordinator.failureCode);
+    const { automaticRecoveryPending } = await import("../recovery/automatic-recovery-pending.js");
+    expect(await automaticRecoveryPending(db, { companyId: f.run.companyId, issueId: issue.id, runId: f.run.id })).toBe(false);
+    const { settleUnansweredPersonMessage } = await import("../recovery/unanswered-person-message.js");
+    const { HELD_PREDECESSOR_NOTICE } = await import("../native-runtime/held-predecessor-notice-text.js");
+    const settle = () => settleUnansweredPersonMessage(db, { companyId: f.run.companyId, issueId: issue.id,
+      now: new Date(failed.finishedAt!.getTime() + 2 * 60_000) });
+    expect(await settle()).toMatchObject({ kind: "noticed" });
+    expect(await settle()).toEqual({ kind: "noticed_before" });
+    const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id),
+      eq(issueComments.authorType, "system")));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ body: HELD_PREDECESSOR_NOTICE,
+      metadata: { authorizationReason: `unanswered_message:${personMessage.id}` } });
+    expect(notices[0].body).not.toMatch(/sending it again is safe/i);
+    console.log(JSON.stringify({ message, runId: failed.id, runCode: failed.errorCode, coordinatorCode: coordinator.failureCode,
+      sweepNoticeId: notices[0].id, body: notices[0].body, autoCodes: AUTO_RECONCILED_FAILURE_CODES, automaticRecoveryPending: false }));
+  });
+
   // DREA-31: real release/queue, first-turn seal, completion publisher and B' notice.
   // Only the provider is deterministic: its answer depends on the actual turn text.
   async function commentContinuationFixture(personMessage = true) {

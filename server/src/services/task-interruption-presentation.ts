@@ -845,9 +845,9 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   // Upstream paperclipai/paperclip b4861d5e task-interruption-presentation.ts:824-840:
   // a card that offers Retry asks the task's execution blocker, and withholds
   // Retry where the blocker refuses it. C9 also selects tasks whose conversation
-  // has a standing notice, and the card shows that notice's own text. One
-  // batched read; blockers only for those tasks.
-  const offered = [...result].flatMap(([issueId, presentation]) => presentation?.canRetry ? [issueId] : []);
+  // has a standing notice, and the card shows that notice's own text, even
+  // while recovery withholds Retry. One batched read; Retry stays the blocker's decision.
+  const offered = [...result].flatMap(([issueId, presentation]) => presentation ? [issueId] : []);
   if (offered.length) {
     const [{ executionBlockerPredicate, getExecutionBlocker, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate },
       { readStandingRunNotices }] = await Promise.all([import("./execution-blocker.js"), import("./standing-run-notice.js")]);
@@ -861,6 +861,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       // The standing notice is shown in place of generic text. Whether Retry
       // is offered is the execution blocker's decision below.
       if (presentation && notice) presentation.notice = { code: notice.code, text: notice.text };
+      if (!presentation?.canRetry) continue;
       const blocker = await getExecutionBlocker(db, companyId, issueId);
       if (!presentation || !blocker || blocker.canRetry) continue;
       presentation.canRetry = false;
