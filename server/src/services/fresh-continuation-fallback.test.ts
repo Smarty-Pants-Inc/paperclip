@@ -435,13 +435,15 @@ suite("fresh-continuation fallback", () => {
     | "D114_two_messages_first_answered" | "D115_earlier_runs_card_after_message" | "D116_three_messages_before_prose"
     | "D117_scalar_commentId" | "D118_soft_deleted_later_message" | "D128_old_approval_before_failed_message"
     | "D181_old_question_before_failed_message" | "D182_board_confirmation_for_someone_else" | "D152_first_turn_input_failed"
-    | "D139_no_wake_no_run";
+    | "D139_no_wake_no_run" | "D136_board_hold_no_run" | "D138_wake_failed_no_run" | "D137_coalesced_execution_wait_failed"
+    | "D180_old_approval_board_hold" | "D157_queued_wake_never_runs" | "D160_workspace_pending" | "D168_carrying_queued_run_never_starts";
   it.each([
     "D008_failed_first_message", "D110_first_turn_input_silent", "D110_first_turn_input_failed_then_timer",
     "D114_two_messages_first_answered", "D115_earlier_runs_card_after_message", "D116_three_messages_before_prose",
     "D117_scalar_commentId", "D118_soft_deleted_later_message", "D128_old_approval_before_failed_message",
     "D181_old_question_before_failed_message", "D182_board_confirmation_for_someone_else", "D152_first_turn_input_failed",
-    "D139_no_wake_no_run",
+    "D139_no_wake_no_run", "D136_board_hold_no_run", "D138_wake_failed_no_run", "D137_coalesced_execution_wait_failed",
+    "D180_old_approval_board_hold", "D157_queued_wake_never_runs", "D160_workspace_pending", "D168_carrying_queued_run_never_starts",
   ] satisfies PinShape[])("F3 pin re-home %s: the latest person message has exactly one truthful outcome by 120 s", async shape => {
     const t = new Date(Date.now() - 600_000);
     const at = (offset: number) => new Date(t.getTime() + offset);
@@ -449,11 +451,12 @@ suite("fresh-continuation fallback", () => {
       conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: at(-300_000) }).returning();
     const issueId = task!.id;
     // A chat message (clientRequestId) whose durable outbox receipt the original delivery consumed, unless `delivered` is false.
-    const message = async (body: string, offset: number, delivered = true) => {
+    const message = async (body: string, offset: number, delivered: boolean | "failed" | "coalesced" = true) => {
       const [row] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId, body,
         clientRequestId: randomUUID(), createdAt: at(offset) }).returning();
       if (delivered) await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented",
-        status: "completed", requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${row!.id}`,
+        status: delivered === true ? "completed" : delivered,
+        ...(delivered === "failed" ? { error: "provider or completion contract changed" } : {}), requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${row!.id}`,
         payload: { issueId, commentId: row!.id }, createdAt: at(offset + 1_000), finishedAt: at(offset + 2_000) });
       return row!;
     };
@@ -469,6 +472,23 @@ suite("fresh-continuation fallback", () => {
       payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
         options: [{ id: "eu", label: "EU" }, { id: "us", label: "US" }] }] } } as never);
     const timer = async (offset: number) => run(offset, "succeeded", { wakeReason: "heartbeat_timer", wakeSource: "timer" }, { invocationSource: "timer" });
+    // A failed native run held by an active board-owned native-reconciliation
+    // recovery action, in the shape today's release leaves it (as unfinishedRun).
+    const boardHeldNativeRun = async (issueId: string, finishedAt: Date, contextSnapshot: Record<string, unknown> = {}) => {
+      await db.update(issues).set({ status: "blocked", statusVersion: 4, blockedTransitionAt: finishedAt }).where(eq(issues.id, issueId));
+      const [held] = await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "on_demand", issueId, nativeIssueId: issueId,
+        runtimeMode: "native", status: "failed", errorCode: "adapter_failed", error: "Native session failed", nativePhase: "terminal_failure",
+        startedAt: new Date(finishedAt.getTime() - 29_000), finishedAt, createdAt: new Date(finishedAt.getTime() - 30_000), responsibleUserId: userId,
+        contextSnapshot: { issueId, wakeReason: "issue_commented", ...contextSnapshot } }).returning();
+      await db.insert(nativeRunFinalizations).values({ runId: held!.id, companyId, issueId, phase: "terminal_failure",
+        recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation", leaseOwner: null });
+      await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "active",
+        ownerType: "board", returnOwnerAgentId: agentId, cause: "native_continuation_requires_reconciliation",
+        fingerprint: `native-continuation:${held!.id}`, maxAttempts: 3, createdAt: finishedAt,
+        nextAction: "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.",
+        evidence: { runId: held!.id, originalFailureCode: "adapter_failed", nativeFailureBlock: { runId: held!.id, statusVersion: 4 } } });
+      return held!;
+    };
     let latest: typeof issueComments.$inferSelect;
     switch (shape) {
       case "D152_first_turn_input_failed": latest = await message("Please answer this accepted request.", -60_000);
@@ -531,14 +551,60 @@ suite("fresh-continuation fallback", () => {
           resolverPolicyProvenance: "explicit", addresseeUserId: "someone-else", createdByUserId: userId, title: "Other person's decision",
           createdAt: at(30_000), payload: { version: 1, prompt: "Approve the unrelated deploy?" } } as never); break;
       }
+      // Zero-outcome shapes (stack135 fix7). A board-owned native-reconciliation
+      // hold on an earlier failed native run, in the shape today's release leaves it.
+      case "D136_board_hold_no_run": {
+        await boardHeldNativeRun(issueId, at(-300_000));
+        latest = await message("Please answer this accepted request.", -60_000); break;
+      }
+      case "D138_wake_failed_no_run": {
+        // The original outbox wake ended FAILED with no run. (REG-21's "blocked" half has no writer at head:
+        // its error text "provider or completion contract changed" is not produced anywhere in server/src.)
+        latest = await message("Please answer this accepted request.", -60_000, "failed"); break;
+      }
+      case "D137_coalesced_execution_wait_failed": {
+        latest = await message("Please answer this accepted request.", -60_000, "coalesced");
+        await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", reason: "execution_wait", status: "failed",
+          error: "remote cleanup wake failed", payload: { issueId, executionWait: { reason: "remote_cleanup" },
+            _paperclipWakeContext: { issueId, wakeCommentIds: [latest.id] } }, createdAt: at(-59_000), finishedAt: at(-30_000) }); break;
+      }
+      case "D180_old_approval_board_hold": {
+        const prior = await message("Deploy when approved.", -200_000);
+        await reply((await run(-150_000, "succeeded", { wakeCommentId: prior.id })).id, -151_000);
+        const [approval] = await db.insert(approvals).values({ companyId, type: "deploy", requestedByAgentId: agentId, status: "pending",
+          payload: { summary: "Deploy to production" }, createdAt: at(-140_000) } as typeof approvals.$inferInsert).returning();
+        await db.insert(issueApprovals).values({ companyId, issueId, approvalId: approval!.id, linkedByAgentId: agentId, createdAt: at(-140_000) } as typeof issueApprovals.$inferInsert);
+        latest = await message("Never mind the deploy. What is the current version?", -60_000);
+        await boardHeldNativeRun(issueId, at(0), { wakeCommentId: latest.id }); break;
+      }
+      case "D157_queued_wake_never_runs": {
+        latest = await message("Please answer this accepted request.", -60_000, false);
+        await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
+          requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${latest.id}`,
+          payload: { issueId, commentId: latest.id }, createdAt: at(-59_000), requestedAt: at(-59_000) }); break;
+      }
+      case "D160_workspace_pending": {
+        latest = await message("Please answer this accepted request.", -60_000);
+        const pending = await run(0, "succeeded", { wakeCommentId: latest.id }, { runtimeMode: "native", nativeIssueId: issueId, nativePhase: "workspace_pending" } as never);
+        await db.insert(nativeRunFinalizations).values({ runId: pending.id, companyId, issueId, phase: "workspace_pending", recoveryState: "pending", leaseOwner: null } as never); break;
+      }
+      case "D168_carrying_queued_run_never_starts": {
+        latest = await message("Please answer this accepted request.", -60_000);
+        await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
+          createdAt: at(-59_000), responsibleUserId: userId, contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: latest.id } }); break;
+      }
     }
     await occupySlot();
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       const heartbeat = heartbeatService(db);
+      // Every production owner a tick drives (heartbeat.ts:4752 stranded sweep,
+      // index.ts executionDisposition + executionContinuation queues).
       for (const elapsed of [90_001, 119_999, 120_000]) {
         vi.setSystemTime(t.getTime() + elapsed);
         await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
+        await settleUnrecoverableExecutions(db);
+        await deliverReconciledExecutions(db, heartbeat.wakeup);
       }
       const card = await taskInterruptionPresentation(db, await issue(issueId));
       const notes = (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
@@ -548,9 +614,14 @@ suite("fresh-continuation fallback", () => {
       const redeliveries = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
         eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${latest.id}`)));
       const [after] = await db.select().from(issueComments).where(eq(issueComments.id, latest.id));
-      const outcomes = notes.length + live.length + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
+      // A wake still queued for the message (no run yet) is the wake queue's owned, pending delivery (D157).
+      const queuedWakes = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.runId} is null`,
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+        sql`(${agentWakeupRequests.idempotencyKey} like 'conversation-comment%' and ${agentWakeupRequests.payload}->>'commentId' = ${latest.id})`));
+      const outcomes = notes.length + live.length + queuedWakes.length + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
       console.info(JSON.stringify({ f3PinRehome: { shape, card: card && { state: card.state, canRetry: card.canRetry },
-        notes: notes.length, live: live.map(r => r.contextSnapshot?.wakeCommentId ?? null), redeliveries: redeliveries.length, outcomes } }));
+        notes: notes.length, live: live.map(r => r.contextSnapshot?.wakeCommentId ?? null), queuedWakes: queuedWakes.length, redeliveries: redeliveries.length, outcomes } }));
       expect(after).toMatchObject({ body: latest.body, authorUserId: userId, deletedAt: null });
       expect(outcomes, "exactly one truthful outcome, never zero or two").toBe(1);
       if (live.length) expect(live.map(r => r.contextSnapshot?.wakeCommentId)).toEqual([latest.id]);

@@ -44,7 +44,7 @@ import { CONTROLLER_LEASE_LOST_FAILURE_CODE, hasLiveLegacyController, legacyCont
 import { isCompletedOnboardingHandoffWake } from "../chat-completion-delivery.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { NATIVE_STATUS_COMMITTER_ACTOR_ID } from "../issue-rewake-throttle.js";
-import { isWaitingConversation, settleConversationTurnForRun, deliverConversationComments, latestPersonMessageTurn, redeliverUnansweredConversationTurn } from "../agent-conversations.js";
+import { isWaitingConversation, settleConversationTurnForRun, deliverConversationComments, latestPersonMessageTurn, redeliverUnansweredConversationTurn, redeliverFailedConversationDelivery } from "../agent-conversations.js";
 import {
   and,
   asc,
@@ -5034,6 +5034,12 @@ export function recoveryService(
         const messageTurn = await latestPersonMessageTurn(db, issue);
         if (messageTurn && await redeliverUnansweredConversationTurn(db, issue, messageTurn.runId, deps.enqueueWakeup,
           { onDeferredDeadline: opts?.onDeferredDeadline, messageId: messageTurn.messageId }) === "redelivered") {
+          result.continuationRequeued += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+        // No run ever carried the message: its wake failed without a run (D137/D138).
+        if (!messageTurn && await redeliverFailedConversationDelivery(db, issue, deps.enqueueWakeup) === "redelivered") {
           result.continuationRequeued += 1;
           result.issueIds.push(issue.id);
           continue;

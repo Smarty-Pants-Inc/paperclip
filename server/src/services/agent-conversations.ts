@@ -16,8 +16,6 @@ import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import {
   agents,
   agentTaskSessions,
-  approvals,
-  issueApprovals,
   agentWakeupRequests,
   heartbeatRuns,
   issueComments,
@@ -809,6 +807,79 @@ export async function latestPersonMessageTurn(
   return run ? { runId: run.id, messageId: message.id } : null;
 }
 
+/**
+ * The person's latest chat message that NO run ever carried because the wake
+ * carrying it ended without a run: its outbox receipt `conversation-comment:<id>`
+ * failed, or it was coalesced into another wake that failed (D137/D138). The
+ * outbox counts any receipt as delivered, so nothing else would deliver it
+ * again. Re-offer it once (same redelivery key as R-SILENT). A wake that is
+ * still queued, claimed or deferred keeps the queue as owner; a cancelled one
+ * (a Stop) is never restarted.
+ */
+export async function redeliverFailedConversationDelivery(
+  db: Db,
+  issue: { id: string; companyId: string; conversationAgentId: string | null },
+  enqueue: Parameters<typeof deliverConversationComments>[2],
+): Promise<"redelivered" | "none"> {
+  if (!issue.conversationAgentId) return "none";
+  const [message] = await db.select({ id: issueComments.id, authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), isNull(issueComments.deletedAt),
+    isNull(issueComments.authorAgentId), sql`${issueComments.authorUserId} is not null`))
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+  if (!message) return "none";
+  if ((await latestPersonMessageTurn(db, issue))?.messageId === message.id) return "none";
+  const carrying = sql`(${agentWakeupRequests.idempotencyKey} = ${"conversation-comment:" + message.id}
+    or ${agentWakeupRequests.payload}->>'commentId' = ${message.id}
+    or coalesce(${agentWakeupRequests.payload}#>'{_paperclipWakeContext,wakeCommentIds}', '[]'::jsonb) @> jsonb_build_array(${message.id}::text))`;
+  const wakes = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, issue.companyId), carrying));
+  const owned = wakes.filter(wake => wake.status !== "coalesced");
+  const failed = owned.find(wake => wake.status === "failed" && !wake.runId);
+  if (!failed || owned.some(wake => wake.runId || !["failed", "skipped"].includes(wake.status))) return "none";
+  const key = `${CONVERSATION_REDELIVERY_KEY_PREFIX}${message.id}`;
+  for (;;) {
+    const outcome = await db.transaction(async (tx) => {
+      const locks = await tx.execute(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${"conversation-delivery:" + issue.id}, 0)) as acquired`,
+      );
+      if (!locks[0]?.acquired) return "retry" as const;
+      const [sent] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.idempotencyKey, key))).limit(1);
+      if (sent) return "none" as const;
+      // Anything said since the message, or a live run, means nothing to re-offer.
+      const [later] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+        eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), isNull(issueComments.deletedAt),
+        sql`(${issueComments.authorAgentId} is not null or ${issueComments.authorUserId} is not null)`,
+        sql`(${issueComments.createdAt}, ${issueComments.id}) > (select cursor.created_at, cursor.id from issue_comments cursor where cursor.id = ${message.id}::uuid)`)).limit(1);
+      const [live] = later ? [] : await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, issue.companyId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
+        sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`)).limit(1);
+      if (later || live) return "none" as const;
+      await enqueue(issue.conversationAgentId!, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "issue_commented",
+        idempotencyKey: key,
+        requestedByActorType: "user",
+        requestedByActorId: message.authorUserId,
+        payload: { issueId: issue.id, commentId: message.id, redeliveredAfterWakeId: failed.id },
+        contextSnapshot: {
+          issueId: issue.id,
+          taskKey: issue.id,
+          commentId: message.id,
+          wakeCommentId: message.id,
+          wakeCommentIds: [message.id],
+          source: "issue.comment",
+          redeliveredAfterWakeId: failed.id,
+        },
+      });
+      return "redelivered" as const;
+    });
+    if (outcome !== "retry") return outcome;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 /** Terminal outcomes of a person's turn that the redelivery may re-offer. A
  * cancelled run (a person's or operator's Stop) is never restarted; an
  * interrupted one belongs to the server-restart lane. */
@@ -857,19 +928,15 @@ export async function redeliverUnansweredConversationTurn(
   if (isPendingCommitPresentation((run.resultJson as Record<string, unknown> | null)?.presentationDecision)) return "none";
   if (run.status !== "succeeded") {
     // Upstream still owns a failed turn that is the task's latest attempt (its
-    // card shows failed + Retry), has a successor, or has a recovery action. A
-    // pending approval that PREDATES the message turns that card into the
-    // approval's wait instead, which does not answer this message (D128/D153).
+    // card shows failed + Retry, even past an approval that predates the
+    // attempt: task-interruption-presentation approvalOwnsTask, D128/D153/D180),
+    // has a successor, or has a recovery action.
     const [later] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), sql`${heartbeatRuns.id} <> ${run.id}`,
       sql`(${heartbeatRuns.issueId} = ${issue.id} or ${heartbeatRuns.nativeIssueId} = ${issue.id}
         or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id})`,
       sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (select own.created_at, own.id from heartbeat_runs own where own.id = ${run.id}::uuid)`)).limit(1);
-    const [olderApproval] = later ? [] : await db.select({ id: approvals.id }).from(issueApprovals)
-      .innerJoin(approvals, eq(approvals.id, issueApprovals.approvalId)).where(and(
-        eq(issueApprovals.companyId, issue.companyId), eq(issueApprovals.issueId, issue.id), eq(approvals.status, "pending"),
-        sql`${approvals.createdAt} < (select created_at from issue_comments where id = ${messageId}::uuid)`)).limit(1);
-    if (!later && !olderApproval) return "none";
+    if (!later) return "none";
     const [successor] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.retryOfRunId, run.id))).limit(1);
     if (successor) return "none";

@@ -43,6 +43,7 @@ const QUEUED_INTERRUPT_HANDOFF_GRACE_MS = 5 * 60_000;
 const QUEUED_INPUT_DISPATCH_GRACE_MS = 2 * 60_000;
 const AUTOMATIC_DISPOSITION_GRACE_MS = 2 * 60_000;
 const WAITING_CONTINUATION_MOVE_FORWARD_MS = 15 * 60_000;
+const FAILED_ATTEMPT_STATUSES = new Set(["failed", "timed_out"]);
 const NO_WORK_CONTINUATION_HANDOFF_GRACE_MS = 30_000;
 const NO_WORK_CONTINUATION_CAUSES = new Set(["native_predecessor_retirement_unproven", "native_failed_before_provider_turn"]);
 
@@ -570,7 +571,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       eq(issueTreeHolds.companyId, issueTreeHoldMembers.companyId), eq(issueTreeHolds.id, issueTreeHoldMembers.holdId)))
       .where(and(eq(issueTreeHoldMembers.companyId, companyId), inArray(issueTreeHoldMembers.issueId, ids),
         eq(issueTreeHolds.status, "active"), eq(issueTreeHolds.mode, "pause"))),
-    db.select({ issueId: issueApprovals.issueId }).from(issueApprovals).innerJoin(approvals, and(
+    db.select({ issueId: issueApprovals.issueId, createdAt: approvals.createdAt }).from(issueApprovals).innerJoin(approvals, and(
       eq(approvals.companyId, issueApprovals.companyId), eq(approvals.id, issueApprovals.approvalId)))
       .where(and(eq(issueApprovals.companyId, companyId), inArray(issueApprovals.issueId, ids),
         inArray(approvals.status, ["pending", "revision_requested"]))),
@@ -801,7 +802,15 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   };
   const agentMap = new Map(agentRows.map(agent => [agent.id, agent]));
   const projectMap = new Map(projectRows.map(project => [project.id, project]));
-  const pauses = new Set(pauseRows.map(row => row.issueId)), approvalsSet = new Set(approvalRows.map(row => row.issueId));
+  const pauses = new Set(pauseRows.map(row => row.issueId));
+  // An approval asked for before a FAILED (or timed-out) latest attempt was
+  // created does not explain that failure: that attempt was started for other
+  // input (a person's later message), so its failure and Retry stay visible
+  // instead of the older approval's wait (D128/D153/D180). The approval itself
+  // stays pending in its own UI; a newer approval still owns the task's state.
+  const approvalOwnsTask = (issueId: string, run: { status: string; createdAt: Date } | undefined) =>
+    approvalRows.some(row => row.issueId === issueId && (!run || !FAILED_ATTEMPT_STATUSES.has(run.status)
+      || row.createdAt.getTime() >= run.createdAt.getTime()));
   const admissionWaitMap = byIssue(admissionWaits);
   const launchWaits = [...retryWaitMap].flatMap(([issueId, wait]) => {
     const run = runMap.get(issueId);
@@ -827,7 +836,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       projectAccessProjectId: denied?.includes(issue.projectId ?? "") ? issue.projectId : null,
       workspaceSelectionAvailable: required?.available ?? false,
       agent: agentMap.get(issue.assigneeAgentId ?? ""), project: projectMap.get(issue.projectId ?? ""),
-      company: companyRows[0], paused: pauses.has(issue.id), approval: approvalsSet.has(issue.id),
+      company: companyRows[0], paused: pauses.has(issue.id), approval: approvalOwnsTask(issue.id, facts.run),
       ownerStopRequired: ownerStopRequired.has(`${issue.id}:${facts.run?.id}`),
       unidentifiedLaunchConfirmable: confirmableLaunches.has(issue.id),
       admissionWait: admissionWaitMap.get(issue.id),
