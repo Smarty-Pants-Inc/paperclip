@@ -2225,10 +2225,10 @@ mod tests {
     #[test]
     fn listener_checks_its_backlog_sooner_than_a_dial_reconnects() {
         let configured = Duration::from_millis(250);
-        let listener = RunnerTransportEndpoint::Listen {
-            listener: TcpListener::bind("0.0.0.0:0").unwrap(),
-            path: "/api/runner/v1/connect/run_1".to_owned(),
-        };
+        let listener = RunnerTransportEndpoint::from_listener(
+            TcpListener::bind("0.0.0.0:0").unwrap(),
+            "/api/runner/v1/connect/run_1".to_owned(),
+        );
         assert_eq!(listener.retry_delay(configured), LISTENER_ACCEPT_INTERVAL);
         assert!(LISTENER_ACCEPT_INTERVAL <= Duration::from_millis(25));
         assert_eq!(

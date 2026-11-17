@@ -4204,6 +4204,9 @@ impl CodexCommandExecutor {
         } else {
             Vec::new()
         };
+        if !expired_tool_calls.is_empty() {
+            next_state.settle_deferred_pi_terminal()?;
+        }
         if next_state.tool_bridge.pending_calls().next().is_some() {
             blockers.push("durable_pending_tool_calls");
         }
@@ -10160,6 +10163,71 @@ done
             );
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    // Keep reason: #21490 closed-turn expiry must release the fork's Pi
+    // deferred terminal before attachment validates and persists its state.
+    #[test]
+    fn pi_rpc_attach_settles_deferred_terminal_after_closed_call_expiry() {
+        for deferred in ["turn.completed", "turn.failed", "turn.interrupted"] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+            payload["completionContract"] =
+                json!({"revision": "expiry-contract", "criterionIds": ["expiry-criterion"]});
+            let state = executor.state.as_mut().unwrap();
+            state.completion_contract = completion_contract(&payload).unwrap();
+            state.tool_bridge = tool_result_authority_state("pi_rpc", "get_task_context").tool_bridge;
+            state.admit_tool_call("closed-call", "get_task_context", &json!({})).unwrap();
+            state.tool_bridge.settle_turn("provider_turn_terminated").unwrap();
+            state.active_provider_turn_id = None;
+            state.lifecycle = "prepared".to_owned();
+            state.last_agent_message = Some("Retained final answer".to_owned());
+            let expected = terminal_events(state, deferred, None);
+            assert!(expected.iter().any(|event| event.event_type == "run.terminal"));
+            let held = state.defer_pi_terminal_outcome(deferred, expected.clone()).unwrap();
+            assert!(held.is_empty());
+            state.validate().unwrap();
+            executor.save_state().unwrap();
+
+            let expired = executor.attach_run(&payload)
+                .expect("closed-call expiry releases the deferred terminal before persistence");
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0].call_id, "closed-call");
+            assert!(expired[0].is_error);
+            let state = executor.state.as_ref().unwrap();
+            state.validate().unwrap();
+            assert!(state.tool_bridge.pending_calls().next().is_none());
+            assert!(state.pi_deferred_terminal.is_none());
+            assert!(state.pi_deferred_terminal_deadline_unix_ms.is_none());
+            let released: Vec<_> = state.pending_events.iter().chain(state.queued_events.iter())
+                .filter(|event| matches!(event.event_type.as_str(), "run.terminal" | "run.result.proposed" | "session.failed"))
+                .map(|event| (&event.event_type, &event.payload)).collect();
+            let expected: Vec<_> = expected.iter()
+                .map(|event| (&event.event_type, &event.payload)).collect();
+            assert_eq!(released, expected, "release must preserve the deferred terminal's type and payload: {deferred}");
+            let mut restored = CodexCommandExecutor::new(&directory);
+            restored.pi_launch_profile = executor.pi_launch_profile.clone();
+            restored.load_state_without_provider().unwrap();
+            assert_eq!(restored.state.as_ref().unwrap(), state);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_rpc_attach_still_refuses_live_turn_pending_calls() {
+        let (directory, mut executor, payload) = prepared_skill_checkpoint("pi_rpc", true);
+        let state = executor.state.as_mut().unwrap();
+        state.tool_bridge = tool_result_authority_state("pi_rpc", "get_task_context").tool_bridge;
+        state.admit_tool_call("live-call", "get_task_context", &json!({})).unwrap();
+        assert!(!state.tool_bridge.turn_closed());
+        state.validate().unwrap();
+        executor.save_state().unwrap();
+        let before = fs::read(executor.state_path()).unwrap();
+        let before_state = executor.state.clone();
+        let error = executor.attach_run(&payload).expect_err("a live turn still owns its pending call");
+        assert!(error.to_string().contains("durable_pending_tool_calls"), "{error}");
+        assert_eq!(executor.state, before_state);
+        assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
