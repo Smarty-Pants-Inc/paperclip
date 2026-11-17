@@ -59,6 +59,7 @@ import { heartbeatRuns, nativeRunFinalizations, workspaceOperations } from "@pap
 import { conflict } from "../../errors.js";
 import { getStartupTraceContext } from "../../instrumentation.js";
 import { logger } from "../../middleware/logger.js";
+import { finishCancelledWarmWorkspaceExport } from "./cancelled-warm-workspace-export.js";
 import {
   buildNativeProviderEnvironment,
   executePaperclipNativeSession,
@@ -1107,6 +1108,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
     if (adapterErr instanceof NativeCancellationPendingRecoveryError) {
       // Durable cancellation is settled by the outer recovery handler;
       // it does not imply a failed workspace or a persisted run result.
+      // pl/cancel-finalize: a settled Stop of a warm turn first finishes its
+      // own prepared export (bounded), before the box is handed off.
+      await finishCancelledWarmWorkspaceExport({ db, runId: run.id, companyId: run.companyId, nativeWorkspaceSync })
+        .catch((error) => logger.warn({ err: error, runId: run.id }, "cancelled warm workspace export failed"));
       throw adapterErr;
     }
     if (adapterErr instanceof NativeWorkspaceFinalizationBusyError
