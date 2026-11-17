@@ -1881,6 +1881,13 @@ function RawTranscriptView({
   );
 }
 
+/** Short opaque id for keeping the reader's place while output pages in. */
+function outputAnchorId(key: string): string {
+  let hash = 5381;
+  for (let index = 0; index < key.length; index += 1) hash = ((hash * 33) ^ key.charCodeAt(index)) >>> 0;
+  return `${hash.toString(36)}-${key.length.toString(36)}`;
+}
+
 export function RunTranscriptView({
   entries,
   earlierOutput,
@@ -1954,7 +1961,7 @@ export function RunTranscriptView({
       {keyedBlocks.map(({ block, key }, index) => (
         <div
           key={key}
-          data-output-anchor={key}
+          data-output-anchor={outputAnchorId(key)}
           className={cn(index === keyedBlocks.length - 1 && streaming && "tc-stream-block-enter")}
         >
           {block.type === "message" && (
