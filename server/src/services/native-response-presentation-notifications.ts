@@ -1,4 +1,4 @@
-import { readCompletedAssistantMessageCandidate } from "./heartbeat-run-summary.js";
+import { readCompletedAssistantMessageCandidate, readTruncatedCompletedAgentMessageItemId } from "./heartbeat-run-summary.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
 export type NativeResponsePresentationScope = { companyId: string; issueId?: string; runId?: string; agentId?: string };
@@ -10,5 +10,6 @@ export async function notifyNativeResponsePresentation(tx: object, scope: Native
 
 export function isNativeResponseEvidence(eventType: string, prpEvent: unknown): boolean {
   return eventType === "run.result.accepted" || eventType === "item.completed" &&
-    readCompletedAssistantMessageCandidate({ seq: 0, prpEvent })?.channel === "final";
+    (readCompletedAssistantMessageCandidate({ seq: 0, prpEvent })?.channel === "final"
+      || readTruncatedCompletedAgentMessageItemId(prpEvent) !== null);
 }

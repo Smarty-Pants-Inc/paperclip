@@ -1317,17 +1317,26 @@ describe("dl-n5-66k a final answer stored without text is never replaced by the 
     expect(resolved.decision.reasonCodes).not.toContain("accepted_semantic_result_summary");
   });
 
-  it("gives a 300 KiB final answer n5e's plain line and a labelled excerpt; the full text is retrievable server-side", () => {
+  it("keeps a 300 KiB rebuilt final whole for the shared completion-comment splitter", () => {
     const answer = answerOf(300 * 1024);
     const resolved = resolve(answer);
     expect(resolved.decision.chosenSource).toBe("final_agent_message");
-    expect(resolved.text).toMatch(/^This answer is longer than one message \(\d+ KB\)\. The full text is kept; ask me to show any part\.\n\nExcerpt \(the start of the answer, not the whole answer\):\n\n/u);
-    const excerpt = resolved.text!.slice(resolved.text!.indexOf(":\n\n") + 3);
-    expect(excerpt.length).toBeGreaterThan(1000);
-    expect(answer.startsWith(excerpt)).toBe(true);
-    expect(resolved.text).not.toMatch(/truncated/iu);
-    // The whole text stays in the server's own run events.
+    expect(resolved.text).toBe(answer);
+    expect(resolved.text).not.toContain("The full text is kept");
     expect(reassembleAgentMessageFromDeltas(rowsFor(answer).deltas, itemId)).toBe(answer);
+  });
+
+  it("a projected fullText receipt whose deltas cannot rebuild the whole is undeliverable, never its excerpt", () => {
+    const answer = "The stored text is incomplete.";
+    const { deltas } = rowsFor(answer);
+    const prpEvent = { eventType: "item.completed", itemId, payload: { kind: "agentMessage", channel: "final",
+      text: "The full text is kept; ask me to show any part.",
+      fullText: { path: "/runner-private/spill.txt", bytes: Buffer.byteLength(answer), sha256: "0".repeat(64) } } };
+    expect(readCompletedAssistantMessageCandidate({ seq: 999, prpEvent })).toBeNull();
+    expect(readTruncatedCompletedAssistantMessageCandidate({ seq: 999, prpEvent, deltaRows: deltas })?.text)
+      .toBe(runSummary.TRUNCATED_FINAL_UNDELIVERABLE_TEXT);
+    expect(readTruncatedCompletedAssistantMessageCandidate({ seq: 999, prpEvent, deltaRows: [] })?.text)
+      .toBe(runSummary.TRUNCATED_FINAL_UNDELIVERABLE_TEXT);
   });
 
   it("NEGATIVE: an answer already posted as the agent's comment with identical final text is reused, not posted twice", () => {

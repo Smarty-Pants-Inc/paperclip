@@ -234,6 +234,7 @@ import {
   isExternalChatPresentationContext,
   LEGACY_WITHHELD_RUN_COMMENT,
   projectHistoricalHeartbeatRunComment,
+  splitFinalAnswerComments,
 } from "./heartbeat-run-summary.js";
 import {
   DEFAULT_INSERT_CHUNK_ROWS,
@@ -13811,6 +13812,23 @@ export function issueService(db: Db) {
       if (options?.completionReply && actor.agentId && actor.runId) {
         const delivered = await existingChatCompletionReply(dbOrTx, actor.runId, issueId);
         if (delivered) return redactIssueComment(delivered, currentUserRedactionOptions.enabled);
+        const parts = splitFinalAnswerComments(redactedBody);
+        if (parts.length > 1) {
+          // This is already the issue-locked posting transaction. Publish ALL
+          // parts before acknowledging completion, so a failure rolls back the
+          // whole answer and replay cannot mistake its first part for delivery.
+          let first: IssueComment | undefined;
+          for (const part of parts) {
+            const comment = await addComment(issueId, part, actor, {
+              ...options, completionReply: false,
+              // Attachments/presentation belong to the reply's first comment.
+              ...(first ? { attachmentIds: undefined, presentation: null, clientRequestId: undefined } : {}),
+            }, dbOrTx);
+            first ??= comment;
+          }
+          await acknowledgeChatCompletionReply(dbOrTx, actor.runId, first!.id);
+          return first!;
+        }
       }
       const authorType = issueCommentAuthorTypeSchema.parse(
         options?.authorType ??

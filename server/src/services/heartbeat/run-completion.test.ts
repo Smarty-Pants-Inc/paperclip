@@ -62,6 +62,7 @@ import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-mes
 import { NativeRunCoordinatorStore } from "../native-runtime/native-run-coordinator-store.js";
 import { finalizeNativeRun, NativeFinalizationDeferredError, recoverCommittedNativeChatResponse } from "../native-runtime/native-run-finalizer.js";
 import { nativeResponsePresentationWork } from "../native-runtime/native-response-presentation-work.js";
+import { issueService } from "../issues.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -699,6 +700,99 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(posted[0]!.body.startsWith(prefix)).toBe(true);
     expect(posted[0]!.body.slice(prefix.length)).toMatch(/output limit/u);
     expect(posted[0]!.body).not.toMatch(/wasn't answered|Sending it again is safe/u);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  // H5: exercise stored pi_rpc events -> real candidate selection -> successful
+  // completion -> real comment service -> PostgreSQL read-back (not mock bodies).
+  const h5Answer = "0123456789abcdef\n".repeat(Math.ceil(300 * 1024 / 17)).slice(0, 300 * 1024);
+  it.each([
+    { storage: "intact", name: "300 KiB intact", answer: h5Answer },
+    { storage: "rebuilt", name: "300 KiB rebuilt", answer: h5Answer },
+    { storage: "projected", name: "300 KiB projector preview", answer: h5Answer },
+    { storage: "intact", name: "under limit unchanged", answer: "  A complete short answer.\n\n" },
+    { storage: "intact", name: "exactly at limit", answer: "x".repeat(250 * 1024) },
+    { storage: "intact", name: "multi-byte boundary", answer: "😀漢é".repeat(40_000) },
+    { storage: "rebuilt", name: "code fence spanning boundary", answer: `\`\`\`ts\n${h5Answer}\n\`\`\`\n`, fence: "```", opening: "```ts" },
+    { storage: "intact", name: "tilde fence spanning boundary", answer: `~~~~js\n${h5Answer}\n~~~~\n`, fence: "~~~~", opening: "~~~~js" },
+  ])("H5 completed final $name posts whole in ordered parts", async ({ storage, answer, name, fence, opening }) => {
+    const f = await fixture({ runtimeMode: "native" }, `H5${randomUUID().slice(0, 5)}`, true);
+    await db.insert(authUsers).values({ id: "local-board", name: "Board", email: "h5-board@example.test",
+      createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Chat with CEO",
+      status: "in_progress", assigneeAgentId: f.agent.id, responsibleUserId: "local-board",
+      conversationAgentId: f.agent.id, conversationUserId: "local-board", conversationState: "active" }).returning();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, f.agent.id));
+    await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, responsibleUserId: "local-board",
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.run.id));
+    f.input.issueId = issue.id;
+    f.input.issueRef = issue;
+    f.input.issueContext = await createHeartbeatRunPreparation(db).getIssueExecutionContext(f.run.companyId, issue.id);
+    f.input.adapterResult.resultJson = { nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Short summary must not replace the answer." } };
+    f.deps.issuesSvc.addComment.mockImplementation(issueService(db).addComment);
+    const turnId = `runner:${f.run.id}:turn-1`, itemId = `${turnId}:pi-message:2:block:0`;
+    const base = { companyId: f.run.companyId, runId: f.run.id, agentId: f.agent.id, stream: "system", level: "info", message: "e" };
+    const events: (typeof heartbeatRunEvents.$inferInsert)[] = [];
+    let seq = 1;
+    for (let offset = 0; offset < answer.length;) {
+      let end = Math.min(answer.length, offset + 4_001);
+      if (end < answer.length && /[\uD800-\uDBFF]/u.test(answer[end - 1]!)) end--;
+      events.push({ ...base, seq: seq++, eventType: "item.delta",
+        payload: { prpEvent: { eventType: "item.delta", itemId, turnId, payload: { kind: "agentMessage", channel: "progress", text: answer.slice(offset, end) } } } });
+      offset = end;
+    }
+    events.push({ ...base, seq: seq++, eventType: "item.completed", payload: { prpEvent: { eventType: "item.completed", itemId, turnId,
+      payload: storage === "intact" ? { kind: "agentMessage", channel: "final", text: answer }
+        : storage === "projected" ? { kind: "agentMessage", channel: "final", text: `This answer is longer than one message (308 KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n${answer.slice(0, 16 * 1024)}`,
+          fullText: { path: "/runner-private/spill.txt", sha256: createHash("sha256").update(answer).digest("hex"), bytes: Buffer.byteLength(answer) } }
+        : { truncated: true, byteSize: Buffer.byteLength(answer) } } } });
+    events.push({ ...base, seq: seq++, eventType: "turn.completed", payload: { prpEvent: { eventType: "turn.completed", turnId, payload: {} } } });
+    await db.insert(heartbeatRunEvents).values(events);
+    await db.update(heartbeatRuns).set({ nextEventSeq: seq }).where(eq(heartbeatRuns.id, f.run.id));
+    await f.completion.completeRun(f.input);
+    const posted = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id), eq(issueComments.createdByRunId, f.run.id)))
+      .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+    if (process.env.H5_EVIDENCE_DIR) {
+      const evidenceDir = join(process.env.H5_EVIDENCE_DIR, name.replaceAll(" ", "-"));
+      await fs.mkdir(evidenceDir, { recursive: true });
+      for (const [i, comment] of posted.entries()) await fs.writeFile(join(evidenceDir, `part-${i + 1}.txt`), comment.body);
+    }
+    expect((await read(f.run.id)).status).toBe("succeeded");
+    expect(f.input.onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining("Failed to resolve run presentation"));
+    const multiple = Buffer.byteLength(answer) > 250 * 1024;
+    if (multiple) expect(posted.length).toBeGreaterThan(1);
+    else expect(posted).toHaveLength(1);
+    const payloads = posted.map((comment, i) => {
+      expect(comment.body.startsWith(`part ${i + 1} of ${posted.length}\n`)).toBe(multiple);
+      expect(Buffer.byteLength(comment.body)).toBeLessThanOrEqual(250 * 1024);
+      expect(comment.body).not.toContain("The full text is kept");
+      expect(Buffer.from(comment.body).toString("utf8")).toBe(comment.body);
+      let payload = comment.body.replace(/^part \d+ of \d+\n/u, "");
+      if (fence) {
+        // Each code part renders independently. Discard only the known
+        // synthetic fence wrappers to recover the byte-identical source.
+        expect(payload.startsWith(`${opening}\n`)).toBe(true);
+        expect(payload.trimEnd().endsWith(fence)).toBe(true);
+        if (i > 0) payload = payload.slice(opening!.length + 1);
+        if (i < posted.length - 1) payload = payload.slice(0, -(fence.length + 1));
+      }
+      return payload;
+    });
+    if (process.env.H5_EVIDENCE_DIR) {
+      const evidenceDir = join(process.env.H5_EVIDENCE_DIR, name.replaceAll(" ", "-"));
+      await fs.mkdir(evidenceDir, { recursive: true });
+      await fs.writeFile(join(evidenceDir, "stored-answer.txt"), answer);
+      await fs.writeFile(join(evidenceDir, "receipt.json"), JSON.stringify({ storage, name, status: (await read(f.run.id)).status,
+        answerBytes: Buffer.byteLength(answer), answerSha256: createHash("sha256").update(answer).digest("hex"),
+        comments: posted.map(comment => ({ id: comment.id, bytes: Buffer.byteLength(comment.body), createdAt: comment.createdAt,
+          sha256: createHash("sha256").update(comment.body).digest("hex") })),
+        reconstructedSha256: createHash("sha256").update(payloads.join("")).digest("hex") }, null, 2));
+    }
+    const storedDeltas = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.run.id), eq(heartbeatRunEvents.eventType, "item.delta"))).orderBy(asc(heartbeatRunEvents.seq));
+    const storedAnswer = storedDeltas.map(row => (row.payload as { prpEvent: { payload: { text: string } } }).prpEvent.payload.text).join("");
+    expect(Buffer.from(payloads.join("")).equals(Buffer.from(storedAnswer))).toBe(true);
+    // A replay of the same final must reuse the durable receipt, not any part.
+    await issueService(db).addComment(issue.id, storedAnswer, { agentId: f.agent.id, runId: f.run.id }, { completionReply: true });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))).toHaveLength(posted.length);
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   // dl-n5-cont3 F1 + F4 (judge rf-2): at 300 KiB the person saw a 16 KB
