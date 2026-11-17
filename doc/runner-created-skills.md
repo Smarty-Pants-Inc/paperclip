@@ -14,6 +14,8 @@ trust level and compatibility. `limit` is at most 20. Follow `nextCursor` with t
 same query until it is null. Search reads stored metadata; it does not synchronize
 sources, install catalog entries or fetch repositories.
 
+The `versionId` is for reading; assignment uses the key (Latest) unless Beta skills is on.
+
 Call `load_skill` with the returned skill ID and `versionId`. An exact key also
 works; a slug must be unique. The default file is `SKILL.md`. To read a referenced
 text file, pass its relative `path` and the same version ID. The response includes
