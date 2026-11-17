@@ -64,12 +64,12 @@ describe("Pi policy refusal: persistence, retry, unanswered message and Stop int
     await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: execution } }).where(eq(heartbeatRuns.id, runId));
     // Pi 1.5.2 message_end {message: {role:"assistant", stopReason:"error", errorMessage}}
     // -> TS driver turn.failed -> RPC turn/failed -> Rust provider_events PRP.
-    // The Codex-compatible RPC envelope labels provider "codex" even for Pi;
-    // classification must use the pinned execution provider, not that label.
+    // Rust reuses the Codex-compatible terminal normalizer, then relabels
+    // the event to pi_rpc. Authority still comes from pinned execution identity.
     const event: PrpEvent = {
       schema: "paperclip.prp.event.v1", runId, normalizedSessionId: native.normalizedSessionId, turnId: native.turnId,
       sourceInstanceId: native.runnerInstanceId, sourceEventId: "pi-terminal", sourceSeq: 1, sourceKind: "runner", eventType: "turn.failed", schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(),
-      payload: { provider: "codex", providerTurnId: "fixture-pi-turn", status: "failed", error: { code, message } },
+      payload: { provider: "pi_rpc", providerTurnId: "fixture-pi-turn", status: "failed", error: { code, message } },
     };
     const terminal: PrpTerminalState = { schema: "paperclip.prp.terminal.v1", turnTerminalState: "failed", runTerminalState: "failed", reportedWorkDisposition: "needs_review" };
     const result = { ...CONTROL_PLANE_CONFORMANCE_RESULT, reportedWorkDisposition: "needs_review" as const, completionClaim: { ...CONTROL_PLANE_CONFORMANCE_RESULT.completionClaim, contractRevision: completionInput.revision } };
