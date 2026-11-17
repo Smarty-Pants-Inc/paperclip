@@ -66724,7 +66724,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(await f.counts()).toEqual(before);
   });
 
-  it("retry-fold6 (rf-3 FAIL 3): the executor's held note takes its instruction from the authority when posted, and once the agent is paused the card supersedes a standing 'Press Retry' with one note naming Resume", async () => {
+  // fam-retry5: SUPERSEDED BY REPLACEMENT (RFL record SUPERSEDE-PAUSED-RETRY-UPSTREAM-1117): the
+  // paused Retry route answers 202, preservation only, in the card's paused words (was 409).
+  it("(superseded by replacement: upstream paused-Retry preservation, RFL record SUPERSEDE-PAUSED-RETRY-UPSTREAM-1117) retry-fold6 (rf-3 FAIL 3): the executor's held note takes its instruction from the authority when posted, and once the agent is paused the card supersedes a standing 'Press Retry' with one note naming Resume", async () => {
     const f = await boatRetryRouteFixture();
     const sessionId = randomUUID();
     await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId));
@@ -66740,10 +66742,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.fixture.assignedAgentId));
     const run = await later();
     await post(run.id);
-    // Production entry point: the Retry route refuses with Resume.
+    // Production entry point: the Retry route accepts for preservation only (upstream), in the card's paused words.
+    const runsBefore = (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).length;
     const refused = await request(f.app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: run.id, idempotencyKey: randomUUID() });
-    expect(refused.status, JSON.stringify(refused.body)).toBe(409);
-    expect(refused.body).toMatchObject({ details: { userAction: "resume", nextAction: AGENT_PAUSED_ACTION } });
+    expect(refused.status, JSON.stringify(refused.body)).toBe(202);
+    expect(refused.body).toMatchObject({ accepted: true, held: { reason: "agent_paused", message: AGENT_PAUSED_RETRY_MESSAGE },
+      presentation: { canRetry: false, userAction: "resume" } });
+    expect(JSON.stringify(refused.body)).not.toMatch(/working|Trying again/i);
+    expect((await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))))
+      .toHaveLength(runsBefore);
     const [pausedNote] = await heldNotes();
     expect(pausedNote?.body).toContain(AGENT_PAUSED_ACTION);
     expect(pausedNote?.body).not.toContain("Press Retry");
