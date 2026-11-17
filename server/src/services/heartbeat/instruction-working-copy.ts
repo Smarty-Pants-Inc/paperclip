@@ -90,8 +90,10 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
       workspace: executionWorkspace,
     }), cwd: executionWorkspace.cwd,
   })).digest("hex");
-  const agentFileConflictMessage = (conflicts: AgentFileConflict[]) => `Agent files saved; ${conflicts.length} file${conflicts.length === 1 ? " was" : "s were"} also saved by another writer and kept. `
-    + conflicts.map(item => `${item.path}: kept ${item.currentHash}; this run's ${item.incomingHash ?? "deletion"} ${item.conflictCopy ? `saved as ${item.conflictCopy}` : "not applied"}.`).join(" ");
+  const agentFileConflictMessage = (conflicts: AgentFileConflict[]) => `Agent files saved; ${conflicts.length} path${conflicts.length === 1 ? " was" : "s were"} also saved by another writer. `
+    + conflicts.map(item => item.currentKept === false
+      ? `${item.path}: ${item.currentHash} not kept after this run's file/folder replacement; no recovery copy is claimed.`
+      : `${item.path}: kept ${item.currentHash}; this run's ${item.incomingHash ?? "deletion"} ${item.conflictCopy ? `saved as ${item.conflictCopy}` : "not applied"}.`).join(" ");
   const recordInstructionSave = async (saved: NonNullable<Awaited<ReturnType<typeof instructionCopies.get>>>) => {
     const receipt = parseObject(saved.receipt);
     const storageWarning = readNonEmptyString(receipt.storageWarning);

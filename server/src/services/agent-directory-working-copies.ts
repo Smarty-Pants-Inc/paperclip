@@ -6,7 +6,7 @@ import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { agents, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
-import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { withDirectoryMergeLock, mergeDirectoryWithBaseline, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory, type AgentFileConflict } from "./agent-file-store.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import { excludeAgentRuntimeFromGit } from "./agent-instruction-git-exclusion.js";
@@ -471,6 +471,28 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           receipt: { ...row.receipt, baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
             checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning, conflicts,
             pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
+        if (!stopped && row.location === "local" && conflicts.length && conflicts.every(item => item.currentKept !== false)) {
+          // A successful save is already recorded above. Refresh only at this
+          // idle turn boundary, under the canonical writer lock, and reject any
+          // post-capture edit instead of overwriting it. A failed refresh retires
+          // the session; never replay a committed save just to retry a refresh.
+          try {
+            row = await store.locked(row.companyId, row.agentId, actor(row), false, async (_tx, _agent, canonical) => {
+              const current = (await inspectAgentDirectory(canonical, false)).snapshot;
+              await mergeDirectoryWithBaseline({ sourceDir: canonical, targetDir: row.localRoot, baseline: snapshot,
+                conflictPolicy: "reject", snapshots: { source: current } });
+              return patch(row, { baseHash: directorySnapshotSha256(current), receipt: { ...row.receipt,
+                baseline: serializeDirectorySnapshot(current), checkpointManifest: checkpointBaseline(current) } });
+            });
+          } catch (error) {
+            logger.warn({ err: error, runId: row.runId }, "Agent file conflict refresh requires retirement");
+            return patch(row, { errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE",
+              errorMessage: "The conflict save succeeded, but the live directory changed before refresh; collect after provider stop.", nextAttemptAt: null });
+          }
+        }
+        // Remote copies are not rewritten through a full-tree upload while the
+        // provider lives. Their canonical/baseline mismatch refuses warm reuse;
+        // stopped collection and fresh preparation restore the kept version.
         return row;
       } catch (error) {
         failure = error;
@@ -732,8 +754,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       if (alreadySealed) return alreadySealed;
       const pending = pendingConflicts(current);
       if (!pending.length) return null;
-      const text = [...new Map(pending.map(item => [item.path, item])).values()].map(item =>
-        `Note: ${JSON.stringify(item.path)} was also saved by another run; that version was kept. ${item.conflictCopy
+      const text = [...new Map(pending.map(item => [item.path, item])).values()].map(item => item.currentKept === false
+        ? `Note: ${JSON.stringify(item.path)} was also saved by another run; that version was not kept after this run's file/folder replacement. No recovery copy is claimed.`
+        : `Note: ${JSON.stringify(item.path)} was also saved by another run; that version was kept. ${item.conflictCopy
           ? `Your earlier edit is saved as ${JSON.stringify(item.conflictCopy)}.`
           : "Your earlier deletion was not applied."}`).join("\n");
       await db.transaction(async tx => {

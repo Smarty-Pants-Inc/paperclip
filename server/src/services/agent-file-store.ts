@@ -50,9 +50,13 @@ function storageWarning(size: number, count: number, fullFile?: string) {
 
 /** A file another writer saved after this run's base, which this run also
  * changed. The saved file stays canonical; the run's version, when it has one,
- * is kept as `conflictCopy`. Hashes are SHA-256 of content; null is absent. */
+ * is kept as `conflictCopy`. A topology replacement can still remove the saved
+ * file; `currentKept: false` records that limitation instead of claiming it was
+ * kept. Hashes are SHA-256 of content; null is absent. */
 export type AgentFileConflict = {
   path: string; baseHash: string | null; currentHash: string; incomingHash: string | null; conflictCopy: string | null;
+  /** Absent in existing receipts means kept. False never claims a recovery copy. */
+  currentKept?: false;
 };
 const entryHash = (entry: SnapshotEntry | undefined) => entry?.kind === "file" ? entry.hash : null;
 const sameContent = (a: SnapshotEntry | undefined, b: SnapshotEntry | undefined) =>
@@ -397,7 +401,7 @@ export function agentFileStore(db: Db) {
         // differs from both this run's base and its result was saved by another
         // writer since this run started. That file stays canonical. The run's
         // version is kept beside it as a named conflict copy, indexed and
-        // persisted like any file in this same commit, never last-sync-wins.
+        // persisted like any file in this same commit, never silently overwritten.
         const sourceRunId = currentPluginInteractionOrigin()?.runId ?? actor.runId;
         const tag = (sourceRunId ?? randomUUID()).replaceAll("-", "").slice(0, 8).toLowerCase();
         const epochMs = Date.now();
@@ -450,6 +454,13 @@ export function agentFileStore(db: Db) {
         }
         for (const item of conflicts) if (item.conflictCopy) {
           finalEntries.set(item.conflictCopy, { value: incoming.entries.get(item.path)!, root: input.sourceDir, source: item.path });
+        }
+        // An incoming ancestor file can remove a held descendant. Topology
+        // preservation is separate work; this receipt must describe the result,
+        // not claim the other writer's bytes survived when they did not.
+        for (const item of conflicts) {
+          const kept = finalEntries.get(item.path)?.value;
+          if (kept?.kind !== "file" || kept.hash !== item.currentHash) item.currentKept = false;
         }
         let total = 0;
         let fullFile: string | undefined;
