@@ -4204,6 +4204,12 @@ impl CodexCommandExecutor {
         } else {
             Vec::new()
         };
+        if !expired_tool_calls.is_empty() {
+            // Expiry settles the old call as an unknown-outcome failure, just
+            // as a recorded result releases Pi's deferred provider terminal.
+            // Retain that terminal in the predecessor FIFO before rebinding.
+            next_state.settle_deferred_pi_terminal()?;
+        }
         if next_state.tool_bridge.pending_calls().next().is_some() {
             blockers.push("durable_pending_tool_calls");
         }
@@ -10220,6 +10226,124 @@ done
             .iter()
             .any(|event| event.event_type == "run.terminal"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    // Keep reason: #21490's closed-turn expiry crosses P1's durable Pi
+    // terminal/result authority boundary. Exercise real attach and persistence,
+    // including the retained FIFO, rather than weakening its state validator.
+    #[test]
+    fn pi_rpc_attach_expiry_releases_the_deferred_terminal_and_persists_fifo() {
+        for event_type in [
+            "turn.completed",
+            "turn.failed",
+            "turn.interrupted",
+            "turn.cancelled",
+        ] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+            let authority = tool_result_authority_state("pi_rpc", "get_task_context");
+            let state = executor.state.as_mut().unwrap();
+            state.tool_bridge = authority.tool_bridge;
+            state.completion_contract = authority.completion_contract;
+            state.run_identity = Some(prepare_contract_identity("run-A"));
+            state.last_agent_message = Some("The previous run's final answer.".to_owned());
+            state
+                .admit_tool_call("expiry-probe", "get_task_context", &json!({}))
+                .unwrap();
+            state
+                .tool_bridge
+                .settle_turn("provider_turn_terminated")
+                .unwrap();
+            state.active_provider_turn_id = None;
+            // Fill both durable FIFO segments; the released predecessor terminal
+            // must follow them, not precede or overwrite retained facts.
+            for index in 0..MAX_EVENTS_PER_POLL + 2 {
+                state
+                    .push_event(NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({"code": "retained-predecessor-fact", "index": index}),
+                    })
+                    .unwrap();
+            }
+            let expected = terminal_events(state, event_type, None);
+            assert!(!expected.is_empty());
+            let outcome = state
+                .defer_pi_terminal_outcome(event_type, expected.clone())
+                .unwrap();
+            assert!(outcome.is_empty());
+            state.extend_terminal_events(outcome).unwrap();
+            assert_eq!(state.pi_deferred_terminal.as_deref(), Some(event_type));
+            state
+                .validate()
+                .expect("P1 deferred-terminal state is valid before expiry");
+            let retained: Vec<_> = state
+                .pending_events
+                .iter()
+                .chain(state.queued_events.iter())
+                .cloned()
+                .collect();
+            let operations: Vec<_> = state.tool_bridge.authorized_tools().cloned().collect();
+            payload["authorizedTools"] = serde_json::to_value(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(&operations).unwrap(),
+                operations,
+            })
+            .unwrap();
+            payload["completionContract"] =
+                serde_json::to_value(&state.completion_contract).unwrap();
+            payload["completionContract"]["revision"] = json!("new-run-contract");
+            payload["paperclipNextAuthority"] = json!({"identity": {
+                "runnerInstanceId": "contract-runner", "environmentLeaseId": "lease",
+                "runId": "run-B", "normalizedSessionId": "contract-session",
+                "turnId": "turn-run-B", "itemId": "item-run-B",
+            }});
+            executor.save_state().unwrap();
+            let expired = executor
+                .attach_run(&payload)
+                .expect("attach expiry must leave the deferred Pi terminal persistable");
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0].call_id, "expiry-probe");
+            assert!(expired[0].is_error);
+            let state = executor.state.as_ref().unwrap();
+            assert!(state.tool_bridge.pending_calls().next().is_none());
+            assert!(state.pi_deferred_terminal.is_none());
+            assert!(state.pi_deferred_terminal_deadline_unix_ms.is_none());
+            assert_eq!(state.run_identity.as_ref().unwrap().run_id, "run-B");
+            assert_eq!(
+                state.completion_contract.as_ref().unwrap().revision,
+                "new-run-contract"
+            );
+            let events: Vec<_> = state
+                .pending_events
+                .iter()
+                .chain(state.queued_events.iter())
+                .cloned()
+                .collect();
+            assert_eq!(&events[..retained.len()], retained.as_slice());
+            let released = &events[retained.len()..];
+            assert_eq!(released.len(), expected.len());
+            for (actual, expected) in released.iter().zip(&expected) {
+                assert_eq!(actual.event_type, expected.event_type);
+                assert_eq!(actual.payload, expected.payload);
+            }
+            let terminal = released
+                .iter()
+                .find(|event| event.event_type == "run.terminal")
+                .unwrap();
+            assert_eq!(
+                terminal.payload["turnTerminalState"],
+                event_type.strip_prefix("turn.").unwrap()
+            );
+            state.validate().expect("attached state validates");
+            let persisted: CodexProviderState =
+                serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+            persisted
+                .validate()
+                .expect("persisted state validates after reload");
+            assert_eq!(&persisted, state);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
