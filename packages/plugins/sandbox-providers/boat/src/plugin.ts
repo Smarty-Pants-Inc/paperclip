@@ -79,6 +79,50 @@ function subscribeCompanyActivity(companyId: string): void {
 const BOAT_CALL_BUDGET_MS = 30_000;
 const BOAT_MAX_ATTEMPTS = 3;
 function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${API}\0${config.apiKey}\0${id}`).digest("hex"); }
+// smarty-dev#20974: Boat's documented 409 answers (troubleshooting 'Error
+// messages'; readiness.md:9-31). Only these closed values reach an error.
+const BOAT_409_CODES: ReadonlySet<string> = new Set([
+  "sandbox_starting", "sandbox_not_ready", "machine_not_running", "sandbox_stopping", "snapshot_data_expired",
+]);
+// API states (readiness.md:15-23) plus the stopping/stopped the 409 texts name.
+const BOAT_STATES: ReadonlySet<string> = new Set([
+  "provisioning", "provisioned", "cloning", "ready", "idle", "running", "archiving", "archived", "error", "stopping", "stopped",
+]);
+type Boat409Fields = { boatCode?: string; boatState?: string; boatRetryable?: boolean };
+/** Boat's closed 409 fields from a parsed body (top level, error, error.details); never the body. */
+function boat409Fields(body: unknown): Boat409Fields {
+  const field = (value: unknown, key: string): unknown => {
+    try { return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>)[key] : undefined; }
+    catch { return undefined; }
+  };
+  const read = (key: string): unknown => {
+    for (const source of [body, field(body, "error"), field(field(body, "error"), "details")]) {
+      const value = field(source, key);
+      if (value !== undefined) return value;
+    }
+    return undefined;
+  };
+  const code = read("code"), state = read("state"), retryable = read("retryable");
+  return {
+    ...(typeof code === "string" ? { boatCode: BOAT_409_CODES.has(code) ? code : "other" } : {}),
+    ...(typeof state === "string" && BOAT_STATES.has(state) ? { boatState: state } : {}),
+    ...(typeof retryable === "boolean" ? { boatRetryable: retryable } : {}),
+  };
+}
+/** "A few minutes" after OUR resume of a box, a not-ready 409 earns one more resume. */
+const BOAT_RESUME_RECOVERY_WINDOW_MS = 5 * 60_000;
+/** Pause before sending a command or files call again after 409 sandbox_starting. */
+const BOAT_STARTING_RESEND_MS = 1_000;
+// Our successful resumes, by account-scoped box key. A recovery resume never
+// renews the entry, and our own stop forgets it, so it can never wake a box we stopped.
+const ourResumes = new Map<string, { at: number; recovery?: Promise<boolean>; settled?: boolean }>();
+function markOurResume(config: Config, id: string): void {
+  const now = Date.now();
+  // Marks past the window can never act; drop them so the map stays small
+  // (an in-flight recovery keeps its own reference to its mark).
+  for (const [key, mark] of ourResumes) if (now - mark.at > BOAT_RESUME_RECOVERY_WINDOW_MS) ourResumes.delete(key);
+  ourResumes.set(activityKey(config, id), { at: now });
+}
 function stateTimestamp(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string") { const parsed = Date.parse(value); if (Number.isFinite(parsed)) return parsed; }
@@ -317,12 +361,15 @@ type RequestErrorCategory = "request_error" | "network_error" | "http_error" | "
  * `status` (integer HTTP status) and `code` (closed errno only) are the structure
  * the host's transient-retry classification reads through the SDK diagnostic;
  * the transient words serve the server's text-only resume retry. */
-function requestError(config: Config, method: string, path: string, httpStatus: number | null, category: RequestErrorCategory, code?: string): Error & { httpStatus: number | null; category: RequestErrorCategory; status?: number; code?: string } {
+function requestError(config: Config, method: string, path: string, httpStatus: number | null, category: RequestErrorCategory, code?: string, boat409?: Boat409Fields): Error & { httpStatus: number | null; category: RequestErrorCategory; status?: number; code?: string } & Boat409Fields {
   const redact = (text: string) => config.apiKey ? text.split(config.apiKey).join("[REDACTED]") : text;
   const closedCode = code !== undefined && TRANSPORT_ERROR_CODES.has(code) ? code : undefined;
   const words = transientWords(httpStatus, closedCode);
-  const error = Object.assign(new Error(redact(`Boat ${method} ${path} failed (${httpStatus ?? "unavailable"}): ${category}${words ? ` (${words})` : ""}`)),
-    { httpStatus, category }, Number.isInteger(httpStatus) ? { status: httpStatus as number } : {}, closedCode ? { code: closedCode } : {});
+  // #20974: which 409, from Boat's closed fields only, so a run records it.
+  const conflict = httpStatus === 409 && boat409 ? boat409Fields({ code: boat409.boatCode, state: boat409.boatState, retryable: boat409.boatRetryable }) : {};
+  const conflictText = Object.keys(conflict).length ? ` [boat 409${conflict.boatCode ? ` code=${conflict.boatCode}` : ""}${conflict.boatState ? ` state=${conflict.boatState}` : ""}${conflict.boatRetryable !== undefined ? ` retryable=${conflict.boatRetryable}` : ""}]` : "";
+  const error = Object.assign(new Error(redact(`Boat ${method} ${path} failed (${httpStatus ?? "unavailable"}): ${category}${words ? ` (${words})` : ""}${conflictText}`)),
+    { httpStatus, category }, Number.isInteger(httpStatus) ? { status: httpStatus as number } : {}, closedCode ? { code: closedCode } : {}, conflict);
   if (error.stack) error.stack = redact(error.stack);
   return error;
 }
@@ -330,6 +377,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
   let category: RequestErrorCategory = "request_error";
   let httpStatus: number | null = null;
   let signal: AbortSignal | undefined;
+  let boat409: Boat409Fields | undefined;
   try {
     if (init.method && init.method !== "GET") assertBoatActivityAdmission();
     const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
@@ -373,12 +421,29 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     ];
     // Not allowlisted: POST commands can execute (docs lines 1415-1416, 2115-2127); upload-url (1397-1398) and PUT files (1559-1560) lack a 429 no-execution guarantee.
     const retryableStart = retryable429Routes.some(route => route.method === method && route.pattern.test(path));
+    // #20974: the command and files calls Boat holds or refuses with a 409 while a box starts.
+    const commandOrFilesCall = /^\/sandboxes\/[^/?]+\/(?:commands|files)(?:[/?]|$)/.test(path);
+    const resumeCall = method === "POST" && /^\/sandboxes\/[^/?]+\/resume$/.test(path);
+    let resumeRecoveryUsed = false;
     for (let attempt = 1; ; attempt++) {
       await waitForRateLimitPause();
       category = "network_error";
       httpStatus = null;
+      boat409 = undefined;
       response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal: callSignal });
       httpStatus = response.status;
+      if (response.status === 409) {
+        category = "http_error";
+        boat409 = boat409Fields(await response.clone().json().catch(() => null));
+        const resend = await boat409Resend(config, path, method, allocation ? decodeURIComponent(allocation) : undefined, boat409, {
+          attempt, deadline, callSignal, retryAfter: response.headers.get("Retry-After"),
+          commandOrFilesCall: commandOrFilesCall && !isStreamBody, resumeCall,
+          resumeRecoveryUsed, useResumeRecovery: () => { resumeRecoveryUsed = true; },
+        });
+        if (!resend) break;
+        await response.body?.cancel();
+        continue;
+      }
       if (response.status !== 429) break;
       category = "http_error";
       const retryAfter = response.headers.get("Retry-After");
@@ -457,8 +522,61 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     // failure; our own call deadline is ETIMEDOUT. The failure itself is dropped.
     const code = httpStatus !== null && httpStatus >= 400 ? undefined
       : isOwnDeadline(error, signal) ? "ETIMEDOUT" : closedTransportCode(error);
-    throw requestError(config, init.method ?? "GET", path, httpStatus, category, code);
+    throw requestError(config, init.method ?? "GET", path, httpStatus, category, code, boat409);
   }
+}
+/**
+ * Boat's documented 409 handling, inside the call's existing bound (its signal,
+ * BOAT_MAX_ATTEMPTS sends, and for waits the call budget). True: send again.
+ * - sandbox_starting (readiness.md:29; troubleshooting): Boat held the command
+ *   or files call up to 60 s; send it again.
+ * - sandbox_not_ready / machine_not_running (readiness.md:31; troubleshooting:
+ *   'Run boat resume, then retry'): only within minutes of OUR resume of that
+ *   box, one more POST /resume plus the ready wait, once per resume; then the
+ *   call is retried once.
+ * - sandbox_stopping (troubleshooting: the resume answer carries Retry-After;
+ *   'Wait that many seconds ... Then run the same resume again'): resume only.
+ * - Anything else (snapshot_data_expired: the data is gone) is surfaced as is.
+ */
+async function boat409Resend(config: Config, path: string, method: string, id: string | undefined, fields: Boat409Fields, call: {
+  attempt: number; deadline: number; callSignal: AbortSignal; retryAfter: string | null;
+  commandOrFilesCall: boolean; resumeCall: boolean; resumeRecoveryUsed: boolean; useResumeRecovery: () => void;
+}): Promise<boolean> {
+  if (call.callSignal.aborted || call.attempt >= BOAT_MAX_ATTEMPTS || !id) return false;
+  const route = path.replace(/^\/sandboxes\/[^/?]+/, "/sandboxes/{sandboxId}").replace(/\?.*$/, "");
+  const log = (action: string) => duplexLogger?.warn("Boat API 409", { method, route, attempt: `${call.attempt}/${BOAT_MAX_ATTEMPTS}`, action, ...fields });
+  if (fields.boatCode === "sandbox_starting" && call.commandOrFilesCall) {
+    log("send_again");
+    await delay(BOAT_STARTING_RESEND_MS, undefined, { signal: call.callSignal });
+    return true;
+  }
+  if ((fields.boatCode === "sandbox_not_ready" || fields.boatCode === "machine_not_running") && call.commandOrFilesCall && !call.resumeRecoveryUsed) {
+    const ours = ourResumes.get(activityKey(config, id));
+    if (!ours || Date.now() - ours.at > BOAT_RESUME_RECOVERY_WINDOW_MS || ours.settled) return false;
+    call.useResumeRecovery();
+    if (!ours.recovery) {
+      log("resume_again");
+      ours.recovery = (async () => {
+        try {
+          await request(config, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", signal: call.callSignal,
+            body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(config), ...(config.boatEnvironment === undefined ? { noEnv: true } : {}) }) });
+          await waitReady(config, id, true, { signal: call.callSignal });
+          return true;
+        } catch { return false; }
+        finally { ours.settled = true; }
+      })();
+    }
+    return await ours.recovery;
+  }
+  if (fields.boatCode === "sandbox_stopping" && call.resumeCall && call.retryAfter !== null) {
+    const seconds = /^\s*(\d+(?:\.\d+)?)\s*$/.exec(call.retryAfter);
+    const waitMs = seconds ? Number(seconds[1]) * 1_000 : NaN;
+    if (!Number.isFinite(waitMs) || waitMs > call.deadline - Date.now()) return false;
+    log("resume_after_retry_after");
+    await delay(waitMs, undefined, { signal: call.callSignal });
+    return true;
+  }
+  return false;
 }
 /** Conservative inventory guard, NOT key-scope detection. Count Personal and
  * inactive rows too; active is only the default wallet for new sandboxes.
@@ -557,17 +675,17 @@ function q(v: string): string { return `'${v.replace(/'/g, `'"'"'`)}'`; }
 function validEnv(env: Record<string, string> = {}): void {
   for (const k of Object.keys(env)) if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`Invalid environment variable: ${k}`);
 }
-async function waitReady(config: Config, id: string, allowArchived = false): Promise<any> {
+async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal } = {}): Promise<any> {
   const until = Date.now() + 120_000;
   while (Date.now() < until) {
-    const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
+    const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, bound.signal ? { signal: bound.signal } : {});
     const s = result.sandbox ?? result;
     assertSandboxId(s, id);
     if (["ready", "idle", "running"].includes(s.state)) return s;
     if (s.state === "error" || (!allowArchived && s.state === "archived")) throw new Error(`Boat sandbox ${id} entered ${s.state}`);
     // Bounded transition observation only; no idle worker poller. Ready webhook
     // delivery belongs to the host; this acquisition has no callback endpoint.
-    await delay(Math.min(500, Math.max(0, until - Date.now())));
+    await delay(Math.min(500, Math.max(0, until - Date.now())), undefined, bound.signal ? { signal: bound.signal } : undefined);
   }
   throw new Error(`Boat sandbox ${id} readiness timed out`);
 }
@@ -588,6 +706,8 @@ async function waitSetup(config: Config, id: string): Promise<any> {
   throw Object.assign(new Error(`Boat sandbox ${id} setup timed out after ${config.setupTimeoutSeconds} seconds`), { code: "ETIMEDOUT" });
 }
 async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseId: string; state: "stopped" }> {
+  // Our stop ends "our resume": a later not-ready 409 must never wake this box.
+  ourResumes.delete(activityKey(config, id));
   idleActivity.resource(activityKey(config, id));
   const proof = idleActivity.proof(activityKey(config, id));
   const stopped = await request(config, `/sandboxes/${encodeURIComponent(id)}/stop`, { method: "POST", body: JSON.stringify({}) });
@@ -1528,6 +1648,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       const response = await request(c, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c), ...(c.boatEnvironment === undefined ? { noEnv: true } : {}) }) });
       const sb = response.sandbox ?? response;
       assertSandboxId(sb, id);
+      markOurResume(c, id);
       sandbox = await waitReady(c, id, true);
       runnerIngressGenerationStore.invalidate(ingressScopeKey(params, c, id));
     } else {
@@ -1648,6 +1769,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       await duplexChannels.suspend({ ...params, providerLeaseId: id });
       await sshCarrier.invalidate({ ...params, providerLeaseId: id });
       await acquireRunnerIngress("sandbox_start", () => request(c, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c), ...(c.boatEnvironment === undefined ? { noEnv: true } : {}) }) }));
+      markOurResume(c, id);
       sandbox = await acquireRunnerIngress("sandbox_refresh", () => waitReady(c, id, true));
       runnerIngressGenerationStore.invalidate(ingressScopeKey(params, c, id));
       // Only explicit acquire/resume may authorize the guardian carrier. This
