@@ -3,6 +3,7 @@ import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteraction
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
 import { notifyDeferredExecutionWork } from "../services/deferred-execution-notifications.js";
+import { UNNAMED_EXECUTION_WAIT } from "../services/deferred-execution-wait.js";
 import { notifyNativeRecoveryNotices } from "../services/native-recovery-notice-notifications.js";
 import { notifyNativeStatusReassessment } from "../services/native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../services/unsafe-workspace-export-notifications.js";
@@ -7864,7 +7865,11 @@ export function issueRoutes(
           ?? (await getNativeSessionSteeringState(steering.steeringRunId)
             .then((state) => state.disposition)
             .catch(() => "temporarily_unavailable" as const));
-    const wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    const savedWait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    // Behind a running turn, a wait no gate named is the ordinary busy turn:
+    // the queue shows its normal queued state. Every named wait still shows.
+    const wait = savedWait.reason === UNNAMED_EXECUTION_WAIT.reason && input.activeRun?.status === "running"
+      ? {} : savedWait;
     // The user's Interrupt click is delivering these messages. Its stopped run
     // settling is not something to read about under the composer; the task
     // notice owns any wait that needs the user.
@@ -7966,6 +7971,74 @@ export function issueRoutes(
       }
     }
     return entries;
+  }
+
+  /**
+   * Agent Chat keeps one wake per waiting message, and requestedAt owns their
+   * order: the read view (chatQueueTail) and the release drain both take the
+   * earliest first. A person's reorder of the whole chat queue, also while a
+   * turn runs, therefore permutes those wakes' saved requestedAt values. A
+   * stale head revision is still refused; the ids must be exactly the chat
+   * queue's, each wake's messages kept together. Returns null when the order
+   * is not a chat-queue order; the ordinary single-wake reorder then decides.
+   */
+  async function reorderChatQueue(input: {
+    issue: { id: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null; executionRunId?: string | null };
+    actor: ReturnType<typeof getActorInfo>; queueId: string; revision: string; orderedCommentIds: string[];
+  }) {
+    const { issue } = input;
+    if (!issue.conversationAgentId || !issue.assigneeAgentId) return null;
+    const activeRun = await resolveActiveIssueRun(issue, { queueStateOnly: true });
+    const publications: ActivityPublication[] = [];
+    const queue = await db.transaction(async (tx) => {
+      await tx.select({ id: issueRows.id }).from(issueRows)
+        .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId))).for("update");
+      const current = await buildQueuedCommentQueue({ executor: tx, issue, activeRun, actor: input.actor });
+      const wakeIdOf = (entry: IssueQueuedCommentQueue["entries"][number]) => entry.queueId ?? current.queueId!;
+      const currentIds = current.entries.map((entry) => entry.comment.id);
+      if (current.queueId !== input.queueId || current.state !== "deferred" ||
+          !current.entries.some((entry) => entry.queueId && entry.queueId !== current.queueId) ||
+          currentIds.length !== input.orderedCommentIds.length ||
+          [...currentIds].sort().join() !== [...input.orderedCommentIds].sort().join()) return null;
+      if (current.revision !== input.revision)
+        throw new QueuedCommentMutationError("queued_comment_revision_conflict", "The queued messages changed in another session");
+      const wakeOf = new Map(current.entries.map((entry) => [entry.comment.id, wakeIdOf(entry)]));
+      const order: string[] = [];
+      for (const id of input.orderedCommentIds) {
+        const wakeId = wakeOf.get(id)!;
+        if (order.at(-1) === wakeId) continue;
+        if (order.includes(wakeId)) throw new QueuedCommentMutationError("queued_comment_order_mismatch",
+          "The queued message order does not match the current queue");
+        order.push(wakeId);
+      }
+      const wakes = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId), inArray(agentWakeupRequests.id, order),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+      )).for("update");
+      if (wakes.length !== order.length) throw new QueuedCommentMutationError("queued_comment_already_dispatching",
+        "The queued message is already being dispatched");
+      const slots = wakes.map((wake) => wake.requestedAt).sort((a, b) => a.getTime() - b.getTime());
+      const now = new Date();
+      for (const [index, wakeId] of order.entries()) {
+        const wake = wakes.find((candidate) => candidate.id === wakeId)!;
+        const ids = input.orderedCommentIds.filter((id) => wakeOf.get(id) === wakeId);
+        const hidden = queuedCommentIdsFromWakePayload(wake.payload).filter((id) => !ids.includes(id));
+        await tx.update(agentWakeupRequests).set({ requestedAt: slots[index]!, updatedAt: now,
+          payload: withQueuedCommentIdsInWakePayload(wake.payload, [...hidden, ...ids]) })
+          .where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, issue.companyId)));
+      }
+      const next = await buildQueuedCommentQueue({ executor: tx, issue, activeRun, actor: input.actor });
+      await logActivity(tx as unknown as Db, {
+        companyId: issue.companyId, actorType: input.actor.actorType, actorId: input.actor.actorId,
+        agentId: input.actor.agentId, runId: input.actor.runId, action: "issue.queued_comments_reordered",
+        entityType: "issue", entityId: issue.id,
+        details: { queueId: next.queueId, revision: next.revision, orderedCommentIds: input.orderedCommentIds },
+      }, publications);
+      return next;
+    });
+    if (!queue) return null;
+    for (const publication of publications) publishActivity(publication);
+    return queue;
   }
 
   function assertQueueMutationTarget(input: {
@@ -18056,6 +18129,12 @@ export function issueRoutes(
       );
       if (!issue) return;
       const actor = getActorInfo(req);
+      const chatQueue = await runQueuedCommentMutation(() => reorderChatQueue({ issue, actor,
+        queueId: req.body.queueId, revision: req.body.revision, orderedCommentIds: req.body.orderedCommentIds as string[] }));
+      if (chatQueue) {
+        res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, chatQueue));
+        return;
+      }
       const { queue, activityPublication } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.reorderQueuedComments({
           issue: buildQueuedCommentIssueContext(issue),

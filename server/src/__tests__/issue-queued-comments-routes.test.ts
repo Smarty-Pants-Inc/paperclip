@@ -234,6 +234,29 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(response.body.entries.slice(1).every((entry: any) => typeof entry.queueRevision === "string" && entry.queueRevision.length > 0)).toBe(true);
   });
 
+  it("reorders an Agent Chat queue across its per-message wakes while a turn runs, and refuses a stale revision", async () => {
+    // S9 (c1, 18:09:08Z): PUT /queued-comments/order with the GET's own
+    // queueId and revision was refused (409) for a chat of three messages.
+    const f = await seedChatTail(["A", "B", "C"]);
+    const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+    const before = (await request(client).get(path).expect(200)).body;
+    expect(before).toMatchObject({ state: "deferred", targetRunId: f.runId, queueId: f.wakeIds[0] });
+    const ids = before.entries.map((entry: any) => entry.comment.id);
+    const reordered = await request(client).put(`${path}/order`)
+      .send({ queueId: before.queueId, revision: before.revision, orderedCommentIds: [ids[2], ids[0], ids[1]] });
+    expect(reordered.status, JSON.stringify(reordered.body)).toBe(200);
+    expect(reordered.body.entries.map((entry: any) => entry.comment.body)).toEqual(["C", "A", "B"]);
+    const after = (await request(client).get(path).expect(200)).body;
+    expect(after.entries.map((entry: any) => entry.comment.body)).toEqual(["C", "A", "B"]);
+    expect(after.queueId).toBe(f.wakeIds[2]);
+    const stale = await request(client).put(`${path}/order`)
+      .send({ queueId: after.queueId, revision: before.revision, orderedCommentIds: ids });
+    expect(stale.status).toBe(409);
+    expect(stale.body.details?.code).toBe("queued_comment_revision_conflict");
+    expect((await request(client).get(path).expect(200)).body.entries.map((entry: any) => entry.comment.body))
+      .toEqual(["C", "A", "B"]);
+  });
+
   it("deletes only B using the later chat entry's own queue identity and revision", async () => {
     const f = await seedChatTail(["A", "B", "C"]);
     const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
@@ -1933,6 +1956,24 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const admitted = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
     expect(admitted.status).toBe(200);
     expect(admitted.body.executionWait).toBeUndefined();
+  });
+
+  it("shows messages behind an ordinary busy turn as queued, not waiting for an unnamed recovery", async () => {
+    // S9 (c1, 18:09:07Z): a running turn, three mid-turn messages, and the
+    // admission default wait no gate named.
+    const seeded = await seedQueue();
+    const executionWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+    await db.update(agentWakeupRequests).set({
+      payload: sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) || ${JSON.stringify({ executionWait })}::jsonb`,
+    }).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    const busy = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+    expect(busy.body).toMatchObject({ state: "deferred", targetRunId: seeded.runId });
+    expect(busy.body.executionWait).toBeUndefined();
+    // Once no turn runs, the saved hold is what the messages wait on.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, seeded.runId));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, seeded.issueId));
+    const held = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+    expect(held.body.executionWait).toEqual(executionWait);
   });
 
   it("returns the authoritative order, preserves full Markdown edits, and rejects stale revisions", async () => {

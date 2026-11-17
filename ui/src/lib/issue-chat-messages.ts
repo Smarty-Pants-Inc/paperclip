@@ -1221,6 +1221,9 @@ export function buildIssueChatMessages(args: {
   for (const comment of sortByCreated(comments)) {
     if (isRedundantAiRecoveryNotice(comment, interactions)) continue;
     if (hiddenIds.has(comment.id)) continue;
+    // A superseded system notice is withdrawn, not something a person deleted:
+    // it leaves no placeholder. Deleted person and agent comments keep theirs.
+    if (comment.deletedAt && effectiveCommentAuthorType(comment) === "system") continue;
     orderedMessages.push({
       createdAtMs: toTimestamp(comment.createdAt),
       order: 1,
