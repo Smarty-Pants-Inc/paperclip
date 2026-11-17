@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -24,6 +24,35 @@ describeEmbeddedPostgres("agent task hierarchy depth", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each([
+    [undefined, 2], ["", 2], ["invalid", 2], ["0", 2], ["-1", 2],
+    ["1.5", 2], ["9007199254740992", 2], [" 5 ", 5],
+  ] as const)("uses configured agent depth %s, preserving the default placement on invalid input", async (raw, limit) => {
+    vi.stubEnv("PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH", raw);
+    const { companyId } = await seedCompany();
+    const rootId = await seedIssue(companyId);
+    const chain = [rootId];
+    for (let depth = 2; depth <= 5; depth++) {
+      chain.push(await seedIssue(companyId, { parentId: chain.at(-1)! }));
+    }
+    // The fifth level is ordinary work only when the operator raises the cap.
+    const requestedParentId = chain[3]!;
+    const effectiveParentId = chain[limit - 2]!;
+    const placement = await resolveNewTaskParent(db, companyId, requestedParentId);
+    expect(placement.effectiveParentId).toBe(effectiveParentId);
+    const created = await issueService(db).create(companyId, {
+      title: "Configured-depth child", parentId: requestedParentId, expectedParentId: effectiveParentId,
+    });
+    expect(created.parentId).toBe(effectiveParentId);
+    expect(created.parentAdjusted?.reason).toBe(limit === 5 ? undefined : "max_agent_depth");
+    // The configured cap still binds at exactly its own depth.
+    expect(await resolveNewTaskParent(db, companyId, chain[limit - 1]!)).toMatchObject({
+      effectiveParentId, adjustment: { reason: "max_agent_depth", applied: true },
+    });
   });
 
   async function seedCompany() {
