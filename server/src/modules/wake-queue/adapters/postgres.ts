@@ -967,10 +967,17 @@ async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: I
   const strings = (value: unknown) => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
   const accounted = new Set([...strings(result.stopRestoredSteeredCommentIds), ...strings(result.restoredSteeredCommentIds),
     ...strings(context.answeredSteeredCommentIds)]);
+  // In the order they were steered (rf5 F3), never JSONB key order: steeredCommentIds is appended by the
+  // steer route in the same transaction that records each acknowledgement, under the run-row lock, and only
+  // the queue head can be steered, so it is the person's queue order. Then the ack time, then the id.
+  const steeredOrder = strings(context.steeredCommentIds);
+  const rank = (id: string) => { const index = steeredOrder.indexOf(id); return index < 0 ? steeredOrder.length : index; };
   const acks = Object.entries(parseObject(result.queuedSteeringAcknowledgements))
     .map(([id, value]) => ({ id, ack: parseObject(value) }))
     .filter(({ ack }) => ack.status === "acknowledged")
-    .sort((a, b) => String(a.ack.acknowledgedAt ?? "").localeCompare(String(b.ack.acknowledgedAt ?? "")));
+    .sort((a, b) => rank(a.id) - rank(b.id)
+      || String(a.ack.acknowledgedAt ?? "").localeCompare(String(b.ack.acknowledgedAt ?? ""))
+      || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   // The steer route writes both records; either one alone still names a steer.
   const steered = [...acks.map(({ id, ack }) => ({ id, queueId: readNonEmptyString(ack.queueId) })),
     ...strings(context.steeredCommentIds).filter((id) => !acks.some((entry) => entry.id === id)).map((id) => ({ id, queueId: null }))]
