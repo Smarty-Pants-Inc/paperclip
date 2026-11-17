@@ -910,7 +910,7 @@ function TranscriptProviderActivity({ block, density, runLogHref }: { block: Ext
       {children.length > 0 ? <ul className="space-y-1">{children.map((child, index) => <li key={String(child.childId ?? index)}><strong>{String(child.role ?? "Child agent")}</strong> · {String(child.status ?? "unknown")}<div className="text-muted-foreground">{String(child.summary ?? "")}</div></li>)}</ul> : null}
       {sources.length > 0 ? <ul className="space-y-1">{sources.map((source, index) => { const url = typeof source.url === "string" && /^https?:\/\//.test(source.url) ? source.url : null; return <li key={String(source.sourceId ?? index)}>{url ? <a className="underline" href={url} target="_blank" rel="noreferrer">{String(source.title ?? url)}</a> : String(source.title ?? "Unavailable source")} <span className="text-muted-foreground">Provider-reported</span></li>; })}</ul> : null}
       {output ? <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-background p-2 font-mono">{output}</pre> : null}
-      {block.payload.outputTruncated === true ? <SavedOutputNotice runLogHref={runLogHref} /> : null}
+      {block.payload.outputTruncated === true ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
       {block.family === "provider_notice" && Array.isArray(block.payload.details) ? <dl className="space-y-1">{block.payload.details.map((value, index) => { const detail = asRecord(value); return detail && typeof detail.name === "string" && typeof detail.value === "string" ? <div key={index}><dt className="text-muted-foreground">{detail.name}</dt><dd className="whitespace-pre-wrap break-words">{detail.value}</dd></div> : null; })}</dl> : null}
       {block.family === "model_identity" ? <div><span className="text-muted-foreground">Requested</span> {String(block.payload.requestedModel ?? "—")} · <span className="text-muted-foreground">Effective</span> {String(block.payload.effectiveModel ?? "—")}</div> : null}
     </div> : null}
@@ -1159,7 +1159,7 @@ function TranscriptToolCard({
                 </pre>
               </div>
             </div>
-            {block.outputTruncated ? <SavedOutputNotice runLogHref={runLogHref} /> : null}
+            {block.outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
             <ToolDecisionDetails decision={decision} compact={compact} />
           </div>
         </div>
@@ -1306,7 +1306,7 @@ function TranscriptCommandGroup({
                   {item.outputTruncated ? item.result : formatToolPayload(item.result)}
                 </pre>
               )}
-              {item.outputTruncated ? <SavedOutputNotice runLogHref={runLogHref} /> : null}
+              {item.outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
               <ToolDecisionDetails decision={findToolDecision(toolDecisionMaps, item)} compact={compact} />
             </div>
           ))}
@@ -1459,7 +1459,7 @@ function TranscriptToolGroup({
                   </div>
                 )}
               </div>
-              {item.outputTruncated ? <SavedOutputNotice runLogHref={runLogHref} /> : null}
+              {item.outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
               <div className="pl-7">
                 <ToolDecisionDetails decision={findToolDecision(toolDecisionMaps, item)} compact={compact} />
               </div>
@@ -1885,7 +1885,7 @@ function RawTranscriptView({
           <pre className="min-w-0 whitespace-pre-wrap break-words text-foreground/80">
             {rawEntryContent(entry)}
           </pre>
-          {(entry.kind === "tool_result" && entry.outputTruncated) || (entry.kind === "provider_activity" && entry.payload.outputTruncated === true) ? <div className="col-start-2"><SavedOutputNotice runLogHref={runLogHref} /></div> : null}
+          {(entry.kind === "tool_result" && entry.outputTruncated) || (entry.kind === "provider_activity" && entry.payload.outputTruncated === true) ? <div className="col-start-2"><SavedOutputNotice fullTextKept runLogHref={runLogHref} /></div> : null}
         </div>
       ))}
       {bottomSpacer > 0 && <div aria-hidden="true" style={{ height: bottomSpacer }} />}

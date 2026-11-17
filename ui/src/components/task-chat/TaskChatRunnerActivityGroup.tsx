@@ -427,7 +427,7 @@ function ActivityDetailsBody({ item }: { item: Activity }) {
         <TaskChatDiffView lines={item.diff.lines} truncated={item.diff.truncated} runLogHref={item.runLogHref} />
         {outputTruncated ? <>
           {detail ? <pre className="whitespace-pre-wrap break-words font-mono">{detail}</pre> : null}
-          <SavedOutputNotice runLogHref={item.runLogHref} />
+          <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} />
         </> : null}
       </>
     );
@@ -443,7 +443,7 @@ function ActivityDetailsBody({ item }: { item: Activity }) {
           {detail}
         </pre>
       ) : null}
-      {outputTruncated ? <SavedOutputNotice runLogHref={item.runLogHref} /> : null}
+      {outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
       {item.decision ? <p>Permission {item.decision}</p> : null}
       {item.diff ? (
         <p className="break-all font-mono">

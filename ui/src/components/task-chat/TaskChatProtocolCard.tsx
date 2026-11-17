@@ -408,7 +408,7 @@ function ProviderActivityCard({
             </pre>
           ) : null}
           {item.outputTruncated ? (
-            <SavedOutputNotice runLogHref={item.runLogHref} />
+            <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} />
           ) : null}
         </details>
       ) : null}

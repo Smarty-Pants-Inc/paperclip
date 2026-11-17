@@ -146,7 +146,7 @@ export function TaskChatToolCard({ item }: { item: TaskChatToolItem }) {
           {detail}
         </pre>
       ) : null}
-      {outputTruncated && showDetail ? <SavedOutputNotice runLogHref={item.runLogHref} /> : null}
+      {outputTruncated && showDetail ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
       {item.diff && showDetail ? (
         item.diff.lines && item.diff.lines.length > 0 ? (
           <div className="ml-1.5 mt-1 min-w-0 max-w-full" data-testid="task-chat-tool-diff">

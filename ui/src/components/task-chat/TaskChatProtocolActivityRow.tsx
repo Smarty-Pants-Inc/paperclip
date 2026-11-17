@@ -128,7 +128,7 @@ function ResearchDetails({ item }: { item: TaskChatProviderActivityItem }) {
       ) : null}
       <DetailList details={additionalDetails} />
       {item.output ? <pre className="max-h-(--sz-64) overflow-auto whitespace-pre-wrap rounded-sm bg-muted/50 p-2 font-mono text-(length:--text-micro) text-foreground">{item.output}</pre> : null}
-      {item.outputTruncated ? <SavedOutputNotice runLogHref={item.runLogHref} /> : null}
+      {item.outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
     </div>
   );
 }
@@ -180,7 +180,7 @@ function ProviderDetails({ item, neutral = false }: { item: TaskChatProviderActi
       {item.output ? (
         <pre className="max-h-(--sz-64) overflow-auto whitespace-pre-wrap rounded-sm bg-muted/50 p-2 font-mono text-(length:--text-micro) text-foreground">{item.output}</pre>
       ) : null}
-      {item.outputTruncated ? <SavedOutputNotice runLogHref={item.runLogHref} /> : null}
+      {item.outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
     </div>
   );
 }

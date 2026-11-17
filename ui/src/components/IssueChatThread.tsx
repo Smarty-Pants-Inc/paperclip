@@ -1,5 +1,6 @@
 import { createUuid } from "@/lib/uuid";
 import { SavedOutputNotice } from "./task-chat/SavedOutputNotice";
+import { savedOutputForDisplay } from "./task-chat/saved-output";
 import { useCurrentAccountGuard } from "../hooks/useAccountBoundMutation";
 import { resolveIssueChatHumanAuthor } from "@/lib/issue-chat-human-author";
 import { useCurrentWorkspaceRetry, useWorkspaceBaseRefRecovery, useWorkspaceRetry } from "./WorkspaceBaseRefRecovery";
@@ -1695,12 +1696,13 @@ function IssueChatToolPart({
   }
   const rawArgsText = argsText ?? "";
   const parsedArgs = args ?? parseToolPayload(rawArgsText);
-  const resultText =
+  const rawResultText =
     typeof result === "string"
       ? result
       : result === undefined
         ? ""
         : formatToolPayload(result);
+  const { output: resultText = "", outputTruncated } = savedOutputForDisplay(rawResultText);
   const inputDetails = describeToolInput(toolName, parsedArgs);
   const displayName = displayToolName(toolName, parsedArgs);
   const isCommand = isCommandTool(toolName, parsedArgs);
@@ -1791,6 +1793,7 @@ function IssueChatToolPart({
                 </CopyablePreBlock>
               </div>
             ) : null}
+            {outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
           </div>
         ) : null}
       </div>
@@ -1823,7 +1826,7 @@ function IssueChatProviderActivity({
       : {};
   const title =
     typeof value.title === "string" ? value.title : "Provider activity";
-  const summary = typeof value.summary === "string" ? value.summary : "";
+  const summary = savedOutputForDisplay(typeof value.summary === "string" ? value.summary : "").output ?? "";
   const steps = Array.isArray(payload.steps) ? payload.steps : [];
   const children = Array.isArray(payload.children)
     ? payload.children
@@ -1831,8 +1834,9 @@ function IssueChatProviderActivity({
   const sources = Array.isArray(payload.sources)
     ? payload.sources
     : [];
-  const output =
-    typeof payload.output === "string" ? payload.output : "";
+  const { output = "", outputTruncated } = savedOutputForDisplay(
+    typeof payload.output === "string" ? payload.output : "", payload.outputTruncated === true,
+  );
   const effectiveModel =
     typeof payload.effectiveModel === "string" ? payload.effectiveModel : null;
   const requestedModel =
@@ -1843,7 +1847,7 @@ function IssueChatProviderActivity({
     sources.length > 0 ||
     output.length > 0 ||
     summary.length > 0 ||
-    payload.outputTruncated === true ||
+    outputTruncated ||
     effectiveModel !== null;
   return (
     <div
@@ -1881,7 +1885,7 @@ function IssueChatProviderActivity({
         {open && hasDetails ? (
           <div className="mt-1 space-y-2 rounded-md border border-border/50 bg-accent/15 p-2 text-xs">
             {summary ? <p className="whitespace-pre-wrap break-words">{summary}</p> : null}
-            {payload.outputTruncated === true ? <SavedOutputNotice runLogHref={runLogHref} /> : null}
+            {outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
             {steps.map((entry, index) => {
               const step =
                 typeof entry === "object" && entry !== null
