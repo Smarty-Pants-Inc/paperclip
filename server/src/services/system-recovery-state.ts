@@ -99,10 +99,13 @@ export function reserveSystemRecoveryAttempt(state: SystemRecoveryState, now = D
       (state.nextAttemptAt !== null && state.nextAttemptAt > now)) return null;
   // A reclaimed physical owner first reconciles the same interrupted attempt.
   // Starting another call is not evidence that the prior call failed.
-  if (state.state === "running" && state.attemptId) return { ...state, revision: state.revision + 1 };
-  if ((state.deadlineAt !== null && now >= state.deadlineAt) ||
-      (state.attempts > 0 && state.retriesUsed >= SYSTEM_RECOVERY_MAX_RETRIES)) return null;
-  return { ...state, revision: state.revision + 1, state: "running", attemptId: randomUUID(),
+  // An attempt that never reports is still bounded: the window starts when the
+  // first attempt starts, and a reclaim past it is refused (the caller exhausts).
+  if (state.deadlineAt !== null && now >= state.deadlineAt) return null;
+  const deadlineAt = state.deadlineAt ?? now + SYSTEM_RECOVERY_WINDOW_MS;
+  if (state.state === "running" && state.attemptId) return { ...state, revision: state.revision + 1, deadlineAt };
+  if (state.attempts > 0 && state.retriesUsed >= SYSTEM_RECOVERY_MAX_RETRIES) return null;
+  return { ...state, revision: state.revision + 1, state: "running", attemptId: randomUUID(), deadlineAt,
     attempts: state.attempts + 1, retriesUsed: state.retriesUsed + (state.attempts > 0 ? 1 : 0), nextAttemptAt: null };
 }
 
@@ -113,7 +116,10 @@ export function failSystemRecovery(
 ): SystemRecoveryState {
   const now = options.now ?? Date.now();
   const firstFailureAt = state.firstFailureAt ?? now;
-  const deadlineAt = state.deadlineAt ?? firstFailureAt + SYSTEM_RECOVERY_WINDOW_MS;
+  // The first failure sets the retry window as before; the provisional bound an
+  // attempt start set (reserveSystemRecoveryAttempt) only covers a silent attempt.
+  const deadlineAt = state.firstFailureAt === null ? firstFailureAt + SYSTEM_RECOVERY_WINDOW_MS
+    : state.deadlineAt ?? firstFailureAt + SYSTEM_RECOVERY_WINDOW_MS;
   const retryNumber = state.retriesUsed + 1;
   const entropy = createHash("sha256").update(`${state.generationId}:${retryNumber}`).digest().readUInt32BE(0) / 0xffffffff;
   const delay = infrastructureRetryDelayMs(retryNumber, entropy);
