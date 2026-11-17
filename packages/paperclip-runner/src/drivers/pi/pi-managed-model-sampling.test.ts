@@ -5,6 +5,7 @@ import { buildPiManagedModel, piManagedModelDefinition, type PiBuiltinModelCatal
 import { PI_MODEL_ROUTING_FIELDS, validateBindRequest } from "./pi-bind-protocol.js";
 
 const api = "openai-completions";
+const affinity = { sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" };
 const base = { id: "sampling-proof", name: "Sampling proof", input: ["text" as const], contextWindow: 128000, maxTokens: 8192, reasoning: true, compat: {} };
 const protectedKeys = ["model", ...PI_MODEL_ROUTING_FIELDS, "reasoning_effort", "reasoningEffort", "reasoning", "thinking", "effort", "budget_tokens", "thinking_budget", "thinking_token_budget", "thinking_budget_tokens", "enable_thinking", "preserve_thinking", "thinkingBudget", "thinkingBudgets", "thinkingEnabled", "thinkingBudgetTokens", "thinkingLevel", "thinkingConfig", "thinking_config", "thinking_level", "chat_template_kwargs", "chat_template_args"];
 
@@ -12,7 +13,7 @@ it("strips the reported same-id model/effort bypass but preserves temperature", 
   const source = { ...base, samplingParams: { model: "x", temperature: 0.3, reasoning_effort: "max" } };
   const diagnostics: string[] = [];
   const actual = await buildPiManagedModel({ snapshot: { providers: { paperclip: { api, models: [source] } } }, id: base.id, api, warn: message => diagnostics.push(message) });
-  expect(actual).toEqual({ ...base, samplingParams: { temperature: 0.3 } });
+  expect(actual).toEqual({ ...base, compat: affinity, samplingParams: { temperature: 0.3 } });
   expect(diagnostics).toEqual([
     'stripped protected sampling key "model" at "samplingParams.model"',
     'stripped protected sampling key "reasoning_effort" at "samplingParams.reasoning_effort"',
@@ -36,7 +37,7 @@ it("does not truncate away per-key diagnostics when config and catalog repeat un
   const catalog: PiBuiltinModelCatalog = { getBuiltinProviders: () => ["openai"], getBuiltinModels: () => [{ ...source, api }] };
   const diagnostics: string[] = [];
   const actual = await buildPiManagedModel({ snapshot: { providers: { paperclip: { api, models: [source] } } }, id: base.id, api, catalog, warn: message => diagnostics.push(message) });
-  expect(actual).toEqual({ ...base, samplingParams: {} });
+  expect(actual).toEqual({ ...base, compat: affinity, samplingParams: {} });
   expect(diagnostics).toHaveLength(protectedKeys.length);
   for (const key of protectedKeys) expect(diagnostics.filter(message => message.includes(`stripped protected sampling key "${key}"`))).toHaveLength(1);
 });
