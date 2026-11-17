@@ -1,5 +1,5 @@
-import { and, eq, sql } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq, isNull, sql } from "drizzle-orm";
+import { heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
@@ -56,6 +56,27 @@ function hasSettledCancellationReceipt(run: Pick<typeof heartbeatRuns.$inferSele
     && receipt.companyId === run.companyId && receipt.issueId === run.nativeIssueId;
 }
 
+/** pl/r4-work (live e9608e9c): NSE settles a person's acknowledged Stop on the
+ * coordinator (terminal_failure / native_retry_cancelled, no lease owner, no
+ * result) after the provider turn ended and BEFORE it releases the warm session,
+ * whether that session was retained (idle receipt) or CLOSED (Pi's abort ladder
+ * not certified clean, an instruction checkpoint refused, ...). It then throws the
+ * NativeCancellationPendingRecoveryError this boundary handles, so the session is
+ * released (closed) before the export starts. A closed session leaves the turn's
+ * edit on the box all the same: without this export the reuse filter hides that
+ * box and the next message takes another box without the edit. */
+async function hasSettledStopCoordinator(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "nativeIssueId">): Promise<boolean> {
+  if (!run.nativeIssueId) return false;
+  const [coordinator] = await db.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.companyId, run.companyId),
+    eq(nativeRunFinalizations.issueId, run.nativeIssueId),
+    eq(nativeRunFinalizations.phase, "terminal_failure"), eq(nativeRunFinalizations.failureCode, "native_retry_cancelled"),
+    isNull(nativeRunFinalizations.leaseOwner), isNull(nativeRunFinalizations.resultId),
+  )).limit(1);
+  return Boolean(coordinator);
+}
+
 /**
  * At the cancellation boundary of a person's Stop of a warm (keep_running)
  * turn, finish the run's own prepared native-workspace export under the run's
@@ -84,7 +105,8 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   )).limit(1);
   if (!run || run.runtimeMode !== "native"
     || admittedNativeResourceDisposition(run.runnerProfileJson) !== "keep_running") return { outcome: "not_applicable" };
-  if (!hasAcknowledgedNativeStopIntent(run) || !hasSettledCancellationReceipt(run)) return { outcome: "not_settled" };
+  if (!hasAcknowledgedNativeStopIntent(run)
+    || (!hasSettledCancellationReceipt(run) && !await hasSettledStopCoordinator(input.db, run))) return { outcome: "not_settled" };
 
   const timeoutMs = input.timeoutMs ?? CANCELLED_WARM_EXPORT_TIMEOUT_MS;
   // pl/cancel-finalize2: ONE aggregate bound for the whole export. At the
