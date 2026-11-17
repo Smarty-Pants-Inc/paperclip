@@ -285,6 +285,7 @@ import {
   issues,
   nativeHarnessBackups,
   nativeRunFinalizations,
+  nativeRunnerCheckpoints,
   nativeRunResults,
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
@@ -8028,16 +8029,20 @@ async function refreshFinishedPerTurnRunnerdProjection(
   const refuse = (reason: string): never => { throw new Error(`native_runner_checkpoint_projection_held:${reason}`); };
   const { companyId } = input.execution.binding;
   const runIds = [...new Set([reference.runId, sourceRunId, input.execution.binding.runId])];
-  const decisionState = async (db: Db) => JSON.stringify({
-    coordinators: (await db.select().from(nativeRunFinalizations).where(and(
-      eq(nativeRunFinalizations.companyId, companyId), inArray(nativeRunFinalizations.runId, runIds))))
-      .sort((a, b) => a.runId.localeCompare(b.runId)),
-    runs: (await db.select().from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds))))
-      .sort((a, b) => a.id.localeCompare(b.id)),
-    leases: (await db.select().from(environmentLeases).where(and(
-      eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, runIds))))
-      .sort((a, b) => a.id.localeCompare(b.id)),
+  // Compare PostgreSQL's canonical row text, including every timestamp at DB
+  // precision. ORM rows would silently truncate microseconds in JS Dates.
+  const leaseState = (db: Db) => db.select({ state: sql<string>`to_jsonb(${environmentLeases})::text` }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, runIds)))
+    .orderBy(environmentLeases.id);
+  const runState = (db: Db) => db.select({ state: sql<string>`to_jsonb(${heartbeatRuns})::text` }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds)))
+    .orderBy(heartbeatRuns.id);
+  const decisionState = async (db: Db) => ({
+    coordinators: await db.select({ state: sql<string>`to_jsonb(${nativeRunFinalizations})::text` }).from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, companyId), inArray(nativeRunFinalizations.runId, runIds)))
+      .orderBy(nativeRunFinalizations.runId),
+    runs: await runState(db),
+    leases: await leaseState(db),
   });
   const expectedState = await decisionState(input.db);
   const recoveryInput = {
@@ -8051,12 +8056,30 @@ async function refreshFinishedPerTurnRunnerdProjection(
   let previousCheckpoint: Awaited<ReturnType<typeof loadNativeRunnerCheckpoint>> = null;
   const applyLocked = async (apply: () => Promise<void> | void) => input.db.transaction(async tx => {
     await lockSourceRecoveryCoordinators(tx, companyId, runIds);
-    if (await decisionState(tx as unknown as Db) !== expectedState) return refuse("source_changed");
+    if (JSON.stringify(await decisionState(tx as unknown as Db)) !== JSON.stringify(expectedState)) return refuse("source_changed");
     const current = await resolveNativeControllerRecovery(tx as unknown as Db, recoveryInput);
     if (current.kind !== "recoverable" || current.checkpoint.runId !== sourceRunId
       || nativeSha256(current.snapshot) !== nativeSha256(recovered.snapshot)
       || nativeSha256(current.metadata) !== nativeSha256(recovered.metadata)
       || checkpointState(current.checkpoint) !== checkpointState(recovered.checkpoint)) return refuse("source_changed");
+    if (previousCheckpoint) {
+      const previous = await loadNativeRunnerCheckpoint(tx as unknown as Db, { ...input.execution.binding, runId: reference.runId });
+      if (!previous || checkpointState(previous) !== checkpointState(previousCheckpoint)) return refuse("source_changed");
+    }
+    // Fence the compare-to-apply interval, including writes committed while the
+    // checkpoint reads above were in flight. Stable order: coordinators (above),
+    // leases by id, runs by id, then checkpoint parts by run id / part.
+    if (JSON.stringify(await leaseState(tx as unknown as Db).for("update")) !== JSON.stringify(expectedState.leases)) {
+      return refuse("source_changed");
+    }
+    if (JSON.stringify(await runState(tx as unknown as Db).for("update")) !== JSON.stringify(expectedState.runs)) {
+      return refuse("source_changed");
+    }
+    await tx.select({ part: nativeRunnerCheckpoints.part }).from(nativeRunnerCheckpoints).where(and(
+      eq(nativeRunnerCheckpoints.companyId, companyId), inArray(nativeRunnerCheckpoints.runId, runIds)))
+      .orderBy(nativeRunnerCheckpoints.runId, nativeRunnerCheckpoints.part).for("update");
+    const lockedCheckpoint = await loadNativeRunnerCheckpoint(tx as unknown as Db, { ...input.execution.binding, runId: sourceRunId });
+    if (!lockedCheckpoint || checkpointState(lockedCheckpoint) !== checkpointState(recovered.checkpoint)) return refuse("source_changed");
     if (previousCheckpoint) {
       const previous = await loadNativeRunnerCheckpoint(tx as unknown as Db, { ...input.execution.binding, runId: reference.runId });
       if (!previous || checkpointState(previous) !== checkpointState(previousCheckpoint)) return refuse("source_changed");

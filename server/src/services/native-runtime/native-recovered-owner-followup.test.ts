@@ -30,6 +30,17 @@ import {
 } from "./predecessor-retirement.js";
 
 const toolDefinitions = vi.hoisted(() => vi.fn());
+// RFL's real-PostgreSQL after-CAS race: only the checkpoint read boundary is
+// controlled; the competing lease write uses a separate database connection.
+const checkpointReadHook = vi.hoisted(() => ({ callback: null as null | (() => Promise<void>) }));
+vi.mock("./native-runner-checkpoint.js", async importOriginal => {
+  const original = await importOriginal<typeof import("./native-runner-checkpoint.js")>();
+  return { ...original, loadNativeRunnerCheckpoint: async (...args: Parameters<typeof original.loadNativeRunnerCheckpoint>) => {
+    const checkpoint = await original.loadNativeRunnerCheckpoint(...args);
+    await checkpointReadHook.callback?.();
+    return checkpoint;
+  } };
+});
 vi.mock("../../runtime-api.js", async importOriginal => ({ ...await importOriginal<typeof import("../../runtime-api.js")>(), resolveLocalRuntimeApiUrl: () => "http://127.0.0.1:43219" }));
 vi.mock("./paperclip-runner-tool-authority.js", () => ({
   PaperclipRunnerToolAuthority: class {
@@ -405,13 +416,23 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).not.toContain("starting a new runner for this conversation");
   }, 60_000);
 
-  it.each([false, true].flatMap(external => ["no transaction", "coordinator changed", "coordinator timestamp changed"].map(scenario => ({ external, scenario }))))(
+  it.each([
+    ...[false, true].flatMap(external => ["no transaction", "coordinator changed", "coordinator timestamp changed",
+      "coordinator microsecond changed", "source run changed", "prior run changed", "source lease changed", "source checkpoint deleted"]
+      .map(scenario => ({ external, scenario }))),
+    { external: true, scenario: "lease changed after CAS" },
+  ])(
     "probes a resumed projection before locking: $scenario (external=$external)", async ({ external, scenario }) => {
       const fixture = await staleProjection("codex", external), { prior, latest, followUp, root, path } = fixture;
       await recordPriorLeaseOnSameSandbox(prior, followUp);
       await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
         issueId: prior.issueId, heartbeatRunId: latest.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
         status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+      if (scenario === "coordinator microsecond changed") {
+        // Keep the 1µs mutation inside one JS millisecond, deterministically.
+        await db.update(nativeRunFinalizations).set({ updatedAt: sql`date_trunc('milliseconds', ${nativeRunFinalizations.updatedAt}) + interval '123 microseconds'` })
+          .where(eq(nativeRunFinalizations.runId, latest.runId));
+      }
       type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
       let active: Transaction | undefined, probes = 0, checks = 0, openProbeTransactions = 0, changed = false;
       const transaction = db.transaction.bind(db);
@@ -420,6 +441,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         try { return await callback(tx); }
         finally { active = undefined; }
       }, config));
+      if (scenario === "lease changed after CAS") checkpointReadHook.callback = async () => {
+        if (active && checks >= 2 && !changed) {
+          await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || '{"judgeChangedAfterCAS":true}'::jsonb` })
+            .where(eq(environmentLeases.heartbeatRunId, latest.runId));
+          changed = true;
+        }
+      };
       const execute = followUp.remoteExecute.getMockImplementation()!;
       followUp.remoteExecute.mockImplementation(async request => {
         const text = JSON.stringify(request);
@@ -433,10 +461,22 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
             lifecycle: "suspended", outbox: [], pendingTerminalDelivery: null, pendingProviderCleanup: null,
             warmTransition: null })).toString("base64"), stderr: "" };
         const result = await execute(request);
-        if (text.includes("paperclip-runner-generation-check") && ++checks === 2 && scenario !== "no transaction") {
-          await (active ?? db).update(nativeRunFinalizations).set(scenario === "coordinator changed"
-            ? { controllerGeneration: 2 } : { updatedAt: new Date(Date.now() + 60_000) })
-            .where(eq(nativeRunFinalizations.runId, latest.runId));
+        if (text.includes("paperclip-runner-generation-check") && ++checks === 2
+          && scenario !== "no transaction" && scenario !== "lease changed after CAS") {
+          if (scenario === "source run changed" || scenario === "prior run changed") {
+            await db.update(heartbeatRuns).set({ updatedAt: new Date(Date.now() + 60_000) })
+              .where(eq(heartbeatRuns.id, scenario === "source run changed" ? latest.runId : prior.runId));
+          } else if (scenario === "source lease changed") {
+            await db.update(environmentLeases).set({ metadata: { remoteCwd: "/workspace", changedBeforeCAS: true } })
+              .where(eq(environmentLeases.heartbeatRunId, latest.runId));
+          } else if (scenario === "source checkpoint deleted") {
+            await db.delete(nativeRunnerCheckpoints).where(eq(nativeRunnerCheckpoints.runId, latest.runId));
+          } else {
+            await (active ?? db).update(nativeRunFinalizations).set(scenario === "coordinator changed"
+              ? { controllerGeneration: 2 } : { updatedAt: scenario === "coordinator microsecond changed"
+                ? sql`${nativeRunFinalizations.updatedAt} + interval '1 microsecond'` : new Date(Date.now() + 60_000) })
+              .where(eq(nativeRunFinalizations.runId, latest.runId));
+          }
           changed = true;
         }
         return result;
@@ -456,7 +496,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
           expect(await archivedOwners(root)).toEqual([]);
         }
         await fixture.assertBackup();
-      } finally { spy.mockRestore(); }
+      } finally { checkpointReadHook.callback = null; spy.mockRestore(); }
     }, 60_000);
 
   it("starts an unclaimed remote follow-up from the previous owner's external marker under a bootstrap claim", async () => {
