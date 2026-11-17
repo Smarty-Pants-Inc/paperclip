@@ -155,7 +155,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       logger.warn({ err: error, runId: row.runId }, "Agent file cleanup deferred; save receipt unchanged");
     }
   }
-  async function prepare(input: { companyId: string; agentId: string; runId: string; target?: AdapterExecutionTarget | null; cwd: string; legacy?: boolean; warm?: boolean; reuseRunId?: string; onWarmHandoff?: (copy: Copy) => void }) {
+  async function prepare(input: { companyId: string; agentId: string; runId: string; target?: AdapterExecutionTarget | null; cwd: string; legacy?: boolean; warm?: boolean; reuseRunId?: string; runnerStateDirectory?: string; onWarmHandoff?: (copy: Copy) => void }) {
     const existing = await get(input.companyId, input.runId);
     if (isAgentDirectoryCopy(existing) || (!existing && !input.legacy)) return directories.prepare(input);
     let refreshStoppedCopy = false;
