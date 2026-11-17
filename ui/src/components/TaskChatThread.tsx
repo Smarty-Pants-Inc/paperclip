@@ -3755,6 +3755,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                           onEdit={beginQueuedEdit}
                           editingCommentId={queuedEdit?.commentId ?? null}
                           autoSteerDelayMs={queuedMessageAutoSteerDelayMs}
+                          steerHeadOnly={conversationMode === true}
                           onReorder={async (orderedCommentIds, revision) => {
                             if (!onReorderQueuedComments)
                               throw new Error("Queue reordering is unavailable.");

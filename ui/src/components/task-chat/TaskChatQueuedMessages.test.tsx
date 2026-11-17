@@ -701,5 +701,38 @@ describe("TaskChatQueuedMessages", () => {
       await advance(10_000);
       expect(props.onSteer).not.toHaveBeenCalled();
     });
+
+    // Agent Chat (Paul P0, 11-17): steer is the default for a chat with a
+    // live native turn, its rows stay mutable, and only the head is steered.
+    it("steers a chat queue from its head after 5 s, one message at a time, with mutable rows", async () => {
+      const at = new Date(Date.now());
+      const chat: IssueQueuedCommentQueue = { ...queue, entries: queue.entries.map(entry => ({
+        ...entry, comment: { ...entry.comment, createdAt: at, updatedAt: at } })) };
+      const props = render({ queue: chat, autoSteerDelayMs: delay, steerHeadOnly: true });
+      const grip = container.querySelector<HTMLButtonElement>('[aria-label="Reorder queued message: Second queued message"]');
+      expect(grip?.disabled).toBe(false);
+      expect(countdown()?.textContent).toContain("Sending in 5s");
+      expect(container.querySelector('[data-testid="task-chat-queued-auto-steer-comment-2"]')).toBeNull();
+      await advance(5_100);
+      expect(props.onSteer).toHaveBeenCalledOnce();
+      expect(props.onSteer).toHaveBeenCalledWith("comment-1", "rev-1");
+      // The second message waits until it is the head of the refreshed queue.
+      await advance(10_000);
+      expect(props.onSteer).toHaveBeenCalledOnce();
+      const refreshed = { ...chat, revision: "rev-2", entries: chat.entries.slice(1).map(entry => ({ ...entry, position: 0 })) };
+      await act(async () => { render({ ...props, queue: refreshed }); });
+      await advance(5_100);
+      expect(props.onSteer).toHaveBeenCalledTimes(2);
+      expect(props.onSteer).toHaveBeenLastCalledWith("comment-2", "rev-2");
+    });
+
+    it("never automatically steers a /new chat reset", async () => {
+      const reset = fresh();
+      reset.entries = reset.entries.map(entry => ({ ...entry, comment: { ...entry.comment, body: "/new" } }));
+      const props = render({ queue: reset, autoSteerDelayMs: delay, steerHeadOnly: true });
+      expect(countdown()).toBeNull();
+      await advance(10_000);
+      expect(props.onSteer).not.toHaveBeenCalled();
+    });
   });
 });
