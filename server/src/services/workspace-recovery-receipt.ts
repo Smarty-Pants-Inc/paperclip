@@ -6,11 +6,13 @@ import { z } from "zod";
 import { readNativeWorkspaceSyncReference, type NativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { readSnapshot } from "./workspace-recovery-snapshot.js";
-import { exhaustedStopWait, exhaustedSystemRecoveryAction, isCapturePolicyRearmable, readSystemRecovery } from "./system-recovery-state.js";
+import { exhaustedStopWait, exhaustedSystemRecoveryAction, isCapturePolicyRearmable, isExhaustedStopProofWait, readSystemRecovery,
+  stopProofRearmsSpent } from "./system-recovery-state.js";
 import { verifiedUnchangedRestoredSnapshot, verifiedWorkspaceSnapshotReuse } from "./remote-workspace-snapshot-reuse-receipt.js";
 import { isAbandonedPreparedRemoteWorkspace } from "./remote-workspace-abandoned-preparation.js";
 import { RECOVERED_WORK_RETRY_MESSAGE } from "./native-runtime/held-predecessor-notice-text.js";
-import { decideRetryAuthority } from "./task-retry-eligibility.js";
+import { decideRetryAuthority, restoreStopWaitFact } from "./task-retry-eligibility.js";
+import { owedRestoreAdoptionBlocked } from "./workspace-restore-recovery-state.js";
 
 export const workspaceRecoverySchema = z.object({
   schema: z.literal("paperclip.workspace-recovery.v1"),
@@ -78,33 +80,48 @@ export function recoveredWorkMessage(runStatus: string | null | undefined, retry
  * same rule as the run projection (workspace-restore-recovery-state.ts). */
 export function workspaceRestoreDelayed(state: { status: string } | undefined, evidence: Record<string, unknown>,
   holdWrittenAt: Date | null | undefined, now = Date.now()) {
-  return Boolean(state && (state.status === "queued" || state.status === "recovering")
-    && evidence[WORKSPACE_RESTORE_PENDING_KEY] === true
+  // restore-card8 item 5: the bound covers every owed hold still in progress, as
+  // the run projection does: not adopted yet (no workspaceRecovery: queued, J4/J7),
+  // queued/recovering, or waiting on an unconfirmed stop (J5).
+  const inProgress = state
+    ? state.status === "queued" || state.status === "recovering" || Boolean(exhaustedStopWait(readSystemRecovery(evidence), evidence))
+    : !readWorkspaceRecovery(evidence);
+  return Boolean(inProgress && evidence[WORKSPACE_RESTORE_PENDING_KEY] === true
     && holdWrittenAt && holdWrittenAt.getTime() + WORKSPACE_RESTORE_PERSON_BOUND_MS <= now);
 }
 
 export function savedWorkOffersRetry(state: { status: string; canRetry: boolean } | undefined,
   runStatus: string | null | undefined, workspaceRepairRequired: boolean, evidence: Record<string, unknown>,
   holdWrittenAt?: Date | null) {
-  if (!state || (runStatus !== "failed" && runStatus !== "timed_out")) return false;
-  if (state.status === "recovered") return !workspaceRepairRequired;
+  if (runStatus !== "failed" && runStatus !== "timed_out") return false;
+  if (state?.status === "recovered") return !workspaceRepairRequired;
   // Past the person bound Retry is offered while the worker continues: the
   // accepted Retry is a durable intent bound to this hold (task-retry.ts), so it
   // continues from the last saved version and the hold keeps the files.
   if (workspaceRestoreDelayed(state, evidence, holdWrittenAt)) return true;
+  if (!state) return false;
   const ownerRecovery = evidence.workspaceOwnerRecovery as { state?: unknown } | undefined;
   const recovery = readSystemRecovery(evidence);
-  // Waiting on an unconfirmed stop: Retry cannot release it (one decision with the chat).
-  if (exhaustedStopWait(recovery, evidence)) return false;
+  // Waiting on an unconfirmed stop: Retry cannot release it. The one Retry
+  // authority decides it (its restoreStopWait fact), as for the chat and the API.
+  if (!decideRetryAuthority({ restoreStopWait: restoreStopWaitFact(evidence, holdWrittenAt), retrySource: true }).canRetry) return false;
+  // restore-card8 (rf-3 J8): an agent stop with every re-arm spent is not that
+  // wait (card7's carve-out): it is re-checked no more, so it keeps the Retry
+  // the chat and the API offer. Other evidence re-checks still re-arm by themselves.
+  const rearmsSpentStop = isExhaustedStopProofWait(recovery) && stopProofRearmsSpent(evidence);
   return state.canRetry && !(ownerRecovery?.state === "operator_required" && evidence.workspaceOwnerStop == null)
-    && recovery?.state === "exhausted" && !recovery.freshAttemptRunId && recovery.failure?.retryClass !== "recheck_evidence"
+    && recovery?.state === "exhausted" && !recovery.freshAttemptRunId
+    && (recovery.failure?.retryClass !== "recheck_evidence" || rearmsSpentStop)
     && !isCapturePolicyRearmable(recovery);
 }
 
 export function workspaceRecoveryDisplay(evidence: Record<string, unknown>, runId: string | null,
   run?: { status: string | null; retryOffered: boolean; heldConversation?: boolean; agentPaused?: boolean }): ExecutionBlocker["workspaceRecovery"] {
-  const state = readWorkspaceRecovery(evidence);
-  if (!state || state.runId !== runId) return undefined;
+  const stored = readWorkspaceRecovery(evidence);
+  if (!stored || stored.runId !== runId) return undefined;
+  // restore-card8 (J9): a blocked adoption of owed files is still queued (the
+  // run projection's rule, workspace-restore-recovery-state.ts), never failed.
+  const state = owedRestoreAdoptionBlocked(evidence) ? { ...stored, status: "queued" as const } : stored;
   return { status: state.status, stage: state.stage,
     canRetry: state.status === "blocked" && state.retryable === true && !exhaustedStopWait(readSystemRecovery(evidence), evidence),
     message: state.status === "queued" || state.status === "recovering" ? "Recovering saved work…"

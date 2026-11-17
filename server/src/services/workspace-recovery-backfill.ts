@@ -1,7 +1,10 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, heartbeatRuns, issues, issueRecoveryActions, type Db } from "@paperclipai/db";
-import { adoptSystemRecovery, unadoptedWorkspaceRecoveryCondition } from "./system-recovery.js";
+import { adoptionLockTimeoutSql, adoptSystemRecovery, unadoptedWorkspaceRecoveryCondition } from "./system-recovery.js";
 import { createSystemRecovery, exhaustedSystemRecoveryAction } from "./system-recovery-state.js";
+import { WORKSPACE_RESTORE_PENDING_KEY } from "@paperclipai/shared";
+import { ADOPTION_FAILED_CAUSE } from "./workspace-restore-recovery-state.js";
+import { workspaceRestoreHoldNextAction } from "./legacy-execution-recovery.js";
 
 /** An adoption that throws this many times is exhausted with a recorded cause,
  * so the card reads failed + Retry and the due-now loop stops (restore-card6). */
@@ -12,10 +15,17 @@ async function recordAdoptionFailure(db: Db, action: typeof issueRecoveryActions
     ? action.evidence.systemRecoveryAdoptionFailures : 0) + 1;
   const runId = String(action.evidence.runId);
   const exhausted = failures >= SYSTEM_RECOVERY_ADOPTION_MAX_FAILURES ? { ...createSystemRecovery(runId), state: "exhausted" as const,
-    failure: { code: "effect_unresolved" as const, retryClass: "service_required" as const, evidenceFingerprint: "adoption_failed",
-      cause: { label: "adoption_failed", code: null, status: null } } } : null;
-  const handoff = exhausted ? exhaustedSystemRecoveryAction(exhausted, action.evidence) : null;
-  await db.update(issueRecoveryActions).set({
+    failure: { code: "effect_unresolved" as const, retryClass: "service_required" as const, evidenceFingerprint: ADOPTION_FAILED_CAUSE,
+      cause: { label: ADOPTION_FAILED_CAUSE, code: null, status: null } } } : null;
+  // restore-card8 (J9): owed files were never copied back, so the hold keeps
+  // its owed words (recovering) instead of failure words; the person bound acts.
+  const handoff = !exhausted ? null : action.evidence[WORKSPACE_RESTORE_PENDING_KEY] === true
+    ? workspaceRestoreHoldNextAction(action.evidence) : exhaustedSystemRecoveryAction(exhausted, action.evidence);
+  // Bounded like the adoption itself (restore-card8 J7): a hold still locked by
+  // another writer is not counted on this pass; the next pass counts it.
+  await db.transaction(async tx => {
+    await tx.execute(adoptionLockTimeoutSql);
+    await tx.update(issueRecoveryActions).set({
     ...(exhausted ? { ownerType: "board", ownerAgentId: null, ownerUserId: null, nextAction: handoff! } : {}),
     evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({ systemRecoveryAdoptionFailures: failures,
       ...(exhausted ? { systemRecovery: exhausted, workspaceRecovery: { schema: "paperclip.workspace-recovery.v1", runId,
@@ -23,6 +33,12 @@ async function recordAdoptionFailure(db: Db, action: typeof issueRecoveryActions
     updatedAt: new Date(),
   }).where(and(eq(issueRecoveryActions.companyId, action.companyId), eq(issueRecoveryActions.id, action.id),
     sql`not (${issueRecoveryActions.evidence} ? 'systemRecovery')`));
+  }).catch(error => { if (!isLockNotAvailable(error)) throw error; });
+}
+function isLockNotAvailable(error: unknown): boolean {
+  for (let current = error as { code?: unknown; cause?: unknown } | undefined, depth = 0; current && depth < 4;
+    current = current.cause as typeof current, depth++) if (current.code === "55P03") return true;
+  return false;
 }
 import { terminalWorkspaceRunStates, workspaceExportCauses } from "./workspace-recovery-source.js";
 
@@ -64,6 +80,8 @@ export async function adoptHistoricalWorkspaceRecoveries(db: Db) {
     sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'systemRecoveryAdoption')`,
   )).orderBy(asc(heartbeatRuns.id)).limit(remaining);
   for (const { run, issue } of missing) await db.transaction(async tx => {
+    // Bounded lock waits for every row this adoption locks (restore-card8 J7).
+    await tx.execute(adoptionLockTimeoutSql);
     await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issue.id)).for("update");
     const [current] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId),
       eq(heartbeatRuns.id, run.id))).for("update");

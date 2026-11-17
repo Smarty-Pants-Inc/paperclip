@@ -122,7 +122,10 @@ vi.mock("./system-recovery.js", async (original) => {
     expect((await getExecutionBlocker(db, f.companyId, f.issueId))?.canRetry).toBe(false);
   }, 120_000);
 
-  it("ITEM 2: an adoption that throws 5 times is exhausted with a recorded cause; due-now stops; card failed + Retry", async () => {
+  // restore-card8 (rf-3 J9) supersedes this case's chat words: a blocked adoption
+  // copied nothing back (attempts=0), so the owed files stay owed (recovering)
+  // until the person bound, never 'failed'. The bound, not the adoption, gives Retry.
+  it("ITEM 2: an adoption that throws 5 times is exhausted with a recorded cause; due-now stops; files still owed", async () => {
     const f = await seedOwed(false);
     adoptionFault.on = true;
     try {
@@ -136,7 +139,7 @@ vi.mock("./system-recovery.js", async (original) => {
     expect(await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
       .where(and(eq(issueRecoveryActions.id, f.actionId), unadoptedWorkspaceRecoveryCondition()))).toEqual([]);
     const result = await chatRunResult(f);
-    expect(result).not.toHaveProperty("workspaceRestorePending");
+    expect(result.workspaceRestorePending).toBe(true);
     expect(result).not.toHaveProperty("workspaceRestoreDelayed");
   }, 120_000);
 });
