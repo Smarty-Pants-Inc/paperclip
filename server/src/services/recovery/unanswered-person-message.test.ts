@@ -2391,6 +2391,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
             nativePhase: "observed", processPid, processStartedAt: startedAt }).where(eq(heartbeatRuns.id, successor.id));
           await db.update(issues).set({ executionRunId: successor.id, executionLockedAt: startedAt, status: "in_progress" })
             .where(eq(issues.id, f.issueId));
+          // The real claim takes the run's wake with it (heartbeat/queue.ts claim: wake status "claimed"
+          // in the same transaction that sets the run running). A wake left "queued" for a run that already
+          // ran is not production state: the sweep would read it as a further attempt (h3-combine).
+          if (successor.wakeupRequestId) await db.update(agentWakeupRequests).set({ status: "claimed", claimedAt: startedAt })
+            .where(eq(agentWakeupRequests.id, successor.wakeupRequestId));
           const [contract] = await db.insert(completionContracts).values({ companyId: f.companyId, issueId: f.issueId, revision: 2 + step,
             schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block",
             contractJson: {}, canonicalSha256: String(50 + step).repeat(32), createdByActorType: "system", createdByActorId: "fixture" }).returning();
