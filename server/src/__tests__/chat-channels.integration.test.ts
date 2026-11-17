@@ -65471,6 +65471,63 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       }
     });
 
+    // fam-retry3 ITEM C (RFL bar (2)): a held CHAT Retry and a held API Retry
+    // (the task Retry API's click, which binds a chat action to its task Retry
+    // intent) during ONE pending restore. While the hold stands neither wakes.
+    // Once the files are back, the chat Retry's own recheck (retryAt, the
+    // issued->processing redelivery) wakes ONCE; every further pass of either
+    // Retry wakes nothing more, so the message runs once.
+    it("retry-fold / fam-retry3: a held chat Retry and a held API Retry during one pending restore wake exactly once after the files are back", async () => {
+      const context = await fixture(true);
+      try {
+        await context.resolve().expect(200);
+        const [chatRetry] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, context.endpoint.id),
+          eq(chatActions.kind, "failed_run_retry")));
+        expect(chatRetry).toMatchObject({ status: "issued" });
+        await insertPendingRestoreHold(db, { companyId: context.fixture.companyId, issueId: context.issue.id, runId: context.runId });
+        await context.service.processFailedChatRunRetry(chatRetry!.id);
+        const [issue] = await readIssuesById(context.issue.id);
+        const apiRetry = await requestTaskRetry({ db, companyId: context.fixture.companyId, issueId: context.issue.id,
+          actorId: issue!.conversationUserId ?? "board", actorSource: "session", observedRunId: context.runId, idempotencyKey: randomUUID(),
+          prepareChatRetry: context.service.prepareFailedChatRunRetry });
+        expect(apiRetry).toMatchObject({ accepted: true, held: { reason: "workspace_repair_required" } });
+        const retries = async () => db.select().from(chatActions).where(and(eq(chatActions.endpointId, context.endpoint.id),
+          eq(chatActions.kind, "failed_run_retry")));
+        for (const action of await retries()) await context.service.processFailedChatRunRetry(action.id).catch(() => undefined);
+        expect(context.wakeup).not.toHaveBeenCalled();
+        // The files are back: the hold is released (the execution blocker is clear).
+        await db.update(issueRecoveryActions).set({ status: "cancelled", outcome: "restored",
+          evidence: sql`(${issueRecoveryActions.evidence} - ${WORKSPACE_RESTORE_PENDING_KEY} - 'workspaceRestoreRecovery' - 'workspaceRestoreFailure' - 'automaticRecovery')
+            || jsonb_build_object('executionReconciliation', jsonb_build_object('runId', ${context.runId}::text, 'providerStopped', true,
+              'actionOutcome', 'not_performed'))` })
+          .where(and(eq(issueRecoveryActions.companyId, context.fixture.companyId), eq(issueRecoveryActions.fingerprint, `native-workspace:${context.runId}`)));
+        const { getExecutionBlocker } = await import("../services/execution-blocker.js");
+        expect(await getExecutionBlocker(db, context.fixture.companyId, context.issue.id)).toBeNull();
+        // The real wake (heartbeat's wakeup), so a second wake would be a second run.
+        await db.update(agents).set({ adapterType: "paperclip_runner", status: "idle",
+          runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } }).where(eq(agents.id, context.fixture.assignedAgentId));
+        context.wakeup.mockImplementation(heartbeatService(db).wakeup);
+        for (let pass = 0; pass < 2; pass++) {
+          for (const action of await retries()) {
+            if (action.status !== "issued") continue;
+            await db.update(chatActions).set({ result: { ...(action.result ?? {}), retryAt: new Date(0).toISOString() } })
+              .where(eq(chatActions.id, action.id));
+            await context.service.processFailedChatRunRetry(action.id).catch(() => undefined);
+          }
+        }
+        await heartbeatService(db).resumeTaskRetry(context.fixture.companyId, apiRetry.requestId!);
+        const runsForMessage = (await readHeartbeatRunsByCompanyId(context.fixture.companyId)).filter(run => run.id !== context.runId
+          && ((run.contextSnapshot as any)?.retryOfRunId === context.runId || (run.contextSnapshot as any)?.previousRunId === context.runId));
+        expect(runsForMessage.map(run => ({ id: run.id, status: run.status }))).toHaveLength(1);
+        // Exactly one run for the message. (The API Retry's chat action, bound to
+        // the same task Retry intent, asks for a wake too; heartbeat refuses it as
+        // an exact repeat, so no second run starts.)
+        expect((await retries()).filter(action => action.status === "processed")).toHaveLength(1);
+      } finally {
+        await context.cleanup();
+      }
+    });
+
     // fam-retry3 ITEM A (RFL 20:33Z, R-ONCE; testing-lead's live shape a58a6a19):
     // the chat Retry of failed run A after successor B posted the final answer
     // to the same person message is a no-op with the one authority's line and no
