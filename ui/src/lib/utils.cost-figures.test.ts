@@ -1,9 +1,13 @@
 import { expect, it } from "vitest";
-import { formatCents, formatConfiguredCents } from "./utils";
+import { formatCents, formatConfiguredCents, formatSpendPercent } from "./utils";
 
 it("temporarily hides rate-card cost figures", () => {
   expect(formatCents(1234)).toBe("—");
   expect(formatCents(0)).toBe("—");
+});
+
+it("masks spend-derived percentages including zero and over-budget amounts", () => {
+  for (const percent of [0, 16, 79.2, 114.46, 1200]) expect(formatSpendPercent(percent)).toBe("—");
 });
 
 it("keeps configured amounts visible with currency and cents precision", () => {

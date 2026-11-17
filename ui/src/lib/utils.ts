@@ -36,6 +36,11 @@ export function asFiniteNumber(value: unknown, fallback: number) {
 // Temporary: cost figures are rate-card estimates, not the real bill; set false when corrected costs land (smarty-dev #20670)
 export const COST_FIGURES_HIDDEN = true;
 
+/** Spend-derived percentages reveal masked costs, even beside a configured limit. */
+export function formatSpendPercent(percent: number): string {
+  return COST_FIGURES_HIDDEN ? "—" : `${percent}%`;
+}
+
 export function formatCents(cents: number, currency = "USD"): string {
   if (COST_FIGURES_HIDDEN) return "—";
   return formatConfiguredCents(cents, currency);
