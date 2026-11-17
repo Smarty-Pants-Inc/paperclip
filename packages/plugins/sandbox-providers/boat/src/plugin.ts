@@ -28,7 +28,11 @@ import type {
   PluginEnvironmentRunnerIngressEndpointParams, PluginEnvironmentRunnerIngressEndpoint, PluginContext,
 } from "@paperclipai/plugin-sdk";
 
-type Config = RunnerConfig & { provider: string; setupTimeoutSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
+type Config = RunnerConfig & { provider: string; setupTimeoutSeconds: number; runLeaseRenewCapSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
+const DEFAULT_RUN_LEASE_RENEW_CAP_SECONDS = 7800;
+function validRunLeaseRenewCap(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 2_592_000;
+}
 const API = "https://boat.dev/api/v1";
 const SPARE_ACTIVITY_EVENTS = ["agent.run.started", "agent.run.finished", "agent.run.failed", "agent.run.cancelled",
   "issue.comment.created", "issue.created", "issue.updated"] as const;
@@ -358,6 +362,8 @@ function parse(raw: Record<string, unknown>): Config {
     type: typeof raw.type === "string" ? raw.type : "small",
     ttlSeconds: Number(raw.ttlSeconds ?? 1800),
     setupTimeoutSeconds: Number(raw.setupTimeoutSeconds ?? 180),
+    // Even a direct SDK caller bypassing validation cannot disable the money cap.
+    runLeaseRenewCapSeconds: validRunLeaseRenewCap(raw.runLeaseRenewCapSeconds) ? raw.runLeaseRenewCapSeconds : DEFAULT_RUN_LEASE_RENEW_CAP_SECONDS,
     reuseLease: raw.reuseLease === true,
     runnerLifecycleMode: (raw.runnerLifecycleMode ?? "inherit") as RunnerConfig["runnerLifecycleMode"],
     runnerIdleTimeoutMs: Number(raw.runnerIdleTimeoutMs ?? DEFAULT_WARM_RUNNER_IDLE_TIMEOUT_MS),
@@ -1512,58 +1518,102 @@ async function patchLeaseTtl(config: Config, id: string, headers: HeadersInit | 
   if (candidate?.id !== id) throw requestError(config, "PATCH", path, 200, "parse_error");
   return candidate;
 }
-type RunLeaseTtlRefresh = { timer: ReturnType<typeof setInterval>; controller: AbortController; work?: Promise<void> };
+type RunLeaseTtlRefresh = { timer?: ReturnType<typeof setTimeout>; controller: AbortController; work?: Promise<void> };
 const runLeaseTtlRefreshes = new Map<string, RunLeaseTtlRefresh>();
+// Preserve the original deadline across duplicate same-RUN warm handoffs. A new
+// runId may get a new grant, but repeated acquire calls never add a box timer.
+const runLeaseTtlCaps = new Map<string, { runId: string; renewUntil: number }>();
 const runLeaseTtlWork = new Set<Promise<void>>();
+const renewalEndedStates = new Set(["archiving", "archived", "stopping", "stopped", "cancelled"]);
 function cancelRunLeaseTtlRefresh(key: string): RunLeaseTtlRefresh | undefined {
   const held = runLeaseTtlRefreshes.get(key);
-  if (held) { runLeaseTtlRefreshes.delete(key); clearInterval(held.timer); held.controller.abort(); }
+  if (held) { runLeaseTtlRefreshes.delete(key); clearTimeout(held.timer); held.controller.abort(); }
   return held;
 }
 async function stopRunLeaseTtlRefresh(config: Config, id: string): Promise<void> {
   await cancelRunLeaseTtlRefresh(activityKey(config, id))?.work;
 }
-function startRunLeaseTtlRefresh(params: PluginEnvironmentAcquireLeaseParams | PluginEnvironmentResumeLeaseParams, config: Config, lease: PluginEnvironmentLease): void {
+function runLeaseRenewUntil(config: Config, id: string, runId: string, acquiredAt: number): number {
+  const key = activityKey(config, id), previous = runLeaseTtlCaps.get(key);
+  if (previous?.runId === runId) return previous.renewUntil;
+  const renewUntil = acquiredAt + config.runLeaseRenewCapSeconds * 1000;
+  runLeaseTtlCaps.set(key, { runId, renewUntil });
+  return renewUntil;
+}
+function startRunLeaseTtlRefresh(params: PluginEnvironmentAcquireLeaseParams | PluginEnvironmentResumeLeaseParams, config: Config, lease: PluginEnvironmentLease, acquiredAt: number): void {
   const id = lease.providerLeaseId;
   // runId is the host's authority: a legacy warm/idle handoff gets only its
   // existing one-shot refresh. Never turn a retained idle box into a live RUN.
   if (shuttingDown || !id || !params.runId || ("purpose" in params && params.purpose === "login")) return;
   const key = activityKey(config, id);
   if (runLeaseTtlRefreshes.has(key)) return;
+  const renewUntil = runLeaseRenewUntil(config, id, params.runId, acquiredAt);
+  if (Date.now() >= renewUntil) return;
+  const generation = boxLifecycle(key);
   const metadata = lease.metadata;
   const personal = (metadata?.boatOwner as { kind?: unknown } | undefined)?.kind === "personal";
   const org = personal ? undefined : metadata?.boatOrgId;
   const headers = typeof org === "string" && org.trim() ? { "X-Boat-Org": org } : undefined;
   const controller = new AbortController();
-  // Protocol-required renewal only while this RUN holds the resource. Lease
-  // acquire/resume is the producer; release/stop/destroy/shutdown makes it quiet.
-  const timer = setInterval(() => {
-    if (shuttingDown || held.work || runLeaseTtlRefreshes.get(key) !== held) return;
+  const held: RunLeaseTtlRefresh = { controller };
+  const current = () => !shuttingDown && runLeaseTtlRefreshes.get(key) === held;
+  const sendGuard = () => {
+    assertBoatActivityAdmission();
+    if (!current() || Date.now() >= renewUntil || boxLifecycle(key) !== generation) throw new Error("Boat RUN lease ended");
+  };
+  const cadence = Math.max(60_000, effectiveTtlSeconds(config) * 1000 / 3);
+  // One deadline timer per account/box, including the hard cap between ticks.
+  // Arm BEFORE starting I/O, never from a late response. The cap cancels even a
+  // hung request; the existing F-01 admission/lifecycle fences guard every send.
+  const arm = () => {
+    held.timer = setTimeout(tick, Math.min(cadence, Math.max(0, renewUntil - Date.now())));
+    held.timer.unref?.();
+  };
+  const tick = () => {
+    if (!current()) return;
+    if (Date.now() >= renewUntil || boxLifecycle(key) !== generation) { cancelRunLeaseTtlRefresh(key); return; }
+    arm();
+    if (held.work) return;
     const work = idleActivity.track(() => withBoatLeaseActivity(leaseActivityKey(params, id), async () => {
-      if (runLeaseTtlRefreshes.get(key) !== held) return;
       let status: "ok" | "unconfirmed" | "failed" | "gone" = "failed";
       let category: RequestErrorCategory | "deadline_mismatch" | "box_gone" | null = null;
-      const requestedAt = Date.now();
       try {
-        const sandbox = await patchLeaseTtl(config, id, headers, { maxSends: 1, strictMissing: true, closedLogs: true,
-          sendGuard: () => { if (runLeaseTtlRefreshes.get(key) !== held) throw new Error("Boat RUN lease ended"); },
-        }, AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]));
-        if (sandbox === null || ["archived", "stopped", "cancelled"].includes(sandbox.state)) {
+        sendGuard();
+        const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]);
+        const options = { maxSends: 1, strictMissing: true, closedLogs: true, sendGuard };
+        // PATCH only extends; it cannot recover an archiving/stopped resource.
+        const found = await request(config, `/sandboxes/${encodeURIComponent(id)}`, { method: "GET", headers, cache: "no-store", signal }, true, { ...options, requireJson: true });
+        sendGuard();
+        const observed = found?.sandbox ?? found;
+        if (observed === null || renewalEndedStates.has(observed?.state)) {
           status = "gone"; category = "box_gone"; cancelRunLeaseTtlRefresh(key);
         } else {
-          const deadline = parseDeadline(sandbox.archiveAfter);
-          status = deadline !== null && Math.abs(Date.parse(deadline) - (requestedAt + effectiveTtlSeconds(config) * 1000)) <= 120_000 ? "ok" : "unconfirmed";
-          category = status === "ok" ? null : "deadline_mismatch";
+          assertSandboxId(observed, id);
+          const requestedAt = Date.now();
+          const sandbox = await patchLeaseTtl(config, id, headers, options, signal);
+          sendGuard(); // A late response authorizes neither a receipt nor a new timer.
+          if (sandbox === null || renewalEndedStates.has(sandbox.state)) {
+            status = "gone"; category = "box_gone"; cancelRunLeaseTtlRefresh(key);
+          } else {
+            const deadline = parseDeadline(sandbox.archiveAfter);
+            status = deadline !== null && Math.abs(Date.parse(deadline) - (requestedAt + effectiveTtlSeconds(config) * 1000)) <= 120_000 ? "ok" : "unconfirmed";
+            category = status === "ok" ? null : "deadline_mismatch";
+          }
         }
-      } catch (error) { category = (error as ReturnType<typeof requestError>).category ?? "request_error"; }
+      } catch (error) {
+        if (!current()) return;
+        const failure = error as ReturnType<typeof requestError> & Boat409Fields;
+        if (renewalEndedStates.has(failure.boatState ?? "")) {
+          status = "gone"; category = "box_gone"; cancelRunLeaseTtlRefresh(key);
+        } else category = failure.category ?? "request_error";
+      }
       const details = { providerLeaseId: redactKey(config, id), status, category };
       if (status === "ok") duplexLogger?.info("Boat run lease TTL refresh", details);
       else duplexLogger?.warn("Boat run lease TTL refresh", details);
-    })).catch(() => undefined).finally(() => { held.work = undefined; runLeaseTtlWork.delete(work); });
+    })).catch(() => { if (current()) cancelRunLeaseTtlRefresh(key); }).finally(() => { held.work = undefined; runLeaseTtlWork.delete(work); });
     held.work = work; runLeaseTtlWork.add(work);
-  }, Math.max(60_000, effectiveTtlSeconds(config) * 1000 / 3));
-  const held: RunLeaseTtlRefresh = { timer, controller };
-  runLeaseTtlRefreshes.set(key, held); timer.unref?.();
+  };
+  runLeaseTtlRefreshes.set(key, held); arm();
 }
 
 const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
@@ -1576,6 +1626,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     knownSparePools.clear();
     claimedSpareLeases.clear();
     runCreateLedgerReads.clear();
+    runLeaseTtlCaps.clear();
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
     for (const unsubscribe of activityUnsubscribers) unsubscribe();
     activityUnsubscribers = [];
@@ -1722,6 +1773,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     if (!["small", "default", "large", "xlarge"].includes(c.type)) errors.push("type must be small, default, large, or xlarge.");
     if (!Number.isInteger(c.ttlSeconds) || c.ttlSeconds < 60 || c.ttlSeconds > 2_592_000) errors.push("ttlSeconds must be an integer from 60 through 2592000.");
     if (!Number.isInteger(c.setupTimeoutSeconds) || c.setupTimeoutSeconds < 1 || c.setupTimeoutSeconds > 600) errors.push("setupTimeoutSeconds must be an integer from 1 through 600.");
+    if (params.config.runLeaseRenewCapSeconds !== undefined && !validRunLeaseRenewCap(params.config.runLeaseRenewCapSeconds)) errors.push("runLeaseRenewCapSeconds must be an integer from 1 through 2592000.");
     if (Object.keys(c.labels).length > 15 || Object.entries(c.labels).some(([k,v]) => !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,62}$/.test(k) || typeof v !== "string" || new TextEncoder().encode(v).length > 256)) errors.push("labels must have valid Boat keys, values <=256 bytes, and at most 15 entries (ownership labels are added).");
     return errors.length ? { ok: false, errors } : { ok: true, normalizedConfig: {
       ...c, ...(params.config.duplexCarrier === undefined ? {} : { duplexCarrier: params.config.duplexCarrier }),
@@ -1733,6 +1785,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   },
   onEnvironmentAcquireLease(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
     if (shuttingDown) return Promise.reject(new Error("Boat provider is shutting down"));
+    const acquiredAt = Date.now();
     let outcomeRecorded = false;
     const recordOutcomeOnce = async (outcome: "spare" | "cold", reason?: AcquireOutcomeReason) => {
       if (outcomeRecorded) return;
@@ -1872,7 +1925,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     return await createOrdinaryLease();
     })();
-    const countedWork = work.then(lease => { startRunLeaseTtlRefresh(params, parse(params.config), lease); return lease; }).finally(async () => {
+    const countedWork = work.then(lease => { startRunLeaseTtlRefresh(params, parse(params.config), lease, acquiredAt); return lease; }).finally(async () => {
       if (!outcomeRecorded) await recordOutcomeOnce("cold", "config_mismatch");
     });
     inFlightAcquisitions.add(countedWork);
@@ -1912,7 +1965,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     const sandbox = result.sandbox ?? result;
     if (sandbox.id !== params.providerLeaseId) throw new Error("Boat inspection returned a different allocation.");
-    if (["archived", "stopped", "cancelled"].includes(sandbox.state)) await stopRunLeaseTtlRefresh(c, params.providerLeaseId);
+    if (renewalEndedStates.has(sandbox.state)) await stopRunLeaseTtlRefresh(c, params.providerLeaseId);
     if (sandbox.state === "archived") idleActivity.confirm(proof, true);
     // Boat documents terminal cancelled/404, the state enum, stoppedAt and lastReboot:
     // https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md
@@ -1921,7 +1974,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     return { providerLeaseId: params.providerLeaseId, state, stoppedAt, lastRebootAt: sandbox.lastReboot?.at ?? null, observedAt };
   },
   async onEnvironmentResumeLease(params: PluginEnvironmentResumeLeaseParams): Promise<PluginEnvironmentLease> {
+    const acquiredAt = Date.now();
     const c = parse(params.config), id = params.providerLeaseId;
+    const renewUntil = params.runId ? runLeaseRenewUntil(c, id, params.runId, acquiredAt) : undefined;
     // End the prior binding before the handoff's own PATCH/resume. A slow RUN
     // refresh must not overlap it, nor survive a refused/expired handoff.
     await stopRunLeaseTtlRefresh(c, id);
@@ -1971,7 +2026,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       const ttlSeconds = effectiveTtlSeconds(c), requestedAt = Date.now();
       const at = new Date(requestedAt).toISOString();
       try {
-        const candidate = await patchLeaseTtl(c, id, orgHeaders);
+        const candidate = await patchLeaseTtl(c, id, orgHeaders, { sendGuard: () => {
+          if (renewUntil !== undefined && Date.now() >= renewUntil) throw new Error("Boat RUN renewal cap reached");
+        } });
         const archiveAfter = parseDeadline(candidate.archiveAfter);
         const expectedDeadline = requestedAt + ttlSeconds * 1000;
         const confirmed = archiveAfter !== null && Math.abs(Date.parse(archiveAfter) - expectedDeadline) <= 120_000;
@@ -2007,7 +2064,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       metadata: { ...retainedMetadata, provider: c.provider, resumed: true, resumedLease: true, resumedFromState,
         ...ownership, ...(ttlRefresh ? { ttlRefresh } : {}),
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}), ...(workspaceSentinel ? { workspaceSentinel } : {}) } };
-    startRunLeaseTtlRefresh(params, c, lease);
+    startRunLeaseTtlRefresh(params, c, lease, acquiredAt);
     return lease;
   },
   async onEnvironmentReleaseLease(params: PluginEnvironmentReleaseLeaseParams) {

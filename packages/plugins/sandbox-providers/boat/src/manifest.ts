@@ -46,6 +46,7 @@ const manifest: PaperclipPluginManifestV1 = {
         retainOnDestroy: { type: "boolean", description: "ignored: sandboxes are always stopped and kept", default: true },
         type: { type: "string", enum: ["small", "default", "large", "xlarge"], default: "small" },
         ttlSeconds: { type: "number", default: 1800, description: "Sandbox auto-stop TTL (seconds; maximum 30 days). Raised above a host warm idle or reconnect window plus five minutes; hard caller expiry is unsupported and rejected before allocation." },
+        runLeaseRenewCapSeconds: { type: "integer", minimum: 1, maximum: 2592000, default: 7800, description: "Absolute RUN renewal budget from acquire/resume entry. The SDK does not expose the run timeout; default 7800 is 7200 seconds plus a 600-second allowance. Renewal stops at the cap even if release never arrives; the last finite Boat TTL then expires. Set this to the run timeout plus one renewal cadence and a small margin." },
         setupTimeoutSeconds: { type: "number", default: 180, minimum: 1, maximum: 600, description: "Maximum seconds to wait for setupScript to finish." },
         labels: { type: "object", additionalProperties: { type: "string" }, description: "Additional Boat labels, merged with Paperclip ownership labels." },
         setupScript: { type: "string", maxLength: 16384, description: "Optional Boat setup script (maximum 16 KiB UTF-8)." },
