@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { hostCleanup, hostMutation } from "./host-mutation-drain.js";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -111,7 +112,9 @@ export async function runLocalGit(
     env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<GitCommandResult> {
-  return await new Promise<GitCommandResult>((resolve, reject) => {
+  // adopt-drain: every local git command (fetch/update-ref/reset/commit-tree...)
+  // is a host mutation of the owner's drain, when one is current.
+  return await hostMutation(() => new Promise<GitCommandResult>((resolve, reject) => {
     execFile(
       "git",
       ["-C", localDir, ...args],
@@ -131,7 +134,7 @@ export async function runLocalGit(
         });
       },
     );
-  });
+  }));
 }
 
 async function runExpensiveWorkspaceGit(
@@ -167,7 +170,7 @@ export async function disposeGitWorkspaceSnapshot(snapshot: GitWorkspaceSnapshot
   if (!ownedDirectory) return;
   ownedSnapshots.delete(snapshot);
   for (const repository of snapshot.repositories ?? []) await disposeGitWorkspaceSnapshot(repository.snapshot);
-  await fs.rm(ownedDirectory, { recursive: true, force: true });
+  await hostCleanup(() => fs.rm(ownedDirectory, { recursive: true, force: true }));
 }
 
 /** Snapshot deadlines include disk backpressure. Operators can allow up to 24h. */
@@ -306,7 +309,7 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
   } catch (error) {
     writer.close(false);
     for (const repo of repositories) await disposeGitWorkspaceSnapshot(repo.snapshot);
-    await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
+    await hostCleanup(() => fs.rm(path.dirname(writer.filePath), { recursive: true, force: true }));
     throw error;
   } finally { options.signal?.removeEventListener("abort", abort); }
 }
@@ -604,13 +607,13 @@ export async function readSanitizedOriginRemoteUrl(localDir: string): Promise<st
 }
 
 export async function copyCloneTree(source: string, target: string): Promise<void> {
-  await fs.mkdir(target, { recursive: true });
+  await hostMutation(() => fs.mkdir(target, { recursive: true }));
   for await (const entry of await fs.opendir(source)) {
     const from = path.join(source, entry.name);
     const to = path.join(target, entry.name);
     if (entry.isDirectory()) await copyCloneTree(from, to);
-    else if (entry.isSymbolicLink()) await fs.symlink(await fs.readlink(from), to);
-    else { await fs.copyFile(from, to); await fs.chmod(to, (await fs.stat(from)).mode); }
+    else if (entry.isSymbolicLink()) { const link = await fs.readlink(from); await hostMutation(() => fs.symlink(link, to)); }
+    else { await hostMutation(() => fs.copyFile(from, to)); const mode = (await fs.stat(from)).mode; await hostMutation(() => fs.chmod(to, mode)); }
   }
 }
 
@@ -621,7 +624,7 @@ export async function withShallowGitWorkspaceClone<T>(
   },
   fn: (cloneDir: string) => Promise<T>,
 ): Promise<T> {
-  const cloneDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-workspace-"));
+  const cloneDir = await hostMutation(() => fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-workspace-")));
   const tempRef = `refs/paperclip/git-sync/import/${randomUUID()}`;
   try {
     const originUrl = input.snapshot.originUrl !== undefined ? input.snapshot.originUrl : await readSanitizedOriginRemoteUrl(input.localDir);
@@ -676,7 +679,7 @@ export async function withShallowGitWorkspaceClone<T>(
       });
     }
     if (input.snapshot.repositories?.length) {
-      await fs.appendFile(path.join(cloneDir, ".git/info/exclude"), `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
+      await hostMutation(() => fs.appendFile(path.join(cloneDir, ".git/info/exclude"), `\n/${PROJECT_REPOSITORIES_DIR}/\n`));
     }
     return await fn(cloneDir);
   } finally {
@@ -684,7 +687,7 @@ export async function withShallowGitWorkspaceClone<T>(
       timeout: 10_000,
       maxBuffer: 16 * 1024,
     }).catch(() => undefined);
-    await fs.rm(cloneDir, { recursive: true, force: true }).catch(() => undefined);
+    await hostCleanup(() => fs.rm(cloneDir, { recursive: true, force: true }).catch(() => undefined));
   }
 }
 
@@ -754,7 +757,7 @@ export async function fetchGitBundleIntoLocalRef(input: {
     const objectFormat = (await importGit(input.localDir, ["rev-parse", "--show-object-format"])).stdout.trim();
     const oid = objectFormat === "sha256" ? /^[a-f0-9]{64}$/ : /^[a-f0-9]{40}$/;
     if (!boundaries.every((boundary) => oid.test(boundary))) throw new GitShallowMetadataError(`Invalid Git shallow boundaries for host object format ${objectFormat}`);
-    const staging = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-bundle-"));
+    const staging = await hostMutation(() => fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-bundle-")));
     try {
       // Git bundles have no shallow protocol. Unpack into a private repository
       // carrying the sender's boundaries, then let ordinary Git fetch negotiate
@@ -809,14 +812,14 @@ export async function fetchGitBundleIntoLocalRef(input: {
         if (missingParent) retainedBoundaries.push(boundary);
       }
       deadline += Date.now() - probeStarted;
-      if (retainedBoundaries.length) await fs.writeFile(path.join(staging, "shallow"), `${[...new Set(retainedBoundaries)].join("\n")}\n`);
+      if (retainedBoundaries.length) await hostMutation(() => fs.writeFile(path.join(staging, "shallow"), `${[...new Set(retainedBoundaries)].join("\n")}\n`));
       await importGit(staging, ["update-ref", input.exportRef, head]);
       guard();
       await importGit(input.localDir, ["fetch", "--force", "--update-shallow", staging, `${input.exportRef}:${input.importedRef}`], {
         timeout: 60_000, maxBuffer: 1024 * 1024,
       });
     } finally {
-      await fs.rm(staging, { recursive: true, force: true });
+      await hostCleanup(() => fs.rm(staging, { recursive: true, force: true }));
     }
   } else {
     guard();
@@ -1016,7 +1019,7 @@ async function updateLocalGitHead(input: {
   // Git holds HEAD.lock (and the branch lock when attached) until commit/abort,
   // so a checkout cannot redirect the write after this check. --no-deref also
   // prevents a detached write from following a newly attached branch.
-  await withWorkspaceRestoreGitCommand("update_ref", () => new Promise<void>((resolve, reject) => {
+  await withWorkspaceRestoreGitCommand("update_ref", () => hostMutation(() => new Promise<void>((resolve, reject) => {
     let identityError: unknown;
     let prepared = false;
     let output = "";
@@ -1060,7 +1063,7 @@ async function updateLocalGitHead(input: {
       "prepare",
       "",
     ].join("\n"));
-  }));
+  })));
 }
 
 export async function integrateImportedGitHead(input: {
