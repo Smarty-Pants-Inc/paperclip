@@ -93,12 +93,16 @@ export function buildNoRunningExecutionNoticeSeed(input: {
   status: "todo" | "in_progress";
   attempts?: number;
 }): StrandedRecoveryNoticeSeed {
-  const tries = input.attempts && input.attempts > 1 ? ` after ${input.attempts} tries` : "";
+  const repeated = input.attempts !== undefined && input.attempts > 1;
   return {
     body: input.status === "todo"
-      ? `Paperclip tried to start this task again, but it still could not start${tries}. Press Retry to start it again.`
-      : `Paperclip tried to continue this task again, but it still could not continue${tries}. `
-        + "Press Retry to start it again from the saved work.",
+      ? repeated
+        ? `Paperclip tried to start this task again, but it still could not start after ${input.attempts} tries. Press Retry to start it again.`
+        : "Paperclip could not start this task. Press Retry to start it."
+      : repeated
+        ? `Paperclip tried to continue this task again, but it still could not continue after ${input.attempts} tries. `
+          + "Press Retry to start it again from the saved work."
+        : "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
     title: NO_RUNNING_EXECUTION_NOTICE_TITLE,
     tone: "danger",
   };
