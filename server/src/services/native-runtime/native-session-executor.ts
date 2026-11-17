@@ -898,7 +898,13 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
           // Runner suspended, the fence refused before reading its state, and
           // the force-stop that followed did not fail. Its saved bytes stay
           // where they are (the box and the last durable backup).
-          || (options?.discardSupersededCheckpoint === true && isSuspendedRemoteCheckpointRefusal(error)));
+          || (options?.discardSupersededCheckpoint === true && isSuspendedRemoteCheckpointRefusal(error))
+          // pl/s3-fence: the same refusal for a Runner the transport did NOT
+          // prove suspended (a mid-turn Stop leaves it unsettled). Accepted only
+          // when this exact session's Runner is proven exited: a finished, idle
+          // holder is stopped first; a busy one stays refused.
+          || (options?.discardSupersededCheckpoint === true && isSupersededCheckpointRefusal(error)
+            && await supersededOwnerRunnerExited(entry)));
       if (retiredWithoutCheckpoint) {
         logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
           providerLeaseId: entry.providerLeaseId ?? null, reason, closeFailure: describeWarmCloseFailure(error) },
@@ -1362,10 +1368,12 @@ function suspendedRunnerHasExited(entry: WarmNativeSession, inspection: SandboxS
 
 export const warmRetainedRunnerStopWait = { waitMs: 10_000, pollMs: 500 };
 
-async function stopRetainedRunnerOfFinishedOwner(entry: WarmNativeSession, error: unknown, db: Db): Promise<boolean> {
-  if (!entry.sandboxRunner || !(error instanceof NativeSessionCloseUnrecoverableError)
-    || error.settlement?.runnerRetained !== true || error.settlement.runnerSuspended === true) return false;
-  const { runner, remoteCwd } = entry.sandboxRunner;
+/** Stop this exact session's Runner if it is a finished owner's idle holder
+ * (retireSandboxRunnerPortHolders: same company/agent/run, terminal run status,
+ * idle state, else `owner_not_settled`), then require the exit proof. */
+async function stopSessionRunnerAndProveExit(entry: WarmNativeSession, db: Db,
+  sandboxRunner: NonNullable<WarmNativeSession["sandboxRunner"]>): Promise<boolean> {
+  const { runner, remoteCwd } = sandboxRunner;
   const runtimeRoot = posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner");
   const sessionDirectory = createHash("sha256").update(entry.normalizedSessionId).digest("hex");
   try {
@@ -1377,7 +1385,34 @@ async function stopRetainedRunnerOfFinishedOwner(entry: WarmNativeSession, error
       "could not stop the retained Runner of a finished warm session");
     return false;
   }
-  if (!await sandboxSessionRunnerExited({ runner, runtimeRoot, sessionDirectory })) return false;
+  return sandboxSessionRunnerExited({ runner, runtimeRoot, sessionDirectory });
+}
+
+/** pl/s3-fence: a successor's retirement met the s3 fence's superseded refusal
+ * of an owner whose Runner the transport did not prove suspended. The refusal
+ * is permanent (no retry can save that checkpoint), so only containment
+ * decides: true only when this session's Runner is proven exited. False when
+ * the sandbox runner or lease database is missing, on any throw, and for a
+ * Runner that is not idle (its stop is refused, owner_not_settled). */
+async function supersededOwnerRunnerExited(entry: WarmNativeSession): Promise<boolean> {
+  if (!entry.sandboxRunner || !entry.sandboxLeaseDb) return false;
+  try {
+    if (!await stopSessionRunnerAndProveExit(entry, entry.sandboxLeaseDb, entry.sandboxRunner)) return false;
+  } catch (proofError) {
+    logger.warn({ runId: entry.runId, providerLeaseId: entry.providerLeaseId ?? null, proofFailure: describeWarmCloseFailure(proofError) },
+      "could not prove the superseded warm owner's Runner exited");
+    return false;
+  }
+  logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+    providerLeaseId: entry.providerLeaseId ?? null },
+  "the superseded warm owner's Runner is proven exited; retired it without a checkpoint");
+  return true;
+}
+
+async function stopRetainedRunnerOfFinishedOwner(entry: WarmNativeSession, error: unknown, db: Db): Promise<boolean> {
+  if (!entry.sandboxRunner || !(error instanceof NativeSessionCloseUnrecoverableError)
+    || error.settlement?.runnerRetained !== true || error.settlement.runnerSuspended === true) return false;
+  if (!await stopSessionRunnerAndProveExit(entry, db, entry.sandboxRunner)) return false;
   logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
     providerLeaseId: entry.providerLeaseId ?? null },
   "stopped the retained Runner of a finished warm session whose suspend was refused; released it without a checkpoint");
