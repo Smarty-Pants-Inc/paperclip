@@ -891,6 +891,28 @@ describe("persistent agent directories", () => {
         } finally { await handle.close(); }
       }, 60_000);
 
+      it("REMOTE sandbox never-OK: after a failed post-check the retained aside copy is surfaced by the stopped collection", async () => {
+        const f = "memory/fd-retired.md", disjoint = "memory/disjoint-racer.md";
+        let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+        try {
+          const result = await raceDuringDelivery({ baseline: { [f]: "checkpoint baseline\n" },
+            sibling: boat => boat.siblingSavesRemote(f, "sibling F'\n"),
+            // A disjoint write fails the post-check; a live fd on F is held across the swap.
+            race: async warm => { handle = await fs.open(path.join(warm, f), "a"); await fs.writeFile(path.join(warm, disjoint), "racer\n"); } });
+          expect(result.applies).toBe(1);
+          expect((result.handoffError as Error).message).toBe("Warm agent directory note refresh could not be verified");
+          await handle!.write("FD-AFTER-SWAP\n");
+          await handle!.sync();
+          expect(await copies.get(companyId, result.chatA.runId)).toMatchObject({ state: "warm_saved", receipt: { notesAside: true } });
+          const asideRoot = path.join(result.chatA.executionRoot, ".paperclip-runtime", "notes-aside");
+          const [epoch] = await fs.readdir(asideRoot);
+          expect((await copies.collectStopped({ companyId, runId: result.chatA.runId, target: result.boat.executionTarget }))?.state).toBe("saved");
+          expect(await fs.readFile(path.join(root, `${f}.aside-${epoch}`), "utf8")).toBe("checkpoint baseline\nFD-AFTER-SWAP\n");
+          expect(await fs.readFile(path.join(root, disjoint), "utf8")).toBe("racer\n");
+          expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
+        } finally { await handle?.close(); }
+      }, 60_000);
+
       it("REMOTE sandbox never-OK: an unchanged retained aside copy is removed only after the next verified checkpoint", async () => {
         await paulBundle();
         const f = "memory/retained.md";
