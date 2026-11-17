@@ -256,10 +256,19 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
         // and the existing preservation holds the message until the workspace
         // recovery worker restores it. Same as U's ordinary Stop with an
         // unproven export; rf-4's 10 s bound is not met on this path.
+        // adopt-stopu-xpaths (rf-4 bar (c)): an unproven export never stops the
+        // box. The release-site guard keeps it running (lease active, no stop,
+        // a deferral the sweep retries), the run carries the true line, and the
+        // message stays queued (person_stop_export_pending), never on a box
+        // without the edit. GAP kept: an export that can never be proven holds
+        // the chat with that line until it is (no Retry card).
         const [runAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
         expect(runAfter.runnerProfileJson?.nativeCancelledWarmExport).toMatchObject({ state: "unproven" });
-        expect(afterSweep.metadata?.sandboxStopAndRetainReceipt).toMatchObject({ providerLeaseId });
-        expect(blocker).toMatchObject({ runId, canRetry: false, workspaceRepairRequired: true, savedMessageCount: 1 });
+        expect(afterSweep.status).toBe("active");
+        expect(afterSweep.metadata?.sandboxStopAndRetainReceipt).toBeUndefined();
+        expect(readLeaseReleaseDeferral(afterSweep.metadata)).toMatchObject({ reason: "person_stop_export_unproven" });
+        expect(stop.mock.calls.filter(([input]) => input.providerLeaseId === providerLeaseId)).toHaveLength(0);
+        expect(providerTurns).toEqual([]);
         return;
       }
       expect(executed || actionable,
