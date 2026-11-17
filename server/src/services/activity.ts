@@ -129,6 +129,13 @@ export function activityService(db: Db) {
       when ${heartbeatRuns.resultJson} is null then null
       else jsonb_strip_nulls(jsonb_build_object(
         'conversationReset', ${heartbeatRuns.resultJson} -> 'conversationReset',
+        'cancelledByActorType', left(${heartbeatRuns.resultJson} ->> 'cancelledByActorType', 32),
+        'cancelledByUserId', left(${heartbeatRuns.resultJson} ->> 'cancelledByUserId', 128),
+        'interruptedByActorType', left(${heartbeatRuns.resultJson} ->> 'interruptedByActorType', 32),
+        'interruptedByActorId', left(${heartbeatRuns.resultJson} ->> 'interruptedByActorId', 128),
+        'operatorInterrupted', case when ${heartbeatRuns.resultJson} -> 'operatorInterrupted' = 'true'::jsonb
+          then to_jsonb(true) end,
+        'interruptionSource', left(${heartbeatRuns.resultJson} ->> 'interruptionSource', 64),
         'executionCancellation', case when ${heartbeatRuns.resultJson} ? 'executionCancellation'
           then jsonb_build_object('state', case
             when jsonb_typeof(${heartbeatRuns.resultJson} -> 'executionCancellation') = 'object'
