@@ -7,7 +7,7 @@ import { assignmentWakePayloadSql, type DeferredExecutionScope, type DeferredRec
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { dependencyResolvedWakePayloadSql } from "../issue-dependency-wakeups.js";
 import { anchorParkedWake, noticeParkedWakeDeadline, PARKED_WAKE_RETRY_MS, parkedWakeAnchor, parkedWakeDeadlineMs,
-  parkedWakeNoticedSql, personControlledWait, personControlledWaitSql } from "./parked-wake-deadline.js";
+  parkedWake, parkedWakeNoticedSql, parkedWakeSql, personSendSql } from "./parked-wake-deadline.js";
 
 type Entry = { id: string; companyId: string; dueAt: number; immediate: boolean; operatorRetry?: boolean };
 /** S124: 30 s after the last attempt, never past the first park's deadline. */
@@ -107,10 +107,10 @@ export function registerDeferredReceiptWork(
           operatorRetry: sql<boolean>`${operatorRetry}`,
           delayed: sql<boolean>`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null
             or ${agentWakeupRequests.payload}->'executionWait' is not null`,
-          // S124: the parked Send's first-park anchor and its press.
-          // Only a person-controlled wait (their pause, a budget) is not a silent park.
-          parked: sql<boolean>`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null
-            and not ${personControlledWaitSql(agentWakeupRequests.payload)}`,
+          // S124: the parked Send's first-park anchor and its press. S124d:
+          // every Stop/Send receipt (QCI or a person's executionWait receipt);
+          // only a person-controlled wait (their pause, a budget) is not a silent park.
+          parked: parkedWakeSql(agentWakeupRequests.payload, personSendSql()),
           pressedAt: sql<string | null>`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'requestedAt'`,
           firstParkedAt: sql<string | null>`${agentWakeupRequests.payload}->>'firstParkedAt'`,
           interruptedLegacy: sql<boolean>`exists (select 1 from heartbeat_runs r
@@ -184,6 +184,7 @@ export function registerDeferredReceiptWork(
         if (kind !== "task_chat") {
           const [current] = await db.select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload,
             updatedAt: agentWakeupRequests.updatedAt, claimedAt: agentWakeupRequests.claimedAt, error: agentWakeupRequests.error,
+            requestedByActorType: agentWakeupRequests.requestedByActorType, reason: agentWakeupRequests.reason,
             // Qualified like interruptedNativeReleased: bare outer columns
             // would bind to the subquery's run.
             interruptedLegacy: sql<boolean>`exists (select 1 from heartbeat_runs r
@@ -196,7 +197,7 @@ export function registerDeferredReceiptWork(
           // S124: a parked Send keeps its FIRST park time (stored once); its
           // 30 s cadence and its one deadline count from it, not updatedAt.
           const parked = kind === "deferred" && current.status === "deferred_issue_execution" && !current.interruptedLegacy
-            && Boolean(current.payload?.queuedCommentInterrupt) && !personControlledWait(current.payload);
+            && parkedWake(current.payload, { actorType: current.requestedByActorType, reason: current.reason });
           const anchor = parked ? parkedWakeAnchor(current.payload) ?? await anchorParkedWake(db, scope0(entry)) : null;
           if (anchor !== null && anchor + parkedWakeDeadlineMs() <= Date.now()) {
             // Past the deadline: ONE true note (+ Retry), no further silent retry.
@@ -240,7 +241,7 @@ export function registerDeferredReceiptWork(
           const [still] = await db.select({ payload: agentWakeupRequests.payload, updatedAt: agentWakeupRequests.updatedAt })
             .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
               eq(agentWakeupRequests.id, entry.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
-          const stillAnchor = still?.payload?.queuedCommentInterrupt ? parkedWakeAnchor(still.payload) : null;
+          const stillAnchor = still ? parkedWakeAnchor(still.payload) : null;
           if (still && stillAnchor !== null) next = parkedDue(still.updatedAt, stillAnchor);
         }
         return next === null ? null : { ...entry, dueAt: next, immediate: false };
