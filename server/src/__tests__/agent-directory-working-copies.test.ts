@@ -21,7 +21,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { agentFileStore, fileHash, inspectAgentFile, inspectAgentDirectory, snapshotAgentFiles, MAX_AGENT_FILE_BYTES, MAX_AGENT_DIRECTORY_BYTES, MAX_AGENT_DIRECTORY_ENTRIES } from "../services/agent-file-store.js";
-import { agents, companies, issues, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies, agentInstructionRevisions, agentInstructionHeads, createDb, fileStorageDb } from "@paperclipai/db";
+import { activityLog, agents, companies, issues, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies, agentInstructionRevisions, agentInstructionHeads, createDb, fileStorageDb } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { agentInstructionWorkingCopyService, instructionWorkingCopyGuidance } from "../services/agent-instruction-working-copies.js";
@@ -877,6 +877,57 @@ describe("persistent agent directories", () => {
       expect(sha(await fs.readFile(path.join(root, "unsaved-note.txt")))).toBe(sha(note));
       expect(await agentFileSaveHeldOnLease(db, { id: leaseId, companyId, providerLeaseId: `held-${leaseId}` })).toBe(false);
       expect(shell).not.toHaveBeenCalled();
+    }, 60_000);
+    // review-fleet-4 (rf4-samenote): on the fail-closed branch alone, a SUCCESSFUL
+    // durable RETRY after a failed save replaced the sibling's canonical B with the
+    // held A and made no conflict copy, so B was lost. The retry must go through
+    // the same three-way compare as a first save: B stays canonical, A is a named
+    // conflict copy, and the save receipt/event names both.
+    it.each([false, true])("RF4 failed save then durable retry keeps B and names A (warm=%s)", async warm => {
+      const hash = (text: string) => fileHash(Buffer.from(text));
+      await fs.mkdir(path.join(root, "memory"), { recursive: true });
+      await fs.writeFile(path.join(root, "memory", "daily.md"), "C");
+      const copy = await run({ warm });
+      await fs.writeFile(path.join(copy.localRoot, "memory", "daily.md"), "A");
+      const failing = failingService("apply");
+      const held = (await collectStoppedInstructionCopyWithRetries(() => failing.collectStopped({ companyId, runId: copy.runId })))!;
+      expect(held).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_FAILED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+      expect(agentFileSaveHeld(held)).toBe(true);
+      // A sibling saves B over the same base C while A is held.
+      const sibling = await run();
+      await fs.writeFile(path.join(sibling.localRoot, "memory", "daily.md"), "B");
+      expect((await copies.collectStopped({ companyId, runId: sibling.runId }))?.state).toBe("saved");
+      expect(await fs.readFile(path.join(root, "memory", "daily.md"), "utf8")).toBe("B");
+      // Heartbeat teardown and the cleanup worker leave the held A in place.
+      await failing.release(companyId, copy.runId);
+      await failing.recoverCaptured();
+      expect(await fs.readFile(path.join(copy.localRoot, "memory", "daily.md"), "utf8")).toBe("A");
+      // Restart: a fresh service retries the held save from the durable row.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, copy.runId));
+      await db.update(agentInstructionWorkingCopies).set({ nextAttemptAt: new Date(Date.now() - 1000) }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      const restarted = agentInstructionWorkingCopyService(db);
+      expect(await restarted.recoverStopped()).toBeGreaterThan(0);
+      const retried = (await restarted.get(companyId, copy.runId))!;
+      expect(retried.state).toBe("saved");
+      expect(agentFileSaveHeld(retried)).toBe(false);
+      // B stays canonical; A is a named conflict copy.
+      expect(await fs.readFile(path.join(root, "memory", "daily.md"), "utf8"), "the retry must not replace the sibling's canonical B").toBe("B");
+      const names = (await fs.readdir(path.join(root, "memory"))).filter(name => name !== "daily.md");
+      expect(names).toHaveLength(1);
+      const copyPath = `memory/${names[0]}`;
+      expect(copyPath).toMatch(new RegExp(`^memory/daily\\.conflict-${copy.runId.slice(0, 8)}-\\d+\\.md$`));
+      expect(await fs.readFile(path.join(root, copyPath), "utf8")).toBe("A");
+      // The save names both: receipt conflicts and the audited save event.
+      const conflict = { path: "memory/daily.md", baseHash: hash("C"), currentHash: hash("B"), incomingHash: hash("A"), conflictCopy: copyPath };
+      expect(retried.receipt?.conflicts).toEqual([conflict]);
+      const audits = await db.select().from(activityLog).where(eq(activityLog.entityId, agentId));
+      expect(audits.map(row => row.details)).toContainEqual(expect.objectContaining({ conflicts: [conflict] }));
+      // Only after the verified save may cleanup discard the temporary tree.
+      await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      // The next turn is told: B was kept, A is saved as the conflict copy.
+      const next = await run();
+      expect(await restarted.claimConflictNotice({ companyId, agentId, runId: next.runId, previousRunId: copy.runId }))
+        .toBe(`Note: "memory/daily.md" was also saved by another run; that version was kept. Your earlier edit is saved as "${copyPath}".`);
     }, 60_000);
   });
   it("checks quota for a small editor save without reading unrelated file bytes", async () => {
