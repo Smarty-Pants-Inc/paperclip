@@ -3685,6 +3685,9 @@ describe("composer Stop", () => {
     const onAdd = vi.fn(async () => {});
     render(<TaskChatComposer workMode="standard" onAdd={onAdd} onStop={onStop} stopScope="subtree" />);
     expect(stopButton()?.title).toBe("Stop response");
+    expect(stopButton()?.classList).toContain("max-sm:size-11");
+    expect(stopButton()?.classList).toContain("max-sm:min-h-11");
+    expect(stopButton()?.classList).toContain("max-sm:min-w-11");
     pressKey("Enter", { metaKey: true });
     expect(onStop).not.toHaveBeenCalled();
     expect(onAdd).not.toHaveBeenCalled();

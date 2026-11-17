@@ -85,6 +85,8 @@ describe("TaskChatQueuedMessages: Steering and Queued sections", () => {
     expect(rowIds("queued")).toEqual(["m3", "m4", "m5"]);
     expect(q('[data-testid="task-chat-queued-count-steering"]')?.textContent).toBe("2");
     expect(q('[data-testid="task-chat-queued-count-queued"]')?.textContent).toBe("3");
+    expect(q('[data-testid="task-chat-queued-section-steering"] h3')?.textContent).toContain("Always first. Delivered at the agent's next step, top first");
+    expect(q('[data-testid="task-chat-queued-section-queued"] h3')?.textContent).toContain("Sent after the agent finishes this turn, top first");
   });
 
   it("gives every row a Steer/Queue toggle, Interrupt now, Edit and Delete, and no grey control without a reason", () => {
@@ -101,6 +103,14 @@ describe("TaskChatQueuedMessages: Steering and Queued sections", () => {
     expect(button("task-chat-queued-interrupt-m3")?.textContent).toContain("Interrupt now");
     expect(button("task-chat-queued-interrupt-m3")?.title).toBe("Stops the current step and sends this message first; the rest stay queued");
     expect(container.querySelector('[aria-label^="Queued message actions"]')).toBeNull();
+    expect(button("task-chat-queued-mode-m1")?.querySelector(".lucide-arrow-left-right")).not.toBeNull();
+    expect(button("task-chat-queued-interrupt-m3")?.querySelector(".lucide-zap")).not.toBeNull();
+    for (const control of ["mode", "interrupt", "edit", "discard"]) {
+      expect(button(`task-chat-queued-${control}-m3`)?.classList).toContain("border");
+    }
+    expect(button("task-chat-queued-edit-m3")?.textContent).toBe("");
+    expect(button("task-chat-queued-edit-m3")?.getAttribute("aria-label")).toBe("Edit queued message: Three");
+    expect(button("task-chat-queued-discard-m3")?.getAttribute("aria-label")).toBe("Delete queued message: Three");
   });
 
   it("the toggle moves a Queued row to the end of Steering and stores its mode", async () => {
@@ -129,6 +139,7 @@ describe("TaskChatQueuedMessages: Steering and Queued sections", () => {
     expect(button("task-chat-queued-mode-behind")?.title).toBe("Can't move to Steering: this message is behind /new");
     expect(button("task-chat-queued-grip-behind")?.disabled).toBe(true);
     expect(button("task-chat-queued-grip-behind")?.title).not.toBe("");
+    expect(q('[data-testid="task-chat-queued-message-behind"]')?.textContent).toContain("Behind /new: can't steer");
   });
 
   it("addendum 2: Interrupt now is grey on a /new and on every row behind it, with the reason", () => {
@@ -151,6 +162,13 @@ describe("TaskChatQueuedMessages: Steering and Queued sections", () => {
     expect(rowIds("steering")).toEqual(["m1", "m2"]);
     expect(q('[data-testid="task-chat-queued-steering-paused"]')?.textContent).toContain("Steering paused: will send after this turn");
     expect(button("task-chat-queued-mode-m1")?.disabled).toBe(false);
+  });
+
+  it("explains Steering 0 when the runner cannot take messages mid-turn", () => {
+    render({ queue: queueOf([entry("q1", "Wait", { deliveryIntent: "queue" })], { steeringDisposition: "unsupported" }) });
+    expect(q('[data-testid="task-chat-queued-count-steering"]')?.textContent).toBe("0");
+    expect(container.textContent).toContain("This runner can't take messages mid-turn, so everything waits in the queue. Use Interrupt now to send one first.");
+    expect(container.textContent).not.toContain("Drag a message here");
   });
 
   it("auto-steers only Steer-mode messages from the head: 'Steers in 5s', never a Queue-mode head", () => {

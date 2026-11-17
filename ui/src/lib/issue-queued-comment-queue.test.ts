@@ -52,11 +52,18 @@ describe("normalizeIssueQueuedCommentQueue", () => {
       executionWait: { reason: "remote_cleanup", message: "Waiting for the previous environment to stop." } }, [])]).toEqual([]);
   });
   it("retains the immutable response and fresh-turn requirement", () => {
-    const source = { kind: "interaction", interactionId: "approval-1", interactionKind: "request_confirmation", requiresFreshSession: true };
+    const source = { kind: "interaction", interactionId: "approval-1", interactionKind: "request_confirmation", requiresFreshSession: true, summary: "Accepted: Plan" };
     const normalized = normalizeIssueQueuedCommentQueue({ entries: [{ comment: comment("approval-1", "Accepted: Plan"), source,
       canEdit: false, canDiscard: false }] }, "issue-1");
     expect(normalized.entries[0]).toMatchObject({ source, canEdit: false, canDiscard: false });
   });
+  it("preserves the server's mode and /new boundary through the real UI normalization path", () => {
+    const normalized = normalizeIssueQueuedCommentQueue({ entries: [{ comment: comment("behind", "After reset"),
+      deliveryIntent: "queue", behindReset: true, queueId: "tail-wake", queueRevision: "tail-revision" }] }, "issue-1");
+    expect(normalized.entries[0]).toMatchObject({ deliveryIntent: "queue", behindReset: true,
+      queueId: "tail-wake", queueRevision: "tail-revision" });
+  });
+
   it("sorts, deduplicates, and drops malformed queue entries", () => {
     const queue = normalizeIssueQueuedCommentQueue(
       {
