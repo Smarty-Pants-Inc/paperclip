@@ -272,6 +272,7 @@ import {
   sql,
 } from "drizzle-orm";
 import {
+  activityLog,
   agentWakeupRequests,
   documentRevisions,
   environments,
@@ -944,6 +945,11 @@ function sandboxProviderLeaseId(target?: AdapterExecutionTarget | null): string 
   return target?.kind === "remote" && target.transport === "sandbox" ? target.sandboxLeaseAcquisition?.providerLeaseId ?? null : null;
 }
 
+function successorOnOwnerSandbox(entry: WarmNativeSession, successor: WarmPredecessorSuccessor): boolean {
+  return successor.providerLeaseId !== null
+    && [entry.providerLeaseId, entry.sandboxProviderLeaseId].includes(successor.providerLeaseId);
+}
+
 /**
  * Retire a predecessor before a new run starts. A failed close keeps the owner
  * registered, so a successor on the same sandbox never launches over it, and
@@ -961,7 +967,9 @@ async function retireInProcessWarmOwnerOnSandbox(runId: string, providerLeaseId:
     entry.busy = true;
     entry.closeOnReleaseReason = "warm Runner held the sandbox Runner port for another session";
     try {
-      await retireWarmPredecessor(entry, entry.closeOnReleaseReason);
+      // The Runner port holder is on the successor's own sandbox.
+      await retireWarmPredecessor(entry, entry.closeOnReleaseReason,
+        { providerLeaseId: providerLeaseId ?? entry.providerLeaseId ?? entry.sandboxProviderLeaseId ?? null });
       forgetWarmNativeSession(scope, entry);
     } finally { entry.busy = false; }
     return true;
@@ -969,7 +977,14 @@ async function retireInProcessWarmOwnerOnSandbox(runId: string, providerLeaseId:
   return false;
 }
 
-async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
+/** The successor that retires a warm predecessor: the providerLeaseId of the
+ * sandbox it runs on (null when it is not on a sandbox lease). Every caller
+ * names it, because a "stopped" receipt on the owner's own lease proves the
+ * owner gone only to a successor on a different sandbox (see
+ * warmSandboxTerminated). */
+type WarmPredecessorSuccessor = { providerLeaseId: string | null };
+
+async function retireWarmPredecessor(entry: WarmNativeSession, reason: string, successor: WarmPredecessorSuccessor,
   options?: Parameters<typeof closeWarmNativeSession>[2]) {
   // Chaos cell SR1U: a sandbox owner whose stop stays unconfirmed even when
   // forced. Test instrumentation only: armed only in a NODE_ENV=test server.
@@ -1000,7 +1015,12 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
       // is proven at once, by the same predicate as the idle close sweep
       // (warmCloseFailureProvesOwnerGone); never by the close error's text. Any
       // other failure (a transient download-url error, no receipt) stays unproven.
-      const gone = await warmCloseFailureProvesOwnerGone(entry, error);
+      // Same-box rule (as at the retirement fence): a "stopped" receipt proves
+      // the owner gone only to a successor on a DIFFERENT sandbox; a successor
+      // reusing that very providerLeaseId keeps the owner unproven unless the
+      // box is destroyed or the Runner is otherwise proven gone.
+      const gone = await warmCloseFailureProvesOwnerGone(entry, error, entry.sandboxLeaseDb,
+        { successorOnOwnerSandbox: successorOnOwnerSandbox(entry, successor) });
       if (gone) {
         await markWarmNativeHarnessBackupMissing(entry, gone);
         logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
@@ -1114,15 +1134,39 @@ subscribeRunStartHandoverChanges(() => {
  */
 export const warmSessionReleaseWait = { timeoutMs: 30_000, pollMs: 25 };
 
-/** The one deadline of a predecessor-settle wait: now + warmSessionReleaseWait. */
-export function predecessorSettleDeadline(): number {
-  return Date.now() + warmSessionReleaseWait.timeoutMs;
+/** settle-sites: ONE own-predecessor settle deadline per successor run.
+ * Every site where a successor joins its own predecessor's release (the
+ * instruction-directory join in heartbeat preparation, the superseded-owner
+ * wait, the Stop-command wait, warm admission) reads the deadline the first of
+ * them derived, so sequential waits never exceed warmSessionReleaseWait in
+ * total. Memory only, never inside a database transaction. An entry is dropped
+ * one further bound after it expired, so a later attempt of the same run
+ * starts afresh. */
+const ownPredecessorSettleDeadlines = new Map<string, number>();
+export function ownPredecessorSettleDeadline(successorRunId: string): number {
+  const now = Date.now();
+  for (const [runId, expiresAt] of ownPredecessorSettleDeadlines) {
+    if (expiresAt + warmSessionReleaseWait.timeoutMs < now) ownPredecessorSettleDeadlines.delete(runId);
+  }
+  let deadline = ownPredecessorSettleDeadlines.get(successorRunId);
+  if (deadline === undefined) {
+    deadline = now + warmSessionReleaseWait.timeoutMs;
+    ownPredecessorSettleDeadlines.set(successorRunId, deadline);
+  }
+  return deadline;
+}
+
+/** The one deadline of a predecessor-settle wait: the successor run's one
+ * own-predecessor settle deadline (ownPredecessorSettleDeadline), at most
+ * warmSessionReleaseWait after the first of its waits began. */
+export function predecessorSettleDeadline(successorRunId: string): number {
+  return ownPredecessorSettleDeadline(successorRunId);
 }
 
 /**
  * The ONE predecessor-settle wait at the retirement fence, bounded only by
- * warmSessionReleaseWait (pass predecessorSettleDeadline()). In order, until
- * the deadline:
+ * warmSessionReleaseWait (pass predecessorSettleDeadline(successorRunId)). In
+ * order, until the deadline:
  * 1. while the owner's turn is over and it is releasing the session (its
  *    execution's final cleanup hands every scope back), or, with `entry`,
  *    while that registered owner is still busy without a successor's claim;
@@ -1180,7 +1224,7 @@ export async function claimWarmNativeInstructionCopy(input: {
   const scope = nativeSessionScopeKey(prior);
   const busyEntry = warmNativeSessions.get(scope);
   if (busyEntry?.busy || settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope)) {
-    await awaitPredecessorSettle(scope, predecessorSettleDeadline());
+    await awaitPredecessorSettle(scope, predecessorSettleDeadline(input.runId));
   }
   // Re-read after the wait: the release may have retired or replaced the session.
   const entry = warmNativeSessions.get(scope);
@@ -1194,7 +1238,7 @@ export async function claimWarmNativeInstructionCopy(input: {
     if (warmNativeSessions.get(scope) !== entry) return;
     entry.closeOnReleaseReason = reason;
     try {
-      await retireWarmPredecessor(entry, reason);
+      await retireWarmPredecessor(entry, reason, { providerLeaseId: sandboxProviderLeaseId(input.target) });
       forgetWarmNativeSession(scope, entry);
     } finally { entry.busy = false; }
   };
@@ -1245,8 +1289,10 @@ export async function reserveWarmNativeInstructionDirectory(input: {
     // busy until its finishRelease in that run's final cleanup. Wait it out
     // once, bounded like claimWarmNativeInstructionCopy's wait, then re-read.
     // Another run's claim (preparingRunId) is a real concurrent owner.
+    // settle-sites S072: this join spends the successor's one own-predecessor
+    // settle deadline (ownPredecessorSettleDeadline), not a fresh bound.
     if (!releaseWaited && !entry.preparingRunId && (entry.busy || settlingNativeSessionScopes.has(id) || closingWarmNativeSessions.has(id))) {
-      await awaitPredecessorSettle(id, predecessorSettleDeadline(), { entry });
+      await awaitPredecessorSettle(id, predecessorSettleDeadline(input.runId), { entry });
       return reserveWarmNativeInstructionDirectory(input, true);
     }
     if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
@@ -1256,7 +1302,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
     const retire = async (reason: string) => {
       entry.closeOnReleaseReason = reason;
       try {
-        await retireWarmPredecessor(entry, reason);
+        await retireWarmPredecessor(entry, reason, { providerLeaseId: sandboxProviderLeaseId(input.target) });
         forgetWarmNativeSession(id, entry);
       } finally {
         // Failed containment remains registered and cannot be adopted. The next
@@ -1300,7 +1346,13 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
   return closeIdleWarmNativeSessions(input);
 }
 
-async function warmSandboxTerminated(db: Db, entry: WarmNativeSession): Promise<boolean> {
+/** Boat's typed teardown receipt on the owner's lease: "destroyed" (the box no
+ * longer exists) proves the owner gone anywhere; "stopped" by the owner's own
+ * run proves it only when the successor is not on that same sandbox
+ * (successorOnOwnerSandbox), since a terminal owner on a reused sandbox can be
+ * retired only from a different sandbox. */
+async function warmSandboxTerminated(db: Db, entry: WarmNativeSession,
+  scope: { successorOnOwnerSandbox?: boolean } = {}): Promise<boolean> {
   if (!entry.providerLeaseId || !entry.environmentId) return false;
   const leases = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.companyId, entry.companyId),
@@ -1311,7 +1363,8 @@ async function warmSandboxTerminated(db: Db, entry: WarmNativeSession): Promise<
   return resolved.some(lease => {
     if (!hasRemoteTerminationReceipt(lease)) return false;
     const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
-    return state === "destroyed" || (state === "stopped" && lease.heartbeatRunId === entry.runId);
+    return state === "destroyed"
+      || (state === "stopped" && lease.heartbeatRunId === entry.runId && scope.successorOnOwnerSandbox !== true);
   });
 }
 
@@ -1344,7 +1397,8 @@ async function warmRunnerPortTakenBySuccessor(db: Db, entry: WarmNativeSession):
 }
 
 /** A failed close is complete when its Runner is proven gone, its sandbox is destroyed, the run's own sandbox lease has a stop receipt, or a later run launched its own Runner on the same sandbox. */
-async function warmCloseFailureProvesOwnerGone(entry: WarmNativeSession, error: unknown, db = entry.sandboxLeaseDb): Promise<false | "close_failed" | "release_without_checkpoint"> {
+async function warmCloseFailureProvesOwnerGone(entry: WarmNativeSession, error: unknown, db = entry.sandboxLeaseDb,
+  scope: { successorOnOwnerSandbox?: boolean } = {}): Promise<false | "close_failed" | "release_without_checkpoint"> {
   const diagnostic = readRemoteRunnerRecoveryError(error);
   if (diagnostic?.stage === "process_verification" && diagnostic.reason === "process_not_running") return "close_failed";
   const runnerIdMissing = diagnostic?.stage === "process_verification" && diagnostic.reason === "process_runner_id_missing";
@@ -1361,7 +1415,7 @@ async function warmCloseFailureProvesOwnerGone(entry: WarmNativeSession, error: 
   }
   if (runnerIdMissing && suspendedRunnerHasExited(entry, inspection)) return "close_failed";
   try {
-    if (db && (await warmSandboxTerminated(db, entry) || await warmRunnerPortTakenBySuccessor(db, entry))) return "close_failed";
+    if (db && (await warmSandboxTerminated(db, entry, scope) || await warmRunnerPortTakenBySuccessor(db, entry))) return "close_failed";
   } catch (proofError) {
     logger.warn({ err: proofError, runId: entry.runId }, "could not read the warm session's sandbox lease");
     return false;
@@ -2920,7 +2974,7 @@ async function retireSupersededWarmNativeSessions(
     const releasing = !foreignPreparation
       && (settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope));
     if (releasing && !releaseWaited) {
-      await awaitPredecessorSettle(scope, predecessorSettleDeadline(), { entry });
+      await awaitPredecessorSettle(scope, predecessorSettleDeadline(runId), { entry });
       return retireSupersededWarmNativeSessions(ownerScope, nextSessionScope, nextSessionId, runId, ingress, target, true);
     }
     if (entry.busy || foreignPreparation || executingRunnerdSessionScopes.has(scope)) {
@@ -2944,7 +2998,7 @@ async function retireSupersededWarmNativeSessions(
     entry.busy = true;
     entry.closeOnReleaseReason = logicalOwner ? "warm native session identity changed" : "warm native ingress requires another session";
     try {
-      await retireWarmPredecessor(entry, entry.closeOnReleaseReason, {
+      await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { providerLeaseId: sandboxProviderLeaseId(target) }, {
         discardUnsettledSession: logicalOwner && entry.normalizedSessionId !== nextSessionId,
         ...(ownReservation ? { preserveInstructionsForRunId: runId } : {}),
       });
@@ -6853,6 +6907,90 @@ async function pendingLifecycleCommandsIssuedByStop(db: Db, root: string, identi
   }
 }
 
+/** Commands only the close of a warm owner queues: its suspension barrier and
+ * its drain (paperclip-runner runnerd-codex-transport.ts). */
+const CLOSE_ISSUED_LIFECYCLE_COMMAND_PREFIXES: Record<string, string> = {
+  "runner.suspend": "command_close_suspend_", "runner.drain": "command_close_drain_" };
+/** Close outcomes that mean the close ended with the Runner's suspend never
+ * acknowledged and the owner released (warmCloseFailureProvesOwnerGone). */
+const CLOSE_ENDED_UNSUSPENDED: ReadonlySet<string> = new Set(["release_without_checkpoint", "close_failed"]);
+
+/** s6409 TERM-before-ack (RFL + rf-3). The stopped warm owner's close ended
+ * without the Runner answering its runner.suspend, and that Runner generation
+ * was then retired. Its journal is frozen: no wait can settle it. The pending
+ * command does not count for the stopped run's direct successor only when all
+ * of these persisted facts hold, else the bounded wait below stays:
+ * (i) the close's own completion record on the stopped run's still-retained
+ *     lease row (environment_leases.metadata.nativeHarnessBackupMissing), and
+ *     every unsettled command is a pending command that close queued (its own
+ *     command id), journaled at or after the person's acknowledged Stop of
+ *     that run and no later than the close's record, in that run's own journal;
+ * (ii) the stopped run's retained-idle receipt (nativeRetainedIdleCheckpoint);
+ * (iii) that Runner generation proven gone: a TERM/KILL-confirmed holder
+ *     retirement of that run and Runner instance
+ *     (native.runner_port_holder_retired). An ended Boat lease or a stopped
+ *     generation already settles these commands in readSettledRunnerdProjection;
+ * (iv) this run is that run's direct successor: no other run of the same
+ *     conversation was created between them.
+ * Returns the journal projected without those commands, or null. */
+async function closedStopOwnerFrozenJournal(db: Db, root: string, identity: Record<string, unknown>,
+  execution: NativeExecutionInput): Promise<string | null> {
+  const { companyId, runId: successorRunId } = execution.binding;
+  const stoppedRunId = identity.runId, sessionId = identity.normalizedSessionId, runnerInstanceId = identity.runnerInstanceId;
+  if (typeof stoppedRunId !== "string" || typeof sessionId !== "string" || typeof runnerInstanceId !== "string") return null;
+  try {
+    const [stopped] = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, stoppedRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+    const stopAt = stopped ? acknowledgedUserStopRequestedAt(stopped) : null;
+    if (!stopped || stopAt === null) return null;
+    // (ii) The retained-idle receipt of this exact Stop.
+    const receipt = record(record(stopped.runnerProfileJson).nativeRetainedIdleCheckpoint);
+    if (receipt.schema !== "paperclip.native-retained-idle-checkpoint.v1" || receipt.runId !== stoppedRunId
+      || receipt.companyId !== companyId || receipt.sessionId !== sessionId) return null;
+    // (i) The close's own completion record on the stopped run's retained box.
+    const leases = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata }).from(environmentLeases)
+      .where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, stoppedRunId)));
+    const closedAt = leases.map(lease => lease.status === "retained" ? record(record(lease.metadata).nativeHarnessBackupMissing) : {})
+      .filter(marker => marker.runId === stoppedRunId && marker.sessionId === sessionId
+        && CLOSE_ENDED_UNSUSPENDED.has(String(marker.reason)) && typeof marker.at === "string")
+      .map(marker => Date.parse(String(marker.at))).filter(Number.isFinite).sort((left, right) => right - left)[0];
+    if (closedAt === undefined) return null;
+    const bytes = readBoundedNativeFile(resolve(root, "control-plane", "control-plane-state.json"),
+      NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8");
+    const control = record(JSON.parse(bytes));
+    if (record(control.identity).runId !== stoppedRunId || !Array.isArray(control.commands)) return null;
+    const commands = control.commands.map(record);
+    const unsettled = new Set(unsettledControllerCommands(commands));
+    const closeIssued = (command: Record<string, unknown>) => {
+      const prefix = CLOSE_ISSUED_LIFECYCLE_COMMAND_PREFIXES[String(command.type)];
+      const issuedAt = typeof command.issuedAt === "string" ? Date.parse(command.issuedAt) : Number.NaN;
+      return command.status === "pending" && prefix !== undefined && typeof command.commandId === "string"
+        && command.commandId.startsWith(prefix) && issuedAt >= stopAt && issuedAt <= closedAt;
+    };
+    if (unsettled.size === 0 || ![...unsettled].every(closeIssued)) return null;
+    // (iii) That exact Runner generation was stopped with TERM/KILL confirmed.
+    const [retired] = await db.select({ id: activityLog.id }).from(activityLog).where(and(eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "native.runner_port_holder_retired"),
+      sql`${activityLog.details}->>'holderRunId' = ${stoppedRunId}`,
+      sql`${activityLog.details}->>'holderRunnerInstanceId' = ${runnerInstanceId}`,
+      sql`${activityLog.details}->>'outcome' in ('stopped', 'killed')`)).limit(1);
+    if (!retired) return null;
+    // (iv) Direct successor: the newest run of this conversation before this one is the stopped run.
+    const [successor] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, successorRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+    if (!successor || successor.createdAt < stopped.createdAt) return null;
+    const [previous] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, stopped.agentId),
+        eq(heartbeatRuns.nativeSessionId, sessionId), ne(heartbeatRuns.id, successorRunId),
+        lt(heartbeatRuns.createdAt, successor.createdAt)))
+      .orderBy(desc(heartbeatRuns.createdAt)).limit(2);
+    if (previous?.id !== stoppedRunId) return null;
+    return JSON.stringify({ ...control, commands: commands.filter(command => !unsettled.has(command)) });
+  } catch {
+    return null;
+  }
+}
+
 /** A Runner lifecycle command that the person's acknowledged Stop issued is
  * still settling, not an unprovable owner. Wait for it through the same
  * predecessor-settle helper and bound as warm admission
@@ -6868,7 +7006,15 @@ async function retireAfterStopIssuedLifecycleCommands(input: Parameters<typeof i
     || !await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
     return { retired: false, refused };
   }
-  const deadline = predecessorSettleDeadline();
+  const frozen = await closedStopOwnerFrozenJournal(input.db, input.root, input.identity, input.execution);
+  if (frozen !== null) {
+    await input.onLog?.("stderr", `[paperclip-runner] run ${String(input.identity.runId)}'s closed Runner was retired; `
+      + "its Stop's unanswered lifecycle command no longer holds this conversation\n");
+    return retireFinishedPerTurnRunnerdOwner({ ...input, projectedControlBytes: frozen });
+  }
+  // settle-sites: the successor's one own-predecessor settle deadline, shared
+  // with its earlier instruction-directory join (S072), not a fresh bound.
+  const deadline = predecessorSettleDeadline(input.execution.binding.runId);
   await input.onLog?.("stderr", `[paperclip-runner] waiting for the Stop's runner lifecycle command of run ${String(input.identity.runId)}\n`);
   await awaitPredecessorSettle(nativeSessionScopeKey(input.execution), deadline, {
     pending: () => pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId),
@@ -13222,7 +13368,9 @@ async function executePaperclipNativeSessionAttempt(
         entry.busy = true;
         entry.closeOnReleaseReason = "warm native session configuration changed";
         try {
-          await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId });
+          await retireWarmPredecessor(entry, entry.closeOnReleaseReason,
+            { providerLeaseId: sandboxProviderLeaseId(input.runnerExecutionTarget) },
+            { preserveInstructionsForRunId: input.execution.binding.runId });
           forgetWarmNativeSession(warmSessionId, entry);
         } catch (error) {
           // This late preparation step is outside the earlier task-prepare
