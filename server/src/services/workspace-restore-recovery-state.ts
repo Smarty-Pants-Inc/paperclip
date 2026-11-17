@@ -36,6 +36,27 @@ export function hasRequiredWorkspaceRecovery(result: Record<string, unknown> | n
 
 
 
+/** restore-card8 (rf-3 J9): the recovery worker could not adopt an owed hold
+ * (workspace-recovery-backfill.ts recordAdoptionFailure): its systemRecovery is
+ * exhausted with cause adoption_failed after zero attempts and no preservation
+ * operation. Nothing was copied back, so nothing failed: the files are still
+ * owed, and the person bound (not these words) makes it actionable. */
+export const ADOPTION_FAILED_CAUSE = "adoption_failed";
+export function owedRestoreAdoptionBlocked(evidence: Record<string, unknown> | null | undefined): boolean {
+  const system = evidence?.systemRecovery as { state?: unknown; attempts?: unknown; failure?: { cause?: { label?: unknown } };
+    preservationOperationIds?: unknown } | undefined;
+  return evidence?.[WORKSPACE_RESTORE_PENDING_KEY] === true && system?.state === "exhausted" && system.attempts === 0
+    && system.failure?.cause?.label === ADOPTION_FAILED_CAUSE
+    && !(Array.isArray(system.preservationOperationIds) && system.preservationOperationIds.length > 0);
+}
+/** SQL form of owedRestoreAdoptionBlocked for the hold aliased `hold`. */
+const holdOwedAdoptionBlockedSql = sql`(hold.evidence -> '${sql.raw(WORKSPACE_RESTORE_PENDING_KEY)}' = 'true'::jsonb
+  and hold.evidence #>> '{systemRecovery,state}' = 'exhausted'
+  and hold.evidence #>> '{systemRecovery,attempts}' = '0'
+  and hold.evidence #>> '{systemRecovery,failure,cause,label}' = ${ADOPTION_FAILED_CAUSE}
+  and coalesce(case when jsonb_typeof(hold.evidence #> '{systemRecovery,preservationOperationIds}') = 'array'
+    then jsonb_array_length(hold.evidence #> '{systemRecovery,preservationOperationIds}') end, 0) = 0)`;
+
 /**
  * The run's owed-files label follows its hold, read where the recovery worker
  * records it: updateSystemRecovery (system-recovery.ts) writes
@@ -43,8 +64,10 @@ export function hasRequiredWorkspaceRecovery(result: Record<string, unknown> | n
  * (evidence.runId = the run), the same field the hold card renders
  * (workspaceRecoveryDisplay). A recovered hold wins over a sibling; otherwise
  * the latest write. No hold row yet means the worker has not adopted it: owed.
+ * An owed hold whose adoption is blocked (J9) is still queued: owed, not failed.
  */
-const runRestoreHoldStatusSql = sql`(select hold.evidence #>> '{workspaceRecovery,status}'
+const runRestoreHoldStatusSql = sql`(select case when ${holdOwedAdoptionBlockedSql} then 'queued'
+    else hold.evidence #>> '{workspaceRecovery,status}' end
   from issue_recovery_actions hold
   where hold.company_id = ${heartbeatRuns.companyId}
     and hold.evidence ->> 'runId' = ${heartbeatRuns.id}::text
