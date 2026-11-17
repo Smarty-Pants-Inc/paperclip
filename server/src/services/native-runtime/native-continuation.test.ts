@@ -31,6 +31,12 @@ describe("native continuation event projection", () => {
     expect(marked.readByEarlierTurn).toEqual({ messageIds: ["new"], note: expect.stringContaining("may have applied it") });
     expect(JSON.parse(build({ ...wake, comments: [comment] })!).readByEarlierTurn).toBeUndefined();
   });
+  it("marks a carried steer 'received mid-task' in one prefix line, and never an ordinary queued message", () => {
+    const comment = { id: "new", body: message.body, author: { type: "user", id: "board" } };
+    const carried = JSON.parse(build({ ...wake, comments: [{ ...comment, receivedMidTask: true }] })!);
+    expect(carried.messages[0].body).toBe(`Received mid-task (while you were working):\n${message.body}`);
+    expect(JSON.parse(build({ ...wake, comments: [comment] })!).messages[0].body).toBe(message.body);
+  });
   it("keeps the task widgets' app context on a resumed turn", () => {
     const appContext = "## App context (untrusted)\n\n```json\n{\"app\":\"Circleback\",\"text\":\"Selected m2\"}\n```";
     const events = JSON.parse(build({ ...wake, mcpAppContext: appContext })!);

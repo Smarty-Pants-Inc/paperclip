@@ -4,6 +4,7 @@ import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueAttachment
 import type { SourceTrustMetadata } from "@paperclipai/shared";
 
 import { pendingContinuationCommentInput } from "../continuation-comment-input.js";
+import { carriedSteerCommentIds, PAPERCLIP_RECEIVED_MID_TASK_LABEL } from "../carried-steer.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
@@ -114,7 +115,7 @@ export function deferredWakeJoinsFirstTurn(
     queuedCommentIdsFromWakePayload(payload).length > 0;
 }
 
-type QueuedMessage = { id: string; body: string; createdAt: Date };
+type QueuedMessage = { id: string; body: string; createdAt: Date; receivedMidTask?: boolean };
 
 export function renderFirstTurnQueuedInput(messages: readonly QueuedMessage[]): string | null {
   if (messages.length === 0) return null;
@@ -126,6 +127,7 @@ export function renderFirstTurnQueuedInput(messages: readonly QueuedMessage[]): 
     remaining -= body.length;
     return [
       `[Message ${index + 1} of ${messages.length} · comment ${message.id} · ${message.createdAt.toISOString()}]`,
+      ...(message.receivedMidTask ? [PAPERCLIP_RECEIVED_MID_TASK_LABEL] : []),
       body,
       ...(truncated ? [`(Truncated here. Read comment ${message.id} on the task for the rest.)`] : []),
     ].join("\n");
@@ -165,11 +167,13 @@ async function readQueuedMessages(
       commentIds: rows.map(row => row.id) })
     : new Set<string>();
   const byId = new Map(rows.map(row => [row.id, row]));
+  const midTask = await carriedSteerCommentIds(tx, { companyId: input.companyId, issueId: input.issueId,
+    commentIds: rows.map(row => row.id) });
   return input.commentIds.flatMap((id) => {
     const row = byId.get(id);
     if (!row || delivered.has(id)) return [];
     const safe = sanitizeQuarantinedCommentForHigherTrust({ ...row, sourceTrust: row.sourceTrust as SourceTrustMetadata | null });
-    return [{ id, body: safe.body, createdAt: row.createdAt }];
+    return [{ id, body: safe.body, createdAt: row.createdAt, ...(midTask.has(id) ? { receivedMidTask: true } : {}) }];
   });
 }
 

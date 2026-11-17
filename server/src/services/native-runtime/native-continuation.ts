@@ -1,4 +1,4 @@
-import { isPaperclipExternalChatContractTurn, normalizePaperclipWakePayload, PAPERCLIP_EARLIER_READ_COMMENT_NOTE } from "@paperclipai/adapter-utils/server-utils";
+import { isPaperclipExternalChatContractTurn, normalizePaperclipWakePayload, PAPERCLIP_EARLIER_READ_COMMENT_NOTE, PAPERCLIP_RECEIVED_MID_TASK_LABEL } from "@paperclipai/adapter-utils/server-utils";
 import type { CaseExecutionContext, projectCaseContinuation } from "../case-context.js";
 import { caseInstructionAlreadyRepresented } from "../case-context.js";
 
@@ -88,6 +88,11 @@ export function buildNativeContinuationPrompt(input: {
     // a resumed turn sees the current selection as well as the new comment.
     ...(typeof rawWake.mcpAppContext === "string" && rawWake.mcpAppContext.trim() ? { appContext: rawWake.mcpAppContext.trim() } : {}),
   };
+  // A carried steer (a person's message steered into a turn that ended without answering it) says so in one
+  // prefix line; the person's text follows unchanged. Never an ordinary queued message.
+  const midTask = new Set(wake.comments.flatMap((comment) => comment.receivedMidTask && comment.id ? [comment.id] : []));
+  if (midTask.size > 0) events.messages = events.messages.map((message) => midTask.has(message.id) && !message.deleted
+    ? { ...message, body: `${PAPERCLIP_RECEIVED_MID_TASK_LABEL}\n${message.body}` } : message);
   const earlierRead = wake.comments.filter((comment) => comment.readByEarlierTurn && comment.id
     && events.messages.some((message) => message.id === comment.id)).map((comment) => comment.id!);
   if (earlierRead.length > 0) Object.assign(events, { readByEarlierTurn: { messageIds: earlierRead, note: PAPERCLIP_EARLIER_READ_COMMENT_NOTE } });

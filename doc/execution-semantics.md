@@ -5866,6 +5866,22 @@ treat it like the turn's own input. A runner that cannot take a mid-turn steer
 reports `unsupported` or `temporarily_unavailable` through the probe; the
 message stays queued and is delivered at the turn boundary.
 
+A steered message counts as answered by its turn only when the run log shows
+reply text that starts after the model read it and before the next tool call or
+the turn's end. At every run end (success, failure, cancel, a person's Stop) an
+acknowledged steer that was not answered goes back to the queue at its place and
+leaves that run's carried input, so the next turn delivers it once. That turn's
+input marks it with one prefix line, "Received mid-task (while you were
+working):", followed by the person's text unchanged; an ordinary queued message
+never gets that line. If the turn that carries it ends failed or cancelled
+without answering it and nothing else will deliver it, the person gets exactly
+one notice for that message ("Your message (received mid-task) wasn't answered
+because the run failed. Sending it again is safe."), never a silent answered
+mark. The residual is a possible duplicate, never a loss: when the provider's
+read of a steered message (its `userMessage` event) is ingested after the run
+end's release has already decided, the message is restored and answered again
+by the next turn, so steering is not exactly-once.
+
 ### Preserve work across handoff and deliver requested files
 
 An agent handoff carries the interrupted run's authorized task history, completed
