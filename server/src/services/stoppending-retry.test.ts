@@ -24,6 +24,7 @@ import { recordTaskStopPending } from "./recovery/stop-pending.js";
 import { taskInterruptionPresentation } from "./task-interruption-presentation.js";
 import { agentTaskSessions, environmentLeases, environments } from "@paperclipai/db";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
+import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { PI_CONVERSATION_KEY, selectPiConversation } from "./native-runtime/pi-conversation-record.js";
 
 const SIX_MINUTES = 6 * 60_000;
@@ -183,5 +184,66 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await select()).toEqual(conversation);
     const fresh = (await notes(f)).filter(note => String(note.metadata?.authorizationReason ?? "").startsWith("fresh_provider_thread:"));
     expect(fresh).toHaveLength(1);
+  }, 60_000);
+  it("E-C01: a second Retry naming the cancelled never-started successor, after everything settled, never restores the old thread into a new box", async () => {
+    const f = await seed("C");
+    const now = Date.now();
+    const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const sessionId = original!.nativeSessionId!;
+    // Everything settled: the person's Stop run released the task, its coordinator is terminal, its lease released.
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null, status: "blocked" }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ createdAt: new Date(now - 700_000), startedAt: new Date(now - 690_000),
+      finishedAt: new Date(now - 600_000) }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.insert(nativeRunFinalizations).values({ runId: f.sourceRunId, companyId: f.companyId, issueId: f.issueId,
+      phase: "terminal_failure", attempt: 1 } as typeof nativeRunFinalizations.$inferInsert);
+    const [environment] = await db.insert(environments).values({ name: `box-${f.sourceRunId}`, driver: "sandbox" }).returning();
+    const identity = { id: randomUUID(), companyId: f.companyId, heartbeatRunId: f.sourceRunId, provider: "daytona", providerLeaseId: "sandbox-c" };
+    await db.insert(environmentLeases).values({ ...identity, environmentId: environment!.id,
+      issueId: f.issueId, status: "released", leasePolicy: "ephemeral", releasedAt: new Date(now - 590_000), cleanupStatus: "success",
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(identity, { providerLeaseId: "sandbox-c", state: "destroyed" }) } });
+    const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: f.agentId,
+      cause: "native_continuation_requires_reconciliation", fingerprint: `native-continuation:${f.sourceRunId}`,
+      evidence: { runId: f.sourceRunId, originalFailureCode: "cancelled" },
+      nextAction: "The run stopped before it finished. Paperclip continues the task from its last saved work.", maxAttempts: 3 }).returning();
+    // The automatic successor the hold cancelled before it started (dfe91312's shape).
+    const staleId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: staleId, companyId: f.companyId, agentId: f.agentId, status: "cancelled",
+      invocationSource: "automation", contextSnapshot: { issueId: f.issueId }, createdAt: new Date(now - 580_000),
+      finishedAt: new Date(now - 570_000), errorCode: "execution_reconciliation_required", error: "held",
+      resultJson: { stopReason: "execution_reconciliation_required", timeoutSource: "stale_queued_run_gate",
+        executionWait: { issueId: f.issueId, recoveryActionId: hold!.id } } });
+    await db.insert(agentTaskSessions).values({ companyId: f.companyId, agentId: f.agentId, adapterType: "paperclip_runner",
+      taskKey: f.issueId, lastRunId: f.sourceRunId, sessionParamsJson: { sessionId, [PI_CONVERSATION_KEY]: {
+        schema: "paperclip.pi-conversation.v1", id: sessionId, generation: 1, previousId: null, reason: "first_message",
+        runId: f.sourceRunId, boundary: { provider: "pi_rpc", cwd: "/workspaces/old-box", remoteCwd: null, workspaceId: null, trust: "trust" } } } });
+    const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "board",
+      idempotencyKey: randomUUID(), observedRunId: staleId });
+    expect(receipt.accepted).toBe(true);
+    const successorRunId = randomUUID();
+    let blockedWith: string | null = null;
+    const admitted = await db.transaction(async tx => {
+      await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+      const continuation = await admitExplicitNativeContinuation({ db: tx as unknown as typeof db, companyId: f.companyId,
+        issueId: f.issueId, agentId: f.agentId, actorType: "user", actorId: "board", reason: "task_retry", commentId: null,
+        successorRunId, taskRetryRequestId: receipt.requestId!, onBlocked: (reason, message) => { blockedWith = `${reason}: ${message}`; } });
+      if (continuation || !blockedWith) await tx.insert(heartbeatRuns).values({ id: successorRunId, companyId: f.companyId, agentId: f.agentId,
+        nativeIssueId: f.issueId, runtimeMode: "native", status: "queued", invocationSource: "on_demand",
+        contextSnapshot: { issueId: f.issueId, wakeReason: "task_retry", forceFreshSession: true, taskRetryRequestId: receipt.requestId,
+          previousRunId: continuation?.previousRunId ?? staleId, ...(continuation ? { explicitUserContinuation: continuation } : {}) } });
+      return continuation;
+    });
+    // A Retry that is held is a visible wait, never a dead end: the card names it.
+    if (blockedWith) throw new Error(`E-C01 Retry held: ${blockedWith}`);
+    await db.update(agentWakeupRequests).set({ status: "coalesced", runId: successorRunId }).where(eq(agentWakeupRequests.id, receipt.requestId!));
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successorRunId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successorRunId));
+    const readiness = admitted?.readiness ?? await readFreshWorkspaceReadiness(db, run!);
+    const conversation = await selectPiConversation(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+      runId: successorRunId, boundary: { provider: "pi_rpc", cwd: "/workspaces/new-box", remoteCwd: null, workspaceId: null, trust: "trust" } });
+    // In a new box the old provider thread is never restored (prior_owner_scope_mismatch); saved history moves with a recorded rotation.
+    expect(readiness?.mode).toBe("fresh_isolated_workspace");
+    expect(conversation.id).not.toBe(sessionId);
+    expect(conversation).toMatchObject({ previousId: sessionId, generation: 2, reason: expect.stringMatching(/^fresh_continuation:/) });
   }, 60_000);
 });
