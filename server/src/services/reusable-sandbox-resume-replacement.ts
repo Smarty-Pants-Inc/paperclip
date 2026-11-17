@@ -77,6 +77,10 @@ export async function reusableSandboxLeaseIsIdle(input: {
  *   so a new sandbox restores exactly the same files;
  * - a native runner session has a verified, lease-bound harness backup, or the
  *   provider proved it cannot start the sandbox, which is then kept, not retired.
+ * A projectless chat (an issue-scoped lease with no execution workspace) has
+ * no workspace snapshot; its history is its verified harness backup. It is
+ * replaced only when that backup is current for the chat's session, and its
+ * sandbox is always kept, never retired: files outside the backup stay on it.
  * Anything else (unsaved work, a live owner, a legacy workspace with no saved
  * version, an access refusal) keeps the strict preserve-and-retry behavior.
  *
@@ -91,13 +95,13 @@ export async function reusableSandboxReplacementPlan(input: {
   companyId: string;
   heartbeatRunId: string | null;
   executionWorkspaceId: string | null;
+  issueId?: string | null;
   adapterType: string | null | undefined;
   cause: unknown;
   providerCannotStart?: boolean;
 }): Promise<ReusableSandboxReplacementPlan | null> {
   const { db, lease } = input;
   if (!lease.providerLeaseId || !await reusableSandboxLeaseIsIdle(input)) return null;
-  if (!input.executionWorkspaceId || lease.executionWorkspaceId !== input.executionWorkspaceId) return null;
   // A replacement cannot succeed where the resume was refused for access, and
   // an unavailable worker cannot create one either.
   if (findPluginWorkerUnavailableError(input.cause)) return null;
@@ -105,6 +109,8 @@ export async function reusableSandboxReplacementPlan(input: {
   const status = failure.status ?? readEnvironmentResumeErrorDiagnostic(input.cause)?.httpStatus ?? null;
   if (failure.label === "provider_access_denied" || failure.label === "permission_denied"
     || status === 401 || status === 403) return null;
+  if (!input.executionWorkspaceId) return await projectlessChatCheckpointed(input) ? "keep" : null;
+  if (lease.executionWorkspaceId !== input.executionWorkspaceId) return null;
 
   const [workspace] = await db.select({ metadata: executionWorkspaces.metadata }).from(executionWorkspaces)
     .where(and(eq(executionWorkspaces.companyId, input.companyId), eq(executionWorkspaces.id, input.executionWorkspaceId)));
@@ -133,6 +139,35 @@ export async function reusableSandboxReplacementPlan(input: {
   }
 
   return "retire";
+}
+
+/** A projectless native chat's sandbox holds nothing its verified, current
+ * harness backup cannot restore: same issue scope, the backup is bound to this
+ * sandbox and to the owner's session, and no provider work followed it. */
+async function projectlessChatCheckpointed(input: {
+  db: Db;
+  lease: EnvironmentLease;
+  companyId: string;
+  heartbeatRunId: string | null;
+  issueId?: string | null;
+  adapterType: string | null | undefined;
+}): Promise<boolean> {
+  const { db, lease } = input;
+  if (!lease.providerLeaseId || lease.executionWorkspaceId !== null || !lease.issueId) return false;
+  if (input.issueId !== undefined && input.issueId !== lease.issueId) return false;
+  const scope = lease.metadata?.reusableSandboxLease as { adapterType?: unknown } | undefined;
+  if (input.adapterType !== "paperclip_runner" && scope?.adapterType !== "paperclip_runner") return false;
+  if (!await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
+    stamp: lease.metadata?.nativeHarnessBackup, providerLeaseId: lease.providerLeaseId })) return false;
+  const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId);
+  if (!stamp) return false;
+  if (lease.heartbeatRunId) {
+    const [owner] = await db.select({ nativeSessionId: heartbeatRuns.nativeSessionId }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId)));
+    if (owner?.nativeSessionId && owner.nativeSessionId !== stamp.normalizedSessionId) return false;
+  }
+  return !await nativeHarnessBackupHasLaterProviderWork(db, { companyId: input.companyId,
+    currentRunId: input.heartbeatRunId, normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt });
 }
 
 /** A compatible configuration change drains only after its owner is terminal
