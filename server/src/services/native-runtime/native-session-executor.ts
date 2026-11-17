@@ -13774,6 +13774,13 @@ async function executePaperclipNativeSessionAttempt(
         findNativeFailedBeforeProviderTurn(error)
       ) {
         if (findNativeFailedBeforeProviderTurn(error)) retireFailedBeforeTurnSessionRoot(input.execution);
+        // As at the earlier preparation steps: no turn of this fresh claim ran,
+        // so the startup owner releases exactly this claim after renewal stops.
+        const retirement = findNativePredecessorRetirementUnproven(error);
+        const unstartedOwner = nativeSessionStartups.get(input.execution.binding.runId);
+        if (retirement && unstartedOwner && freshClaimAttempt !== undefined && !unstartedOwner.unstartedClaim) {
+          unstartedOwner.unstartedClaim = { leaseOwner, attempt: freshClaimAttempt, failureCode: retirement.code };
+        }
         // This is not a provider failure and must not overwrite the durable
         // result/coordinator state. The heartbeat boundary will either hand an
         // already-materialized result to the finalizer or retain the durable

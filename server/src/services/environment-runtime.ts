@@ -2221,17 +2221,19 @@ function createSandboxEnvironmentDriver(
           }
           // A run that could not retire its predecessor's Runner on this
           // sandbox asked for a fresh one. Replace it under the same safety
-          // rule as a failed resume; otherwise resume it as before.
-          replacingUnretiredOwner = readReplaceBeforeReuseMarker(reusableLease.metadata) !== null
-            && await reusableSandboxReplacementPlan({
+          // rule as a failed resume (a projectless chat's box is kept, never
+          // retired); otherwise resume it as before.
+          const unretiredOwnerPlan = readReplaceBeforeReuseMarker(reusableLease.metadata) !== null
+            ? await reusableSandboxReplacementPlan({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
-              executionWorkspaceId: input.executionWorkspaceId, adapterType: input.adapterType,
+              executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, adapterType: input.adapterType,
               cause: new Error(NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE),
-            }) === "retire";
+            }) : null;
+          replacingUnretiredOwner = unretiredOwnerPlan !== null;
           let idleStartWaitSpent = false;
-          if (replacingUnretiredOwner) {
+          if (unretiredOwnerPlan) {
             replacementReason = "resume_failed";
-            replacementPlan = "retire";
+            replacementPlan = unretiredOwnerPlan;
           } else try {
             // One run spends a bounded budget resuming, retries included; the
             // provider's own start deadline (five minutes on Daytona) is not it.
