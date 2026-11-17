@@ -31,6 +31,7 @@ import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal, isRecoverableNativeSupervisionFailure } from "../native-continuation-refusal.js";
 import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION } from "../native-runtime/remote-runner-recovery-diagnostics.js";
+import { AGENT_LIFECYCLE_STOP_REASON } from "../governance-pause-stop.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -78,6 +79,9 @@ const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] 
 /** The agent that answers the conversation is paused (or held) and will not
  * run until it is resumed. Not a failure: a waiting-kind note. */
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
+/** A resumed agent's own pause cancelled this message's unbound wake, not a failure.
+ * Started runs retain final5c3's existing started-run notice policy. */
+const PAUSE_STOPPED_CODE = "agent_pause_stopped";
 /** Setup completes by itself; a stalled setup gets one factual waiting note. */
 export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
 export const SETUP_WAIT_BOUND_MS = 10 * 60_000;
@@ -998,18 +1002,28 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     }
   } else if (!run) {
     // A failed wake or an explicitly moved-on cancellation is settled no-run
-    // evidence for THIS message. The grace still covers a wake that threw
-    // before any receipt existed; a cancelled receipt cannot start later.
-    const failedWakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+    // evidence for THIS message. Also read pause cancellations to explain a
+    // resumed agent's unbound wake without calling the pause a failure.
+    const terminalWakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status,
+      error: agentWakeupRequests.error, runId: agentWakeupRequests.runId }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-      or(eq(agentWakeupRequests.status, "failed"), and(eq(agentWakeupRequests.status, "cancelled"),
-        eq(agentWakeupRequests.error, "The conversation moved on"))), gt(agentWakeupRequests.updatedAt, message.createdAt)));
+      inArray(agentWakeupRequests.status, ["failed", "cancelled"]), gt(agentWakeupRequests.updatedAt, message.createdAt)))
+      .orderBy(desc(agentWakeupRequests.updatedAt), desc(agentWakeupRequests.createdAt));
     // Only THIS message's own wake (Paperclip's queued-comment attribution) is
-    // evidence; an unrelated failed wake on the issue is not.
-    const wakeFailed = failedWakes.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+    // evidence; a later terminal attempt wins over an older pause cancellation.
+    const ownWakes = terminalWakes.filter(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+    const wakeFailed = ownWakes.some(wake => wake.status === "failed"
+      || (wake.status === "cancelled" && wake.error === "The conversation moved on"));
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_NO_RUN_GRACE_MS;
     if (!wakeFailed && due > now.getTime()) return { kind: "pending", recheckAt: due };
-    code = UNANSWERED_MESSAGE_NO_RUN_CODE;
+    // The lifecycle driver's pausing stop cancels unbound queued/deferred wakes
+    // with this exact error, preserving their reason and message payload
+    // (heartbeat/run-control.ts cancelPendingWakeupsForAgentsInternal). Resume
+    // does not replay them. Do not apply this while setup, a hold or live work
+    // takes precedence above, or to a stopped/terminating agent.
+    const latestWake = ownWakes[0];
+    code = agentRow?.lifecycleState === "ready" && latestWake?.status === "cancelled" && latestWake.runId === null
+      && latestWake.error === AGENT_LIFECYCLE_STOP_REASON ? PAUSE_STOPPED_CODE : UNANSWERED_MESSAGE_NO_RUN_CODE;
   } else {
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     const due = (run.finishedAt ?? run.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
@@ -1120,6 +1134,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const held = (isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run));
   const supervisionUnconfirmed = code === REMOTE_RUNNER_SUPERVISION_EXHAUSTED && !held;
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
+  const pauseStopped = code === PAUSE_STOPPED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
   // A standing working note whose run ended without answering: the run
@@ -1145,6 +1160,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     : UNANSWERED_MESSAGE_NO_RUN_TEXT;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
@@ -1152,13 +1168,15 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       : held ? HELD_PREDECESSOR_NOTICE : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
+      title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start"
+        : pauseStopped ? `${pausedName} was paused before it answered` : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: policyRefused ? "Automatic retry is disabled for this request."
         : settingUp ? "No action is needed; your message is saved."
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
+        : pauseStopped ? "Send it again to continue."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
         : workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION : "Send the message again; if it fails again, assign this agent a new task.",
@@ -1168,7 +1186,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     recoveryResponsibility: "user",
     sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
     // A waiting note is not a failure: no "Failure code" row, a marker row instead.
-    failureCode: waiting ? undefined : run ? undefined : code,
+    failureCode: waiting || pauseStopped ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
   return { kind: "notice", reason, code, notice, ...(setupWaitRecord ? { recordWait: setupWaitRecord } : {}),

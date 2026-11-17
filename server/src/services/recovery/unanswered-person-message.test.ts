@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { appendFileSync } from "node:fs";
 import {
   activityLog,
   agentWakeupRequests,
@@ -24,10 +25,11 @@ import {
 } from "@paperclipai/db";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
-import { createAgentLifecycle } from "../agent-lifecycle.js";
+import { createAgentLifecycle, configureAgentLifecycle } from "../agent-lifecycle.js";
+import { createLifecycleDriver } from "../agent-lifecycle-driver.js";
 import { LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE } from "../../modules/agent-lifecycle/application/retry.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
@@ -62,6 +64,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     database = await startEmbeddedPostgresTestDatabase("unanswered-person-message-");
     db = createDb(database.connectionString);
   }, 60_000);
+  afterEach(() => vi.useRealTimers());
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
   async function fixture(input: { status?: string; chat?: boolean } = {}) {
@@ -875,6 +878,127 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const history = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
       expect(history.map(note => note.body)).toEqual([WORKING]);
       expect(history[0]!.deletedAt).not.toBeNull();
+    });
+
+  // Keep: rf5 independent waitnote F1 caught a real lifecycle pause cancelling
+  // the still-deferred carrying wake, then resume being called another failure.
+  async function deferredMessageBeforePause() {
+    const start = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    const f = await fixture();
+    await db.update(agents).set({ status: "idle", lifecycleState: "ready" }).where(eq(agents.id, f.agentId));
+    const commentId = await f.message("After Stop, continue my saved work.");
+    await db.update(issueComments).set({ createdAt: new Date(start) }).where(eq(issueComments.id, commentId));
+    const payload = { issueId: f.issueId, commentId, executionWait: { reason: "remote_cleanup",
+      message: "Waiting for the previous environment to stop. Your message will start automatically.", recoveryActionId: null } };
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: f.userId, payload,
+      createdAt: new Date(start), updatedAt: new Date(start) }).returning();
+    const advance = (minute: number) => vi.setSystemTime(start + minute * 60_000);
+    const stampedWaits = new Set<string>();
+    const sweep = async (minute: number) => {
+      advance(minute);
+      await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
+      // Date-only timers do not change PostgreSQL defaultNow(): stamp each T0
+      // once at its sweep's virtual time, without restarting the durable bound.
+      const clocks = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId), eq(activityLog.action, PENDING_WAIT_ACTION)));
+      for (const clock of clocks) if (!stampedWaits.has(clock.id)) {
+        await db.update(activityLog).set({ createdAt: new Date() }).where(eq(activityLog.id, clock.id));
+        stampedWaits.add(clock.id);
+      }
+      return f.visible();
+    };
+    return { ...f, commentId, wakeId: wake!.id, payload, advance, sweep };
+  }
+
+  it.each(["paused", "waiting", "none"] as const)(
+    "pausewake rf5: pause cancels deferred wake with no run, resume +1/+11 gives the true pause note (standing %s)", async standing => {
+      const f = await deferredMessageBeforePause();
+      if (standing !== "none") {
+        await f.sweep(1); await f.sweep(5);
+        expect((await f.visible()).map(note => note.body)).toEqual([WAITING]);
+      }
+      f.advance(5.1);
+      const lifecycle = createAgentLifecycle(db);
+      const driver = createLifecycleDriver(db, {} as never);
+      const worker = configureAgentLifecycle(db, { ...driver, requiredPluginIds: async () => [], runPlugin: async () => "complete" });
+      try {
+        await lifecycle.pauseAgent(f.agentId); await worker.process(f.agentId);
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+        expect(wake).toMatchObject({ status: "cancelled", runId: null, error: "Agent lifecycle stop requested",
+          reason: "issue_execution_deferred", payload: f.payload });
+        expect(wake!.finishedAt).not.toBeNull();
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+        if (standing === "paused") {
+          const paused = await f.sweep(5.5);
+          expect(paused).toHaveLength(1);
+          expect(rowsOf(paused[0]!).find(row => row.label === "Waiting code")?.value).toBe("agent_paused");
+        }
+        const before = (await f.visible())[0];
+        f.advance(6); await lifecycle.resumeAgent(f.agentId); await worker.process(f.agentId);
+        expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]!.lifecycleState).toBe("ready");
+        for (const minute of [7, 17]) {
+          const notes = await f.sweep(minute);
+          if (process.env.PAUSEWAKE_EVIDENCE_FILE) appendFileSync(process.env.PAUSEWAKE_EVIDENCE_FILE,
+            `${JSON.stringify({ standing, minute, wake, notes })}\n`);
+          expect(notes).toHaveLength(1);
+          expect.soft(notes[0]!.body, `resume+${minute - 6}m`).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
+          expect.soft(notes[0]!.presentation).toMatchObject({ title: "Managed Pi was paused before it answered" });
+          expect.soft(codeOf(notes[0]!)).toBeUndefined();
+          expect.soft(JSON.stringify(notes[0])).not.toContain("if it fails again");
+          if (before) {
+            expect(notes[0]!.id).toBe(before.id);
+            expect(notes[0]!.createdAt.getTime()).toBe(before.createdAt.getTime());
+          }
+        }
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(1);
+      } finally { await worker.stop(); }
+    });
+
+  it.each([
+    { status: "cancelled", error: "Cancelled as delivered to another turn" },
+    { status: "cancelled", error: "Cancelled because the company was archived" },
+    { status: "cancelled", error: null },
+    { status: "failed", error: "Agent lifecycle stop requested" },
+  ])("pausewake guard: a wake cancelled for another reason or failed keeps no_run (%j)", async input => {
+    const f = await deferredMessageBeforePause();
+    f.advance(5);
+    await db.update(agentWakeupRequests).set({ ...input, finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, f.wakeId));
+    for (const minute of [7, 17]) {
+      const notes = await f.sweep(minute);
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toBe(NO_RUN);
+      expect(codeOf(notes[0]!)).toBe("no_run");
+    }
+  });
+
+  it.each(["message", "issue", "agent", "linked-run", "later-failure"] as const)(
+    "pausewake guard: a pause-cancelled wake cannot mask a different or later attempt (%s)", async control => {
+      const f = await deferredMessageBeforePause();
+      f.advance(5);
+      const other = await fixture();
+      const otherCommentId = await other.message();
+      const unrelatedRun = control === "linked-run" ? await f.run({ status: "succeeded" }) : null;
+      await db.update(agentWakeupRequests).set({ status: "cancelled", error: "Agent lifecycle stop requested",
+        finishedAt: new Date(), updatedAt: new Date(), runId: unrelatedRun,
+        ...(control === "agent" ? { agentId: other.agentId } : {}),
+        payload: { ...f.payload, ...(control === "message" ? { commentId: otherCommentId } : {}),
+          ...(control === "issue" ? { issueId: other.issueId } : {}) } })
+        .where(eq(agentWakeupRequests.id, f.wakeId));
+      if (control === "later-failure") {
+        f.advance(6);
+        await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+          source: "on_demand", reason: "issue_commented", status: "failed", error: "A later wake failed",
+          payload: f.payload, createdAt: new Date(), updatedAt: new Date(), finishedAt: new Date() });
+      }
+      const notes = await f.sweep(7);
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toBe(NO_RUN);
+      expect(codeOf(notes[0]!)).toBe("no_run");
     });
 
   it("waitnote: execution_recovery uses the existing start bound and upgrades the SAME waiting note after it", async () => {
