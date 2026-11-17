@@ -1,13 +1,18 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
-import { runExecutionsStoppedOrHandedOffWarm } from "../agent-execution-stop.js";
-import { logActivity, type ActivityPublication } from "../activity-log.js";
+import { runExecutionsHaveStopped, runExecutionsStoppedOrHandedOffWarm } from "../agent-execution-stop.js";
+import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
+import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
 
 const STOP_PENDING_CODE = "execution_stop_pending";
 export const STOP_PENDING_SCHEMA = "paperclip.task-stop-pending.v1";
-const STOP_PENDING_ACTION = "Stop pending (execution_stop_pending): Paperclip cannot confirm that the previous execution stopped. " +
+const STOP_PENDING_FINDING = "Paperclip cannot confirm that the previous execution stopped.";
+/** The card's own finding, for the person's held message. It names no wait
+ * and promises no automatic start (adopt-stopu-bound2). */
+export const STOP_PENDING_PERSON_LINE = `Stop pending: ${STOP_PENDING_FINDING} Your message is saved.`;
+const STOP_PENDING_ACTION = `Stop pending (execution_stop_pending): ${STOP_PENDING_FINDING} ` +
   "Recovery retained this task's claims and escalated the failed inspection to the board. " +
   "Inspect the bound runs and use the owning agent's Stop/cleanup controls. If its Stop work is parked, inspect its evidence before using the agent's Retry. " +
   "The task stays held until Stop is proved; starting a replacement or waiting longer is not proof.";
@@ -188,4 +193,52 @@ export async function clearTaskStopPending(tx: Db, input: TaskBinding & { answer
     details: { runIds: input.runIds, recoveryActionId: existing.id,
       ...(input.answeredByRunId ? { reason: "later_run_succeeded", answeredByRunId: input.answeredByRunId } : {}) },
   }, publications);
+}
+
+type StoppedRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "nativeIssueId" | "issueId" | "resultJson">;
+const runIssueId = (run: StoppedRun & { contextSnapshot?: Record<string, unknown> | null }) => {
+  const id = run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId;
+  return typeof id === "string" ? id : null;
+};
+/** adopt-stopu-bound2: a person's Stop whose environment cleanup retry failed
+ * to get the stop receipt. Raise the existing Stop-pending card under the task
+ * and run locks, rather than holding the person's messages with no card.
+ * Non-person stops keep the ordinary cleanup escalation. */
+export async function recordPersonStopCleanupPending(db: Db, run: StoppedRun & { contextSnapshot?: Record<string, unknown> | null }) {
+  const issueId = runIssueId(run);
+  if (!issueId || run.status !== "cancelled" || !hasAcknowledgedNativeStopIntent(run)) return false;
+  const publications: ActivityPublication[] = [];
+  const recorded = await db.transaction(async tx => {
+    const [task] = await tx.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.companyId, run.companyId), eq(issues.id, issueId))).for("update");
+    if (!task) return false;
+    await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).for("update");
+    if (await runExecutionsHaveStopped(tx as unknown as Db, run.companyId, [run.id])) return false;
+    await recordTaskStopPending(tx as unknown as Db, { companyId: run.companyId, issueId, runIds: [run.id],
+      source: "recovery.person_stop_cleanup_pending" }, publications);
+    return true;
+  });
+  for (const publication of publications) publishActivity(publication);
+  return recorded;
+}
+/** The receipt landed: retire the card under the same locks before the held
+ * messages are reconsidered (recheck proves Stop; it never invents it). */
+export async function recheckPersonStopCleanupPending(db: Db, run: StoppedRun & { contextSnapshot?: Record<string, unknown> | null }) {
+  const issueId = runIssueId(run);
+  if (!issueId) return;
+  const publications: ActivityPublication[] = [];
+  await db.transaction(async tx => {
+    await tx.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.companyId, run.companyId), eq(issues.id, issueId))).for("update");
+    await recheckTaskStopPending(tx as unknown as Db, { companyId: run.companyId, issueId }, publications);
+  });
+  for (const publication of publications) publishActivity(publication);
+}
+/** The person's line while this run's Stop-pending card is open, else null. */
+export async function personStopPendingLine(db: Db, input: { companyId: string; issueId: string; runId: string }) {
+  const actions = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId),
+    inArray(issueRecoveryActions.status, ["active", "escalated"])));
+  return actions.some(action => stopPending(action)?.runIds.includes(input.runId)) ? STOP_PENDING_PERSON_LINE : null;
 }

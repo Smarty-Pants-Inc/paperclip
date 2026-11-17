@@ -9,6 +9,11 @@ export const ENVIRONMENT_CLEANUP_RETRY_MS = 5 * 60_000;
 // Escalate and slow cleanup after this many attempts; never abandon a live lease.
 export const PENDING_CLEANUP_SWEEP_ATTEMPT_CAP = 5;
 
+// adopt-stopu-bound2: a person's Stop raises the Stop-pending card after this
+// many failed cleanup attempts without the stop receipt (the first retry, about
+// ENVIRONMENT_CLEANUP_RETRY_MS after the Stop). Cleanup itself keeps the cap above.
+export const PERSON_STOP_CARD_ATTEMPTS = 1;
+
 // The reaper stores its retry attempt count under this key in the lease metadata.
 export const PENDING_CLEANUP_ATTEMPTS_METADATA_KEY = "pendingCleanupRetryAttempts";
 

@@ -19,6 +19,7 @@ import { createScheduledRetryCancellationRecovery } from "./scheduled-retry-canc
 import {
   PENDING_CLEANUP_ATTEMPTS_METADATA_KEY,
   PENDING_CLEANUP_SWEEP_ATTEMPT_CAP,
+  PERSON_STOP_CARD_ATTEMPTS,
   pendingCleanupAttemptsSql,
   pendingCleanupDeadlineSql,
   pendingCleanupMetadataObjectSql,
@@ -115,6 +116,8 @@ import {
 import { performance } from "node:perf_hooks";
 import { buildProcessLossDiagnostic } from "../process-loss-diagnostics.js";
 import { logActivity, persistActivity } from "../activity-log.js";
+import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
+import { recheckPersonStopCleanupPending, recordPersonStopCleanupPending } from "../recovery/stop-pending.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { releaseRuntimeServicesForRun } from "../workspace-runtime.js";
@@ -2022,6 +2025,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       }, 30_000);
       renewal.unref();
 
+      const destroyedBefore = destroyed;
       try {
         if (opts?.explicitRetry) await logActivity(db, {
           companyId: row.companyId, actorType: "user", actorId: opts.explicitRetry.actorId,
@@ -2138,6 +2142,15 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       }).where(and(eq(environmentLeases.id, lease.id),
         sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${claimed}`)), { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
       if (lease.heartbeatRunId) {
+        // adopt-stopu-bound2: a person's Stop whose box still has no stop
+        // receipt after this retry gets the existing Stop-pending card (never
+        // an unbounded hold); a retry that settles retires it before resume.
+        await (async () => {
+          const stopped = await getRun(lease.heartbeatRunId!);
+          if (!stopped || !hasAcknowledgedNativeStopIntent(stopped)) return;
+          if (destroyed > destroyedBefore) await recheckPersonStopCleanupPending(db, stopped);
+          else if (attempts + 1 >= PERSON_STOP_CARD_ATTEMPTS) await recordPersonStopCleanupPending(db, stopped);
+        })().catch(() => logger.warn({ leaseId: lease.id }, "could not record the person's Stop-pending card"));
         // Delivery failure must not revert successful provider cleanup. A new
         // message can still use the persisted receipt on its next admission.
         await (async () => {
