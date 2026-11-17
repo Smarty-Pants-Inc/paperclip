@@ -99,6 +99,26 @@ async function renderPage(url = fixture.url) {
   return client;
 }
 describe("Coordinator Needs You — Archived view and history filters (PAP-749 task 2e)", () => {
+  it.each([true, false])("Needs-You / Inbox: person-Stop=%s never borrows another escalation's header", async (personStop) => {
+    fixture.pending = [{ id: "stop-card", sourceKind: "recovery_action", inlineResolvable: false,
+      subject: { id: "stop-card", kind: "recovery_action", title: "Your Stop is not confirmed yet.",
+        status: "escalated", href: "/PAP/issues/PAP-9", metadata: { kind: "active_run_watchdog",
+          cause: "execution_stop_pending", personStop } },
+      relatedIssue: { id: "task-9", identifier: "PAP-9", title: "Daily work", href: "/PAP/issues/PAP-9" },
+      activityAt: new Date().toISOString() } as unknown as AttentionItem];
+    const client = await renderPage("/decisions");
+    const card = container.querySelector('[data-attention-card="stop-card"]');
+    expect(card).not.toBeNull();
+    if (personStop) {
+      expect(card!.textContent).toContain("Stop pending");
+      expect(card!.textContent).not.toMatch(/recovery escalated|recovery paused|resolve, reassign or cancel/i);
+    } else {
+      expect(card!.textContent).toContain("Recovery escalated");
+      expect(card!.textContent).toContain("Resolve, reassign or cancel");
+    }
+    client.clear();
+  });
+
   it("lets the mobile card header and its context wrap instead of overflowing", async () => {
     await renderPage();
     const card = container.querySelector<HTMLElement>("[data-attention-card]");
