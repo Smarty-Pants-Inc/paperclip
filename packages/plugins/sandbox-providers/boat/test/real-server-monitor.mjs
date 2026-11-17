@@ -1,5 +1,12 @@
 // Full unmodified server launcher/probe + emitted Boat plugin + real authenticated
 // durable Runner transport. Only Boat HTTP/guest filesystem are simulated.
+// Keep: #20974 / F-04F, an observation-budget exhaustion cannot prove exit.
+// Run from repo root after building Boat and the two Cargo binaries:
+// node --import ./server/node_modules/tsx/dist/loader.mjs \
+//   packages/plugins/sandbox-providers/boat/test/real-server-monitor.mjs \
+//   ROOT RUNNERD FAKE_CODEX OUTPUT_DIR [all|within|outlast|absent]
+// TMPDIR must name a private scratch directory. The outlast case is a known RED
+// until the separately authorized native monitor owner fix; no server is patched.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
@@ -101,10 +108,12 @@ for(const mode of (CASE==='all'?['within','outlast','absent']:[CASE])) {
   }
   const evidence=bundle.evidence();
   const pass=mode==='within'?!failure&&monitorSuccessAfterResume>=2:mode==='absent'?!failure&&exit45>0&&launches>=2&&diagnostics.some(d=>d.message.includes('restored its durable PRP session')):!failure;
-  result={mode,verdict:pass?'PASS':'FAIL',failure,resumes,launches,monitorRuns,monitorSuccessAfterResume,exit45,monitorError,evidence,diagnostics,calls,
+  calls.push({at:at(),event:'case-verdict',verdict:pass?'PASS':'FAIL'});
+  result={mode,verdict:pass?'PASS':'FAIL',observedAtMs:at(),failure,resumes,launches,monitorRuns,monitorSuccessAfterResume,exit45,monitorError,evidence,diagnostics,calls,
    endLine:failure?'packages/paperclip-runner/src/live/runnerd-codex-transport.ts:8743-8748':mode==='absent'?'packages/paperclip-runner/src/live/runnerd-codex-transport.ts:8896-8898':'server/src/services/native-runtime/native-session-executor.ts:14980-14984'};
  }catch(e){result={mode,verdict:'HARNESS_ERROR',message:e.message,stack:e.stack,calls,diagnostics,evidence:bundle.evidence()};}
  finally{
+  calls.push({at:at(),event:'cleanup-start'});
   armed=false;state='ready';
   // Close runs the real remote signal and confirmed-exit cleanup, not a fake receipt.
   try{await bundle.transport.close();}catch(e){result.cleanupCloseError=e.message;await bundle.detachControllerForRestart().catch(()=>{});}

@@ -685,7 +685,8 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
  * - sandbox_not_ready / machine_not_running (readiness.md:31; troubleshooting:
  *   'Run boat resume, then retry'): command calls get ONE resume + ready wait
  *   + resend, even without a prior resume; files retain the recent-OUR-resume
- *   gate. sandbox_starting commands use the same single recovery.
+ *   gate. A recent explicit resume shares one recovery across later calls.
+ *   sandbox_starting only resends; Boat says 'Send it again', not resume.
  * - sandbox_stopping (troubleshooting: the resume answer carries Retry-After;
  *   'Wait that many seconds ... Then run the same resume again'): resume only.
  * - F-04D unknown/unparsed command 409: GET readiness, never infer from the
@@ -747,14 +748,16 @@ async function boat409Resend(config: Config, path: string, method: string, id: s
     }
     return false;
   }
-  if (call.commandCall && ["sandbox_not_ready", "machine_not_running", "sandbox_starting"].includes(fields.boatCode ?? "")) {
-    if (!canResume()) return false;
-    if (fields.boatCode === "sandbox_starting") {
-      if (BOAT_STARTING_RESEND_MS >= call.deadline - Date.now()) return false;
-      await delay(BOAT_STARTING_RESEND_MS, undefined, { signal });
+  if (call.commandCall && ["sandbox_not_ready", "machine_not_running"].includes(fields.boatCode ?? "")) {
+    const ours = ourResumes.get(activityKey(config, id));
+    // A recent explicit resume owns one shared recovery, not one per command.
+    // Fall through to that owner even when it has already settled. Without a
+    // recent owner, readiness.md:31 still requires one bounded resume per call.
+    if (!ours || Date.now() - ours.at > BOAT_RESUME_RECOVERY_WINDOW_MS) {
+      if (!canResume()) return false;
+      call.useResumeRecovery();
+      return await resume() ? 1 : false;
     }
-    call.useResumeRecovery();
-    return await resume() ? 1 : false;
   }
   if (call.attempt >= call.maxSends) return false;
   const route = path.replace(/^\/sandboxes\/[^/?]+/, "/sandboxes/{sandboxId}").replace(/\?.*$/, "");
