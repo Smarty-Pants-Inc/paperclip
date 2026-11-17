@@ -21,11 +21,11 @@ const assets = Object.fromEntries(await Promise.all(names.map(async name => [nam
 const hashes = Object.fromEntries(names.map(name => [name, createHash("sha256").update(assets[name]).digest("hex")]));
 const base = { driverKey: "boat", companyId: "company", environmentId: "environment", config: { apiKey: secret, duplexCarrier: "ssh" } };
 const ok = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
-function mockBoat(options: { staged?: boolean; nodeVersion?: string; fail?: string; state?: string; badReply?: boolean; poisonHash?: boolean } = {}) {
+function mockBoat(options: { staged?: boolean; nodeVersion?: string; fail?: string; state?: string; badReply?: boolean; poisonHash?: boolean; resetOnce?: string } = {}) {
   const commands: string[] = [], uploads: { path: string; bytes: Buffer; headers: Headers }[] = [];
   const disk = new Map<string, Buffer>(options.staged ? names.map(name => [`${guest}/${name}`, assets[name]]) : []);
   const signed = new Map<string, string>();
-  let deleted = false, stopped = false;
+  let deleted = false, stopped = false, reset = false;
   vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init: RequestInit = {}) => {
     const u = String(url), method = init.method ?? "GET";
     if (signed.has(u)) {
@@ -47,6 +47,10 @@ function mockBoat(options: { staged?: boolean; nodeVersion?: string; fail?: stri
       // F-04: the fake Boat reads the command text after its attempt marker (a shell no-op).
       const command = String(JSON.parse(init.body as string).command).replace(/^: paperclip-attempt=[0-9a-f-]{36}; /, "");
       commands.push(command);
+      if (!reset && options.resetOnce && command.includes(`paperclip-guardian:${options.resetOnce}`)) {
+        reset = true;
+        throw Object.assign(new TypeError("PRIVATE-RESET"), { cause: Object.assign(new Error("PRIVATE-RESET"), { code: "ECONNRESET" }) });
+      }
       if (command.startsWith("cat '")) return ok({ exitCode: 0, stdout: disk.get(command.slice(5, -1))?.toString() ?? "" });
       if (options.fail && command.includes(`paperclip-guardian:${options.fail}`)) return ok({ exitCode: 1, stderr: secret, stdout: signedSecret });
       if (command.includes("paperclip-guardian:seal")) for (const name of names) if (disk.has(`${uploadDir}/${name}`)) disk.set(`${guest}/${name}`, disk.get(`${uploadDir}/${name}`)!);
@@ -167,6 +171,17 @@ describe("guardian staging through Boat lease hooks", () => {
     const boat = mockBoat();
     const lease = await plugin.definition.onEnvironmentResumeLease!({ ...base, config: { apiKey: secret }, providerLeaseId: "bx_guardian", leaseMetadata: { guardianPreflight: { usable: true } } });
     expect(lease.metadata?.guardianPreflight).toBeUndefined(); expect(boat.commands).toEqual([]); expect(boat.uploads).toEqual([]);
+  });
+  it.each(["probe", "preflight"])("F-04D R6 %s ECONNRESET during resume stays transient; next resume recovers", async resetOnce => {
+    const boat = mockBoat({ staged: true, resetOnce });
+    const params = { ...base, providerLeaseId: "bx_guardian" };
+    const error = await plugin.definition.onEnvironmentResumeLease!(params).catch(e => e);
+    expect(error).toMatchObject({ code: "ECONNRESET", category: "network_error" });
+    expect(error.message).toContain("connection reset");
+    expect(error.message).not.toContain("PRIVATE-RESET");
+    expect(boat.commands.filter(c => c.includes(`paperclip-guardian:${resetOnce}`))).toHaveLength(1);
+    const recovered = await plugin.definition.onEnvironmentResumeLease!(params);
+    expect(recovered.metadata?.guardianPreflight).toMatchObject({ usable: true });
   });
   it("does not return stale usable metadata or delete a retained lease on resume failure", async () => {
     const boat = mockBoat({ staged: true, fail: "preflight" });
