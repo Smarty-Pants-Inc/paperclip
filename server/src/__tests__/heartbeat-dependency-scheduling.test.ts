@@ -45,6 +45,8 @@ import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapte
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import * as workspacePreparation from "../services/heartbeat/workspace-preparation.js";
 import { WorkspaceBusyDeferral } from "../services/heartbeat/retries.js";
+import { commitNativeStatusDecision, enqueueWake } from "../services/native-runtime/status-decision-committer.js";
+import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "../services/native-runtime/status-arbiter.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -154,10 +156,10 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.delete(documents);
     await db.delete(issueRelations);
     await db.delete(issueTreeHolds);
+    await db.delete(nativeRunFinalizations);
     await db.delete(statusDecisionEffects);
     await db.delete(statusDecisions);
     await db.delete(workAssessments);
-    await db.delete(nativeRunFinalizations);
     await db.delete(nativeRunResults);
     await db.delete(completionContracts);
     await db.delete(issues);
@@ -346,6 +348,151 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(2);
     } finally { finishPredecessor(); }
   }, 45_000);
+
+  // R-ONCE: the famh3-retry-2 shape (person Retry fails before startup,
+  // execution recovery answers, then an older arbiter retry intent is drained).
+  async function seedFailedPersonRetry() {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const failedRunId = randomUUID(), commentId = randomUUID(), decisionId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "famh3-retry-2", issuePrefix: `R${companyId.slice(0, 6).toUpperCase()}` });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Retry worker", role: "engineer", status: "active", adapterType: "codex_local",
+      adapterConfig: {}, permissions: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Answer the person's request once", status: "in_progress",
+      assigneeAgentId: agentId, responsibleUserId: "responsible-user" });
+    const messageAt = new Date(Date.now() - 10_000);
+    await db.insert(issueComments).values({ id: commentId, companyId, issueId, authorType: "user", authorUserId: "responsible-user",
+      body: "Retry and give me the final answer.", createdAt: messageAt });
+    await db.insert(heartbeatRuns).values({ id: failedRunId, companyId, agentId, issueId, nativeIssueId: issueId,
+      invocationSource: "on_demand", triggerDetail: "manual", status: "failed", runtimeMode: "native",
+      errorCode: "native_run_failed", error: "prior_owner_scope_mismatch", finishedAt: new Date(),
+      contextSnapshot: { issueId, wakeReason: "retry_failed_run", firstTurnQueuedInput: { commentIds: [commentId] } } });
+    const contractId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID();
+    await db.insert(completionContracts).values({ id: contractId, companyId, issueId, revision: 1, schemaVersion: "paperclip.completion-contract.v1",
+      policyVersion: "test", risk: "standard", completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: {}, canonicalSha256: contractId, createdByActorType: "system", createdByActorId: "test" });
+    await db.update(heartbeatRuns).set({ completionContractId: contractId }).where(eq(heartbeatRuns.id, failedRunId));
+    await db.insert(nativeRunResults).values({ id: resultId, companyId, issueId, runId: failedRunId, completionContractId: contractId,
+      serverFingerprint: resultId, schemaStatus: "accepted", resultJson: {}, canonicalSha256: resultId });
+    await db.insert(workAssessments).values({ id: assessmentId, companyId, issueId, runId: failedRunId, contractId, resultId,
+      triggerKind: "turn_finished", triggerActorCompanyId: companyId, priorIssueStatus: "in_progress", priorStatusVersion: 0,
+      policyVersion: "test", assessmentJson: {}, inputDigest: assessmentId });
+    await db.insert(statusDecisions).values({ id: decisionId, companyId, issueId, runId: failedRunId, assessmentId, decisionVersion: 1,
+      policyVersion: "test", fromStatus: "in_progress", toStatus: "in_progress", reasonCode: "run_failed_partial_evidence_preserved",
+      decisionJson: {}, decisionDigest: decisionId, applicationState: "applied", appliedAt: new Date() });
+    const payload = { nativeDecisionId: decisionId, retryCause: "native_run_failed", retrySummary: "Preserve partial evidence and retry" };
+    const wakeInput = { companyId, issueId, agentId, reason: "issue_status_changed", originRunId: failedRunId,
+      idempotencyKey: `native-status:${decisionId}:retry`, payload };
+    async function intent() {
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", triggerDetail: "system",
+        reason: "issue_status_changed", requestedByActorType: "system", requestedByActorId: "native-status-committer",
+        idempotencyKey: wakeInput.idempotencyKey, payload: { issueId, taskId: issueId, ...payload,
+          _paperclipWakeContext: { issueId, taskId: issueId, source: "native_status_decision" } } }).returning();
+      await db.insert(statusDecisionEffects).values({ companyId, issueId, decisionId, ordinal: 0,
+        effectKind: "schedule_retry", targetType: "agent_wakeup_request", targetId: wake!.id,
+        idempotencyKey: wakeInput.idempotencyKey, payload: { cause: "native_run_failed" }, deliveryState: "delivered", deliveredAt: new Date() });
+      return wake!;
+    }
+    async function successor(link: "column" | "restore-context" | "none", answer: boolean) {
+      const id = randomUUID();
+      await db.insert(heartbeatRuns).values({ id, companyId, agentId, issueId, nativeIssueId: issueId,
+        invocationSource: "automation", triggerDetail: "system", status: "succeeded", runtimeMode: "native", finishedAt: new Date(),
+        ...(link === "column" ? { retryOfRunId: failedRunId } : {}),
+        contextSnapshot: { issueId, ...(link === "none" ? { wakeCommentId: commentId } : {}),
+          ...(link === "restore-context" ? { previousRunId: failedRunId, wakeReason: "issue_recovery_action_restored", source: "execution.reconciled" } : {}) } });
+      if (answer) await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId,
+        createdByRunId: id, body: "Here is the final answer." });
+      return id;
+    }
+    mockAdapterExecute.mockImplementation(async () => {
+      const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "running")));
+      await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId,
+        createdByRunId: run!.id, body: "Here is the final answer." });
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Here is the final answer.", provider: "test", model: "test-model" };
+    });
+    return { companyId, agentId, issueId, failedRunId, decisionId, assessmentId, resultId, intent, successor, wakeInput };
+  }
+
+  it.each(["column", "restore-context", "none"] as const)("R-ONCE skips a generic retry after a later run answered (%s)", async link => {
+    const f = await seedFailedPersonRetry();
+    const intent = await f.intent(); // Intent predates recovery: decision-time checks alone cannot fix this.
+    await f.successor(link, true);
+    const result = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent")));
+    expect({ dispatched: result.dispatched, runs: runs.length, replies: replies.map(r => r.body) })
+      .toEqual({ dispatched: 0, runs: 2, replies: ["Here is the final answer."] });
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.id));
+    expect(saved).toMatchObject({ status: "skipped", runId: null, error: "person_message_already_answered" });
+    expect(saved!.finishedAt).not.toBeNull();
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
+  });
+
+  it.each(["column", "restore-context"] as const)("R-ONCE skips a generic retry with an unanswered existing successor (%s)", async link => {
+    const f = await seedFailedPersonRetry();
+    const intent = await f.intent();
+    await f.successor(link, false);
+    expect((await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).dispatched).toBe(0);
+    await heartbeat.drainActiveRunExecutions();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.id));
+    expect(saved).toMatchObject({ status: "skipped", runId: null, error: "failed_run_has_successor" });
+  });
+
+  it("R-ONCE still dispatches an unanswered generic retry with no successor", async () => {
+    const f = await seedFailedPersonRetry();
+    await f.intent();
+    expect((await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).dispatched).toBe(1);
+    await heartbeat.drainActiveRunExecutions();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    expect(runs).toHaveLength(2);
+    expect(runs.find(r => r.id !== f.failedRunId)).toMatchObject({ status: "succeeded" });
+    expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent")))).toHaveLength(1);
+  });
+
+  it.each([true, false])("R-ONCE avoids decision-time insertion when superseded (answered=%s)", async answered => {
+    const f = await seedFailedPersonRetry();
+    await f.successor(answered ? "none" : "column", answered);
+    expect(await db.transaction(tx => enqueueWake({ tx: tx as unknown as typeof db, ...f.wakeInput }))).toBeNull();
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it("R-ONCE rechecks a recovery successor admitted between dispatch and issue admission", async () => {
+    const f = await seedFailedPersonRetry();
+    const intent = await f.intent();
+    const transaction = db.transaction.bind(db);
+    const intercept = vi.spyOn(db, "transaction").mockImplementationOnce((async (callback, options) => {
+      await f.successor("column", false);
+      return transaction(callback, options);
+    }) as typeof db.transaction);
+    try {
+      expect((await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).dispatched).toBe(0);
+      await heartbeat.drainActiveRunExecutions();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
+      const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.id));
+      expect(saved).toMatchObject({ status: "skipped", runId: null, error: "failed_run_has_successor" });
+    } finally { intercept.mockRestore(); }
+  });
+
+  it.each([true, false])("R-ONCE records a skipped retry effect without a wake (answered=%s)", async answered => {
+    const f = await seedFailedPersonRetry();
+    await f.successor(answered ? "none" : "column", answered);
+    await db.delete(statusDecisions).where(eq(statusDecisions.id, f.decisionId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.failedRunId,
+      phase: "assessed", resultId: f.resultId, assessmentId: f.assessmentId });
+    const committed = await commitNativeStatusDecision({ db, companyId: f.companyId, issueId: f.issueId, runId: f.failedRunId,
+      assessmentId: f.assessmentId, priorStatus: "in_progress", priorStatusVersion: 0, priorDecisionId: null,
+      decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "preserve", toStatus: "in_progress",
+        reasonCode: "run_failed_partial_evidence_preserved", unblockDescriptor: null,
+        effects: [{ kind: "schedule_retry", agentId: f.agentId, cause: "native_run_failed", summary: "Preserve partial evidence and retry" }] } });
+    const reason = answered ? "person_message_already_answered" : "failed_run_has_successor";
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, committed.decision.id)))
+      .toMatchObject([{ effectKind: "schedule_retry", targetId: null, deliveryState: "skipped", lastError: reason, payload: { skipReason: reason } }]);
+  });
 
   it("dispatches and coalesces durable native status wake intents into one heartbeat run", async () => {
     const companyId = randomUUID();

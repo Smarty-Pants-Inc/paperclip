@@ -1,4 +1,5 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { nativeStatusSuccessorState } from "../native-runtime/native-status-successor.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
@@ -3976,6 +3977,25 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (priorWake) return { kind: "skipped" as const };
           }
 
+          if (source === "automation" && opts.requestedByActorType === "system" &&
+              readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
+            // Repeat dispatch's DB-only check under the admission issue lock.
+            // This also fences a saved dispatch receipt promoted after recovery.
+            const successor = await nativeStatusSuccessorState(tx as unknown as Db, {
+              companyId: issue.companyId, issueId: issue.id, reason: reason ?? "", payload: parseObject(payload),
+              ...(automaticParentRunId ? { originRunId: automaticParentRunId } : {}),
+            });
+            if (successor.skipReason) {
+              const skipped = { status: "skipped", error: successor.skipReason, finishedAt: new Date(), updatedAt: new Date() };
+              if (executionWaitRequestId) await tx.update(agentWakeupRequests).set(skipped)
+                .where(and(eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.id, executionWaitRequestId)));
+              else await tx.insert(agentWakeupRequests).values({ companyId: issue.companyId, agentId, source, triggerDetail,
+                reason, payload, requestedByActorType: opts.requestedByActorType, requestedByActorId: opts.requestedByActorId,
+                idempotencyKey: opts.idempotencyKey, ...skipped });
+              return { kind: "skipped" as const };
+            }
+          }
+
           if (opts.failedRunId) {
             // The issue lock makes double-clicks and network retries adopt the
             // same successor, including after it has already finished.
@@ -5869,6 +5889,22 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
 
       try {
+        // An outbox intent can outlive both its failure and the recovery run
+        // that answered it. Re-read durable evidence, not just this intent's
+        // own prior dispatch receipt, before admitting a generic successor.
+        const successor = issueId ? await nativeStatusSuccessorState(db, {
+          companyId: candidate.companyId, issueId, reason: candidate.reason ?? "", payload,
+        }) : null;
+        if (successor?.skipReason) {
+          await db.transaction(async tx => {
+            await notifyChatRunMilestones(tx, { companyId: candidate.companyId, issueId: issueId ?? undefined });
+            await tx.update(agentWakeupRequests).set({ status: "skipped", finishedAt: new Date(),
+              error: successor.skipReason, updatedAt: new Date() })
+              .where(and(eq(agentWakeupRequests.id, candidate.id), isNull(agentWakeupRequests.runId)));
+          });
+          recovered += 1;
+          continue;
+        }
         const wakeRun = await enqueueWakeup(candidate.agentId, {
           allowRunCoalescing: false,
           source: candidate.source as WakeupOptions["source"],
