@@ -3,7 +3,7 @@ import { eq, sql } from "drizzle-orm";
 import { isDeepStrictEqual } from "node:util";
 import { workspaceSourceIdentities, withWorkspaceSourceLocks } from "./workspace-source-lock.js";
 import { localWorkspaceSourcePaths } from "./execution-workspace-source-roots.js";
-import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
+import { currentHostMutationDrain, withHeldLockHostDrain } from "./native-runtime/held-lock-host-drain.js";
 
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -27,6 +27,8 @@ export async function withExecutionWorkspaceLifecycleLock<T>(
   workspaceId: string,
   work: (tx: Transaction, signal?: AbortSignal) => Promise<T>,
 ): Promise<T> {
+  // pl/keepalive6: an enclosing held lock's gate (e.g. a caller's source lock), captured before any connection opens.
+  const callerGate = currentHostMutationDrain();
   const [source] = await db.select({ companyId: executionWorkspaces.companyId, projectId: executionWorkspaces.projectId,
     providerType: executionWorkspaces.providerType, sourceIssueId: executionWorkspaces.sourceIssueId, cwd: executionWorkspaces.cwd, providerRef: executionWorkspaces.providerRef }).from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId));
   const sourceRoots = source ? await Promise.all(localWorkspaceSourcePaths(source)
@@ -37,7 +39,8 @@ export async function withExecutionWorkspaceLifecycleLock<T>(
   const issueIds = [...new Set([...sourceRoots.flatMap(root => root.issueIds),
     source && ["local_fs", "git_worktree"].includes(source.providerType) ? source.sourceIssueId : null,
   ].filter((id): id is string => Boolean(id)))].sort();
-  const workWithLifecycle = () => withDedicatedDbConnection(db, (connection) =>
+  // Inside this function's own source scope, the parent is that scope's gate (itself joined to callerGate).
+  const workWithLifecycle = (parentGate = callerGate) => withDedicatedDbConnection(db, (connection) =>
     connection.transaction(async (tx) => {
       await acquireExecutionWorkspaceLifecycleLock(tx, workspaceId);
       if ((projectIds.length || issueIds.length) && source) {
@@ -53,20 +56,16 @@ export async function withExecutionWorkspaceLifecycleLock<T>(
       const rows = await tx.execute(
         sql`select setting::bigint as idle_timeout_ms from pg_settings where name = 'idle_in_transaction_session_timeout'`,
       );
-      // pl/keepalive5: a failed ping aborts work's signal; a lost lock is a failure, never a success.
-      const lost = new AbortController();
-      const result = await withWorkspaceLockKeepalive(
-        tx,
-        Number(rows[0]?.idle_timeout_ms),
-        () => work(tx, lost.signal),
-        { onLost: cause => lost.abort(new ExecutionWorkspaceLifecycleLockLostError(cause)) },
-      );
-      lost.signal.throwIfAborted();
-      return result;
+      // pl/keepalive6: a failed ping closes the lifecycle gate; it is JOINED to the outer source lock's gate,
+      // so losing either lock stops work's host writes; in-flight ones drain before the lock is released.
+      return withHeldLockHostDrain({ lock: tx, idleTimeoutMs: Number(rows[0]?.idle_timeout_ms), parent: parentGate,
+        label: "execution workspace lifecycle lock", lostError: cause => new ExecutionWorkspaceLifecycleLockLostError(cause) },
+      (signal) => work(tx, signal));
     }),
   );
   return (projectIds.length || issueIds.length) && source
-    ? withWorkspaceSourceLocks(db, { companyId: source.companyId, projectIds, issueIds }, workWithLifecycle)
+    ? withWorkspaceSourceLocks(db, { companyId: source.companyId, projectIds, issueIds },
+      () => workWithLifecycle(currentHostMutationDrain() ?? callerGate))
     : workWithLifecycle();
 }
 
