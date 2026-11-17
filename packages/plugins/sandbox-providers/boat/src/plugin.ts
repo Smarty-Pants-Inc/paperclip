@@ -81,6 +81,10 @@ const BOAT_MAX_ATTEMPTS = 3;
 function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${API}\0${config.apiKey}\0${id}`).digest("hex"); }
 // smarty-dev#20974: Boat's documented 409 answers (troubleshooting 'Error
 // messages'; readiness.md:9-31). Only these closed values reach an error.
+// snapshot_data_expired is Boat's troubleshooting.md, 'Error messages',
+// '### `409 snapshot_data_expired`' (copy read 11-17, lines 17-23): "boat deleted
+// this sandbox's data after it had been stopped for at least 14 days. Resume, fork
+// and a saved snapshot save of this sandbox fail. You cannot get the data back."
 const BOAT_409_CODES: ReadonlySet<string> = new Set([
   "sandbox_starting", "sandbox_not_ready", "machine_not_running", "sandbox_stopping", "snapshot_data_expired",
 ]);
@@ -116,6 +120,12 @@ const BOAT_STARTING_RESEND_MS = 1_000;
 // Our successful resumes, by account-scoped box key. A recovery resume never
 // renews the entry, and our own stop forgets it, so it can never wake a box we stopped.
 const ourResumes = new Map<string, { at: number; recovery?: Promise<boolean>; settled?: boolean }>();
+// A box's lifecycle generation (frozen8 verdict F-01). Our stop of the box ends
+// a generation as it starts and again once it completes; a call bound to an older
+// generation never sends again, so no in-flight 409 recovery outlives our stop.
+const boxLifecycles = new Map<string, number>();
+function boxLifecycle(key: string): number { return boxLifecycles.get(key) ?? 0; }
+function endBoxLifecycle(key: string): void { boxLifecycles.set(key, boxLifecycle(key) + 1); }
 function markOurResume(config: Config, id: string): void {
   const now = Date.now();
   // Marks past the window can never act; drop them so the map stays small
@@ -373,7 +383,18 @@ function requestError(config: Config, method: string, path: string, httpStatus: 
   if (error.stack) error.stack = redact(error.stack);
   return error;
 }
-async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false, responseOptions: { onHeaders?: (headers: Headers) => void; requireJson?: boolean; strictMissing?: boolean } = {}): Promise<any> {
+type RequestOptions = {
+  onHeaders?: (headers: Headers) => void; requireJson?: boolean; strictMissing?: boolean;
+  /** At most this many sends (never above BOAT_MAX_ATTEMPTS). */
+  maxSends?: number;
+  /** An enclosing call's budget end: no wait here crosses it. */
+  deadline?: number;
+  /** An enclosing call's admission check, run immediately before every send. */
+  sendGuard?: () => void;
+  /** Our own stop: it ends the box's lifecycle and is never revoked by it. */
+  ownStop?: boolean;
+};
+async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false, responseOptions: RequestOptions = {}): Promise<any> {
   let category: RequestErrorCategory = "request_error";
   let httpStatus: number | null = null;
   let signal: AbortSignal | undefined;
@@ -381,7 +402,20 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
   try {
     if (init.method && init.method !== "GET") assertBoatActivityAdmission();
     const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
-    if (allocation) idleActivity.resource(activityKey(config, decodeURIComponent(allocation)));
+    const boxKey = allocation ? activityKey(config, decodeURIComponent(allocation)) : undefined;
+    if (boxKey) idleActivity.resource(boxKey);
+    const generation = boxKey ? boxLifecycle(boxKey) : 0;
+    // F-01: immediately before EVERY send (the first, and each after any wait):
+    // the lease admission (a stop/release/destroy closes it) and the box's
+    // lifecycle generation (our stop ends it) must still hold, plus any check the
+    // enclosing call passed down (a 409 recovery runs under its call's check).
+    const sideEffecting = (init.method ?? "GET").toUpperCase() !== "GET";
+    const sendGuard = () => {
+      if (sideEffecting) assertBoatActivityAdmission();
+      if (boxKey && sideEffecting && !responseOptions.ownStop && boxLifecycle(boxKey) !== generation) throw new Error("Boat sandbox lease is no longer active.");
+      responseOptions.sendGuard?.();
+    };
+    const maxSends = Math.max(1, Math.min(BOAT_MAX_ATTEMPTS, responseOptions.maxSends ?? BOAT_MAX_ATTEMPTS));
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${config.apiKey}`);
     if (init.body !== undefined) headers.set("Content-Type", "application/json");
@@ -389,7 +423,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     const isStreamBody = requestBody !== null && typeof requestBody === "object" &&
       (typeof (requestBody as { getReader?: unknown }).getReader === "function" || typeof (requestBody as { pipe?: unknown }).pipe === "function");
     let response: Response;
-    const deadline = Date.now() + BOAT_CALL_BUDGET_MS;
+    const deadline = Math.min(Date.now() + BOAT_CALL_BUDGET_MS, responseOptions.deadline ?? Number.POSITIVE_INFINITY);
     const callSignal = init.signal ?? AbortSignal.timeout(BOAT_CALL_BUDGET_MS);
     signal = callSignal;
     const method = (init.method ?? "GET").toUpperCase();
@@ -427,6 +461,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     let resumeRecoveryUsed = false;
     for (let attempt = 1; ; attempt++) {
       await waitForRateLimitPause();
+      sendGuard();
       category = "network_error";
       httpStatus = null;
       boat409 = undefined;
@@ -436,11 +471,13 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         category = "http_error";
         boat409 = boat409Fields(await response.clone().json().catch(() => null));
         const resend = await boat409Resend(config, path, method, allocation ? decodeURIComponent(allocation) : undefined, boat409, {
-          attempt, deadline, callSignal, retryAfter: response.headers.get("Retry-After"),
-          commandOrFilesCall: commandOrFilesCall && !isStreamBody, resumeCall,
+          attempt, maxSends, deadline, callSignal, retryAfter: response.headers.get("Retry-After"),
+          commandOrFilesCall: commandOrFilesCall && !isStreamBody, resumeCall, sendGuard,
           resumeRecoveryUsed, useResumeRecovery: () => { resumeRecoveryUsed = true; },
         });
-        if (!resend) break;
+        if (resend === false) break;
+        // F-02: a recovery resume was one of this call's sends.
+        attempt += resend;
         await response.body?.cancel();
         continue;
       }
@@ -467,7 +504,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       }
       const isIpLimit = String(errorCode) === "IP_RATE_LIMIT_EXCEEDED";
       if (!isIpLimit) duplexLogger?.warn("Boat API 429", {
-        method, route, attempt: `${attempt}/${BOAT_MAX_ATTEMPTS}`, retryAfter: retryAfterText,
+        method, route, attempt: `${attempt}/${maxSends}`, retryAfter: retryAfterText,
         rateLimit: response.headers.get("RateLimit"), rateLimitPolicy: response.headers.get("RateLimit-Policy"),
         ...(errorCode ? { code: errorCode } : {}),
       });
@@ -487,7 +524,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         if (remainingMs <= 0 || retryAfterMs > remainingMs) throw new Error(category);
         await delay(retryAfterMs, undefined, { signal: callSignal });
       }
-      if (!retryableStart || isStreamBody || attempt >= BOAT_MAX_ATTEMPTS || !["rate_limited", "limit_reached", "member_limit_reached"].includes(String(errorCode))) throw new Error(category);
+      if (!retryableStart || isStreamBody || attempt >= maxSends || !["rate_limited", "limit_reached", "member_limit_reached"].includes(String(errorCode))) throw new Error(category);
       if (!hasRateLimitWait) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) throw new Error(category);
@@ -526,47 +563,60 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
   }
 }
 /**
- * Boat's documented 409 handling, inside the call's existing bound (its signal,
- * BOAT_MAX_ATTEMPTS sends, and for waits the call budget). True: send again.
+ * Boat's documented 409 handling, inside the call's existing bound: its signal,
+ * its send cap (BOAT_MAX_ATTEMPTS, or less for a recovery resume), its admission
+ * and box lifecycle checked before every send, and no wait past the call budget
+ * (min of the 30 s deadline and the signal). A number: send again, after that
+ * many extra sends of this call. false: surface the 409.
  * - sandbox_starting (readiness.md:29; troubleshooting): Boat held the command
- *   or files call up to 60 s; send it again.
+ *   or files call up to 60 s; send it again after BOAT_STARTING_RESEND_MS.
  * - sandbox_not_ready / machine_not_running (readiness.md:31; troubleshooting:
  *   'Run boat resume, then retry'): only within minutes of OUR resume of that
- *   box, one more POST /resume plus the ready wait, once per resume; then the
- *   call is retried once.
+ *   box, ONE more POST /resume (a single send of this call) plus the ready wait,
+ *   once per resume; then the call is retried once.
  * - sandbox_stopping (troubleshooting: the resume answer carries Retry-After;
  *   'Wait that many seconds ... Then run the same resume again'): resume only.
- * - Anything else (snapshot_data_expired: the data is gone) is surfaced as is.
+ * - Anything else is surfaced as is: snapshot_data_expired (troubleshooting:
+ *   'Resume, fork and a saved snapshot save of this sandbox fail. You cannot get
+ *   the data back.') and any code outside the closed list.
  */
 async function boat409Resend(config: Config, path: string, method: string, id: string | undefined, fields: Boat409Fields, call: {
-  attempt: number; deadline: number; callSignal: AbortSignal; retryAfter: string | null;
-  commandOrFilesCall: boolean; resumeCall: boolean; resumeRecoveryUsed: boolean; useResumeRecovery: () => void;
-}): Promise<boolean> {
-  if (call.callSignal.aborted || call.attempt >= BOAT_MAX_ATTEMPTS || !id) return false;
+  attempt: number; maxSends: number; deadline: number; callSignal: AbortSignal; retryAfter: string | null;
+  commandOrFilesCall: boolean; resumeCall: boolean; sendGuard: () => void; resumeRecoveryUsed: boolean; useResumeRecovery: () => void;
+}): Promise<number | false> {
+  if (call.callSignal.aborted || call.attempt >= call.maxSends || !id) return false;
   const route = path.replace(/^\/sandboxes\/[^/?]+/, "/sandboxes/{sandboxId}").replace(/\?.*$/, "");
-  const log = (action: string) => duplexLogger?.warn("Boat API 409", { method, route, attempt: `${call.attempt}/${BOAT_MAX_ATTEMPTS}`, action, ...fields });
+  const log = (action: string) => duplexLogger?.warn("Boat API 409", { method, route, attempt: `${call.attempt}/${call.maxSends}`, action, ...fields });
   if (fields.boatCode === "sandbox_starting" && call.commandOrFilesCall) {
+    // F-03: the resend wait never crosses the call budget.
+    if (BOAT_STARTING_RESEND_MS > call.deadline - Date.now()) return false;
     log("send_again");
     await delay(BOAT_STARTING_RESEND_MS, undefined, { signal: call.callSignal });
-    return true;
+    return 0;
   }
   if ((fields.boatCode === "sandbox_not_ready" || fields.boatCode === "machine_not_running") && call.commandOrFilesCall && !call.resumeRecoveryUsed) {
+    // F-02: the recovery resume and the retried call are both sends of this call.
+    if (call.attempt + 2 > call.maxSends) return false;
     const ours = ourResumes.get(activityKey(config, id));
     if (!ours || Date.now() - ours.at > BOAT_RESUME_RECOVERY_WINDOW_MS || ours.settled) return false;
     call.useResumeRecovery();
     if (!ours.recovery) {
       log("resume_again");
+      // F-01: every send of the recovery (the resume and each ready poll) runs
+      // this call's admission and box lifecycle check first.
+      const guard = call.sendGuard;
       ours.recovery = (async () => {
         try {
           await request(config, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", signal: call.callSignal,
-            body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(config), ...(config.boatEnvironment === undefined ? { noEnv: true } : {}) }) });
-          await waitReady(config, id, true, { signal: call.callSignal });
+            body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(config), ...(config.boatEnvironment === undefined ? { noEnv: true } : {}) }) },
+          false, { maxSends: 1, deadline: call.deadline, sendGuard: guard });
+          await waitReady(config, id, true, { signal: call.callSignal, deadline: call.deadline, sendGuard: guard });
           return true;
         } catch { return false; }
         finally { ours.settled = true; }
       })();
     }
-    return await ours.recovery;
+    return await ours.recovery ? 1 : false;
   }
   if (fields.boatCode === "sandbox_stopping" && call.resumeCall && call.retryAfter !== null) {
     const seconds = /^\s*(\d+(?:\.\d+)?)\s*$/.exec(call.retryAfter);
@@ -574,7 +624,7 @@ async function boat409Resend(config: Config, path: string, method: string, id: s
     if (!Number.isFinite(waitMs) || waitMs > call.deadline - Date.now()) return false;
     log("resume_after_retry_after");
     await delay(waitMs, undefined, { signal: call.callSignal });
-    return true;
+    return 0;
   }
   return false;
 }
@@ -675,10 +725,13 @@ function q(v: string): string { return `'${v.replace(/'/g, `'"'"'`)}'`; }
 function validEnv(env: Record<string, string> = {}): void {
   for (const k of Object.keys(env)) if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`Invalid environment variable: ${k}`);
 }
-async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal } = {}): Promise<any> {
-  const until = Date.now() + 120_000;
+async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal; deadline?: number; sendGuard?: () => void } = {}): Promise<any> {
+  // A bounded caller (a 409 recovery) never waits past its call budget, and its
+  // admission and lifecycle check runs before every poll (frozen8 F-01/F-03).
+  const until = Math.min(Date.now() + 120_000, bound.deadline ?? Number.POSITIVE_INFINITY);
+  const options: RequestOptions = { ...(bound.deadline !== undefined ? { deadline: bound.deadline } : {}), ...(bound.sendGuard ? { sendGuard: bound.sendGuard } : {}) };
   while (Date.now() < until) {
-    const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, bound.signal ? { signal: bound.signal } : {});
+    const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, bound.signal ? { signal: bound.signal } : {}, false, options);
     const s = result.sandbox ?? result;
     assertSandboxId(s, id);
     if (["ready", "idle", "running"].includes(s.state)) return s;
@@ -708,9 +761,17 @@ async function waitSetup(config: Config, id: string): Promise<any> {
 async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseId: string; state: "stopped" }> {
   // Our stop ends "our resume": a later not-ready 409 must never wake this box.
   ourResumes.delete(activityKey(config, id));
+  // It also ends the box's lifecycle generation, now and once it completes, so
+  // no call bound to the old generation (an in-flight 409 recovery) sends again.
+  endBoxLifecycle(activityKey(config, id));
+  try {
+    return await stopSandboxRequests(config, id);
+  } finally { endBoxLifecycle(activityKey(config, id)); }
+}
+async function stopSandboxRequests(config: Config, id: string): Promise<{ providerLeaseId: string; state: "stopped" }> {
   idleActivity.resource(activityKey(config, id));
   const proof = idleActivity.proof(activityKey(config, id));
-  const stopped = await request(config, `/sandboxes/${encodeURIComponent(id)}/stop`, { method: "POST", body: JSON.stringify({}) });
+  const stopped = await request(config, `/sandboxes/${encodeURIComponent(id)}/stop`, { method: "POST", body: JSON.stringify({}) }, false, { ownStop: true });
   // Boat documents the operation as `stop`; OpenAPI may expose `operation`.
   // https://docs.boat.dev/api/reference/sandboxes/stop-and-archive-sandbox.md
   const operation = stopped?.stop ?? stopped?.operation ?? stopped?.sandbox?.stop;
