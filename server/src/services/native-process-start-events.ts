@@ -10,6 +10,9 @@ export const PRIOR_OWNER_FENCE_REFUSED = "native.prior_owner_fence_refused";
 /** Server-authored events (no source event ID) that prove a run started its own process. */
 export const OWN_PROCESS_START_EVENT_TYPES = [PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED, PROCESS_STARTED] as const;
 
+/** Unsourced start names. Classifiers must also accept either sourceEventId or
+ * sourceInstanceId: a runner-origin row with a missing event ID is not proof
+ * that the run never launched. Do not enumerate runner-written event names. */
 export const NATIVE_EXECUTION_START_EVENT_TYPES = [
   "adapter.invoke",
   ...OWN_PROCESS_START_EVENT_TYPES,

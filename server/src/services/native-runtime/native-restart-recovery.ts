@@ -260,7 +260,8 @@ function previousRecoveryClaim(
 /**
  * Whether the resume claimed at `watermark` reached execution. The executor
  * records native.process_start_requested before any backend may spawn a
- * runner, and every runner event carries a source event ID.
+ * runner. Either source identifier proves runner origin, even if a persisted
+ * event has lost its source event ID.
  */
 async function nativeExecutionStartedSince(tx: Pick<Db, "select">, runId: string, watermark: number): Promise<boolean> {
   const [started] = await tx
@@ -271,6 +272,7 @@ async function nativeExecutionStartedSince(tx: Pick<Db, "select">, runId: string
       gt(heartbeatRunEvents.seq, watermark),
       or(
         isNotNull(heartbeatRunEvents.sourceEventId),
+        isNotNull(heartbeatRunEvents.sourceInstanceId),
         inArray(heartbeatRunEvents.eventType, [...NATIVE_EXECUTION_START_EVENT_TYPES]),
       ),
     ))
@@ -873,6 +875,7 @@ async function hasNativeRunnerOriginatedEvidence(
   const [event] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents)
     .where(and(eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
       or(isNotNull(heartbeatRunEvents.sourceEventId),
+        isNotNull(heartbeatRunEvents.sourceInstanceId),
         inArray(heartbeatRunEvents.eventType, ["adapter.invoke", "tool.execution.started"]))))
     .limit(1);
   return event !== undefined;
@@ -917,6 +920,7 @@ export async function hasNativeExecutionStartEvidence(
       eq(heartbeatRunEvents.runId, run.id),
       or(
         isNotNull(heartbeatRunEvents.sourceEventId),
+        isNotNull(heartbeatRunEvents.sourceInstanceId),
         inArray(heartbeatRunEvents.eventType, [...NATIVE_EXECUTION_START_EVENT_TYPES]),
       ),
     ))
