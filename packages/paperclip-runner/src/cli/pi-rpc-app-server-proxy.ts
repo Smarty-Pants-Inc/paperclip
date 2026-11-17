@@ -119,15 +119,17 @@ function text(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
-/** Display-only bound: at most 8K UTF-16 units (even JSON control escapes
- * remain under 64KiB). Native records, final receipts and spill files are untouched. */
+/** Live partial tool output only: a labelled preview of at most 8K UTF-16 units
+ * (even JSON control escapes remain under 64KiB). It is never the answer: the
+ * tool's final receipt carries the whole output (or its spill reference), and
+ * native records and spill files are untouched. No cut marker is shown. */
 function piPartialToolPayload(eventType: string, payload: Record<string, unknown>): Record<string, unknown> {
   if (eventType !== "tool.execution.progressed" && !(eventType === "item.delta" && ["tool", "commandExecution"].includes(String(payload.kind)))) return payload;
   const bound = (value: unknown) => {
     if (typeof value !== "string" || value.length <= 8192) return value;
     let end = 8192;
     if (value.charCodeAt(end - 1) >= 0xd800 && value.charCodeAt(end - 1) <= 0xdbff) end--;
-    return `${value.slice(0, end)}\n[Pi tool output truncated for display]`;
+    return `${value.slice(0, end)}\n[Live output: showing the first ${end} of ${value.length} characters so far; the whole output arrives with the tool result]`;
   };
   const item = record(payload.item);
   return { ...payload, ...(payload.output === undefined ? {} : { output: bound(payload.output) }),
