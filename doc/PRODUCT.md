@@ -201,17 +201,21 @@ and board-column membership keep their existing server order.
 Search and pagination apply the routine origin filter on the server. Creation-time
 sorting also runs before pagination, with task ID as a stable tie-breaker.
 
-Tasks and project lists hide agent-created and system-created tasks by default.
-The Filters menu's **Show agent-created tasks** checkbox includes routine runs,
-recovery/watchdog tasks, chat-channel tasks, and other automation. Channel tasks
-remain bot-created for this filter even when a human starts the conversation. The choice is saved per company
-and collection; Clear filters restores the hidden default. An instance admin can
-make these lists show agent-created tasks by default with the General setting
+Tasks and project lists show agent-created and system-created tasks by default.
+The Filters menu's **Hide agent-created tasks** checkbox is unchecked by default.
+Checking it hides routine runs, recovery/watchdog tasks, chat-channel tasks, and
+other automation. Channel tasks remain bot-created for this filter even when a
+human starts the conversation. The choice is saved per company and collection
+as `hideAgentCreatedTasks`, with `hideAgentCreatedTasksExplicit` marking a new
+choice. Old `showAgentCreatedTasks` preferences (including explicit false) are
+ignored on read and dropped when the collection next saves, so upgrading does
+not silently keep a person hiding tasks. Other saved filters and view choices
+are preserved. Clear filters restores the instance default, which is shown when
+no setting exists. An instance admin can still change the General setting
 **Show agent-created tasks in task lists by default**
 (`PATCH /api/instance/settings/general` with
-`{"taskListsShowAgentCreatedByDefault": true}`). A person's own choice in the
-Filters menu still wins, and Clear filters then restores the instance default.
-Choices saved before this setting existed are not treated as a choice. Nested lists preserve
+`{"taskListsShowAgentCreatedByDefault": false}` to opt out). A person's new
+Hide choice in the Filters menu still wins. Nested lists preserve
 ancestors and expandable subtasks as context without promoting unrelated automated
 work to independent results. Agent profiles, routine histories, and task-detail
 subtasks retain their full history.
@@ -242,8 +246,8 @@ checks preserve direct board comments on channel tasks. If both historical
 records are absent, the comment remains unclassified and keeps its previous
 behavior. A task origin alone cannot prove the source of an old comment.
 
-Inbox discovery searches and Blocked hide unrelated automatic tasks unless the
-checkbox is checked. The checkbox does not subscribe a person to automatic work.
+Inbox discovery searches and Blocked show automatic tasks unless Hide is checked.
+The checkbox does not subscribe a person to automatic work.
 Source feeds and project task lists retain their existing access rules.
 
 ### Company Skills and Policy

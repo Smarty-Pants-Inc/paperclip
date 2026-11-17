@@ -80,7 +80,7 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
   }
 
   const censorUsernameInLogs = generalQuery.data?.censorUsernameInLogs === true;
-  const taskListsShowAgentCreatedByDefault = generalQuery.data?.taskListsShowAgentCreatedByDefault === true;
+  const taskListsShowAgentCreatedByDefault = generalQuery.data?.taskListsShowAgentCreatedByDefault !== false;
   const feedbackDataSharingPreference = generalQuery.data?.feedbackDataSharingPreference ?? "prompt";
   const backupRetention: BackupRetentionPolicy = generalQuery.data?.backupRetention ?? DEFAULT_BACKUP_RETENTION;
   const hiddenSettings = new Set(healthQuery.data?.hiddenSettings ?? []);
@@ -187,8 +187,8 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
             <h2 className="text-sm font-semibold">Show agent-created tasks in task lists by default</h2>
             <p className="max-w-2xl text-sm text-muted-foreground">
               Task and project lists include tasks that agents, routines and other automation created, without
-              anyone opening Filters. A person who picks Show agent-created tasks in a list keeps their own
-              choice. This is off by default.
+              anyone opening Filters. A person who toggles Hide agent-created tasks in a list keeps their own
+              choice. This is on by default.
             </p>
           </div>
           <ToggleSwitch
