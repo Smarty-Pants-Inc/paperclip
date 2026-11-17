@@ -684,6 +684,7 @@ const runRetryFreshCase = async () => {
     const successorRunId = randomUUID();
     let blockedWith: string | null = null;
     const admitted = await db.transaction(async tx => {
+      if (!db) throw new Error("Expected initialized test database");
       await tx.select().from(issues).where(eq(issues.id, issueId)).for("update");
       const continuation = await admitExplicitNativeContinuation({ db: tx as unknown as typeof db, companyId, issueId, agentId,
         actorType: "user", actorId: "local-board", reason: "task_retry", commentId: null, successorRunId,
