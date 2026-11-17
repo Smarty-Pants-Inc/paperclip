@@ -11,7 +11,6 @@ import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./ex
 import { continueHeldExecutions } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
 import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT } from "./recovery/unanswered-person-message.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -45,7 +44,6 @@ suite("fresh-continuation watchdog snapshot-binding chain", () => {
   });
 
   it("stops fresh resolved watchdog actions after two snapshot-binding fallbacks and publishes one real owner note", async () => {
-    expect(isNativeContinuationRefusal({ errorCode: cause, error: failure })).toBe(false);
     const startedAt = new Date(Date.now() - 10 * 60_000);
     await db.insert(issues).values({ id: issueId, companyId, title: "Finish the requested work", status: "in_progress",
       assigneeAgentId: agentId, responsibleUserId: userId, conversationAgentId: agentId,

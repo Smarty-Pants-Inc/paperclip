@@ -36,7 +36,7 @@ import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
 import { environmentService } from "../environments.js";
-import { materializePiSessionRecoveryNotice, readUnsupersededHeldConversationNotice, writePiSessionHistoryLossNotice } from "../native-runtime/pi-session-recovery-notice.js";
+import { materializePiSessionRecoveryNotice, writePiSessionHistoryLossNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { ensureFreshContinuation, listFreshContinuations } from "../fresh-continuation-fallback.js";
 import { issueRecoveryActions } from "@paperclipai/db";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
@@ -845,7 +845,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         authorType: "system", body: "The earlier attempt is still being checked.",
         metadata: { version: 1, authorizationReason: `native_prior_owner_held:${oldId}`, sections: [] } }).returning();
       heldCommentId = held.id;
-      expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).not.toBeNull();
     }
     const beforeNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
     // The existing disposition owner runs again when cleanup/turn completion
@@ -905,7 +904,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     if (heldCommentId) {
       expect(notes[0].id).not.toBe(heldCommentId);
       expect(allNotes.find(note => note.id === heldCommentId)?.metadata?.supersededByCommentId).toBe(notes[0].id);
-      expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toBeNull();
     }
     expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);
   }, 60_000);

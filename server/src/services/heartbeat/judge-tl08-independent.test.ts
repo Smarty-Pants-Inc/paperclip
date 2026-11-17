@@ -34,7 +34,7 @@ import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
 import { environmentService } from "../environments.js";
-import { materializePiSessionRecoveryNotice, readUnsupersededHeldConversationNotice, writePiSessionHistoryLossNotice } from "../native-runtime/pi-session-recovery-notice.js";
+import { materializePiSessionRecoveryNotice, writePiSessionHistoryLossNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { ensureFreshContinuation, listFreshContinuations } from "../fresh-continuation-fallback.js";
 import { issueRecoveryActions } from "@paperclipai/db";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
@@ -1039,7 +1039,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         authorType: "system", body: "The earlier attempt is still being checked.",
         metadata: { version: 1, authorizationReason: `native_prior_owner_held:${oldId}`, sections: [] } }).returning();
       heldCommentId = held.id;
-      expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).not.toBeNull();
     }
     // The existing disposition owner runs again when cleanup/turn completion
     // signals it. No Retry, new message, or time advance supplies authority.
@@ -1111,7 +1110,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       expect(notes[0].id).not.toBe(heldCommentId);
       expect(allNotes.find(c => c.id === heldCommentId)).toMatchObject({ body: "The earlier attempt is still being checked.",
         metadata: { supersededByCommentId: notes[0].id } });
-      expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toBeNull();
     }
     if (tl08) for (const oldLease of seedLeases) {
       const [unchanged] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLease.id));

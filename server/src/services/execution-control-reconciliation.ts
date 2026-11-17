@@ -19,7 +19,6 @@ import {
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { issueService } from "./issues.js";
 import { hasLiveLegacyController } from "./legacy-controller-lease.js";
 import { reportRunFailure } from "./run-failure-report.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
@@ -29,7 +28,6 @@ import { EXECUTION_FINALIZATION_DEADLINE_EXCEEDED, EXECUTION_FINALIZATION_DEADLI
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { NATIVE_STARTUP_CLEANUP_PENDING, readNativeStartupContext, promoteNativeStartupCleanup } from "./native-runtime/native-startup-cleanup.js";
 import { releaseAbandonedNativeOwners } from "./native-runtime/native-failed-run-owner-release.js";
-import { EXECUTION_DEADLINE_NOTICE_BODY, EXECUTION_DEADLINE_NOTICE_REASON_PREFIX } from "./execution-deadline-notice.js";
 
 /** Only newly recorded control deadlines are eligible. Upgrades never replay ambiguous historical runs. */
 export async function reconcileAbandonedExecutionControl(
@@ -359,19 +357,6 @@ export async function reconcileAbandonedExecutionControl(
             maxAttempts: 3,
             supersedeOnIdentityChange: true,
           });
-          // This terminal transition can precede provider admission, so there
-          // is no model reply for the normal finalizer to publish. Commit its
-          // visible failure with the run, under the same current-task lock.
-          // A repeated sweep takes the terminal-status guard above instead.
-          await issueService(db).addComment(task.id, EXECUTION_DEADLINE_NOTICE_BODY,
-            {}, { authorType: "system", presentation: { kind: "system_notice", tone: "danger",
-              title: "Reply could not finish", density: "compact", detailsDefaultOpen: true },
-              metadata: { version: 1, sourceRunId: run.id, recoveryResponsibility: "system",
-                authorizationReason: `${EXECUTION_DEADLINE_NOTICE_REASON_PREFIX}${run.id}`,
-                sections: [{ title: "Failure details", rows: [
-                  { type: "run_link", runId: run.id, agentId: run.agentId, title: "Failed reply" },
-                  { type: "key_value", label: "Failure code", value: cause },
-                ] }] } }, tx);
           if (updatedRun) await preserveNativeFailedWorkspace(tx as unknown as Db, updatedRun);
           return true;
         });

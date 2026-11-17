@@ -22,7 +22,6 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { executionProjectionsForRuns } from "../execution-projection.js";
 import { heartbeatService } from "../heartbeat.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
-import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY } from "./unanswered-person-message.js";
@@ -33,7 +32,6 @@ import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
 // or a production record shape named in the test title, on an agent with
 // managed instructions. "Visible" is the v2 chat filter (TaskChatThread.tsx:930):
 // a system comment is hidden only when recoveryResponsibility is "system".
-// follow-Paperclip Cut B R8: held copy preserves the message and offers a new message, never a permanent ban.
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("unanswered person message notice (C9, the stranded sweep)", () => {
@@ -296,14 +294,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await unanswered.visible()).toHaveLength(1);
   });
 
-  it("G4: a pre-turn refusal recorded as adapter_failed (legacy_owner_unverified) -> one held notice", async () => {
+  it("G4: a pre-turn refusal recorded as adapter_failed (legacy_owner_unverified) -> one unanswered notice", async () => {
     const f = await fixture();
     await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
       error: "runner_state_identity_mismatch: legacy_owner_unverified" });
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(HELD);
+    expect(notices[0]!.body).toBe(NOT_ANSWERED);
     expect(codeOf(notices[0]!)).toBe("runner_state_identity_mismatch");
   });
 
@@ -323,7 +321,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.sweep();
       const notices = await f.visible();
       expect(notices).toHaveLength(1);
-      expect(notices[0]!.body).toBe(HELD);
+      expect(notices[0]!.body).toBe(NOT_ANSWERED);
     }
   });
 
@@ -833,46 +831,6 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
-  it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
-    for (let round = 0; round < 4; round++) {
-      const f = await fixture();
-      const sessionId = randomUUID();
-      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "failed", runtimeMode: "native",
-        nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId }, createdAt: f.at(), finishedAt: f.at() });
-      const refused = await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
-        error: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate" });
-      await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, refused));
-      const [late] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", runtimeMode: "native",
-        nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId } }).returning();
-      const writer = () => noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
-        binding: { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, runId: late!.id },
-        session: { normalizedSessionId: sessionId } } as never }, new Error("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate"));
-      const sweep = () => heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
-      await expect(Promise.all(round % 2 ? [writer(), sweep()] : [sweep(), writer()])).resolves.toBeDefined();
-      await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, late!.id));
-      await sweep();
-      expect(await f.visible(), `round ${round}`).toHaveLength(1);
-    }
-  });
-
-  it("RFL F2, the other order: the sweep's notice first, then the executor's held-notice writer adds none (same issue fence)", async () => {
-    const f = await fixture();
-    const sessionId = randomUUID();
-    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "failed", runtimeMode: "native",
-      nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId }, createdAt: f.at(), finishedAt: f.at() });
-    const refused = await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
-      error: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate" });
-    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, refused));
-    await f.sweep();
-    expect(await f.visible()).toHaveLength(1);
-    const [late] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", runtimeMode: "native",
-      nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId } }).returning();
-    await noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
-      binding: { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, runId: late!.id },
-      session: { normalizedSessionId: sessionId } } as never }, new Error("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate"));
-    expect(await f.visible()).toHaveLength(1);
-  });
-
   it("a later answer supersedes the notice", async () => {
     const f = await fixture();
     const commentId = await f.message();
@@ -924,15 +882,6 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await visitedWhileBlocked(f.issueId)).toBe(true);
   });
 
-  it("the executor's standing held notice for the conversation adds no second notice", async () => {
-    const f = await fixture();
-    await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
-      error: "runner_state_identity_mismatch: prior_owner_active" });
-    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: HELD, authorType: "system",
-      metadata: { version: 1, authorizationReason: `native_prior_owner_held:${randomUUID()}`, sections: [] }, createdAt: f.at() });
-    await f.sweep();
-    expect(await f.visible()).toHaveLength(1);
-  });
   // RFL second judge (21:33Z), cases copied unchanged from .local/rfl-bprime/bprime2-judge-cases.ts.
 
   it("JUDGE: a pending approval from BEFORE the latest failed message does not answer that message", async () => {

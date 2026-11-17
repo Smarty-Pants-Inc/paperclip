@@ -267,8 +267,7 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
   }, 60_000);
 
   // ---------------------------------------------------------------- B-5 + B-2
-  // The kept held-notice writer returns early for the typed family (native-session-executor.ts noticeHeldUnfinishedPredecessor,
-  // `if (freshThreadRefusalCode(error)) return`). After Cut B the typed family is an ordinary failure: the fallback continues it
+  // The typed family is an ordinary failure: the fallback continues it
   // (its user text is the recovery action's nextAction, no thread comment), and the ONE thread note owner is the unanswered-message
   // sweep (recovery/unanswered-person-message.ts). B-2: the ONE bound is the K=2 chain cap; #21394's hourly window does not
   // re-open it.

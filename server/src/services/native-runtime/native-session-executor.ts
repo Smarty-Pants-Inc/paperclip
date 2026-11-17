@@ -364,8 +364,8 @@ import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js
 import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
-import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
-  readUnsupersededHeldConversationNotice, writeRestoreUnavailableContinuationNotice } from "./pi-session-recovery-notice.js";
+import { materializePiSessionRecoveryNotice, piSessionRecovery,
+  writeRestoreUnavailableContinuationNotice } from "./pi-session-recovery-notice.js";
 import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
@@ -8001,8 +8001,6 @@ async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExe
   }
 }
 
-/** The banner text for a conversation held behind an unfinished predecessor. */
-import { HELD_PREDECESSOR_NOTICE } from "./held-predecessor-notice-text.js";
 import { providerIdentityResetLine } from "./provider-identity-reset-notice.js";
 
 /**
@@ -8011,74 +8009,6 @@ import { providerIdentityResetLine } from "./provider-identity-reset-notice.js";
  * remembers, is unknown and the new-thread line makes no history claim.
  */
 const freshSessionHandoffOutcomes = new Map<string, boolean>();
-export { HELD_PREDECESSOR_NOTICE };
-// The refusals that hold a conversation behind its unfinished predecessor:
-// the prior-owner fences (including the legacy migration fence), the
-// retained-sandbox binding, a prior session whose
-// cleanup is still quarantined (it guards process ownership of that session),
-// a predecessor Runner whose termination could not be confirmed, and a warm
-// attachment to a predecessor Runner that had already exited.
-const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch: (?:legacy_)?prior_owner_|native_controller_recovery_missing_evidence:retained_sandbox_binding|native_session_cleanup_quarantined:|runner_process_termination_unconfirmed:|native_runner_warm_attachment_runner_exited:)/;
-
-/**
- * A conversation held because its previous run ended without a result (a
- * failed run, or a Stop) and its owner could not be retired is never a silent
- * stuck loop: exactly one durable notice per held predecessor, deduplicated,
- * through the typed history-loss notice helper (one per conversation, so each
- * later refused message adds none). Nothing else changes: the
- * refusal stands.
- */
-/** Exported for the notice-writer regression only. */
-export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution: NativeExecutionInput }, error: unknown): Promise<void> {
-  // D10 disposition owns both waiting and fresh-history notices for typed
-  // refusals; the legacy held writer must not add a competing dead-chat note.
-  if (freshThreadRefusalCode(error)) return;
-  const message = error instanceof Error ? error.message : String(error);
-  if (!HELD_PREDECESSOR_REFUSAL.test(message)) return;
-  const { companyId, issueId, agentId, runId } = input.execution.binding;
-  const normalizedSessionId = nativeSessionKey(input.execution);
-  if (!issueId) return;
-  try {
-    const [current] = await input.db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
-    if (!current) return;
-    const [prior] = await input.db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.nativeIssueId, issueId),
-        eq(heartbeatRuns.nativeSessionId, normalizedSessionId), ne(heartbeatRuns.id, runId),
-        lt(heartbeatRuns.createdAt, current.createdAt)))
-      .orderBy(desc(heartbeatRuns.createdAt)).limit(1);
-    if (!prior || !["failed", "cancelled", "interrupted", "timed_out"].includes(prior.status)) return;
-    const [owner] = await input.db.select({ resultId: nativeRunFinalizations.resultId }).from(nativeRunFinalizations)
-      .where(and(eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, prior.id)));
-    if (owner?.resultId) return;
-    await input.db.transaction(async tx => {
-      const [issue] = await tx.select({ id: issues.id }).from(issues)
-        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId))).for("no key update");
-      if (!issue) return;
-      // One notice per HOLD: while this conversation's notice stands (no later
-      // run of the same session succeeded with a committed result), every
-      // later refused message adds none. A conversation held again after it
-      // continued gets a fresh notice. The standing rule is the banner's own
-      // reader, under this issue lock.
-      const standing = await readUnsupersededHeldConversationNotice(tx as unknown as Db, { companyId, issueId });
-      if (standing?.normalizedSessionId === normalizedSessionId) return;
-      // The stranded sweep's unanswered-message notice already tells the
-      // person (recovery/unanswered-person-message.ts, same issue fence): a
-      // live one stands until an answer supersedes it. One notice, both orders.
-      const [unanswered] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
-        eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
-        isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`)).limit(1);
-      if (unanswered) return;
-      await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
-        kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true,
-      }, metadata: { version: 1, authorizationReason: `${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${normalizedSessionId}`,
-        sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Held conversation" }] }] } }, tx);
-    });
-  } catch (failure) {
-    logger.warn({ err: failure, runId }, "held predecessor notice unavailable");
-  }
-}
-
 /** The controller checkpoint and Runner lifecycle have separate authorities.
  * Rehydrate a missing suspension receipt before choosing live warm adoption.
  * Exported for the provider-boundary regression only. */
@@ -10989,16 +10919,7 @@ export function resolveNativeCancellationStatus(input: {
   };
 }
 
-export async function executePaperclipNativeSession(input: Parameters<typeof executePaperclipNativeSessionUnnoticed>[0]) {
-  try {
-    return await executePaperclipNativeSessionUnnoticed(input);
-  } catch (error) {
-    await noticeHeldUnfinishedPredecessor(input, error);
-    throw error;
-  }
-}
-
-async function executePaperclipNativeSessionUnnoticed(input: {
+export async function executePaperclipNativeSession(input: {
   casesEnabled?: boolean;
   getFreshSessionHandoff?: () => Promise<string | null>;
   /** Retire a retained transport so recovery can replace provider tool declarations. */

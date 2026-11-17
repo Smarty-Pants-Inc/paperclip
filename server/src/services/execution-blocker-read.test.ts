@@ -4,8 +4,8 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { EXECUTION_BLOCKER_PERSON_RETRY_ACTION, getExecutionBlocker } from "./execution-blocker.js";
-import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
-import { readUnsupersededHeldConversationNotice, writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
+const HELD_PREDECESSOR_NOTICE = "Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.";
+import { writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
 import { EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -184,7 +184,7 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     return f;
   }
   const generic = "Saved work recovered.";
-  // The durable notice exactly as the executor writes it (noticeHeldUnfinishedPredecessor).
+  // A historical held notice must not change upstream recovery guidance.
   async function heldNotice(f: Awaited<ReturnType<typeof recoveredRefusal>>, sessionId: string) {
     await db.transaction(tx => writePiSessionHistoryLossNotice(db, tx, { companyId: f.companyId, issueId: f.issueId,
       runId: f.run.id, agentId: f.agentId, authorizationReason: `native_prior_owner_held:${sessionId}`,
@@ -208,14 +208,9 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
       workspaceRecovery: { status: "recovered" } });
     expect(blocker!.nextAction).toBe(generic);
     expect(blocker!.nextAction).not.toMatch(/send a message to continue/i);
-    expect(await readUnsupersededHeldConversationNotice(db, f)).toMatchObject({ body: HELD_PREDECESSOR_NOTICE });
-    // A success on another conversation (a new task) does not clear the output notice.
     await committedSuccess(f, randomUUID());
-    expect(await readUnsupersededHeldConversationNotice(db, f)).toMatchObject({ body: HELD_PREDECESSOR_NOTICE });
     expect((await getExecutionBlocker(db, f.companyId, f.issueId))!.nextAction).toBe(generic);
-    // A later committed success on the same conversation supersedes the output notice.
     await committedSuccess(f, sessionId);
-    expect(await readUnsupersededHeldConversationNotice(db, f)).toBeNull();
     expect((await getExecutionBlocker(db, f.companyId, f.issueId))!.nextAction).toBe(generic);
   });
 
