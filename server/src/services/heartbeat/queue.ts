@@ -1,5 +1,8 @@
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
+import { QUEUED_SEND_AFTER_STOP_KEY } from "../run-cancellation.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
@@ -267,6 +270,8 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   cancelActiveForAgentInternal: (agentId: string, reason: string) => Promise<unknown>;
   resumeExecutionWaitComments: (scope?: DeferredReceiptRecoveryOptions) => Promise<unknown>;
   resumeQueuedCommentInterrupt: (companyId: string, queueId: string) => Promise<unknown>;
+  /** The native run this Interrupt stopped has proven it can no longer write. */
+  queuedCommentInterruptTargetStopped?: (companyId: string, queueId: string) => Promise<boolean>;
   resumeSavedLegacyComments: (companyId: string, queueId: string) => Promise<unknown>;
   formatIssueIdentifierLink: (identifier: string | null, fallback: string) => string;
 }
@@ -486,6 +491,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     resumeExecutionWaitComments,
     getWorktreeExecutionCutoff,
     resumeQueuedCommentInterrupt,
+    queuedCommentInterruptTargetStopped,
     resumeSavedLegacyComments,
     cancelActiveForAgentInternal,
     listCompanyAgentOrgRows,
@@ -2058,6 +2064,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments(scope);
     const cutoff = await getWorktreeExecutionCutoff();
+    // S8q: the age gate waits out a run that may still write. An exact hint for
+    // an Interrupt whose stopped run has finished teardown needs no wait; every
+    // other wake keeps the gate, and admission still rechecks under its locks.
+    const stoppedInterrupt = scope.companyId && scope.requestId && queuedCommentInterruptTargetStopped
+      ? await queuedCommentInterruptTargetStopped(scope.companyId, scope.requestId) : false;
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
       .where(and(scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
@@ -2065,7 +2076,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(companies.status, "active"),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
-        lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
+        stoppedInterrupt ? undefined : lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const wake of pendingInterrupts) {
@@ -2712,6 +2723,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       delete payload.queuedCommentInterrupt;
       delete payload.manualUserWake;
       delete payload.taskRetry;
+      delete payload[QUEUED_SEND_AFTER_STOP_KEY];
     }
     if (opts.manualUserWake) {
       if (opts.requestedByActorType !== "user" || !opts.requestedByActorId || opts.failedRunId) {
@@ -2778,6 +2790,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       enrichedContextSnapshot.forceFreshSession = true;
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
       enrichedContextSnapshot.taskRetryRequestId = receipt.id;
+      // H3 R-ONCE: a person's Retry of a run that held their answer takes that answer
+      // as input, through the one continuation seam (scope from the source run's own
+      // row, never this payload). Saved board messages keep their own Retry carry.
+      const answered = await readContinuationCommentInput(db, { companyId: receipt.companyId, issueId: issueId!,
+        runId: retry.sourceRunId });
+      if (answered.interactionIds) Object.assign(enrichedContextSnapshot, answered);
       if (retry.boardMessageOrigin) enrichedContextSnapshot.boardMessageRetry = true;
     }
 
@@ -3529,6 +3547,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+          await lockAgentForRunAdmission(tx, { companyId: agent.companyId, agentId });
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
@@ -5463,10 +5482,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     const queueOutcome = await db.transaction(async (tx) => {
       await lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent);
+      // The fallback may still bind a fresh continuation to a context issue.
+      // Match scoped admission/recovery: issue first, then agent, then inserts.
+      const continuedIssueId = readNonEmptyString(enrichedContextSnapshot.issueId);
+      if (continuedIssueId && readNonEmptyString(enrichedContextSnapshot.freshContinuationIsolation)) {
+        await tx.execute(sql`select id from issues where company_id = ${agent.companyId} and id = ${continuedIssueId} for update`);
+      }
+      await lockAgentForRunAdmission(tx, { companyId: agent.companyId, agentId });
       await notifyRunDispatch(tx, { companyId: agent.companyId });
-      await tx.execute(
-        sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
-      );
 
       const dailyCapBlock = await getHeartbeatDailyCapBlock(
         agent,
@@ -5549,9 +5572,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         .returning()
         .then((rows) => rows[0]);
 
-      const continuedIssueId = readNonEmptyString(enrichedContextSnapshot.issueId);
       if (continuedIssueId && readNonEmptyString(enrichedContextSnapshot.freshContinuationIsolation)) {
-        await tx.execute(sql`select id from issues where company_id = ${agent.companyId} and id = ${continuedIssueId} for update`);
         await foldWaitingRetriesIntoContinuation(tx as unknown as Db, { companyId: agent.companyId, issueId: continuedIssueId, runId: newRun.id,
           sourceRunId: readNonEmptyString(enrichedContextSnapshot.previousRunId) });
       }

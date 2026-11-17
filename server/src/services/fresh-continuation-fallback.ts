@@ -7,6 +7,7 @@ import {
   EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type ExecutionReconciliation,
 } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { logActivity } from "./activity-log.js";
 import { taskHistoryReadsForRun } from "./queued-comment-delivery.js";
 import { undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
@@ -25,12 +26,13 @@ import { abandonUnverifiedRemoteWorkspaceEpoch } from "./remote-workspace-epoch-
 import { notifyRoutineExecutionStatus } from "./routine-execution-status-notifications.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { readRunCancellation } from "./run-cancellation.js";
-import { readSystemRecovery } from "./system-recovery-state.js";
+import { PERMANENT_SOURCE_RETRY_CLASSES, UNVERIFIABLE_SOURCE_CODES, readSystemRecovery } from "./system-recovery-state.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
 export { freshContinuationChain } from "./fresh-continuation-chain.js";
 import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.js";
-import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuesAutomaticallySql, isPersonOwnedFailureCode } from "./continuation-cause.js";
+import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuationCauseIsSystemOwnedSql, continuesAutomaticallySql,
+  isPersonOwnedFailureCode } from "./continuation-cause.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
 import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, readThinkingOnlyCapStop,
   THINKING_CAP_STOP_CONTINUATION_INSTRUCTION, type CutAnswerCause } from "./heartbeat-run-summary.js";
@@ -82,6 +84,12 @@ export const FRESH_CONTINUATION_CHECK_KEY = "freshContinuationCheck" as const;
 // import cycle); a test pins them to SERVER_RESTART_RETRY_MAX_ATTEMPTS/_WINDOW_MS.
 export const FRESH_CONTINUATIONS_PER_HOUR = 6;
 export const FRESH_CONTINUATIONS_PER_CHAIN = 2;
+export const FRESH_CONTINUATIONS_PER_CHAIN_ENV = "PAPERCLIP_FRESH_CONTINUATIONS_PER_CHAIN";
+
+/** Absence preserves the existing limit; malformed settings refuse startup. */
+export function resolveFreshContinuationsPerChain(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntegerEnvironment(env, FRESH_CONTINUATIONS_PER_CHAIN_ENV, FRESH_CONTINUATIONS_PER_CHAIN);
+}
 export const FRESH_CONTINUATION_WINDOW_MS = 60 * 60_000;
 const PERSON_RECHECK_MS = 60 * 60_000;
 /** Consecutive pending checks (about 12 minutes) before the fallback stops waiting. */
@@ -360,7 +368,8 @@ const blocksExecution = (hold: typeof issueRecoveryActions.$inferSelect) =>
 /** A reconciliation hold that blocks the task and that this decision settles. */
 function isOwnedReconciliationHold(hold: typeof issueRecoveryActions.$inferSelect) {
   if (hold.kind === "stranded_assigned_issue") return false;
-  if (!(EXECUTION_RECONCILIATION_CAUSES as readonly string[]).includes(hold.cause) || !blocksExecution(hold)) return false;
+  const interruption = hold.kind === "active_run_watchdog" && (RESTART_CLASS_FAILURE_CODES as readonly string[]).includes(hold.cause);
+  if ((!(EXECUTION_RECONCILIATION_CAUSES as readonly string[]).includes(hold.cause) && !interruption) || !blocksExecution(hold)) return false;
   if (isHumanGate(hold)) return false;
   // A restore hold is owned only once its saved-work recovery completed.
   return !isRestoreHold(hold) || readSystemRecovery(hold.evidence)?.state === "complete";
@@ -457,7 +466,8 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
     || reconciliation.actorId !== FRESH_CONTINUATION_ACTOR || reconciliation.runId !== source.id
     || !["remote_epoch", "writer_ended", "fresh_isolated_workspace"].includes(String(fresh.isolation))
     || settlement.isolation !== fresh.isolation
-    || (fresh.isolation === "fresh_isolated_workspace" && context.freshContinuationIsolation !== action.id)
+    || (fresh.isolation === "fresh_isolated_workspace" && context.freshContinuationIsolation !== action.id
+      && !isRetryFreshProviderThread(action, source.id, run))
     || (fresh.isolation === "writer_ended" ? fresh.stopProof !== "writer_ended"
       : !["unproven_epoch_abandoned", "unproven_isolated"].includes(String(fresh.stopProof)))
     || typeof fresh.recordedAt !== "string" || source.resultJson?.[FRESH_CONTINUATION_SUPERSEDED_KEY] !== fresh.recordedAt
@@ -472,6 +482,80 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
   if (await hasAnswerSinceSettlement(db, source, issueId, fresh.recordedAt, run.id)) return null;
   return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId,
     startedNote: await freshThreadStartedNote(db, source) };
+}
+
+/** The Retry's own record (recordRetryFreshProviderThread): bound at admission
+ * to exactly the successor run whose admitted readiness chose the new box. */
+function isRetryFreshProviderThread(action: typeof issueRecoveryActions.$inferSelect, sourceRunId: string,
+  run: typeof heartbeatRuns.$inferSelect) {
+  const readiness = object(object(object(run.contextSnapshot).explicitUserContinuation).readiness);
+  return RETRY_FRESH_THREAD_TRIGGERS.includes(object(action.evidence.freshContinuation).trigger as RetryFreshThreadTrigger)
+    && action.evidence.continuationRunId === run.id && action.evidence.continuationDelivery === "delivered"
+    && readiness.mode === "fresh_isolated_workspace" && readiness.sourceRunId === sourceRunId;
+}
+
+export const RETRY_FRESH_THREAD_TRIGGER = "person_retry" as const;
+/** Who started a Retry routed to a fresh workspace. Only a person's own action
+ * is person_retry; restart recovery, the provider-limit reset and the budget
+ * resume file the Retry for the person but are automatic, so their records are
+ * counted against the automatic continuation cap (freshContinuationTimes). */
+export const RETRY_FRESH_THREAD_TRIGGERS = [RETRY_FRESH_THREAD_TRIGGER, "retry_restart_recovery",
+  "retry_provider_limit_reset", "retry_budget_resume"] as const;
+export type RetryFreshThreadTrigger = typeof RETRY_FRESH_THREAD_TRIGGERS[number];
+export function retryFreshThreadTrigger(intent: { initiatedBy?: "restart_recovery" | "provider_limit_reset";
+  resumedBy?: "budget_resume" }): RetryFreshThreadTrigger {
+  if (intent.initiatedBy) return `retry_${intent.initiatedBy}`;
+  if (intent.resumedBy) return `retry_${intent.resumedBy}`;
+  return RETRY_FRESH_THREAD_TRIGGER;
+}
+
+/**
+ * A person's native Retry that admission routed to a fresh isolated workspace
+ * (the old box is not the task's own, or is remote) cannot continue the old
+ * provider thread there: the checkpoint matched by its session id belongs to
+ * the old box's scope, and the new scope root refuses it
+ * (prior_owner_scope_mismatch). Record, in the admitting transaction, the same
+ * fresh-thread decision the held_recovery follow-up records, delivered to the
+ * Retry's successor run. Its first run then selects a new provider thread
+ * (selectPiConversation / selectFreshContinuationThread) that starts with the
+ * saved-history handoff, and posts that path's one fresh-thread note. The
+ * conversation is not reset; only its provider thread is replaced, recorded.
+ * Caller holds the admission and has proven the source stopped. Only a
+ * person's own Retry (person_retry) is left out of the automatic attempt count
+ * (see freshContinuationTimes); an automatic resume's trigger counts.
+ */
+export async function recordRetryFreshProviderThread(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; sourceRunId: string; successorRunId: string;
+  trigger: RetryFreshThreadTrigger;
+}): Promise<string | null> {
+  const [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.agentId, input.agentId))).for("update");
+  if (!source || source.runtimeMode !== "native" || source.nativeIssueId !== input.issueId || !source.nativeSessionId
+    || !UNFINISHED_STATUSES.includes(source.status) || !source.finishedAt) return null;
+  // The admitting transaction's clock: never later than its successor's created_at.
+  const [clock] = await db.execute<{ ms: string }>(sql`select (extract(epoch from date_trunc('milliseconds', now())) * 1000)::bigint::text as ms`);
+  const recordedAt = new Date(Number(clock!.ms)).toISOString();
+  const isolation: FreshContinuationIsolation = "fresh_isolated_workspace";
+  const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: source.id, trigger: input.trigger,
+    failureCode: source.errorCode ?? null, delivery: "caller_owns", recordedAt, isolation, stopProof: "unproven_isolated" };
+  const reconciliation = { runId: source.id, providerStopped: true, providerStopProof: "isolated",
+    workspaceRepairEvidence: `The Retry of run ${source.id} starts in a new isolated workspace; no unverified files are applied.`,
+    actorId: FRESH_CONTINUATION_ACTOR, recordedAt };
+  const settlement = { schema: FRESH_CONTINUATION_SCHEMA, actorType: "system", actorId: FRESH_CONTINUATION_ACTOR,
+    decision: "continue_in_fresh_run", replay: "none", sourceRunId: source.id, failureCode: source.errorCode ?? null,
+    reason: "retry_fresh_isolated_workspace", isolation, requestedBy: input.trigger === RETRY_FRESH_THREAD_TRIGGER ? RETRY_FRESH_THREAD_TRIGGER : "system", recordedAt };
+  const [created] = await db.insert(issueRecoveryActions).values({ companyId: input.companyId, sourceIssueId: input.issueId,
+    kind: "active_run_watchdog", status: "resolved", outcome: "restored", ownerType: "system",
+    returnOwnerAgentId: input.agentId, cause: FRESH_CONTINUATION_CAUSE, fingerprint: `fresh-continuation:retry:${input.successorRunId}`,
+    nextAction: USER_TEXT, resolutionNote: "retry_fresh_provider_thread", resolvedAt: new Date(recordedAt), attemptCount: 1,
+    evidence: { runId: source.id, originalFailureCode: source.errorCode ?? null, executionReconciliation: reconciliation,
+      freshContinuationSettlement: settlement, freshContinuation, continuationDelivery: "delivered",
+      continuationRunId: input.successorRunId } }).returning({ id: issueRecoveryActions.id });
+  // As the follow-up does: the replaced run loses its write authority.
+  await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
+    || ${JSON.stringify({ [FRESH_CONTINUATION_SUPERSEDED_KEY]: recordedAt })}::jsonb` }).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, source.id)));
+  return created!.id;
 }
 
 /**
@@ -666,7 +750,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
   const chain = await freshContinuationChain(tx, { companyId, issueId: issue.id, runId: run.id });
-  if (chain.attempts >= FRESH_CONTINUATIONS_PER_CHAIN)
+  if (chain.attempts >= resolveFreshContinuationsPerChain())
     return { kind: "not_applicable", reason: "fresh_continuation_chain_exhausted" };
   // dl-n5-cont2 item 3 COST GUARD: at most ONE automatic continuation per ask
   // after a thinking-only output-cap stop. When that continuation stopped the
@@ -1077,6 +1161,8 @@ const cancelledAtDispatch = (alias: "newer" | "held") => sql.raw(`coalesce(${ali
 const runOfTask = (alias: "newer" | "held", issueId: SQL) => sql`(${sql.raw(alias)}.native_issue_id::text = ${issueId}::text
   or ${sql.raw(alias)}.issue_id::text = ${issueId}::text or ${sql.raw(alias)}.context_snapshot->>'issueId' = ${issueId}::text)`;
 
+const sqlList = (values: readonly string[]) => sql.join(values.map(value => sql`${value}`), sql`, `);
+
 function interruptionEligibility(input: { now: Date; companyId: SQL; issueId: SQL; sourceRunId: SQL }) {
   const since = sql`${new Date(input.now.getTime() - BACKLOG_CONTINUATION_MAX_AGE_MS).toISOString()}::timestamptz`;
   const source = (condition: SQL) => sql`exists (select 1 from ${heartbeatRuns} source where source.company_id = ${input.companyId}
@@ -1088,8 +1174,20 @@ function interruptionEligibility(input: { now: Date; companyId: SQL; issueId: SQ
       and retry.run_id is null and retry.payload->>'issueId' = ${input.issueId}::text and retry.requested_at > source.finished_at)
     or exists (select 1 from ${heartbeatRuns} held where ${refusedLater}
       and held.context_snapshot->>'wakeReason' = 'task_retry' and held.finished_at > ${since}))`);
+  // Saved-work recovery proved the run's unsaved files are permanently gone
+  // (`source_unavailable`, use another strategy). The only way on is a fresh
+  // run in a new workspace, which is exactly what Retry would do: a person
+  // adds nothing, so the system takes that step itself (needed-retry is 0%).
+  // Uncast keys, so the (company, task, evidence runId) index serves the lookup.
+  const savedFilesLost = sql`exists (select 1 from ${issueRecoveryActions} lost where lost.company_id = source.company_id
+    and lost.source_issue_id = ${input.issueId}
+    and (lost.evidence->>'runId' = source.id::text or (lost.evidence->>'runId' is null and lost.evidence->>'sourceRunId' = source.id::text))
+    and lost.evidence#>>'{systemRecovery,state}' = 'exhausted'
+    and lost.evidence#>>'{systemRecovery,failure,code}' in (${sqlList(UNVERIFIABLE_SOURCE_CODES)})
+    and lost.evidence#>>'{systemRecovery,failure,retryClass}' in (${sqlList(PERMANENT_SOURCE_RETRY_CLASSES)}))`;
   const recent = source(sql`(${continuesAutomaticallySql("source")}
-    or source.error_code in (${sql.join(FRESH_THREAD_REFUSAL_CODES.map(code => sql`${code}`), sql`, `)}))
+    or source.error_code in (${sql.join(FRESH_THREAD_REFUSAL_CODES.map(code => sql`${code}`), sql`, `)})
+    or (${continuationCauseIsSystemOwnedSql("source")} and ${savedFilesLost}))
     and greatest(source.finished_at, (select max(held.finished_at) from ${heartbeatRuns} held where ${refusedLater})) > ${since}`);
   return { recent, personAsked };
 }

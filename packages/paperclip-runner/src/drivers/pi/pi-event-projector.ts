@@ -55,7 +55,7 @@ function fittingPrefix(value: string, budget: number, suffix = ""): string {
  * the Runner's TMPDIR (the same TMPDIR Pi's own read tool opens) and the
  * display copy is a leading excerpt plus a plain reference to that file.
  */
-function spillText(value: string, label: "input" | "output" | "text" | "answer", budget = MAX_TEXT_BYTES, directory?: string): string {
+export function spillText(value: string, label: "input" | "output" | "text" | "answer", budget = MAX_TEXT_BYTES, directory?: string): string {
   if (jsonBytes(value) <= budget) return value;
   const root = directory ?? join(tmpdir(), "paperclip-pi-spill");
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -97,7 +97,7 @@ function liveOutputPreview(value: string, budget = SPILL_PREVIEW_BYTES): string 
   return label + value.slice(start);
 }
 /** Split text into UTF-16-safe pages whose JSON form each fits budget. */
-function pages(value: string, budget = PAGE_BYTES): string[] {
+export function pages(value: string, budget = PAGE_BYTES): string[] {
   if (jsonBytes(value) <= budget) return [value];
   const out: string[] = [];
   let rest = value;

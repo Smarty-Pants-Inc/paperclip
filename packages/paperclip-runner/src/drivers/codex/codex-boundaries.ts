@@ -318,6 +318,40 @@ export function boundedCodexPayload(
   return record(boundedCodexValue(value));
 }
 
+/**
+ * Prose is the answer, not a diagnostic preview. Retain it once, redacted
+ * before any bounding, while keeping provider metadata under the existing
+ * retained-payload limits. Also used for streamed pages: remove their duplicate
+ * provider text just as we remove a completed item's duplicate answer.
+ */
+export function boundedCodexCompletedPayload(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  if (value.kind !== "agentMessage" && value.kind !== "reasoning") {
+    return boundedCodexPayload(value);
+  }
+  const item = { ...record(value.item) };
+  delete item.text;
+  if (value.kind === "reasoning") delete item.summary;
+  const { text: answer, update: rawUpdate, ...metadata } = value;
+  const update = { ...record(rawUpdate) };
+  for (const key of ["text", "delta", "patch", "output"]) delete update[key];
+  if (update.item !== undefined) {
+    const updateItem = { ...record(update.item) };
+    delete updateItem.text;
+    if (value.kind === "reasoning") delete updateItem.summary;
+    update.item = updateItem;
+  }
+  const retained = boundedCodexPayload({ ...metadata, item,
+    ...(rawUpdate === undefined ? {} : { update: redactCodexValue(update) }),
+  });
+  // Oversized metadata must not replace the answer's whole payload either.
+  const safeMetadata = retained.truncated === true
+    ? { kind: value.kind, channel: value.channel, item: retained }
+    : retained;
+  return { ...safeMetadata, text: redactCodexDiagnostic(typeof answer === "string" ? answer : "") };
+}
+
 export function isRetainableCodexPayload(value: unknown): boolean {
   try {
     return (

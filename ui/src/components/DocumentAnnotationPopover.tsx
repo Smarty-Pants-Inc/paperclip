@@ -6,7 +6,7 @@ import type { DocumentAnnotationTarget } from "@/api/document-annotations";
 import type { CompanyUserProfile } from "@/lib/company-members";
 import { useDocumentAnnotationMutations } from "@/hooks/useDocumentAnnotationMutations";
 import type { AnnotationAnchorRect, PendingAnchor } from "./DocumentAnnotationLayer";
-import { useCopyAnnotationLink, ThreadCard, truncate } from "./DocumentAnnotationPanel";
+import { useCopyAnnotationLink, ThreadCard } from "./DocumentAnnotationPanel";
 
 export interface DocumentAnnotationPopoverProps {
   anchorRect: AnnotationAnchorRect;
@@ -88,7 +88,7 @@ export function DocumentAnnotationPopover(props: DocumentAnnotationPopoverProps)
       {props.pendingAnchor ? (
         <div className="p-3">
           <blockquote className="mb-2 line-clamp-2 rounded-md bg-muted px-2 py-1 text-xs italic text-muted-foreground">
-            {truncate(props.pendingAnchor.selectedText, 120)}
+            {props.pendingAnchor.selectedText}
           </blockquote>
           <Textarea
             ref={composerRef}

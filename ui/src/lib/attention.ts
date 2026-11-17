@@ -9,7 +9,7 @@ import type {
   AttentionSourceKind,
   AttentionWorkspaceRef,
 } from "@paperclipai/shared";
-import { formatCents } from "./utils";
+import { formatCents, formatConfiguredCents, formatSpendPercent } from "./utils";
 
 export type AttentionListOptions = AttentionFeedQuery;
 
@@ -247,7 +247,7 @@ export function attentionDetailLine(item: AttentionItem): string | null {
     }
     case "budget":
       // Budget amounts are cents, like the Spend line of the budget card.
-      return `${Math.round(detail.observedPercent)}% of budget used (${formatCents(detail.amountObserved)} / ${formatCents(detail.amountLimit)})`;
+      return `${formatSpendPercent(Math.round(detail.observedPercent))} of budget used (${formatCents(detail.amountObserved)} / ${formatConfiguredCents(detail.amountLimit)})`;
     case "generic":
       return quote(detail.summaryExcerpt);
     default:

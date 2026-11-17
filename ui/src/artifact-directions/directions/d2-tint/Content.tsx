@@ -77,10 +77,6 @@ export function SheetTable({
   // Before the first measurement only the name column is laid out, so nothing can spill for a frame.
   const preview = sheetPreview(artifact, maxRows, fit?.cells ?? 0);
   if (!preview) return null;
-  const more = [
-    preview.more > 0 ? `+${preview.more} more row${preview.more === 1 ? "" : "s"}` : null,
-    preview.moreColumns > 0 ? `+${preview.moreColumns} more column${preview.moreColumns === 1 ? "" : "s"}` : null,
-  ].filter(Boolean);
   return (
     <div ref={ref} data-excerpt className={cn("relative min-w-0 overflow-hidden font-mono", className)}>
       <table className="w-full border-collapse text-left">
@@ -105,7 +101,6 @@ export function SheetTable({
           ))}
         </tbody>
       </table>
-      {more.length > 0 ? <p className="truncate text-(--tint-ink-2)">{more.join(" · ")}</p> : null}
     </div>
   );
 }

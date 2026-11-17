@@ -35,6 +35,7 @@ import { QueryErrorState } from "@/components/QueryView";
 import { useResilientFetch } from "@/hooks/useResilientFetch";
 import { parsePaperclipRunnerStdoutLine } from "@/adapters/paperclip-runner";
 import { TaskChatProtocolCard } from "@/components/task-chat/TaskChatProtocolCard";
+import { SavedOutputNotice } from "@/components/task-chat/SavedOutputNotice";
 import type { TaskChatProtocolItem } from "@/components/task-chat/task-chat-model";
 import { transcriptToTaskChatItems } from "@/components/task-chat/transcript-adapter";
 import { TASK_PROTOCOL_EVENT_SURFACE_REGISTRY } from "@/components/task-chat/task-protocol-surfaces";
@@ -155,7 +156,7 @@ function statusVariant(status: string | undefined) {
 function traceBadgeLabel(status: string, expiresAt: string | Date) {
   if (status === "capturing") return "Raw trace enabled";
   if (status === "incomplete") return "Incomplete";
-  if (status === "truncated") return "Truncated";
+  if (status === "truncated") return "Captured";
   if (status === "deleted") return "Deleted";
   if (status === "expired") return "Expired";
   const remainingMs = new Date(expiresAt).getTime() - Date.now();
@@ -645,12 +646,14 @@ function StatCard({ label, value, detail }: { label: string; value: string | num
 
 export function RunnerInspector({
   runId,
+  runLogHref,
   run,
   open,
   onOpenChange,
   onRerunWithTrace,
 }: {
   runId: string;
+  runLogHref?: string;
   run?: { resultJson: Record<string, unknown> | null; status: string } | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -1023,6 +1026,7 @@ export function RunnerInspector({
             <SheetTitle>Runner Inspector</SheetTitle>
             {inspection?.trace ? (
               <>
+                {inspection.trace.status === "truncated" ? <SavedOutputNotice kind="trace" runLogHref={runLogHref} /> : null}
                 <Badge variant={statusVariant(inspection.trace.status)}>
                   {traceBadgeLabel(inspection.trace.status, inspection.trace.expiresAt)}
                 </Badge>

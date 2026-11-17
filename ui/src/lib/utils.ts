@@ -36,8 +36,18 @@ export function asFiniteNumber(value: unknown, fallback: number) {
 // Temporary: cost figures are rate-card estimates, not the real bill; set false when corrected costs land (smarty-dev #20670)
 export const COST_FIGURES_HIDDEN = true;
 
+/** Spend-derived percentages reveal masked costs, even beside a configured limit. */
+export function formatSpendPercent(percent: number): string {
+  return COST_FIGURES_HIDDEN ? "—" : `${percent}%`;
+}
+
 export function formatCents(cents: number, currency = "USD"): string {
   if (COST_FIGURES_HIDDEN) return "—";
+  return formatConfiguredCents(cents, currency);
+}
+
+/** Configured budgets, limits and plan prices are not computed spend estimates. */
+export function formatConfiguredCents(cents: number, currency = "USD"): string {
   // Older finance writes accepted arbitrary three-character codes. Keep those
   // amounts readable without passing an invalid currency to Intl.
   if (!/^[a-z]{3}$/i.test(currency)) {
@@ -55,7 +65,7 @@ export function formatNumber(n: number, options?: Intl.NumberFormatOptions): str
  * Monthly budgets render a `/mo` suffix; lifetime budgets show the bare amount.
  */
 export function formatProjectBudget(budget: { amountCents: number; windowKind: string }): string {
-  const amount = formatCents(budget.amountCents);
+  const amount = formatConfiguredCents(budget.amountCents);
   return budget.windowKind === "calendar_month_utc" ? `${amount}/mo` : amount;
 }
 

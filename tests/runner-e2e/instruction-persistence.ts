@@ -136,8 +136,9 @@ export async function runInstructionPersistenceFlow(input: {
   const restored = final;
 
   // The provider publishes an ordinary attachment before a bounded command wait.
-  // A board edit during that run is superseded only for the same changed file.
-  const conflictSuffix = `\nLast completed synchronization: ${nonce}\n`;
+  // A board edit during that run stays canonical; the divergent run edit is
+  // preserved as a named file, not a legacy review candidate.
+  const conflictSuffix = `\nDivergent run edit: ${nonce}\n`;
   const expectedCandidate = `${restored.content}${conflictSuffix}`;
   await create("Sync a concurrent instruction edit", [
     "Use Node.js built-in fs. Apply the append exactly once, checking existing bytes before any retry.",
@@ -174,18 +175,27 @@ export async function runInstructionPersistenceFlow(input: {
   await page.goto(`/${fixtures.company.issuePrefix}/issues/${issue.identifier ?? issue.id}`);
   await settle(3);
   const syncRunId = runs[2]!.id;
-  const resolved = await pollUntil({ label: "last completed sync wins", deadlineAt: Math.min(input.deadlineAt, Date.now() + 30_000),
-    load: () => api.get<Row>(filePath), accept: row => row.content === expectedCandidate });
+  const syncEvents = await pollUntil({ label: "divergent run edit saved as a conflict copy", deadlineAt: Math.min(input.deadlineAt, Date.now() + 30_000),
+    load: () => collectRunEvents<Row>((afterSeq, limit) => api.get(`/api/heartbeat-runs/${syncRunId}/events?afterSeq=${afterSeq}&limit=${limit}`)),
+    accept: rows => rows.some(row => row.eventType === "instruction_save" && row.payload?.state === "saved" && row.payload?.conflicts?.some((item: Row) => item.path === "AGENTS.md")) });
+  const syncSave = syncEvents.find(row => row.eventType === "instruction_save" && row.payload?.state === "saved" && row.payload?.conflicts?.some((item: Row) => item.path === "AGENTS.md"))!;
+  const conflict = syncSave.payload.conflicts.find((item: Row) => item.path === "AGENTS.md");
+  expect(conflict).toMatchObject({ currentHash: board.contentHash, incomingHash: createHash("sha256").update(expectedCandidate).digest("hex") });
+  expect(conflict.conflictCopy).toMatch(new RegExp(`^AGENTS\\.conflict-${syncRunId.slice(0, 8)}-\\d+\\.md$`));
+  const resolved = await api.get<Row>(filePath);
+  expect(resolved.content).toBe(board.content);
+  expect(resolved.contentHash).toBe(board.contentHash);
+  const preserved = await readPersonal(conflict.conflictCopy);
+  expect(preserved.content).toBe(expectedCandidate);
+  expect(preserved.contentHash).toBe(conflict.incomingHash);
   const candidates = await api.get<Row[]>(`/api/agents/${fixtures.agent.id}/instructions-bundle/candidates`);
   expect(candidates.some(row => row.runId === syncRunId)).toBe(false);
   expect((await readPersonal("notes/concurrent-editor.txt")).content).toBe(unrelatedContent);
-  const syncEvents = await collectRunEvents<Row>((afterSeq, limit) => api.get(`/api/heartbeat-runs/${syncRunId}/events?afterSeq=${afterSeq}&limit=${limit}`));
-  expect(syncEvents.some(row => row.eventType === "instruction_save" && row.payload?.state === "saved")).toBe(true);
   await page.goto(instructionsUrl);
   await expect(page.getByRole("button", { name: "Review preserved files", exact: true })).toHaveCount(0);
-  checks.push({ id: "per-file-last-sync-wins", passed: true, detail: "The later agent sync replaced the concurrent browser edit to its changed entry, preserved an unrelated new file, and created no conflict candidate" });
+  checks.push({ id: "per-file-canonical-and-conflict-copy", passed: true, detail: "The browser's saved version stayed canonical; the divergent run edit was saved at the receipt's named conflict-copy path, with an unrelated new file preserved and no legacy review candidate" });
   await page.goto(`/${fixtures.company.issuePrefix}/issues/${issue.identifier ?? issue.id}`);
-  await input.capture("last-sync-wins", "Concurrent changes synchronized per file without a conflict-review step", "last-sync-wins.png");
+  await input.capture("canonical-and-conflict-copy", "Concurrent browser edit kept; divergent run edit saved as a named conflict copy", "canonical-and-conflict-copy.png");
 
   const quotaTask = (action: string, receipt: string) => [
     "This is a controlled persistent-storage quota check. Use ordinary Node.js filesystem tools in your registered AGENT_HOME. Do not edit AGENTS.md.",
@@ -225,7 +235,7 @@ export async function runInstructionPersistenceFlow(input: {
   await expect(page.getByRole("note").filter({ hasText: "Agent storage warning" })).toHaveCount(0);
   checks.push({ id: "storage-full-does-not-block-runs", passed: true, detail: "A run saved a file at quota, a subsequent run succeeded despite an oversized save rejection, and the next run removed the full file and cleared its warning; all three tasks completed" });
   await input.evidence("api-state.json", { issue, runs, checks, canonicalInstructions: resolved, attachments });
-  await input.evidence("instruction-persistence.json", { checks, before, after, final, restored, board, candidates, resolved, syncEvents, runs, attachments, fullEvents });
+  await input.evidence("instruction-persistence.json", { checks, before, after, final, restored, board, candidates, resolved, preserved, syncEvents, runs, attachments, fullEvents });
   await page.goto(`/${fixtures.company.issuePrefix}/issues/${issue.identifier ?? issue.id}`);
   await input.capture("storage-recovered", "Agent completed a normal task and cleared storage warning after cleanup", "storage-recovered.png");
   return { issue, runs, checks };

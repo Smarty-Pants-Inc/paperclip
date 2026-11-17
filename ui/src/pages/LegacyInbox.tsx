@@ -89,7 +89,7 @@ import { BlockedInboxView } from "../components/BlockedInboxView";
 import { SwipeToArchive } from "../components/SwipeToArchive";
 
 import { StatusIcon } from "../components/StatusIcon";
-import { cn } from "../lib/utils";
+import { cn, formatSpendPercent } from "../lib/utils";
 import { StatusBadge } from "../components/StatusBadge";
 import { approvalLabel, defaultTypeIcon, typeIcon } from "../components/ApprovalPayload";
 import { timeAgo } from "../lib/timeAgo";
@@ -723,7 +723,7 @@ export function Inbox() {
   const { dismissedAtByKey, dismiss: dismissInboxItem } = useInboxDismissals(selectedCompanyId);
   const { readItems, markRead: markItemRead, markUnread: markItemUnread } = useReadInboxItems();
   const { allCategoryFilter, allApprovalFilter } = filterPreferences;
-  // Show agent-created tasks: the person's explicit choice, else the instance default.
+  // Hide agent-created tasks: the person's new choice, else the instance default.
   const agentCreatedTasksDefault = useAgentCreatedTasksDefault();
   const issueFilters = useMemo(
     () => resolveAgentCreatedTasksDefault(filterPreferences.issueFilters, agentCreatedTasksDefault),
@@ -996,14 +996,14 @@ export function Inbox() {
       ...queryKeys.issues.search(selectedCompanyId!, normalizedSearchQuery, undefined, 25),
       "compact",
       "inbox-supplement",
-      issueFilters.showAgentCreatedTasks,
+      issueFilters.hideAgentCreatedTasks,
       "live-descendant-summary",
     ],
     queryFn: () =>
       issuesApi.listCompact(selectedCompanyId!, {
         q: normalizedSearchQuery,
         limit: 25,
-        includeAgentCreatedTasks: issueFilters.showAgentCreatedTasks,
+        includeAgentCreatedTasks: !issueFilters.hideAgentCreatedTasks,
         includeParticipatedTasks: true,
         includeRoutineExecutions: true,
         includeLiveDescendantSummary: true,
@@ -3168,7 +3168,7 @@ export function Inbox() {
                     <AlertTriangle className="h-4 w-4 shrink-0 text-yellow-400" />
                     <span className="text-sm">
                       Budget at{" "}
-                      <span className="font-medium">{dashboard!.costs.monthUtilizationPercent}%</span>{" "}
+                      <span className="font-medium">{formatSpendPercent(dashboard!.costs.monthUtilizationPercent)}</span>{" "}
                       utilization this month
                     </span>
                   </Link>

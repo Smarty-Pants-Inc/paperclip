@@ -1,3 +1,4 @@
+import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { readRunAnswerEvents, readThinkingCapStop, thinkingCapStopCandidate } from "../thinking-cap-stop.js";
 import { settleReattachRun } from "./run-admission.js";
@@ -2653,6 +2654,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         )
         .then((rows) => rows[0] ?? null);
       if (!issue) return null;
+      await lockAgentForRunAdmission(tx, { companyId: run.companyId, agentId: run.agentId });
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)

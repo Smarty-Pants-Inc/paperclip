@@ -9,7 +9,7 @@ export function TaskChatSkillCreatedCard({ item, onOpen }: { item: TaskChatSkill
         <span className="min-w-0 flex-1 space-y-1">
           <span className="block text-xs text-muted-foreground">Skill created</span>
           <span className="block break-words text-sm font-medium hover:underline focus-visible:underline">{item.name}</span>
-          {item.description ? <span className="block line-clamp-3 text-sm text-muted-foreground">{item.description}</span> : null}
+          {item.description ? <span className="block whitespace-pre-wrap break-words text-sm text-muted-foreground">{item.description}</span> : null}
         </span>
       </button>
     </article>

@@ -21,10 +21,6 @@ function compactWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function truncate(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, Math.max(0, max - 1))}...` : value;
-}
-
 function humanizeLabel(value: string): string {
   return value
     .replace(/[_-]+/g, " ")
@@ -54,7 +50,7 @@ function summarizeRecord(record: Record<string, unknown>, keys: string[]): strin
   for (const key of keys) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) {
-      return truncate(compactWhitespace(value), 120);
+      return compactWhitespace(value);
     }
   }
   return null;
@@ -125,17 +121,16 @@ export function displayToolName(name: string, input: unknown): string {
 export function summarizeToolInput(
   name: string,
   input: unknown,
-  density: TranscriptDensity = "comfortable",
+  _density: TranscriptDensity = "comfortable",
 ): string {
-  const compactMax = density === "compact" ? 72 : 120;
   if (typeof input === "string") {
     const normalized = isCommandTool(name, input) ? stripWrappedShell(input) : compactWhitespace(input);
-    return truncate(normalized, compactMax);
+    return normalized;
   }
   const record = asRecord(input);
   if (!record) {
     const serialized = compactWhitespace(formatUnknown(input));
-    return serialized ? truncate(serialized, compactMax) : `Inspect ${name} input`;
+    return serialized ? serialized : `Inspect ${name} input`;
   }
 
   const command = typeof record.command === "string"
@@ -147,35 +142,35 @@ export function summarizeToolInput(
     summarizeRecord(record, ["description", "summary", "reason", "goal", "intent", "action", "task"])
     ?? null;
   if (humanDescription) {
-    return truncate(humanDescription, compactMax);
+    return humanDescription;
   }
   if (command && isCommandTool(name, record)) {
-    return truncate(stripWrappedShell(command), compactMax);
+    return stripWrappedShell(command);
   }
 
   const direct =
     summarizeRecord(record, ["path", "filePath", "file_path", "query", "url", "prompt", "message"])
     ?? summarizeRecord(record, ["pattern", "name", "title", "target", "tool", "command", "cmd"])
     ?? null;
-  if (direct) return truncate(direct, compactMax);
+  if (direct) return direct;
 
   if (Array.isArray(record.paths) && record.paths.length > 0) {
     const first = record.paths.find((value): value is string => typeof value === "string" && value.trim().length > 0);
     if (first) {
-      return truncate(`${record.paths.length} paths, starting with ${first}`, compactMax);
+      return `${record.paths.length} paths, starting with ${first}`;
     }
   }
 
   const keys = Object.keys(record);
   if (keys.length === 0) return `No ${name} input`;
-  if (keys.length === 1) return truncate(`${keys[0]} payload`, compactMax);
-  return truncate(`${keys.length} fields: ${keys.slice(0, 3).join(", ")}`, compactMax);
+  if (keys.length === 1) return `${keys[0]} payload`;
+  return `${keys.length} fields: ${keys.join(", ")}`;
 }
 
-function readToolDetailValue(value: unknown, max = 200): string | null {
+function readToolDetailValue(value: unknown, _max = 200): string | null {
   if (typeof value === "string") {
     const normalized = compactWhitespace(value);
-    return normalized ? truncate(normalized, max) : null;
+    return normalized ? normalized : null;
   }
   if (typeof value === "number" || typeof value === "boolean") {
     return String(value);
@@ -186,7 +181,7 @@ function readToolDetailValue(value: unknown, max = 200): string | null {
 export function describeToolInput(name: string, input: unknown): ToolInputDetail[] {
   if (typeof input === "string") {
     const summary = compactWhitespace(isCommandTool(name, input) ? stripWrappedShell(input) : input);
-    return summary ? [{ label: isCommandTool(name, input) ? "Command" : "Input", value: truncate(summary, 200), tone: "code" }] : [];
+    return summary ? [{ label: isCommandTool(name, input) ? "Command" : "Input", value: summary, tone: "code" }] : [];
   }
 
   const record = asRecord(input);
@@ -231,7 +226,7 @@ export function describeToolInput(name: string, input: unknown): ToolInputDetail
       ? record.cmd
       : null;
   if (command && isCommandTool(name, record) && !details.some((detail) => detail.label === "Intent")) {
-    pushDetail("Command", truncate(stripWrappedShell(command), 200), "code");
+    pushDetail("Command", stripWrappedShell(command), "code");
   }
 
   return details;
@@ -246,7 +241,7 @@ export function summarizeToolResult(
   const structured = parseStructuredToolResult(result);
   if (structured) {
     if (structured.body) {
-      return truncate(structured.body.split("\n")[0] ?? structured.body, density === "compact" ? 84 : 140);
+      return structured.body.split("\n")[0] ?? structured.body;
     }
     if (structured.status === "completed") return "Completed";
     if (structured.status === "failed" || structured.status === "error") {
@@ -258,7 +253,7 @@ export function summarizeToolResult(
     .map((line) => compactWhitespace(line))
     .filter(Boolean);
   const firstLine = lines[0] ?? result;
-  return truncate(firstLine, density === "compact" ? 84 : 140);
+  return firstLine;
 }
 
 export function parseSystemActivity(text: string): TranscriptActivity | null {
@@ -276,6 +271,6 @@ export function shouldHideNiceModeStderr(text: string): boolean {
   return normalized.startsWith("[paperclip] skipping saved session resume");
 }
 
-export function summarizeNotice(text: string, max = 160): string {
-  return truncate(compactWhitespace(text), max);
+export function summarizeNotice(text: string, _max = 160): string {
+  return compactWhitespace(text);
 }

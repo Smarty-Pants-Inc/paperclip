@@ -1,4 +1,5 @@
 import { observeCodexUsage, codexRunUsage } from "./codex-usage-baseline.js";
+import { pages as piTextPages, spillText as spillPiText } from "../pi/pi-event-projector.js";
 import { codexRateLimitSnapshot, rateLimitNoticeEvent, rateLimitSnapshotChanged } from "../provider-rate-limits.js";
 import { classifyCodexNotification } from "./codex-notification-identity.js";
 import { paperclipWorkspaceFileReferencesFromText } from "../../live/workspace-file-reference.js";
@@ -8,7 +9,7 @@ import { isNativeRestartInterruption, NativeSessionProtocolIntegrityError } from
 import { isPrpAuthCredentialsUpdated, validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import type { CodexRpcNotification, CodexTraceInterpretation } from "./app-server-transport.js";
 import { redactCodexDiagnostic } from "./app-server-transport.js";
-import { boundedCodexPayload as boundedPayload, boundedCodexValue, isRetainableCodexPayload } from "./codex-boundaries.js";
+import { boundedCodexPayload as boundedPayload, boundedCodexCompletedPayload, boundedCodexValue, isRetainableCodexPayload } from "./codex-boundaries.js";
 import { runtimeRequestProtocolPayload, runtimeRequestResponse } from "./codex-question-adapter.js";
 import {
   isSupportedCodexNotificationMethod,
@@ -641,14 +642,28 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
         : itemId
           ? (state.itemChannels.get(itemId) ?? channelForStartedItem(state, item))
           : channelForStartedItem(state, item);
+      // The Pi projector's tool output can fit its own record but exceed this
+      // facade's 32 KiB string bound. Reuse its redacted spill contract before
+      // the generic bound, so the full output remains readable from the footer.
+      const completedItem = { ...item };
+      if (state.driverKind === "pi_rpc" &&
+          ["commandExecution", "builtinToolCall", "dynamicToolCall", "mcpToolCall", "tool_use"].includes(text(item.type))) {
+        for (const key of ["output", "aggregatedOutput", "text"]) {
+          if (typeof completedItem[key] === "string") {
+            completedItem[key] = spillPiText(redactCodexDiagnostic(completedItem[key]), "output", 16 * 1024);
+          }
+        }
+      }
       state.emit(
         "item.completed",
-        boundedPayload({
+        boundedCodexCompletedPayload({
           kind: text(item.type, "unknown"),
           channel,
           providerPhase: text(item.phase) || undefined,
-          text: itemText(item),
-          item,
+          text: itemText(completedItem),
+          item: completedItem,
+          ...(state.driverKind === "pi_rpc" && params.fullText !== undefined
+            ? { fullText: record(params.fullText) } : {}),
         }),
         { turnId, itemId },
       );
@@ -686,19 +701,26 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
           : itemId
             ? (state.itemChannels.get(itemId) ?? "unknown")
             : "unknown";
-      state.emit(
-        "item.delta",
-        boundedPayload({
-          kind: deltaKind,
-          channel,
-          providerMethod: notification.method,
-          text: notification.method === "item/reasoning/summaryPartAdded"
-            ? "\n\n"
-            : text(params.delta, text(params.patch, text(params.output))),
-          update: params,
-        }),
-        { turnId, itemId: itemId || `${turnId}:${deltaKind}` },
-      );
+      const deltaText = notification.method === "item/reasoning/summaryPartAdded"
+        ? "\n\n"
+        : text(params.delta, text(params.patch, text(params.output)));
+      // Redact the whole delta before paging: a page boundary must not split a
+      // credential pattern. Reuse Pi's existing 96 KiB, UTF-16-safe page budget.
+      const deltaPages = deltaKind === "agentMessage" || deltaKind === "reasoning"
+        ? piTextPages(redactCodexDiagnostic(deltaText)) : [deltaText];
+      for (const page of deltaPages) {
+        state.emit(
+          "item.delta",
+          boundedCodexCompletedPayload({
+            kind: deltaKind,
+            channel,
+            providerMethod: notification.method,
+            text: page,
+            update: params,
+          }),
+          { turnId, itemId: itemId || `${turnId}:${deltaKind}` },
+        );
+      }
       if (notification.method === "item/fileChange/patchUpdated") {
         recordWorkspaceChanges(state, turnId, params.changes, false);
       } else if (notification.method === "turn/diff/updated") {

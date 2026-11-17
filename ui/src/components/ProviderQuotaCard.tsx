@@ -11,6 +11,9 @@ import { CodexSubscriptionPanel } from "./CodexSubscriptionPanel";
 import {
   billingTypeDisplayName,
   formatCents,
+  formatConfiguredCents,
+  formatSpendPercent,
+  COST_FIGURES_HIDDEN,
   formatTokens,
   providerDisplayName,
   quotaSourceDisplayName,
@@ -175,15 +178,17 @@ export function ProviderQuotaCard({
             <QuotaBar
               label="Period spend"
               percentUsed={budgetPct}
+              spendDerived
               leftLabel={formatCents(totalCostCents)}
-              rightLabel={`${Math.round(budgetPct)}% of company budget`}
+              rightLabel={`${formatSpendPercent(Math.round(budgetPct))} of company budget`}
               showDeficitNotch={showDeficitNotch}
             />
             <QuotaBar
               label="This week"
               percentUsed={weekPct}
+              spendDerived
               leftLabel={formatCents(weekSpendCents)}
-              rightLabel={`~${formatCents(Math.round(weeklyBudgetShare))} / wk`}
+              rightLabel={`~${formatConfiguredCents(Math.round(weeklyBudgetShare))} / wk`}
               showDeficitNotch={weekPct >= 100}
             />
           </div>
@@ -217,7 +222,7 @@ export function ProviderQuotaCard({
                       <div className="h-2 w-full border border-border overflow-hidden">
                         <div
                           className="h-full bg-primary/60 transition-(--tp-width) duration-150"
-                          style={{ width: `${barPct}%` }}
+                          style={{ width: `${COST_FIGURES_HIDDEN ? 0 : barPct}%` }}
                         />
                       </div>
                     </div>
@@ -304,8 +309,8 @@ export function ProviderQuotaCard({
                       {/* cost share overlay — narrower, opaque, shows relative cost weight */}
                       <div
                         className="absolute inset-y-0 left-0 bg-primary/85 transition-(--tp-width) duration-150"
-                        style={{ width: `${costPct}%` }}
-                        title={`${Math.round(costPct)}% of provider cost`}
+                        style={{ width: `${COST_FIGURES_HIDDEN ? 0 : costPct}%` }}
+                        title={`${formatSpendPercent(Math.round(costPct))} of provider cost`}
                       />
                     </div>
                   </div>

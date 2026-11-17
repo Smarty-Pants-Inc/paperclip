@@ -14,7 +14,7 @@ import { readNativeWorkspaceSyncReference } from "./native-runtime/native-worksp
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
-import { canContinueCancelledRun, userStopBoundaryAt } from "./run-cancellation.js";
+import { canContinueCancelledRun, QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, userStopBoundaryAt } from "./run-cancellation.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { isCancelledNativeStartup, isFailedNativePreparation, isFailedNativePreparationRetryAncestor } from "./cancelled-native-startup.js";
 import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession, nativeGatedRunNeverLaunched, nativeRunNeverLaunched, recordedLocalExecutionStopped, recordUnidentifiedLocalRunnerStop } from "./native-local-process-stop.js";
@@ -281,7 +281,11 @@ export async function admitExplicitNativeContinuation(input: {
   const nativeQueuedSend = queuedInterrupt && agentIsNative;
   if (nativeQueuedSend && (!interruptRequestedAt || !Number.isFinite(interruptRequestedAt.getTime())))
     return blocked("send_intent_missing", "Send the saved message again to continue.");
-  const authorizedAt = nativeQueuedSend ? interruptRequestedAt!
+  // The dispatch fallback saved this queue because its user sent it after a
+  // Stop; that Send, not the older message, is the user's fresh direction.
+  const savedSend = queuedRequest && !queuedInterrupt ? queuedSendAfterStop(savedQueue!.payload,
+    { stoppedAt: new Date(0), actorId, key: QUEUED_SEND_AFTER_STOP_KEY }) : null;
+  const authorizedAt = nativeQueuedSend ? interruptRequestedAt! : savedSend ? new Date(savedSend.requestedAt)
     : response?.comment.createdAt ?? comment?.createdAt ?? retryWake?.requestedAt ?? new Date();
   if (!input.dryRun) await preserveTaskRemoteWorkspaceWriter(db, companyId, issueId);
   blocker = await getExecutionBlocker(db, companyId, issueId);
@@ -756,6 +760,13 @@ export async function admitExplicitNativeContinuation(input: {
   if (readiness) await persistActivity(db, { companyId, actorType: "system", actorId: "task-recovery",
     action: readiness.mode === "reuse_issue_workspace" ? "issue.retry_workspace_reused" : "issue.fresh_workspace_selected",
     entityType: "issue", entityId: issueId, details: { ...readiness, runId: input.successorRunId } });
+  // The new box cannot restore the old box's provider thread: the Retry's first
+  // run opens a fresh thread with the saved history, never a doomed restore.
+  if (taskRetry && readiness?.mode === "fresh_isolated_workspace") {
+    const { recordRetryFreshProviderThread, retryFreshThreadTrigger } = await import("./fresh-continuation-fallback.js");
+    await recordRetryFreshProviderThread(db, { companyId, issueId, agentId, sourceRunId: readiness.sourceRunId,
+      successorRunId: input.successorRunId, trigger: retryFreshThreadTrigger(taskRetry) });
+  }
   if (input.taskRetryRequestId) {
     const payload = sql`jsonb_set(${agentWakeupRequests.payload} #- '{taskRetry,continuation}', '{taskRetry,strategy}',
       ${JSON.stringify(readiness?.mode === "fresh_isolated_workspace" ? "fresh_isolated_workspace" : "continue")}::jsonb)`;

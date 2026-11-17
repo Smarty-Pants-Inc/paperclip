@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { WorkspaceFileContent } from "@paperclipai/shared";
@@ -48,6 +49,17 @@ describe("describeDenial", () => {
 });
 
 describe("FileContentViewer", () => {
+  it("independent: raw CSV source preserves through its last byte after 503 rows", () => {
+    const csv = 'id,value\n' + Array.from({ length: 503 }, (_, i) => `${i},${i === 502 ? 'LAST_ユニコード🙂END' : `value-${i}`}`).join('\n');
+    const source = { resource: { previewKind: 'text', displayPath: 'proof.csv', title: 'proof.csv', contentType: 'text/csv' }, content: { encoding: 'utf8', data: csv } } as WorkspaceFileContent;
+    const html = renderToStaticMarkup(<FileContentViewer content={source} highlightedLine={null} previewMode="raw" />);
+    const container = document.createElement('div');
+    container.innerHTML = html;
+    const recovered = [...container.querySelectorAll('pre code')].map(n => n.textContent).join('\n');
+    expect(recovered).toBe(csv);
+    expect(new TextEncoder().encode(recovered)).toEqual(new TextEncoder().encode(csv));
+  });
+
   function content(overrides: Partial<WorkspaceFileContent> = {}): WorkspaceFileContent {
     return {
       resource: {
@@ -212,15 +224,16 @@ describe("CSV preview limits", () => {
         content: { encoding: "utf8", data: source },
       };
       const rendered = renderToStaticMarkup(<FileContentViewer content={content} highlightedLine={null} previewMode="rendered" />);
-      expect((rendered.match(/<td /g) ?? []).length).toBe(Math.min(rowCount, 500) * Math.min(columnCount, 100));
-      expect((rendered.match(/scope="col"/g) ?? []).length).toBe(Math.min(columnCount, 100) + 1);
+      expect((rendered.match(/<td /g) ?? []).length).toBe(Math.min(rowCount, 500) * columnCount);
+      expect((rendered.match(/scope="col"/g) ?? []).length).toBe(columnCount + 1);
       expect(rendered).toContain(`${rowCount} ${rowCount === 1 ? "row" : "rows"}`);
       expect(rendered).toContain(`${columnCount} columns`);
-      if (rowCount > 500 || columnCount > 100) {
-        expect(rendered).toContain(`Showing the first ${Math.min(rowCount, 500)} rows and ${Math.min(columnCount, 100)} columns.`);
-      } else {
-        expect(rendered).not.toContain("Showing the first");
+      expect(rendered).not.toContain("Showing the first");
+      if (rowCount > 500) {
+        expect(rendered).toContain(`Show ${rowCount - 500} more row`);
       }
+      // The interactive NOTE 5 control regression clicks this action and checks
+      // the complete row count; raw mode independently retains every source byte.
       const raw = renderToStaticMarkup(<FileContentViewer content={content} highlightedLine={null} previewMode="raw" />);
       expect(raw).not.toContain("<table");
       expect((raw.match(/Value0/g) ?? []).length).toBe(rowCount);

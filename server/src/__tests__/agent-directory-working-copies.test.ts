@@ -21,18 +21,27 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { agentFileStore, fileHash, inspectAgentFile, inspectAgentDirectory, snapshotAgentFiles, MAX_AGENT_FILE_BYTES, MAX_AGENT_DIRECTORY_BYTES, MAX_AGENT_DIRECTORY_ENTRIES } from "../services/agent-file-store.js";
-import { agents, companies, issues, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies, agentInstructionRevisions, agentInstructionHeads, createDb, fileStorageDb } from "@paperclipai/db";
+import { activityLog, agents, companies, issues, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies, agentInstructionRevisions, agentInstructionHeads, createDb, fileStorageDb } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { agentInstructionWorkingCopyService, instructionWorkingCopyGuidance } from "../services/agent-instruction-working-copies.js";
 import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { buildNativeRuntimeContext } from "../services/native-runtime/runtime-context.js";
+import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
+import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createReusableLeaseHandoff } from "../services/environment-lease-handoff.js";
-import { AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService } from "../services/agent-directory-working-copies.js";
+import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService, agentFileSaveHeld } from "../services/agent-directory-working-copies.js";
+import { agentFileSaveHeldOnLease } from "../services/agent-file-save-hold.js";
+import { collectStoppedInstructionCopyWithRetries } from "../services/agent-instruction-working-copies.js";
+import { HttpError } from "../errors.js";
 import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { heartbeatRunEvents } from "@paperclipai/db";
+import { agentFileRoots } from "@paperclipai/db";
+import * as storageModule from "../storage/index.js";
+import { Readable } from "node:stream";
 import { logger } from "../middleware/logger.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_AGENT_DIRECTORY_TEST_DATABASE_URL");
@@ -760,6 +769,251 @@ describe("persistent agent directories", () => {
     expect(await inspectAgentFile(root, "boundary.bin")).toMatchObject({ size: MAX_AGENT_FILE_BYTES, bytes: null });
   });
 
+  describe("fail-closed agent-directory saves", () => {
+    afterEach(() => { vi.restoreAllMocks(); });
+    const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+    type Kind = "apply" | "quota" | "authorization" | "timeout";
+    const failureFor = (kind: Kind) => kind === "quota" ? new fileStoreModule.AgentFileLimitError("Agent folder exceeds a storage limit")
+      : kind === "authorization" ? new HttpError(403, "Current permissions do not allow this agent-file save")
+        : kind === "timeout" ? new Error("Remote agent-file capture timed out") : new Error("store.apply failed (EIO)");
+    /** A service instance whose real store fails every apply, as a controller would see. */
+    function failingService(kind: Kind) {
+      const actual = fileStoreModule.agentFileStore;
+      vi.spyOn(fileStoreModule, "agentFileStore").mockImplementation((...args) => {
+        const store = actual(...args);
+        vi.spyOn(store, "apply").mockRejectedValue(failureFor(kind));
+        return store;
+      });
+      const service = agentInstructionWorkingCopyService(db);
+      vi.mocked(fileStoreModule.agentFileStore).mockRestore();
+      return service;
+    }
+    async function holdUnsavedNote(warm: boolean, kind: Kind) {
+      const copy = await run({ warm });
+      const note = `unsaved note ${randomUUID()}`;
+      await fs.writeFile(path.join(copy.localRoot, "unsaved-note.txt"), note);
+      const failing = failingService(kind);
+      // The wrapper's immediate retry helper, then heartbeat teardown, then the cleanup worker.
+      const held = (await collectStoppedInstructionCopyWithRetries(() => failing.collectStopped({ companyId, runId: copy.runId })))!;
+      return { copy, note, failing, held };
+    }
+    async function assertRetained(copy: Awaited<ReturnType<typeof run>>, note: string) {
+      const row = (await copies.get(companyId, copy.runId))!;
+      expect(agentFileSaveHeld(row)).toBe(true);
+      expect(row).toMatchObject({ state: "unavailable", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+      expect(row.processStoppedAt).not.toBeNull();
+      expect(row.nextAttemptAt?.getTime()).toBeGreaterThan(Date.now() - 1);
+      expect(row.receipt?.baseline).toBeTruthy();
+      expect(row.receipt?.cleanupPending).toBeUndefined();
+      expect(sha(await fs.readFile(path.join(copy.localRoot, "unsaved-note.txt")))).toBe(sha(note));
+      if (copy.receipt?.warm === true) expect(JSON.parse(await fs.readFile(path.join(path.dirname(copy.localRoot), "owner.json"), "utf8")).runId).toBe(copy.runId);
+      await expect(fs.stat(path.join(root, "unsaved-note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      return row;
+    }
+    const cases = [false, true].flatMap(warm => (["apply", "quota", "authorization", "timeout"] as const).map(kind => [warm ? "warm" : "cold", kind] as const));
+    it.each(cases)("stopped agent-directory save failure retains exact source and lease across teardown/restart, then retries to a verified save (%s, local, %s)", async (mode, kind) => {
+      const warm = mode === "warm";
+      const { copy, note, failing, held } = await holdUnsavedNote(warm, kind);
+      expect(held).toMatchObject({ state: "unavailable", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
+        errorCode: kind === "quota" ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED" });
+      expect((held.receipt?.savePending as { code?: string }).code).toBe(held.errorCode);
+      // Heartbeat teardown: loss report, instruction cleanup, then the cleanup worker sweep.
+      expect((await failing.reportUnavailable(companyId, copy.runId))?.state).toBe("unavailable");
+      await failing.release(companyId, copy.runId);
+      await failing.recoverCaptured();
+      await assertRetained(copy, note);
+      // The one true instruction is listed for the person/operator.
+      const listed = await copies.list(companyId, agentId, board());
+      expect(listed.find(entry => entry.runId === copy.runId)).toMatchObject({ state: "unavailable", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+      // Restart: a fresh controller service, real store, durable retry is due.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, copy.runId));
+      await db.update(agentInstructionWorkingCopies).set({ nextAttemptAt: new Date(Date.now() - 1000) }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      const restarted = agentInstructionWorkingCopyService(db);
+      expect(await restarted.recoverStopped()).toBeGreaterThan(0);
+      const saved = (await restarted.get(companyId, copy.runId))!;
+      expect(saved.state).toBe("saved");
+      expect(agentFileSaveHeld(saved)).toBe(false);
+      expect(sha(await fs.readFile(path.join(root, "unsaved-note.txt")))).toBe(sha(note));
+      // Only after the verified save may cleanup discard the temporary tree.
+      await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    }, 60_000);
+
+    it("a held save does not block the next message: the next run starts from canonical and the instruction stays visible", async () => {
+      const { copy, note } = await holdUnsavedNote(false, "apply");
+      const next = await run();
+      expect(next.state).toBe("prepared");
+      expect(await fs.readFile(path.join(next.localRoot, entryFile), "utf8")).toBe(initial);
+      await fs.writeFile(path.join(next.localRoot, "next.txt"), "answered");
+      expect((await copies.collectStopped({ companyId, runId: next.runId }))?.state).toBe("saved");
+      expect(await fs.readFile(path.join(root, "next.txt"), "utf8")).toBe("answered");
+      const listed = await copies.list(companyId, agentId, board());
+      expect(listed.find(entry => entry.runId === copy.runId)?.errorMessage).toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
+      await assertRetained(copy, note);
+    });
+
+    it("stopped agent-directory save failure retains exact source and lease across teardown/restart, then retries to a verified save (cold, remote, lease uncertainty)", async () => {
+      const { copy, note, failing } = await holdUnsavedNote(false, "apply");
+      const environmentId = randomUUID(), leaseId = randomUUID(), remoteCwd = "/fixture/held-task";
+      await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: copy.runId,
+        provider: "daytona", providerLeaseId: `held-${leaseId}`, status: "active", metadata: { remoteCwd } });
+      const row = (await copies.get(companyId, copy.runId))!;
+      expect(typeof (row.receipt?.savePending as { mirrorHash?: unknown }).mirrorHash).toBe("string");
+      // The same held tree, recorded as a remote copy whose mirror was retrieved.
+      await db.update(agentInstructionWorkingCopies).set({ location: `remote:${environmentId}`,
+        executionRoot: path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", agentId, copy.runId),
+        receipt: { ...row.receipt, cleanup: { leaseId, remoteCwd } } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      expect(await agentFileSaveHeldOnLease(db, { id: leaseId, companyId, providerLeaseId: `held-${leaseId}` })).toBe(true);
+      // Lease uncertainty: the lease is released mid-hold. No remote rm, no mirror rm.
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() }).where(eq(environmentLeases.id, leaseId));
+      const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand");
+      await failing.release(companyId, copy.runId);
+      await failing.recoverCaptured();
+      expect(shell).not.toHaveBeenCalled();
+      await assertRetained(copy, note);
+      // Restart with no collector: retry from the verified mirror.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, copy.runId));
+      await db.update(agentInstructionWorkingCopies).set({ nextAttemptAt: new Date(Date.now() - 1000) }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      const restarted = agentInstructionWorkingCopyService(db);
+      await restarted.recoverStopped();
+      expect((await restarted.get(companyId, copy.runId))?.state).toBe("saved");
+      expect(sha(await fs.readFile(path.join(root, "unsaved-note.txt")))).toBe(sha(note));
+      expect(await agentFileSaveHeldOnLease(db, { id: leaseId, companyId, providerLeaseId: `held-${leaseId}` })).toBe(false);
+      expect(shell).not.toHaveBeenCalled();
+    }, 60_000);
+    // review-fleet-4 (rf4-samenote): on the fail-closed branch alone, a SUCCESSFUL
+    // durable RETRY after a failed save replaced the sibling's canonical B with the
+    // held A and made no conflict copy, so B was lost. The retry must go through
+    // the same three-way compare as a first save: B stays canonical, A is a named
+    // conflict copy, and the save receipt/event names both.
+    it.each([false, true])("RF4 failed save then durable retry keeps B and names A (warm=%s)", async warm => {
+      const hash = (text: string) => fileHash(Buffer.from(text));
+      await fs.mkdir(path.join(root, "memory"), { recursive: true });
+      await fs.writeFile(path.join(root, "memory", "daily.md"), "C");
+      const copy = await run({ warm });
+      await fs.writeFile(path.join(copy.localRoot, "memory", "daily.md"), "A");
+      const failing = failingService("apply");
+      const held = (await collectStoppedInstructionCopyWithRetries(() => failing.collectStopped({ companyId, runId: copy.runId })))!;
+      expect(held).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_FAILED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+      expect(agentFileSaveHeld(held)).toBe(true);
+      // A sibling saves B over the same base C while A is held.
+      const sibling = await run();
+      await fs.writeFile(path.join(sibling.localRoot, "memory", "daily.md"), "B");
+      expect((await copies.collectStopped({ companyId, runId: sibling.runId }))?.state).toBe("saved");
+      expect(await fs.readFile(path.join(root, "memory", "daily.md"), "utf8")).toBe("B");
+      // Heartbeat teardown and the cleanup worker leave the held A in place.
+      await failing.release(companyId, copy.runId);
+      await failing.recoverCaptured();
+      expect(await fs.readFile(path.join(copy.localRoot, "memory", "daily.md"), "utf8")).toBe("A");
+      // Restart: a fresh service retries the held save from the durable row.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, copy.runId));
+      await db.update(agentInstructionWorkingCopies).set({ nextAttemptAt: new Date(Date.now() - 1000) }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      const restarted = agentInstructionWorkingCopyService(db);
+      expect(await restarted.recoverStopped()).toBeGreaterThan(0);
+      const retried = (await restarted.get(companyId, copy.runId))!;
+      expect(retried.state).toBe("saved");
+      expect(agentFileSaveHeld(retried)).toBe(false);
+      // B stays canonical; A is a named conflict copy.
+      expect(await fs.readFile(path.join(root, "memory", "daily.md"), "utf8"), "the retry must not replace the sibling's canonical B").toBe("B");
+      const names = (await fs.readdir(path.join(root, "memory"))).filter(name => name !== "daily.md");
+      expect(names).toHaveLength(1);
+      const copyPath = `memory/${names[0]}`;
+      expect(copyPath).toMatch(new RegExp(`^memory/daily\\.conflict-${copy.runId.slice(0, 8)}-\\d+\\.md$`));
+      expect(await fs.readFile(path.join(root, copyPath), "utf8")).toBe("A");
+      // The save names both: receipt conflicts and the audited save event.
+      const conflict = { path: "memory/daily.md", baseHash: hash("C"), currentHash: hash("B"), incomingHash: hash("A"), conflictCopy: copyPath };
+      expect(retried.receipt?.conflicts).toEqual([conflict]);
+      const audits = await db.select().from(activityLog).where(eq(activityLog.entityId, agentId));
+      expect(audits.map(row => row.details)).toContainEqual(expect.objectContaining({ conflicts: [conflict] }));
+      // Only after the verified save may cleanup discard the temporary tree.
+      await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      // The next turn is told: B was kept, A is saved as the conflict copy.
+      const next = await run();
+      expect(await restarted.claimConflictNotice({ companyId, agentId, runId: next.runId, previousRunId: copy.runId }))
+        .toBe(`Note: "memory/daily.md" was also saved by another run; that version was kept. Your earlier edit is saved as "${copyPath}".`);
+    }, 60_000);
+  });
+  // Ported from the RFL same-note judge (judge-lifecycle-addition.ts, fixture from judge-samefile.test.ts):
+  // the conflict-side bytes A are in the stopped run's copy, canonical has moved on to B, and the
+  // durable upload of A fails after a prefix (before any head commit). Production retirement
+  // (collectStopped, which retries and then gives up) must keep the only copy of A and a durable retry.
+  // These assertions use only the row and the filesystem, so the same block runs unchanged on N23c (RED).
+  describe("JUDGE same-note retirement variants: failed conflict upload", () => {
+    const objects = { bytes: new Map<string, Buffer>(), failHash: null as string | null, failedPrefix: 0 };
+    const judgeStorage = () => ({
+      provider: "s3" as const,
+      async putFile(input: { companyId: string; namespace: string; body: Readable; byteSize: number; sha256: string }) {
+        if (objects.failHash === input.sha256) {
+          for await (const chunk of input.body) {
+            objects.failedPrefix = Math.min(Buffer.from(chunk).length, Math.floor(input.byteSize / 2));
+            throw new Error("JUDGE interrupted A upload after prefix");
+          }
+        }
+        const chunks: Buffer[] = [];
+        for await (const chunk of input.body) chunks.push(Buffer.from(chunk));
+        const body = Buffer.concat(chunks);
+        expect(body.length).toBe(input.byteSize);
+        expect(fileHash(body)).toBe(input.sha256);
+        const objectKey = `${input.companyId}/${input.namespace}/${randomUUID()}`;
+        objects.bytes.set(objectKey, body);
+        return { objectKey };
+      },
+      async getObject(owner: string, objectKey: string) {
+        expect(objectKey.startsWith(`${owner}/`)).toBe(true);
+        const body = objects.bytes.get(objectKey);
+        if (!body) throw new Error("fixture object missing");
+        return { stream: Readable.from([body]) };
+      },
+      async headObject(_owner: string, key: string) { return { exists: objects.bytes.has(key), lastModified: new Date(0) }; },
+      async deleteObject(owner: string, key: string) { expect(key.startsWith(`${owner}/`)).toBe(true); objects.bytes.delete(key); },
+    });
+    beforeEach(() => {
+      objects.bytes.clear(); objects.failHash = null; objects.failedPrefix = 0;
+      vi.stubEnv("PAPERCLIP_DURABLE_AGENT_FILES", "true");
+      vi.spyOn(storageModule, "getStorageService").mockImplementation(() => judgeStorage() as unknown as ReturnType<typeof storageModule.getStorageService>);
+    });
+    afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+    it.each([false, true])("JUDGE failed conflict upload must retain source through production retirement (warm=%s)", async warm => {
+      const store = agentFileStore(db);
+      await store.write({ ...target(), path: "daily.md", bytes: Buffer.from("C"), baseHash: null }, board());
+      const parked = await run({ warm });
+      expect(parked).toBeTruthy();
+      const A = Buffer.alloc(512 * 1024, 0x41);
+      await fs.writeFile(path.join(parked.localRoot, "daily.md"), A);
+      await store.write({ ...target(), path: "daily.md", bytes: Buffer.from("B"), baseHash: fileHash(Buffer.from("C")) }, board());
+      const [prior] = await db.select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId));
+      expect(prior).toBeTruthy();
+      objects.failHash = fileHash(A);
+      // Production retirement: the wrapper's collect-with-retries, then heartbeat teardown and the cleanup worker.
+      const saved = await collectStoppedInstructionCopyWithRetries(() => copies.collectStopped({ companyId, runId: parked.runId }));
+      await copies.release(companyId, parked.runId);
+      await copies.recoverCaptured();
+      const source = await fs.readFile(path.join(parked.localRoot, "daily.md")).catch(() => null);
+      const [after] = await db.select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId));
+      const row = (await copies.get(companyId, parked.runId))!;
+      console.log("JUDGE failed production retirement", JSON.stringify({ warm, state: saved?.state, code: saved?.errorCode,
+        failedPrefix: objects.failedPrefix, receipt: row.receipt, nextAttemptAt: row.nextAttemptAt, sourceRetained: source !== null,
+        AInObjectStore: [...objects.bytes.values()].some(b => b.equals(A)) }));
+      expect(objects.failedPrefix).toBeGreaterThan(0);
+      expect(after).toEqual(prior);
+      expect(await store.read(companyId, agentId, "daily.md", board())).toEqual(Buffer.from("B"));
+      expect(source, "refused save must keep the only source A, not remove it on terminal cleanup").toEqual(A);
+      // A durable retry exists: the row is held (not completed), its baseline is kept, and a retry is scheduled.
+      expect(row.state).not.toBe("saved");
+      expect((row.receipt as { savePending?: unknown } | null)?.savePending).toBeTruthy();
+      expect(row.receipt?.baseline).toBeTruthy();
+      expect(row.nextAttemptAt).not.toBeNull();
+      // The retry, once storage recovers, durably records A; only then may the temporary tree go.
+      objects.failHash = null;
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, parked.runId));
+      await db.update(agentInstructionWorkingCopies).set({ nextAttemptAt: new Date(Date.now() - 1000) }).where(eq(agentInstructionWorkingCopies.runId, parked.runId));
+      const restarted = agentInstructionWorkingCopyService(db);
+      await restarted.recoverStopped();
+      expect((await restarted.get(companyId, parked.runId))?.state).toBe("saved");
+      expect([...objects.bytes.values()].some(b => b.equals(A))).toBe(true);
+    }, 60_000);
+  });
   it("checks quota for a small editor save without reading unrelated file bytes", async () => {
     const asset = path.join(root, "large.bin");
     await sparseFile(asset, MAX_AGENT_FILE_BYTES);
@@ -771,20 +1025,25 @@ describe("persistent agent directories", () => {
     } finally { open.mockRestore(); }
   });
 
-  it("reports an oversized run file without a partial save and removes its temporary copy", async () => {
+  // supersedes (fail-closed): the old test asserted the temporary copy was deleted
+  // (ENOENT + compacted baseline) after an over-quota save. That discarded the only
+  // copy of "changed instructions". It now asserts retention under a held save.
+  it("supersedes: reports an oversized run file without a partial save and removes its temporary copy → reports an oversized run file without a partial save and retains its unsaved source", async () => {
     const copy = await run();
     await sparseFile(path.join(copy.localRoot, "too-large.bin"), MAX_AGENT_FILE_BYTES + 1);
     await fs.writeFile(path.join(copy.localRoot, entryFile), "changed instructions");
     const failed = await copies.collectStopped({ companyId, runId: copy.runId });
-    expect(failed).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", candidateHash: null, nextAttemptAt: null, attempts: 1 });
+    expect(failed).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", candidateHash: null, attempts: 1,
+      errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+    expect(failed?.nextAttemptAt?.getTime()).toBeGreaterThan(Date.now());
     expect(failed?.receipt?.storageWarning).toContain("Runs can continue");
-    expect(failed?.errorMessage).toContain('"too-large.bin" exceeds the 256 MiB');
+    expect((failed?.receipt?.savePending as { reason?: string }).reason).toContain('"too-large.bin" exceeds the 256 MiB');
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
     await expect(fs.stat(path.join(root, "too-large.bin"))).rejects.toMatchObject({ code: "ENOENT" });
     expect((await copies.reportUnavailable(companyId, copy.runId))?.errorCode).toBe("AGENT_FILES_LIMIT_EXCEEDED");
     await copies.release(companyId, copy.runId);
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
-    expect((await copies.get(companyId, copy.runId))?.receipt?.baseline).toBeUndefined();
+    expect(await fs.readFile(path.join(copy.localRoot, entryFile), "utf8")).toBe("changed instructions");
+    expect((await copies.get(companyId, copy.runId))?.receipt?.baseline).toBeTruthy();
     const next = await run();
     expect(await fs.readFile(path.join(next.localRoot, entryFile), "utf8")).toBe(initial);
     await fs.writeFile(path.join(next.localRoot, "next-task.txt"), "still working");
@@ -813,15 +1072,17 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(next.localRoot, "task-output.txt"), "utf8")).toBe("work continues");
   }, 30_000);
 
-  it("starts successive runs with an already oversized saved file and lets the agent remove it", async () => {
+  // supersedes (fail-closed): the old test asserted ENOENT for the first run's copy after its
+  // stopped save hit the limit. A failed stopped save now holds its source; later runs still start.
+  it("supersedes: starts successive runs with an already oversized saved file and lets the agent remove it → the first run's unsaved copy is retained and successive runs still start", async () => {
     await sparseFile(path.join(root, "old-large.bin"), MAX_AGENT_FILE_BYTES + 1);
     const first = await run();
     expect(first.state).toBe("prepared");
     expect(first.receipt?.storageWarning).toContain("256 MiB");
     expect(await fs.readFile(path.join(first.localRoot, entryFile), "utf8")).toBe(initial);
     const stopped = await copies.collectStopped({ companyId, runId: first.runId });
-    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED" });
-    await expect(fs.stat(first.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+    expect((await fs.stat(first.localRoot)).isDirectory()).toBe(true);
     copies = agentInstructionWorkingCopyService(db);
     const cleanup = await run();
     expect(cleanup.state).toBe("prepared");
@@ -852,14 +1113,15 @@ describe("persistent agent directories", () => {
     } finally { sizes.mockRestore(); }
   });
 
-  it("rejects more than 2 GiB in aggregate before hashing or saving any file", async () => {
+  it("supersedes: rejects more than 2 GiB in aggregate before hashing or saving any file → the limit reason is kept in the held save receipt", async () => {
     expect(MAX_AGENT_DIRECTORY_BYTES).toBe(2 * 1024 * 1024 * 1024);
     const copy = await run();
     for (let index = 0; index < 8; index++) await sparseFile(path.join(copy.localRoot, `part-${index}.bin`), MAX_AGENT_FILE_BYTES);
     // The eight allowed files exactly fill the quota; the entry is additional.
     const result = await copies.collectStopped({ companyId, runId: copy.runId });
-    expect(result).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED" });
-    expect(result?.errorMessage).toContain("2 GiB total storage limit");
+    expect(result).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+    // supersedes (fail-closed): the limit reason moved from errorMessage to the held save receipt.
+    expect((result?.receipt?.savePending as { reason?: string }).reason).toContain("2 GiB total storage limit");
     expect(await fs.readdir(root)).toEqual(["policy"]);
   });
 
@@ -875,17 +1137,20 @@ describe("persistent agent directories", () => {
     } finally { readdir.mockRestore(); }
   }, 30_000);
 
-  it("keeps the entry's 1 MiB limit and cleans up failed synchronization", async () => {
+  // supersedes (fail-closed): the old test asserted the failed copy was deleted (ENOENT).
+  // The over-limit entry is the only copy of that edit; it is now retained under a held save.
+  it("supersedes: keeps the entry's 1 MiB limit and cleans up failed synchronization → keeps the entry's 1 MiB limit and retains the unsaved source after failed synchronization", async () => {
     const copy = await run();
     await fs.writeFile(path.join(copy.localRoot, entryFile), "a".repeat(1024 * 1024 + 1));
     const result = await copies.collectStopped({ companyId, runId: copy.runId });
     expect(result?.state).toBe("unavailable");
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
-    expect(result?.errorMessage).toContain("at most 1 MiB");
+    expect((await fs.readFile(path.join(copy.localRoot, entryFile))).length).toBe(1024 * 1024 + 1);
+    expect(result?.errorMessage).toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
+    expect((result?.receipt?.savePending as { reason?: string }).reason).toContain("at most 1 MiB");
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
   });
 
-  it("merges independent changes and uses the last synchronization for same-file edits", async () => {
+  it("supersedes: merges independent changes and uses the last synchronization for same-file edits — keeps a sibling's same-file save, with the later edit as a conflict copy", async () => {
     const a = await run(), b = await run();
     await fs.writeFile(path.join(a.localRoot, "a.txt"), "A");
     await fs.writeFile(path.join(b.localRoot, "b.txt"), "B");
@@ -897,15 +1162,20 @@ describe("persistent agent directories", () => {
     await fs.writeFile(path.join(d.localRoot, "a.txt"), "D");
     await fs.writeFile(path.join(c.localRoot, "b.txt"), "new B");
     expect((await copies.collectStopped({ companyId, runId: c.runId }))?.state).toBe("saved");
-    expect((await copies.collectStopped({ companyId, runId: d.runId }))?.state).toBe("saved");
-    expect(await fs.readFile(path.join(root, "a.txt"), "utf8")).toBe("D");
+    const saved = await copies.collectStopped({ companyId, runId: d.runId });
+    expect(saved?.state).toBe("saved");
+    expect(await fs.readFile(path.join(root, "a.txt"), "utf8")).toBe("C");
+    const [kept] = saved?.receipt?.conflicts as Array<{ path: string; conflictCopy: string }>;
+    expect(kept).toMatchObject({ path: "a.txt", currentHash: fileHash(Buffer.from("C")), incomingHash: fileHash(Buffer.from("D")),
+      conflictCopy: expect.stringMatching(new RegExp(`^a\\.conflict-${d.runId.slice(0, 8)}-\\d+\\.txt$`)) });
+    expect(await fs.readFile(path.join(root, kept!.conflictCopy), "utf8")).toBe("D");
     expect(await fs.readFile(path.join(root, "b.txt"), "utf8")).toBe("new B");
     expect(await copies.list(companyId, agentId, board())).toEqual([]);
     for (const copy of [a, b, c, d]) await expect(fs.stat(path.dirname(copy.localRoot))).rejects.toMatchObject({ code: "ENOENT" });
     expect(await fs.readdir(path.join(path.dirname(root), "file-sync", "runs"))).toEqual([]);
   });
 
-  it("makes concurrent edit/delete races last-sync-wins and preserves unrelated new files", async () => {
+  it("supersedes: makes concurrent edit/delete races last-sync-wins and preserves unrelated new files — keeps a saved edit over a stale deletion and applies a later edit over a deletion", async () => {
     await fs.mkdir(path.join(root, "notes"));
     await fs.writeFile(path.join(root, "notes", "old.txt"), "old");
     const deleting = await run(), editing = await run();
@@ -913,8 +1183,11 @@ describe("persistent agent directories", () => {
     await fs.writeFile(path.join(editing.localRoot, "notes", "old.txt"), "edited");
     await fs.writeFile(path.join(editing.localRoot, "notes", "new.txt"), "unrelated");
     await copies.collectStopped({ companyId, runId: editing.runId });
-    expect((await copies.collectStopped({ companyId, runId: deleting.runId }))?.state).toBe("saved");
-    await expect(fs.stat(path.join(root, "notes", "old.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    const deleted = await copies.collectStopped({ companyId, runId: deleting.runId });
+    expect(deleted?.state).toBe("saved");
+    expect(deleted?.receipt?.conflicts).toEqual([{ path: "notes/old.txt", baseHash: fileHash(Buffer.from("old")),
+      currentHash: fileHash(Buffer.from("edited")), incomingHash: null, conflictCopy: null }]);
+    expect(await fs.readFile(path.join(root, "notes", "old.txt"), "utf8")).toBe("edited");
     expect(await fs.readFile(path.join(root, "notes", "new.txt"), "utf8")).toBe("unrelated");
     const remove = await run(), change = await run();
     await fs.unlink(path.join(remove.localRoot, "notes", "new.txt"));
@@ -1166,7 +1439,9 @@ describe("persistent agent directories", () => {
     await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it.each([false, true])("rejects symlinks without saving any part of the tree, preserving an existing full-storage warning: %s", async (full) => {
+  // supersedes (fail-closed): the old test asserted ENOENT for the copy holding "innocent.txt".
+  // That valid unsaved file is now retained; the symlink is still never saved.
+  it.each([false, true])("supersedes: rejects symlinks without saving any part of the tree, preserving an existing full-storage warning: %s → the valid unsaved file is retained", async (full) => {
     if (full) await sparseFile(path.join(root, "full.bin"), MAX_AGENT_FILE_BYTES);
     const copy = await run();
     await fs.writeFile(path.join(copy.localRoot, "innocent.txt"), "changed");
@@ -1176,7 +1451,7 @@ describe("persistent agent directories", () => {
     expect(result?.errorCode).toBe("AGENT_FILES_SAVE_FAILED");
     expect(result?.receipt?.storageWarning).toBe(copy.receipt?.storageWarning);
     if (full) expect(result?.receipt?.storageWarning).toContain("Agent storage is full");
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(path.join(copy.localRoot, "innocent.txt"), "utf8")).toBe("changed");
     await expect(fs.stat(path.join(root, "innocent.txt"))).rejects.toMatchObject({ code: "ENOENT" });
   }, 30_000);
 
@@ -1325,16 +1600,19 @@ describe("persistent agent directories", () => {
     await fs.rm(path.join(copy.localRoot, "escape"));
     expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
   });
-  it("rejects over-quota warm changes without replacing saved bytes, then permits a clean future run", async () => {
+  // supersedes (fail-closed): the old test asserted the warm directory was deleted
+  // (ENOENT) after an over-quota stopped save. It now asserts the source is held.
+  it("supersedes: rejects over-quota warm changes without replacing saved bytes, then permits a clean future run → rejects over-quota warm changes without replacing saved bytes, retains them, then permits a clean future run", async () => {
     const copy = await run({ warm: true });
     const handle = await fs.open(path.join(copy.localRoot, "too-large.bin"), "w");
     await handle.truncate(MAX_AGENT_FILE_BYTES + 1); await handle.close();
     expect((await copies.checkpointWarm({ companyId, runId: copy.runId }))?.errorCode).toBe("AGENT_FILES_CHECKPOINT_UNSTABLE");
     const stopped = (await copies.collectStopped({ companyId, runId: copy.runId }))!;
-    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED" });
+    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
     expect(stopped.receipt?.storageWarning).toContain("Agent storage is full");
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.stat(path.join(copy.localRoot, "too-large.bin"))).size).toBe(MAX_AGENT_FILE_BYTES + 1);
+    expect(agentFileSaveHeld(stopped)).toBe(true);
     expect(await run({ warm: true })).toBeTruthy();
   });
   // RED for smarty-dev#20814 (b13): a low-trust run that changed nothing must not be asked for write authority.
@@ -1355,15 +1633,17 @@ describe("persistent agent directories", () => {
   });
   // Exercise the production heartbeat callback consumed by the native executor,
   // rather than duplicating its saved-state-to-boolean expression in this test.
-  async function heartbeatCopy(copy: Awaited<ReturnType<typeof run>>) {
+  async function heartbeatCopy(copy: Awaited<ReturnType<typeof run>>, appendRunEvent = vi.fn(async (..._args: unknown[]) => {}),
+    options: { previousRunId?: string; context?: Record<string, unknown> } = {}) {
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     const [currentRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, copy.runId));
     type Input = Parameters<typeof createHeartbeatInstructionWorkingCopy>[0];
     const lifecycle = createHeartbeatInstructionWorkingCopy({ db, instructionCopies: copies,
-      agent: agent!, readRun: () => currentRun!, context: {},
-      session: { taskSession: null, taskSessionForRun: null, sessionConfigMetadata: {} as Input["session"]["sessionConfigMetadata"] },
+      agent: agent!, readRun: () => currentRun!, context: options.context ?? {},
+      session: { taskSession: options.previousRunId ? { lastRunId: options.previousRunId } : null,
+        taskSessionForRun: null, sessionConfigMetadata: {} as Input["session"]["sessionConfigMetadata"] },
       workspace: { executionTarget: null, executionWorkspace: { cwd: home } as Input["workspace"]["executionWorkspace"], persistedExecutionWorkspace: null },
-      appendRunEvent: vi.fn(async () => {}),
+      appendRunEvent,
     });
     type Prepare = Parameters<typeof lifecycle.prepare>[0];
     await lifecycle.prepare({ runtimeConfig: {}, hasInstructionFilesystem: true,
@@ -1372,6 +1652,190 @@ describe("persistent agent directories", () => {
     expect(lifecycle.instructionCopy?.runId).toBe(copy.runId);
     return lifecycle;
   }
+  it("keeps a sibling's saved note canonical when a parked chat's retirement checkpoint carries an older edit, and names both in the save event", async () => {
+    await fs.mkdir(path.join(root, "memory"));
+    await fs.writeFile(path.join(root, "memory", "x.md"), "C");
+    const parked = await run({ warm: true });
+    const appendRunEvent = vi.fn(async (..._args: unknown[]) => {});
+    const lifecycle = await heartbeatCopy(parked, appendRunEvent);
+    const sibling = await run();
+    await fs.writeFile(path.join(sibling.localRoot, "memory", "x.md"), "B");
+    expect((await copies.collectStopped({ companyId, runId: sibling.runId }))?.state).toBe("saved");
+    await fs.writeFile(path.join(parked.localRoot, "memory", "x.md"), "A");
+    await lifecycle.collectStoppedInstructions();
+    expect(await fs.readFile(path.join(root, "memory", "x.md"), "utf8")).toBe("B");
+    const hash = (text: string) => fileHash(Buffer.from(text));
+    const save = lifecycle.getInstructionSave() as { state?: string; conflicts?: Array<{ conflictCopy: string }> } | null;
+    expect(save).toMatchObject({ state: "saved", conflicts: [{ path: "memory/x.md", baseHash: hash("C"), currentHash: hash("B"), incomingHash: hash("A"),
+      conflictCopy: expect.stringMatching(/^memory\/x\.conflict-[0-9a-z]{8}-\d+\.md$/) }] });
+    const copyPath = save!.conflicts![0]!.conflictCopy;
+    expect(copyPath.startsWith(`memory/x.conflict-${parked.runId.slice(0, 8)}-`)).toBe(true);
+    expect(await fs.readFile(path.join(root, copyPath), "utf8")).toBe("A");
+    expect(await agentFileStore(db).read(companyId, agentId, copyPath, board())).toEqual(Buffer.from("A"));
+    const event = appendRunEvent.mock.calls.map(call => call[1] as { eventType: string; level: string; message: string; payload: Record<string, unknown> })
+      .find(entry => entry.eventType === "instruction_save");
+    expect(event).toMatchObject({ level: "warn", payload: { conflicts: save!.conflicts } });
+    for (const text of ["memory/x.md", hash("B"), hash("A"), copyPath]) expect(event!.message).toContain(text);
+    // A fresh chat starts from the sibling's note and sees the conflict copy.
+    const fresh = await run();
+    expect(await fs.readFile(path.join(fresh.localRoot, "memory", "x.md"), "utf8")).toBe("B");
+    expect(await fs.readFile(path.join(fresh.localRoot, copyPath), "utf8")).toBe("A");
+  });
+  // Data-safety regression: use real saves, cleanup, the next run's prepare,
+  // and the native envelope consumed on warm resume (not just save events).
+  it.each([false, true])("carries a conflict notice into the next model input once, after cleanup (warm save: %s)", async warm => {
+    await fs.mkdir(path.join(root, "memory"));
+    await fs.writeFile(path.join(root, "memory/x.md"), "C");
+    await fs.writeFile(path.join(root, "memory/y.md"), "C");
+    const first = await run({ warm });
+    await fs.writeFile(path.join(first.localRoot, "memory/x.md"), "A");
+    await fs.unlink(path.join(first.localRoot, "memory/y.md"));
+    await fs.writeFile(path.join(root, "memory/x.md"), "B");
+    await fs.writeFile(path.join(root, "memory/y.md"), "B");
+    const saved = warm ? await copies.checkpointWarm({ companyId, runId: first.runId })
+      : await copies.collectStopped({ companyId, runId: first.runId });
+    const conflicts = saved!.receipt!.conflicts as Array<{ path: string; conflictCopy: string | null }>;
+    const copyPath = conflicts.find(item => item.path === "memory/x.md")!.conflictCopy!;
+    // A no-change retirement checkpoint must not erase an undelivered notice.
+    if (warm) await copies.collectStopped({ companyId, runId: first.runId });
+    const next = await run();
+    const context: Record<string, unknown> = {};
+    await heartbeatCopy(next, undefined, { previousRunId: first.runId, context });
+    const notice = context.paperclipAgentFileConflictNotice;
+    expect(notice).toBe(`Note: "memory/x.md" was also saved by another run; that version was kept. Your earlier edit is saved as "${copyPath}".\nNote: "memory/y.md" was also saved by another run; that version was kept. Your earlier deletion was not applied.`);
+    const modelInput = (text: unknown) => buildNativeExecutionInput({ companyId, agentId, runId: next.runId,
+      issue: { id: randomUUID(), identifier: null, title: "Continue this chat", description: null, workMode: "standard" },
+      taskPrompt: "Continue", agentFileConflictNotice: typeof text === "string" ? text : null,
+      workspace: { id: next.runId, cwd: home, repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: randomUUID(), resumedSession: true,
+      previousTurn: { runId: first.runId, task: { title: "Continue this chat", description: null } },
+      provider: "codex", completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`,
+        schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Continue", criteria: [{ id: "answer", requirement: "Answer" }] } },
+      runtimeContext: nativeRuntimeContextFixture() });
+    for (const envelope of [buildNativeModelEnvelope(modelInput(notice)), buildNativeModelEnvelope(modelInput(notice), { resumedSession: true })]) {
+      const text = JSON.stringify(envelope);
+      expect(text).toContain(copyPath);
+      expect(text).toContain("that version was kept");
+      expect(text.split("Your earlier edit is saved as")).toHaveLength(2);
+    }
+    // Preparation retries, including a new facade after controller restart,
+    // rebuild the same input without consuming another delivery.
+    await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, next.runId));
+    copies = agentInstructionWorkingCopyService(db);
+    const retryContext: Record<string, unknown> = {};
+    await heartbeatCopy(next, undefined, { previousRunId: first.runId, context: retryContext });
+    expect(retryContext.paperclipAgentFileConflictNotice).toBe(notice);
+    await copies.collectStopped({ companyId, runId: next.runId });
+    const later = await run();
+    const laterContext: Record<string, unknown> = {};
+    await heartbeatCopy(later, undefined, { previousRunId: next.runId, context: laterContext });
+    expect(laterContext.paperclipAgentFileConflictNotice ?? null).toBeNull();
+    expect(JSON.stringify(buildNativeModelEnvelope(modelInput(laterContext.paperclipAgentFileConflictNotice), { resumedSession: true }))).not.toContain("Your earlier edit");
+    expect(await fs.readFile(path.join(root, "memory/x.md"), "utf8")).toBe("B");
+    expect(await fs.readFile(path.join(root, copyPath), "utf8")).toBe("A");
+  });
+  it("refreshes a still-warm conflicted tree and its baseline before same-root reuse, with a next-turn notice", async () => {
+    await fs.mkdir(path.join(root, "memory"));
+    await fs.writeFile(path.join(root, "memory/x.md"), "C");
+    const first = await run({ warm: true });
+    await fs.writeFile(path.join(first.localRoot, "memory/x.md"), "A");
+    await fs.writeFile(path.join(root, "memory/x.md"), "B");
+    const saved = (await copies.checkpointWarm({ companyId, runId: first.runId }))!;
+    const [item] = saved.receipt!.conflicts as Array<{ conflictCopy: string }>;
+    expect(await fs.readFile(path.join(first.localRoot, "memory/x.md"), "utf8")).toBe("B");
+    expect(await fs.readFile(path.join(first.localRoot, item!.conflictCopy), "utf8")).toBe("A");
+    expect(saved.receipt?.checkpointManifest).toMatchObject({ entries: expect.arrayContaining([
+      ["memory/x.md", expect.objectContaining({ hash: fileHash(Buffer.from("B")) })],
+    ]) });
+    expect(await copies.canReuseWarm(companyId, agentId, first.runId)).toBe(true);
+    const repeated = (await copies.checkpointWarm({ companyId, runId: first.runId }))!;
+    expect(repeated.receipt?.checkpointState).toBe("unchanged");
+    expect(repeated.receipt?.conflicts).toEqual([]);
+    const next = await run({ warm: true, reuseRunId: first.runId });
+    expect(next.localRoot).toBe(first.localRoot);
+    const context: Record<string, unknown> = {};
+    await heartbeatCopy(next, undefined, { previousRunId: first.runId, context });
+    const notice = context.paperclipAgentFileConflictNotice;
+    expect(notice).toBe(`Note: "memory/x.md" was also saved by another run; that version was kept. Your earlier edit is saved as "${item!.conflictCopy}".`);
+    const input = buildNativeExecutionInput({ companyId, agentId, runId: next.runId,
+      issue: { id: randomUUID(), identifier: null, title: "Continue", description: null, workMode: "standard" },
+      taskPrompt: "Continue", agentFileConflictNotice: String(notice),
+      workspace: { id: next.runId, cwd: home, repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: randomUUID(), resumedSession: true,
+      previousTurn: { runId: first.runId, task: { title: "Continue", description: null } },
+      provider: "codex", completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`,
+        schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Continue", criteria: [{ id: "answer", requirement: "Answer" }] } },
+      runtimeContext: nativeRuntimeContextFixture() });
+    expect(JSON.stringify(buildNativeModelEnvelope(input, { resumedSession: true }))).toContain(item!.conflictCopy);
+    await fs.writeFile(path.join(next.localRoot, "memory/x.md"), "D");
+    const later = (await copies.checkpointWarm({ companyId, runId: next.runId }))!;
+    expect(later.receipt?.conflicts).toEqual([]);
+    expect(await fs.readFile(path.join(root, "memory/x.md"), "utf8")).toBe("D");
+    expect((await fs.readdir(path.join(root, "memory"))).filter(name => name.includes(".conflict-"))).toEqual([path.basename(item!.conflictCopy)]);
+    await copies.collectStopped({ companyId, runId: next.runId });
+  });
+  it.each([false, true])("does not claim a sibling's file was kept when a folder replacement removed it (warm: %s)", async warm => {
+    await fs.mkdir(path.join(root, "memory"));
+    await fs.writeFile(path.join(root, "memory/x.md"), "C");
+    const first = await run({ warm });
+    const events = vi.fn(async (..._args: unknown[]) => {});
+    const lifecycle = await heartbeatCopy(first, events);
+    await fs.rm(path.join(first.localRoot, "memory"), { recursive: true });
+    await fs.writeFile(path.join(first.localRoot, "memory"), "A replacement");
+    await fs.writeFile(path.join(root, "memory/x.md"), "B");
+    await lifecycle.collectStoppedInstructions();
+    const save = lifecycle.getInstructionSave();
+    expect(save).toMatchObject({ state: "saved", conflicts: [{ path: "memory/x.md", currentKept: false }] });
+    expect(await fs.readFile(path.join(root, "memory"), "utf8")).toBe("A replacement");
+    const event = events.mock.calls.map(call => call[1] as { eventType: string; message: string })
+      .find(row => row.eventType === "instruction_save");
+    expect(event?.message).toContain("not kept");
+    expect(event?.message).not.toContain("and kept");
+    expect(event?.message).not.toContain(`: kept ${fileHash(Buffer.from("B"))}`);
+    const next = await run(), context: Record<string, unknown> = {};
+    await heartbeatCopy(next, undefined, { previousRunId: first.runId, context });
+    expect(context.paperclipAgentFileConflictNotice).toContain("that version was not kept");
+    expect(context.paperclipAgentFileConflictNotice).not.toContain("that version was kept");
+  });
+  it("retires instead of overwriting a post-capture edit when refreshing a warm conflict", async () => {
+    await fs.mkdir(path.join(root, "memory"));
+    await fs.writeFile(path.join(root, "memory/x.md"), "C");
+    const first = await run({ warm: true });
+    await fs.writeFile(path.join(first.localRoot, "memory/x.md"), "A");
+    await fs.writeFile(path.join(root, "memory/x.md"), "B");
+    const actual = fileStoreModule.agentFileStore;
+    const factory = vi.spyOn(fileStoreModule, "agentFileStore").mockImplementation((...args) => {
+      const store = actual(...args), apply = store.apply;
+      vi.spyOn(store, "apply").mockImplementation(async (...input) => {
+        const saved = await apply(...input);
+        // Real post-capture write, not a mocked merge/conflict result.
+        await fs.writeFile(path.join(first.localRoot, "memory/x.md"), "A2");
+        return saved;
+      });
+      return store;
+    });
+    try {
+      copies = agentInstructionWorkingCopyService(db);
+      const saved = (await copies.checkpointWarm({ companyId, runId: first.runId }))!;
+      expect(saved).toMatchObject({ state: "warm_saved", errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE" });
+      expect(saved.errorMessage).toContain("conflict save succeeded");
+      expect(await copies.canReuseWarm(companyId, agentId, first.runId)).toBe(false);
+      expect(await fs.readFile(path.join(first.localRoot, "memory/x.md"), "utf8")).toBe("A2");
+      expect(await fs.readFile(path.join(root, "memory/x.md"), "utf8")).toBe("B");
+      const files = (await fs.readdir(path.join(root, "memory"))).filter(name => name.includes(".conflict-"));
+      expect(files).toHaveLength(1); // A committed save was not replayed on refresh failure.
+      expect(await fs.readFile(path.join(root, "memory", files[0]!), "utf8")).toBe("A");
+    } finally { factory.mockRestore(); copies = agentInstructionWorkingCopyService(db); }
+    await copies.collectStopped({ companyId, runId: first.runId });
+  });
+  it("adds no next-turn notice after an ordinary save", async () => {
+    const first = await run();
+    await fs.writeFile(path.join(first.localRoot, "ordinary.md"), "Saved without a competing writer");
+    await copies.collectStopped({ companyId, runId: first.runId });
+    const next = await run(), context: Record<string, unknown> = {};
+    await heartbeatCopy(next, undefined, { previousRunId: first.runId, context });
+    expect(context.paperclipAgentFileConflictNotice ?? null).toBeNull();
+  });
   it("b13 RED: the executor-facing checkpointWarm callback returns true for an unchanged low-trust turn", async () => {
     await lowTrust();
     const copy = await run({ warm: true });

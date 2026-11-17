@@ -1,4 +1,5 @@
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
+import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, agentFileSaveHeld } from "./agent-directory-working-copies.js";
 import { registerCompletedTurnCleanupResumer } from "./native-runtime/completed-turn-cleanup-hold-settlement.js";
 import { endStorageOutageWaitOn, reportStorageOutageWaitsTo, runInOwnStorageScope } from "../storage/storage-unavailable.js";
 import { createStorageWaitNotice } from "./heartbeat/storage-wait-notice.js";
@@ -64,7 +65,7 @@ import { reconcileMuseNativeTerminalRun } from "./native-runtime/muse-terminal-r
 import { prepareHeartbeatWorkspace, RetryWorkspaceRefused } from "./heartbeat/workspace-preparation.js";
 import { nativeRecoveryClaimRelinquished, ownNativeExecutionLeaseLapsed, releaseLapsedNativeRestartClaim } from "./native-runtime/native-execution-lease.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
-import { preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
+import { nativeStopWorkspaceOutcome, preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
 import { nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { prepareAndSelectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
 import { createHeartbeatRunCompletion } from "./heartbeat/run-completion.js";
@@ -265,6 +266,7 @@ export {
   stripPaperclipSessionMetadataFromSessionParams,
   resolveTaskSessionConfigFreshness,
 } from "./heartbeat/workspaces.js";
+import { IsolatedRepositorySourceBusy } from "./workspace-source-lock.js";
 import { boundHeartbeatRunEventPayloadForStorage } from "./heartbeat/run-log.js";
 export {
   boundHeartbeatRunEventPayloadForStorage,
@@ -1062,6 +1064,7 @@ export function heartbeatService(
     findExecutionWorkspaceHolder,
     finalizeAiConnectionBusyDeferral,
     finalizeWorkspaceBusyDeferral,
+    finalizeWorkspaceSourceLockWait,
     finalizeAgentDirectoryBusyDeferral,
     promoteDueScheduledRetries,
     nextScheduledRetryAt,
@@ -1361,6 +1364,7 @@ export function heartbeatService(
     resumeExecutionWaitComments,
     getWorktreeExecutionCutoff,
     resumeQueuedCommentInterrupt,
+    queuedCommentInterruptTargetStopped,
     resumeSavedLegacyComments,
     cancelActiveForAgentInternal,
     listCompanyAgentOrgRows,
@@ -1587,6 +1591,10 @@ export function heartbeatService(
 
   function resumeQueuedCommentInterrupt(...args: Parameters<typeof runControl.resumeQueuedCommentInterrupt>) {
     return runControl.resumeQueuedCommentInterrupt(...args);
+  }
+
+  function queuedCommentInterruptTargetStopped(...args: Parameters<typeof runControl.queuedCommentInterruptTargetStopped>) {
+    return runControl.queuedCommentInterruptTargetStopped(...args);
   }
 
   function resumeSavedLegacyComments(...args: Parameters<typeof runControl.resumeSavedLegacyComments>) {
@@ -2191,6 +2199,7 @@ export function heartbeatService(
     let providerTraceFinalized = false;
     let readFailureReportSecrets: () => string[] = () => [];
     let identityRedactor = createAgentIdentityRedactor();
+    let workspaceWaitWasIssueAssignee = false;
 
     try {
       const loadedAgent = await timePreparation("agent_read", () => getAgent(run.agentId));
@@ -2927,6 +2936,9 @@ export function heartbeatService(
         getLatestAgentConfigRevision,
       }));
       let preparedSession = await prepareSession();
+      // Captured before workspace preparation, which on this line runs here
+      // (ahead of the session destructure upstream anchors it to).
+      workspaceWaitWasIssueAssignee = issueContext?.assigneeAgentId === agent.id;
       const prepareWorkspace = () => timePreparation("workspace", () => prepareHeartbeatWorkspace(db, {
         run, agent, controllerLease, nativeRunnerPreparationSpans, signal: executionControl.controller.signal,
         task: {
@@ -3116,7 +3128,7 @@ export function heartbeatService(
         }
         const enforceContinuationOwnership = Boolean(issueId && (isFailedChatRunRetry || isResolvedInteractionContinuationWakeContext(context) ||
           typeof context.workspaceReconstructionActionId === "string" ||
-          ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? "")));
+          ["native_safe_replacement", "native_provider_overloaded", "native_environment_blocker"].includes(run.scheduledRetryReason ?? "")));
         if (issueId && enforceContinuationOwnership) {
           await options.beforeResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
           await options.afterResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
@@ -3863,7 +3875,10 @@ export function heartbeatService(
           return;
         }
         if (err instanceof NativeCancellationPendingRecoveryError) {
-          await preserveNativeWorkspaceOnFailure();
+          // The shared Stop policy: an ordinary Stop on a warm (keep_running) box is
+          // a handoff and writes no hold; only a stopping box needs one.
+          if (nativeStopWorkspaceOutcome({ admittedDisposition: providerResourceDispositionForRun, stopped: true })
+            !== "handoff") await preserveNativeWorkspaceOnFailure();
           await cancelRunInternal(
             run.id,
             "Recovered durable native run cancellation",
@@ -4066,6 +4081,24 @@ export function heartbeatService(
             );
           },
         );
+      } else if (outerErr instanceof IsolatedRepositorySourceBusy) {
+        // A bounded workspace source lock wait ran out while this run was
+        // preparing: resource contention, not a failure. The finally block
+        // below still releases leases, runtime services, and scratch.
+        await finalizeWorkspaceSourceLockWait(run, outerErr, {
+          wasIssueAssignee: workspaceWaitWasIssueAssignee,
+        }).catch(
+          (deferralErr) => {
+            logger.error(
+              { err: deferralErr, runId },
+              "failed to finalize source-lock wait deferral",
+            );
+          },
+        );
+        if (runOptions.nativeRestartRecovery && !legacyAdapterEntered && !nativeDispatchStarted)
+          await settleFailedNativeRecoveryPreparation(db, { companyId: run.companyId, runId: run.id,
+            claim: runOptions.nativeRestartRecovery }).catch(error =>
+            logger.warn({ err: error, runId: run.id }, "Failed native recovery preparation could not be settled"));
       } else if (!(await leaveToNextController(outerErr))) {
         await preserveNativeWorkspaceOnFailure();
         if (!nativeOwnershipHeld && !nativeStartupCleanupScheduled && !nativeStartupCleanupError) {
@@ -4184,6 +4217,15 @@ export function heartbeatService(
               payload: { state: "unavailable", code: uncapturedInstructions.errorCode } });
           }
           await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+          // Fail closed: an unverified agent-file save is held in this box.
+          // Stop it and retain the lease; never destroy or expire its source.
+          const heldInstructions = await instructionCopies.get(run.companyId, run.id);
+          if (agentFileSaveHeld(heldInstructions)) {
+            providerResourceDispositionForRun = "stop_and_retain";
+            await appendRunEvent(run, { eventType: "instruction_save", stream: "system", level: "warn",
+              message: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
+              payload: { state: "pending_collection", savePending: true, code: heldInstructions?.errorCode ?? null } });
+          }
           await withAdapterExecutionPhase(executionPhaseContext, "lease_release", () => releaseEnvironmentLeasesForRun({
             runId: run.id,
             companyId: run.companyId,
@@ -4703,6 +4745,7 @@ export function heartbeatService(
     registerDeferredReceiptWork: (coordinator: Parameters<typeof registerDeferredReceiptWork>[1], canRun: () => boolean) =>
       registerDeferredReceiptWork(db, coordinator, {
         resume: scope => heartbeatQueue.resumeDeferredExecutionReceipts(scope),
+        interruptTargetStopped: scope => queuedCommentInterruptTargetStopped(scope.companyId, scope.requestId!),
         settleTaskChat: scope => reconcileTaskChatRetryReceipts(db, { ...scope, settleOnly: true }),
         createNativeBatch: heartbeatQueue.createNativeStatusWakeBatch,
         schedulingSuppressed: async () => (await getSchedulingSuppression(true)).suppressed,
@@ -4772,6 +4815,7 @@ export function heartbeatService(
     resumeRemoteStopComments,
     resumeTaskRetry: runControl.resumeTaskRetry,
     resumeQueuedCommentInterrupt,
+    queuedCommentInterruptTargetStopped,
     resumeExecutionWaitComments,
 
     sweepStaleIssueLocks,

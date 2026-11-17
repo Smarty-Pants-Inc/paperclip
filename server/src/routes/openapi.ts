@@ -1,6 +1,7 @@
 import { catalogTeamInstallSchema, catalogTeamPreviewSchema, updateWorkspacePreferenceSchema } from "@paperclipai/shared";
 import { MUSE_ASSET_VERSION, museStopBoundarySchema, museDetectorCleanupAttestationSchema, createGrokInvitationSchema, configureGrokRoutineSchema, verifyGrokRoutineSchema, recoverGrokRoutineSchema, pairGrokBindingSchema, stopGrokWorkSchema, retryGrokDeliverySchema, updateFastResponseSchema } from "@paperclipai/shared";
 import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAuthorizationSchema, slackSetupOptionsSchema, slackManagedProvisionSchema, slackManagedResultSchema, slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema } from "@paperclipai/shared";
+import { createServerAcceptedPlanDecompositionSchema } from "../services/plan-decomposition-limit.js";
 import { experimentalApiMetadata } from "./experimental-api-metadata.js";
 import { ATTENTION_SOURCE_KINDS } from "@paperclipai/shared";
 import { agentCaseHandoffSchema, caseWorkflowDocumentTextSchema, doneCaseHandoffSchema, createWorkflowSchema, updateWorkflowSchema, listWorkflowsSchema, readWorkflowQuerySchema } from "@paperclipai/shared";
@@ -268,7 +269,6 @@ import {
   createDocumentAnnotationThreadSchema,
   updateDocumentAnnotationThreadSchema,
   // Issue recovery and decomposition
-  createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
   recoverWorkspaceSchema,
   taskRetrySchema,
@@ -1546,6 +1546,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/resource-memberships/me",
   "GET /api/workspace-preferences/me",
   "PUT /api/companies/{companyId}/workspace-preferences/me",
+  "GET /api/companies/{companyId}/primary-agents",
   "GET /api/companies/{companyId}/primary-agent/me",
   "PUT /api/companies/{companyId}/primary-agent/me",
   "PUT /api/companies/{companyId}/resource-memberships/me/agents/{agentId}",
@@ -7284,6 +7285,19 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/primary-agents",
+  tags: ["agents"],
+  summary: "List active members' primary agents",
+  description: "Company board members can read primary assignments for active human members. Only agents the caller may read are returned. This read changes no preference or permissions. Agent credentials cannot access it.",
+  request: { params: z.object({ companyId: z.string().uuid() }) },
+  responses: {
+    200: r.ok(z.array(z.object({ userId: z.string(), agentId: z.string().uuid() }))),
+    401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+  },
+});
+
 const primaryAgentPreferenceResponse = z.object({
   companyId: z.string().uuid(),
   userId: z.string(),
@@ -11292,7 +11306,7 @@ registerCurrentRoute({
   path: "/api/issues/{id}/accepted-plan-decompositions",
   tags: ["issues"],
   summary: "Create accepted plan decomposition child issues",
-  body: createAcceptedPlanDecompositionSchema,
+  body: createServerAcceptedPlanDecompositionSchema(),
 });
 
 for (const route of [

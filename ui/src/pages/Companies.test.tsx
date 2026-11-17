@@ -30,8 +30,8 @@ vi.mock("../context/CompanyContext", () => ({
         issuePrefix: "PAP",
         name: "Acme Labs",
         status: "active",
-        budgetMonthlyCents: 0,
-        spentMonthlyCents: 0,
+        budgetMonthlyCents: 50000,
+        spentMonthlyCents: 57230,
       },
     ],
     selectedCompanyId: "company-1",
@@ -121,6 +121,16 @@ describe("Companies page", () => {
     } finally {
       act(() => root.unmount());
     }
+  });
+
+  it("shows configured company budgets without the spend-derived percentage", async () => {
+    const root = await renderPage();
+    try {
+      expect(container.textContent).toContain("— / $500.00");
+      expect(container.textContent).toContain("(—)");
+      expect(container.textContent).not.toContain("114%");
+      expect(container.textContent).not.toContain("$572.30");
+    } finally { act(() => root.unmount()); }
   });
 
   it("offers the company wizard when self-hosted", async () => {

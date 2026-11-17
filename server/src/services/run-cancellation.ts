@@ -1,4 +1,5 @@
 import type { heartbeatRuns } from "@paperclipai/db";
+import { sql, type SQLWrapper } from "drizzle-orm";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect, "status" | "startedAt" | "finishedAt" | "runtimeMode" | "errorCode" | "error" | "resultJson">;
 const SOURCES = ["operator", "queued_message", "shutdown", "provider", "transport", "control_plane", "controller_lease", "unknown"] as const;
@@ -145,6 +146,29 @@ export function recordedUserStop(run: Pick<Run, "status" | "resultJson">) {
     ["operator", "queued_message"].includes(cancellation.source) ? cancellation : null;
 }
 
+/** Presentation of a settled operator Stop; this does not grant replay authority. */
+export function isAcknowledgedLegacyUserStop(run: Pick<Run, "status" | "resultJson"> & Partial<Pick<Run, "runtimeMode" | "finishedAt">>): boolean {
+  const cancellation = recordedUserStop(run);
+  const receipt = run.resultJson?.executionCancellation as Record<string, unknown> | undefined;
+  return run.status === "cancelled" && run.runtimeMode === "legacy" && Boolean(run.finishedAt)
+    && cancellation?.source === "operator" && cancellation.expected
+    && receipt?.state === "acknowledged" && receipt.proof === "preparation_settled";
+}
+
+/** The same bounded Stop evidence for both task-page projections. */
+export function runStopPresentationJson(result: SQLWrapper) {
+  return sql<Record<string, unknown>>`jsonb_build_object(
+    'cancellation', jsonb_build_object(
+      'source', left(${result}->'cancellation'->>'source', 32),
+      'expected', ${result}->'cancellation'->'expected',
+      'initiator', jsonb_build_object('type', left(${result}->'cancellation'->'initiator'->>'type', 32)),
+      'reason', left(${result}->'cancellation'->>'reason', 512),
+      'recordedAt', left(${result}->'cancellation'->>'recordedAt', 64)),
+    'executionCancellation', jsonb_build_object(
+      'state', left(${result}->'executionCancellation'->>'state', 32),
+      'proof', left(${result}->'executionCancellation'->>'proof', 64)))`;
+}
+
 /** When a user's Stop or interrupt took effect for message ordering. A native
  * run finishes only after its provider stop and workspace save settle, which
  * can take many seconds. A message written after the Stop request is a new
@@ -157,6 +181,22 @@ export function userStopBoundaryAt(run: Pick<Run, "status" | "finishedAt" | "res
   if (!cancellation) return run.finishedAt;
   const requestedAt = new Date(cancellation.recordedAt);
   return Number.isFinite(requestedAt.getTime()) && requestedAt < run.finishedAt ? requestedAt : run.finishedAt;
+}
+
+/** A saved queue's Send receipt that a user recorded after a Stop. Input queued
+ * before the Stop is not a new direction on its own; that user's later Send of
+ * the queue is. Only the board queue route writes the receipt, so the dispatch
+ * fallback carries it under its own key, which wake callers can never supply. */
+export const QUEUED_SEND_AFTER_STOP_KEY = "queuedCommentSentAfterStop";
+
+export function queuedSendAfterStop(payloadValue: unknown, input: { stoppedAt: Date; actorId: string | null; key?: string }) {
+  const payload = payloadValue && typeof payloadValue === "object" ? payloadValue as Record<string, unknown> : {};
+  const raw = payload[input.key ?? "queuedCommentInterrupt"];
+  const intent = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const sentAt = typeof intent.requestedAt === "string" ? new Date(intent.requestedAt) : null;
+  if (!input.actorId || intent.actorId !== input.actorId || !sentAt || !Number.isFinite(sentAt.getTime()) ||
+      sentAt <= input.stoppedAt) return null;
+  return { actorId: input.actorId, requestedAt: sentAt.toISOString() };
 }
 
 export function isUnexpectedRunCancellation(run: Run): boolean {

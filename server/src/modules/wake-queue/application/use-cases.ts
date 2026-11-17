@@ -1,5 +1,5 @@
 import { readWakeChatConversationId } from "../../run-dispatch/index.js";
-import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun } from "../domain/context.js";
+import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun, withMergedWakeReasons } from "../domain/context.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../domain/policy.js";
 import {
   decideQueuedCommentAction,
@@ -386,6 +386,7 @@ async function promoteDeferredWake(
     shouldReopen =
       !selfAuthorship.allSelfAuthored &&
       (workingCandidate.requestedByActorType === "user" ||
+        selfAuthorship.includesPersonComment ||
         workingCandidate.wakeReason === "issue_reopened_via_comment" ||
         // The agent watching the task posted it while the run that closed the
         // task was active. That agent receives the completed result and can
@@ -767,7 +768,7 @@ async function runReleaseRecoveryTail(
     deriveImmediateRecoveryContextLabels(issue.status);
   // This fresh normal-model seed carries no inherited recovery/model-profile fields.
   const recoveryContextSnapshot: Record<string, unknown> = {
-    ...await transaction.pendingContinuationCommentInput({ companyId: run.companyId, issueId: issue.id, contextSnapshot: run.contextSnapshot }),
+    ...await transaction.pendingContinuationCommentInput({ companyId: run.companyId, issueId: issue.id, agentId: run.agentId, contextSnapshot: run.contextSnapshot }),
     issueId: issue.id,
     taskId: issue.id,
     wakeReason: recoveryReason,
@@ -973,12 +974,16 @@ export function createAdmitWakeBehindIssueExecution(deps: {
           });
 
     if (existingDeferred && !existingDeferred.payload?.interactionId && !existingDeferred.deferredContext.interactionId) {
-      const mergedDeferredContext = deps.helpers.mergeCoalescedContextSnapshot(
+      const mergedDeferredContext = withMergedWakeReasons(
+        deps.helpers.mergeCoalescedContextSnapshot(
+          existingDeferred.deferredContext,
+          input.contextSnapshot,
+          {
+            preserveExistingInteractionContinuation: true,
+          },
+        ),
         existingDeferred.deferredContext,
         input.contextSnapshot,
-        {
-          preserveExistingInteractionContinuation: true,
-        },
       );
       const mergedPayload = {
         ...existingDeferred.payload,

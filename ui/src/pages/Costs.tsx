@@ -41,7 +41,7 @@ import { useCompany } from "../context/CompanyContext";
 import { useDateRange, PRESET_KEYS, PRESET_LABELS } from "../hooks/useDateRange";
 import { retainQuotaWindows } from "../lib/quota-refresh";
 import { queryKeys } from "../lib/queryKeys";
-import { billingTypeDisplayName, cn, formatCents, formatTokens, providerDisplayName } from "../lib/utils";
+import { billingTypeDisplayName, cn, formatCents, formatConfiguredCents, formatSpendPercent, formatTokens, providerDisplayName } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -678,14 +678,14 @@ export function Costs({
               label="Budget"
               value={activeBudgetIncidents.length > 0 ? String(activeBudgetIncidents.length) : (
                 spendData?.summary.budgetCents && spendData.summary.budgetCents > 0
-                  ? preset === "mtd" ? `${spendData.summary.utilizationPercent}%` : formatCents(spendData.summary.budgetCents)
+                  ? preset === "mtd" ? formatSpendPercent(spendData.summary.utilizationPercent) : formatConfiguredCents(spendData.summary.budgetCents)
                   : "Open"
               )}
               subtitle={
                 activeBudgetIncidents.length > 0
                   ? `${budgetData?.pausedAgentCount ?? 0} agents paused · ${budgetData?.pausedProjectCount ?? 0} projects paused`
                   : spendData?.summary.budgetCents && spendData.summary.budgetCents > 0
-                    ? preset === "mtd" ? `${formatCents(spendData.summary.spendCents)} of ${formatCents(spendData.summary.budgetCents)} this month` : "Monthly limit"
+                    ? preset === "mtd" ? `${formatCents(spendData.summary.spendCents)} of ${formatConfiguredCents(spendData.summary.budgetCents)} this month` : "Monthly limit"
                     : "No monthly cap configured"
               }
               icon={Coins}
@@ -836,7 +836,7 @@ export function Costs({
                                             costCents={modelRow.costCents}
                                             eventCount={modelRow.eventCount}
                                             estimatedEventCount={modelRow.estimatedEventCount}
-                                            suffix={<span className="ml-1 font-normal text-muted-foreground">({sharePct}%)</span>}
+                                            suffix={<span className="ml-1 font-normal text-muted-foreground">({formatSpendPercent(sharePct)})</span>}
                                           />
                                           <div className="text-muted-foreground">
                                             {formatTokens(modelRow.inputTokens + modelRow.cachedInputTokens + modelRow.outputTokens)} tok

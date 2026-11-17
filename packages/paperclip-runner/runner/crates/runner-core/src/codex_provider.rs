@@ -1760,10 +1760,30 @@ impl CodexProvider {
         }
         let blockers = self.warm_run_attachment_blockers()?;
         if !blockers.is_empty() {
+            // Name what is buffered (bounded method names only, never params)
+            // so a live refusal says which provider frames were left behind.
+            let buffered = self
+                .pending_messages
+                .iter()
+                .take(8)
+                .map(|message| {
+                    let method = message.value.get("method").and_then(Value::as_str);
+                    match (method, message.value.get("id").is_some()) {
+                        (Some(method), true) => format!("request:{}", bounded_method(method)),
+                        (Some(method), false) => bounded_method(method),
+                        (None, _) => "response".to_owned(),
+                    }
+                })
+                .collect::<Vec<_>>();
             return Err(LocalRunnerError::invalid(
                 format!(
-                    "Codex warm run attachment requires an idle live provider with no pending work ({})",
-                    blockers.join(",")
+                    "Codex warm run attachment requires an idle live provider with no pending work ({}){}",
+                    blockers.join(","),
+                    if buffered.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; buffered {}: {}", self.pending_messages.len(), buffered.join(","))
+                    }
                 ),
             ));
         }
@@ -1806,13 +1826,28 @@ impl CodexProvider {
     ) -> (Vec<(String, Value)>, Result<(), LocalRunnerError>) {
         let mut accounting = Vec::new();
         let result = (|| {
-            let Some(completed_turn_id) = self
+            let completed_turn_id = self
                 .completed_turn_authority
                 .as_ref()
-                .map(|authority| authority.provider_turn_id.clone())
-            else {
+                .map(|authority| authority.provider_turn_id.clone());
+            // A successful in-place attach (run.prepare's rebind) clears the
+            // authority, but frames Pi emitted while answering that run.attach
+            // request (its idle attach timing, diagnostics) stay buffered. With
+            // no live turn they are the same settled tail: drain them under
+            // the settled-turn identities instead of refusing the next attach.
+            // Only buffered notifications qualify; a buffered provider request
+            // (e.g. a tool callback) is left for the blockers to refuse.
+            let buffer_only = completed_turn_id.is_none();
+            if buffer_only
+                && (self.pending_messages.is_empty()
+                    || self.ambiguous_turn_start_pending
+                    || self
+                        .pending_messages
+                        .iter()
+                        .any(|message| message.value.get("id").is_some()))
+            {
                 return Ok(());
-            };
+            }
             if self.active_provider_turn_id.is_some() {
                 return Ok(());
             }
@@ -1829,6 +1864,9 @@ impl CodexProvider {
             let mut quiet_since: Option<std::time::Instant> = None;
             let mut drained = 0usize;
             loop {
+                if buffer_only && self.pending_messages.is_empty() {
+                    return Ok(());
+                }
                 if std::time::Instant::now() >= deadline {
                     return Err(LocalRunnerError::invalid(
                         "Codex warm run attachment tail did not become quiescent",
@@ -1843,8 +1881,13 @@ impl CodexProvider {
                                 "Codex warm run attachment tail exceeded its bounded frame limit",
                             ));
                         }
-                        let names_other_turn = notification_turn_id(&params)
-                            .is_some_and(|turn_id| turn_id != completed_turn_id);
+                        let names_other_turn =
+                            notification_turn_id(&params).is_some_and(|turn_id| {
+                                match completed_turn_id.as_deref() {
+                                    Some(completed) => turn_id != completed,
+                                    None => !self.settled_provider_turn_ids.contains(turn_id),
+                                }
+                            });
                         // A notification about the settled turn is history. Only
                         // a new turn means something is live; a provider request
                         // or process exit has its own fail-closed arm below.
@@ -5797,6 +5840,188 @@ done
             }
         }
         provider
+    }
+
+    /// S2p shape (2) RED. Drives the production path run.prepare(different run)
+    /// -> rebind -> attach_run_with_provider_refresh -> attach_run_in_place
+    /// (provider_backend.rs prepare_with_legacy_attachment), then the run.attach
+    /// command -> attach_run -> attach_run_in_place again, against a real child
+    /// process speaking the pi_rpc app-server proxy frames. Pi's driver flushes
+    /// the idle `runner.pi.attach` timing span (pi-rpc-driver.ts #measure with
+    /// flushIdle) as `paperclip/providerPerformance` (proxy pumpEvents) before
+    /// the run.attach response, so request() buffers it (pending_messages), and
+    /// the first attach clears completed_turn_authority. The second attach then
+    /// skipped its tail drain and refused with `pending_messages`.
+    #[cfg(unix)]
+    fn pi_attach_with_buffered_tail_provider(extra_before_ack: &str) -> CodexProvider {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"reader-tail-thread"}}}' ;;
+    *'"method":"run.attach"'*)
+      id=${line#*\"id\":}; id=${id%%,*}
+      printf '%s\n' '{"method":"paperclip/providerPerformance","params":{"threadId":"reader-tail-thread","spans":[{"name":"runner.pi.attach","outcome":"ok"}]}}'
+      if [ -z "$swept" ]; then swept=1; __EXTRA__; fi
+      printf '{"id":%s,"result":true}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"reader-tail-1"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"reader-tail-1","status":"completed"}}}' ;;
+  esac
+done
+"#;
+        let config = CodexProviderConfig {
+            profile: None,
+            provider: "codex".to_owned(),
+            driver: "codex_app_server".to_owned(),
+            provider_version: "reader-tail-fixture".to_owned(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_owned(),
+                script.replace("__EXTRA__", extra_before_ack),
+            ],
+            cwd: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            model: None,
+            provider_session_id: None,
+            instructions: "Test only.".to_owned(),
+            approval_policy: "never".to_owned(),
+            externally_sandboxed: false,
+            read_only: false,
+            include_skill_instructions: None,
+            conversation_mode: None,
+        };
+        let mut provider = CodexProvider::start(&config, None).unwrap();
+        provider.start_turn("First turn", &config.cwd).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            if matches!(provider.poll().unwrap(), Some(CodexProviderEvent::Notification { method, .. }) if method == "turn/completed")
+            {
+                break;
+            }
+        }
+        provider.config.provider = "pi_rpc".to_owned();
+        provider
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_run_attach_after_prepare_rebind_drains_the_settled_attach_tail() {
+        let mut provider = pi_attach_with_buffered_tail_provider(":");
+        let context = json!({"runId": "answer-run"});
+        // run.prepare for the person's answer run rebinds in place.
+        assert!(provider
+            .attach_run_in_place(
+                [],
+                None,
+                Some(("Answer run", &context, "answer-run")),
+                &mut Vec::new()
+            )
+            .unwrap());
+        // Exactly this frame sits in pending_messages, buffered by request().
+        let buffered = provider
+            .pending_messages
+            .iter()
+            .map(|message| message.value["method"].as_str().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(buffered, ["paperclip/providerPerformance"]);
+        assert!(provider.completed_turn_authority.is_none());
+        // The run.attach command for the same answer run must not refuse.
+        let mut accounting = Vec::new();
+        let attached = provider.attach_run_in_place(
+            [],
+            None,
+            Some(("Answer run", &context, "answer-run")),
+            &mut accounting,
+        );
+        assert!(
+            attached.as_ref().is_ok_and(|kept| *kept),
+            "settled attach tail must not refuse the answer run: {attached:?}"
+        );
+        assert!(accounting.is_empty());
+        provider.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_run_attach_drains_a_late_settled_turn_item_swept_in_by_the_first_attach() {
+        // A parked turn's late tool item (e.g. a long sibling callback that
+        // finished after release) still sits in Pi's stdout; the first
+        // attach's run.attach request reads and buffers it with the timing.
+        let mut provider = pi_attach_with_buffered_tail_provider(
+            r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"reader-tail-thread","turnId":"reader-tail-1","item":{"id":"sibling","type":"dynamicToolCall","status":"completed"}}}'"#,
+        );
+        let context = json!({"runId": "answer-run"});
+        assert!(provider
+            .attach_run_in_place(
+                [],
+                None,
+                Some(("Answer run", &context, "answer-run")),
+                &mut Vec::new()
+            )
+            .unwrap());
+        assert_eq!(provider.pending_messages.len(), 2);
+        let attached = provider.attach_run_in_place(
+            [],
+            None,
+            Some(("Answer run", &context, "answer-run")),
+            &mut Vec::new(),
+        );
+        assert!(attached.as_ref().is_ok_and(|kept| *kept), "{attached:?}");
+        // Only this attach's own fresh timing frame remains for the next poll;
+        // the parked turn's late item was drained as settled history.
+        let left = provider
+            .pending_messages
+            .iter()
+            .map(|message| message.value["method"].as_str().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(left, ["paperclip/providerPerformance"]);
+        provider.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_run_attach_still_refuses_buffered_live_work_after_prepare_rebind() {
+        // Negative controls: a new turn or a provider request buffered during
+        // the rebind is live work, never history. Attachment stays fail-closed.
+        for extra in [
+            r#"printf '%s\n' '{"method":"turn/started","params":{"threadId":"reader-tail-thread","turn":{"id":"live-turn-2"}}}'"#,
+            r#"printf '%s\n' '{"method":"item/started","params":{"threadId":"reader-tail-thread","turnId":"live-turn-2","item":{"id":"i"}}}'"#,
+            r#"printf '%s\n' '{"id":77,"method":"item/tool/call","params":{"threadId":"reader-tail-thread","turnId":"reader-tail-1","callId":"c","tool":"t","arguments":{}}}'"#,
+        ] {
+            let mut provider = pi_attach_with_buffered_tail_provider(extra);
+            let context = json!({"runId": "answer-run"});
+            assert!(provider
+                .attach_run_in_place(
+                    [],
+                    None,
+                    Some(("Answer run", &context, "answer-run")),
+                    &mut Vec::new()
+                )
+                .unwrap());
+            assert_eq!(provider.pending_messages.len(), 2, "{extra}");
+            let attached = provider.attach_run_in_place(
+                [],
+                None,
+                Some(("Answer run", &context, "answer-run")),
+                &mut Vec::new(),
+            );
+            assert!(
+                attached.is_err(),
+                "{extra}: live work must refuse: {attached:?}"
+            );
+            if extra.contains("item/tool/call") {
+                // The refusal names the buffered frames; nothing was answered.
+                assert!(attached.unwrap_err().to_string().ends_with(
+                    "(pending_messages); buffered 2: paperclip/providerPerformance,request:item/tool/call"
+                ));
+                assert_eq!(provider.pending_messages.len(), 2);
+            }
+            provider.shutdown().unwrap();
+        }
     }
 
     #[cfg(unix)]

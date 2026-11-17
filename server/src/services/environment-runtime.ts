@@ -1,4 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
+import { agentFileSaveHeldOnLease } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -31,6 +32,7 @@ import { flushDeferredEnvironmentCleanup, registerDeferredEnvironmentCleanup, wr
 import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatchedEnvironmentTask } from "./environment-task-runtime.js";
 import { allowLegacyShutdownWorkspaceCleanup, legacyShutdownWorkspaceResourceProtected } from "./legacy-shutdown-workspace-settlement.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
+import { hasNativeHarnessBackupMissing } from "./native-runtime/native-harness-backup-missing.js";
 import { abandonedWorkspaceFilesHeldOnLease, abandonedWorkspaceFilesParked, parkAbandonedWorkspaceFilesLease } from "./remote-workspace-abandoned-files-hold.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
@@ -2814,6 +2816,9 @@ function createSandboxEnvironmentDriver(
 
     async retryPendingSandboxTeardown(input) {
       const exportResume = hasStopOnlyCleanup(input.lease);
+      if (!exportResume && hasNativeHarnessBackupMissing(input.lease)) {
+        throw new Error("Native harness backup is missing; destructive cleanup is forbidden.");
+      }
       if (!exportResume && await nativeWorkspaceExportPendingForLease(db, input.lease)) {
         throw new Error("Native workspace export is pending; destructive cleanup is forbidden.");
       }
@@ -3602,8 +3607,11 @@ function createSandboxEnvironmentDriver(
     lease: EnvironmentLease;
     failureReason: string;
   }): Promise<EnvironmentLease | null> {
+    if (hasNativeHarnessBackupMissing(input.lease)) return null;
     if (reusableSandboxKeptAfterReplacement(input.lease)) return null;
     if (await legacyShutdownWorkspaceResourceProtected(db, input.lease)) return null;
+    // An unverified agent-file save holds this box: expiry must not destroy it.
+    if (await agentFileSaveHeldOnLease(db, input.lease)) return null;
     if (await abandonedWorkspaceFilesHeldOnLease(db, input.lease)) {
       await parkAbandonedWorkspaceFilesLease(db, input.lease, ["released", "retained", "failed", "pending_cleanup"]);
       return null;
@@ -3750,6 +3758,7 @@ const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "creationOperationId",
   "sandboxLeaseAcquisition",
   "nativeHarnessBackup",
+  "nativeHarnessBackupMissing",
   "nativeWorkspaceSync",
   "reusableSandboxLease",
   // The host process that holds the lease (ownership proof); never provider config.
@@ -4368,8 +4377,10 @@ export function environmentRuntimeService(
     anyLeasePolicy?: boolean;
     releasesKeptSandbox?: boolean;
   }): Promise<EnvironmentLease | null> {
+    if (hasNativeHarnessBackupMissing(input.leaseRow)) return null;
     if (await nativeWorkspaceExportPendingForLease(db, input.leaseRow)) return null;
     if (!(await allowLegacyShutdownWorkspaceCleanup(db, input.leaseRow))) return null;
+    if (await agentFileSaveHeldOnLease(db, input.leaseRow)) return null;
     const now = new Date();
     const attemptId = randomUUID();
     // The claimer is bound to this attempt. If this server dies mid-teardown,
@@ -4815,6 +4826,9 @@ export function environmentRuntimeService(
       if (!hasStopOnlyCleanup(input.lease) && await abandonedWorkspaceFilesHeldOnLease(db, input.lease)) {
         throw new Error("Unsaved files from an abandoned workspace are held on this sandbox; destructive cleanup is forbidden.");
       }
+      if (!hasStopOnlyCleanup(input.lease) && await agentFileSaveHeldOnLease(db, input.lease)) {
+        throw new Error("Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.");
+      }
       if (input.lease.metadata?.legacyShutdownWorkspaceSettlement) {
         const current = await environmentsSvc.getLeaseById(input.lease.id);
         if (!current) throw new Error("Shutdown workspace source is unavailable.");
@@ -5103,6 +5117,7 @@ export function environmentRuntimeService(
     },
 
     async destroyRunLease(input: EnvironmentDriverLeaseInput): Promise<EnvironmentLease | null> {
+      if (hasNativeHarnessBackupMissing(input.lease)) return null;
       if (await nativeWorkspaceExportPendingForLease(db, input.lease)) return null;
       if (await legacyShutdownWorkspaceResourceProtected(db, input.lease)) return null;
       if (input.lease.metadata?.legacyShutdownWorkspaceSettlement) {

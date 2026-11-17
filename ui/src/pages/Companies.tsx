@@ -8,7 +8,7 @@ import { useCloudInstance } from "../hooks/useCloudInstance";
 import { companiesApi } from "../api/companies";
 import { queryKeys } from "../lib/queryKeys";
 import { QueryErrorState } from "../components/QueryView";
-import { formatCents, relativeTime } from "../lib/utils";
+import { formatCents, formatConfiguredCents, formatSpendPercent, relativeTime } from "../lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -284,7 +284,7 @@ export function Companies() {
                   <span>
                     {formatCents(company.spentMonthlyCents)}
                     {company.budgetMonthlyCents > 0
-                      ? <> / {formatCents(company.budgetMonthlyCents)} <span className="text-xs">({budgetPct}%)</span></>
+                      ? <> / {formatConfiguredCents(company.budgetMonthlyCents)} <span className="text-xs">({formatSpendPercent(budgetPct)})</span></>
                       : <span className="text-xs ml-1">Unlimited budget</span>}
                   </span>
                 </div>
