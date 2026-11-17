@@ -118,6 +118,10 @@ export async function pendingContinuationInteractionInput(db: Pick<Db, "select">
     inArray(issueThreadInteractions.id, candidates), eq(issueThreadInteractions.createdByAgentId, input.agentId),
     sql`${issueThreadInteractions.resolvedByUserId} is not null`, isNull(issueThreadInteractions.resolvedByAgentId),
     inArray(issueThreadInteractions.status, ["answered", "accepted", "rejected"]),
+    // Carry once (h3-combine 5a): a card answer some run already answered (the shared predicate,
+    // keyed by the card and its answer time, as unansweredCardAnswerSql reads it) is not pending input.
+    sql`not ${answeredPersonMessageSql({ id: sql`${issueThreadInteractions.id}`, companyId: sql`${issueThreadInteractions.companyId}`,
+      issueId: sql`${issueThreadInteractions.issueId}`, createdAt: sql`${issueThreadInteractions.resolvedAt}` })}`,
   )).orderBy(asc(issueThreadInteractions.resolvedAt), asc(issueThreadInteractions.id));
   const interactionIds = rows.map(row => row.id);
   return interactionIds.length ? { interactionIds, interactionId: interactionIds.at(-1) } : {};
