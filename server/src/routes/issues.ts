@@ -215,6 +215,8 @@ import { validate, validateIssueMutationBody } from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
 import { conversationDecisionReceiptsService } from "../services/conversation-decision-receipts.js";
 import { attentionHandledDetails, attentionHandledFor, type AttentionHandledFor } from "../services/attention-receipts.js";
+import { recordCommentWakeIntent, retryCommentWakeIntent, settleCommentWakeIntent } from "../services/comment-wake-intent.js";
+import { withTransactionRetry } from "../services/transaction-retry.js";
 import {
   accessService,
   agentService,
@@ -20607,6 +20609,7 @@ export function issueRoutes(
       let comment: Awaited<ReturnType<typeof svc.addComment>>;
       let goalCommentSteered = false;
       let fastResponseEnqueued = false;
+      let commentWakeIntent: { agentId: string; commentId: string } | null = null;
       if (shouldAutoApproveReviewComment) {
         const transition = applyIssueExecutionPolicyTransition({
           issue: currentIssue,
@@ -20784,15 +20787,25 @@ export function issueRoutes(
             dbOrTx,
           );
         const needsFastResponse = actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status);
-        comment = needsFastResponse ? await db.transaction(async tx => {
+        // S004: a person's comment and the intent to wake its assignee commit
+        // together, so a wake that fails after the 201 is retried, not lost.
+        const wakeIntentAgentId = actor.actorType === "user" ? currentIssue.assigneeAgentId : null;
+        // Database-only transaction: a deadlock on it (now also the intent
+        // insert) is retried from a clean slate rather than failing the post.
+        comment = needsFastResponse || wakeIntentAgentId ? await withTransactionRetry(db, () => db.transaction(async tx => {
           const saved = await add(tx as unknown as Db);
+          if (wakeIntentAgentId) {
+            await recordCommentWakeIntent(tx as unknown as Db, { companyId: currentIssue.companyId, issueId: currentIssue.id,
+              agentId: wakeIntentAgentId, commentId: saved.id, requestedByActorId: actor.actorId });
+            commentWakeIntent = { agentId: wakeIntentAgentId, commentId: saved.id };
+          }
           if (actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status)) {
             await enqueueFastResponse(tx as unknown as Db, { companyId: currentIssue.companyId, issueId: currentIssue.id, agentId: currentIssue.assigneeAgentId,
               responsibleUserId: actor.actorId, sourceCommentId: saved.id, sourceKey: `comment:${saved.id}`, acceptedAt: new Date(saved.createdAt) });
             fastResponseEnqueued = true;
           }
           return saved;
-        }) : await add();
+        })) : await add();
       }
 
       if (!fastResponseEnqueued && actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status)) {
@@ -20981,6 +20994,21 @@ export function issueRoutes(
           currentIssue.status === "todo",
       });
 
+      // S004: the comment's durable wake intent is settled when its wake is
+      // issued (or not owed) and handed to the outbox's saved receipt when the
+      // wake fails, so the drain delivers it exactly once.
+      const pendingWakeIntent = commentWakeIntent as { agentId: string; commentId: string } | null;
+      const intentWakeKey = pendingWakeIntent ? `${pendingWakeIntent.agentId}:${currentIssue.id}` : null;
+      let intentWakeDispatched = false;
+      const retryWakeIntent = (err: unknown) => {
+        if (!pendingWakeIntent) return;
+        logger.warn({ err, issueId: currentIssue.id, commentId: pendingWakeIntent.commentId },
+          "issue comment wake failed; saving the message for the outbox drain");
+        void retryCommentWakeIntent(db, { companyId: currentIssue.companyId, issueId: currentIssue.id,
+          agentId: pendingWakeIntent.agentId, commentId: pendingWakeIntent.commentId })
+          .catch(retryErr => logger.warn({ err: retryErr, issueId: currentIssue.id },
+            "could not save a failed comment wake; the unanswered-message reconciler remains the backstop"));
+      };
       // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
       void (async () => {
         type WakeupRequest = NonNullable<
@@ -21243,9 +21271,27 @@ export function issueRoutes(
           }
         }
 
-        for (const { agentId, wakeup } of wakeups.values()) {
+        if (pendingWakeIntent && !(intentWakeKey && wakeups.has(intentWakeKey))) {
+          // No wake of the assignee is owed for this comment.
+          intentWakeDispatched = true;
+          await settleCommentWakeIntent(db, { companyId: currentIssue.companyId, commentId: pendingWakeIntent.commentId })
+            .catch(err => logger.warn({ err, issueId: currentIssue.id }, "failed to settle a comment wake intent"));
+        }
+        for (const [wakeKey, { agentId, wakeup }] of wakeups.entries()) {
+          const carriesIntent = pendingWakeIntent !== null && wakeKey === intentWakeKey;
+          if (carriesIntent) intentWakeDispatched = true;
           heartbeat
             .wakeup(agentId, wakeup)
+            .then(async (wakeRun) => {
+              if (carriesIntent) {
+                await settleCommentWakeIntent(db, { companyId: currentIssue.companyId, commentId: pendingWakeIntent!.commentId })
+                  .catch(err => logger.warn({ err, issueId: currentIssue.id }, "failed to settle a comment wake intent"));
+              }
+              return wakeRun;
+            }, (err) => {
+              if (carriesIntent) retryWakeIntent(err);
+              throw err;
+            })
             .then((wakeRun) => {
               if (wakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) return;
               const payload =
@@ -21287,7 +21333,11 @@ export function issueRoutes(
               ),
             );
         }
-      })();
+      })().catch((err) => {
+        // The wake decision itself failed before the comment's wake was issued.
+        if (!intentWakeDispatched) retryWakeIntent(err);
+        else logger.warn({ err, issueId: currentIssue.id }, "failed to wake agents on issue comment");
+      });
 
 
       await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
