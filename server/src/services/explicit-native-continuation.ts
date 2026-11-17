@@ -355,10 +355,27 @@ export async function admitExplicitNativeContinuation(input: {
     const [source] = await db.select(continuationRunFields).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, taskRetry.sourceRunId), eq(heartbeatRuns.agentId, agentId),
     )).for("update");
+    // h3-ii-live (gate 4 famh3-retry-2): a native run whose failed result was
+    // accepted and committed (an answer run whose Pi died mid-turn) can have no
+    // hold naming it: the wake queue's native terminal hold is not written for
+    // it. That committed failure is immutable history, the same source the loop
+    // below admits (committedFailure). Admit it as that native source, so every
+    // stop proof below still applies and this Retry's workspace decision and
+    // fresh-thread record are taken here, before native selection.
+    const [committedFailure] = source?.runtimeMode === "native" && source.status === "failed" && source.finishedAt
+      && coordinator?.phase === "committed" && coordinator.resultId && !coordinator.leaseOwner
+      ? await db.select({ id: nativeRunResults.id }).from(nativeRunResults).where(and(
+          eq(nativeRunResults.companyId, companyId), eq(nativeRunResults.issueId, issueId),
+          eq(nativeRunResults.runId, source.id), eq(nativeRunResults.id, coordinator.resultId),
+          eq(nativeRunResults.schemaStatus, "accepted"),
+          sql`${nativeRunResults.resultJson}->'terminal'->>'runTerminalState' = 'failed'`,
+        )).limit(1)
+      : [];
     if (!source || (source.nativeIssueId ?? source.issueId ?? source.contextSnapshot?.issueId) !== issueId
-      || adapterExecutionControls.has(source.id) ||
-      !(await isFailedNativePreparation(db, source, coordinator) || await isPreDispatchExecutionWaitVerified(db, source))) return refused("previous_execution_unverified", PREVIOUS_EXECUTION_UNVERIFIED);
-    sourceChecks.push({ cause: "legacy_execution_requires_reconciliation", evidence: { runId: source.id } });
+      || adapterExecutionControls.has(source.id) || !(committedFailure ||
+      await isFailedNativePreparation(db, source, coordinator) || await isPreDispatchExecutionWaitVerified(db, source))) return refused("previous_execution_unverified", PREVIOUS_EXECUTION_UNVERIFIED);
+    sourceChecks.push({ cause: committedFailure ? "native_continuation_requires_reconciliation" : "legacy_execution_requires_reconciliation",
+      evidence: { runId: source.id } });
   }
   if (!sourceChecks.length && !nativeQueuedSend) return null;
   if (blocker && blocker.recoveryActionId === null) return null;
