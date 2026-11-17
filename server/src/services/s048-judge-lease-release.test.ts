@@ -51,7 +51,7 @@ const support = await getEmbeddedPostgresTestSupport();
     // Own runner-exit marker, active before release. The finalization owner is the remaining cleanup gate.
     const environmentId = randomUUID();
     await db.insert(environments).values({ id: environmentId, name: `judge retained-release ${environmentId}`, driver: "sandbox", status: "active", config: {} });
-    await db.insert(environmentLeases).values({ id: leaseId, environmentId, companyId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId,
+    await db.insert(environmentLeases).values({ id: leaseId, environmentId, companyId, issueId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId,
       status: "active", leasePolicy: "reuse_by_environment", metadata: {
         driver: "sandbox", [HANDED_OFF_WARM_EXIT_KEY]: { runId: sourceRunId, provenAt: new Date().toISOString() },
       } });

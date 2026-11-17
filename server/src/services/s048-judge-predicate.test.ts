@@ -32,7 +32,7 @@ const support = await getEmbeddedPostgresTestSupport();
       status: "cancelled", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId },
       runnerProfileJson: { nativeResourceDisposition: "keep_running" } });
     const metadata = marker === "none" ? {} : { [HANDED_OFF_WARM_EXIT_KEY]: { runId: marker === "own" ? runId : randomUUID(), provenAt: new Date().toISOString() } };
-    await db.insert(environmentLeases).values({ companyId, heartbeatRunId: runId, provider: "daytona",
+    await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: runId, provider: "daytona",
       providerLeaseId: `bx_${randomUUID().slice(0, 8)}`, status: "active", leasePolicy: "reuse_by_execution_workspace",
       ...lease, metadata: { ...metadata, ...(lease.metadata ?? {}) } });
     return { companyId, runId };
