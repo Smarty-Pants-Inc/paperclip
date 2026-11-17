@@ -236,6 +236,39 @@ describe.each(["legacy", "native"] as const)("historical %s system status", (run
     ]);
   };
 
+  it.each([
+    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "viewer" }, label: "Stopped by you", detail: "You stopped this run before it finished." },
+    { resultJson: { interruptedByActorType: "user", interruptedByActorId: "viewer", operatorInterrupted: true }, label: "Interrupted by you", detail: "You interrupted this run." },
+    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "other" }, label: "Stopped by Alex", detail: "Alex stopped this run before it finished." },
+    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "unknown" }, label: "Stopped by a board member", detail: "A board member stopped this run before it finished." },
+    { resultJson: { cancelledByActorType: "system", cancelledByUserId: "viewer" }, label: runtimeMode === "native" ? "Run cancelled" : "Stopped", detail: runtimeMode === "native" ? "The run was cancelled." : "Execution was stopped." },
+    { resultJson: { cancelledByActorType: "agent", cancelledByUserId: "viewer" }, label: runtimeMode === "native" ? "Run cancelled" : "Stopped", detail: runtimeMode === "native" ? "The run was cancelled." : "Execution was stopped." },
+  ])("attributes the latest stop without guessing the actor ($label)", ({ resultJson, label, detail }) => {
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} issueStatus="in_progress"
+      currentUserId="viewer" userLabelMap={new Map([["other", "Alex"]])}
+      linkedRuns={[{ ...run("stop", "cancelled", 0), resultJson }]} />);
+    expect(container.textContent).toContain(label);
+    const disclosure = Array.from(container.querySelectorAll("button")).find(button => button.textContent?.includes(label));
+    if (disclosure) flushSync(() => disclosure.click());
+    expect(container.textContent).toContain(detail);
+  });
+
+  it("keeps a person's stop attribution alongside output already returned by the run", () => {
+    setTranscript("stop");
+    render(<TaskChatThread comments={[comment("response", "Saved the useful response.", "stop")]}
+      onAdd={async () => {}} issueStatus="in_progress" currentUserId="viewer"
+      linkedRuns={[{ ...run("stop", "cancelled", 0), resultJson: { cancelledByActorType: "user", cancelledByUserId: "viewer" } }]} />);
+    expect(container.textContent).toContain("Saved the useful response.");
+    expect(container.textContent).toContain("Stopped by you");
+  });
+
+  it("keeps a person's stop visible when the interruption presentation is resolved", () => {
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} issueStatus="in_progress" currentUserId="viewer"
+      interruption={{ state: "resolved", responsibility: "system", canRetry: false, userAction: null } as ComponentProps<typeof TaskChatThread>["interruption"]}
+      linkedRuns={[{ ...run("stop", "cancelled", 0), resultJson: { cancelledByActorType: "user", cancelledByUserId: "viewer" } }]} />);
+    expect(container.textContent).toContain("Stopped by you");
+  });
+
   it.each([true, false].flatMap(streamlined => ["done", "cancelled"].map(issueStatus => ({ streamlined, issueStatus }))))("removes failures, stops, waits and stored notices on $issueStatus tasks (streamlined=$streamlined)", ({ streamlined, issueStatus }) => {
     streamlinedState.enabled = streamlined;
     setTranscript("failed");
