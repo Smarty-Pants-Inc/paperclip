@@ -40,6 +40,8 @@ import { canResumePreservedResultFinalization } from "./preserved-result-finaliz
 import { isServerReplacementInterruption } from "./server-replacement-interruption.js";
 import { normalizeAgentNameKey } from "./agent-name-key.js";
 import { liftInterruptionBlock } from "./interruption-block-release.js";
+import { readRetryStopGate, retireUnprovenStopRetry, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON,
+  RETRY_STOP_WAIT_MESSAGE, RETRY_STOP_WAIT_REASON } from "./task-retry-stop-gate.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "agentId" | "status" | "startedAt" | "finishedAt" | "createdAt" |
@@ -289,6 +291,19 @@ export async function admitExplicitNativeContinuation(input: {
     : response?.comment.createdAt ?? comment?.createdAt ?? retryWake?.requestedAt ?? new Date();
   if (!input.dryRun) await preserveTaskRemoteWorkspaceWriter(db, companyId, issueId);
   blocker = await getExecutionBlocker(db, companyId, issueId);
+  // A Retry never dispatches past an unproven Stop: without a hold the
+  // refusals below are swallowed (refused() above) and the Retry would start
+  // ungated into the old conversation. It waits visibly, bounded.
+  if (taskRetry) {
+    const gate = await readRetryStopGate(db, { companyId, issueId, sourceRunId: taskRetry.sourceRunId,
+      requestedAt: retryWake?.requestedAt ?? null });
+    if (gate && (gate.cause !== "source_settling" || !blocker)) {
+      if (gate.state === "waiting") return blocked(RETRY_STOP_WAIT_REASON, RETRY_STOP_WAIT_MESSAGE);
+      if (!input.dryRun) await retireUnprovenStopRetry(db, { companyId, issueId, requestId: input.taskRetryRequestId!,
+        agentId, sourceRunId: taskRetry.sourceRunId });
+      return blocked(RETRY_STOP_UNPROVEN_REASON, RETRY_STOP_UNPROVEN_MESSAGE);
+    }
+  }
   const [boundary] = await db.select({ createdAt: issueComments.createdAt }).from(issues).innerJoin(issueComments, and(
     eq(issueComments.companyId, issues.companyId), eq(issueComments.issueId, issues.id),
     eq(issueComments.id, issues.conversationBoundaryCommentId),

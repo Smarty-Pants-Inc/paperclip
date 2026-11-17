@@ -3,6 +3,7 @@ import { agentWakeupRequests, heartbeatRuns, type Db } from "@paperclipai/db";
 
 const REFUSALS_A_CLICK_CANNOT_CHANGE: ReadonlySet<string> = new Set([
   "cancelled_by_operator", "retry_source_changed", "workspace_owner_stop_required", "previous_execution_unverified",
+  "execution_stop_unproven",
 ]);
 
 export function heldRetryOffersRetry(reason: string | null | undefined, cleanupSettling = false): boolean {
