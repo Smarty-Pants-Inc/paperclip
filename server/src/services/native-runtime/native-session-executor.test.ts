@@ -12749,6 +12749,152 @@ describe("native warm session supervision", () => {
     }, 60_000);
   });
 
+  // release-order (live 116e7f2f, 2026-11-17 17:02:56Z): a /new on a Boat
+  // remote pi_rpc warm chat retired the old owner 141e0676 on the same box
+  // bx_5xs37eag. Its close checkpoints the harness out of the box (provider
+  // file sync, Boat download-url). A provider release of that box ran while
+  // the checkpoint was in flight: the Boat plugin's admission fence revoked
+  // the checkpoint's next request locally ("... download-url failed
+  // (unavailable): request_error"), the close failed, and the successor failed.
+  // The release must run after the close finished ("run your own cleanup
+  // first, then stop"); a box with no owner closing releases at once.
+  describe("release-order 116e7f2f: a sandbox release waits for its warm owner's close", () => {
+    let proofDb: Db;
+    let cleanup: (() => Promise<void>) | undefined;
+    beforeAll(async () => {
+      const { startRecoveryPostgres } = await import("../../__tests__/helpers/recovery-postgres.js");
+      const { createDb } = await import("@paperclipai/db");
+      const database = await startRecoveryPostgres("release-order-");
+      cleanup = database.cleanup;
+      proofDb = createDb(database.connectionString);
+    }, 180_000);
+    afterAll(async () => { await proofDb?.$client.end(); await cleanup?.(); });
+
+    async function seed() {
+      const { companies, agents, environments, plugins } = await import("@paperclipai/db");
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
+      const environmentId = randomUUID(), pluginId = randomUUID(), workspaceId = randomUUID(), sessionId = randomUUID();
+      const providerLeaseId = `bx_5xs37eag-${randomUUID().slice(0, 8)}`;
+      await proofDb.insert(companies).values({ id: companyId, name: "Release order", issuePrefix: `R${companyId.slice(0, 7).toUpperCase()}` });
+      await proofDb.insert(agents).values({ id: agentId, companyId, name: "Boat chat", adapterType: "paperclip_runner" });
+      await proofDb.insert(issues).values({ id: issueId, companyId, title: "Boat chat", status: "in_progress" });
+      await proofDb.insert(executionWorkspaces).values({ id: workspaceId, companyId, sourceIssueId: issueId,
+        mode: "shared_workspace", strategyType: "project_primary", name: "Conversation workspace" });
+      await proofDb.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox", config: { provider: "boat" } });
+      await proofDb.insert(plugins).values({ id: pluginId, pluginKey: pluginId, packageName: "boat-fixture", version: "1", status: "ready",
+        manifestJson: { capabilities: ["environment.drivers.register"], environmentDrivers: [{ driverKey: "boat", kind: "sandbox_provider",
+          sandboxCapabilities: { reusableLeases: true } }] } as never });
+      await proofDb.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, status: "succeeded", runtimeMode: "native",
+        nativeSessionId: sessionId, finishedAt: new Date(Date.now() - 10_000) });
+      const [lease] = await proofDb.insert(environmentLeases).values({ companyId, environmentId, executionWorkspaceId: workspaceId,
+        issueId, heartbeatRunId: runId, provider: "boat", providerLeaseId, status: "active", leasePolicy: "ephemeral",
+        metadata: { pluginId, provider: "boat", sandboxProviderPlugin: true, driver: "sandbox" } }).returning();
+      // The Boat plugin's admission fence (lease-gates.ts): a release, stop or
+      // destroy of the box revokes every in-flight request of that box.
+      const order: string[] = [];
+      let revoked = false;
+      const call = vi.fn(async (_id: string, method: string, params: { providerLeaseId?: string }) => {
+        order.push(`provider:${method}`);
+        revoked = true;
+        return { providerLeaseId: params.providerLeaseId, state: "stopped" };
+      });
+      const workers = { isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentReleaseLease", "environmentStopLease",
+        "environmentDestroyLease", "environmentResumeLease"] }) } as unknown as import("../plugin-worker-manager.js").PluginWorkerManager;
+      const { environmentRuntimeService } = await import("../environment-runtime.js");
+      const runtime = environmentRuntimeService(proofDb, { pluginWorkerManager: workers });
+      return { companyId, agentId, issueId, runId, environmentId, workspaceId, sessionId, providerLeaseId, lease: lease!,
+        order, call, runtime, revoked: () => revoked };
+    }
+
+    it.each([
+      // RED on the base image: the provider release revoked the in-flight
+      // checkpoint and the /new successor failed.
+      { name: "owner closing", ownerClosing: true },
+      // Negative: no warm owner on the box, the release runs at once as today.
+      { name: "no owner closing", ownerClosing: false },
+    ])("orders the box release after the warm owner's close ($name)", async ({ ownerClosing }) => {
+      const f = await seed();
+      if (!ownerClosing) {
+        const started = Date.now();
+        await f.runtime.releaseRunLeases(f.runId, "released");
+        expect(f.order).toEqual(["provider:environmentReleaseLease"]);
+        expect(Date.now() - started).toBeLessThan(5_000);
+        return;
+      }
+      // Live shape: a Boat remote pi_rpc warm chat with an agent_files copy.
+      const warmExecution = { ...execution,
+        binding: { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, runId: f.runId, executionWorkspaceId: f.workspaceId },
+        provider: { kind: "pi_rpc", model: "paperclip/selected-model-exactly", profile: QUALIFIED_PI_RPC_PROFILE },
+        session: { ...execution.session, driverKind: "pi_rpc", normalizedSessionId: f.sessionId,
+          lifecyclePolicy: { mode: "warm", idleTimeoutMs: 8 * 60 * 60_000 } } } as unknown as NativeExecutionInputV1;
+      const copy = (ownerRunId: string) => ({ runId: ownerRunId, root: join(tmpdir(), `release-order-${f.sessionId}`), preparationKey: "unchanged",
+        hasChanges: async () => false, collectStopped: async () => undefined });
+      const target = (outcome: "created" | "resumed") => ({ kind: "remote" as const, transport: "sandbox" as const,
+        providerKey: "boat", environmentId: f.environmentId, leaseId: f.lease.id, remoteCwd: warmExecution.workspace.cwd!,
+        sandboxLeaseAcquisition: { outcome, providerLeaseId: f.providerLeaseId } });
+      const executorDb = (input: NativeExecutionInput) => {
+        const db = leaseDb(input), select = db.select.bind(db);
+        db.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => table === environmentLeases
+          ? proofDb.select(fields as never).from(environmentLeases) : select(fields as never).from(table as never) })) as unknown as Db["select"];
+        return db;
+      };
+      // The old owner's close: transport close -> checkpoint -> provider file
+      // sync out of the box. The fence fails its next request once revoked.
+      let checkpointStarted!: () => void, finishCheckpoint!: () => void;
+      const started = new Promise<void>(resolve => { checkpointStarted = resolve; });
+      const checkpoint = new Promise<void>(resolve => { finishCheckpoint = resolve; });
+      const close = vi.fn(async (): Promise<void> => {
+        checkpointStarted();
+        await checkpoint;
+        if (f.revoked()) {
+          f.order.push("checkpoint:revoked");
+          throw new Error(`Boat POST /sandboxes/${f.providerLeaseId}/files/download-url failed (unavailable): request_error`);
+        }
+        f.order.push("checkpoint:done");
+      });
+      onTestFinished(async () => {
+        close.mockResolvedValue(undefined);
+        await closeWarmNativeSessionsForEnvironment({ environmentId: f.environmentId, reason: "test cleanup" });
+      });
+      const answer = (runId: string, normalizedSessionId: string, summary: string) => ({ result: { summary },
+        terminal: { runTerminalState: "succeeded" }, turnId: runId, normalizedSessionId, providerSessionId: normalizedSessionId,
+        driverKind: "pi_rpc", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null });
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        await options.onSession?.({ close });
+        return answer(f.runId, f.sessionId, "Earlier answer.");
+      });
+      // Entry: executePaperclipNativeSession (the old owner's warm turn).
+      await executePaperclipNativeSession({ db: executorDb(warmExecution), execution: warmExecution, runnerInstanceId: "release-order-runner",
+        runnerExecutionTarget: target("created"), instructionWorkingCopy: copy(f.runId) });
+      // /new: the successor's new session on the same box retires the old owner.
+      const successorRunId = randomUUID(), newSessionId = randomUUID();
+      await proofDb.insert(heartbeatRuns).values({ id: successorRunId, companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, status: "running" });
+      const next = { ...warmExecution, binding: { ...warmExecution.binding, runId: successorRunId },
+        session: { ...warmExecution.session, normalizedSessionId: newSessionId } } as NativeExecutionInputV1;
+      state.execute.mockImplementationOnce(async () => answer(successorRunId, newSessionId, "It answers after /new."));
+      const successor = executePaperclipNativeSession({ db: executorDb(next), execution: next, runnerInstanceId: "release-order-runner",
+        runnerExecutionTarget: target("resumed"), instructionWorkingCopy: copy(successorRunId) }).then(value => value, error => error as Error);
+      await started;
+      // The old lease's provider release, while the checkpoint is in flight.
+      const errors: unknown[] = [];
+      const releasing = f.runtime.releaseRunLeases(f.runId, "released", (_id, error) => { errors.push(error); });
+      await new Promise(resolve => setTimeout(resolve, 300));
+      finishCheckpoint();
+      await releasing;
+      const outcome = await successor;
+      // One view of the ordering and of the /new successor's first run.
+      expect({ order: f.order, successor: outcome instanceof Error
+        ? { failed: (outcome as Error & { code?: string }).code ?? outcome.message, cause: String((outcome as Error).cause ?? "") }
+        : { summary: (outcome as { summary?: string }).summary } })
+        .toEqual({ order: ["checkpoint:done", "provider:environmentReleaseLease"], successor: { summary: "It answers after /new." } });
+      expect(errors).toEqual([]);
+      expect(close).toHaveBeenCalledOnce();
+      expect(outcome).not.toBeInstanceOf(Error);
+      expect(outcome).toMatchObject({ exitCode: 0, summary: "It answers after /new." });
+      expect(state.execute).toHaveBeenCalledTimes(2);
+    }, 60_000);
+  });
+
   // Staging: instruction preparation retires the previous
   // run's warm owner before runtime selection. Its close failed, and the run
   // failed with no provider work and no way back.
