@@ -48,6 +48,21 @@ import { requestTaskRetry, reconcileTaskChatRetryReceipts } from "../services/ta
 import * as taskRetryModule from "../services/task-retry.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import { AGENT_PAUSED_ACTION, AGENT_PAUSED_RETRY_MESSAGE, HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
+import { RECOVERING_SAVED_WORK_NEXT_ACTION, WORKSPACE_RESTORE_PENDING_KEY } from "../services/legacy-execution-recovery.js";
+import { LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../services/workspace-restore-recovery-state.js";
+import { noticeHeldUnfinishedPredecessor } from "../services/native-runtime/native-session-executor.js";
+// retry-fold6: paperclip-lead's restore hold, as recordRequiredWorkspaceRestoreFailure
+// (legacy-execution-recovery.ts) writes it while the saved files are only owed.
+async function insertPendingRestoreHold(db: import("@paperclipai/db").Db, input: { companyId: string; issueId: string; runId: string }) {
+  const evidence = { runId: input.runId, workspaceRestoreFailure: "restore_pending",
+    workspaceRestoreRecovery: { schema: LEGACY_WORKSPACE_RECOVERY_SCHEMA, state: "pending" }, [WORKSPACE_RESTORE_PENDING_KEY]: true,
+    continuationDelivery: "invalidated", automaticRecovery: { policy: "preserve_without_replay_v1", runId: input.runId,
+      replay: "blocked", actionOutcome: "unknown", recordedAt: new Date().toISOString() } };
+  await db.insert(issueRecoveryActions).values({ companyId: input.companyId, sourceIssueId: input.issueId,
+    kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation",
+    fingerprint: `native-workspace:${input.runId}`, attemptCount: 1, status: "resolved", outcome: "blocked", ownerType: "board",
+    evidence, resolvedAt: new Date(), nextAction: RECOVERING_SAVED_WORK_NEXT_ACTION });
+}
 import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.js";
 import { createSystemRecovery } from "../services/system-recovery-state.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
@@ -65419,6 +65434,31 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       }
     });
 
+    // retry-fold6 (rf-3 M9): processFailedChatRunRetry's NORMAL prepared path
+    // reads the one Retry authority before it asks for a wake. A restore hold
+    // whose files are only owed is refused there (the card offers no Retry);
+    // removing the authority checks (failed-run-retry.ts assertChatRetryAuthority
+    // before the wake and inside its admission) lets the wake start.
+    it("retry-fold6: a prepared chat Retry under a pending restore hold is refused by the one authority before any wake, with the hold's words", async () => {
+      const context = await fixture(true);
+      try {
+        await context.resolve().expect(200);
+        const [retry] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, context.endpoint.id),
+          eq(chatActions.kind, "failed_run_retry")));
+        expect(retry).toMatchObject({ status: "issued" });
+        expect(retry!.payload.sourceAuthorizationPending).not.toBe(true);
+        await insertPendingRestoreHold(db, { companyId: context.fixture.companyId, issueId: context.issue.id, runId: context.runId });
+        await context.service.processFailedChatRunRetry(retry!.id).catch(() => undefined);
+        expect(context.wakeup).not.toHaveBeenCalled();
+        expect(await readAgentWakeupRequestsById(retry!.id)).toEqual([]);
+        const [settled] = await db.select().from(chatActions).where(eq(chatActions.id, retry!.id));
+        expect(settled?.result).toMatchObject({ code: "failed_chat_retry_not_authorized",
+          message: RECOVERING_SAVED_WORK_NEXT_ACTION, nextAction: RECOVERING_SAVED_WORK_NEXT_ACTION });
+      } finally {
+        await context.cleanup();
+      }
+    });
+
     it.each([
       "revoked_principal",
       "closed_conversation",
@@ -66415,6 +66455,113 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(card).toMatchObject({ canRetry: true, notice: { code: "native_prior_owner_held", text: HELD_PREDECESSOR_NOTICE } });
     expect(card?.notice?.text).toContain("Press Retry");
     expect(card?.notice?.text).not.toMatch(/send a new message|new task|cannot continue/i);
+  });
+
+  // retry-fold6: the Paul-shaped chat (Boat remote, agent_files, pi_rpc) behind
+  // the production Retry route, POST /api/issues/:id/retry (routes/issues.ts:10429
+  // -> task-retry.ts requestTaskRetry), and the card route GET /api/issues/:id.
+  async function boatRetryRouteFixture() {
+    const f = await currentGitHubTaskRetryFixture();
+    const companyId = f.fixture.companyId, issueId = f.issue.id;
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", instructionsBundleMode: "managed" } })
+      .where(eq(agents.id, f.fixture.assignedAgentId));
+    await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: f.runId, provider: "boat",
+      providerLeaseId: randomUUID(), status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      leasePolicy: "reuse_by_environment", metadata: {} });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { req.actor = boardActor(companyId); next(); });
+    app.use("/api", issueRoutes(db, createStorageService().storage, { chatRunRetries: f.service }));
+    app.use(errorHandler);
+    f.wakeup.mockClear();
+    const counts = async () => ({
+      wakes: (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "task_retry")))).length,
+      chatRetries: (await db.select().from(chatActions).where(and(eq(chatActions.companyId, companyId),
+        eq(chatActions.kind, "failed_run_retry")))).length });
+    const card = async () => (await taskInterruptionPresentation(db, (await readIssuesById(issueId))[0])) ?? null;
+    return { ...f, app, companyId, issueId, counts, card };
+  }
+
+  it("retry-fold6 (rf-3 FAIL 1): a Boat-remote, agent_files, pi_rpc chat under a pending restore hold: the Retry route refuses with the hold's one instruction, as the card does, and saves nothing", async () => {
+    const f = await boatRetryRouteFixture();
+    await insertPendingRestoreHold(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId });
+    const before = await f.counts();
+    // Production entry point first: POST /api/issues/:id/retry (routes/issues.ts:10429).
+    const response = await request(f.app).post(`/api/issues/${f.issueId}/retry`)
+      .send({ observedRunId: f.runId, idempotencyKey: randomUUID() });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body).toMatchObject({ error: RECOVERING_SAVED_WORK_NEXT_ACTION, details: { code: "retry_not_available",
+      reason: "workspace_repair_required", nextAction: RECOVERING_SAVED_WORK_NEXT_ACTION } });
+    expect(f.wakeup).not.toHaveBeenCalled();
+    expect(await f.counts()).toEqual(before);
+    // Same decision as the card: no Retry, the hold's words.
+    expect(await f.card()).toMatchObject({ canRetry: false, retryWait: { message: RECOVERING_SAVED_WORK_NEXT_ACTION } });
+  });
+
+  it("retry-fold6 (rf-3 FAIL 2, finding A): a repeat of a waiting Retry whose Stop has since expired unproven is refused at requestTaskRetry, as the card refuses it", async () => {
+    const f = await boatRetryRouteFixture();
+    // A requested Stop the Runner has not proven yet: Retry waits (deferred).
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(),
+      resultJson: { cancellation: { requestedAt: new Date().toISOString(), source: "user" } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    const body = { observedRunId: f.runId, idempotencyKey: randomUUID() };
+    const first = await request(f.app).post(`/api/issues/${f.issueId}/retry`).send(body);
+    expect(first.status, JSON.stringify(first.body)).toBe(202);
+    expect(first.body).toMatchObject({ accepted: true });
+    // The bound passes with the Stop still unproven.
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 10 * 60_000) }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await f.card()).toMatchObject({ canRetry: false });
+    const before = await f.counts();
+    // Production entry point: the idempotent repeat of the same click.
+    const repeat = await request(f.app).post(`/api/issues/${f.issueId}/retry`).send(body);
+    expect(repeat.status, JSON.stringify(repeat.body)).toBe(409);
+    expect(repeat.body).toMatchObject({ details: { code: "execution_stop_unproven" } });
+    expect(await f.counts()).toEqual(before);
+  });
+
+  it("retry-fold6 (rf-3 FAIL 3): the executor's held note takes its instruction from the authority when posted, and once the agent is paused the card supersedes a standing 'Press Retry' with one note naming Resume", async () => {
+    const f = await boatRetryRouteFixture();
+    const sessionId = randomUUID();
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId));
+    const later = async () => (await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.fixture.assignedAgentId,
+      status: "failed", runtimeMode: "native", nativeIssueId: f.issueId, nativeSessionId: sessionId, finishedAt: new Date(),
+      contextSnapshot: { issueId: f.issueId } }).returning())[0]!;
+    const post = (runId: string) => noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
+      binding: { companyId: f.companyId, agentId: f.fixture.assignedAgentId, issueId: f.issueId, runId },
+      session: { normalizedSessionId: sessionId } } as never }, new Error("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate"));
+    const heldNotes = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'native_prior_owner_held:')`)));
+    // (a) Agent paused when the executor posts: the note's instruction is the authority's (Resume), never "Press Retry".
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.fixture.assignedAgentId));
+    const run = await later();
+    await post(run.id);
+    // Production entry point: the Retry route refuses with Resume.
+    const refused = await request(f.app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: run.id, idempotencyKey: randomUUID() });
+    expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+    expect(refused.body).toMatchObject({ details: { userAction: "resume", nextAction: AGENT_PAUSED_ACTION } });
+    const [pausedNote] = await heldNotes();
+    expect(pausedNote?.body).toContain(AGENT_PAUSED_ACTION);
+    expect(pausedNote?.body).not.toContain("Press Retry");
+    // (b) The agent resumes: a new hold's note is the authority's Retry words (upstream's text, byte-identical).
+    await db.delete(issueComments).where(eq(issueComments.id, pausedNote!.id));
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, f.fixture.assignedAgentId));
+    const run2 = await later();
+    await post(run2.id);
+    const [retryNote] = await heldNotes();
+    expect(retryNote?.body).toBe(HELD_PREDECESSOR_NOTICE);
+    // Then the agent is paused: the card route (GET /api/issues/:id) supersedes
+    // the standing "Press Retry" with one note naming the one instruction.
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.fixture.assignedAgentId));
+    const got = await request(f.app).get(`/api/issues/${f.issueId}`);
+    expect(got.status, JSON.stringify(got.body).slice(0, 500)).toBe(200);
+    const card = got.body.interruption;
+    expect(card).toMatchObject({ canRetry: false, userAction: "resume",
+      notice: { code: "native_prior_owner_held" } });
+    expect(card.notice.text).toContain(AGENT_PAUSED_ACTION);
+    expect(JSON.stringify(card)).not.toContain("Press Retry");
+    expect(card.retryWait).toBeUndefined();
   });
 
   it.each(["settled", "pending_at_intake", "source_edited", "operator_stopped", "unknown_stop", "live_owner", "absent_sandbox"] as const)(
