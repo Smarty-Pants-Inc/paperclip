@@ -234,7 +234,7 @@ import {
   isExternalChatPresentationContext,
   LEGACY_WITHHELD_RUN_COMMENT,
   projectHistoricalHeartbeatRunComment,
-  splitFinalAnswerComments,
+  splitFinalAnswerParts,
 } from "./heartbeat-run-summary.js";
 import {
   DEFAULT_INSERT_CHUNK_ROWS,
@@ -1678,6 +1678,7 @@ function withAgentCommentAuthorizationMetadata(
     version: 1,
     ...(metadata?.chatMessage ? { chatMessage: metadata.chatMessage } : {}),
     ...(metadata?.attachmentPreparation ? { attachmentPreparation: metadata.attachmentPreparation } : {}),
+    ...(metadata?.answerPart ? { answerPart: metadata.answerPart } : {}),
     ...(metadata?.sourceRunId !== undefined
       ? { sourceRunId: metadata.sourceRunId }
       : {}),
@@ -13724,7 +13725,7 @@ export function issueService(db: Db) {
         mirrorToSlack?: boolean;
       },
       dbOrTx: any = db,
-    ): Promise<IssueComment> {
+    ): Promise<IssueComment & { answerPartCommentIds?: string[] }> {
       const pluginOrigin = currentPluginInteractionOrigin();
       if (pluginOrigin) {
         actor = { ...actor, agentId: pluginOrigin.agentId, runId: pluginOrigin.runId ?? undefined, userId: undefined };
@@ -13812,22 +13813,33 @@ export function issueService(db: Db) {
       if (options?.completionReply && actor.agentId && actor.runId) {
         const delivered = await existingChatCompletionReply(dbOrTx, actor.runId, issueId);
         if (delivered) return redactIssueComment(delivered, currentUserRedactionOptions.enabled);
-        const parts = splitFinalAnswerComments(redactedBody);
+        const parts = splitFinalAnswerParts(redactedBody);
         if (parts.length > 1) {
           // This is already the issue-locked posting transaction. Publish ALL
           // parts before acknowledging completion, so a failure rolls back the
           // whole answer and replay cannot mistake its first part for delivery.
+          // H5 round 2: every part records ONE answer id, its k of N and the
+          // exact label and fence wrappers added, so readers rebuild the
+          // whole answer (byte-equal) instead of taking one part for it.
+          const answerId = randomUUID();
           let first: IssueComment | undefined;
-          for (const part of parts) {
-            const comment = await addComment(issueId, part, actor, {
+          const partIds: string[] = [];
+          for (const [index, part] of parts.entries()) {
+            const comment = await addComment(issueId, part.body, actor, {
               ...options, completionReply: false,
+              metadata: { version: 1, ...(options.metadata ?? {}), sections: options.metadata?.sections ?? [],
+                answerPart: { answerId, index: index + 1, count: parts.length,
+                  label: part.label, prefix: part.prefix, suffix: part.suffix } },
               // Attachments/presentation belong to the reply's first comment.
               ...(first ? { attachmentIds: undefined, presentation: null, clientRequestId: undefined } : {}),
             }, dbOrTx);
             first ??= comment;
+            partIds.push(comment.id);
           }
           await acknowledgeChatCompletionReply(dbOrTx, actor.runId, first!.id);
-          return first!;
+          // The first part keeps the single-comment return shape; the ordered
+          // receipt of ALL parts rides along for callers that need them.
+          return { ...first!, answerPartCommentIds: partIds };
         }
       }
       const authorType = issueCommentAuthorTypeSchema.parse(
