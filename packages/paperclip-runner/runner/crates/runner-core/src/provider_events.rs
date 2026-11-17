@@ -1673,6 +1673,43 @@ pub(crate) fn normalize_pi_notification_in(
     params: &Value,
     cwd: Option<&str>,
 ) -> Vec<NormalizedProviderEvent> {
+    // Pi pages streamed answer/reasoning text to its record budget upstream.
+    // These are live text, not diagnostic previews: bypass bounded_text, while
+    // retaining redaction and the durable outbox's unchanged frame guard.
+    let streamed = match method {
+        "item/agentMessage/delta" => Some(("agentMessage", "progress", params.get("delta"))),
+        "item/reasoning/summaryTextDelta" => Some(("reasoning", "summary", params.get("delta"))),
+        // Pi's facade forwards reasoning item.delta as item/delta (not the
+        // Codex summary notification). Do not drop this real wire shape.
+        "item/delta" => match string(params.get("kind").or_else(|| item(params).get("type"))) {
+            "agentMessage" => Some((
+                "agentMessage",
+                "progress",
+                params.get("text").or_else(|| item(params).get("text")),
+            )),
+            "reasoning" => Some((
+                "reasoning",
+                "summary",
+                params.get("text").or_else(|| item(params).get("text")),
+            )),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((kind, channel, text)) = streamed {
+        return vec![NormalizedProviderEvent {
+            event_type: "item.delta".to_owned(),
+            priority: EventPriority::P2,
+            payload: json!({
+                "provider": "pi_rpc",
+                "itemId": stable_id(string(params.get("itemId").or_else(|| item(params).get("id"))), "pi-item"),
+                "kind": kind,
+                "channel": channel,
+                "providerMethod": method,
+                "text": redact_sensitive_text_values(string(text)),
+            }),
+        }];
+    }
     // item/failed is a Pi compatibility notification, not a Codex terminal.
     // Preserve it as an item failure; only Pi's turn terminal settles the run.
     if method == "item/failed" {
@@ -2631,6 +2668,36 @@ fn has_rfc_uri_scheme_prefix(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep reason: Paul NOTE 5's real Pi facade -> PRP boundary must not
+    // turn a live answer into a preview (or drop a reasoning delta).
+    #[test]
+    fn dl_n5_delta_agent_message_normalizes_whole() {
+        assert_pi_delta_normalizes_whole("item/agentMessage/delta", "agentMessage");
+    }
+
+    #[test]
+    fn dl_n5_delta_reasoning_normalizes_whole() {
+        assert_pi_delta_normalizes_whole("item/delta", "reasoning");
+        assert_pi_delta_normalizes_whole("item/reasoning/summaryTextDelta", "reasoning");
+    }
+
+    fn assert_pi_delta_normalizes_whole(method: &str, kind: &str) {
+        let text = "x".repeat(6_000);
+        let events = normalize_pi_notification_in(
+            method,
+            &json!({"threadId": "native", "turnId": "turn", "itemId": "stream",
+                "kind": kind, "text": text, "delta": text,
+                "item": {"id": "stream", "type": kind, "text": text}}),
+            None,
+        );
+        assert_eq!(events.len(), 1, "{method} must reach the outbox");
+        assert_eq!(events[0].event_type, "item.delta");
+        assert_eq!(events[0].payload["kind"], kind);
+        assert_eq!(events[0].payload["text"].as_str().unwrap().len(), 6_000);
+        assert_eq!(events[0].payload["text"], text);
+        assert!(!events[0].payload.to_string().contains("…[truncated]"));
+    }
 
     // Keep reason: L17's JSON-RPC -> canonical PRP boundary dropped item/failed
     // after the Pi proxy had already forwarded it. Never turn it into settlement.
