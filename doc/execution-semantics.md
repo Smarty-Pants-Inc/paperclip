@@ -1406,8 +1406,20 @@ A bound Pi provider terminal refusal is `provider_policy_refusal`, a permanent
 failure, not a capacity error or an interrupted session. The Pi driver preserves
 Anthropic's `rawStopReason: "refusal"` as that code even when the provider's
 explanation does not mention policy. Older pinned packs forward
-`pi_provider_error` with Pi's default refusal message or an explicit usage-policy
-rejection; the server classifies those at the same committed-event boundary.
+`pi_provider_error` with Pi's default refusal message or an explicit policy or
+Terms of Service rejection; the server classifies those at the same
+committed-event boundary. This includes output-side refusals after streamed
+reasoning, not just refusals before output. Where forwarded, native
+`rawStopReason`/`stop_reason: "refusal"`, `stop_details.type: "refusal"`, or a
+known `stop_details.category` (including `reasoning_extraction`) identifies the
+refusal without depending on its explanation. The pinned Pi driver forwards
+only the error text; this server repair does not change runner/PACK bytes.
+
+Anthropic documents the [refusal shape and categories](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback#refusal-response)
+and [stop reasons](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons).
+Explanation text is not stable; the text fallback exists for pinned packs that
+lose native details. Anthropic offers optional model fallback for some categories;
+Paperclip does not opt into automatic resubmission after a refusal.
 Assistant prose, tool output and events from another run, source or turn cannot
 authorize this classification. Finalization after restart re-derives it from the
 hash-checked persisted runner event, not a display diagnostic.

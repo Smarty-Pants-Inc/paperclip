@@ -36,6 +36,27 @@ describe("native provider failure observation", () => {
     expect(observed.forTerminal("turn", { ...terminal, turnTerminalState: "cancelled" })).toBeNull();
   });
   it.each([
+    // Exact live provider texts from Gate 2 N23c and run 021eddf2.
+    { message: "This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy…" },
+    { message: "blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs" },
+    { message: "The request was declined.", rawStopReason: "refusal" },
+    { rawStopReason: "refusal" },
+    { stop_details: { type: "refusal", category: null } },
+    { stop_details: { category: "reasoning_extraction" } },
+    { message: "This request was blocked under the commercial terms." },
+    { message: "Your request was refused under our terms of use." },
+    { message: "The request was declined.", stop_reason: "refusal" },
+    { message: "The request was declined.", stop_details: { type: "refusal", category: "reasoning_extraction" } },
+    ...["cyber", "bio", "frontier_llm", "reasoning_extraction", "general_harms"].map(category => ({
+      message: "The request was declined.", stop_details: { category },
+    })),
+    { message: "The request was declined.", stopDetails: { type: "refusal", category: null } },
+  ])("classifies live text or native refusal details without resending: %j", error => {
+    const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
+    observed.observe({ ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", ...error } } });
+    expect(observed.forTerminal("turn", terminal)?.errorCode).toBe("provider_policy_refusal");
+  });
+  it.each([
     { ...policyEvent, sourceKind: "control_plane" as const },
     { ...policyEvent, eventType: "item.failed" as const },
     { ...policyEvent, eventType: "harness.diagnostic" as const },
@@ -45,6 +66,10 @@ describe("native provider failure observation", () => {
     { ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", message: "400 invalid_request_error: blocked tool schema; field content_policy is unknown" } } },
     { ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", message: "400 invalid_request_error: usage policy parameter is missing" } } },
     { ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", message: "529 overloaded_error: Overloaded" } } },
+    { ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", message: "Connection refused" } } },
+    { ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", message: "Here is an ordinary answer mentioning usage policy." } } },
+    { ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", message: "Unavailable", stop_details: { category: "unknown" } } } },
+    { ...policyEvent, eventType: "item.completed" as const, payload: { status: "completed", text: "Your request was blocked by usage policy." } },
   ])("does not mistake non-refusal evidence for policy refusal %#", candidate => {
     const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
     observed.observe(candidate);

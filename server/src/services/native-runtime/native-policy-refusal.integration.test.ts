@@ -40,7 +40,7 @@ describe("Pi policy refusal: persistence, retry, unanswered message and Stop int
   }, 60_000);
   afterAll(async () => { await db?.$client.end(); await temporary?.cleanup(); });
 
-  async function failTurn(message: string, code = "pi_provider_error") {
+  async function failTurn(message: string, code = "pi_provider_error", details: Record<string, unknown> = {}) {
     const issueId = randomUUID(), runId = randomUUID(), userId = `fixture-user-${randomUUID()}`;
     const before = new Date(Date.now() - 900_000);
     const [issue] = await db.insert(issues).values({ id: issueId, companyId, title: "A harmless chat message", status: "in_progress", workMode: "standard", assigneeAgentId: agentId,
@@ -68,16 +68,21 @@ describe("Pi policy refusal: persistence, retry, unanswered message and Stop int
     // the event to pi_rpc. Authority still comes from pinned execution identity.
     const event: PrpEvent = {
       schema: "paperclip.prp.event.v1", runId, normalizedSessionId: native.normalizedSessionId, turnId: native.turnId,
-      sourceInstanceId: native.runnerInstanceId, sourceEventId: "pi-terminal", sourceSeq: 1, sourceKind: "runner", eventType: "turn.failed", schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(),
-      payload: { provider: "pi_rpc", providerTurnId: "fixture-pi-turn", status: "failed", error: { code, message } },
+      sourceInstanceId: native.runnerInstanceId, sourceEventId: "pi-terminal", sourceSeq: 2, sourceKind: "runner", eventType: "turn.failed", schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(),
+      payload: { provider: "pi_rpc", providerTurnId: "fixture-pi-turn", status: "failed", error: { code, message, ...details } },
     };
     const terminal: PrpTerminalState = { schema: "paperclip.prp.terminal.v1", turnTerminalState: "failed", runTerminalState: "failed", reportedWorkDisposition: "needs_review" };
     const result = { ...CONTROL_PLANE_CONFORMANCE_RESULT, reportedWorkDisposition: "needs_review" as const, completionClaim: { ...CONTROL_PLANE_CONFORMANCE_RESULT.completionClaim, contractRevision: completionInput.revision } };
     provider.execute.mockReset().mockImplementation(async (options: { controlPlane: ControlPlanePort }) => {
       await options.controlPlane.openRun({ identity: { companyId, issueId, runId, agentId, sessionId: native.normalizedSessionId }, backendKind: "mock", sourceInstanceId: native.runnerInstanceId });
+      // OUTPUT-side refusals can follow reasoning. Partial reasoning is not an
+      // answer and must not suppress the truthful refusal note or permit retry.
+      await options.controlPlane.appendEvent({ ...event, sourceEventId: "pi-reasoning", sourceSeq: 1,
+        eventType: "item.completed", itemId: "pi-thought", emittedAt: new Date(Date.now() - 97_000).toISOString(),
+        payload: { provider: "pi_rpc", kind: "reasoning", text: "Partial reasoning, not a final answer." } });
       await options.controlPlane.appendEvent(event);
       await options.controlPlane.completeRun({ result, terminal, turnId: native.turnId });
-      return { result, terminal, turnId: native.turnId, normalizedSessionId: native.normalizedSessionId, providerSessionId: "fixture-provider-session", driverKind: execution.session.driverKind, driverVersion: "fixture", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+      return { result, terminal, turnId: native.turnId, normalizedSessionId: native.normalizedSessionId, providerSessionId: "fixture-provider-session", driverKind: execution.session.driverKind, driverVersion: "fixture", nativeEventCount: 2, highestContiguousSourceSeq: 2, usage: null };
     });
     const adapter = await executePaperclipNativeSession({ db, execution, runnerInstanceId: native.runnerInstanceId,
       backend: { descriptor: async () => { throw new Error("No provider call"); }, openSession: async () => { throw new Error("No provider call"); } } });
@@ -97,12 +102,16 @@ describe("Pi policy refusal: persistence, retry, unanswered message and Stop int
   }
 
   it.each([
-    [usagePolicyError, "pi_provider_error"],
-    ["The model refused to complete the request", "pi_provider_error"],
-    ["This request would violate our usage policy.", "pi_provider_error"],
-    ["The request was declined.", "provider_policy_refusal"],
-  ])("one true note and no retry for %s", async (message, code) => {
-    const f = await failTurn(message, code);
+    [usagePolicyError, "pi_provider_error", {}],
+    // Exact live texts: N23c already classified; 021eddf2 must not spawn 77f318d4.
+    ["This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy…", "pi_provider_error", {}],
+    ["blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs", "pi_provider_error", {}],
+    ["The request was declined.", "pi_provider_error", { stop_details: { category: "reasoning_extraction" } }],
+    ["The model refused to complete the request", "pi_provider_error", {}],
+    ["This request would violate our usage policy.", "pi_provider_error", {}],
+    ["The request was declined.", "provider_policy_refusal", {}],
+  ])("one true note and no retry for %s", async (message, code, details) => {
+    const f = await failTurn(message, code, details);
     const at = Date.now();
     for (const offset of [0, 180_000, 360_000]) await settleUnansweredPersonMessage(db, { companyId, issueId: f.issueId, now: new Date(at + offset) });
     for (let pass = 0; pass < 2; pass++) await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
@@ -119,6 +128,8 @@ describe("Pi policy refusal: persistence, retry, unanswered message and Stop int
     expect.soft(eligibility[0]?.eligible).toBe(false);
     expect.soft((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)))
       .filter(w => w.payload?.issueId === f.issueId)).toHaveLength(0);
+    expect.soft(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, f.issueId)))
+      .toEqual([{ id: f.runId }]);
     expect.soft(classifyContinuationFailure(f.failedRun)).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
     expect.soft(notes.map(n => n.body)).toEqual([POLICY_NOTE]);
     expect.soft(JSON.stringify(notes)).not.toMatch(/Sending it again|Send (?:the|a new) message|send it again/i);

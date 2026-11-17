@@ -13,19 +13,29 @@ export const PROVIDER_POLICY_REFUSAL_CODE = "provider_policy_refusal";
 export const PROVIDER_POLICY_REFUSAL_MESSAGE =
   "The model provider refused this request under its usage policy; it won't be retried automatically.";
 
+// Anthropic's documented stop_details.category vocabulary. A refusal can also
+// have a null or future category; stop_reason / stop_details.type takes priority.
+const PI_REFUSAL_CATEGORIES = new Set([
+  "cyber", "bio", "frontier_llm", "reasoning_extraction", "general_harms",
+]);
+
 /** Pi forwards the provider's errorMessage on its failed terminal. This is
- * provider error evidence, never assistant prose, tools or notice text. Pi's
- * Anthropic adapter maps stop_reason=refusal to the default below, or the
- * provider's stop_details.explanation. Gate policy text on an actual rejection
- * so an ordinary invalid request mentioning a policy field is not a refusal. */
+ * provider error evidence, never assistant prose, tools or notice text. Prefer
+ * native refusal evidence when forwarded: explanation text is not stable.
+ * Pinned packs can forward only that text, including OUTPUT-side Terms of
+ * Service refusals. Require a policy/terms family AND actual rejection language
+ * so ordinary policy mentions and transport failures do not stop retries. */
 function isPiPolicyRefusal(error: Record<string, unknown>): boolean {
-  // New packs preserve the native refusal before its explanation is lost.
-  // The text path keeps the pinned Pi 1.5.2 pack compatible.
   if (error.code === PROVIDER_POLICY_REFUSAL_CODE) return true;
-  if (error.code !== "pi_provider_error" || typeof error.message !== "string") return false;
+  if (error.code !== "pi_provider_error") return false;
+  const details = record(error.stop_details ?? error.stopDetails);
+  if (error.rawStopReason === "refusal" || error.stop_reason === "refusal" || error.stopReason === "refusal"
+    || details.type === "refusal"
+    || (typeof details.category === "string" && PI_REFUSAL_CATEGORIES.has(details.category))) return true;
+  if (typeof error.message !== "string") return false;
   const message = error.message;
   return message.trim() === "The model refused to complete the request"
-    || (/\b(?:usage|acceptable[ -]use|safety|content)[ -]polic(?:y|ies)\b/i.test(message)
+    || (/\b(?:(?:usage|acceptable[ -]use|safety|content)[ -]polic(?:y|ies)|terms[ -]of[ -](?:service|use)|commercial[ -]terms)\b/i.test(message)
       && /\b(?:refus\w*|block\w*|flag\w*|violat\w*|reject\w*|disallow\w*|not allowed)\b/i.test(message));
 }
 export const NATIVE_PROVIDER_OVERLOADED_DIAGNOSTIC = {
