@@ -1159,6 +1159,72 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notices[0]!.body).toBe(PAUSED_TEXT);
   });
 
+  // PV2 gate 1, comment 8757f468 (13:18Z): the person's message 410f8aec was
+  // carried by run ebe11bc8; the user paused the agent 11 s into that run (the
+  // pause route: lifecycle pause, then cancelActiveForAgent -> the run is
+  // cancelled with errorCode agent_paused); 19 s after the pause, with the
+  // agent still paused, the sweep wrote "Your message wasn't answered. Sending
+  // it again is safe" with the cancelled run as its source. The exact sequence:
+  it("PV2 8757f468: the pause route cancels the message's running run (agent_paused); the sweep 19 s later writes the paused note, never the resend text", async () => {
+    const f = await fixture();
+    const commentId = await f.message("Please continue.");
+    const carrying = await f.run({ commentId, status: "running" });
+    // routes/agents.ts POST /agents/:id/pause: lifecycle pause (status paused,
+    // lifecycle pausing, hold manual), then heartbeat.cancelActiveForAgent.
+    await db.update(agents).set({ status: "paused", lifecycleState: "pausing", lifecycleHolds: ["manual"], pauseReason: "manual" })
+      .where(eq(agents.id, f.agentId));
+    // cancelActiveForAgent(id) -> cancelRun(..., { errorCode: "agent_paused" })
+    // (heartbeat.ts:4842-4843, run-control.ts:1801-1815); the native
+    // cancellation settles the run as the live row did (lease released with
+    // "Cancelled due to agent pause").
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "agent_paused", error: "Cancelled due to agent pause",
+      finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, carrying));
+    const [agentRow] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(agentRow!.status).toBe("paused");
+    await settleAt(f, 19_000);
+    await f.sweep();
+    await settleAt(f, 3 * 60_000);
+    await settleAt(f, 10 * 60_000);
+    const notices = await f.visible();
+    expect(notices.map(n => n.body)).toEqual([PAUSED_TEXT]);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    // 13:20:43Z the user resumes the agent. The sweep passes again with the
+    // standing paused note and the pause-cancelled run as the message's run.
+    await resume(f);
+    await f.sweep();
+    await settleAt(f, 11 * 60_000);
+    await settleAt(f, 20 * 60_000);
+    const after = await f.visible();
+    // Nothing re-runs the message after the resume: the pause's stop is the
+    // message's only run, and no wake was queued (Paperclip treats an
+    // agent_paused stop as intentional, wake-queue/adapters/postgres.ts:146-157).
+    expect((await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId)))
+      .map(row => row.id)).toEqual([carrying]);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+    expect(after).toHaveLength(1);
+    expect(after[0]!.id).toBe(notices[0]!.id);
+    expect(after[0]!.createdAt.getTime()).toBe(notices[0]!.createdAt.getTime());
+    // The live row 8757f468: the SAME note (created while paused) now carries
+    // the resend text, Source run = the pause's stop, Failure code
+    // unclassified_failure (agent_paused is not a shown code).
+    expect(after[0]!.body).not.toBe(NOT_ANSWERED);
+    expect(codeOf(after[0]!)).not.toBe("unclassified_failure");
+  });
+
+  // The guard: a run that FAILED on an agent that is not paused keeps its true
+  // notice (the resend text, its own failure code), and a run cancelled for a
+  // pause after the agent is resumed is not treated as paused either.
+  it("guard: a failed (not paused) run on an active agent keeps its true resend notice", async () => {
+    const f = await fixture();
+    const commentId = await f.message("Please continue.");
+    await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "provider_process_exited: exit 1" });
+    await f.sweep();
+    await settleAt(f, 3 * 60_000);
+    const notices = await f.visible();
+    expect(notices.map(n => n.body)).toEqual([NOT_ANSWERED]);
+    expect(codeOf(notices[0]!)).toBe("provider_process_exited");
+  });
+
   it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
     for (let round = 0; round < 4; round++) {
       const f = await fixture();
