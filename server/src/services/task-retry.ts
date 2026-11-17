@@ -10,7 +10,7 @@ import { taskRetryRunAncestry } from "./recovery-run-ancestry.js";
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, chatActions, chatConversations, chatEndpoints, heartbeatRuns, issues, issueComments, runIdentityContexts, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { conflict, forbidden, notFound, HttpError } from "../errors.js";
-import { readRetryStopGate, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON } from "./task-retry-stop-gate.js";
+import { RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON } from "./task-retry-stop-gate.js";
 import { retryRefusedBeforeAdmission } from "./task-retry-eligibility.js";
 import { persistActivity } from "./activity-log.js";
 import { createSystemRecovery, exhaustedStopWait, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
@@ -300,8 +300,11 @@ export async function requestTaskRetry(input: TaskRetryRequest) {
 
 /** Retry fold (judge R8, rf-3 A): accept only a Retry the card offers; the
  * one authority decides (task-retry-eligibility.ts retryRefusedBeforeAdmission). */
-async function refuseRetryTheCardDoesNotOffer(db: Db, issue: { companyId: string; id: string }) {
-  const authority = await retryRefusedBeforeAdmission(db, { companyId: issue.companyId, issueId: issue.id });
+async function refuseRetryTheCardDoesNotOffer(db: Db, issue: { companyId: string; id: string }, sourceRunId: string | null, repeat = false) {
+  const authority = await retryRefusedBeforeAdmission(db, { companyId: issue.companyId, issueId: issue.id, sourceRunId, repeat });
+  // An expired unproven Stop keeps the Stop gate's established refusal shape.
+  if (authority?.reason === RETRY_STOP_UNPROVEN_REASON)
+    throw conflict(RETRY_STOP_UNPROVEN_MESSAGE, { code: RETRY_STOP_UNPROVEN_REASON, reason: "stop_unproven" });
   if (authority) throw conflict(authority.cardText!, { code: "retry_not_available", reason: authority.reason,
     userAction: authority.userAction, nextAction: authority.nextAction });
 }
@@ -320,9 +323,10 @@ function admitTaskRetry(input: TaskRetryRequest) {
       if (sameRequest.payload?.issueId !== issue.id || sameRequest.requestedByActorId !== input.actorId)
         throw conflict("This retry request belongs to a different task or user.");
       // A repeat of a Retry that already has its run replays the truth. A
-      // repeat of one that has no run reads the same authority as a new click.
-      if (!sameRequest.runId) await refuseRetryTheCardDoesNotOffer(db, issue);
+      // repeat of one that has no run reads the same authority as a new click,
+      // with its own source run (rf-3 finding A: an expired Stop is refused).
       const intent = readTaskRetryIntent(sameRequest.payload);
+      if (!sameRequest.runId) await refuseRetryTheCardDoesNotOffer(db, issue, intent?.sourceRunId ?? null, true);
       const [coalescedRun] = sameRequest.status === "coalesced" && sameRequest.runId
         ? await tx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sameRequest.runId)))
@@ -339,11 +343,9 @@ function admitTaskRetry(input: TaskRetryRequest) {
         latest.agentId !== issue.assigneeAgentId || input.observedRunId !== latest.id) {
       return { requestId: null, accepted: false, stale: true, observedRunId: latest?.id ?? null, chatActionId: undefined };
     }
-    // Same predicate as admission and the card: past the bound an unproven
+    // Same authority as admission and the card: past the bound an unproven
     // Stop refuses Retry with its reason instead of accepting a dead end.
-    if ((await readRetryStopGate(db, { companyId: issue.companyId, issueId: issue.id, sourceRunId: latest.id }))?.state === "expired")
-      throw conflict(RETRY_STOP_UNPROVEN_MESSAGE, { code: RETRY_STOP_UNPROVEN_REASON, reason: "stop_unproven" });
-    await refuseRetryTheCardDoesNotOffer(db, issue);
+    await refuseRetryTheCardDoesNotOffer(db, issue, latest.id);
     if (input.retryAction === "move_forward" && !["queued", "running"].includes(latest.status) &&
         !(await undeliveredContinuation(tx, { companyId: issue.companyId, issueId: issue.id })))
       return { requestId: null, accepted: false, stale: false, alreadyMovedOn: true, observedRunId: latest.id, chatActionId: undefined };
