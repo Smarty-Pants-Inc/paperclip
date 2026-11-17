@@ -854,20 +854,16 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     // A task-level hold that CLEARED after this run was queued restarts the
     // clock at the clear (RFL 20:46Z, rf-3 22:23Z), from existing fields only:
     // - previous run of this task ending (any agent): heartbeat_runs.finished_at;
-    // - its sandbox cleanup settling: environment_leases.updated_at of a lease of
-    //   this task's runs now cleanup_status = 'success';
     // - a case handoff leaving awaiting_release / pending_dispatch: case_handoffs.updated_at.
-    // Agent setup, the in-process native session cleanup, a budget pause and the
-    // external-bot gate store no clear time (named in the fix12 result).
+    // A sandbox cleanup settling has no settled time: environment_leases.updated_at
+    // moves on any write (metadata, reuse stamps), so it is not read. Agent setup,
+    // the in-process native session cleanup, a budget pause and the external-bot
+    // gate store no clear time either (named in the fix12 result).
     const clearRows = await Promise.all(personQueued.map(async run => {
       const created = run.createdAt!.toISOString();
       const result = await db.execute<{ cleared_at: string | null }>(sql`select greatest(
         (select max(prior.finished_at) from heartbeat_runs prior where prior.company_id = ${companyId}::uuid
           and prior.issue_id = ${run.issueId}::uuid and prior.id <> ${run.id}::uuid and prior.finished_at > ${created}::timestamptz),
-        (select max(lease.updated_at) from environment_leases lease where lease.company_id = ${companyId}::uuid
-          and lease.cleanup_status = 'success' and lease.updated_at > ${created}::timestamptz
-          and lease.heartbeat_run_id in (select prior.id from heartbeat_runs prior where prior.company_id = ${companyId}::uuid
-            and prior.issue_id = ${run.issueId}::uuid and prior.id <> ${run.id}::uuid)),
         (select max(handoff.updated_at) from case_handoffs handoff where handoff.company_id = ${companyId}::uuid
           and handoff.issue_id = ${run.issueId}::uuid and handoff.state not in ('awaiting_release', 'pending_dispatch')
           and handoff.updated_at > ${created}::timestamptz)) as cleared_at`);
