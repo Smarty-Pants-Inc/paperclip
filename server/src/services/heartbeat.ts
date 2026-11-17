@@ -325,6 +325,7 @@ import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiCon
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import {
   getExecutionBlocker,
+  hasPendingRunCleanup,
 } from "./execution-blocker.js";
 import {
   claimedAdapterType,
@@ -1581,7 +1582,11 @@ export function heartbeatService(
   };
   registerHeldPreparationResumer(resumeSettledRun);
   registerCompletedTurnCleanupResumer(resumeSettledRun);
-  registerCleanupSettledResumer(resumeSettledRun);
+  // One resume per settled run: an event that fires while this run's cleanup is
+  // still pending does not use up the wake (see cleanup-settled-wake.ts).
+  registerCleanupSettledResumer(resumeSettledRun, {
+    settled: async ({ companyId, runId }) => !(await hasPendingRunCleanup(db, companyId, runId)),
+  });
 
   function cancelRunInternal(...args: Parameters<typeof runControl.cancelRunInternal>) {
     return runControl.cancelRunInternal(...args);

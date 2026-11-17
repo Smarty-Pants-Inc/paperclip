@@ -135,10 +135,13 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   const mark = reason
     ? { state: "unproven", reason, detail, timeoutMs, at: new Date().toISOString() }
     : { state: "finalized", at: new Date().toISOString() };
+  // S048: the wake below may fire only once this mark write has committed.
+  let markCommitted = false;
   try {
     await input.db.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
       || ${JSON.stringify({ nativeCancelledWarmExport: mark })}::jsonb` }).where(and(
       eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
+    markCommitted = true;
     await appendHeartbeatRunEvent(input.db, {
       companyId: run.companyId, agentId: run.agentId, runId: run.id,
       eventType: reason ? "workspace_export_deferred" : "workspace_export_finalized",
@@ -173,8 +176,12 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       "Stopped warm turn's workspace export unproven; the box stays a protected export source");
     return { outcome: "unproven", reason };
   }
-  // S048: the finalized mark is committed (no transaction here); wake a message
-  // parked behind this Stop's cleanup by this event, once, not by the re-poll.
-  await wakeAfterCleanupSettled({ companyId: input.companyId, runId: input.runId, event: "export_finalized" });
+  // S048: wake a message parked behind this Stop's cleanup by this event, once,
+  // not by the re-poll, but ONLY when the finalized mark write committed (no
+  // transaction here). A failed mark write wakes nothing: without the mark the
+  // run is not settled, and the re-poll stays the fallback.
+  if (markCommitted) {
+    await wakeAfterCleanupSettled({ companyId: input.companyId, runId: input.runId, event: "export_finalized" });
+  }
   return { outcome: "finalized" };
 }
