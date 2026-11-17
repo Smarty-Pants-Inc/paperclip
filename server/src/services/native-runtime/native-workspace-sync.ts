@@ -1245,12 +1245,16 @@ export async function resumeNativeWorkspaceSync(input: {
   runId: string;
   target: AdapterExecutionTarget;
   assertOwnership?: () => Promise<void>;
+  /** pl/lockloss: the finalization ownership's `lost` signal; once aborted the
+   * copyback writes nothing more (the same fence as a cancelled export). */
+  signal?: AbortSignal;
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
 }): Promise<boolean> {
   if (input.target.kind !== "remote" || input.target.transport !== "sandbox") {
     throw new Error("workspace_sync_out_unrecoverable");
   }
+  const target = abandonableTarget(input.target, () => input.signal);
   const run = await input.db
     .select({ companyId: heartbeatRuns.companyId, runnerProfileJson: heartbeatRuns.runnerProfileJson })
     .from(heartbeatRuns)
@@ -1294,9 +1298,10 @@ export async function resumeNativeWorkspaceSync(input: {
     });
     return true;
   }
+  input.signal?.throwIfAborted();
   const runtime = await prepareRuntime({
     runId: input.runId,
-    target: input.target,
+    target,
     onPhase: input.onPhase,
     onCheckpoint: input.onCheckpoint,
     workspaceLocalDir: existing.descriptor.binding.localCwd,
@@ -1308,10 +1313,11 @@ export async function resumeNativeWorkspaceSync(input: {
   await finalizePreparedRuntime({
     db: input.db,
     runId: input.runId,
-    target: input.target,
+    target,
     runtime,
     descriptor: existing.descriptor,
     assertOwnership: input.assertOwnership,
+    signal: input.signal,
     onPhase: input.onPhase,
     onCheckpoint: input.onCheckpoint,
   });

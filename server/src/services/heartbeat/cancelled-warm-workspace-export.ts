@@ -4,7 +4,10 @@ import { logger } from "../../middleware/logger.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { admittedNativeResourceDisposition } from "../native-runtime/native-failed-workspace-recovery.js";
-import { withNativeWorkspaceFinalizationOwnership } from "../native-runtime/native-workspace-finalization-ownership.js";
+import {
+  NativeWorkspaceFinalizationOwnershipLostError,
+  withNativeWorkspaceFinalizationOwnership,
+} from "../native-runtime/native-workspace-finalization-ownership.js";
 
 /** pl/cancel-finalize: the longest a Stop's cancellation boundary waits for the
  * stopped turn's workspace export. The warm box's lease is only handed off
@@ -92,13 +95,20 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   const timedOut = new Error("cancelled_warm_export_timed_out");
   let timer: ReturnType<typeof setTimeout> | undefined;
   const aborted = new Promise<never>((_resolve, reject) => {
-    controller.signal.addEventListener("abort", () => reject(timedOut), { once: true });
+    controller.signal.addEventListener("abort", () => reject(
+      controller.signal.reason instanceof NativeWorkspaceFinalizationOwnershipLostError ? controller.signal.reason : timedOut,
+    ), { once: true });
   });
   aborted.catch(() => undefined);
   const work = withNativeWorkspaceFinalizationOwnership({ db: input.db, companyId: input.companyId, runId: input.runId },
     async (ownership) => {
+      // pl/lockloss: losing the lock session aborts the same controller, so the
+      // cancel-finalize3 fence stops the copyback's late host writes too.
+      const onLost = () => controller.abort(ownership.lost.reason);
+      if (ownership.lost.aborted) onLost();
+      else ownership.lost.addEventListener("abort", onLost, { once: true });
       const assertHeld = async () => {
-        if (controller.signal.aborted) throw timedOut;
+        if (controller.signal.aborted) throw controller.signal.reason;
         await ownership.assertHeld();
       };
       const export_ = sync.restoreWorkspace(assertHeld, { signal: controller.signal });
@@ -117,7 +127,9 @@ export async function finishCancelledWarmWorkspaceExport(input: {
     if (result === "timed_out") reason = "timed_out";
     else if (!result.acquired) reason = `ownership_${result.reason}`;
   } catch (error) {
-    reason = error instanceof Error && error.message === "cancelled_warm_export_timed_out" ? "timed_out" : "export_failed";
+    reason = controller.signal.reason instanceof NativeWorkspaceFinalizationOwnershipLostError
+      || error instanceof NativeWorkspaceFinalizationOwnershipLostError ? "ownership_lost"
+      : error instanceof Error && error.message === "cancelled_warm_export_timed_out" ? "timed_out" : "export_failed";
     detail = (error instanceof Error ? error.message : String(error)).slice(0, 300);
   } finally {
     if (timer) clearTimeout(timer);
