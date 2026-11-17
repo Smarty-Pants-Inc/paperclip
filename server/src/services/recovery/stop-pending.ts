@@ -17,7 +17,7 @@ export const STOP_PENDING_PERSON_LINE = `Stop pending: ${STOP_PENDING_FINDING} Y
  * sweep and the cleanup retry) and the held messages are then admitted once. It names
  * no board decision and no indefinite hold. */
 export const STOP_PENDING_PERSON_ACTION =
-  `Stop pending: ${STOP_PENDING_FINDING} Messages you send are saved and will be sent once the stop is confirmed.`;
+  `Stop pending: ${STOP_PENDING_FINDING} New messages you send now are saved and will start once the stop is confirmed. Messages waiting from before Stop still need Send.`;
 /** ONE bound for a person's Stop card, read by BOTH writers: the recovery sweep's
  * deferral (recovery/service.ts) and the cleanup retry (recordPersonStopCleanupPending,
  * called from heartbeat/recovery.ts). Measured from nativeCancellation.recordedAt. */
