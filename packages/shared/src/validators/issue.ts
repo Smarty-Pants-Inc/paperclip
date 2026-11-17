@@ -1178,6 +1178,7 @@ export const issueCommentMetadataSchema = z
     // A notice's wording is immutable. Later state appends a new notice and
     // points the previous one at it instead of rewriting conversation history.
     supersededByCommentId: z.uuid().optional(),
+    supersededByMigration: z.object({ migration: z.string().min(1).max(200) }).strict().optional(),
     supersededByIncident: z.object({
       kind: z.enum(["fresh_continuation", "conversation_redelivery", "answered"]),
       id: z.string().min(1).max(200),

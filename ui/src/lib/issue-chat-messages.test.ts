@@ -1878,6 +1878,25 @@ describe("AI recovery presentation", () => {
 });
 
 describe("superseded waiting notes", () => {
+  it("hides migration-marked U5 history without hiding authored messages or other system notices", () => {
+    const old = createComment({
+      id: "legacy-note", authorType: "system", authorUserId: null,
+      body: "Your message wasn't answered. Sending it again is safe.",
+      presentation: { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false },
+      metadata: { version: 1, sections: [], authorizationReason: "unanswered_message:old-message",
+        supersededByMigration: { migration: "0495_retire_legacy_message_notes" } },
+    });
+    const person = createComment({ id: "person-message", body: "Please finish the notes." });
+    const agent = createComment({ id: "agent-answer", authorType: "agent", authorAgentId: "agent-1", authorUserId: null, body: "Here are the notes." });
+    const other = createComment({ id: "other-notice", authorType: "system", authorUserId: null, body: "An unrelated system notice." });
+    const comments = [old, person, agent, other];
+    const messages = buildIssueChatMessages({ comments, interactions: [], timelineEvents: [], linkedRuns: [], liveRuns: [] });
+    expect(messages.map(message => message.id).sort()).toEqual([person.id, agent.id, other.id].sort());
+    expect(JSON.stringify(messages)).not.toMatch(/Sending it again/);
+    expect(comments[0]).toBe(old); // Visibility does not mutate retained API history.
+    expect(old.body).toContain("Sending it again");
+  });
+
   it("keeps a superseded note when its successor is not in the list being built", () => {
     const notice = { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false } as const;
     const old = createComment({

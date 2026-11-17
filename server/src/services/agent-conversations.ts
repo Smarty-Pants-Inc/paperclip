@@ -1,6 +1,5 @@
 import { isContextCompactionRun } from "./context-compaction.js";
 import { SETTLING_GRACE_MS } from "./recovery/assigned-work-invariant.js";
-import { retireSupersededMessageNotes } from "./recovery/message-note-retirement.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
@@ -865,9 +864,6 @@ export async function redeliverUnansweredConversationTurn(
           redeliveredAfterRunId: run.id,
         },
       });
-      // This redelivery is the new current incident for the message.
-      await retireSupersededMessageNotes(tx, { companyId: issue.companyId, issueId: issue.id, messageIds: [messageId],
-        incident: { kind: "conversation_redelivery", id: key, at: now } });
       return "redelivered" as const;
     });
     if (outcome !== "retry") return outcome;

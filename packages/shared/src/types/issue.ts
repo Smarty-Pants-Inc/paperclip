@@ -1273,6 +1273,7 @@ export interface IssueCommentMetadata {
    * or a redelivered turn) retired this older note without appending one; the
    * original body remains conversation history. */
   supersededByIncident?: { kind: "fresh_continuation" | "conversation_redelivery" | "answered"; id: string; at: string };
+  supersededByMigration?: { migration: string };
   /** Inbound channel attribution; never an authorization input. */
   sourceChannel?: ChatProvider;
   /**

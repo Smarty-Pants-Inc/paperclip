@@ -1,6 +1,6 @@
 {
-  "id": "99e25130-3845-45a0-b72f-310b305c7e63",
-  "prevId": "dc61c7f3-cf3d-44c5-9296-86973e5f0925",
+  "id": "c4806745-80bc-44de-b32a-cbfbc2349b68",
+  "prevId": "100dd315-0937-4d80-8b36-002d80004171",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -2381,6 +2381,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
         }
       },
       "indexes": {},
@@ -64977,6 +64983,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "agent_reasoning_display": {
+          "name": "agent_reasoning_display",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
         },
         "created_at": {
           "name": "created_at",

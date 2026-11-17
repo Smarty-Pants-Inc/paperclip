@@ -1171,7 +1171,7 @@ export function supersededCommentIds(comments: readonly IssueChatComment[]): Set
     if (typeof next === "string" && next && ids.has(next)) hidden.add(comment.id);
     // A later current incident for the same message retired this note; the
     // card (task interruption) is its one current instruction.
-    else if (comment.metadata?.supersededByIncident) hidden.add(comment.id);
+    else if (comment.metadata?.supersededByIncident || comment.metadata?.supersededByMigration) hidden.add(comment.id);
   }
   return hidden;
 }

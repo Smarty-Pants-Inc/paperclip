@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { assignedWorkSweep } from "./recovery/assigned-work-sweep.js";
 import { currentNotices } from "./rfl-current-notice-assertions.js";
-import { insertIssueComment } from "./issue-comment-writes.js";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -10,7 +9,7 @@ import { join } from "node:path";
 import { and, eq, sql, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog, agentTaskSessions, agentWakeupRequests, agents, approvals, authUsers, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueApprovals, issueRecoveryActions, issueThreadInteractions,
+  applyPendingMigrations, activityLog, agentTaskSessions, agentWakeupRequests, agents, approvals, authUsers, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueApprovals, issueRecoveryActions, issueThreadInteractions,
   heartbeatRunEvents, issueComments, issues, nativeRunFinalizations, toolInvocations, companyMemberships,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
@@ -2452,10 +2451,16 @@ suite("fresh-continuation fallback", () => {
     expect(many.length).toBeLessThanOrEqual(64 * 3);
   }, 60_000);
 
-  // stack135 F4 (rf-3 legacy-note contradiction, pre-existing at the base).
-  // Upgraded data keeps U5's "send it again" notes; a new current incident for
-  // the same message retires them by supersession, never deletion.
-  it("an old send-it-again note plus a new scheduled continuation leaves exactly one current instruction", async () => {
+  // F4 migration: old U5 notes are history, not current instructions. Exercise
+  // the upgrade executor, continuation card and the API's comment read service.
+  async function migrateLegacyNotes() {
+    // The fixture starts at head. Rewind ONLY the new data-migration receipt
+    // so its persisted rows have the same shape as an upgraded database.
+    await db.execute(sql`delete from drizzle.__drizzle_migrations where created_at > 1794877714216`);
+    await applyPendingMigrations(temporary!.connectionString);
+  }
+
+  it("an upgraded send-it-again note is hidden after migration but still retrievable by API", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
     await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" })
       .where(eq(issues.id, f.issueId));
@@ -2473,28 +2478,49 @@ suite("fresh-continuation fallback", () => {
       legacy(message!.id, "Your message wasn't answered. Sending it again is safe."),
       legacy(otherMessage!.id, "Your earlier message wasn't answered. Sending it again is safe."),
     ]).returning();
+    await migrateLegacyNotes();
     await settleUnrecoverableExecutions(db);
     const card = await taskInterruptionPresentation(db, await issue(f.issueId));
     expect(card).toMatchObject({ responsibility: "system", canRetry: false });
     expect(["working", "retry_scheduled"]).toContain(card!.state);
     const after = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
     const current = currentNotices(after, before);
-    // Only the note for the continued message is retired; the separate message's note is not this incident's.
-    expect(current.map(note => note.metadata?.authorizationReason)).toEqual([`unanswered_message:${otherMessage!.id}`]);
+    expect(current).toEqual([]);
+    expect(JSON.stringify({ card, current })).not.toMatch(/send (it|a new message).*again/i);
     const retired = after.find(note => note.id === before[0]!.id)!;
     expect(retired).toMatchObject({ body: before[0]!.body, deletedAt: null });
-    expect(retired.metadata?.supersededByIncident).toMatchObject({ kind: "fresh_continuation" });
-    // Idempotent: another pass changes nothing.
+    expect(retired.metadata?.supersededByMigration).toEqual({ migration: "0495_retire_legacy_message_notes" });
+    expect(retired.metadata?.supersededByIncident).toBeUndefined();
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId,
+      membershipRole: "owner", status: "active" });
+    const [{ default: express }, { default: request }, { issueRoutes }] = await Promise.all([
+      import("express"), import("supertest"), import("../routes/issues.js"),
+    ]);
+    const app = express();
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", userId, companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        source: "cloud_tenant", isInstanceAdmin: false };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never));
+    const apiResponse = await request(app).get(`/api/issues/${f.issueId}/comments/${retired.id}`).expect(200);
+    const apiNote = apiResponse.body;
+    expect(apiNote).toMatchObject({ id: retired.id, body: before[0]!.body, deletedAt: null,
+      metadata: { authorizationReason: before[0]!.metadata!.authorizationReason,
+        supersededByMigration: { migration: "0495_retire_legacy_message_notes" } } });
+    console.info(JSON.stringify({ legacyMigration: { hidden: before.map(note => note.id),
+      apiStatus: apiResponse.status, apiNote: { id: apiNote.id, body: apiNote.body, metadata: apiNote.metadata }, card } }));
+    // The journal makes a second startup a no-op.
+    await applyPendingMigrations(temporary!.connectionString);
     await settleUnrecoverableExecutions(db); await deliver();
     const again = await db.select().from(issueComments).where(eq(issueComments.id, before[0]!.id));
     expect(again[0]!.metadata).toEqual(retired.metadata);
   }, 60_000);
 
-  // stack135 FIX3 item 4 (D074/D175). Keep reason: never-OK history guard. An
-  // agent's answer supersedes the old send-it-again / retrying notes of the
-  // messages it answers, by supersession, never deletion; a later message's
-  // note stays current, and a person's own comment retires nothing.
-  it("an agent's answer supersedes the old send-it-again notes of the messages it answers, never a later message's", async () => {
+  // Never-OK history/attribution guard: only the removed U5 system notes may
+  // be marked. Authored comments and similar-looking system notices survive.
+  it("the one-time migration marks only legacy U5 system notes, never people, agents or other notices", async () => {
     const [task] = await db.insert(issues).values({ companyId, title: "Answer the question", status: "in_progress",
       assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" }).returning();
     const issueId = task!.id;
@@ -2506,32 +2532,45 @@ suite("fresh-continuation fallback", () => {
       presentation: { kind: "system_notice" as const, tone: "warning" as const, density: "compact" as const, detailsDefaultOpen: true },
       metadata: { version: 1 as const, authorizationReason: reason, recoveryResponsibility: "user" as const,
         sections: [{ rows: [{ type: "key_value" as const, label: "Next action", value: "Send a new message to try again." }] }] } });
+    // Cross multiple 500-row keyset batches, including both UUID extremes.
+    await db.insert(issueComments).values(Array.from({ length: 1001 }, (_, index) =>
+      legacy(`other_notice:${index}`, "Retained unrelated history.")));
     const before = await db.insert(issueComments).values([
-      legacy(`unanswered_message:${answered!.id}`, "Your message wasn't answered. Sending it again is safe."),
+      { ...legacy(`unanswered_message:${answered!.id}`, "Your message wasn't answered. Sending it again is safe."),
+        id: "00000000-0000-0000-0000-000000000000" },
       legacy(`retrying_message:${answered!.id}`, "Your message is being retried."),
-      legacy(`unanswered_message:${later!.id}`, "Your later message wasn't answered. Sending it again is safe."),
+      { ...legacy(`unanswered_message:${later!.id}`, "Your later message wasn't answered. Sending it again is safe."),
+        id: "ffffffff-ffff-ffff-ffff-ffffffffffff" },
     ]).returning();
-    const systemNotes = async () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
-    // A person's own comment is not an answer.
-    await insertIssueComment(db, { companyId, issueId, authorType: "user", authorUserId: userId, body: "Still waiting.",
-      createdAt: new Date(Date.now() - 5 * 60_000) });
-    expect(currentNotices(await systemNotes(), before)).toHaveLength(3);
-    const [answer] = await insertIssueComment(db, { companyId, issueId, authorType: "agent", authorAgentId: agentId, body: "Here is the status." });
-    const after = await systemNotes();
-    const current = currentNotices(after, before);
-    console.info(JSON.stringify({ answeredSupersession: { current: current.map(n => n.metadata?.authorizationReason),
-      retired: after.filter(n => n.metadata?.supersededByIncident).map(n => [n.metadata?.authorizationReason, n.metadata?.supersededByIncident]) } }));
-    expect(current.map(note => note.metadata?.authorizationReason)).toEqual([`unanswered_message:${later!.id}`]);
-    for (const old of before.slice(0, 2)) {
+    const controls = await db.insert(issueComments).values([
+      { ...legacy(`unanswered_message:${answered!.id}`, "A person's own words."), authorType: "user", authorUserId: userId },
+      { ...legacy(`retrying_message:${answered!.id}`, "Here is the agent's answer."), authorType: "agent", authorAgentId: agentId },
+      legacy(`unansweredXmessage:${answered!.id}`, "Not the literal U5 prefix."),
+      legacy(`retryingXmessage:${answered!.id}`, "Also not the literal U5 prefix."),
+      legacy(`other_notice:${answered!.id}`, "An unrelated system notice."),
+    ]).returning();
+    const comments = async () => db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    await migrateLegacyNotes();
+    const after = await comments();
+    for (const old of before) {
       const retired = after.find(note => note.id === old.id)!;
       expect(retired).toMatchObject({ body: old.body, deletedAt: null });
-      expect(retired.metadata?.supersededByIncident).toMatchObject({ kind: "answered", id: answer!.id });
+      expect(retired.metadata).toEqual({ ...old.metadata,
+        supersededByMigration: { migration: "0495_retire_legacy_message_notes" } });
     }
-    // Idempotent: a second answer neither rewrites the marker nor reaches the later message.
-    await insertIssueComment(db, { companyId, issueId, authorType: "agent", authorAgentId: agentId, body: "One more detail." });
-    const again = await systemNotes();
-    for (const note of after) expect(again.find(row => row.id === note.id)!.metadata).toEqual(note.metadata);
-    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).filter(row => row.deletedAt)).toHaveLength(0);
+    const current = currentNotices(after, before);
+    for (const old of before) expect(current.map(note => note.id)).not.toContain(old.id);
+    expect(current).toHaveLength(1008); // 1001 other notices, 5 controls, 2 person messages.
+    for (const old of controls) expect(after.find(note => note.id === old.id)).toEqual(old);
+    // Re-running both startup and the idempotent SQL does not rewrite anything.
+    await applyPendingMigrations(temporary!.connectionString);
+    const { readFile } = await import("node:fs/promises");
+    await db.$client.unsafe(await readFile(new URL("../../../packages/db/src/migrations/0495_retire_legacy_message_notes.sql", import.meta.url), "utf8"));
+    const again = await comments();
+    expect(again.sort((a, b) => a.id.localeCompare(b.id))).toEqual(after.sort((a, b) => a.id.localeCompare(b.id)));
+    const receipt = await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations where created_at > 1794877714216`);
+    expect(receipt[0]!.count).toBe(1);
+    console.info(JSON.stringify({ migrationScope: { marked: before.length, untouched: current.length, receipts: receipt[0]!.count } }));
   }, 60_000);
 
   // stack135 F3 re-home of D002/D010/D013/D018/D171 (S1-pause). The U5 paused

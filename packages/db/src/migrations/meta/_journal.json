@@ -3452,6 +3452,13 @@
       "when": 1794877714216,
       "tag": "0494_agent_reasoning_display",
       "breakpoints": true
+    },
+    {
+      "idx": 495,
+      "version": "7",
+      "when": 1794931286874,
+      "tag": "0495_retire_legacy_message_notes",
+      "breakpoints": true
     }
   ]
 }
