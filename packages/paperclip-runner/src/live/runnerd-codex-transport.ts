@@ -7884,6 +7884,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         ? this.#core?.store.state.commands.find((candidate) => candidate.type === type)
         : this.#core?.getCommand(commandId),
       runnerHasExited: () => this.#runnerHasExited(),
+      // A confirmed old PID's exit is not failure of its durable pending turn.
+      // The existing watcher owns restart authority, confirmation and grace;
+      // wait for this SAME command's authenticated result, never submit again.
+      runnerRecoveryPending: () => this.#startupComplete && !this.#closed && this.#failure === null
+        && this.options.runnerReconnectGraceMs !== undefined && !!this.#handle?.restart,
       failureCode: () => this.#startupComplete ? "provider_transport_failed" : this.#startupFailureCode,
     });
 
@@ -8735,6 +8740,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           );
           return;
         }
+        // Preserve the process owner's closed observation-budget outcome and
+        // instruction. This does NOT confirm exit or enter the restart branch.
+        if (error instanceof Error && (error as Error & { code?: unknown }).code === "runner_process_observation_budget_exhausted") {
+          this.#failTransport(error);
+          return;
+        }
         const code = handle.isExitConfirmed?.() === false
           ? "runner_process_termination_unconfirmed"
           : this.#startupComplete
@@ -9520,6 +9531,8 @@ export async function waitForRunnerCommand(input: {
   throwIfFailed: () => void;
   command: () => { status: string; result?: unknown } | undefined;
   runnerHasExited: () => Promise<boolean>;
+  /** Only a pending durable turn can outlive its old process generation. */
+  runnerRecoveryPending?: () => boolean;
   failureCode: () => string;
 }): Promise<void> {
   const now = () => input.clock ? input.clock.now() : Date.now();
@@ -9540,7 +9553,8 @@ export async function waitForRunnerCommand(input: {
       Object.defineProperty(error, "runnerCommandResult", { value: structuredClone(command.result), enumerable: false });
       throw error;
     }
-    if (await input.runnerHasExited()) {
+    if (await input.runnerHasExited()
+      && !(input.type === "turn.start" && command?.status === "pending" && input.runnerRecoveryPending?.())) {
       throw new Error(`runnerd exited while waiting for ${input.type}`);
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 10));

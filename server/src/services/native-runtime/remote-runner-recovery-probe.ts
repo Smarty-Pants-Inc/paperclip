@@ -27,6 +27,12 @@ export async function readRemoteRunnerRecoveryProbe(input: {
       const result = await input.runner.execute({
         ...input.request,
         timeoutMs: Math.min(10_000, remaining),
+        // Unlike an observation timeout hint, the command deadline reaches the
+        // plugin's abort path. Never spend a provider's transport grace beyond
+        // the remaining probe allowance.
+        commandTimeoutMs: Math.min(10_000, remaining,
+          input.request.commandTimeoutMs && input.request.commandTimeoutMs > 0
+            ? input.request.commandTimeoutMs : Infinity),
       });
       if (!result.timedOut) return result;
       lastError = new RemoteRunnerRecoveryError({ stage: input.stage, reason: "probe_timeout" });

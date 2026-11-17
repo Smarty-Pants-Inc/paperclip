@@ -56,7 +56,6 @@ import { createRunUsageRecorder } from "../usage-receipts.js";
 import { syncPluginTaskCredentialHandoff, registerPluginTaskCredentialHandoff } from "../plugin-task-credential-writeback.js";
 import { resolvePluginTaskResume } from "../environment-task-runtime.js";
 import { environmentTaskOperationSchema, environmentTaskResultSchema, JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
-import { sandboxStateTransitionFailure } from "../reusable-sandbox-resume-replacement.js";
 import { preparePluginRunnerCredentials } from "./plugin-runner-credentials.js";
 import { createPluginRunnerTaskOwner, verifyPluginRunnerTaskReattachment } from "./plugin-runner-task.js";
 import { createSandboxRunnerRetention, createSandboxRunnerSupervision, type SandboxRunnerRetention } from "./sandbox-runner-retention.js";
@@ -8474,6 +8473,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === NATIVE_CURRENT_WAKE_COMMENTS_CHANGED_AFTER_READ ||
     sourceFailureCode === "native_session_cleanup_quarantined" ||
     sourceFailureCode === "native_adopted_runner_authentication_timeout" ||
+    sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED ||
     sourceFailureCode === "native_provider_usage_limit" ||
     sourceFailureCode === NATIVE_PROVIDER_SESSION_CLOSED ||
     sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED;
@@ -8578,6 +8578,7 @@ export function nativeSessionFailureSourceCode(
   | typeof NATIVE_PROVIDER_STARTUP_REJECTED
   | "native_session_cleanup_quarantined"
   | "native_adopted_runner_authentication_timeout"
+  | typeof REMOTE_RUNNER_OBSERVATION_EXHAUSTED
   | "runner_remote_provider_artifact_incompatible"
   | "runner_remote_provider_verification_unavailable"
   | "provider_process_exited"
@@ -8604,6 +8605,8 @@ export function nativeSessionFailureSourceCode(
   | "runner_ingress_acquisition_failed"
   | "local_runtime_api_listener_unavailable"
   | "native_session_interrupted" {
+  if (error instanceof Error && /^(?:Notification transport failed closed: )?runner_process_observation_budget_exhausted:/.test(error.message))
+    return REMOTE_RUNNER_OBSERVATION_EXHAUSTED;
   if (error instanceof NativePermissionDeclinedError) return "native_permission_declined";
   if (error instanceof NativeGovernedWaitSettlementPendingError) return "native_governed_wait_settlement_pending";
   if (error instanceof NativeProviderStateIncompatibleError) return NATIVE_PROVIDER_STATE_INCOMPATIBLE;
@@ -12563,6 +12566,8 @@ async function executePaperclipNativeSessionAttempt(
                   ? NATIVE_PROVIDER_SESSION_CLOSED_ACTION
                   : sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED
                   ? NATIVE_PROVIDER_STARTUP_REJECTED_ACTION
+                  : sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED
+                  ? REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION
                   : sourceFailureCode === "native_session_cleanup_quarantined"
                   ? nativeCleanupRefusalAction(completedTurnCleanup)
                   : sourceFailureCode === "runner_remote_provider_verification_unavailable"
@@ -12840,6 +12845,8 @@ async function executePaperclipNativeSessionAttempt(
               ? NATIVE_PROVIDER_SESSION_CLOSED_ACTION
               : sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED
               ? NATIVE_PROVIDER_STARTUP_REJECTED_ACTION
+              : sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED
+              ? REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION
               : sourceFailureCode === "native_session_cleanup_quarantined"
               ? nativeCleanupRefusalAction(completedTurnCleanup)
               : sourceFailureCode === "runner_task_admission_rejected"
@@ -14415,14 +14422,23 @@ const REMOTE_RUNNER_PROCESS_POLL_MS = 1_000;
 // total failed-observation time retained by this monitor, not each transition;
 // healthy reads and supervision parking do not replenish this allowance.
 const REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS = 10 * 60_000;
+export const REMOTE_RUNNER_OBSERVATION_EXHAUSTED = "runner_process_observation_budget_exhausted";
+export const REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION =
+  "The sandbox is still changing state after the ten-minute observation allowance. Runner termination is not confirmed. Wait for archiving to finish, then retry recovery of this run after verifying the retained runner. Do not start a replacement while that runner may still be alive.";
+
+function remoteRunnerObservationExhausted(cause: unknown): Error {
+  return Object.assign(new Error(`${REMOTE_RUNNER_OBSERVATION_EXHAUSTED}: ${REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION}`, { cause }),
+    { code: REMOTE_RUNNER_OBSERVATION_EXHAUSTED });
+}
 
 function remoteRunnerSandboxTransitionRefusal(error: unknown): boolean {
   for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
     if ((cause as { code?: unknown }).code === "boat_sandbox_state_transition") return true;
-    // Worker RPC drops string codes. Use its typed error envelope and the
-    // existing transition classifier, never arbitrary transport error text.
+    // Worker RPC drops string codes; Boat puts its closed code at the start
+    // of the message. The acquisition retry classifier also accepts provider
+    // readiness prose, which is NOT authority to retain a live monitor.
     if (cause instanceof JsonRpcCallError && cause.code === PLUGIN_RPC_ERROR_CODES.WORKER_ERROR &&
-        sandboxStateTransitionFailure(cause)) return true;
+        cause.message.startsWith("boat_sandbox_state_transition: ")) return true;
   }
   return false;
 }
@@ -14994,7 +15010,7 @@ export function createRemoteRunnerProcessLauncher(input: {
           if (supervision && !supervision.accepts(monitorGeneration!)) return null;
           if (pendingSignal || !remoteRunnerSandboxTransitionRefusal(error)) throw error;
           retainedTransitionMs += Math.max(0, Date.now() - observationStartedAt);
-          if (retainedTransitionMs >= REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS) throw error;
+          if (retainedTransitionMs >= REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS) throw remoteRunnerObservationExhausted(error);
           const waitStartedAt = Date.now();
           // There is no sandbox-state event on this command boundary. Reuse
           // the active-process safety-net cadence; do not infer exit or launch.
@@ -15002,7 +15018,8 @@ export function createRemoteRunnerProcessLauncher(input: {
             REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS - retainedTransitionMs)));
           if (supervision && !supervision.accepts(monitorGeneration!)) return null;
           retainedTransitionMs += Math.max(0, Date.now() - waitStartedAt);
-          if (pendingSignal || retainedTransitionMs >= REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS) throw error;
+          if (pendingSignal) throw error;
+          if (retainedTransitionMs >= REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS) throw remoteRunnerObservationExhausted(error);
           return null;
         });
         if (supervision && !supervision.accepts(monitorGeneration!)) continue;

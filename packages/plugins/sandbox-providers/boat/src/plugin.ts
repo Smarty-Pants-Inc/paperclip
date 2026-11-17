@@ -675,8 +675,8 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     if (archivingCommandConflict) {
       // A documented or state-confirmed refusal, including a second 409 after
       // recovery, gets ONE named transient across the real RPC text predicate.
-      failure.message += " (state change in progress)";
-      if (failure.stack) failure.stack = failure.stack.replace("\n", " (state change in progress)\n");
+      failure.message = `boat_sandbox_state_transition: ${failure.message} (state change in progress)`;
+      if (failure.stack) failure.stack = failure.stack.replace("Error: ", "Error: boat_sandbox_state_transition: ").replace("\n", " (state change in progress)\n");
       Object.assign(failure, { code: "boat_sandbox_state_transition" });
     }
     throw failure;
@@ -2179,6 +2179,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const id = params.lease.providerLeaseId; if (!id) return { exitCode: 1, timedOut: false, stdout: "", stderr: "No Boat lease ID available." };
     recordSpareUse(params.companyId, id, "execute");
     const c = parse(params.config); validEnv(params.env);
+    // A caller's command deadline includes recovery/HTTP transport time, not
+    // only Boat's rounded command timeout plus its transport allowance.
+    const signal = params.commandTimeoutMs && params.commandTimeoutMs > 0
+      ? AbortSignal.timeout(Math.ceil(params.commandTimeoutMs)) : undefined;
     let stdinPath: string | null = null, envPath: string | null = null;
     const base = `/sandboxes/${encodeURIComponent(id)}/files`;
     const stage = async (path: string, content: string, kind: "stdin" | "env") => {
@@ -2226,7 +2230,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       // Absolute cleanup utilities still work when the caller overrides PATH.
       const environment = envPath ? `umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} || exit 197 && ` : "";
       const wrapped = `${params.cwd ? (envPath ? `if cd ${q(params.cwd)}; then :; else exit 1; fi; ` : `cd ${q(params.cwd)} && `) : ""}${environment}exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
-      let result = await runCommand(c, id, wrapped, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
+      let result = await runCommand(c, id, wrapped, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000, undefined, signal);
       if (!envRecoveryUsed && envPath && result.exitCode === 197) {
         envRecoveryUsed = true;
         preparedEnvDirectories.delete(id);
@@ -2236,7 +2240,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         await stage(retryPath, Object.entries(params.env ?? {}).map(([k, v]) => `export ${k}=${q(v)}\n`).join(""), "env");
         envPath = retryPath;
         const retryWrapper = `${params.cwd ? `if cd ${q(params.cwd)}; then :; else exit 1; fi; ` : ""}umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} || exit 197 && exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
-        result = await runCommand(c, id, retryWrapper, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
+        result = await runCommand(c, id, retryWrapper, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000, undefined, signal);
       }
       return result;
     } finally {
