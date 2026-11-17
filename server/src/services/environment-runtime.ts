@@ -19,6 +19,8 @@ import {
   reusableSandboxNotKeptAfterReplacementSql,
   reusableSandboxReplacementPlan,
   type ReusableSandboxReplacementPlan,
+  providerReportsSandboxBusy,
+  sandboxResumeRefusedForGood,
   sandboxStateTransitionFailure,
 } from "./reusable-sandbox-resume-replacement.js";
 import { admittedSandboxLeaseConfig, sandboxLeaseIdentityConfig, sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
@@ -37,7 +39,7 @@ import { historicalProviderCredentials } from "./historical-provider-credentials
 import { ownedWorkspaceRecoveryLease, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
 import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSandboxStop, preparePreviousBootClosedTipStop, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
-import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError, readEnvironmentResumeErrorDiagnostic } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
 import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
@@ -818,23 +820,45 @@ function delay(ms: number): Promise<void> {
 }
 
 function transientSandboxResumeFailure(error: unknown): boolean {
+  // The provider says the saved state is gone: waiting cannot help.
+  if (sandboxResumeRefusedForGood(error)) return false;
   const candidate = error && typeof error === "object"
     ? error as Record<string, unknown>
     : {};
+  // A plugin worker refusal crosses JSON-RPC with only a message and an RPC
+  // code; the provider's safe HTTP status and errno travel in its envelope.
+  const envelope = readEnvironmentResumeErrorDiagnostic(error);
   const status = typeof candidate.status === "number"
     ? candidate.status
     : typeof candidate.statusCode === "number"
       ? candidate.statusCode
-      : null;
+      : envelope?.httpStatus ?? null;
   if (status === 429 || (status !== null && status >= 500)) return true;
   // A sandbox still stopping, archiving, or starting can be started shortly.
   if (sandboxStateTransitionFailure(error)) return true;
-  const code = typeof candidate.code === "string" ? candidate.code.toUpperCase() : "";
-  if (["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "ENETUNREACH"].includes(code)) {
+  const code = typeof candidate.code === "string" ? candidate.code.toUpperCase() : envelope?.errorCode ?? "";
+  if (["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "ENETUNREACH", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET"].includes(code)) {
     return true;
   }
   const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
   return /\b(timeout|timed out|rate limit|temporar|network|connection reset|service unavailable)\b/.test(message);
+}
+
+/**
+ * The provider reports the sandbox busy rather than gone: a resume conflict
+ * (Boat answers 409 only for a sandbox still stopping, starting or not ready),
+ * a temporary unavailability (503), or one of Boat's documented state codes.
+ * An idle sandbox in this state is retried, and waited for up to the idle
+ * resume budget, before the run gives up on it or rotates. A bare 409 on a
+ * sandbox another run still holds is a conflict, not readiness, and is not
+ * retried. A provider that already spent its own start deadline says so in
+ * text and keeps the initial budget.
+ */
+function sandboxResumeStillSettling(error: unknown): boolean {
+  if (sandboxResumeRefusedForGood(error)) return false;
+  if (providerReportsSandboxBusy(error)) return true;
+  const status = readEnvironmentResumeErrorDiagnostic(error)?.httpStatus;
+  return status === 409 || status === 503;
 }
 
 function getLeaseDriverKey(
@@ -2249,12 +2273,15 @@ function createSandboxEnvironmentDriver(
                 );
                 break;
               } catch (error) {
-                if (!transientSandboxResumeFailure(error)) throw error;
+                if (!transientSandboxResumeFailure(error) && !(sandboxResumeStillSettling(error)
+                  && await reusableSandboxLeaseIsIdle({
+                    db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
+                  }))) throw error;
                 if (sandboxProviderFailureLabel(error).label !== "transport_timeout") everyResumeTimedOut = false;
                 const retryAt = Date.now() + retryDelayMs * 1.25;
                 if (retryAt >= resumeDeadline) {
                   const waitForIdleStart = resumeDeadline < idleResumeDeadline && retryAt < idleResumeDeadline
-                    && sandboxProviderFailureLabel(error).label === "transport_timeout"
+                    && (sandboxProviderFailureLabel(error).label === "transport_timeout" || sandboxResumeStillSettling(error))
                     && await reusableSandboxLeaseIsIdle({
                       db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
                     });
