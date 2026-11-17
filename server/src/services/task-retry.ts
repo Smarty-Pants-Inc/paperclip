@@ -11,7 +11,7 @@ import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, chatActions, chatConversations, chatEndpoints, heartbeatRuns, issues, issueComments, runIdentityContexts, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { conflict, forbidden, notFound, HttpError } from "../errors.js";
 import { persistActivity } from "./activity-log.js";
-import { createSystemRecovery, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
+import { createSystemRecovery, exhaustedStopWait, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
 import { adoptSystemRecovery, updateSystemRecovery } from "./system-recovery.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { notifyChatActionWork } from "./chat-work-notifications.js";
@@ -398,6 +398,11 @@ function admitTaskRetry(input: TaskRetryRequest) {
         runId: String(action.evidence.runId), actionId: action.id });
       [records[index]] = await tx.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
     }
+    // rf-3 15:30Z (3): the run's hold waits on an unconfirmed stop. A Retry
+    // cannot release it, so admission refuses it, as the card and chat show.
+    if (!busy && records.some(action => action.evidence.runId === latest.id
+        && exhaustedStopWait(readSystemRecovery(action.evidence), action.evidence)))
+      return { requestId: null, accepted: false, stale: false, waitingOnStop: true, observedRunId: latest.id, chatActionId: undefined };
     // An unadmitted request can outlive its exhausted repair. A new deliberate
     // click replaces that generation; a replay of the same key returned above.
     if (active && !busy && !active.runId && records.some(action => {

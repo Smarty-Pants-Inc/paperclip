@@ -1,5 +1,6 @@
 import { isWorkspaceRestoreDelayed, isWorkspaceRestorePending, isWorkspaceRestoreRecovered, safeWorkspaceRestorePath,
-  WORKSPACE_RESTORE_DELAYED_TEXT, WORKSPACE_RESTORE_RECOVERED_TEXT, WORKSPACE_RESTORE_RECOVERING_TEXT } from "@paperclipai/shared";
+  WORKSPACE_RESTORE_DELAYED_TEXT, WORKSPACE_RESTORE_RECOVERED_TEXT, WORKSPACE_RESTORE_RECOVERING_TEXT,
+  workspaceRestoreStopWaitText } from "@paperclipai/shared";
 
 /** The run marker reads the server's owed fact (workspaceRestorePending), never
  * the raw workspaceRestoreFailure value alone: owed files are recovering. */
@@ -13,6 +14,10 @@ export function workspaceRestoreMarker(result: Record<string, unknown> | null | 
   // Past the person bound the hold is still recovering, but Retry is offered
   // (not pending), the same Retry the server's blocker offers and accepts.
   const delayed = !pending && !recovered && isWorkspaceRestoreDelayed(result);
+  // A hold exhausted on an unconfirmed stop is a wait the server card shows with
+  // no Retry (rf-3 15:30Z (3)): same words, and pending so the chat offers none.
+  if (!pending && !recovered && !delayed && workspaceRestoreStopWaitText(result))
+    return { pending: true, recovered, delayed, label: "Recovering saved work", tone: "neutral" };
   return pending || delayed
     ? { pending, recovered, delayed, label: "Recovering saved work", tone: "neutral" }
     : recovered
@@ -27,7 +32,7 @@ export function workspaceRestoreMarkerDetail(input: {
 }): string {
   const marker = workspaceRestoreMarker(input.result);
   const parts = marker.pending || marker.recovered || marker.delayed
-    ? [marker.pending ? WORKSPACE_RESTORE_RECOVERING_TEXT : marker.delayed ? WORKSPACE_RESTORE_DELAYED_TEXT : WORKSPACE_RESTORE_RECOVERED_TEXT,
+    ? [marker.pending ? workspaceRestoreStopWaitText(input.result) ?? WORKSPACE_RESTORE_RECOVERING_TEXT : marker.delayed ? WORKSPACE_RESTORE_DELAYED_TEXT : WORKSPACE_RESTORE_RECOVERED_TEXT,
       ...(input.savedPlan ? ["The saved plan is available."] : [])]
     : [input.savedPlan
       ? "Workspace restore failed after the plan was saved. The saved plan is available."
