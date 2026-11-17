@@ -1,3 +1,4 @@
+import { assertNoOpenTransaction } from "@paperclipai/db/transaction-context";
 import { measureRunPhase } from "../execution-preparation-timing.js";
 import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { createHash } from "node:crypto";
@@ -91,6 +92,7 @@ export function createPluginRunnerTaskOwner(input: {
     input.configuredEnvironmentVersion === 1 && launchesRunner ? { configuredEnvironment: { ...input.configuredEnvironment } } : {};
   let configuredEnvironmentDelivered: boolean | undefined = input.adoptIdentity ? undefined : false;
   const call = async (operation: PluginEnvironmentTaskOperation) => {
+    assertNoOpenTransaction(`boat:task_${operation.kind}`);
     const phase = ({ prepare: "execution.plugin_prepare", check_project_auth: "execution.plugin_project_auth",
       submit: "execution.plugin_submit", connection: "execution.plugin_connection" } as const)[operation.kind as "prepare" | "check_project_auth" | "submit" | "connection"];
     return parseEnvironmentTaskResult(operation, taskId, await measureNativeControllerStep(`boat_${operation.kind}`, () => phase

@@ -23,6 +23,9 @@ type SupertestTestConstructor = {
   };
 };
 
+// A provider, Boat or runner call inside an open DB transaction throws in tests (transaction-context.ts).
+process.env.PAPERCLIP_TX_NETWORK_GUARD ??= "throw";
+
 // Keep the original home available only for read-only host port-lease checks.
 process.env.PAPERCLIP_TEST_HOST_HOME ??= process.env.PAPERCLIP_HOME?.trim() || path.join(os.homedir(), ".paperclip");
 
