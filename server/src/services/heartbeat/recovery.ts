@@ -32,7 +32,8 @@ import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { listExpiredNativeRunnerAuthorities } from "../native-runtime/native-runner-checkpoint.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
-import { preserveCancelledNativeWorkspaces, preserveOrphanedNativeWorkspace } from "../native-runtime/native-failed-workspace-recovery.js";
+import { admittedNativeResourceDisposition, nativeStopWorkspaceOutcome, preserveCancelledNativeWorkspaces, preserveOrphanedNativeWorkspace } from "../native-runtime/native-failed-workspace-recovery.js";
+import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
 import { hasNativeWorkspaceExportResume } from "../native-runtime/native-workspace-export-resume.js";
 import { nativeWorkspaceExportPendingForLease, pendingNativeWorkspaceFinalizationCondition } from "../native-runtime/native-workspace-finalization-state.js";
 import { expireAbandonedWorkspaceFileHoldsWhenDue, parkAbandonedWorkspaceFilesLease, recordAbandonedWorkspaceFilesRemoved } from "../remote-workspace-abandoned-files-hold.js";
@@ -1663,6 +1664,22 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       );
   }
 
+  // A controller that died after a person's acknowledged run-only Stop but
+  // before the lease release saved no deferral. A warm (keep_running) reusable
+  // box gets the disposition its own teardown would have used, through the
+  // shared Stop policy: the handoff keeps it running, an unprovable handoff
+  // stops and retains it. Destroy would preserve files the box still holds and
+  // withhold the next message. Every other cancelled run keeps destroy.
+  function crashedStopDisposition(run: { id: string; companyId: string; status: string; nativeIssueId: string | null;
+    resultJson: Record<string, unknown> | null; runnerProfileJson: Record<string, unknown> | null },
+    lease: typeof environmentLeases.$inferSelect): "keep_running" | "stop_and_retain" | "destroy" {
+    if (run.status !== "cancelled" || !hasAcknowledgedNativeRunStopRequest(run)
+      || !["reuse_by_environment", "reuse_by_execution_workspace"].includes(lease.leasePolicy)
+      || admittedNativeResourceDisposition(run.runnerProfileJson) !== "keep_running") return "destroy";
+    return nativeStopWorkspaceOutcome({ admittedDisposition: "keep_running", stopped: true, source: lease }) === "handoff"
+      ? "keep_running" : "stop_and_retain";
+  }
+
   async function retryTerminalRunLeaseRelease(lease: typeof environmentLeases.$inferSelect,
     localRuns: { has(runId: string): boolean }, onDeferredDeadline?: (at: number) => void): Promise<boolean> {
     if (!lease.heartbeatRunId || localRuns.has(lease.heartbeatRunId)) return false;
@@ -1674,7 +1691,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     }
     const [run] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
       status: heartbeatRuns.status, error: heartbeatRuns.error, runtimeMode: heartbeatRuns.runtimeMode,
-      controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt })
+      controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt, nativeIssueId: heartbeatRuns.nativeIssueId,
+      resultJson: heartbeatRuns.resultJson, runnerProfileJson: heartbeatRuns.runnerProfileJson })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, lease.companyId)));
     if (!run || !HEARTBEAT_RUN_TERMINAL_STATUSES.some(status => status === run.status)) return false;
     if (!deferral && !(run.runtimeMode === "native" && run.status === "cancelled")) return false;
@@ -1688,7 +1706,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     }
     await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId, agentId: run.agentId,
       status: run.status, failureReason: run.error ?? undefined,
-      providerResourceDisposition: deferral ? deferral.providerResourceDisposition ?? undefined : "destroy" });
+      providerResourceDisposition: deferral ? deferral.providerResourceDisposition ?? undefined : crashedStopDisposition(run, lease) });
     const [after] = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata })
       .from(environmentLeases).where(eq(environmentLeases.id, lease.id));
     if (after?.status !== "active") return true;
