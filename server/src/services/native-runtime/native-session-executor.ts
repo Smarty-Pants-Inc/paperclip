@@ -2044,7 +2044,13 @@ export function createGovernedWaitEventObservation(
       const payload = record(event.payload);
       providerLost ||= event.eventType === "runtime_request.expired" && payload.reason === "provider_process_lost";
       const kind = payload.kind;
-      const tool = ["dynamicToolCall", "mcpToolCall", "commandExecution"].includes(String(kind));
+      // Pi and Cursor Cloud report every tool execution as kind "tool" (bash
+      // stays commandExecution). Pi starts a whole batch before its host
+      // callbacks reach the Runner one at a time, so a question's answered
+      // callback must not park the turn while a sibling still runs: that
+      // sibling's callback would never get a result and the Runner's saved
+      // state would keep it pending.
+      const tool = ["dynamicToolCall", "mcpToolCall", "commandExecution", "tool"].includes(String(kind));
       if (event.itemId) {
         if (tool && event.eventType === "item.started") pendingTools.add(event.itemId);
         // Terminal error events can omit kind; the tracked ID owns cleanup.
