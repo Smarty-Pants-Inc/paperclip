@@ -5,7 +5,7 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
-import { ensurePostgresDatabase } from "./client.js";
+import { applyPendingMigrations, ensurePostgresDatabase, inspectMigrations } from "./client.js";
 import {
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   getEmbeddedPostgresTestSupport,
@@ -37,6 +37,52 @@ async function createSiblingDatabase(connectionString: string, databaseName: str
   const targetUrl = new URL(connectionString);
   targetUrl.pathname = `/${databaseName}`;
   return targetUrl.toString();
+}
+
+async function readSchemaCatalog(sql: postgres.Sql) {
+  await sql`SET search_path = pg_catalog`;
+  const constraints = await sql`
+    SELECT n.nspname AS schema_name, t.relname AS table_name, c.conname,
+           c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition
+    FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+    ORDER BY n.nspname, t.relname, c.conname
+  `;
+  const indexes = await sql`
+    SELECT schemaname, tablename, indexname, indexdef FROM pg_indexes
+    WHERE schemaname <> 'information_schema' AND schemaname !~ '^pg_'
+    ORDER BY schemaname, tablename, indexname
+  `;
+  const columns = await sql`
+    SELECT n.nspname AS schema_name, t.relname AS table_name, a.attname,
+           format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull,
+           a.attidentity, pg_get_expr(d.adbin, d.adrelid) AS default_expression
+    FROM pg_attribute a
+    JOIN pg_class t ON t.oid = a.attrelid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    LEFT JOIN pg_attrdef d ON d.adrelid = t.oid AND d.adnum = a.attnum
+    WHERE t.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped
+      AND n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+    ORDER BY n.nspname, t.relname, a.attnum
+  `;
+  const statistics = await sql`
+    SELECT n.nspname AS schema_name, s.stxname, s.stxstattarget,
+           pg_get_statisticsobjdef(s.oid) AS definition
+    FROM pg_statistic_ext s JOIN pg_namespace n ON n.oid = s.stxnamespace
+    WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+    ORDER BY n.nspname, s.stxname
+  `;
+  return { constraints: [...constraints], indexes: [...indexes], columns: [...columns], statistics: [...statistics] };
+}
+
+function recordSchemaCatalogs(name: string, source: unknown, restored: unknown) {
+  const directory = process.env.BACKUP_FIDELITY_EVIDENCE_DIR;
+  if (!directory) return;
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, `${name}-source.json`), JSON.stringify(source, null, 2));
+  fs.writeFileSync(path.join(directory, `${name}-restored.json`), JSON.stringify(restored, null, 2));
 }
 
 afterEach(async () => {
@@ -76,6 +122,145 @@ describe("createBufferedTextFileWriter", () => {
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it("round-trips CHECK, exclusion, NULLS NOT DISTINCT and extended statistics with data", async () => {
+    const cluster = await createTempDatabase();
+    const source = await createSiblingDatabase(cluster, "constraint_source");
+    const target = await createSiblingDatabase(cluster, "constraint_restore");
+    const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+    const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+    try {
+      await sourceSql.unsafe(`
+        CREATE SCHEMA fidelity;
+        CREATE SCHEMA statistics_only;
+        CREATE FUNCTION fidelity.is_positive(integer) RETURNS boolean
+          LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+        CREATE TABLE fidelity.records (
+          id integer CONSTRAINT records_pk PRIMARY KEY DEFERRABLE INITIALLY DEFERRED,
+          slot text,
+          score integer NOT NULL DEFAULT 1,
+          span int4range,
+          CONSTRAINT positive_score CHECK (fidelity.is_positive(score)),
+          CONSTRAINT unique_slot UNIQUE NULLS NOT DISTINCT (slot) INCLUDE (score) DEFERRABLE,
+          CONSTRAINT nonoverlapping_span EXCLUDE USING gist (span WITH &&) DEFERRABLE INITIALLY DEFERRED
+        );
+        INSERT INTO fidelity.records VALUES (1, NULL, 1, '[1,3)'), (2, 'second', 2, '[3,5)');
+        ALTER TABLE fidelity.records ADD CONSTRAINT unvalidated_score CHECK (score > 10) NOT VALID;
+        CREATE STATISTICS statistics_only.record_stats (dependencies, ndistinct, mcv)
+          ON slot, score FROM fidelity.records;
+        ALTER STATISTICS statistics_only.record_stats SET STATISTICS 123;
+        CREATE STATISTICS fidelity.expression_stats ON (fidelity.is_positive(score)), slot FROM fidelity.records;
+        CREATE TABLE fidelity.parent (a integer, b integer, UNIQUE (a, b));
+        CREATE TABLE fidelity.child (a integer, b integer,
+          CONSTRAINT full_fk FOREIGN KEY (a, b) REFERENCES fidelity.parent (a, b) MATCH FULL
+            DEFERRABLE INITIALLY DEFERRED);
+        ALTER TABLE fidelity.child ADD CONSTRAINT unvalidated_fk FOREIGN KEY (a, b)
+          REFERENCES fidelity.parent (a, b) NOT VALID;
+        INSERT INTO fidelity.parent VALUES (1, 2);
+        INSERT INTO fidelity.child VALUES (1, 2);
+        ALTER DATABASE constraint_source SET search_path = fidelity, public;
+      `);
+      const backup = await runDatabaseBackup({ connectionString: source,
+        backupDir: createTempDir("constraint-fidelity-"), backupEngine: "javascript",
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      const sourceCatalog = await readSchemaCatalog(sourceSql);
+      const restoredCatalog = await readSchemaCatalog(targetSql);
+      recordSchemaCatalogs("constraints", sourceCatalog, restoredCatalog);
+      expect.soft(restoredCatalog.constraints).toEqual(sourceCatalog.constraints);
+      expect.soft(restoredCatalog.statistics).toEqual(sourceCatalog.statistics);
+      expect.soft(restoredCatalog.indexes).toEqual(sourceCatalog.indexes);
+      expect.soft(restoredCatalog.columns).toEqual(sourceCatalog.columns);
+      expect(await targetSql`SELECT id FROM fidelity.records ORDER BY id`).toEqual([{ id: 1 }, { id: 2 }]);
+      await expect(targetSql`INSERT INTO fidelity.records VALUES (3, 'bad', -1, '[8,9)')`)
+        .rejects.toThrow('positive_score');
+      await expect(targetSql`INSERT INTO fidelity.records VALUES (3, NULL, 20, '[8,9)')`)
+        .rejects.toThrow('unique_slot');
+      await expect(targetSql`INSERT INTO fidelity.records VALUES (3, 'third', 20, '[2,4)')`)
+        .rejects.toThrow('nonoverlapping_span');
+      const backupSql = gunzipSync(fs.readFileSync(backup.backupFile)).toString("utf8");
+      expect(backupSql.indexOf('ADD CONSTRAINT "positive_score"')).toBeGreaterThan(
+        backupSql.lastIndexOf('INSERT INTO "fidelity"."records"'));
+    } finally {
+      await sourceSql.end();
+      await targetSql.end();
+    }
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("skips extended statistics cleanly when the server deparser is unavailable", async () => {
+    const cluster = await createTempDatabase();
+    const source = await createSiblingDatabase(cluster, "statistics_unavailable_source");
+    const target = await createSiblingDatabase(cluster, "statistics_unavailable_restore");
+    const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+    const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+    try {
+      await sourceSql.unsafe(`
+        CREATE TABLE public.records (a integer, b integer);
+        INSERT INTO public.records VALUES (1, 2);
+        CREATE STATISTICS public.record_stats ON a, b FROM public.records;
+        ALTER FUNCTION pg_catalog.pg_get_statisticsobjdef(oid) RENAME TO unavailable_statistics_deparser;
+      `);
+      const backup = await runDatabaseBackup({ connectionString: source,
+        backupDir: createTempDir("statistics-unavailable-"), backupEngine: "javascript",
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      expect(await targetSql`SELECT a, b FROM public.records`).toEqual([{ a: 1, b: 2 }]);
+      expect(await targetSql`SELECT stxname FROM pg_statistic_ext`).toEqual([]);
+    } finally {
+      await sourceSql.end();
+      await targetSql.end();
+    }
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("rejects and rolls back a restore when transformed data violates a validated CHECK", async () => {
+    const cluster = await createTempDatabase();
+    const source = await createSiblingDatabase(cluster, "invalid_check_source");
+    const target = await createSiblingDatabase(cluster, "invalid_check_restore");
+    const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+    const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+    try {
+      await sourceSql.unsafe(`
+        CREATE TABLE public.records (value text CONSTRAINT required_value CHECK (value IS NOT NULL));
+        INSERT INTO public.records VALUES ('present');
+      `);
+      const backup = await runDatabaseBackup({ connectionString: source,
+        backupDir: createTempDir("invalid-check-"), backupEngine: "javascript",
+        nullifyColumns: { records: ["value"] },
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      await expect(runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile }))
+        .rejects.toThrow('required_value');
+      expect(await targetSql`SELECT to_regclass('public.records') AS table_name`).toEqual([{ table_name: null }]);
+    } finally {
+      await sourceSql.end();
+      await targetSql.end();
+    }
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("round-trips the complete migrated schema catalog through the JavaScript engine", async () => {
+    const cluster = await createTempDatabase();
+    const source = await createSiblingDatabase(cluster, "migrated_source");
+    const target = await createSiblingDatabase(cluster, "migrated_restore");
+    const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+    const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+    try {
+      await applyPendingMigrations(source);
+      const migrationState = await inspectMigrations(source);
+      expect(migrationState.status).toBe("upToDate");
+      expect(migrationState.appliedMigrations).toEqual(migrationState.availableMigrations);
+      const sourceCatalog = await readSchemaCatalog(sourceSql);
+      expect(sourceCatalog.constraints.filter(c => c.contype === "c").length).toBeGreaterThan(0);
+      const backup = await runDatabaseBackup({ connectionString: source,
+        backupDir: createTempDir("migrated-fidelity-"), backupEngine: "javascript",
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      const restoredCatalog = await readSchemaCatalog(targetSql);
+      recordSchemaCatalogs("migrated", sourceCatalog, restoredCatalog);
+      expect(restoredCatalog).toEqual(sourceCatalog);
+    } finally {
+      await sourceSql.end();
+      await targetSql.end();
+    }
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
   it("preserves a post-pg_dump verification error without falling back or pruning", async () => {
     const connectionString = await createTempDatabase();
     const backupDir = createTempDir("checkpoint-pg-dump-");
