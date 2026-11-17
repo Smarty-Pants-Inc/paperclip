@@ -4286,14 +4286,16 @@ export function recoveryService(
     const leases = await tx.select().from(environmentLeases).where(and(
       eq(environmentLeases.companyId, issue.companyId), inArray(environmentLeases.heartbeatRunId, ownerRunIds),
     ));
-    // Same lease family as the shared Stop guard, including pending cleanup
-    // and release deferrals. Cleanup remains its existing owner's duty.
+    // Same lease family as the shared Stop guard, including pending cleanup.
+    // Only ordinary release deferrals qualify below; cleanup stays owner-held.
     const blockers = leases.filter(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) ||
       lease.status === "pending_cleanup" || lease.cleanupStatus === "failed");
     if (!blockers.length) return false;
     const now = Date.now();
     let next = now + 30_000;
     for (const lease of blockers) {
+      const deferral = parseObject(lease.metadata?.releaseDeferral);
+      if (lease.metadata?.releaseDeferral !== undefined && !(deferral.reason === "release_failed" || (deferral.reason === "release_skipped" && lease.status === "active"))) return false;
       let expiry = lease.expiresAt?.getTime();
       if (expiry === undefined) {
         const [environment] = lease.environmentId ? await tx.select({ config: environments.config }).from(environments)

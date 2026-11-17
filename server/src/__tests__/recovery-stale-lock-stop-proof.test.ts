@@ -220,10 +220,52 @@ describe("stale-lock sweep requires execution Stop proof", () => {
   it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted"] as const)("does not infer a Stop request from terminal status %s", async status => {
     const f = await warmFixture();
     await db.update(heartbeatRuns).set({ status, resultJson: { stopReason: "cancelled" } }).where(eq(heartbeatRuns.id, f.runId));
-    await db.update(environmentLeases).set({ metadata: { releaseDeferral: { reason: "save_failed", attempts: 1,
+    await db.update(environmentLeases).set({ metadata: { releaseDeferral: { reason: "release_failed", attempts: 1,
       retryAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
     await inspect(f, "sweep");
     expect(await stopActions(f.issueId)).toEqual([]);
+  });
+
+  it.each((["sweep", "stranded"] as const).flatMap(path => ([
+    ["release_skipped", true], ["release_failed", true],
+    ["workspace_owner_active", false], ["workspace_retention_busy", false],
+    ["future_release_reason", false], ["warm_session_busy", false], ["warm_session_close_failed", false],
+  ] as const).map(([reason, allowed]) => [path, reason, allowed] as const)))(
+    "%s release deferral %s allowed=%s", async (path, reason, allowed) => {
+      const f = await warmFixture(path === "stranded");
+      await db.update(environmentLeases).set({ metadata: { releaseDeferral: { reason, attempts: 1,
+        retryAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
+      const before = await task(f.issueId);
+      await inspect(f, path);
+      expect(await task(f.issueId)).toEqual(before);
+      const actions = await stopActions(f.issueId);
+      if (allowed) expect(actions).toEqual([]);
+      else expect(actions).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+    });
+
+  it.each(["release_skipped", "release_failed"] as const)("bounds allow-listed %s by expiry plus five minutes", async reason => {
+    const f = await warmFixture();
+    await db.update(environmentLeases).set({ expiresAt: new Date(Date.now() - 240_000),
+      metadata: { releaseDeferral: { reason, attempts: 1, retryAt: new Date().toISOString() } } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    const before = await task(f.issueId);
+    await inspect(f, "sweep");
+    expect(await stopActions(f.issueId)).toEqual([]);
+    await db.update(environmentLeases).set({ expiresAt: new Date(Date.now() - 301_000) })
+      .where(eq(environmentLeases.id, f.lease.id));
+    await inspect(f, "sweep");
+    expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+    expect(await task(f.issueId)).toEqual(before);
+  });
+
+  it("does not allow release_skipped on a lease that is no longer active", async () => {
+    const f = await warmFixture();
+    await db.update(environmentLeases).set({ status: "pending_cleanup",
+      metadata: { releaseDeferral: { reason: "release_skipped", attempts: 1, retryAt: new Date().toISOString() } } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    await inspect(f, "sweep");
+    expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
   });
 
   it("retains a recorded pause request even on a succeeded run", async () => {
@@ -349,16 +391,27 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     expect(logs.filter(log => log.action === "issue.execution_stop_confirmed")).toHaveLength(0);
   });
 
-  it("never resolves a real unproven Stop just because a later chat answered", async () => {
+  it.each([false, true])("never resolves a real unproven Stop after a later success, even when old locks are gone=%s", async noLocks => {
     const f = await warmFixture();
     await existingCard(f, true);
+    const before = await stopActions(f.issueId);
     await laterAnswer(f);
-    await inspect(f, "sweep");
-    expect(await stopActions(f.issueId)).toMatchObject([{ status: "escalated" }]);
+    if (noLocks) await db.update(issues).set({ checkoutRunId: null, executionRunId: null }).where(eq(issues.id, f.issueId));
+    const beforeTask = await task(f.issueId);
+    for (let tick = 0; tick < 2; tick++) {
+      await inspect(f, "sweep");
+      expect(await stopActions(f.issueId)).toEqual(before);
+      expect(await task(f.issueId)).toEqual(beforeTask);
+      expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    }
+    const logs = await db.select().from(activityLog).where(eq(activityLog.entityId, f.issueId));
+    expect(logs.filter(log => log.action === "issue.execution_stop_pending_resolved")).toHaveLength(0);
+    expect(logs.filter(log => log.action === "issue.execution_stop_confirmed")).toHaveLength(0);
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
       .where(eq(environmentLeases.id, f.lease.id));
     await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
-    expect(await stopActions(f.issueId)).toMatchObject([{ status: "resolved", outcome: "restored" }]);
+    expect(await stopActions(f.issueId)).toMatchObject([{ id: before[0]!.id, status: "resolved", outcome: "restored",
+      resolutionNote: "Stop proved under the task and bound-run locks." }]);
   });
   it("resolves an existing no-Stop card once the named lease is released after its binding changes", async () => {
     const f = await warmFixture();
