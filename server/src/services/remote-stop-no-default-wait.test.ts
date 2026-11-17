@@ -7,25 +7,22 @@ import {
   agentWakeupRequests, agents, companies, companyMemberships, createDb, environmentLeases, heartbeatRuns, issueComments,
   issueRecoveryActions, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
+import { providerResourceDispositionForTerminalRun } from "./runner-environment-lifecycle.js";
+import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
 
-// pl/no-default-wait: the Runner-exit proof needs a live Boat Runner; the test
-// stands in only for its boolean answer. Everything else is the real code.
-const proof = vi.hoisted(() => ({ exited: false }));
-vi.mock("./native-runtime/native-session-executor.js", async importOriginal => ({
-  ...await importOriginal<Record<string, unknown>>(),
-  handedOffWarmOwnerRunnerExited: async () => proof.exited,
-  // The same live controller holds the warm session, so its proof is
-  // obtainable (not sas3's restart case): consistent with the stand-in above.
-  handedOffWarmOwnerProofUnavailable: () => false,
-}));
+// adopt-stopu: no handed-off lease. The stopped run's lease is released as its
+// own teardown releases it (runner-environment-lifecycle.ts, the real
+// disposition for a person's Stop of a warm run); a stop_and_retain release of a
+// reuse lease is `released` with the provider's bound stop receipt
+// (environment-runtime.ts releaseRunLease). Everything else is the real code.
 const { heartbeatService } = await import("./heartbeat.js");
 const { issueRoutes } = await import("../routes/issues.js");
 const { errorHandler } = await import("../middleware/index.js");
 const { buildExecutionContinuation } = await import("./execution-continuation.js");
 
 const support = await getEmbeddedPostgresTestSupport();
-(support.supported ? describe : describe.skip)("pl/no-default-wait: Stop with held messages on a warm handed-off box", () => {
+(support.supported ? describe : describe.skip)("pl/no-default-wait (U shape): Stop with held messages on a warm box released stop_and_retain", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   beforeAll(async () => {
@@ -65,8 +62,15 @@ const support = await getEmbeddedPostgresTestSupport();
           intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } } });
     await db.insert(nativeRunFinalizations).values({ runId: sourceRunId, companyId, issueId, phase: "terminal_failure", failureCode: "native_retry_cancelled" });
     const leaseId = randomUUID(), providerLeaseId = "bx_warm";
-    await db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId,
-      status: "retained", leasePolicy: "reuse_by_environment", cleanupStatus: "success", metadata: {} });
+    const disposition = providerResourceDispositionForTerminalRun("keep_running", "cancelled", "cancelled");
+    const identity = { id: leaseId, companyId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId };
+    await db.insert(environmentLeases).values({ ...identity, leasePolicy: "reuse_by_environment", cleanupStatus: "success",
+      ...(disposition === "stop_and_retain"
+        // The release: released, with Boat's stop receipt landing inside the run's cleanup.
+        ? { status: "released", releasedAt: stoppedAt,
+            metadata: { remoteExecutionTermination: remoteTerminationReceipt(identity, { providerLeaseId, state: "stopped" }) } }
+        // c1x: the warm handoff (retained, still running, no stop receipt).
+        : { status: "retained", metadata: {} }) });
     const base = stoppedAt.getTime() - 3_000;
     const comments = ["M2", "M3", "M4"].map((body, index) => ({ id: randomUUID(), companyId, issueId, authorType: "user" as const,
       authorUserId: "board", body, createdAt: new Date(base + index) }));
@@ -85,7 +89,6 @@ const support = await getEmbeddedPostgresTestSupport();
 
   it("the automatic resume after Stop saves no default wait, keeps the Send line, and Send delivers M2-M4 once", async () => {
     const f = await seed();
-    proof.exited = false; // the automatic pass ran before the Runner's exit was proven
     vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
     await heartbeatService(db).resumeRemoteStopComments(run);
@@ -97,11 +100,11 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(held.payload?.executionWait).toBeUndefined();
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).map(r => r.id)).toEqual([f.sourceRunId]);
     const queue = await readQueue(f);
-    expect(queue.executionWait?.reason).toBe("stopped_by_person");
+    expect(queue.executionWait).toEqual({ reason: "stopped_by_person",
+      message: "Stopped. These messages are waiting: Send them, or delete any first." });
     expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
 
-    // The person's Send: one successor through the existing admission.
-    proof.exited = true;
+    // The person's Send: one successor through the existing admission (same receipt gate).
     const sent = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
       .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
     expect(sent.status).toBeLessThan(300);
@@ -117,5 +120,32 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(done.status).not.toBe("deferred_issue_execution");
     expect((done.payload?.executionWait as { reason?: string } | undefined)?.reason).not.toBe("execution_recovery");
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toHaveLength(0);
+  }, 60_000);
+  // adopt-stopu U5 (RED at c1x: the warm handoff leaves no stop receipt, so the
+  // admission gate explicit-native-continuation.ts remote_cleanup holds the wake).
+  it("U5: after the stop_and_retain release no wake waits on remote_cleanup; the +0 message is woken and admitted", async () => {
+    const f = await seed();
+    const after = { id: randomUUID(), companyId: f.companyId, issueId: f.issueId, authorType: "user" as const,
+      authorUserId: "board", body: "Next message", createdAt: new Date() };
+    await db.insert(issueComments).values(after);
+    // The +0 next message, held while the stopped turn was still cleaning up.
+    const nextId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: nextId, companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "board",
+      requestedAt: new Date(),
+      payload: { issueId: f.issueId, commentId: after.id, _paperclipWakeContext: { wakeCommentIds: [after.id], wakeReason: "issue_commented" } } });
+    // The end of the stopped run's cleanup (heartbeat.ts -> run-control.ts resumeRemoteStopComments).
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await heartbeatService(db).resumeRemoteStopComments(run);
+    const waits = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+      .map(wake => (wake.payload as Record<string, any> | null)?.executionWait?.reason ?? null);
+    expect(waits).not.toContain("remote_cleanup");
+    await vi.waitFor(async () => {
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => r.id !== f.sourceRunId);
+      expect(runs).toHaveLength(1);
+    }, { timeout: 15_000, interval: 200 });
+    expect((await wakeOf(nextId)).status).not.toBe("deferred_issue_execution");
+    // The pre-Stop held messages are not started by the automatic pass (Send-only).
+    expect((await wakeOf(f.queueId)).status).toBe("deferred_issue_execution");
   }, 60_000);
 });
