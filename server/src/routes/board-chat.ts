@@ -1,6 +1,7 @@
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import { enqueueFastResponse, supersedeFastResponse } from "../services/fast-responses.js";
 import { Router } from "express";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -65,12 +66,9 @@ export function isConciergeReply(comment: {
 export const MAX_CONCURRENT_BOARD_CHATS = 3;
 export const BOARD_CHAT_MAX_CONCURRENT_ENV = "PAPERCLIP_BOARD_CHAT_MAX_CONCURRENT";
 
-/** Missing or invalid settings preserve the upstream board-chat concurrency cap. */
+/** Absence preserves the upstream cap; malformed settings refuse startup. */
 export function resolveBoardChatMaxConcurrent(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[BOARD_CHAT_MAX_CONCURRENT_ENV]?.trim();
-  if (!raw || !/^\d+$/.test(raw)) return MAX_CONCURRENT_BOARD_CHATS;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) && value > 0 ? value : MAX_CONCURRENT_BOARD_CHATS;
+  return readPositiveIntegerEnvironment(env, BOARD_CHAT_MAX_CONCURRENT_ENV, MAX_CONCURRENT_BOARD_CHATS);
 }
 
 export function boardChatRoutes(

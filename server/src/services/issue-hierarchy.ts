@@ -1,15 +1,13 @@
 import { and, eq, sql } from "drizzle-orm";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { issues, type Db } from "@paperclipai/db";
 import { MAX_AGENT_TASK_HIERARCHY_DEPTH, type IssueParentAdjustment } from "@paperclipai/shared";
 
 export const AGENT_TASK_HIERARCHY_DEPTH_ENV = "PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH";
 
-/** Missing or invalid settings preserve the upstream agent hierarchy limit. */
+/** Absence preserves the upstream limit; malformed settings refuse startup. */
 export function resolveAgentTaskHierarchyDepth(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[AGENT_TASK_HIERARCHY_DEPTH_ENV]?.trim();
-  if (!raw || !/^\d+$/.test(raw)) return MAX_AGENT_TASK_HIERARCHY_DEPTH;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) && value > 0 ? value : MAX_AGENT_TASK_HIERARCHY_DEPTH;
+  return readPositiveIntegerEnvironment(env, AGENT_TASK_HIERARCHY_DEPTH_ENV, MAX_AGENT_TASK_HIERARCHY_DEPTH);
 }
 
 /**

@@ -29,13 +29,13 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH` | `/opt/paperclip-runner/provider-pack` in Docker; otherwise unset | Host-local path to the immutable provider pack built by `pnpm --filter @paperclipai/paperclip-runner build:provider-pack`. Stamped standard Docker images include the pack; downstream compositions and the `cloud` target inherit it. Unstamped local Docker builds skip pack generation. The pack includes its target-built Node 24.11+ runtime, locked production dependencies, OpenCode proxy/executable, and ACPX sidecar. Remote OpenCode and ACPX fail closed without it. A preinstalled pack is accepted only when its complete digested manifest matches this build-owned pack; otherwise Paperclip stages this pack into the sandbox. |
 | `PAPERCLIP_HIDDEN_SETTINGS` | (unset) | Comma-separated settings surfaces to hide from the UI and floor at the API, for operators hosting Paperclip for others (managed cloud, internal shared server). See [Hiding settings surfaces](#hiding-settings-surfaces). |
 | `PAPERCLIP_SETTING_DEFAULTS` | (unset) | JSON object replacing the schema default of selected instance settings, for hosting operators. See [Operator setting defaults](#operator-setting-defaults). |
-| `PAPERCLIP_CROSS_ISSUE_INFLUENCE_LIMIT` | `20` | Maximum number of writes one heartbeat run can make to issues other than its source issue. The value is a positive integer and applies to every agent on the server. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
-| `PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH` | `2` | Maximum depth of agent-created task trees (root depth is 1); board-created trees are exempt. Re-parented creates return `parentAdjusted` and `parentAdjustmentWarning`, with an `issue.parent_adjusted` activity entry in the same transaction. The value is a positive integer and applies to every agent on the server. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
-| `PAPERCLIP_MAX_ACTIVE_CHILD_ISSUES` | `25` | Maximum active (not done or cancelled) children per parent created through the child helper. The value is a positive integer and applies server-wide. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
-| `PAPERCLIP_MAX_PLAN_DECOMPOSITION_CHILDREN` | `25` | Maximum children per accepted-plan decomposition request, injected into server validation and OpenAPI; the shared/browser schema keeps its default of 25. The active-child helper limit applies independently. The value is a positive integer. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
-| `PAPERCLIP_BOARD_CHAT_MAX_CONCURRENT` | `3` | Maximum concurrent board concierge chats per server. The value is a positive integer. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
-| `PAPERCLIP_STATUS_CARD_AGENT_MAX_CARDS` | `20` | Maximum status cards authored by one agent over its lifetime, including archived cards. The value is a positive integer and applies to every agent on the server. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
-| `PAPERCLIP_FRESH_CONTINUATIONS_PER_CHAIN` | `2` | Maximum automatic fresh continuations per source-run chain, counted durably across restarts; the separate 6-per-task hourly limit still applies. The value is a positive integer. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
+| `PAPERCLIP_CROSS_ISSUE_INFLUENCE_LIMIT` | `20` | Maximum number of writes one heartbeat run can make to issues other than its source issue. Applies to every agent on the server. Only absence uses the default; malformed values stop startup (see cap configuration below). |
+| `PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH` | `2` | Maximum depth of agent-created task trees (root depth is 1); board-created trees are exempt. Re-parented creates return `parentAdjusted` and `parentAdjustmentWarning`, with an `issue.parent_adjusted` activity entry in the same transaction. Applies to every agent on the server. Only absence uses the default; malformed values stop startup (see cap configuration below). |
+| `PAPERCLIP_MAX_ACTIVE_CHILD_ISSUES` | `25` | Maximum active (not done or cancelled) children per parent created through the child helper. Applies server-wide. Only absence uses the default; malformed values stop startup (see cap configuration below). |
+| `PAPERCLIP_MAX_PLAN_DECOMPOSITION_CHILDREN` | `25` | Maximum children per accepted-plan decomposition request, injected into server validation and OpenAPI; the shared/browser schema keeps its default of 25. The active-child helper limit applies independently. Only absence uses the default; malformed values stop startup (see cap configuration below). |
+| `PAPERCLIP_BOARD_CHAT_MAX_CONCURRENT` | `3` | Maximum concurrent board concierge chats per server. Only absence uses the default; malformed values stop startup (see cap configuration below). |
+| `PAPERCLIP_STATUS_CARD_AGENT_MAX_CARDS` | `20` | Maximum status cards authored by one agent over its lifetime, including archived cards. Applies to every agent on the server. Only absence uses the default; malformed values stop startup (see cap configuration below). |
+| `PAPERCLIP_FRESH_CONTINUATIONS_PER_CHAIN` | `2` | Maximum automatic fresh continuations per source-run chain, counted durably across restarts; the separate 6-per-task hourly limit still applies. Only absence uses the default; malformed values stop startup (see cap configuration below). |
 
 Daytona connectivity for `paperclip_runner` uses authenticated provider
 WebSocket ingress and follows the instance experimental setting
@@ -45,6 +45,15 @@ runs retain their recovery path. The deprecated `enableRunnerPreviewIngress`
 key remains accepted in stored and managed configuration for version-skew
 compatibility, but it has no runtime effect. The setting has no effect on
 legacy adapters or callback bridges.
+
+### Cap configuration
+
+The cap settings above accept positive safe integers (at most `9007199254740991`).
+Surrounding whitespace and leading zeroes are accepted. Only an absent variable
+uses its documented default. Explicit empty or whitespace-only strings, zero,
+negative numbers, fractions, exponent notation, trailing junk, and overflow stop
+startup with `Invalid <ENV_VAR>: expected a positive safe integer.`, naming the
+exact variable. A malformed value never silently restores the old cap.
 
 ### Webhook-only chat ingress
 

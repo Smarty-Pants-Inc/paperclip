@@ -68,6 +68,7 @@ import {
 import { Buffer } from "node:buffer";
 import { isDeepStrictEqual } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
 import { markdownToPlainText, parseMarkdown } from "chat";
@@ -303,12 +304,9 @@ const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
 export const MAX_ACTIVE_CHILD_ISSUES_ENV = "PAPERCLIP_MAX_ACTIVE_CHILD_ISSUES";
 
-/** Missing or invalid settings preserve the upstream active-child limit. */
+/** Absence preserves the upstream limit; malformed settings refuse startup. */
 export function resolveMaxActiveChildIssues(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[MAX_ACTIVE_CHILD_ISSUES_ENV]?.trim();
-  if (!raw || !/^\d+$/.test(raw)) return MAX_CHILD_ISSUES_CREATED_BY_HELPER;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) && value > 0 ? value : MAX_CHILD_ISSUES_CREATED_BY_HELPER;
+  return readPositiveIntegerEnvironment(env, MAX_ACTIVE_CHILD_ISSUES_ENV, MAX_CHILD_ISSUES_CREATED_BY_HELPER);
 }
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;

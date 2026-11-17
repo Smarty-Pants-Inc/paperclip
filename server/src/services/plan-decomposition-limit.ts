@@ -1,14 +1,12 @@
 import { createAcceptedPlanDecompositionSchemaWithLimit } from "@paperclipai/shared";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 
 export const MAX_PLAN_DECOMPOSITION_CHILDREN = 25;
 export const MAX_PLAN_DECOMPOSITION_CHILDREN_ENV = "PAPERCLIP_MAX_PLAN_DECOMPOSITION_CHILDREN";
 
-/** Missing or invalid settings preserve the upstream per-request plan limit. */
+/** Absence preserves the upstream limit; malformed settings refuse startup. */
 export function resolveMaxPlanDecompositionChildren(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[MAX_PLAN_DECOMPOSITION_CHILDREN_ENV]?.trim();
-  if (!raw || !/^\d+$/.test(raw)) return MAX_PLAN_DECOMPOSITION_CHILDREN;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) && value > 0 ? value : MAX_PLAN_DECOMPOSITION_CHILDREN;
+  return readPositiveIntegerEnvironment(env, MAX_PLAN_DECOMPOSITION_CHILDREN_ENV, MAX_PLAN_DECOMPOSITION_CHILDREN);
 }
 
 /** The server injects its limit; the shared/browser default remains 25. */

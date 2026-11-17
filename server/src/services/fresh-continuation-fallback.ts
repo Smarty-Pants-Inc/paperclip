@@ -7,6 +7,7 @@ import {
   EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type ExecutionReconciliation,
 } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { logActivity } from "./activity-log.js";
 import { taskHistoryReadsForRun } from "./queued-comment-delivery.js";
 import { undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
@@ -81,12 +82,9 @@ export const FRESH_CONTINUATIONS_PER_HOUR = 6;
 export const FRESH_CONTINUATIONS_PER_CHAIN = 2;
 export const FRESH_CONTINUATIONS_PER_CHAIN_ENV = "PAPERCLIP_FRESH_CONTINUATIONS_PER_CHAIN";
 
-/** Missing or invalid settings preserve the existing durable chain limit. */
+/** Absence preserves the existing limit; malformed settings refuse startup. */
 export function resolveFreshContinuationsPerChain(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[FRESH_CONTINUATIONS_PER_CHAIN_ENV]?.trim();
-  if (!raw || !/^\d+$/.test(raw)) return FRESH_CONTINUATIONS_PER_CHAIN;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) && value > 0 ? value : FRESH_CONTINUATIONS_PER_CHAIN;
+  return readPositiveIntegerEnvironment(env, FRESH_CONTINUATIONS_PER_CHAIN_ENV, FRESH_CONTINUATIONS_PER_CHAIN);
 }
 export const FRESH_CONTINUATION_WINDOW_MS = 60 * 60_000;
 const PERSON_RECHECK_MS = 60 * 60_000;

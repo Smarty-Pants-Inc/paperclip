@@ -1,6 +1,7 @@
 import { notifyStatusCardEvaluation } from "./status-card-notifications.js";
 import { issueDisplayStatusSql } from "./issue-display-status.js";
 import { createHash } from "node:crypto";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { and, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, ne, or, sql, type SQL } from "drizzle-orm";
 import {
   agents,
@@ -49,12 +50,9 @@ import {
 
 export const STATUS_CARD_AGENT_MAX_CARDS_ENV = "PAPERCLIP_STATUS_CARD_AGENT_MAX_CARDS";
 
-/** Missing or invalid settings preserve the upstream lifetime author limit. */
+/** Absence preserves the upstream limit; malformed settings refuse startup. */
 export function resolveStatusCardAgentMaxCards(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[STATUS_CARD_AGENT_MAX_CARDS_ENV]?.trim();
-  if (!raw || !/^\d+$/.test(raw)) return STATUS_CARD_AGENT_MAX_CARDS;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) && value > 0 ? value : STATUS_CARD_AGENT_MAX_CARDS;
+  return readPositiveIntegerEnvironment(env, STATUS_CARD_AGENT_MAX_CARDS_ENV, STATUS_CARD_AGENT_MAX_CARDS);
 }
 
 type StatusCardActor = { agentId: string | null; userId: string | null };
