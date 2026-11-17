@@ -17,6 +17,25 @@ function allRows(metadata: { sections: Array<{ rows: unknown[] }> }) {
 }
 
 describe("stranded recovery notice seeds", () => {
+  // Keep: recorded gate-1 catch, one setup failure falsely claimed a repeated failure.
+  it.each([undefined, 0, 1])("one-note: attempts %s never claims the task failed again", (attempts) => {
+    expect(buildNoRunningExecutionNoticeSeed({ status: "todo", attempts }).body).toBe(
+      "Paperclip could not start this task. Press Retry to start it.",
+    );
+    expect(buildNoRunningExecutionNoticeSeed({ status: "in_progress", attempts }).body).toBe(
+      "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
+    );
+  });
+
+  it("one-note: two failures retain the repeated-attempt wording", () => {
+    expect(buildNoRunningExecutionNoticeSeed({ status: "todo", attempts: 2 }).body).toBe(
+      "Paperclip tried to start this task again, but it still could not start after 2 tries. Press Retry to start it again.",
+    );
+    expect(buildNoRunningExecutionNoticeSeed({ status: "in_progress", attempts: 2 }).body).toBe(
+      "Paperclip tried to continue this task again, but it still could not continue after 2 tries. Press Retry to start it again from the saved work.",
+    );
+  });
+
   it("(superseded by replacement: one-note wording, RFL record 00:01Z) says what happened and the one thing to do, with no internal words (the UI recognizes this wording)", () => {
     for (const [seed, expectedBody] of [
       [buildImmediateExecutionPathRecoveryNoticeSeed({ status: "todo" }),

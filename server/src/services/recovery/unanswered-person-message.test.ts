@@ -22,6 +22,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { heartbeatService } from "../heartbeat.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
+import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING } from "./unanswered-person-message.js";
@@ -102,6 +103,89 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
     return sections.flatMap(section => section.rows).find(row => row.label === "Failure code")?.value;
   };
+
+  // Keep: recorded gate-1 catch: one setup_failed run had a Retry notice, then a contradictory resend note.
+  async function setupFailureWithRetryNotice(input: { attempts?: number; actionStatus?: string; deleted?: boolean;
+    noticeRunId?: string; nextAction?: string; linkedActionId?: string; ownerType?: string } = {}) {
+    const f = await fixture({ status: "blocked", chat: false });
+    const messageId = await f.message();
+    const runId = await f.run({ commentId: messageId, status: "failed", errorCode: "setup_failed" });
+    const actionId = await f.boardHold("stranded_assigned_issue", runId, "stranded_assigned_issue");
+    await db.update(issueRecoveryActions).set({ status: input.actionStatus ?? "active", ownerType: input.ownerType ?? "board",
+      nextAction: input.nextAction ?? "Press Retry to start it again from the saved work." })
+      .where(eq(issueRecoveryActions.id, actionId));
+    const notice = buildStrandedRecoveryEscalationNotice({
+      seed: buildNoRunningExecutionNoticeSeed({ status: "in_progress", attempts: input.attempts ?? 1 }),
+      recoveryActionId: input.linkedActionId ?? actionId, recoveryOwner: null,
+      sourceRun: { id: input.noticeRunId ?? runId, status: "failed", errorCode: "setup_failed" },
+    });
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "system", ...notice, createdAt: f.at(), deletedAt: input.deleted ? f.at() : null }).returning();
+    const notes = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
+    return { ...f, messageId, runId, actionId, commentId: comment!.id, notes };
+  }
+
+  it.each(["active", "escalated"])("one-note: a single setup failure with an %s Retry notice has exactly one note after repeated sweeps", async actionStatus => {
+    const f = await setupFailureWithRetryNotice({ actionStatus });
+    for (let pass = 0; pass < 2; pass++) {
+      const outcome = await settleUnansweredPersonMessage(db, f);
+      await f.sweep();
+      const notes = await f.notes();
+      expect(notes).toHaveLength(1);
+      expect(outcome).toEqual({ kind: "explained" });
+      expect(notes[0]!.id).toBe(f.commentId);
+      expect(notes[0]!.body).toBe("Paperclip could not continue this task. Press Retry to start it again from the saved work.");
+      expect(notes[0]!.body.split(".")[0]).not.toContain("again");
+      expect(notes[0]!.metadata?.sourceRunId).toBe(f.runId);
+      expect(notes[0]!.body).not.toContain("Sending it again");
+    }
+  });
+
+  it("one-note: a system-owned recovery action with a Retry remedy also covers its run", async () => {
+    const f = await setupFailureWithRetryNotice({ ownerType: "system" });
+    const outcome = await settleUnansweredPersonMessage(db, f);
+    expect(await f.notes()).toHaveLength(1);
+    expect(outcome).toEqual({ kind: "explained" });
+  });
+
+  it("one-note: a second failure keeps after 2 tries without a second remedy", async () => {
+    const f = await setupFailureWithRetryNotice({ attempts: 2 });
+    const outcome = await settleUnansweredPersonMessage(db, f);
+    const notes = await f.notes();
+    expect(notes).toHaveLength(1);
+    expect(outcome).toEqual({ kind: "explained" });
+    expect(notes[0]!.body).toBe("Paperclip tried to continue this task again, but it still could not continue after 2 tries. Press Retry to start it again from the saved work.");
+  });
+
+  it("one-note: a setup failure with no recovery notice still gets the unanswered-message note", async () => {
+    const f = await fixture({ status: "blocked", chat: false });
+    const messageId = await f.message();
+    const runId = await f.run({ commentId: messageId, status: "failed", errorCode: "setup_failed" });
+    await f.boardHold("stranded_assigned_issue", runId, "stranded_assigned_issue");
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.body).toBe(NOT_ANSWERED);
+    expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
+  });
+
+  it.each([
+    { actionStatus: "resolved" }, { deleted: true }, { noticeRunId: randomUUID() },
+    { nextAction: "" }, { nextAction: "The agent continues automatically." }, { linkedActionId: randomUUID() },
+  ])("one-note: a non-covering recovery notice cannot silence the message (%j)", async input => {
+    const f = await setupFailureWithRetryNotice(input);
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
+    expect((await f.visible())[0]!.body).toBe(NOT_ANSWERED);
+  });
+
+  it("one-note: an older Retry notice does not cover a new message and failed run", async () => {
+    const f = await setupFailureWithRetryNotice();
+    const messageId = await f.message("A new request");
+    await f.run({ commentId: messageId, status: "failed", errorCode: "setup_failed" });
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
+    expect((await f.visible())[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
+  });
 
   // Keep: recorded D10 F0 catch. One continuation must not abort the ordinary conversations behind it.
   it("RFL round4 F0 sweeps a continued conversation with five ordinary unanswered ones without throwing", async () => {
