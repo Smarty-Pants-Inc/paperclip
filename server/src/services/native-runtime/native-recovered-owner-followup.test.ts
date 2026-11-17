@@ -20,6 +20,7 @@ import { createNativeControllerRecovery, resolveNativeControllerRecovery } from 
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { freshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
 import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
 } from "./native-session-resume.js";
@@ -782,6 +783,152 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       eventType: "lifecycle", stream: "system", message: "task.run.measured",
       payload: { phase: "task.run.measured", outcome: "failed", durableSettlement: true } });
   }
+
+  /** metaformat (11-17): the live rows of the attempt the prior-owner fence
+   * refused. 78bd0dd2: a NEW box (lease created), inherited checkpoint, no
+   * pointer, no own provider events, failed native_continuation_requires_reconciliation. */
+  async function shapeLiveFenceRefusal(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, runId: string) {
+    const environmentId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: `new-box-${runId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId, issueId: prior.issueId, heartbeatRunId: runId,
+      provider: "boat", providerLeaseId: `bx_new_${runId.slice(0, 8)}`, status: "expired", releasedAt: new Date(),
+      metadata: { remoteCwd: "/workspace" } });
+    await db.update(heartbeatRuns).set({ errorCode: "native_continuation_requires_reconciliation" }).where(eq(heartbeatRuns.id, runId));
+  }
+
+  /** dd45b4c1: the owner requested its provider process (events line 3424), then Stop cancelled it. */
+  async function startedThenStopped(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: prior.runId, seq: 50, stream: "system",
+      payload: {}, eventType: "native.process_start_requested" });
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled" }).where(eq(heartbeatRuns.id, prior.runId));
+  }
+
+  async function fenceEvents(runId: string) {
+    return (await db.select({ eventType: heartbeatRunEvents.eventType }).from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId))).map(row => row.eventType).filter(type => type === "native.prior_owner_fence_refused");
+  }
+
+  // R1, the c1 gate-4 chronology: Stop cancels dd45b4c1 after its provider
+  // started; 78bd0dd2 inherits its checkpoint on a new box and is refused at
+  // the prior-owner fence; the next message 18613087 failed
+  // native_controller_recovery_unsupported:metadata_format at base.
+  it("R1 metaformat: after Stop, the next message restores the owner, not the fence-refused successor", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    await startedThenStopped(prior);
+    const refused = await failUnstartedFollowUp(prior);
+    await shapeLiveFenceRefusal(prior, refused);
+    expect(await fenceEvents(refused)).toEqual(["native.prior_owner_fence_refused"]);
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, refused));
+    expect(row.runnerProfileJson!.nativeControllerRecovery ?? null).toBeNull();
+    expect((row.runnerProfileJson!.sessionCheckpoint as { identity: { runId: string } }).identity.runId).toBe(refused);
+    const next = await admitFollowUp(prior);
+    // Base: { selected: the refused run, outcome: native_controller_recovery_unsupported:metadata_format }.
+    expect({ selected: next.selectedRunId, outcome: await next.start() }).toEqual({ selected: prior.runId, outcome: ADMITTED });
+    const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.runId));
+    // Same provider thread as the owner: the earlier conversation is recalled.
+    expect((current.runnerProfileJson!.sessionCheckpoint as { providerSessionId: string }).providerSessionId)
+      .toBe("provider-session-before-recovery");
+  }, 60_000);
+
+  // R1 on the live lease shape: 18613087 RESUMED bx_qmv8g5qk, the box the
+  // refused 78bd0dd2 had created; the owner's box (bx_cue58jb5) is retained.
+  // The selector now names the owner; the owner never ran on this box, so the
+  // existing retained-sandbox binding refuses with its typed fresh-thread code
+  // (floor (c)), never the dead metadata_format of a non-owner source.
+  it("R1 metaformat (resumed box): the next message on the refused run's resumed box gets the typed outcome", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    await startedThenStopped(prior);
+    const refused = await failUnstartedFollowUp(prior);
+    const next = await admitFollowUp(prior);
+    await db.insert(environments).values({ id: next.environmentId, name: `bx-${next.environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId: next.environmentId, issueId: prior.issueId,
+      heartbeatRunId: refused, provider: "daytona", providerLeaseId: next.providerLeaseId, status: "expired",
+      releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+    await db.update(heartbeatRuns).set({ errorCode: "native_continuation_requires_reconciliation" }).where(eq(heartbeatRuns.id, refused));
+    const outcome = await next.start("resumed");
+    // Base: { selected: the refused run, outcome and typed: native_controller_recovery_unsupported:metadata_format }.
+    expect({ selected: next.selectedRunId, outcome, typed: freshThreadRefusalCode(next.failures.at(-1)) }).toEqual({
+      selected: prior.runId, outcome: "native_controller_recovery_missing_evidence:retained_sandbox_binding",
+      typed: "native_controller_recovery_missing_evidence:retained_sandbox_binding" });
+  }, 60_000);
+
+  // R2, fresh 9f543b9a: after Boat blips, the source run had itself opened a
+  // provider session on a new box (resume_failed_on_new_box) and holds no
+  // pointer. It did provider work, so it is never walked past; the floor is
+  // the existing typed fresh-thread refusal, not a new controller source.
+  it("R2 metaformat: a source that did its own provider work stays the source with the typed fresh-thread outcome", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    await startedThenStopped(prior);
+    const worked = await failUnstartedFollowUp(prior);
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: worked, seq: 100, stream: "system", payload: {},
+      eventType: "session.started" });
+    const next = await admitFollowUp(prior);
+    expect(next.selectedRunId).toBe(worked);
+    expect(await next.start()).toBe("native_controller_recovery_unsupported:metadata_format");
+    expect(freshThreadRefusalCode(next.failures.at(-1))).toBe("native_controller_recovery_unsupported:metadata_format");
+  }, 60_000);
+
+  it("metaformat negative: a malformed owner pointer is still refused after the walk-back", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    await startedThenStopped(prior);
+    const refused = await failUnstartedFollowUp(prior);
+    await shapeLiveFenceRefusal(prior, refused);
+    const [owner] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...owner.runnerProfileJson, nativeControllerRecovery: {
+      ...(owner.runnerProfileJson!.nativeControllerRecovery as object), schema: "paperclip.native-controller-recovery.v0" } } })
+      .where(eq(heartbeatRuns.id, prior.runId));
+    const next = await admitFollowUp(prior);
+    expect(next.selectedRunId).toBe(prior.runId);
+    expect(await next.start()).toBe("native_controller_recovery_unsupported:metadata_format");
+  }, 60_000);
+
+  it("metaformat negative: a pointer naming another run's checkpoint is refused", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    const other = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    await startedThenStopped(prior);
+    const refused = await failUnstartedFollowUp(prior);
+    await shapeLiveFenceRefusal(prior, refused);
+    const [owner] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    const pointer = owner.runnerProfileJson!.nativeControllerRecovery as { checkpoint: Record<string, unknown> };
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...owner.runnerProfileJson, nativeControllerRecovery: {
+      ...pointer, checkpoint: { ...pointer.checkpoint, runId: other.runId } } } }).where(eq(heartbeatRuns.id, prior.runId));
+    const next = await admitFollowUp(prior);
+    expect(next.selectedRunId).toBe(prior.runId);
+    expect(await next.start()).toBe("native_controller_recovery_missing_evidence:snapshot_digest_or_checkpoint_binding");
+  }, 60_000);
+
+  it("metaformat negative: a fence-refused run with its own launch request stays the source", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    await startedThenStopped(prior);
+    const refused = await failUnstartedFollowUp(prior);
+    await shapeLiveFenceRefusal(prior, refused);
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: refused, seq: 100, stream: "system", payload: {},
+      eventType: "native.process_start_requested" });
+    const next = await admitFollowUp(prior);
+    expect(next.selectedRunId).toBe(refused);
+    expect(await next.start()).toBe("native_controller_recovery_unsupported:metadata_format");
+  }, 60_000);
+
+  it("metaformat negative: the walk-back past a fence-refused run stops at an unsafe failed attempt", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    await startedThenStopped(prior);
+    const unsafe = await failUnstartedFollowUp(prior);
+    // Unsafe: no fence proof of its own, and the carried owner started a process.
+    await db.delete(heartbeatRunEvents).where(sql`run_id = ${unsafe} and event_type = 'native.prior_owner_fence_refused'`);
+    const refused = await admitFollowUp(prior);
+    expect(refused.selectedRunId).toBe(unsafe);
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_continuation_requires_reconciliation", finishedAt: new Date(),
+      nativePhase: "observed", resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })
+      .where(eq(heartbeatRuns.id, refused.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure" }).where(eq(nativeRunFinalizations.runId, refused.runId));
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: refused.runId, seq: 100, stream: "system", payload: {},
+      eventType: "native.prior_owner_fence_refused" });
+    await recordMeasured(refused.runId);
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, prior.issueId));
+    const next = await admitFollowUp(prior);
+    expect(next.selectedRunId).toBe(unsafe);
+    expect(await next.start()).toBe("native_controller_recovery_unsupported:metadata_format");
+  }, 60_000);
 
   it("retries from the committed owner after a follow-up failed before provider work", async () => {
     const prior = await seedRecoveredPriorRun();
