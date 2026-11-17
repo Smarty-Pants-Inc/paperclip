@@ -3,6 +3,7 @@ import { and, eq, inArray, sql, type SQLWrapper } from "drizzle-orm";
 import { agentWakeupRequests, issues, type Db } from "@paperclipai/db";
 import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { anchorParkedWakePayloadSql, personSendSql } from "./heartbeat/parked-wake-anchor.js";
 
 /** Admission has saved this refusal on the caller's durable deferred receipt.
  * HTTP callers still receive the existing 409; receipt recovery waits for its
@@ -52,10 +53,14 @@ export async function writeDeferredExecutionWait(db: Db, scope: { companyId: str
       ? (previous as Record<string, unknown>).reason : undefined;
     const reasonChanged = !previous || previousReason !== condition.reason;
     if (reasonChanged) await notifyDeferredExecutionWork(tx, scope);
-    const [saved] = await tx.update(agentWakeupRequests).set({
-      payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
+    const written = sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
         ${options.replace ? sql`'{}'::jsonb` : sql`coalesce(${agentWakeupRequests.payload}->'executionWait', '{}'::jsonb)`}
-          || ${JSON.stringify(condition)}::jsonb)`,
+          || ${JSON.stringify(condition)}::jsonb)`;
+    const [saved] = await tx.update(agentWakeupRequests).set({
+      // S124d: a person's Send deferred in a non-person wait is anchored at its
+      // FIRST deferral (the receipt's updated_at before this write), set once;
+      // a person-controlled wait (pause, budget) holds no anchor.
+      payload: anchorParkedWakePayloadSql(written, agentWakeupRequests.updatedAt, personSendSql()),
       updatedAt: new Date(),
     }).where(and(eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.id, scope.requestId),
       eq(agentWakeupRequests.status, "deferred_issue_execution"))).returning({ id: agentWakeupRequests.id });
