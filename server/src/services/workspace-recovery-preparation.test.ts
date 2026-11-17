@@ -917,4 +917,45 @@ describe("automatic retained workspace recovery", () => {
     } finally { releaseStop(); await coordinator.stop(); await worker.stop(); stoppedWorker?.proof.mockRestore(); }
   }, 40_000);
 
+  // fam-retry3 ITEM C (RFL bar (2)): two DIFFERENT Retry clicks during ONE
+  // pending restore (two idempotency keys) are accepted and held; when the real
+  // preservation worker puts the files back, exactly ONE run starts and a later
+  // resume of either click starts nothing more.
+  it("fam-retry3: two Retry clicks (two keys) during one pending restore produce exactly one run when the files are back", async () => {
+    const f = await failedRemotePreparation();
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(environmentLeases).set({ status: "active", releasedAt: null, cleanupStatus: null,
+      metadata: { ...lease.metadata, remoteExecutionTermination: null } }).where(eq(environmentLeases.id, lease.id));
+    let releaseStop!: () => void;
+    const stopped = new Promise<void>(resolve => { releaseStop = resolve; });
+    f.runtime.retryPendingSandboxTeardown.mockImplementation(async () => {
+      await stopped;
+      return { providerLeaseId: f.providerLeaseId, state: "stopped" };
+    });
+    const errors = vi.fn(), heartbeat = heartbeatService(db, { environmentRuntime: f.environmentRuntime });
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, canReconcile: () => true, onError: errors });
+    const worker = registerWorkspaceRecoveryWork(db, coordinator, f.environmentRuntime, heartbeat.resumeRemoteStopComments);
+    const successors = () => db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${f.runId}`));
+    try {
+      await worker.ready;
+      const app = boardRecoveryApp();
+      const first = await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: f.runId, idempotencyKey: randomUUID() });
+      const second = await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: f.runId, idempotencyKey: randomUUID() });
+      for (const answer of [first, second]) expect([200, 202], JSON.stringify(answer.body)).toContain(answer.status);
+      // One canonical held Retry: the second click joins the first.
+      expect(second.body.requestId).toBe(first.body.requestId);
+      await expect.poll(() => f.runtime.retryPendingSandboxTeardown.mock.calls.length, { timeout: 20_000 }).toBe(1);
+      expect(await successors()).toHaveLength(0);
+      releaseStop();
+      await expect.poll(async () => (await successors()).length, { timeout: 20_000 }).toBe(1);
+      await Promise.all([heartbeat.resumeTaskRetry(f.companyId, first.body.requestId),
+        heartbeat.resumeTaskRetry(f.companyId, second.body.requestId), heartbeat.resumeExecutionWaitComments(),
+        heartbeat.resumeRemoteStopComments(await run(f.runId))]);
+      expect(await successors()).toHaveLength(1);
+      expect(f.runtime.resumeRunLease).toHaveBeenCalledOnce();
+      expect(errors).not.toHaveBeenCalled();
+    } finally { releaseStop(); await coordinator.stop(); await worker.stop(); }
+  }, 40_000);
+
 });
