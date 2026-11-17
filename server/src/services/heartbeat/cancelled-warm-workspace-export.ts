@@ -1,7 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
-import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
+import { hasAcknowledgedNativeRunStopRequest, hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { admittedNativeResourceDisposition } from "../native-runtime/native-failed-workspace-recovery.js";
 import {
@@ -71,6 +71,10 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   companyId: string;
   nativeWorkspaceSync: PreparedSync | null | undefined;
   timeoutMs?: number;
+  /** adopt-stopu-xpaths: at the release site the run is already terminal
+   * `cancelled` by an acknowledged run-only Stop; that, not the NSE settle
+   * row, is the trigger there (the Stop may have surfaced as another error). */
+  settledBy?: "nse_settle" | "terminal_cancelled_run";
 }): Promise<CancelledWarmExportOutcome> {
   const sync = input.nativeWorkspaceSync;
   if (!sync || sync.reference.state !== "prepared") return { outcome: "not_applicable" };
@@ -79,7 +83,9 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   )).limit(1);
   if (!run || run.runtimeMode !== "native"
     || admittedNativeResourceDisposition(run.runnerProfileJson) !== "keep_running") return { outcome: "not_applicable" };
-  if (!await hasSettledPersonStop(input.db, run)) return { outcome: "not_settled" };
+  if (input.settledBy === "terminal_cancelled_run"
+    ? !(run.status === "cancelled" && hasAcknowledgedNativeRunStopRequest(run))
+    : !await hasSettledPersonStop(input.db, run)) return { outcome: "not_settled" };
 
   const timeoutMs = input.timeoutMs ?? CANCELLED_WARM_EXPORT_TIMEOUT_MS;
   // pl/cancel-finalize2: ONE aggregate bound for the whole export. At the
