@@ -6877,6 +6877,45 @@ async function assertPluginTaskReattachmentBinding(input: {
   return taskId;
 }
 
+/** S095 (rf-3): the person's Stop of this exact run is requested but its
+ * acknowledgement has not landed: cancelled by a user, executionCancellation
+ * still "requested", and its own run-scoped native Stop intent still
+ * dispatchState "pending". Until it lands no retirement refusal of this owner
+ * can be judged, and a quarantined copy would refuse every later admission. */
+function personStopAwaitingAcknowledgement(run: typeof heartbeatRuns.$inferSelect): boolean {
+  const result = record(run.resultJson);
+  const intent = record(result.nativeCancellation);
+  return run.status === "cancelled" && result.cancelledByActorType === "user"
+    && typeof result.cancelledByUserId === "string" && result.cancelledByUserId.length > 0
+    && record(result.executionCancellation).state === "requested"
+    && intent.schema === "paperclip.native-cancellation.v1" && intent.runId === run.id && intent.companyId === run.companyId
+    && intent.scope === "run" && intent.dispatchState === "pending";
+}
+
+async function ownerStopAwaitingAcknowledgement(input: { db: Db; execution: NativeExecutionInput },
+  identity: { runId?: unknown }): Promise<boolean> {
+  if (typeof identity.runId !== "string") return false;
+  const [run] = await input.db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, identity.runId),
+    eq(heartbeatRuns.companyId, input.execution.binding.companyId))).limit(1);
+  return run !== undefined && personStopAwaitingAcknowledgement(run);
+}
+
+/** Waits within warmSessionReleaseWait (outside any transaction) for the
+ * acknowledgement, then lets today's retirement decide. Still pending at the
+ * bound: the typed pre-claim recovery wait, never the quarantine. */
+async function retireAfterPersonStopAcknowledged(input: Parameters<typeof retireFinishedPerTurnRunnerdOwner>[0])
+  : Promise<Awaited<ReturnType<typeof retireFinishedPerTurnRunnerdOwner>>> {
+  await input.onLog?.("stderr", `[paperclip-runner] waiting for the acknowledgement of the person's Stop of run ${String(input.identity.runId)}\n`);
+  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+  while (Date.now() < deadline && await ownerStopAwaitingAcknowledgement(input, input.identity)) {
+    await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
+  }
+  if (await ownerStopAwaitingAcknowledgement(input, input.identity)) {
+    throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs));
+  }
+  return retireFinishedPerTurnRunnerdOwner(input);
+}
+
 async function migrateRunnerdStateRootForExecution(input: {
   db: Db;
   execution: NativeExecutionInput;
@@ -7064,7 +7103,12 @@ async function migrateRunnerdStateRootForExecution(input: {
           if (await provenLostResumedSandboxRunner({ ...input, root: scoped })) return;
           retirementRefusal = "; retirement_refused=restarted_sandbox_owner_unproven";
         } else {
-          const retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
+          let retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
+          // S095: never quarantine the owner of a person's Stop whose
+          // acknowledgement is still pending; wait for it once, then decide.
+          if (!retirement.retired && await ownerStopAwaitingAcknowledgement(input, identity)) {
+            retirement = await retireAfterPersonStopAcknowledged({ ...input, root: scoped, identity });
+          }
           if (retirement.retired) return;
           if (retirement.refused !== "lifecycle_not_per_turn") retirementRefusal = `; retirement_refused=${retirement.refused}`;
         }
