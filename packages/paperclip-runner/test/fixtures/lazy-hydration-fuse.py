@@ -26,6 +26,9 @@ left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
 env = dict(os.environ, _FUSE_COMMFD=str(right.fileno()))
 mount = subprocess.Popen(["fusermount3", "-o", "rw,nosuid,nodev,fsname=lazyhydration,subtype=lazyhydration", "--", mountpoint],
                          env=env, pass_fds=[right.fileno()])
+# Only fusermount3 may hold the other end: if it fails (mount denied), recvmsg
+# then sees EOF instead of blocking forever on our own copy.
+right.close()
 fds = array.array("i")
 _, ancillary, _, _ = left.recvmsg(1, socket.CMSG_LEN(fds.itemsize))
 for level, kind, payload in ancillary:
@@ -33,7 +36,7 @@ for level, kind, payload in ancillary:
         fds.frombytes(payload[: fds.itemsize])
 mount.wait()
 if not fds:
-    sys.exit("fusermount3 did not pass a /dev/fuse descriptor")
+    sys.exit(f"fusermount3 did not pass a /dev/fuse descriptor (exit {mount.returncode})")
 fuse = fds[0]
 
 uid, gid = os.getuid(), os.getgid()
