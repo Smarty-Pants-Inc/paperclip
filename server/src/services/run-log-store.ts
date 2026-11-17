@@ -46,6 +46,20 @@ interface RunLogByteRange {
   nextOffset?: number;
 }
 
+// Only defer an incomplete trailing sequence, not arbitrary invalid bytes or
+// complete characters. A valid UTF-8 character has at most three continuations.
+function incompleteUtf8Tail(bytes: Buffer): { start: number; missing: number } | undefined {
+  if (bytes.length === 0) return undefined;
+  let start = bytes.length - 1;
+  while (start > 0 && bytes.length - start <= 3 && (bytes[start]! & 0xc0) === 0x80) start--;
+  const lead = bytes[start]!;
+  const width = lead >= 0xc2 && lead <= 0xdf ? 2
+    : lead >= 0xe0 && lead <= 0xef ? 3
+    : lead >= 0xf0 && lead <= 0xf4 ? 4 : 1;
+  const missing = width - (bytes.length - start);
+  return missing > 0 ? { start, missing } : undefined;
+}
+
 export interface RunLogFinalizeSummary {
   // Null means a stalled write prevented a verified final snapshot. Callers
   // can still settle the run without recording a false byte count or hash.
@@ -472,14 +486,12 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         // Local file gone (pod rolled) -> serve from the S3 mirror if configured.
         ?? await readS3Range(handle.logRef, start, length, opts?.signal);
       const result = await readRange(offset, limitBytes);
-      if (!opts?.alignStartToRecord || offset === 0 || result.bytes.length === 0) {
-        return { content: result.bytes.toString("utf8"), nextOffset: result.nextOffset };
-      }
+      const aligned = opts?.alignStartToRecord && offset > 0 && result.bytes.length > 0;
       // Walk back only to the preceding record boundary. Keep bytes intact
       // until decoding so a tail beginning inside UTF-8 text is not corrupted.
       const parts = [result.bytes];
       let before = offset;
-      while (before > 0) {
+      while (aligned && before > 0) {
         const start = Math.max(0, before - 32_000);
         const prefix = await readRange(start, before - start);
         if (prefix.bytes.length !== before - start) throw new Error("Run log changed while reading its tail");
@@ -488,9 +500,28 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         if (boundary >= 0) break;
         before = start;
       }
+      let bytes = Buffer.concat(parts);
+      let end = offset + result.bytes.length;
+      let nextOffset = result.nextOffset;
+      let tail = incompleteUtf8Tail(bytes);
+      if (tail && end - (bytes.length - tail.start) <= offset && nextOffset !== undefined) {
+        // A limit smaller than one character must still progress. Read only
+        // its missing bytes, without rereading the prefix or carrying state.
+        const extension = await readRange(end, tail.missing);
+        bytes = Buffer.concat([bytes, extension.bytes]);
+        end += extension.bytes.length;
+        nextOffset = extension.nextOffset;
+        tail = incompleteUtf8Tail(bytes);
+      }
+      if (tail) {
+        // Also defer an unfinished live EOF: the next read starts at its lead.
+        end -= bytes.length - tail.start;
+        bytes = bytes.subarray(0, tail.start);
+        nextOffset = end;
+      }
       return {
-        content: Buffer.concat(parts).toString("utf8"),
-        nextOffset: result.nextOffset ?? offset + result.bytes.length,
+        content: bytes.toString("utf8"),
+        nextOffset: nextOffset ?? (aligned ? end : undefined),
       };
     },
 
