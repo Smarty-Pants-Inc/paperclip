@@ -13,7 +13,7 @@ import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "
 import { readRunCancellation } from "../../../services/run-cancellation.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
-import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
+import { currentConversationCommentCondition, isConversationReset } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../../../services/native-runtime/native-runner-ownership.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
@@ -914,6 +914,56 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
   };
 }
 
+/**
+ * Agent Chat, a person's Stop: nothing is sent. The messages that person
+ * queued behind the stopped turn wait as ONE queue, in the order they were
+ * sent, so the chat lists them together and the owner's Send starts one turn
+ * with all of them (or with those left after a delete). Chat messages are
+ * otherwise saved one wake each (no coalescing behind a running turn).
+ */
+async function gatherPersonStoppedChatMessages(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date): Promise<void> {
+  if (run.status !== "cancelled" || issue.conversationAgentId !== run.agentId || issue.assigneeAgentId !== run.agentId ||
+      issue.assigneeUserId || parseObject(run.resultJson).cancelledByActorType !== "user") return;
+  const waiting = await tx.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+    eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS), eq(agentWakeupRequests.requestedByActorType, "user"),
+    sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+    sql`${agentWakeupRequests.payload} ->> 'interactionId' is null`,
+    sql`${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ->> 'interactionId' is null`,
+    sql`${agentWakeupRequests.payload} -> 'queuedCommentInterrupt' is null`,
+    sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
+  )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).for("update");
+  // Only plain person messages join, from the oldest on, and a /new keeps its
+  // boundary: the first wake that is not plain ends the queue (as Agent
+  // Chat's own deferred merge keeps it), so A, /new, B never share a turn.
+  const allIds = waiting.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload));
+  const comments = allIds.length ? await tx.select({ id: issueComments.id, body: issueComments.body,
+    authorType: issueComments.authorType, authorAgentId: issueComments.authorAgentId, deletedAt: issueComments.deletedAt })
+    .from(issueComments).where(and(
+    eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, allIds))) : [];
+  const byId = new Map(comments.map((comment) => [comment.id, comment]));
+  const messages: typeof waiting = [];
+  for (const wake of waiting) {
+    const ids = queuedCommentIdsFromWakePayload(wake.payload);
+    const plain = ids.length > 0 && parseObject(parseObject(wake.payload)[DEFERRED_WAKE_CONTEXT_KEY]).forceFreshSession !== true &&
+      ids.every((id) => { const comment = byId.get(id);
+        return comment && !comment.deletedAt && (comment.authorType ?? (comment.authorAgentId ? "agent" : "user")) === "user" &&
+          !isConversationReset(comment.body); });
+    if (!plain) break;
+    messages.push(wake);
+  }
+  if (messages.length < 2) return;
+  const [queue, ...rest] = messages;
+  const ids = [...new Set(messages.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))];
+  await tx.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(queue!.payload, ids),
+    coalescedCount: (queue!.coalescedCount ?? 0) + rest.length, updatedAt: now })
+    .where(and(eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, queue!.id)));
+  await tx.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: now, updatedAt: now,
+    error: "Waiting with the chat's other queued messages after a person's Stop" })
+    .where(and(eq(agentWakeupRequests.companyId, run.companyId), inArray(agentWakeupRequests.id, rest.map((wake) => wake.id)),
+      eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS)));
+}
+
 async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date): Promise<boolean> {
   const applies =
     run.runtimeMode === "native" &&
@@ -1460,12 +1510,17 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // When a reassignment committed while that stop was still settling, the
         // new assignee's wake parked behind this run; it is explicit new work
         // and must run now, or the task is left with no run at all.
-        const handoffAssigneeAgentId = preDrain.kind === "released" &&
-          decidePreDrain({ ...preDrainFacts, executionCancellationAcknowledged: false }).kind === "proceed" &&
+        const releasedOnlyByStop = preDrain.kind === "released" &&
+          decidePreDrain({ ...preDrainFacts, executionCancellationAcknowledged: false }).kind === "proceed";
+        const handoffAssigneeAgentId = releasedOnlyByStop &&
           issueRow?.assigneeAgentId && !issueRow.assigneeUserId && issueRow.assigneeAgentId !== run.agentId
           ? issueRow.assigneeAgentId : undefined;
 
         if (preDrain.kind === "released" && !handoffAssigneeAgentId) {
+          // Stop means stop (org 11-17): an Agent Chat's person Stop sends
+          // nothing either. Its waiting messages are gathered for the
+          // owner's Send, which starts their one turn.
+          if (releasedOnlyByStop && issueRow) await gatherPersonStoppedChatMessages(tx, run, issueRow, input.now);
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
