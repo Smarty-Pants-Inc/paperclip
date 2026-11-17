@@ -1,5 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
-import { agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim } from "./agent-file-save-hold.js";
+import { agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -418,6 +418,14 @@ export function buildEnvironmentLeaseContext(input: {
  * The transport selection reads this input in a later phase; this phase only
  * delivers the setting and the per-run read.
  */
+/**
+ * The Stop collector for one agent-file copy on a box that is being retired
+ * (CR6). Bound by the owner of the instruction-copy service (heartbeat), so the
+ * runtime never imports it. Returns the copy row after collection.
+ */
+export type AgentFileRetirementCollector = (input: { environment: Environment; lease: EnvironmentLease; runId: string }) =>
+  Promise<{ state: string; receipt?: Record<string, unknown> | null; processStoppedAt?: Date | null } | null>;
+
 export interface ResolvedSandboxDuplexBridgeInput {
   /** True only when the instance opts in to the sandbox duplex command stream. */
   enableDuplexBridge: boolean;
@@ -1398,6 +1406,7 @@ function createSandboxEnvironmentDriver(
     deferredOrphanCleanupBufferLimit?: number;
     orphanCleanupSpool?: SandboxOrphanCleanupSpool;
     orphanCleanupSpoolDir?: string;
+    agentFileCollector?: { current: AgentFileRetirementCollector | null };
   } = {},
 ): EnvironmentRuntimeDriver {
   const pluginWorkerManager = options.pluginWorkerManager;
@@ -1872,6 +1881,16 @@ function createSandboxEnvironmentDriver(
     for (const lease of [...input.leases, ...(input.closedActiveTips?.leases ?? [])]) {
       if (reusableIds.has(lease.id)) continue;
       if (!reusableLeaseCanBeCleanedUp(lease) && !closedActiveTipIds.has(lease.id)) continue;
+      // CR6: retiring the box loses agent files written after the last turn-end
+      // save. Collect them first with the Stop collector, while the box is
+      // live. Anything short of a verified save (a held save, an unreadable
+      // box, no collector) fails closed: never destroyed, only stopped and kept.
+      let agentFilesSettled = true;
+      for (const runId of await agentFileCopiesToCollectOnLease(db, lease)) {
+        const collected = await options.agentFileCollector?.current?.({ environment: input.environment, lease, runId })
+          .catch((error: unknown) => { logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file collection before source-change retirement failed"); return null; });
+        if (!collected || !agentFileCopyRetirementSettled(collected)) agentFilesSettled = false;
+      }
       // Destroying an obsolete source deletes its box. A native session there
       // needs verified custody first: upstream's own resume-replacement guard
       // (verifyRecoverableNativeHarnessBackup). Without it nothing is
@@ -1886,7 +1905,7 @@ function createSandboxEnvironmentDriver(
       // Harness custody excludes workspace writes after finalize: a changed
       // source must stop and keep even with a verified backup or non-native adapter.
       // Boat keeps stopped disks >=14 days, without compute: https://docs.boat.dev/limits
-      if (!sandboxLeaseSourceMatches(input.providerConfigForLease, lease.metadata ?? {})
+      if (!agentFilesSettled || !sandboxLeaseSourceMatches(input.providerConfigForLease, lease.metadata ?? {})
         || (!knownNonNative
           && (!lease.providerLeaseId || !await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
             stamp: await obsoleteLeaseCustodyStamp(lease), providerLeaseId: lease.providerLeaseId })))) {
@@ -4335,6 +4354,7 @@ export function environmentRuntimeService(
     },
   } };
   const environmentsSvc = environmentService(db);
+  const agentFileCollector: { current: AgentFileRetirementCollector | null } = { current: null };
   let orphanRecoveryFlush: Promise<{ recovered: number; pending: number }> | null = null;
   const drivers = new Map<string, EnvironmentRuntimeDriver>();
 
@@ -4350,6 +4370,7 @@ export function environmentRuntimeService(
       deferredOrphanCleanupBufferLimit: options.deferredOrphanCleanupBufferLimit,
       orphanCleanupSpool: options.orphanCleanupSpool,
       orphanCleanupSpoolDir: options.orphanCleanupSpoolDir,
+      agentFileCollector,
     }),
     ...(options.pluginWorkerManager
       ? [createPluginEnvironmentDriver(db, options.pluginWorkerManager)]
@@ -4492,6 +4513,11 @@ export function environmentRuntimeService(
 
   return {
     getDriver,
+
+    /** CR6: the instruction-copy owner binds the Stop collector for box retirements. */
+    bindAgentFileRetirementCollector(collector: AgentFileRetirementCollector | null) {
+      agentFileCollector.current = collector;
+    },
 
     async destroyRemoteWorkspaceLease(input: {
       companyId: string; workspaceId: string; leaseId: string; environmentId: string; providerLeaseId: string;
