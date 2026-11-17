@@ -43,9 +43,32 @@ export type ReusableSandboxReplacementPlan = "retire" | "keep";
  * resolve it, so it is retried like a 5xx.
  */
 export function sandboxStateTransitionFailure(error: unknown): boolean {
+  if (sandboxResumeRefusedForGood(error)) return false;
   for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
     const message = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
     if (/state change in progress|\bis still [a-z_]+ at its start deadline\b|\bis still settling cancelled work\b/i.test(message)) return true;
+  }
+  return providerReportsSandboxBusy(error);
+}
+
+/** Boat's documented resume refusals for a sandbox that is still changing
+ * state (POST /sandboxes/{id}/resume: 409 sandbox_stopping, sandbox_starting,
+ * sandbox_not_ready, machine_not_running; 502 sandbox_restoring). */
+export function providerReportsSandboxBusy(error: unknown): boolean {
+  if (sandboxResumeRefusedForGood(error)) return false;
+  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
+    const message = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+    if (/\b(sandbox_stopping|sandbox_starting|sandbox_not_ready|sandbox_resuming|sandbox_restoring|machine_not_running)\b/.test(message)) return true;
+  }
+  return false;
+}
+
+/** Boat's documented resume refusals that waiting cannot fix: the saved
+ * sandbox state is gone or its resume already failed. Never retried in place. */
+export function sandboxResumeRefusedForGood(error: unknown): boolean {
+  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
+    const message = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+    if (/\b(snapshot_data_expired|resume_failed)\b/.test(message)) return true;
   }
   return false;
 }
