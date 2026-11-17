@@ -80,14 +80,14 @@ describe("Boat 429 retry", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it("caps IP pauses at 120 seconds and logs the pause plus a refused call with a distinct code", async () => {
+  it("(superseded by replacement: frozen8 F1 IP-pause 429 shape, ip-pause-shape.test.ts) caps IP pauses at 120 seconds and logs the pause plus a refused call with a distinct code", async () => {
     vi.useFakeTimers();
     const fetch = vi.fn().mockResolvedValue(response({ code: "IP_RATE_LIMIT_EXCEEDED", retryAfter: 9999 }, 429, {
       "Retry-After": "9999", RateLimit: '"ip";r=1;t=60', "RateLimit-Policy": '"ip";q=10000;w=60',
     }));
     vi.stubGlobal("fetch", fetch);
     await expect(plugin.definition.onEnvironmentResumeLease!({ driverKey: "boat", companyId: "c", environmentId: "e", config, providerLeaseId: id }))
-      .rejects.toMatchObject({ message: "boat_ip_rate_limit_paused", code: "boat_ip_rate_limit_paused" });
+      .rejects.toMatchObject({ message: `Boat POST /sandboxes/${id}/resume failed (429): http_error (rate limit)`, status: 429, httpStatus: 429, code: "boat_ip_rate_limit_paused" });
     expect(logger.warn).toHaveBeenCalledWith("Boat IP rate-limit pause", expect.objectContaining({
       reason: "IP_RATE_LIMIT_EXCEEDED", pauseUntil: new Date(Date.now() + 120_000).toISOString(), retryAfter: "9999",
       method: "POST", route: "/sandboxes/{sandboxId}/resume", rateLimit: '"ip";r=1;t=60', rateLimitPolicy: '"ip";q=10000;w=60',

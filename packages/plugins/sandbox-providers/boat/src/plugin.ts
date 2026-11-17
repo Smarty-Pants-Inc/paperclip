@@ -355,9 +355,11 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         duplexLogger?.warn(`Boat IP rate-limit pause until ${new Date(pauseUntil).toISOString()}, call refused without a request`, {
           method, route, deadline: new Date(deadline).toISOString(),
         });
-        const error = new Error("boat_ip_rate_limit_paused") as Error & { code: string };
-        error.code = "boat_ip_rate_limit_paused";
-        throw error;
+        // Refused without a request, but for the host this is Boat's 429: the
+        // same status and '(rate limit)' words as frozen7's other transient
+        // errors (frozen7-VERDICT F1). The distinct code is kept; the SDK
+        // diagnostic forwards only the status, never a non-errno code.
+        throw Object.assign(requestError(config, init.method ?? "GET", path, 429, "http_error"), { code: "boat_ip_rate_limit_paused" });
       }
       await delay(remaining, undefined, { signal: callSignal });
     };
