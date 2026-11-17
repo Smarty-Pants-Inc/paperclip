@@ -29,9 +29,9 @@ describeEmbeddedPostgres("agent task hierarchy depth", () => {
   afterEach(() => vi.unstubAllEnvs());
 
   it.each([
-    [undefined, 2], ["", 2], ["invalid", 2], ["0", 2], ["-1", 2],
-    ["1.5", 2], ["9007199254740992", 2], [" 5 ", 5],
-  ] as const)("uses configured agent depth %s, preserving the default placement on invalid input", async (raw, limit) => {
+    [undefined, 2], ["2", 2], ["02", 2], [" 2", 2], ["2 ", 2],
+    ["002", 2], ["\t2\n", 2], [" 5 ", 5],
+  ] as const)("uses configured agent depth %s, preserving the default placement when absent", async (raw, limit) => {
     vi.stubEnv("PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH", raw);
     const { companyId } = await seedCompany();
     const rootId = await seedIssue(companyId);

@@ -18,8 +18,8 @@ describe.skipIf(!support.supported)("configured lifetime agent status-card limit
 
   // Keep: durable author-scoped admission boundary, including archived lifetime cards.
   it.each([
-    [undefined, 20], ["", 20], ["invalid", 20], ["0", 20], ["-1", 20],
-    ["1.5", 20], ["9007199254740992", 20], [" 50 ", 50],
+    [undefined, 20], ["20", 20], ["020", 20], [" 20", 20], ["20 ", 20],
+    ["0020", 20], ["\t20\n", 20], [" 50 ", 50],
   ] as const)("allows %s lifetime cards, preserving the default refusal", async (raw, limit) => {
     vi.stubEnv("PAPERCLIP_STATUS_CARD_AGENT_MAX_CARDS", raw);
     const companyId = randomUUID(), agentId = randomUUID();

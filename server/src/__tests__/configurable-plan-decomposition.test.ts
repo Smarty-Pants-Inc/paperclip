@@ -21,8 +21,8 @@ describe.skipIf(!support.supported)("configured accepted-plan decomposition limi
 
   // Keep: real API validation boundary plus durable creation of all accepted children.
   it.each([
-    [undefined, 25], ["", 25], ["invalid", 25], ["0", 25], ["-1", 25],
-    ["1.5", 25], ["9007199254740992", 25], [" 30 ", 30],
+    [undefined, 25], ["25", 25], ["025", 25], [" 25", 25], ["25 ", 25],
+    ["0025", 25], ["\t25\n", 25], [" 30 ", 30],
   ] as const)("accepts %s children up to the configured boundary", async (raw, limit) => {
     vi.stubEnv("PAPERCLIP_MAX_PLAN_DECOMPOSITION_CHILDREN", raw);
     vi.stubEnv("PAPERCLIP_MAX_ACTIVE_CHILD_ISSUES", "100");

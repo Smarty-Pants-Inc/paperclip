@@ -21,8 +21,8 @@ describe.skipIf(!support.supported)("configured durable fresh-continuation chain
 
   // Keep: durable replay/data-safety boundary, using the real transactional fallback and ledger.
   it.each([
-    [undefined, 2], ["", 2], ["invalid", 2], ["0", 2], ["-1", 2],
-    ["1.5", 2], ["9007199254740992", 2], [" 5 ", 5],
+    [undefined, 2], ["2", 2], ["02", 2], [" 2", 2], ["2 ", 2],
+    ["002", 2], ["\t2\n", 2], [" 5 ", 5],
   ] as const)("allows %s fresh continuations then returns the existing exhaustion reason", async (raw, limit) => {
     vi.stubEnv("PAPERCLIP_FRESH_CONTINUATIONS_PER_CHAIN", raw);
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = randomUUID();

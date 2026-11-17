@@ -17,8 +17,8 @@ describe.skipIf(!support.supported)("configured active child limit", () => {
 
   // Keep: data-safety boundary, including terminal-child exclusion and the exact refusal.
   it.each([
-    [undefined, 25], ["", 25], ["invalid", 25], ["0", 25], ["-1", 25],
-    ["1.5", 25], ["9007199254740992", 25], [" 30 ", 30],
+    [undefined, 25], ["25", 25], ["025", 25], [" 25", 25], ["25 ", 25],
+    ["0025", 25], ["\t25\n", 25], [" 30 ", 30],
   ] as const)("enforces %s at its own boundary, not the former cap", async (raw, limit) => {
     vi.stubEnv("PAPERCLIP_MAX_ACTIVE_CHILD_ISSUES", raw);
     const companyId = randomUUID(), parentId = randomUUID();

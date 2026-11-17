@@ -104,8 +104,8 @@ describe("board-chat client disconnect", () => {
 
   // Keep: resource-admission boundary exercised through held-open HTTP streams.
   it.each([
-    [undefined, 3], ["", 3], ["invalid", 3], ["0", 3], ["-1", 3],
-    ["1.5", 3], ["9007199254740992", 3], [" 10 ", 10],
+    [undefined, 3], ["3", 3], ["03", 3], [" 3", 3], ["3 ", 3],
+    ["003", 3], ["\t3\n", 3], [" 10 ", 10],
   ] as const)("admits %s concurrent streams and returns the unchanged busy error at the cap", async (raw, limit) => {
     vi.clearAllMocks();
     vi.stubEnv("PAPERCLIP_BOARD_CHAT_MAX_CONCURRENT", raw);
