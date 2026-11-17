@@ -2,8 +2,8 @@
 name: paperclip-board
 description: >
   Manage a Paperclip company as a board member via chat. Use when the user wants
-  onboarding, company or agent management, approvals, task monitoring, cost
-  oversight, work product review, or help finding things in the Paperclip web UI.
+  onboarding, company or agent management, approvals, task monitoring,
+  work product review, or help finding things in the Paperclip web UI.
 ---
 
 # Paperclip Board Skill
@@ -431,22 +431,6 @@ Team Overview
   Working on: PAP-15 Blog template
 ```
 
-## Cost Monitoring
-
-```bash
-# Overall summary
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/costs/summary"
-
-# Breakdown by agent
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/costs/by-agent"
-
-# Breakdown by project
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/costs/by-project"
-
-# Optional date range
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/costs/summary?from=2026-03-01&to=2026-03-31"
-```
-
 ## Work Products
 
 ```bash
@@ -600,9 +584,6 @@ All web UI links must include the company prefix:
 | Approve | POST | `/api/approvals/:id/approve` |
 | Reject | POST | `/api/approvals/:id/reject` |
 | Request revision | POST | `/api/approvals/:id/request-revision` |
-| Cost summary | GET | `/api/companies/:companyId/costs/summary` |
-| Costs by agent | GET | `/api/companies/:companyId/costs/by-agent` |
-| Costs by project | GET | `/api/companies/:companyId/costs/by-project` |
 | Adapter docs | GET | `/llms/agent-configuration.txt` |
 | Adapter detail | GET | `/llms/agent-configuration/:adapterType.txt` |
 | Agent icons | GET | `/llms/agent-icons.txt` |
