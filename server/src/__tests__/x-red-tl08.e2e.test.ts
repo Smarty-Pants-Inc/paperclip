@@ -57,7 +57,7 @@ import { buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeT
 import { materializeAsset } from "../services/native-runtime/runtime-context.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
+const HELD_PREDECESSOR_NOTICE = "Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.";
 import { FRESH_THREAD_STARTED_NOTE } from "../services/native-runtime/fresh-thread-stop-gate.js";
 
 const enabled = process.env.PAPERCLIP_PI_LEASE_E2E === "1";
@@ -223,15 +223,9 @@ function sourceLine(relative: string, needle: string): string {
 }
 function noteWriter(note: typeof issueComments.$inferSelect) {
   const reason = String(record(note.metadata).authorizationReason ?? "");
-  // The sweep may use the same held body as the executor; durable provenance,
-  // not identical prose, identifies which owner actually wrote the note.
   if (reason.startsWith("unanswered_message:")) {
     const writer = sourceLine("../services/recovery/unanswered-person-message.ts", "const comment = await issueService(tx as unknown as Db).addComment");
     return { writer, caller: sourceLine("../services/heartbeat.ts", "? await settleUnansweredPersonMessagesForTask(db"), authorizationReason: reason };
-  }
-  if (reason.startsWith("native_prior_owner_held:") || note.body === HELD_PREDECESSOR_NOTICE) {
-    const writer = sourceLine("../services/native-runtime/native-session-executor.ts", "await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE");
-    return { writer, caller: writer, authorizationReason: reason };
   }
   const shared = sourceLine("../services/native-runtime/pi-session-recovery-notice.ts", "const next = await issueService(db).addComment");
   const caller = reason.startsWith("fresh_provider_thread_pending:")

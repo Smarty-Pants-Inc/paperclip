@@ -321,34 +321,6 @@ export function restoreHoldPredicate() {
   );
 }
 
-/** Upstream's own wording for continuing when no in-place control can (this
- * file's removed-chat copy). */
-export const NEW_TASK_CONTINUE_ACTION = "Create a new task to continue the work.";
-
-/**
- * The banner never names a Retry the person cannot press. When Retry is not
- * offered, every sentence that directs to Retry (including "Retry or send a
- * message") is replaced by the new-task action, which is always available.
- * It is not replaced by "send a message": where Retry is refused (a restore
- * hold, a held conversation, a refusal a click cannot change) a new message
- * can be refused the same way. Smarty fork (C9 M1.1, TEMPORARY): stored
- * recovery copy such as UNRESTORED_FILES_NEXT_ACTION (#21348) says "Press
- * Retry" while a restore hold disables it.
- */
-export function withoutUnavailableRetry(text: string, retryOffered: boolean): string {
-  if (retryOffered || !/\bRetry\b/.test(text)) return text;
-  const sentences = text.match(/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g) ?? [text];
-  let replaced = false;
-  const kept = sentences.flatMap(sentence => {
-    const trimmed = sentence.trim();
-    if (!/\bRetry\b/.test(trimmed)) return [trimmed];
-    replaced = true;
-    return [];
-  });
-  if (replaced && !kept.includes(NEW_TASK_CONTINUE_ACTION)) kept.push(NEW_TASK_CONTINUE_ACTION);
-  return kept.filter(Boolean).join(" ");
-}
-
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: {
   conversationResetCommentId?: string | null;
   /** The native run being dispatched; its own scheduled resume does not block it. */
@@ -506,10 +478,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     // A stopped reviewer can differ from the task owner who receives the work back.
     agentId: run?.agentId ?? null,
     cause: action.cause,
-    nextAction: withoutUnavailableRetry(workspaceRecovery?.message
-      ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
-      retryOffered),
-
+    nextAction: workspaceRecovery?.message ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
     ...(workspaceRecovery ? { workspaceRecovery } : {}),
     runStatus: run?.status ?? null,
     runError: runError?.slice(0, 1024) ?? null,

@@ -65,7 +65,7 @@ import { environmentService } from "../environments.js";
 import { issueService } from "../issues.js";
 import { FRESH_CONTINUATION_PENDING_BOUND_MS } from "../fresh-continuation-fallback.js";
 import { PROCESS_START_REQUESTED } from "../native-local-process-stop.js";
-import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
+const HELD_PREDECESSOR_NOTICE = "Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.";
 import { FRESH_THREAD_STARTED_NOTE } from "../native-runtime/fresh-thread-stop-gate.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
 import { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";

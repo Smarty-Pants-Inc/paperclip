@@ -34,7 +34,6 @@ const executionRunColumns = {
   id: heartbeatRuns.id,
   agentId: heartbeatRuns.agentId,
   driverKind: heartbeatRuns.driverKind,
-  error: heartbeatRuns.error,
   errorCode: heartbeatRuns.errorCode,
   executionControlDeadlineAt: heartbeatRuns.executionControlDeadlineAt,
   finishedAt: heartbeatRuns.finishedAt,

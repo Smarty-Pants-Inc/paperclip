@@ -34,7 +34,7 @@ import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapte
 import { createSystemRecovery } from "./system-recovery-state.js";
 import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
-import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
+const NATIVE_CONTINUATION_REFUSED_ACTION = "Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.";
 import { settleUnansweredPersonMessagesForTask, PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS } from "./recovery/unanswered-person-message.js";
 import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";

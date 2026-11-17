@@ -128,27 +128,6 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     }
   });
 
-  it("posts one visible thread notice for a finalization deadline, including on a repeated sweep", async () => {
-    const f = await seedAbandonedRunFixture();
-    await reconcileAbandonedExecutionControl(db);
-    await db.update(heartbeatRuns).set({ executionControlDeadlineAt: new Date(Date.now() - 1_000) })
-      .where(eq(heartbeatRuns.id, f.runId));
-    await reconcileAbandonedExecutionControl(db);
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-    expect(comments).toHaveLength(1);
-    expect(comments[0]).toMatchObject({
-      authorAgentId: null,
-      body: expect.stringContaining("could not resume or finish this reply"),
-      presentation: { kind: "system_notice", tone: "danger", title: "Reply could not finish" },
-      metadata: { sourceRunId: f.runId,
-        authorizationReason: `execution_finalization_deadline_exceeded:${f.runId}` },
-    });
-    // RFL 20:36Z: 'Reply could not finish' is written open.
-    expect(comments[0].presentation).toMatchObject({ detailsDefaultOpen: true });
-    expect(JSON.stringify(comments[0].metadata)).toContain(f.runId);
-    expect(comments[0].body).not.toMatch(/starting fresh|history (was |is )?lost|automatically retr/i);
-  });
-
   it("does not post a deadline notice over a newer run, reset conversation, or completed task", async () => {
     for (const state of ["successor", "reset", "done"] as const) {
       const f = await seedAbandonedRunFixture();

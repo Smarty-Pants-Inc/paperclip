@@ -17,14 +17,10 @@ import { issueService } from "../issues.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
-import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
-import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
-import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
-import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -137,21 +133,6 @@ const SHOWN_CODES = new Set([
   "runner_remote_provider_artifact_incompatible", "runner_remote_provider_verification_unavailable",
   "provider_process_exited", "provider_initialize_timeout", "provider_request_timeout", "provider_transport_failed",
   "provider_session_open_rejected", "provider_session_open_timeout",
-]);
-
-// Refusals a new message meets the same way: the held text, not "send it again".
-const HELD_CODES = new Set([
-  "runner_state_identity_mismatch", "native_controller_recovery_missing_evidence",
-  "native_controller_recovery_dependency_unavailable", "native_controller_recovery_unsupported",
-  "native_session_cleanup_quarantined", "runner_process_termination_unconfirmed",
-  "native_runner_warm_attachment_runner_exited", "native_runner_checkpoint_missing", "native_runner_checkpoint_binding_mismatch",
-  "native_runner_checkpoint_invalid", "native_runner_checkpoint_missing_after_sandbox_retirement",
-  "native_runner_checkpoint_missing_after_suspension", "native_sandbox_cold_resume_unproven",
-  "native_session_supervisor_checkpoint_mismatch", "native_runner_warm_transition_recovery_unproven",
-  "native_runner_staged_attachment_binding_mismatch", "native_runner_staged_attachment_recovery_unproven",
-  "native_event_replay_conflict", "native_execution_ownership_unverified", "runner_state_directory_unsafe",
-  "runner_state_too_large", "runner_durable_identity_too_large", "recovery_state_too_large",
-  "native_session_supervisor_checkpoint_too_large", "pi_conversation_identity_missing",
 ]);
 
 const GENERIC_RUN_CODES = new Set(["adapter_failed", "setup_failed"]);
@@ -680,11 +661,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     code = run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
   }
 
-  // Already explained: the executor's held notice for this conversation, or a
-  // person-facing recovery notice, posted after the message. An older held
-  // notice never silences a newer message.
-  const heldNotice = await readUnsupersededHeldConversationNotice(q, { companyId: issue.companyId, issueId: issue.id });
-  if (heldNotice && heldNotice.createdAt > message.createdAt) return { kind: "explained" };
   const [explained] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
@@ -694,24 +670,20 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     sql`not starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), ${UNANSWERED_MESSAGE_REASON_PREFIX})`)).limit(1);
   if (explained) return { kind: "explained" };
 
-  // A fresh-thread refusal is continued by the fresh-continuation fallback on
-  // its own (#20925): never the held-conversation "send a new message" note,
-  // as isNativeContinuationRefusal already decides for its own patterns.
-  const held = (isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run));
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
   const body = paused ? agentPausedText(pausedName)
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
-      : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
+      : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: paused ? `${pausedName} is paused` : "Your message wasn't answered",
       body,
       tone: "warning",
       nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
-        : held ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
+        : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,

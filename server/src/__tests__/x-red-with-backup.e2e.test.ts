@@ -69,7 +69,7 @@ import { buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeT
 import { materializeAsset } from "../services/native-runtime/runtime-context.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
+const HELD_PREDECESSOR_NOTICE = "Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "../services/native-runtime/native-provider-work-proof.js";
 
 const enabled = process.env.PAPERCLIP_PI_LEASE_E2E === "1";
