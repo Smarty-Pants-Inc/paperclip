@@ -28,5 +28,6 @@ export function useCoordinatorAttentionCount(companyId: string | null | undefine
   const snapshots = feedPage ? [attention, tasks, summary] : taskPage ? [tasks, attention, summary] : [summary, attention, tasks];
   const newest = snapshots.filter(snapshot => snapshot.data !== undefined)
     .sort((a, b) => ((Date.parse(b.data?.generatedAt ?? "") || 0) - (Date.parse(a.data?.generatedAt ?? "") || 0))
-      || b.dataUpdatedAt - a.dataUpdatedAt)[0]?.data?.deskBadgeCount ?? 0;
+      || b.dataUpdatedAt - a.dataUpdatedAt)[0]?.data;
+  return newest ? newest.deskBadgeCount ?? newest.totalCount : 0;
 }
