@@ -1773,7 +1773,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         await appendRunEvent(cancelled, {
           eventType: "lifecycle",
           stream: "system",
-          level: "warn",
+          level: readRunCancellation(cancelled.resultJson)?.expected ? "info" : "warn",
           message: options.eventMessage ?? "run cancelled",
           payload: { ...options.eventPayload, cancellation: readRunCancellation(cancelled.resultJson) },
         }).catch((eventErr) => {

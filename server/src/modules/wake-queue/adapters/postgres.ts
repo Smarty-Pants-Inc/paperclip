@@ -527,10 +527,18 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
 
     async getCommentSelfAuthorship({ companyId, issueId, finishingRunId, commentIds }) {
       const rows = await tx
-        .select({ createdByRunId: issueComments.createdByRunId })
+        .select({
+          createdByRunId: issueComments.createdByRunId, authorType: issueComments.authorType,
+          authorUserId: issueComments.authorUserId, authorAgentId: issueComments.authorAgentId,
+          derivedAuthorAgentId: issueComments.derivedAuthorAgentId, deletedAt: issueComments.deletedAt,
+        })
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)));
-      return { allSelfAuthored: rows.length > 0 && rows.every((row) => row.createdByRunId === finishingRunId) };
+      return {
+        allSelfAuthored: rows.length > 0 && rows.every((row) => row.createdByRunId === finishingRunId),
+        includesPersonComment: rows.some((row) => !row.deletedAt && row.authorUserId !== null && row.createdByRunId === null &&
+          row.authorAgentId === null && row.derivedAuthorAgentId === null && (row.authorType === "user" || row.authorType === null)),
+      };
     },
 
     async isWatcherCommentDuringFinishingRun({ companyId, issueId, finishingRunId, commentIds }) {
@@ -1444,7 +1452,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           issueStatus: issueRow?.status ?? "",
           hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
           assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
-          legacyExecutionNeedsReconciliation: evidence.kind === "complete" &&
+          legacyExecutionNeedsReconciliation: evidence.kind === "complete" && !agentRunSupersededByFreshContinuation(run) &&
             await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, evidence.run),
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
