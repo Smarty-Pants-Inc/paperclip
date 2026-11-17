@@ -1,5 +1,6 @@
 import type { IssueCommentPresentation } from "@paperclipai/shared";
 import type { SystemNoticeTone } from "../components/SystemNotice";
+import { TASK_RECOVERY_STATEMENT } from "./task-recovery-notice";
 
 /**
  * Pure classifier for system comments in the chat shell (PAP-443 / PAP-442
@@ -75,7 +76,7 @@ export function humanizeSystemNotice(input: {
     };
   }
   if (body.includes("no live execution path")
-    || /^Paperclip tried to (?:start|continue) this task again\b/.test(body.trim())) {
+    || TASK_RECOVERY_STATEMENT.test(body.trim())) {
     const owner = recoveryOwnerName(body);
     return {
       title: owner
