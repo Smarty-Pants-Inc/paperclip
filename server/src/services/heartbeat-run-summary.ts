@@ -467,14 +467,16 @@ const CUT_ANSWER_NOTE: Record<CutAnswerCause, string> = {
  * dl-n5-cont (Paul NOTE 5): a turn that streamed answer text as item.delta
  * events and then FAILED (pi_output_truncated at the output cap, a provider
  * EOF) has no completed answer, yet the person must get what was streamed,
- * first and once. Returns the streamed prefix of the failed turn's last agent
- * message, rebuilt with `reassembleAgentMessageFromDeltas`, and the candidate
- * to post: the prefix (n5e's line and excerpt above 250 KiB) and ONE true note.
- * Null when the last turn did not fail, when that item completed with text
- * (the completed path posts it), or when no answer text was streamed.
+ * first and once. Returns the streamed prefix of ALL the failed turn's agent
+ * message items in order (dl-n5-cont3 F3), each rebuilt with
+ * `reassembleAgentMessageFromDeltas`, and the candidate to post: the WHOLE
+ * prefix (dl-n5-cont3 F1: never an excerpt) and ONE true note. Null when the
+ * last turn did not fail, when its last item completed with text (the
+ * completed path posts it), or when no answer text was streamed.
  */
 export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; payload: unknown }[]): {
   itemId: string;
+  itemIds: string[];
   text: string;
   cause: CutAnswerCause;
   candidate: CompletedFinalAgentMessageCandidate & { reasonCode: string };
@@ -490,35 +492,52 @@ export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; paylo
   }
   if (!lastTerminal || lastTerminal.event.eventType !== "turn.failed") return null;
   const failedTurnId = typeof lastTerminal.event.turnId === "string" ? lastTerminal.event.turnId : null;
-  let itemId: string | null = null;
+  // dl-n5-cont3 F3: EVERY agentMessage item the failed turn streamed, in the
+  // order its first delta arrived; never only the last one.
+  const itemIds: string[] = [];
   for (const row of ordered) {
     if (row.seq > lastTerminal.seq) break;
     const event = eventOf(row);
     if (event.eventType !== "item.delta" || typeof event.itemId !== "string") continue;
     if (failedTurnId && typeof event.turnId === "string" && event.turnId !== failedTurnId) continue;
-    if (record(event.payload).kind === "agentMessage") itemId = event.itemId;
+    if (record(event.payload).kind === "agentMessage" && !itemIds.includes(event.itemId)) itemIds.push(event.itemId);
   }
-  if (!itemId) return null;
-  const completedWithText = ordered.some((row) => {
-    const event = eventOf(row);
-    const payload = record(event.payload);
-    return event.eventType === "item.completed" && event.itemId === itemId && typeof payload.text === "string"
-      && payload.text.trim().length > 0;
-  });
-  if (completedWithText) return null;
-  const text = reassembleAgentMessageFromDeltas(
-    ordered.filter((row) => row.seq <= lastTerminal!.seq),
-    itemId,
-  );
-  if (!text) return null;
+  if (itemIds.length === 0) return null;
+  const completedText = (id: string) => {
+    for (const row of ordered) {
+      const event = eventOf(row);
+      const payload = record(event.payload);
+      if (event.eventType === "item.completed" && event.itemId === id && typeof payload.text === "string"
+        && payload.text.trim().length > 0) return payload.text;
+    }
+    return null;
+  };
+  // The answer completed (the completed path posts it): not a cut answer.
+  if (completedText(itemIds[itemIds.length - 1]!) !== null) return null;
+  const upToTerminal = ordered.filter((row) => row.seq <= lastTerminal!.seq);
+  const pieces: string[] = [];
+  for (const id of itemIds) {
+    const piece = completedText(id) ?? reassembleAgentMessageFromDeltas(upToTerminal, id);
+    // A partial rebuild is never presented as the answer.
+    if (piece === null) return null;
+    if (piece.trim()) pieces.push(piece);
+  }
+  if (pieces.length === 0) return null;
+  const text = pieces.reduce((joined, piece) => !joined ? piece
+    : `${joined}${joined.endsWith("\n\n") ? "" : joined.endsWith("\n") ? "\n" : "\n\n"}${piece}`, "");
+  const itemId = itemIds[itemIds.length - 1]!;
   const cause = cutAnswerCause(record(record(lastTerminal.event.payload).error).code);
   return {
     itemId,
+    itemIds,
     text,
     cause,
     candidate: {
       seq: lastTerminal.seq,
-      text: `${presentFinalAnswerText(text)}${text.endsWith("\n") ? "" : "\n"}\n— ${CUT_ANSWER_NOTE[cause]}`,
+      // dl-n5-cont3 F1: the rebuilt prefix is posted WHOLE, never an excerpt
+      // (comments have no 250 KiB cap), so the ending the continuation quotes
+      // is text the person was really shown.
+      text: `${text}${text.endsWith("\n") ? "" : "\n"}\n— ${CUT_ANSWER_NOTE[cause]}`,
       sourceEventId: readCommentText(lastTerminal.event.sourceEventId),
       channel: "final",
       reasonCode: "failed_turn_streamed_answer_prefix",
@@ -587,9 +606,8 @@ export function cutAnswerContinuationInstruction(input: { text: string; cause: C
       + "starting the answer again from the beginning. Do not refer to any earlier reply.";
   }
   const tail = input.text.slice(-CUT_ANSWER_TAIL_CHARS);
-  const shown = Buffer.byteLength(JSON.stringify(input.text)) > FINAL_ANSWER_INLINE_MAX_BYTES
-    ? "The part you had written is kept in full, but it was too long for one message, so only the start of it was shown to the person as an excerpt, with a line saying the full text is kept. "
-    : "The part you had written was posted to the person as your reply, exactly as written. ";
+  // dl-n5-cont3 F1: the prefix is always posted whole, so its ending was shown.
+  const shown = "The part you had written was posted to the person as your reply, exactly as written. ";
   return `Your previous answer to the person stopped before it finished because ${why}. ${shown}`
     + `It ends with exactly this text:\n\n<<<END OF POSTED TEXT\n${tail}\nEND OF POSTED TEXT>>>\n\n`
     + "Continue exactly where it stopped: begin with the next words after that ending, as one answer. Do not repeat or summarize "

@@ -1402,12 +1402,26 @@ suite("fresh-continuation fallback", () => {
   it("dl-n5-cont2 item 3 RED: a thinking-only cap stop gets ONE continuation told to write the answer now", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
     await db.insert(heartbeatRunEvents).values(capStopEvents(f.runId));
+    // dl-n5-cont3 (3): the recovery run is a FRESH session with no history:
+    // its opening carries the person's ORIGINAL ask and says no answer was shown.
+    const ask = "Write the 50 KiB capacity plan: \"every host\", its role, and the 128k cap 🦀.\nSecond line of the ask.";
+    await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "An older message.", createdAt: new Date(Date.now() - 20 * 60_000) });
+    await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: ask, createdAt: new Date(Date.now() - 12 * 60_000) });
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" })).toMatchObject({ kind: "continued" });
     const continuation = await buildExecutionContinuation({ db, companyId, issueId: f.issueId, agentId,
       context: { previousRunId: f.runId }, summary: null, exposeLowTrustRaw: false });
     const text = JSON.stringify(continuation);
     expect(text).toContain("Write the answer now; keep further thinking short. The person has not seen any answer yet.");
     expect(text).not.toMatch(/Continue exactly where it stopped|wasn't answered|Sending it again is safe/u);
+    const { thinkingCapStopRecoveryOpening } = await import("./fresh-continuation-fallback.js");
+    const opening = thinkingCapStopRecoveryOpening(ask);
+    expect(opening).toBe("Write the answer now; keep further thinking short. The person has not seen any answer yet. "
+      + "This is a new session with no earlier history. The person's original ask, exactly as they wrote it:\n\n"
+      + `<<<PERSON'S ASK\n${ask}\nEND OF PERSON'S ASK>>>\n\nAnswer that ask now, in full.`);
+    expect(text).toContain(JSON.stringify(opening).slice(1, -1));
+    expect(text).not.toContain("An older message.\\nEND OF PERSON'S ASK");
     expect(await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, f.issueId),
       sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}' = ${f.runId}`))).toHaveLength(1);
   }, 60_000);

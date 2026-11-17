@@ -1409,7 +1409,9 @@ describe("dl-n5-cont a failed turn's streamed answer is posted first; the contin
     expect(note).not.toMatch(/wasn't answered|send(ing)? (it )?again/iu);
   });
 
-  it("(a) the continuation is told exactly where the posted text ends; together the two replies hold the whole answer once", () => {
+  // dl-n5-cont3 F4: the "whole once" check reads the POSTED comments back from
+  // the DB (run-completion.test.ts); here only the instruction's content.
+  it("(a) the continuation is told exactly where the posted text ends", () => {
     const prefix = streamedUpTo(262);
     const cut = readFailedTurnStreamedAnswer(failedRunRows(prefix, "pi_output_truncated"))!;
     const instruction = cutAnswerContinuationInstruction({ text: cut.text, cause: cut.cause, posted: true });
@@ -1417,29 +1419,50 @@ describe("dl-n5-cont a failed turn's streamed answer is posted first; the contin
     expect(instruction).toContain(prefix.slice(-200).trim());
     expect(instruction).toMatch(/do not repeat/iu);
     expect(instruction).toMatch(/never (say|claim)|do not (say|claim)/iu);
-    // A continuation that follows the instruction: the rest, starting at item 0263.
-    const continuation = whole.slice(prefix.length);
-    const posted = [prefix, continuation].join("");
-    expect(posted).toBe(whole);
-    for (let n = 1; n <= 280; n++) expect(posted.split(item(n)).length - 1).toBe(1);
   });
 
-  it("(b) provider EOF after 269 KB: n5e's plain line + excerpt, a true note, and the continuation is told the prefix was not shown whole", () => {
-    const prefix = "x".repeat(40) + "\n" + "Paragraph of the long answer, streamed before the EOF. ".repeat(4_900);
-    expect(Buffer.byteLength(prefix)).toBeGreaterThan(269_000);
-    const cut = readFailedTurnStreamedAnswer(failedRunRows(prefix, "pi_provider_error", 997))!;
-    expect(cut.cause).toBe("stream_ended");
+  // dl-n5-cont3 F1 (judge rf-2 5x5): at 300 KiB the person was shown a 16 KB
+  // excerpt while the continuation quoted the last 600 chars of the FULL
+  // prefix: 291,070 bytes never shown, and the quoted ending unseen. The
+  // rebuilt prefix is now posted WHOLE, so the quoted ending really was posted.
+  it.each([["pi_provider_error", 269_000, /connection to the model ended/u], ["pi_output_truncated", 300 * 1024, /output limit/u]] as const)(
+    "F1 RED: %s after %d B: the WHOLE prefix is posted (no excerpt), and the quoted ending is the posted text's ending", (code, size, note) => {
+    const prefix = "x".repeat(40) + "\n" + "Paragraph of the long answer, streamed before the cut. ".repeat(Math.ceil(size / 55));
+    expect(Buffer.byteLength(prefix)).toBeGreaterThan(size);
+    const cut = readFailedTurnStreamedAnswer(failedRunRows(prefix, code, 997))!;
     expect(cut.text).toBe(prefix);
     const resolved = resolveHeartbeatRunResponse({ resultJson: {}, nativeConversationFinalResponse: true,
       finalAgentMessage: selectHeartbeatRunFinalAgentMessage({ candidates: [cut.candidate] }) });
     expect(resolved.decision.commentAction).toBe("create");
-    expect(resolved.text).toMatch(/^This answer is longer than one message \(\d+ KB\)\. The full text is kept; ask me to show any part\./u);
-    expect(resolved.text).toMatch(/connection to the model ended/u);
+    expect(resolved.text!.startsWith(prefix)).toBe(true);
+    expect(resolved.text).not.toMatch(/longer than one message|Excerpt \(the start/u);
+    expect(resolved.text!.slice(prefix.length)).toMatch(note);
     expect(resolved.text).not.toMatch(/wasn't answered|send(ing)? (it )?again/iu);
     const instruction = cutAnswerContinuationInstruction({ text: cut.text, cause: cut.cause, posted: true });
-    expect(instruction).toMatch(/continue exactly where/iu);
-    expect(instruction).toContain(prefix.slice(-120).trim());
-    expect(instruction).toMatch(/only the start of it was shown/iu);
+    const quoted = /<<<END OF POSTED TEXT\n([\s\S]*)\nEND OF POSTED TEXT>>>/u.exec(instruction)![1]!;
+    expect(resolved.text!.slice(0, prefix.length).endsWith(quoted)).toBe(true);
+    expect(instruction).toMatch(/posted to the person as your reply, exactly as written/u);
+    expect(instruction).not.toMatch(/only the start of it was shown|excerpt/iu);
+  });
+
+  // dl-n5-cont3 F3 (judge rf-2 3x5): only the LAST streamed agentMessage item
+  // was rebuilt; a failed turn with two answer items dropped the first.
+  it("F3 RED: a failed turn with two answer items posts BOTH, in seq order", () => {
+    const first = streamedUpTo(40), second = Array.from({ length: 30 }, (_, i) => item(i + 41)).join("");
+    const rows = failedRunRows(first, "pi_output_truncated");
+    const failed = rows.pop()!;
+    rows.push({ seq: 5_000, payload: { prpEvent: { eventType: "item.started", itemId: `${turnId}:tool:1`, turnId,
+      payload: { kind: "toolCall" } } } });
+    let seq = 5_001;
+    for (let offset = 0; offset < second.length; offset += 61) rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta",
+      itemId: `${turnId}:pi-message:4:block:0`, turnId, payload: { kind: "agentMessage", channel: "progress", text: second.slice(offset, offset + 61) } } } });
+    rows.push({ ...failed, seq: seq++ });
+    const cut = readFailedTurnStreamedAnswer(rows)!;
+    expect(cut.text.indexOf(item(1))).toBe(0);
+    expect(cut.text.indexOf(item(40))).toBeLessThan(cut.text.indexOf(item(41)));
+    for (let n = 1; n <= 70; n++) expect(cut.text.split(item(n)).length - 1).toBe(1);
+    expect(cut.text.endsWith(item(70))).toBe(true);
+    expect(cut.candidate.text.startsWith(cut.text)).toBe(true);
   });
 
   it("(rule 3) a cut answer that was NOT posted is restarted whole, and the continuation says so plainly", () => {

@@ -327,6 +327,58 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
       .toBe("The model used its whole output budget thinking; continuing with the answer.");
   });
 
+  // dl-n5-cont3: the ONE automatic recovery run after a thinking-only cap stop
+  // runs at 'high' (capacity-lead's probe: xhigh 128k all thinking, high the
+  // whole answer at 78k), as a run-level override through the task-override
+  // path heartbeat applies (heartbeat.ts -> projectPaperclipRunnerTaskConfig ->
+  // the native input's piRpcThinkingLevel, a FRESH session admits it).
+  it("dl-n5-cont3 (1)(2) RED: the cap-stop recovery run's native input carries 'high'; the stored config and the next normal run stay xhigh", async () => {
+    const { resolveRunAssigneeAdapterOverrides } = await import("../thinking-cap-stop.js");
+    const { projectPaperclipRunnerTaskConfig, resolvePaperclipRunnerNativeProviderInput } = await import("../native-runtime/provider-profile.js");
+    const first = await thinkingCapStop();
+    const stored = { provider: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "xhigh" };
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: stored }).where(eq(agents.id, first.agentId));
+    const [agent] = await db.select().from(agents).where(eq(agents.id, first.agentId));
+    const nativeInputLevel = async (runId: string) => {
+      const overrides = await resolveRunAssigneeAdapterOverrides(db, { companyId: first.companyId, runId, agent: agent!,
+        issueContext: { assigneeAgentId: agent!.id, assigneeAdapterOverrides: null } });
+      const provider = resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc",
+        adapterConfig: projectPaperclipRunnerTaskConfig("pi_rpc", agent!.adapterConfig, overrides?.adapterConfig) });
+      return provider.provider === "pi_rpc" ? provider.piRpcThinkingLevel : null;
+    };
+    // The source run (the person's ask) ran at the stored level.
+    expect(await nativeInputLevel(first.runId)).toBe("xhigh");
+    const [recovery] = await db.insert(heartbeatRuns).values({ companyId: first.companyId, agentId: first.agentId, status: "queued",
+      runtimeMode: "native", retryOfRunId: first.runId,
+      contextSnapshot: { previousRunId: first.runId, wakeReason: "issue_recovery_action_restored", forceFreshSession: true } }).returning();
+    // (1) the recovery run runs at 'high' ...
+    expect(await nativeInputLevel(recovery!.id)).toBe("high");
+    // ... while the agent's stored config stays 'xhigh'.
+    expect((await db.select().from(agents).where(eq(agents.id, first.agentId)))[0]!.adapterConfig).toEqual(stored);
+    // (2) the NEXT normal run (the person's next message) is xhigh again.
+    const [next] = await db.insert(heartbeatRuns).values({ companyId: first.companyId, agentId: first.agentId, status: "queued",
+      runtimeMode: "native", contextSnapshot: { wakeReason: "issue_commented", previousRunId: recovery!.id } }).returning();
+    expect(await nativeInputLevel(next!.id)).toBe("xhigh");
+    // A person's Retry of the cap stop is a new ask at the stored level.
+    const [retry] = await db.insert(heartbeatRuns).values({ companyId: first.companyId, agentId: first.agentId, status: "queued",
+      runtimeMode: "native", contextSnapshot: { wakeReason: "task_retry", previousRunId: first.runId } }).returning();
+    expect(await nativeInputLevel(retry!.id)).toBe("xhigh");
+    // A task's own lower override is never raised.
+    expect((await resolveRunAssigneeAdapterOverrides(db, { companyId: first.companyId, runId: recovery!.id, agent: agent!,
+      issueContext: { assigneeAgentId: agent!.id, assigneeAdapterOverrides: { adapterConfig: { piRpcThinkingLevel: "medium" } } } }))
+      ?.adapterConfig).toEqual({ piRpcThinkingLevel: "medium" });
+  });
+
+  it("dl-n5-cont3 (4): the cost guard holds: a second cap stop gets ONE note with Retry, no 'continuing' note", async () => {
+    const first = await thinkingCapStop();
+    const second = await thinkingCapStop({ retryOfRunId: first.runId,
+      contextSnapshot: { previousRunId: first.runId, wakeReason: "issue_recovery_action_restored" } }, first);
+    const { readThinkingCapStop } = await import("../thinking-cap-stop.js");
+    expect((await readThinkingCapStop(db, { companyId: second.companyId, runId: second.runId }))?.repeated).toBe(true);
+    expect((await createHeartbeatLifecycle(db, callbacks(db)).findLatestCompletedFinalAgentMessage(second.runId, second.companyId))?.text)
+      .toBe("The model ran out of output budget again before answering. Press Retry to try once more.");
+  });
+
   // dl-n5-cont2 C1 (rf-2 2x4) on the live completion path.
   it("dl-n5-cont2 C1 RED: a truncated completed final whose deltas include a cut piece is the plain line, not null (the summary)", async () => {
     const { run, agent } = await fixture({ status: "succeeded", finishedAt: new Date() });

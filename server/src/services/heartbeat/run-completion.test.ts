@@ -19,7 +19,7 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { createNativeRunLogCoverageVerifier, formatNativeRunLogEvent } from "../native-runtime/native-run-log-export.js";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, agentWakeupRequests, approvals, issueApprovals, budgetReservations, caseHandoffs, cases, companies, completionContracts, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, heartbeatRunEvents, issueComments, issueQuestionResponseDeliveries, issueRecoveryActions, issues, issueThreadInteractions, nativeRunFinalizations } from "@paperclipai/db";
-import { and, eq, sql } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import * as usageReceipts from "../usage-receipts.js";
@@ -696,6 +696,66 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(posted[0]!.body.startsWith(prefix)).toBe(true);
     expect(posted[0]!.body.slice(prefix.length)).toMatch(/output limit/u);
     expect(posted[0]!.body).not.toMatch(/wasn't answered|Sending it again is safe/u);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  // dl-n5-cont3 F1 + F4 (judge rf-2): at 300 KiB the person saw a 16 KB
+  // excerpt while the continuation quoted the end of the FULL prefix. The
+  // "whole once" check now reads the POSTED comments back from the DB: the
+  // first reply holds the whole prefix, the quoted ending is that reply's
+  // ending, and the replies together hold every item exactly once, in order.
+  it("dl-n5-cont3 F1/F4 RED: a 300 KiB cut answer is posted whole; the posted comments hold the answer once, in order", async () => {
+    const f = await fixture({ runtimeMode: "native" }, `CUT${randomUUID().slice(0, 5)}`);
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Chat with CEO",
+      status: "in_progress", assigneeAgentId: f.agent.id, responsibleUserId: "local-board",
+      conversationAgentId: f.agent.id, conversationUserId: "local-board", conversationState: "active" }).returning();
+    await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, responsibleUserId: "local-board",
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.run.id));
+    f.input.issueId = issue.id;
+    f.input.issueRef = issue;
+    f.input.issueContext = await createHeartbeatRunPreparation(db).getIssueExecutionContext(f.run.companyId, issue.id);
+    f.input.adapterResult = { ...f.input.adapterResult, exitCode: 1, errorCode: "pi_output_truncated",
+      errorMessage: "Pi's final assistant response reached its output limit.", resultJson: {} };
+    const item = (n: number) => `Item ${String(n).padStart(4, "0")}: ${"body text of this numbered item; ".repeat(7)}\n`;
+    const whole = Array.from({ length: 1_500 }, (_, i) => item(i + 1)).join("");
+    const streamed = 1_300;
+    const prefix = Array.from({ length: streamed }, (_, i) => item(i + 1)).join("");
+    expect(Buffer.byteLength(prefix)).toBeGreaterThan(300 * 1024);
+    const turnId = "turn-1", itemId = "turn-1:pi-message:2:block:0";
+    const rows: { seq: number; payload: unknown }[] = [];
+    let seq = 1;
+    for (let offset = 0; offset < prefix.length; offset += 4_001) rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta",
+      itemId, turnId, payload: { kind: "agentMessage", channel: "progress", text: prefix.slice(offset, offset + 4_001) } } } });
+    rows.push({ seq: seq++, payload: { prpEvent: { eventType: "turn.failed", turnId, payload: { error: { code: "pi_output_truncated" } } } } });
+    const { readFailedTurnStreamedAnswer, cutAnswerContinuationInstruction } = await import("../heartbeat-run-summary.js");
+    const cut = readFailedTurnStreamedAnswer(rows)!;
+    f.deps.findLatestCompletedFinalAgentMessage.mockResolvedValue(cut.candidate);
+    f.deps.issuesSvc.addComment.mockImplementation(async (issueId, body) => {
+      const [comment] = await db.insert(issueComments).values({ companyId: f.run.companyId, issueId,
+        authorAgentId: f.agent.id, authorType: "agent", createdByRunId: f.run.id, body }).returning();
+      return { ...comment, authorType: "agent" as const };
+    });
+
+    await f.completion.completeRun(f.input);
+
+    const postedByRun = (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id)))
+      .filter(comment => comment.createdByRunId === f.run.id);
+    expect(postedByRun).toHaveLength(1);
+    const NOTE = /\n+— The answer stopped here because it hit the model's output limit\. Paperclip is continuing it from exactly this point in the next reply\.$/u;
+    expect(postedByRun[0]!.body).toMatch(NOTE);
+    const shown = postedByRun[0]!.body.replace(NOTE, "\n");
+    expect(shown).toBe(prefix);
+    // The continuation is told an ending the person really saw.
+    const instruction = cutAnswerContinuationInstruction({ text: cut.text, cause: cut.cause, posted: true });
+    const quoted = /<<<END OF POSTED TEXT\n([\s\S]*)\nEND OF POSTED TEXT>>>/u.exec(instruction)![1]!;
+    expect(shown.endsWith(quoted)).toBe(true);
+    // A continuation that follows it posts the rest from the next words after that ending.
+    await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: issue.id, authorAgentId: f.agent.id,
+      authorType: "agent", body: whole.slice(whole.indexOf(quoted) + quoted.length), createdAt: new Date(Date.now() + 60_000) });
+    const replies = (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))
+      .orderBy(asc(issueComments.createdAt), asc(issueComments.id))).filter(comment => comment.authorAgentId === f.agent.id);
+    const answer = replies.map(comment => comment.body.replace(NOTE, "\n")).join("");
+    expect(answer).toBe(whole);
+    for (const n of [1, 700, streamed, streamed + 1, 1_500]) expect(answer.split(item(n)).length - 1).toBe(1);
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   it("settles the accepted native exact rate-card price without replacing it with zero", async () => {
