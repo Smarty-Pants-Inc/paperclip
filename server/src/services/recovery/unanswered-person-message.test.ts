@@ -41,6 +41,7 @@ import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotic
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING,
+  UNANSWERED_CARD_ANSWER_TEXT,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
@@ -2023,7 +2024,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     // committed coordinator, no lease), and the wake queue's real release
     // (createReleaseIssueExecution over the postgres adapter) settles it. No
     // hand edit of the hold, the coordinator or the issue after that point.
-    it("Retry on a REALLY settled failed disposition successor runs exactly ONE request-bound successor carrying the answer once", async () => {
+    it("h3-exact1: capped failed disposition chain posts exactly ONE card-answer notice before Retry runs one request-bound successor", async () => {
       answerDelivery.paused = true;
       try {
         const f = await fixture({ status: "in_progress" });
@@ -2097,8 +2098,19 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
           runs: runs.map(r => ({ id: r.id, status: r.status, retryOf: r.retryOfRunId, mode: r.runtimeMode, err: r.errorCode })) }));
         expect(coordinator).toMatchObject({ phase: expect.any(String), leaseOwner: null });
         expect(issue!.executionRunId, "the real release freed the task's execution lock").toBeNull();
+        const cappedHold = holds.find(hold => hold.evidence.runId === successor.id);
+        expect(cappedHold, "the last failed successor's persisted hold is resolved at the recovery cap").toMatchObject({
+          status: "resolved", outcome: "blocked", nextAction: expect.stringContaining("Automatic recovery stopped"),
+        });
         const notices = await allNotices(f);
-        const noticeBodies = notices.map(n => n.body);
+        console.log("ITEM2_NOTICES", JSON.stringify({ hold: { id: cappedHold!.id, status: cappedHold!.status,
+          outcome: cappedHold!.outcome, sourceRunId: cappedHold!.evidence.runId, text: cappedHold!.nextAction },
+          notices: notices.map(n => ({ id: n.id, sourceRunId: n.metadata?.sourceRunId, body: n.body })) }));
+        expect(notices, "exactly one sweep notice for the card answer after the chain caps, before the person's Retry").toHaveLength(1);
+        expect(notices[0]!.metadata?.sourceRunId).toBe(cappedHold!.evidence.runId);
+        expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${k.card.id}`);
+        expect(notices[0]!.body).toBe(UNANSWERED_CARD_ANSWER_TEXT);
+        expect(notices[0]!.body, "the notice explains the unanswered card, not just the resolved recovery hold").not.toBe(cappedHold!.nextAction);
         // The person presses Retry on the notice.
         const { requestTaskRetry } = await import("../task-retry.js");
         const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: f.userId,
@@ -2115,12 +2127,6 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
           runId: retries[0]!.id, agentId: f.agentId, interactionIds: retries[0]!.contextSnapshot!.interactionIds as string[],
           wakeReason: "task_retry" });
         expect(answers.map(answer => answer.interactionId), "the card answer, once").toEqual([k.card.id]);
-        // Never two notes for one answer. On this real path the chain ends at
-        // the disposition's cap (its last hold resolved "blocked": "Automatic
-        // recovery stopped ..."), and the sweep posts no unanswered note (see
-        // RESULT.md item 2: recorded, not asserted here).
-        console.log("ITEM2_NOTICES", JSON.stringify(noticeBodies));
-        expect(noticeBodies.length).toBeLessThanOrEqual(1);
         // A second resume of the same Retry adds nothing.
         await heartbeatService(db).resumeTaskRetry(f.companyId, receipt.requestId!);
         expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
