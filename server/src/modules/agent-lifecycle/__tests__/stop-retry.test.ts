@@ -190,7 +190,7 @@ describe("bounded lifecycle Stop recovery", () => {
     } finally { await worker.stop(); }
   });
 
-  it.each(["pausing", "terminating", "cleaning_up"] as const)("also bounds thrown %s Stop failures with secret-safe errors", async phase => {
+  it.each(["pausing", "terminating", "cleaning_up"] as const)("keeps retrying thrown %s Stop failures with secret-safe errors", async phase => {
     const agent = await fixture(phase);
     const store = createLifecycleStore(db, createAgentLifecycleEffects());
     const runHost = vi.fn(async () => { throw new Error("private provider detail"); });
@@ -198,10 +198,11 @@ describe("bounded lifecycle Stop recovery", () => {
     try {
       for (let attempt = 0; attempt < 5; attempt++) { await due(agent.id); await worker.process(agent.id); }
       const row = await current(agent.id);
-      expect(row.lifecycleOperation?.retryRequired).toBe(true);
-      expect(row.lifecycleError).toContain("Automatic stop work is paused");
+      expect(runHost).toHaveBeenCalledTimes(5);
+      expect(row.lifecycleOperation?.retryRequired).toBeUndefined();
+      expect(row.lifecycleOperation?.retryAt).toBeTruthy();
       expect(row.lifecycleError).not.toContain("private provider detail");
-      expect(await store.claim(agent.id, "parked-error", new Date(Date.now() + 86_400_000))).toBeNull();
+      expect(await store.claim(agent.id, "retry-error", new Date(Date.now() + 86_400_000))).not.toBeNull();
     } finally { await worker.stop(); }
   });
   it("retries a required cleanup plugin without replaying a completed host stop", async () => {

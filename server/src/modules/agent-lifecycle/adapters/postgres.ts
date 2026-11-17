@@ -345,20 +345,17 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
           sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });
         return rows.length > 0;
       }
-      const failures = options?.stopFailures ?? options?.verificationFailures;
+      const failures = options?.verificationFailures;
       const previousPasses = (agent.lifecycleOperation as { pendingPasses?: unknown } | null)?.pendingPasses;
       const pendingPasses = options?.pendingReason ? (typeof previousPasses === "number" ? previousPasses : 0) + 1 : undefined;
       const delay = failures !== undefined ? lifecycleRetryDelay(failures)
         : error ? 60_000 : pendingPasses ? lifecyclePendingRetryDelayMs(pendingPasses) : 2_000;
-      const retry: Partial<AgentLifecycleOperation> = options?.retryRequired
+      const retry: Partial<AgentLifecycleOperation> = options?.retryRequired && ["verifying", "resuming"].includes(agent.lifecycleState)
         ? { retryRequired: true }
         : { retryAt: new Date(now.getTime() + delay).toISOString() };
       if (options?.pendingReason && pendingPasses) Object.assign(retry, { pendingReason: options.pendingReason, pendingPasses });
       if (options?.verificationFailures !== undefined && ["verifying", "resuming"].includes(agent.lifecycleState)) {
         retry.verificationFailures = options.verificationFailures;
-      }
-      if (options?.stopFailures !== undefined && ["pausing", "terminating", "cleaning_up"].includes(agent.lifecycleState)) {
-        retry.stopFailures = options.stopFailures;
       }
       const rows = await db.update(agents).set({
         lifecycleError: sql`case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true' then null else ${error}::text end`,
