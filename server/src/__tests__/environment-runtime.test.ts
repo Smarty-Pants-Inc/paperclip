@@ -916,6 +916,111 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     return { pluginId, companyId, agentId, environment, runId, executionWorkspaceId, reusableLease };
   }
 
+  // Keep: data safety. A failed idle close leaves the session only on this disk.
+  it.each((["retry", "run", "reusable"] as const).flatMap(path => [true, false].map(flagged => ({ path, flagged }))))(
+    "nativeHarnessBackupMissing refuses $path destroy only when flagged=$flagged", async ({ path: destroyPath, flagged }) => {
+      const f = await seedReusablePluginSandboxLease("paperclip_runner");
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+      const marker = { runId: f.runId, sessionId: "pi-session", sessionRootDigest: "a".repeat(64), reason: "close_failed", at: new Date().toISOString() };
+      await db.update(environmentLeases).set({ status: "retained", metadata: { ...f.reusableLease.metadata,
+        ...(flagged ? { nativeHarnessBackupMissing: marker } : {}) } }).where(eq(environmentLeases.id, f.reusableLease.id));
+      const lease = (await environmentService(db).getLeaseById(f.reusableLease.id))!;
+      const call = vi.fn(async (_pluginId: string, method: string) => {
+        if (method !== "environmentDestroyLease") throw new Error(`Unexpected method: ${method}`);
+        return { providerLeaseId: lease.providerLeaseId, state: "destroyed" };
+      });
+      const service = environmentRuntimeService(db, { pluginWorkerManager: {
+        isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentDestroyLease"] }),
+      } as unknown as PluginWorkerManager });
+      if (destroyPath === "retry") {
+        const destroying = service.retryPendingSandboxTeardown({ environment: f.environment, lease });
+        if (flagged) await expect(destroying).rejects.toThrow("Native harness backup is missing; destructive cleanup is forbidden.");
+        else await expect(destroying).resolves.toMatchObject({ state: "destroyed" });
+      } else if (destroyPath === "run") {
+        const result = await service.destroyRunLease({ environment: f.environment, lease });
+        if (flagged) expect(result).toBeNull();
+        else expect(result).toMatchObject({ status: "expired", cleanupStatus: "success" });
+      } else {
+        const result = await service.destroyReusableSandboxLeases({ companyId: f.companyId, executionWorkspaceId: f.executionWorkspaceId });
+        expect(result).toHaveLength(flagged ? 0 : 1);
+      }
+      if (flagged) {
+        expect(call).not.toHaveBeenCalled();
+        expect((await environmentService(db).getLeaseById(lease.id))!).toMatchObject({ status: "retained",
+          metadata: { nativeHarnessBackupMissing: marker } });
+      } else expect(call).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([true, false])("nativeHarnessBackupMissing guards the reusable driver's expiry destroy (flagged=%s)", async flagged => {
+    // Expiry delegates straight to destroyReusableSandboxLease, not the public
+    // destroy or scoped cleanup guards exercised above.
+    const f = await seedReusablePluginSandboxLease("paperclip_runner");
+    const marker = { runId: f.runId, sessionId: "pi-expiry-session", sessionRootDigest: "b".repeat(64), reason: "close_failed", at: new Date().toISOString() };
+    if (flagged) await db.update(environmentLeases).set({ metadata: { ...f.reusableLease.metadata, nativeHarnessBackupMissing: marker } })
+      .where(eq(environmentLeases.id, f.reusableLease.id));
+    const call = vi.fn(async (_pluginId: string, method: string) => {
+      if (method !== "environmentDestroyLease") throw new Error(`Unexpected method: ${method}`);
+      return { providerLeaseId: f.reusableLease.providerLeaseId, state: "destroyed" };
+    });
+    const service = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+    await service.releaseRunLeases(f.runId, "expired");
+    const saved = (await environmentService(db).getLeaseById(f.reusableLease.id))!;
+    if (flagged) {
+      expect(call).not.toHaveBeenCalled();
+      expect(saved).toMatchObject({ status: "active", metadata: { nativeHarnessBackupMissing: marker } });
+    } else {
+      expect(call).toHaveBeenCalledOnce();
+      expect(saved).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    }
+  });
+
+  it("nativeHarnessBackupMissing still permits stop-and-retain without destroying the disk", async () => {
+    const f = await seedReusablePluginSandboxLease("paperclip_runner");
+    const marker = { runId: f.runId, sessionId: "pi-stop-session", sessionRootDigest: "b".repeat(64), reason: "retries_exhausted", at: new Date().toISOString() };
+    await db.update(environmentLeases).set({ metadata: { ...f.reusableLease.metadata, nativeHarnessBackupMissing: marker } })
+      .where(eq(environmentLeases.id, f.reusableLease.id));
+    const call = vi.fn(async (_pluginId: string, method: string) => {
+      if (method !== "environmentStopLease") throw new Error(`Unexpected method: ${method}`);
+      return { providerLeaseId: f.reusableLease.providerLeaseId, state: "stopped" };
+    });
+    const service = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentStopLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+    await service.releaseRunLeases(f.runId, "released", undefined, "stop_and_retain");
+    expect(call).toHaveBeenCalledOnce();
+    expect((await environmentService(db).getLeaseById(f.reusableLease.id))!).toMatchObject({ status: "released",
+      metadata: { nativeHarnessBackupMissing: marker, remoteExecutionTermination: { state: "stopped" } } });
+  });
+
+  it.each(["same session", "another session", "older backup"] as const)(
+    "nativeHarnessBackupMissing clearing on successful server backup: %s", async scenario => {
+      const { recordNativeHarnessBackupStampOnLeaseChain } = await import("../services/native-runtime/native-retired-backup-source.ts");
+      const f = await seedReusablePluginSandboxLease("paperclip_runner");
+      const sessionId = randomUUID(), at = new Date().toISOString();
+      const marker = { runId: f.runId, sessionId, sessionRootDigest: createHash("sha256").update(sessionId).digest("hex"), reason: "close_failed", at };
+      await db.update(environmentLeases).set({ status: "retained", metadata: { ...f.reusableLease.metadata,
+        preserved: "current authority", nativeHarnessBackupMissing: marker } }).where(eq(environmentLeases.id, f.reusableLease.id));
+      const [neighbor] = await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: f.environment.id,
+        heartbeatRunId: f.runId, provider: "fake-plugin", providerLeaseId: f.reusableLease.providerLeaseId,
+        status: "retained", metadata: { nativeHarnessBackupMissing: { ...marker, sessionId: "different-session" } } }).returning();
+      const stamp = { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: scenario === "another session" ? "other" : sessionId,
+        runnerInstanceId: "backup-runner", sessionScopeSha256: "c".repeat(64), sourceProviderLeaseId: f.reusableLease.providerLeaseId,
+        authorizedProviderLeaseId: f.reusableLease.providerLeaseId, manifestSha256: `sha256:${"d".repeat(64)}`,
+        completedAt: new Date(Date.parse(at) + (scenario === "older backup" ? -1000 : 1000)).toISOString() };
+      expect(await recordNativeHarnessBackupStampOnLeaseChain(db, { leaseId: f.reusableLease.id, companyId: f.companyId,
+        providerLeaseId: f.reusableLease.providerLeaseId!, runId: f.runId, stamp })).toBe(true);
+      const saved = (await environmentService(db).getLeaseById(f.reusableLease.id))!;
+      expect(saved.metadata).toMatchObject({ preserved: "current authority", nativeHarnessBackup: stamp });
+      if (scenario === "same session") expect(saved.metadata).not.toHaveProperty("nativeHarnessBackupMissing");
+      else expect(saved.metadata?.nativeHarnessBackupMissing).toEqual(marker);
+      expect((await environmentService(db).getLeaseById(neighbor.id))!.metadata?.nativeHarnessBackupMissing)
+        .toEqual({ ...marker, sessionId: "different-session" });
+    },
+  );
+
   // Regression: cold workspace/instructions sync must not inherit the 30 s plugin RPC default.
   it.each((["syncIn", "syncOut"] as const).flatMap(method => [
     { timeoutMs: null, expectedRpcTimeoutMs: 120_000 },
