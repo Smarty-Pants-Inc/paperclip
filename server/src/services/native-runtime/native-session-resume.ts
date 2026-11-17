@@ -320,7 +320,8 @@ async function isUnstartedInheritedFollowUp(
         and prior.process_started_at is not distinct from ${heartbeatRuns.processStartedAt})`,
     processStart: sql<boolean>`exists (select 1 from ${heartbeatRunEvents} event
       where event.company_id = ${heartbeatRuns.companyId} and event.run_id = ${heartbeatRuns.id}
-        and event.event_type in (${sql.join(NATIVE_EXECUTION_START_EVENT_TYPES.map(type => sql`${type}`), sql`, `)}))`,
+        and (event.source_event_id is not null or event.source_instance_id is not null
+          or event.event_type in (${sql.join(NATIVE_EXECUTION_START_EVENT_TYPES.map(type => sql`${type}`), sql`, `)})))`,
     controllerCheckpoint: sql<boolean>`exists (select 1 from ${nativeRunnerCheckpoints}
       where ${nativeRunnerCheckpoints.companyId} = ${heartbeatRuns.companyId} and ${nativeRunnerCheckpoints.runId} = ${heartbeatRuns.id})`,
     result: sql<boolean>`exists (select 1 from ${nativeRunResults}
