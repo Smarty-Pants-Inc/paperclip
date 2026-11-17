@@ -23,7 +23,7 @@ import { canonicalExecutionUuid } from "./execution-identity.js";
 import { chatActionDeadline } from "./chat-action-work.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { isAcknowledgedLegacyUserStop, isQueuedDependencyWait, runStopPresentationJson } from "./run-cancellation.js";
-import { decideRetryAuthority, heldRetryOffersRetry, readRetryAuthorityFacts } from "./task-retry-eligibility.js";
+import { decideRetryAuthority, heldRetryOffersRetry, readRestoreHoldEvidence, readRetryAuthorityFacts } from "./task-retry-eligibility.js";
 import { readRetryStopGate, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON, RETRY_STOP_WAIT_MESSAGE } from "./task-retry-stop-gate.js";
 import { exhaustedNativeFinalizationCondition, savedResultRetryPendingCondition } from "./native-runtime/exhausted-finalization-retry.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
@@ -904,7 +904,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   if (offered.length) {
     const [{ executionBlockerPredicate, getExecutionBlocker, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate },
       { readStandingRunNotices }] = await Promise.all([import("./execution-blocker.js"), import("./standing-run-notice.js")]);
-    const [held, notices] = await Promise.all([db.selectDistinct({ issueId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions).where(and(
+    const [held, notices] = await Promise.all([db.select({ issueId: issueRecoveryActions.sourceIssueId,
+      evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, companyId), inArray(issueRecoveryActions.sourceIssueId, offered),
       executionBlockerPredicate(), not(restoreHoldReleasedForCurrentOwnerPredicate()), restoreHoldPredicate())),
       readStandingRunNotices(db, { companyId, issueIds: offered })]);
@@ -918,7 +919,16 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       if (!presentation || !blocker || blocker.canRetry) continue;
       presentation.canRetry = false;
       delete presentation.retryAction;
-      if (!presentation.retryWait && blocker.workspaceRecovery && blocker.workspaceRecovery.status !== "recovered")
+      // A held notice names Retry; where Retry is withheld it is not shown
+      // beside the card's other instruction (one instruction at every moment).
+      if (presentation.notice?.code === "native_prior_owner_held") delete presentation.notice;
+      // Restore hold: the words are restore-card's exports, read through the
+      // one authority (decideRetryAuthority delegates; no second mapping).
+      const hold = held.find(row => row.issueId === issueId);
+      if (!presentation.retryWait && hold && blocker.workspaceRecovery && blocker.workspaceRecovery.status !== "recovered")
+        presentation.retryWait = { reason: "workspace_repair_required",
+          message: decideRetryAuthority({ restoreHold: hold.evidence }).cardText! };
+      else if (!presentation.retryWait && blocker.workspaceRecovery && blocker.workspaceRecovery.status !== "recovered")
         presentation.retryWait = { reason: "workspace_repair_required", message: retryWaitMessages.workspace_repair_required! };
     }
   }
@@ -937,8 +947,11 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     const run = runMap.get(issueId);
     const stopGate = run?.runtimeMode === "native" && run.finishedAt
       ? (await readRetryStopGate(db, { companyId, issueId, sourceRunId: run.id, now }))?.state ?? null : null;
+    // A restore hold that already withheld Retry gets its words from the
+    // authority, which delegates to restore-card's exports (no veto added here).
+    const restoreHold = presentation.canRetry ? null : await readRestoreHoldEvidence(db, { companyId, issueId });
     const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId, issueId }), stopGate,
-      automaticRecovery, retrySource: presentation.canRetry });
+      automaticRecovery, restoreHold, retrySource: presentation.canRetry });
     if (authority.canRetry) continue;
     // Judge R9: Paperclip is continuing by itself; the card says so in the
     // authority's words (the same words the transcript note carries).
@@ -948,6 +961,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     }
     presentation.canRetry = false;
     delete presentation.retryAction;
+    if (presentation.notice?.code === "native_prior_owner_held") delete presentation.notice;
     if (presentation.state === "working") continue;
     if (authority.userAction === "resume" && !presentation.userAction) presentation.userAction = "resume";
     // One instruction: a card that already asks the person for its own action

@@ -55,11 +55,16 @@ export async function readRetryStopGate(db: Db, input: {
   }
   // A stopped native run that still holds the task has not settled: its hold
   // (or its absence) is not known yet, so a Retry cannot be judged.
+  // rf-3 STOP 2: only a REQUESTED Stop (the run was cancelled, or carries its
+  // cancellation record) makes Retry wait; a run nobody stopped never does,
+  // whatever its process liveness or task claim.
   const [source] = await db.select({ finishedAt: heartbeatRuns.finishedAt, runtimeMode: heartbeatRuns.runtimeMode,
+    status: heartbeatRuns.status, stopRequested: sql<boolean>`(${heartbeatRuns.resultJson} -> 'cancellation') is not null`,
     executionRunId: issues.executionRunId }).from(heartbeatRuns)
     .innerJoin(issues, and(eq(issues.companyId, heartbeatRuns.companyId), eq(issues.id, input.issueId)))
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.sourceRunId))).limit(1);
-  if (source?.runtimeMode === "native" && source.finishedAt && source.executionRunId === input.sourceRunId) {
+  if (source?.runtimeMode === "native" && source.finishedAt && source.executionRunId === input.sourceRunId
+    && (source.status === "cancelled" || source.stopRequested)) {
     const since = input.requestedAt ?? source.finishedAt;
     return { state: state(since), since, cause: "source_settling" };
   }
