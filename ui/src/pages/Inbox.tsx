@@ -891,7 +891,7 @@ function StreamlinedInbox({
   const { dismissedAtByKey, dismiss: dismissInboxItem, isLoading: isDismissalsLoading, error: dismissalsError } = useInboxDismissals(selectedCompanyId);
   const { readItems, markRead: markItemRead, markUnread: markItemUnread } = useReadInboxItems();
   const { allCategoryFilter, allApprovalFilter } = filterPreferences;
-  // Show agent-created tasks: the person's explicit choice, else the instance default.
+  // Hide agent-created tasks: the person's new choice, else the instance default.
   const agentCreatedTasksDefault = useAgentCreatedTasksDefault();
   const issueFilters = useMemo(
     () => resolveAgentCreatedTasksDefault(filterPreferences.issueFilters, agentCreatedTasksDefault),
@@ -1244,14 +1244,14 @@ function StreamlinedInbox({
       ...queryKeys.issues.search(selectedCompanyId!, normalizedSearchQuery, undefined, 25),
       "compact",
       "inbox-supplement",
-      issueFilters.showAgentCreatedTasks,
+      issueFilters.hideAgentCreatedTasks,
       "live-descendant-summary",
     ],
     queryFn: () =>
       issuesApi.listCompact(selectedCompanyId!, {
         q: normalizedSearchQuery,
         limit: 25,
-        includeAgentCreatedTasks: issueFilters.showAgentCreatedTasks,
+        includeAgentCreatedTasks: !issueFilters.hideAgentCreatedTasks,
         includeParticipatedTasks: true,
         includeRoutineExecutions: true,
         includeLiveDescendantSummary: true,

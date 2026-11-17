@@ -31,6 +31,14 @@ describe("ApprovalPayloadRenderer", () => {
     container.remove();
   });
 
+  it.each([0, 5000])("shows a configured %s-cent override limit while masking observed spend", (budgetAmount) => {
+    const root = createRoot(container);
+    act(() => root.render(<ApprovalPayloadRenderer type="budget_override_required"
+      payload={{ budgetAmount, observedAmount: 1234 }} />));
+    expect(container.textContent).toContain(`Limit $${(budgetAmount / 100).toFixed(2)} · Observed —`);
+    act(() => root.unmount());
+  });
+
   it("renders request_board_approval payload fields without falling back to raw JSON", () => {
     const root = createRoot(container);
 

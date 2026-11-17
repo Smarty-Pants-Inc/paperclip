@@ -541,10 +541,10 @@ export function IssueFiltersPopover({
                 {enableAgentCreatedVisibilityFilter ? (
                   <label className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
                     <Checkbox
-                      checked={state.showAgentCreatedTasks}
-                      onCheckedChange={(checked) => onChange({ showAgentCreatedTasks: checked === true, showAgentCreatedTasksExplicit: true })}
+                      checked={state.hideAgentCreatedTasks}
+                      onCheckedChange={(checked) => onChange({ hideAgentCreatedTasks: checked === true, hideAgentCreatedTasksExplicit: true })}
                     />
-                    <span className="text-sm">Show agent-created tasks</span>
+                    <span className="text-sm">Hide agent-created tasks</span>
                   </label>
                 ) : null}
                 {onHiddenOnlyChange ? (

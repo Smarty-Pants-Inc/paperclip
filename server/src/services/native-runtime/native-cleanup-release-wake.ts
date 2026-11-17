@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { notifyDeferredExecutionWork } from "../deferred-execution-notifications.js";
+import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../deferred-execution-notifications.js";
 import { notifyQueuedRunDispatch } from "../run-dispatch-notifications.js";
 import { onNativeSessionCleanupQuarantined, onNativeSessionCleanupSettled } from "../../vendor/paperclip-runner/index.js";
 
@@ -10,10 +10,13 @@ import { onNativeSessionCleanupQuarantined, onNativeSessionCleanupSettled } from
  * dispatch repeats every admission check under its own locks.
  */
 export function registerNativeCleanupReleaseWake(db: Db, onError: (error: unknown, companyId: string) => void): () => void {
-  const unsubscribeSettled = onNativeSessionCleanupSettled(({ companyId }) => {
+  const unsubscribeSettled = onNativeSessionCleanupSettled(({ companyId, issueIds }) => {
     if (!companyId) return;
     void db.transaction(async tx => {
       await notifyDeferredExecutionWork(tx, { companyId });
+      // S8q: the end of a session close is the end of teardown. Exact hints
+      // reach the held wakes without waiting out the company reconstruction.
+      for (const issueId of issueIds ?? []) await notifyDeferredWakesForIssue(tx, { companyId, issueId });
       await notifyQueuedRunDispatch(tx, { companyId });
     }).catch((error: unknown) => onError(error, companyId));
   });

@@ -184,7 +184,34 @@ if sys.argv[1] != "completion":
     const result = await executeWorkspaceTool(directory, "workspace_run", { program: "/bin/sleep", args: ["20"] }, async () => { if (++calls > 2) throw new Error("revoked"); });
     expect(result).toMatchObject({ stopped: "authority_revoked" });
     const large = await executeWorkspaceTool(directory, "workspace_run", { program: "/bin/sh", args: ["-c", "yes x | head -c 50000"] }, authorize) as any;
-    expect(large.truncated).toBe(true); expect(Buffer.byteLength(large.output)).toBeLessThanOrEqual(24000);
+    expect(Buffer.byteLength(large.output)).toBeLessThan(40000);
+    expect((await readFile(join(directory, large.outputPath))).length).toBe(50000);
+    expect(large.outputBytes).toBe(50000);
+  });
+  it.skipIf(!workspaceCommandSandboxAvailable())("preserves 200,000 command bytes in a sandbox-protected, readable workspace log", async () => {
+    const directory = await root();
+    const expected = "x".repeat(150000) + "E1_MIDDLE_SENTINEL" + "x".repeat(200000 - 150000 - "E1_MIDDLE_SENTINEL".length - "E1_FINAL_SENTINEL".length) + "E1_FINAL_SENTINEL";
+    expect(Buffer.byteLength(expected)).toBe(200000);
+    await writeFile(join(directory, "emit.txt"), expected);
+    const result = await executeWorkspaceTool(directory, "workspace_run", {
+      program: "/bin/cat", args: ["emit.txt"],
+    }, authorize) as any;
+    expect(result.exitCode).toBe(0);
+    expect(result.outputBytes).toBe(200000);
+    expect(result.output).toContain("E1_FINAL_SENTINEL");
+    expect(result.output).not.toMatch(/\[truncated\]/i);
+    let text = "", offset: number | null = 0;
+    while (offset !== null) {
+      const page = await executeWorkspaceTool(directory, "workspace_read", { path: result.outputPath, offset }, authorize) as any;
+      text += page.text; offset = page.nextOffset;
+    }
+    expect(text).toBe(expected);
+    // The currently running command cannot clobber its capture file.
+    const protectedLog = await executeWorkspaceTool(directory, "workspace_run", {
+      program: "/bin/sh", args: ["-c", "for f in .workspace-run-*.log; do printf overwritten > \"$f\" 2>/dev/null; done; printf CAPTURE_INTACT"],
+    }, authorize) as any;
+    expect(await readFile(join(directory, protectedLog.outputPath), "utf8")).toContain("CAPTURE_INTACT");
+    expect(protectedLog.output).toContain("CAPTURE_INTACT");
   });
   it("reads only a pinned skill file and detects tampering", async () => {
     const bundle = await materializeAsset([{ path: "SKILL.md", content: Buffer.from("# Assigned skill\nUse the pinned instructions."), mode: 0o444 }]);

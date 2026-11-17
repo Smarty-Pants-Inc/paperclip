@@ -134,6 +134,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { keepPreviousDataForSameQueryTail } from "../lib/query-placeholder-data";
 import { useIssueWorkProducts } from "../hooks/useIssueWorkProducts";
 import {
+  isQueuedInterruptHandoff,
   mergePendingIssueQueuedComments,
   normalizeIssueQueuedCommentQueue,
   startingQueuedCommentIds,
@@ -1818,8 +1819,16 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               run.contextCommentId.length > 0
             ? run.contextCommentId
             : null;
-      const inputIds =
-        batchedIds.length > 0 ? batchedIds : fallbackId ? [fallbackId] : [];
+      // Messages posted while the run was starting, which its first turn took.
+      const firstTurnIds = Array.isArray(run.firstTurnCommentIds)
+        ? run.firstTurnCommentIds.filter(
+            (value): value is string => typeof value === "string" && value.length > 0,
+          )
+        : [];
+      const inputIds = [...new Set([
+        ...(batchedIds.length > 0 ? batchedIds : fallbackId ? [fallbackId] : []),
+        ...firstTurnIds,
+      ])];
       const anchorAt = run.startedAt ?? run.createdAt;
       const anchorMs = new Date(anchorAt).getTime();
       inputIds.forEach((commentId, sequence) => {
@@ -2518,7 +2527,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       });
       try {
         const updatedQueue = await onInterruptQueued(runId);
-        if (updatedQueue?.state === "deferred") {
+        if (updatedQueue?.state === "deferred" && !isQueuedInterruptHandoff(updatedQueue)) {
           const remaining = new Set(updatedQueue.entries.map(entry => entry.comment.id));
           setConsumedQueuedCommentIds(current => new Set([...current].filter(id => !remaining.has(id))));
           setLocalInterruptPlacements(current => new Map([...current].filter(([id]) => !remaining.has(id))));
@@ -2537,6 +2546,13 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           for (const id of ids) next.delete(id);
           return next;
         });
+        // S8q: a press with nothing left to send is an answer, not a failure.
+        if (error instanceof ApiError && error.status === 409 &&
+            (error.body as { details?: { reason?: string } } | undefined)?.details?.reason === "nothing_waiting") {
+          await queryClient.invalidateQueries({ queryKey: queryKeys.issues.queuedComments(issueId) });
+          setClassicQueuedDeliveryError("Nothing is waiting.");
+          return;
+        }
         if (classicTaskInterfaceEnabled) {
           setClassicQueuedDeliveryError("Couldn’t interrupt. Message is still queued.");
           return;
@@ -2552,6 +2568,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       storeQueuedCommentQueue,
       refreshQueueAfterConflict,
       classicTaskInterfaceEnabled,
+      queryClient,
+      issueId,
     ],
   );
 
