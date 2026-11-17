@@ -10,6 +10,8 @@ import { claimCancellationRequest } from "../services/native-runtime/native-canc
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerIssueRecoveryWork } from "../services/recovery/work.js";
 import { nativeUserStopRecoveryHeld } from "../services/native-runtime/native-user-stop-settlement.js";
+import { handedOffWarmLeaseSettled } from "../services/native-runtime/handed-off-warm-lease.js";
+import { environmentService } from "../services/environments.js";
 
 // Keep reason: #20807 RFL F1's independent PostgreSQL reproduction caught a
 // data-safety failure: the ordinary sweep released a still-executing owner's
@@ -678,5 +680,117 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       expect(first.deadlines).toEqual([]);
       expect(first.cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
       expect(first.held).toBe(true);
+    });
+  // Keep reason: adopt-h6-xred3 (rf-3 19:14Z/19:17Z, live c1 run 11130cd2). The
+  // SAME handed-off warm lease has two states: active before the release, and
+  // retained/success after it (environment-runtime.ts releaseLease("retained",
+  // { cleanupStatus: "success" })). H6's card proof and the Send gate
+  // (explicit-native-continuation.ts handedOffWarmLeaseSettled) must both
+  // accept both states, and only with a handoff marker naming THIS run.
+  async function crossUnitFixture() {
+    const f = await warmStopFixture("settled");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    // The live run's admitted disposition (live rawNativeWorkspaceSync.resourceDisposition = keep_running).
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run!.runnerProfileJson, nativeResourceDisposition: "keep_running" } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    // The Send's marker: the s3 fence's runner-exit stamp naming this run.
+    await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata,
+      handedOffWarmOwnerRunnerExited: { runId: f.runId, provenAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
+    return f;
+  }
+  async function release(f: { lease: { id: string } }) {
+    // The real writer of the handoff release (environment-runtime.ts keep_running + reuse_by_environment branch).
+    await environmentService(db).releaseLease(f.lease.id, "retained", { cleanupStatus: "success" });
+  }
+  async function bothCallers(f: { companyId: string; runId: string; lease: { id: string } }) {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    return { lease: lease!, h6: await runExecutionsStoppedOrHandedOffWarm(db, f.companyId, [f.runId]),
+      send: handedOffWarmLeaseSettled(run!, lease!) };
+  }
+
+  it("XRED: before the release (active) H6's proof holds and the Send gate admits the same lease", async () => {
+    const f = await crossUnitFixture();
+    const before = await task(f.issueId);
+    const r = await bothCallers(f);
+    expect(r.lease).toMatchObject({ status: "active", cleanupStatus: null, releasedAt: null });
+    expect({ h6: r.h6, send: r.send }).toEqual({ h6: true, send: true });
+    const { cards, held } = await onePass(f);
+    expect(cards).toEqual([]);
+    expect(held).toBe(false);
+    expect(await task(f.issueId)).toEqual(before);
+  });
+
+  it("XRED: after the release (retained/success) H6's proof holds (no card) and the Send gate admits the same lease", async () => {
+    const f = await crossUnitFixture();
+    const before = await task(f.issueId);
+    await release(f);
+    const r = await bothCallers(f);
+    expect(r.lease).toMatchObject({ status: "retained", cleanupStatus: "success", releasedAt: null, id: f.lease.id });
+    expect({ h6: r.h6, send: r.send }).toEqual({ h6: true, send: true });
+    // The live 11130cd2 symptom: an escalated execution_stop_pending card after the receipt landed.
+    const { cards, held } = await onePass(f);
+    expect(cards).toEqual([]);
+    expect(held).toBe(false);
+    expect(await task(f.issueId)).toEqual(before);
+  });
+
+  it("XRED: an existing card is retired once the released handoff is proven (the live 7.5 min)", async () => {
+    const f = await crossUnitFixture();
+    // The live card was written at 18:02:30, before the receipt (18:02:38). The receipt
+    // is present here; the release lands; the next sweep must retire it.
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run!.runnerProfileJson, nativeRetainedIdleCheckpoint: undefined } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const first = await onePass(f);
+    expect(first.cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+    await db.update(heartbeatRuns).set({ runnerProfileJson: run!.runnerProfileJson }).where(eq(heartbeatRuns.id, f.runId));
+    await release(f);
+    const recheck = await onePass(f);
+    expect(recheck.cards.filter(card => card.status === "escalated")).toEqual([]);
+    expect(recheck.held).toBe(false);
+  });
+
+  it.each(["stop_and_retain", "terminated", "other_run_marker", "no_marker", "non_warm", "cleanup_failed"] as const)(
+    "XRED negative %s: H6's proof and the Send gate both refuse it", async variant => {
+      const f = await crossUnitFixture();
+      await release(f);
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const other = randomUUID();
+      if (variant === "stop_and_retain") {
+        await db.update(environmentLeases).set({ metadata: { ...lease!.metadata,
+          sandboxStopAndRetainReceipt: { state: "stopped", at: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
+      } else if (variant === "terminated") {
+        await environmentService(db).releaseLease(f.lease.id, "released", { cleanupStatus: "success",
+          remoteExecutionTermination: remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId, state: "destroyed" })! });
+      } else if (variant === "other_run_marker") {
+        const receipt = run!.runnerProfileJson!.nativeRetainedIdleCheckpoint as Record<string, unknown>;
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run!.runnerProfileJson,
+          nativeRetainedIdleCheckpoint: { ...receipt, runId: other } } }).where(eq(heartbeatRuns.id, f.runId));
+        await db.update(environmentLeases).set({ metadata: { ...lease!.metadata,
+          handedOffWarmOwnerRunnerExited: { runId: other, provenAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
+      } else if (variant === "no_marker") {
+        const { nativeRetainedIdleCheckpoint: _r, ...profile } = run!.runnerProfileJson!;
+        const { handedOffWarmOwnerRunnerExited: _m, ...metadata } = lease!.metadata!;
+        await db.update(heartbeatRuns).set({ runnerProfileJson: profile }).where(eq(heartbeatRuns.id, f.runId));
+        await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, f.lease.id));
+      } else if (variant === "non_warm") {
+        await db.update(environmentLeases).set({ leasePolicy: "ephemeral" }).where(eq(environmentLeases.id, f.lease.id));
+      } else {
+        await db.update(environmentLeases).set({ cleanupStatus: "failed" }).where(eq(environmentLeases.id, f.lease.id));
+      }
+      const r = await bothCallers(f);
+      if (variant === "terminated") {
+        // A real termination is not a handoff: the Send's handoff predicate refuses
+        // it (the gate admits it through its own termination-receipt branch), and
+        // the Stop proof holds through the strict receipt path, not the handoff.
+        expect(r.send).toBe(false);
+        expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
+        return;
+      }
+      expect({ h6: r.h6, send: r.send }).toEqual({ h6: false, send: false });
+      const { cards } = await onePass(f);
+      expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
     });
 });
