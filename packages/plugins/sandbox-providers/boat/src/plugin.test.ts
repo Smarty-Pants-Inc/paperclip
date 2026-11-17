@@ -11,7 +11,7 @@ describe("Boat provider", () => {
     expect(manifest.environmentDrivers?.[0]?.configSchema?.properties?.reuseLease).toMatchObject({ type: "boolean", default: false });
     expect(await plugin.definition.onEnvironmentValidateConfig?.({ driverKey: "boat", config: cfg })).toMatchObject({ ok: true, normalizedConfig: { reuseLease: false } });
     const { reuseLease: _omitted, ...withoutReuseOption } = cfg;
-    expect(await plugin.definition.onEnvironmentValidateConfig?.({ driverKey: "boat", config: withoutReuseOption })).toMatchObject({ ok: true, normalizedConfig: { reuseLease: false } });
+    expect(await plugin.definition.onEnvironmentValidateConfig?.({ driverKey: "boat", config: withoutReuseOption })).toEqual({ ok: true, normalizedConfig: withoutReuseOption });
     expect(await plugin.definition.onEnvironmentValidateConfig?.({ driverKey: "boat", config: { ...cfg, reuseLease: true } })).toMatchObject({ ok: true, normalizedConfig: { reuseLease: true } });
   });
   it("validates and normalizes configuration", async () => {

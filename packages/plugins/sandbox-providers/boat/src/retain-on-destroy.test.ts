@@ -41,13 +41,14 @@ describe("retainOnDestroy compatibility", () => {
     ]);
     expect(fetch.mock.calls.some(([url]) => String(url).includes("/commands") || String(url).includes("/files"))).toBe(false);
   });
-  it("declares an ignored boolean default true and always normalizes retention on", async () => {
+  it("declares an ignored boolean default true and normalizes only explicit retention on", async () => {
     expect(manifest.environmentDrivers?.[0]?.configSchema?.properties?.retainOnDestroy).toMatchObject({
       type: "boolean", default: true, description: "ignored: sandboxes are always stopped and kept",
     });
     for (const reuseLease of [false, true]) for (const retainOnDestroy of [undefined, false, true]) {
-      expect(await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config: { ...config, reuseLease, ...(retainOnDestroy === undefined ? {} : { retainOnDestroy }) } }))
-        .toMatchObject({ ok: true, normalizedConfig: { reuseLease, retainOnDestroy: true } });
+      const input = { ...config, reuseLease, ...(retainOnDestroy === undefined ? {} : { retainOnDestroy }) };
+      expect(await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config: input }))
+        .toEqual({ ok: true, normalizedConfig: { ...input, ...(retainOnDestroy === undefined ? {} : { retainOnDestroy: true }) } });
     }
   });
 

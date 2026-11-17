@@ -71,18 +71,18 @@ afterEach(async () => {
 });
 
 describe("F-05B bounded per-box RUN renewal", () => {
-  it("R1: default 7800s cap stops an orphaned RUN and its last finite TTL expires", async () => {
+  it("R1: default 86400s cap stops an orphaned RUN and its last finite TTL expires", async () => {
     const timers = vi.getTimerCount();
     await acquire();
-    await vi.advanceTimersByTimeAsync(7_799_999);
+    await vi.advanceTimersByTimeAsync(86_399_999);
     expect(fake.expired).toBe(false);
-    expect(fake.patches).toHaveLength(77);
+    expect(fake.patches).toHaveLength(863);
     await vi.advanceTimersByTimeAsync(1);
     expect(vi.getTimerCount()).toBe(timers);
     await vi.advanceTimersByTimeAsync(600_000);
-    expect(fake.patches).toHaveLength(77);
+    expect(fake.patches).toHaveLength(863);
     expect(fake.expired).toBe(true);
-    expect(fake.deadline).toBe(start + 8_000_000);
+    expect(fake.deadline).toBe(start + 86_600_000);
     expect(fake.patches.every(p => p.ttlSeconds === 300)).toBe(true);
     expect(fake.starts).toEqual(["/sandboxes"]);
   });
@@ -171,8 +171,8 @@ describe("F-05B bounded per-box RUN renewal", () => {
     expect(fake.patches).toHaveLength(count);
     await vi.advanceTimersByTimeAsync(500_000); expect(fake.expired).toBe(true);
   });
-  it("exposes and validates a finite positive cap, with default 7800", async () => {
-    expect(manifest.environmentDrivers![0].configSchema?.properties?.runLeaseRenewCapSeconds).toMatchObject({ type: "integer", default: 7800 });
+  it("exposes and validates a finite positive cap, with default 86400", async () => {
+    expect(manifest.environmentDrivers![0].configSchema?.properties?.runLeaseRenewCapSeconds).toMatchObject({ type: "integer", default: 86400 });
     for (const value of [null, 0, -1, 1.5, Infinity, "7800"]) {
       const result = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config: { ...config, runLeaseRenewCapSeconds: value } });
       expect(result.ok, `invalid cap ${value}`).toBe(false);
