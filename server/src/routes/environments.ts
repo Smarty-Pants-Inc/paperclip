@@ -62,6 +62,7 @@ import {
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { assertBoard, assertBoardOrgAccess, assertCompanyAccess, boardAccessRequired, getActorInfo } from "./authz.js";
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
+import { clearLeaseCollectionPin } from "../services/agent-file-save-hold.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "../services/environment-custom-image-runtime.js";
@@ -1197,6 +1198,20 @@ export function environmentRoutes(
     const discarded = await agentInstructionWorkingCopyService(db).discardHeld({ companyId,
       runId: req.params.runId as string, actorId: actor.actorId, reason });
     res.json(discarded);
+  });
+
+  router.post("/companies/:companyId/environment-leases/:leaseId/collection-pins/clear", async (req, res) => {
+    assertCanAccessInstanceEnvironments(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const { copyKey, token, collectorStopped } = req.body ?? {};
+    const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+    if (typeof copyKey !== "string" || !copyKey || copyKey.length > 512 || typeof token !== "string" || !token || token.length > 256
+      || collectorStopped !== true || !reason || reason.length > 1000)
+      throw unprocessable("The exact copyKey and token, a reason, and collectorStopped: true are required");
+    await clearLeaseCollectionPin(db, { companyId, leaseId: req.params.leaseId as string, copyKey, token, reason,
+      actorId: getActorInfo(req).actorId });
+    res.json({ cleared: true, leaseId: req.params.leaseId, copyKey });
   });
 
   router.get("/environment-leases/:leaseId", async (req, res) => {

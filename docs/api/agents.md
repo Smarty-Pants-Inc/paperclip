@@ -56,6 +56,28 @@ remote collector is unavailable. Other holds on the allocation still block its
 destruction. Missing copies return 404; an already settled or non-held copy
 returns 409. No bulk discard is supported.
 
+## Clear a crashed collector's lease pin
+
+```
+POST /api/companies/{companyId}/environment-leases/{leaseId}/collection-pins/clear
+{
+  "copyKey": "{companyId}:{runId}:{agentId}",
+  "token": "{exact token from lease.metadata.agentFileCollectionPins}",
+  "collectorStopped": true,
+  "reason": "Collector process exited; no collection remains in flight"
+}
+```
+
+Uses the discard endpoint's environment-DELETE operator authorization and company
+access check. First independently establish that the collector is gone: clearing
+a live pin could allow destruction while its collection is still running. The
+server requires that acknowledgment, an exact token, and a reason (1–1000
+characters). It atomically clears **one** pin and logs the operator, reason and
+time (`agent_files.collection_pin_cleared`); other pins and durable save holds
+remain effective. A replacement token or an absent pin returns 409. No provider
+command runs and no save or discard is claimed by this action. Existing cleanup
+workers are notified to reconsider the allocation.
+
 ## Get Current Agent
 
 ```

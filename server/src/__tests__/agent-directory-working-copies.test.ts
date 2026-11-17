@@ -1066,6 +1066,41 @@ describe("persistent agent directories", () => {
       app.use("/api", environmentRoutes(db)); app.use(errorHandler); return app;
     }
     const discardUrl = (runId: string) => `/api/companies/${companyId}/agent-file-holds/${runId}/discard`;
+    it("operator clears only an acknowledged crashed collector pin with its exact token", async () => {
+      const fx = await boundLeaseFixture();
+      const key = `${companyId}:${fx.copy.runId}:${agentId}`, otherKey = `${companyId}:${randomUUID()}:${agentId}`;
+      const token = randomUUID(), otherToken = randomUUID();
+      await db.update(environmentLeases).set({ metadata: { ...(await fx.lease()).metadata,
+        agentFileCollectionPins: { [key]: token, [otherKey]: otherToken } } }).where(eq(environmentLeases.id, fx.leaseId));
+      const url = `/api/companies/${companyId}/environment-leases/${fx.leaseId}/collection-pins/clear`;
+      const admin = operatorApp({ type: "board", source: "local_implicit", userId });
+      const payload = { copyKey: key, token, reason: "Collector crashed; its process is gone", collectorStopped: true };
+      expect(await claimLeaseForDestroyUnlessHeld(db, await fx.lease())).toBeNull();
+      expect((await request(operatorApp({ type: "agent", companyId, agentId, source: "agent_key" }))
+        .post(url).send(payload)).status).toBe(403);
+      expect((await request(admin).post(url).send({ ...payload, token: randomUUID() })).status).toBe(409);
+      expect((await request(admin).post(url).send({ ...payload, collectorStopped: false })).status).toBe(422);
+      expect((await request(admin).post(url).send(payload)).status).toBe(200);
+      expect((await fx.lease()).metadata?.agentFileCollectionPins).toEqual({ [otherKey]: otherToken });
+      expect(await claimLeaseForDestroyUnlessHeld(db, await fx.lease())).toBeNull();
+      // An old clear cannot erase a replacement collector's token.
+      await db.update(environmentLeases).set({ metadata: { ...(await fx.lease()).metadata,
+        agentFileCollectionPins: { [key]: "replacement", [otherKey]: otherToken } } }).where(eq(environmentLeases.id, fx.leaseId));
+      expect((await request(admin).post(url).send(payload)).status).toBe(409);
+      expect((await request(admin).post(url).send({ ...payload, token: "replacement" })).status).toBe(200);
+      expect((await request(admin).post(url).send({ ...payload, copyKey: otherKey, token: otherToken })).status).toBe(200);
+      expect((await fx.lease()).metadata).not.toHaveProperty("agentFileCollectionPins");
+      const claim = await claimLeaseForDestroyUnlessHeld(db, await fx.lease());
+      expect(claim).toEqual(expect.any(String));
+      await releaseLeaseDestroyClaim(db, fx.leaseId, claim!);
+      expect(await fx.surviving()).toBe(fx.note);
+      expect(fx.call).not.toHaveBeenCalled();
+      const records = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+      const clears = records.filter(row => row.action === "agent_files.collection_pin_cleared");
+      expect(clears).toHaveLength(3);
+      expect(clears[0]).toMatchObject({ actorType: "user", actorId: userId,
+        details: { copyKey: key, reason: payload.reason, collectorStopped: true, clearedAt: expect.any(String) } });
+    });
     it("operator discard removes exactly one held save and atomically records who why and when", async () => {
       const first = await holdUnsavedNote(true, "quota"), second = await holdUnsavedNote(false, "authorization");
       const before = Date.now();
