@@ -685,17 +685,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         !(await recordedLocalExecutionStopped(db, run))) return;
     const issueId = run.nativeIssueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
     if (!issueId) return;
-    const currentRun = run.runtimeMode === "native" ? await readNativeStopExecutionEvidence(db, run.companyId, run.id) : null;
-    const [coordinator] = currentRun ? await db.select({ phase: nativeRunFinalizations.phase,
-      leaseOwner: nativeRunFinalizations.leaseOwner }).from(nativeRunFinalizations).where(and(
-      eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
-    )) : [];
     // The ordinary path still enforces task holds, ownership, and native session
     // cleanup before starting a provider.
-    const stoppedNativeExecution = currentRun && isAcknowledgedNativeStop(currentRun) &&
-      !activeRunExecutions.has(run.id) && !coordinator?.leaseOwner &&
-      ["terminal_failure", "applied"].includes(coordinator?.phase ?? "") &&
-      await acknowledgedNativeStopExecutionHasStopped(db, currentRun);
+    const stoppedNativeExecution = run.runtimeMode === "native" && await nativeStopExecutionProven(run.companyId, run.id);
     if (stoppedNativeExecution) await observeStoppedWorkspaceRecovery(db, { companyId: run.companyId, issueId, runId: run.id });
     const stoppedNativeContinuation = stoppedNativeExecution && !(await getExecutionBlocker(db, run.companyId, issueId));
     const legacyContinuation = run.runtimeMode === "legacy" &&
@@ -791,6 +783,40 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         idempotencyKey: `remote-stop-comment:${run.id}:${wake.id}` }, wake.id);
       break;
     }
+  }
+
+  /** One writer per native session: the acknowledged Stop, a released
+   * controller (no executor, no coordinator lease owner, terminal phase) and
+   * the provider's recorded stop. Nothing may start a successor before this. */
+  async function nativeStopExecutionProven(companyId: string, runId: string) {
+    const currentRun = await readNativeStopExecutionEvidence(db, companyId, runId);
+    if (!currentRun) return false;
+    const [coordinator] = await db.select({ phase: nativeRunFinalizations.phase,
+      leaseOwner: nativeRunFinalizations.leaseOwner }).from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, runId),
+    ));
+    return isAcknowledgedNativeStop(currentRun) && !activeRunExecutions.has(runId) &&
+      !adapterExecutionControls.has(runId) && !coordinator?.leaseOwner &&
+      ["terminal_failure", "applied"].includes(coordinator?.phase ?? "") &&
+      await acknowledgedNativeStopExecutionHasStopped(db, currentRun);
+  }
+
+  /** S8q: the native run this Interrupt click stopped has finished teardown.
+   * Its end-of-teardown hint may then deliver the saved messages at once
+   * instead of waiting out the 30 s fallback age gate. */
+  async function queuedCommentInterruptTargetStopped(companyId: string, queueId: string) {
+    const [wake] = await db.select({ agentId: agentWakeupRequests.agentId }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, queueId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
+    ));
+    if (!wake) return false;
+    const [target] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, wake.agentId),
+      eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "cancelled"),
+      sql`${heartbeatRuns.resultJson}->>'queuedCommentInterruptQueueId' = ${queueId}`,
+    )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
+    return Boolean(target) && await nativeStopExecutionProven(companyId, target!.id);
   }
 
   async function resumeQueuedCommentInterrupt(companyId: string, queueId: string, opts?: { retryCleanup?: boolean }) {
@@ -1973,6 +1999,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     cancelRunInternal,
     resumeExecutionWaitComments,
     resumeQueuedCommentInterrupt,
+    queuedCommentInterruptTargetStopped,
     resumeSavedLegacyComments: resumeSavedComments,
     resumeTaskRetry,
     cancelActiveForAgentInternal,

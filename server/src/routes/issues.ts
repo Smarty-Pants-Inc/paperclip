@@ -18007,11 +18007,21 @@ export function issueRoutes(
         }
       }
       const actor = getActorInfo(req);
+      // S8q(5): a press with no run to stop and nothing left in the queue keeps
+      // the existing 409 queued_comment_not_pending contract, worded plainly so
+      // the client can say "Nothing is waiting." instead of showing an error.
+      const untargeted = !req.body.targetRunId;
+      const nothingWaiting = () => conflict("Nothing is waiting.", {
+        code: "queued_comment_not_pending", reason: "nothing_waiting" });
       const interruptPlan = await db.transaction(async (tx): Promise<{ firstTurnRunId: string } | { runToInterrupt: string | null }> => {
         const locked = await lockQueuedCommentState({
           tx, issue, actor, queueId: req.body.queueId, targetRunId: req.body.targetRunId ?? undefined,
           allowStoppedTarget: true,
+        }).catch((error: unknown) => {
+          if (untargeted && (error as { details?: { code?: string } })?.details?.code === "queued_comment_not_pending") throw nothingWaiting();
+          throw error;
         });
+        if (untargeted && (locked.state !== "deferred" || !locked.queue.entries.length)) throw nothingWaiting();
         assertQueueMutationTarget({ queue: locked.queue, queueId: req.body.queueId, revision: req.body.revision });
         // Explicit Interrupt is also the fallback when a native turn cannot
         // accept steering. Cancellation and ordinary admission still own Stop
