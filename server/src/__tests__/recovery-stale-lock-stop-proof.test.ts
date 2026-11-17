@@ -10,6 +10,7 @@ import { claimCancellationRequest } from "../services/native-runtime/native-canc
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerIssueRecoveryWork } from "../services/recovery/work.js";
 import { nativeUserStopRecoveryHeld } from "../services/native-runtime/native-user-stop-settlement.js";
+import { prepareSandboxStopAndRetain } from "../services/sandbox-stop-and-retain.js";
 
 // Keep reason: #20807 RFL F1's independent PostgreSQL reproduction caught a
 // data-safety failure: the ordinary sweep released a still-executing owner's
@@ -565,6 +566,77 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       const { cards, held } = await onePass(f);
       expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
       expect(held).toBe(true);
+    });
+
+  // U owns a real, bound stop-only request, not H6's retained-idle receipt.
+  async function boundedPersonStop(inFlight = true) {
+    const f = await warmStopFixture("missing");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...run!.resultJson,
+      nativeCancellation: { ...(run!.resultJson!.nativeCancellation as Record<string, unknown>), recordedAt: new Date().toISOString() } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata, pluginId: randomUUID() } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    const requested = await prepareSandboxStopAndRetain(db, lease!);
+    expect(requested).not.toBeNull();
+    if (inFlight) await db.update(environmentLeases).set({ metadata: { ...requested!.metadata,
+      pendingCleanupInFlight: true, pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000 } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    return f;
+  }
+
+  it.each([false, true])("U bounded person Stop requested/in-flight=%s: no card until receipt, then claims release", async inFlight => {
+    const f = await boundedPersonStop(inFlight);
+    const before = await task(f.issueId);
+    const deadlines: number[] = [];
+    await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId,
+      onDeferredDeadline: at => deadlines.push(at) });
+    expect(await stopActions(f.issueId)).toEqual([]);
+    expect(await task(f.issueId)).toEqual(before);
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    expect(deadlines.length).toBeGreaterThan(0);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId, state: "stopped" }) } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    expect((await onePass(f)).cards).toEqual([]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
+    expect(await nativeUserStopRecoveryHeld(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId })).toBe(false);
+  });
+
+  it("U no receipt: a renewed cleanup claim cannot extend five minutes from the acknowledged Stop", async () => {
+    const f = await boundedPersonStop();
+    expect((await onePass(f)).cards).toEqual([]);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...run!.resultJson,
+      nativeCancellation: { ...(run!.resultJson!.nativeCancellation as Record<string, unknown>),
+        recordedAt: new Date(Date.now() - 5 * 60_000 - 1).toISOString() } } }).where(eq(heartbeatRuns.id, f.runId));
+    expect((await onePass(f)).cards).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+  });
+
+  it.each(["non-person", "no-stop-request", "unacknowledged", "crash", "no-stop-intent", "expired-claim", "unknown-bound"] as const)(
+    "U control %s still cards", async control => {
+      const f = await boundedPersonStop();
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const result = { ...run!.resultJson };
+      if (control === "non-person") result.cancelledByActorType = "agent";
+      if (control === "no-stop-request") { delete result.nativeCancellation; delete result.executionCancellation;
+        delete result.cancelledByActorType; delete result.cancelledByUserId; }
+      if (control === "unacknowledged") result.nativeCancellation = { ...(result.nativeCancellation as Record<string, unknown>), dispatched: false };
+      if (control === "unknown-bound") result.nativeCancellation = { ...(result.nativeCancellation as Record<string, unknown>), recordedAt: undefined };
+      await db.update(heartbeatRuns).set({ status: control === "crash" ? "failed" : "cancelled", resultJson: result })
+        .where(eq(heartbeatRuns.id, f.runId));
+      if (control === "no-stop-intent" || control === "expired-claim") {
+        const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+        const metadata = { ...lease!.metadata };
+        if (control === "no-stop-intent") delete metadata.sandboxStopAndRetain;
+        else metadata.pendingCleanupLeaseExpiresAtMs = Date.now() - 1;
+        await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, f.lease.id));
+      }
+      expect((await onePass(f)).cards).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
     });
 
   it("a stop_and_retain Stop with no receipt yet keeps the card even with a settled-turn receipt", async () => {
