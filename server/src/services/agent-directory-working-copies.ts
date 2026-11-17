@@ -3,11 +3,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
-import { agents, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
+import { agents, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
-import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
-import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory } from "./agent-file-store.js";
+import { withDirectoryMergeLock, mergeDirectoryWithBaseline, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory, type AgentFileConflict } from "./agent-file-store.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import { excludeAgentRuntimeFromGit } from "./agent-instruction-git-exclusion.js";
 import { resolveInstructionActor } from "./agent-instruction-authorization.js";
@@ -89,6 +89,11 @@ function baseline(row: Copy) {
   const snapshot = parseDirectorySnapshot(row.receipt?.baseline);
   if (!snapshot || directorySnapshotSha256(snapshot) !== row.baseHash) throw new Error("Agent directory baseline is invalid");
   return snapshot;
+}
+function pendingConflicts(row: Copy): AgentFileConflict[] {
+  // Old receipts have only conflicts. An explicit empty queue means delivered.
+  const value = row.receipt?.pendingConflicts ?? row.receipt?.conflicts;
+  return Array.isArray(value) ? value as AgentFileConflict[] : [];
 }
 function actor(row: Copy): AuthorizationActor {
   return { type: "agent", companyId: row.companyId, agentId: row.agentId, runId: row.runId, onBehalfOfUserId: row.responsibleUserId };
@@ -235,7 +240,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // leaves a recoverable preparing receipt instead of an orphan directory.
     const preparing = { entryFile: deriveBundleState(agent).entryFile, baseRevisionId: null, baseHash: "preparing",
       localRoot, executionRoot, location, state: "preparing", candidateBase64: null, candidateHash: null,
-      receipt: { schema: AGENT_FILES_CONTRACT, workspaceCwd: input.cwd, materializationRunId: origin, ...(input.warm ? { warm: true, directoryRunId: input.runId } : {}), ...(input.target?.kind === "remote"
+      receipt: { schema: AGENT_FILES_CONTRACT, workspaceCwd: input.cwd, materializationRunId: origin,
+        ...(row ? { pendingConflicts: pendingConflicts(row) } : {}), ...(input.warm ? { warm: true, directoryRunId: input.runId } : {}), ...(input.target?.kind === "remote"
         ? { cleanup: { leaseId: input.target.leaseId ?? null, remoteCwd: input.target.remoteCwd } } : {}) }, processStoppedAt: null, attempts: 0,
       nextAttemptAt: null, errorCode: null, errorMessage: null };
     if (row) row = await patch(row, preparing);
@@ -476,16 +482,39 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         const snapshot = checkpointSnapshot(captured.manifest);
         const nextHash = directorySnapshotSha256(snapshot);
         const changed = nextHash !== row.baseHash;
-        const { storageWarning } = changed
+        const { storageWarning, conflicts } = changed
           ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest }, actor(row))
           : await unchangedCheckpoint(row).then(() => ({
-            storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null,
+            storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null, conflicts: [],
           }));
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
           receipt: { ...row.receipt, baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
-            checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning } });
+            checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning, conflicts,
+            pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
+        if (!stopped && row.location === "local" && conflicts.length && conflicts.every(item => item.currentKept !== false)) {
+          // A successful save is already recorded above. Refresh only at this
+          // idle turn boundary, under the canonical writer lock, and reject any
+          // post-capture edit instead of overwriting it. A failed refresh retires
+          // the session; never replay a committed save just to retry a refresh.
+          try {
+            row = await store.locked(row.companyId, row.agentId, actor(row), false, async (_tx, _agent, canonical) => {
+              const current = (await inspectAgentDirectory(canonical, false)).snapshot;
+              await mergeDirectoryWithBaseline({ sourceDir: canonical, targetDir: row.localRoot, baseline: snapshot,
+                conflictPolicy: "reject", snapshots: { source: current } });
+              return patch(row, { baseHash: directorySnapshotSha256(current), receipt: { ...row.receipt,
+                baseline: serializeDirectorySnapshot(current), checkpointManifest: checkpointBaseline(current) } });
+            });
+          } catch (error) {
+            logger.warn({ err: error, runId: row.runId }, "Agent file conflict refresh requires retirement");
+            return patch(row, { errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE",
+              errorMessage: "The conflict save succeeded, but the live directory changed before refresh; collect after provider stop.", nextAttemptAt: null });
+          }
+        }
+        // Remote copies are not rewritten through a full-tree upload while the
+        // provider lives. Their canonical/baseline mismatch refuses warm reuse;
+        // stopped collection and fresh preparation restore the kept version.
         return row;
       } catch (error) {
         failure = error;
@@ -557,13 +586,14 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         const { snapshot } = inspected;
         const candidateHash = directorySnapshotSha256(snapshot);
         let storageWarning = inspected.storageWarning;
+        let conflicts: AgentFileConflict[] = [];
         if (candidateHash === row.baseHash) {
           row = await patch(row, { state: "unchanged", errorCode: null, errorMessage: null, nextAttemptAt: null });
         } else {
-          ({ storageWarning } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
+          ({ storageWarning, conflicts } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
           row = await patch(row, { state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null });
         }
-        row = await patch(row, { receipt: { ...withoutSaveHold(row.receipt), storageWarning } });
+        row = await patch(row, { receipt: { ...withoutSaveHold(row.receipt), storageWarning, conflicts, pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
         break;
       } catch (error) {
         const retryable = !(error instanceof HttpError) || error.status >= 500;
@@ -636,6 +666,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       }
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
+        // The final save receipt keeps any file kept from another writer.
+        ...(Array.isArray(row.receipt?.conflicts) && row.receipt.conflicts.length ? { conflicts: row.receipt.conflicts } : {}),
+        pendingConflicts: pendingConflicts(row),
         ...(row.receipt?.directoryRunId ? { directoryRunId: row.receipt.directoryRunId } : {}),
         ...(cleanupPending ? { cleanup: row.receipt?.cleanup, ...(destroyedOnly ? { cleanupDestroyedOnly: true } : {}) } : {}) },
         nextAttemptAt: cleanupPending ? new Date(Date.now() + 30_000) : null });
@@ -748,7 +781,46 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       return withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), run);
     }));
   }
-  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable,
+  async function claimConflictNotice(input: { companyId: string; agentId: string; runId: string; previousRunId?: string | null }): Promise<string | null> {
+    // A restarted preparation repeats this run's sealed notice, not another
+    // run's inherited context. The pending queue is consumed atomically with it.
+    const readSealed = async () => {
+      const [run] = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.id, input.runId)));
+      const notice = run?.context?.agentFileConflictNotice as { runId?: string; text?: string } | undefined;
+      return notice?.runId === input.runId && typeof notice.text === "string" ? notice.text : null;
+    };
+    const sealed = await readSealed();
+    if (sealed) return sealed;
+    const successor = await get(input.companyId, input.runId);
+    const prior = input.previousRunId ? await get(input.companyId, input.previousRunId) : null;
+    // Warm handoff/adoption moves the queue with its owner. Never consume a
+    // transferred alias as well as its successor's copy of the same receipt.
+    const source = successor && pendingConflicts(successor).length ? successor
+      : prior && prior.state !== "superseded" && !prior.receipt?.retainedByRunId ? prior : null;
+    if (!source || source.agentId !== input.agentId || !isAgentDirectoryCopy(source) || !pendingConflicts(source).length) return null;
+    return serial(source, async current => {
+      const alreadySealed = await readSealed();
+      if (alreadySealed) return alreadySealed;
+      const pending = pendingConflicts(current);
+      if (!pending.length) return null;
+      const text = [...new Map(pending.map(item => [item.path, item])).values()].map(item => item.currentKept === false
+        ? `Note: ${JSON.stringify(item.path)} was also saved by another run; that version was not kept after this run's file/folder replacement. No recovery copy is claimed.`
+        : `Note: ${JSON.stringify(item.path)} was also saved by another run; that version was kept. ${item.conflictCopy
+          ? `Your earlier edit is saved as ${JSON.stringify(item.conflictCopy)}.`
+          : "Your earlier deletion was not applied."}`).join("\n");
+      await db.transaction(async tx => {
+        const [run] = await tx.update(heartbeatRuns).set({ contextSnapshot:
+          sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ agentFileConflictNotice: { runId: input.runId, text } })}::jsonb`,
+        }).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.id, input.runId))).returning({ id: heartbeatRuns.id });
+        if (!run) throw notFound("Conflict notice run not found");
+        await tx.update(copies).set({ receipt: { ...current.receipt, pendingConflicts: [] }, updatedAt: new Date() })
+          .where(and(eq(copies.companyId, input.companyId), eq(copies.runId, current.runId)));
+      });
+      return text;
+    }, "agent_directory_prepare");
+  }
+  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable, claimConflictNotice,
     /** Exact-allocation destruction proof (the only loss that ends a hold without a save). */
     destroyedRemote: (row: Copy) => destroyedRemoteCopy(row),
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),
