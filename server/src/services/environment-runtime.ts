@@ -2108,7 +2108,8 @@ function createSandboxEnvironmentDriver(
           : [];
         for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
           // Protected allocations must stay out of both selection and obsolete cleanup.
-          if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId)
+          if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId,
+            { handoffSuccessorRunId: input.heartbeatRunId })
             || await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!))
             reusableCandidateLeases.splice(index, 1);
         }
@@ -2547,7 +2548,8 @@ function createSandboxEnvironmentDriver(
           : [];
       for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
         // Protected allocations must stay out of both selection and obsolete cleanup.
-        if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId)
+        if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId,
+          { handoffSuccessorRunId: input.heartbeatRunId })
           || await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!))
           reusableCandidateLeases.splice(index, 1);
       }
