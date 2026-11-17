@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
+import { retireSupersededMessageNotes, runWakeMessageIds } from "./recovery/message-note-retirement.js";
 import {
   agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRuns, issueApprovals,
   issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolInvocations, type Db,
@@ -905,6 +906,10 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     action: "issue.continued_from_saved_work", entityType: "issue", entityId: issue.id, agentId: run.agentId, runId: run.id,
     details: { recoveryActionId: primaryId, sourceRunId: run.id, failureCode: run.errorCode ?? null, trigger: input.trigger,
       delivery, workspaceEpochAbandoned: Boolean(fenced), unverifiedActionCount: unverified.length } });
+  // This continuation is the new current incident for the person's message:
+  // an older note that told them to send it again no longer applies (stack135 F4).
+  await retireSupersededMessageNotes(tx, { companyId, issueId: issue.id, messageIds: runWakeMessageIds(run.contextSnapshot),
+    incident: { kind: "fresh_continuation", id: primaryId, at: now } });
   logger.info({ runId: run.id, issueId: issue.id, failureCode: run.errorCode, trigger: input.trigger, delivery },
     "Unfinished run continues in a fresh run from saved work");
   return { kind: "continued", recoveryActionId: primaryId, delivery, isolation };

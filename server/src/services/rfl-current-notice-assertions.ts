@@ -18,5 +18,5 @@ export function currentNotices(after: Note[], before: Note[] = []): Note[] {
     const target = note.metadata?.supersededByCommentId;
     if (target) expect(after.some(candidate => candidate.id === target && candidate.id !== note.id)).toBe(true);
   }
-  return after.filter(note => !note.metadata?.supersededByCommentId);
+  return after.filter(note => !note.metadata?.supersededByCommentId && !note.metadata?.supersededByIncident);
 }

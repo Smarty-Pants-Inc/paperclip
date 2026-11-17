@@ -2268,6 +2268,44 @@ suite("fresh-continuation fallback", () => {
     expect(many.length).toBeLessThanOrEqual(64 * 3);
   }, 60_000);
 
+  // stack135 F4 (rf-3 legacy-note contradiction, pre-existing at the base).
+  // Upgraded data keeps U5's "send it again" notes; a new current incident for
+  // the same message retires them by supersession, never deletion.
+  it("an old send-it-again note plus a new scheduled continuation leaves exactly one current instruction", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" })
+      .where(eq(issues.id, f.issueId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "Please finish the notes.", createdAt: new Date(Date.now() - 5 * 60_000) }).returning();
+    const [otherMessage] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "An older, separate request.", createdAt: new Date(Date.now() - 50 * 60_000) }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const legacy = (messageId: string, body: string) => ({ companyId, issueId: f.issueId, authorType: "system" as const, body,
+      presentation: { kind: "system_notice" as const, tone: "warning" as const, density: "compact" as const, detailsDefaultOpen: true },
+      metadata: { version: 1 as const, authorizationReason: `unanswered_message:${messageId}`, recoveryResponsibility: "user" as const,
+        sections: [{ rows: [{ type: "key_value" as const, label: "Next action", value: "Send a new message to try again." }] }] } });
+    const before = await db.insert(issueComments).values([
+      legacy(message!.id, "Your message wasn't answered. Sending it again is safe."),
+      legacy(otherMessage!.id, "Your earlier message wasn't answered. Sending it again is safe."),
+    ]).returning();
+    await settleUnrecoverableExecutions(db);
+    const card = await taskInterruptionPresentation(db, await issue(f.issueId));
+    expect(card).toMatchObject({ responsibility: "system", canRetry: false });
+    expect(["working", "retry_scheduled"]).toContain(card!.state);
+    const after = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+    const current = currentNotices(after, before);
+    // Only the note for the continued message is retired; the separate message's note is not this incident's.
+    expect(current.map(note => note.metadata?.authorizationReason)).toEqual([`unanswered_message:${otherMessage!.id}`]);
+    const retired = after.find(note => note.id === before[0]!.id)!;
+    expect(retired).toMatchObject({ body: before[0]!.body, deletedAt: null });
+    expect(retired.metadata?.supersededByIncident).toMatchObject({ kind: "fresh_continuation" });
+    // Idempotent: another pass changes nothing.
+    await settleUnrecoverableExecutions(db); await deliver();
+    const again = await db.select().from(issueComments).where(eq(issueComments.id, before[0]!.id));
+    expect(again[0]!.metadata).toEqual(retired.metadata);
+  }, 60_000);
+
   // D146 re-homed (never-OK, stack135 F2). The U5 notice that owned this is
   // deleted; the person-visible card and any recovery notice now own it.
   it.each([
