@@ -34,3 +34,13 @@ it("says recovered, neither recovering nor failed, once the owed files were save
   expect(detail.toLowerCase()).not.toContain("failed");
   expect(detail).not.toContain("Recovering");
 });
+
+// restore-card6: past the person bound the server projects workspaceRestoreDelayed;
+// the marker says the delayed words and offers Retry (not pending).
+it("says recovering is taking longer, with Retry, once the owed hold is past the person bound", async () => {
+  const { workspaceRestoreMarker } = await import("./workspace-restore-marker");
+  const result = { workspaceRestoreFailure: "restore_failed", workspaceRestoreDelayed: true };
+  expect(workspaceRestoreMarkerDetail({ result, savedPlan: false, hasResponse: true }))
+    .toBe("Recovering your saved work is taking longer than expected. You can Retry to continue from the last saved version.");
+  expect(workspaceRestoreMarker(result)).toMatchObject({ pending: false, label: "Recovering saved work", tone: "neutral" });
+});
