@@ -33,6 +33,7 @@ import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { isFailedTurnContinuationRun } from "./native-failed-turn-continuation.js";
 import { isNativeMidStreamCutRecoveryRun, readNativeMidStreamCut } from "./native-mid-stream-cut.js";
 import { readPersistedNativeFailureEvidence } from "./native-provider-failure-evidence.js";
+import { PROVIDER_POLICY_REFUSAL_FAILURE } from "./native-provider-failure.js";
 // Fork: upstream reads nativeRunHasStopRequest from native-tool-receipt-limit.ts (#21913, not carried).
 import { nativeRunHasStopRequest } from "./native-run-stop-request.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE, isNativeEnvironmentBlocker } from "./native-environment-blocker.js";
@@ -1837,9 +1838,18 @@ async function finalizeNativeRunAndProject(input: {
         (!planWait || nativeSha256(planWait.result) !== nativeSha256(result))) {
       throw new Error("native_plan_wait_authority_lost");
     }
-    const { providerFailure, turnFailure, providerExplanation } = await readPersistedNativeFailureEvidence(
+    const persistedFailure = await readPersistedNativeFailureEvidence(
       input.db, run, resultRow.turnId, envelope.terminal as PrpTerminalState,
     );
+    const { providerExplanation } = persistedFailure;
+    const midStreamCut = terminalState === "failed"
+      ? await readNativeMidStreamCut(input.db, { companyId: run.companyId, runId: run.id }) : null;
+    // A cut the cut lane reads as a provider refusal defers to the refusal
+    // path: its code, its terminal decision and its one neutral note. The cut
+    // lane has no refusal code or note of its own.
+    const cutDefersToRefusal = !persistedFailure.providerFailure && midStreamCut === "provider_refusal";
+    const providerFailure = cutDefersToRefusal ? { ...PROVIDER_POLICY_REFUSAL_FAILURE } : persistedFailure.providerFailure;
+    const turnFailure = cutDefersToRefusal ? null : persistedFailure.turnFailure;
     const ownsProviderFailureDecision =
       (!authoritativeIssue.executionRunId || authoritativeIssue.executionRunId === run.id) &&
       (reviewContext ? nativeReview?.interaction.status === "pending"
@@ -1892,8 +1902,7 @@ async function finalizeNativeRunAndProject(input: {
       // The recovery successor of a mid-stream cut is that one continuation too.
       failedTurnContinuationUsed: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext
         && (isNativeMidStreamCutRecoveryRun(run) || await isFailedTurnContinuationRun(input.db, run, authoritativeIssue.id)),
-      midStreamCut: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext
-        ? await readNativeMidStreamCut(input.db, { companyId: run.companyId, runId: run.id }) : null,
+      midStreamCut: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext ? midStreamCut : null,
       ...(addressedOutcome ? { nativeAddressedInteractionOutcome: addressedOutcome } : {}),
       ...(reviewContext ? { nativeReviewOutcome: nativeReview
         ? nativeReview.interaction.status === "pending" ? "pending" as const : "resolved" as const

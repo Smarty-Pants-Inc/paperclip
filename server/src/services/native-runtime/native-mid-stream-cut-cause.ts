@@ -9,8 +9,6 @@
 export const NATIVE_MID_STREAM_CUT_CODE = "native_mid_stream_cut";
 export const NATIVE_MID_STREAM_CUT_MESSAGE =
   "The model's reply was cut off before it finished. Paperclip continues it once.";
-/** A provider refusal ends here: nothing continues or re-sends it from this path. */
-export const NATIVE_PROVIDER_REFUSAL_TERMINAL_REASON = "native_provider_refusal_terminal";
 
 /**
  * - `output_cap_no_text`: the turn stopped at the output cap (`pi_output_truncated`)
@@ -20,5 +18,7 @@ export const NATIVE_PROVIDER_REFUSAL_TERMINAL_REASON = "native_provider_refusal_
  * - `provider_error`: the provider failed mid-turn (an EOF, any provider error).
  *   Recovery resumes the session.
  * - `provider_refusal`: the provider refused the turn. Terminal: no successor.
+ *   The cut lane has no code or note of its own for it: the finalizer hands it
+ *   to the refusal path (`provider_policy_refusal`, its one neutral note).
  */
 export type NativeMidStreamCut = "output_cap_no_text" | "output_cap" | "provider_error" | "provider_refusal";

@@ -3,7 +3,7 @@ import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
 import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE, PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "./native-provider-failure.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_ACTION, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE,
   NATIVE_ENVIRONMENT_BLOCKER_MAX_RETRIES } from "./native-environment-blocker.js";
-import { NATIVE_MID_STREAM_CUT_CODE, NATIVE_PROVIDER_REFUSAL_TERMINAL_REASON, type NativeMidStreamCut } from "./native-mid-stream-cut-cause.js";
+import { NATIVE_MID_STREAM_CUT_CODE, type NativeMidStreamCut } from "./native-mid-stream-cut-cause.js";
 
 export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v14";
 
@@ -344,7 +344,8 @@ export function arbitrateNativeStatus(input: {
   }
   // A refused request must never enter either generic continuation or capacity
   // retry. Keep review authority intact; otherwise bind the existing board hold.
-  if (input.providerPolicyRefused && input.terminalState === "failed") {
+  // A cut the cut lane reads as a refusal is this same decision: one code, one note.
+  if ((input.providerPolicyRefused || input.midStreamCut === "provider_refusal") && input.terminalState === "failed") {
     if (input.nativeReviewOutcome) return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
       statusAction: "preserve", toStatus: input.priorIssueStatus,
@@ -437,18 +438,6 @@ export function arbitrateNativeStatus(input: {
         reasonCode: "cancellation_run_only",
         unblockDescriptor: null,
         effects: [{ kind: "release_run_resources" }],
-      };
-    }
-    if (input.midStreamCut === "provider_refusal") {
-      // The provider refused the turn. Resuming or re-sending it would only
-      // be refused again: this path starts no successor of any kind.
-      return {
-        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
-        statusAction: "preserve",
-        toStatus: input.priorIssueStatus,
-        reasonCode: NATIVE_PROVIDER_REFUSAL_TERMINAL_REASON,
-        unblockDescriptor: null,
-        effects: [{ kind: "release_checkout" }],
       };
     }
     if (input.failedTurnContinuationUsed) {

@@ -375,15 +375,19 @@ describe("native mid-stream cut: one successor, through recovery", () => {
   it("RED: a provider refusal (Terms of Service, reasoning_extraction) is terminal: zero successors, no wake of any kind", async () => {
     const issueId = await task();
     const cut = await cutTurn(issueId, "refusal");
-    expect(cut.decision.reasonCode).toBe("native_provider_refusal_terminal");
+    // compose: unit 1 defers to dl-refusal2: its code, its terminal decision, its one neutral note.
+    expect(cut.decision.reasonCode).toBe("provider_policy_refusal");
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, cut.runId)))[0]).toMatchObject({
+      errorCode: "provider_policy_refusal",
+      error: "The model provider refused this request under its policies; it won't be retried automatically." });
     expect(cut.effects.filter(effect => effect.effectKind === "schedule_retry" || effect.effectKind === "enqueue_continuation")).toEqual([]);
     const { heartbeat, generic, promoted, successors } = await dispatchEverything(issueId, cut.runId);
     expect(generic).toMatchObject({ dispatched: 0 });
     expect(promoted).toMatchObject({ promoted: 0 });
     expect(successors).toEqual([]);
     expect(await issueWakes(issueId)).toEqual([]);
-    // The task is left as it was; this path creates no re-send.
-    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ status: "in_progress", assigneeAgentId: agentId });
+    // No re-send; the task takes dl-refusal2's board hold (unit 1 alone left it in_progress).
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
     await heartbeat.drainActiveRunExecutions();
   }, 180_000);
 

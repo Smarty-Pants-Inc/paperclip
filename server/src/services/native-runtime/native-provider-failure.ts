@@ -19,13 +19,20 @@ const PI_REFUSAL_CATEGORIES = new Set([
   "cyber", "bio", "frontier_llm", "reasoning_extraction", "general_harms",
 ]);
 
+/** The ONE classified result of a provider refusal: its code, its neutral note. */
+export const PROVIDER_POLICY_REFUSAL_FAILURE = {
+  errorCode: PROVIDER_POLICY_REFUSAL_CODE,
+  errorMessage: PROVIDER_POLICY_REFUSAL_MESSAGE,
+  diagnostic: { provider: "pi_rpc", category: "policy_refusal" } as const,
+} as const;
+
 /** Pi forwards the provider's errorMessage on its failed terminal. This is
  * provider error evidence, never assistant prose, tools or notice text. Prefer
  * native refusal evidence when forwarded: explanation text is not stable.
  * Pinned packs can forward only that text, including OUTPUT-side Terms of
  * Service refusals. Match request refusals, not account/key rejection plus an
  * unrelated policy/terms mention. Native refusal fields remain authoritative. */
-function isPiPolicyRefusal(error: Record<string, unknown>): boolean {
+export function isPiPolicyRefusal(error: Record<string, unknown>): boolean {
   if (error.code === PROVIDER_POLICY_REFUSAL_CODE) return true;
   if (error.code !== "pi_provider_error") return false;
   const details = record(error.stop_details ?? error.stopDetails);
@@ -322,11 +329,7 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
     },
     forTerminal(turnId: string | null | undefined, terminal: PrpTerminalState) {
       if (!turnId || terminal.turnTerminalState !== "failed" || terminal.runTerminalState !== "failed") return null;
-      if (policyRefusedTurns.has(turnId)) return {
-        errorCode: PROVIDER_POLICY_REFUSAL_CODE,
-        errorMessage: PROVIDER_POLICY_REFUSAL_MESSAGE,
-        diagnostic: { provider: "pi_rpc", category: "policy_refusal" } as const,
-      };
+      if (policyRefusedTurns.has(turnId)) return { ...PROVIDER_POLICY_REFUSAL_FAILURE };
       if (turnId === overloadedTurnId) return {
         errorCode: NATIVE_PROVIDER_OVERLOADED_CODE,
         errorMessage: NATIVE_PROVIDER_OVERLOADED_MESSAGE,

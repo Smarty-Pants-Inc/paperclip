@@ -4,18 +4,26 @@ import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, readThi
   THINKING_CAP_STOP_AGAIN_NOTE, type CompletedFinalAgentMessageCandidate } from "../heartbeat-run-summary.js";
 import { readRunAnswerEvents } from "../thinking-cap-stop.js";
 
-export { NATIVE_MID_STREAM_CUT_CODE, NATIVE_MID_STREAM_CUT_MESSAGE, NATIVE_PROVIDER_REFUSAL_TERMINAL_REASON,
+export { NATIVE_MID_STREAM_CUT_CODE, NATIVE_MID_STREAM_CUT_MESSAGE,
   type NativeMidStreamCut } from "./native-mid-stream-cut-cause.js";
 import { NATIVE_MID_STREAM_CUT_CODE, type NativeMidStreamCut } from "./native-mid-stream-cut-cause.js";
+import { isPiPolicyRefusal, PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "./native-provider-failure.js";
 
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 
 const REFUSAL_PATTERN = /reasoning_extraction|terms of service|\bprovider refused (?:this |the )?request\b/iu;
 
-/** The provider's own refusal: its stop category, or its Terms-of-Service text. */
+/**
+ * The provider's own refusal. The refusal path's classifier decides first
+ * (anything it calls a refusal is never a cut that gets a successor or a
+ * dropped-connection note); the cut lane adds only the stop category and
+ * Terms-of-Service evidence it sees on a cut turn. Either way the result is
+ * the refusal path's: `provider_policy_refusal` and its one neutral note.
+ */
 export function isNativeProviderRefusal(error: unknown): boolean {
   const detail = record(error);
+  if (isPiPolicyRefusal(detail)) return true;
   if (detail.stopReason === "refusal" || detail.stopCategory === "reasoning_extraction"
     || detail.category === "reasoning_extraction") return true;
   try { return REFUSAL_PATTERN.test(JSON.stringify(detail)); } catch { return false; }
@@ -59,8 +67,9 @@ export const NATIVE_MID_STREAM_CUT_CONNECTION_EXHAUSTED_NOTE =
 /**
  * The cut lane's ONE automatic successor also failed: publish the last cut's
  * true note, not a promise to continue. Keep any streamed answer whole, but
- * replace its continuing note. A refusal is owned by the refusal path, never
- * described as a dropped connection. A person's Retry has no cut-lane marking.
+ * replace its continuing note. A refusal is owned by the refusal path: its
+ * note is that path's one neutral note under that path's code, never a
+ * dropped connection. A person's Retry has no cut-lane marking.
  * Publication uses the normal attributed completion reply, so the unanswered
  * sweep sees this message's notice duty discharged through its run lineage.
  */
@@ -69,7 +78,7 @@ export async function readExhaustedNativeMidStreamCutCandidate(
   rows: readonly { seq: number; payload: unknown }[],
 ): Promise<(CompletedFinalAgentMessageCandidate & { reasonCode: string }) | null> {
   const cut = classifyNativeMidStreamCut(rows);
-  if (!cut || cut === "provider_refusal") return null;
+  if (!cut) return null;
   const [run] = await db.select({ retryOfRunId: heartbeatRuns.retryOfRunId, scheduledRetryReason: heartbeatRuns.scheduledRetryReason })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId))).limit(1);
   if (!run || !isNativeMidStreamCutRecoveryRun(run)) return null;
@@ -77,13 +86,14 @@ export async function readExhaustedNativeMidStreamCutCandidate(
     record(record(row.payload).prpEvent).eventType === "turn.failed")!;
   const event = record(record(terminal.payload).prpEvent);
   const prefix = readFailedTurnStreamedAnswer(rows)?.text;
-  const note = cut === "provider_error" ? NATIVE_MID_STREAM_CUT_CONNECTION_EXHAUSTED_NOTE : THINKING_CAP_STOP_AGAIN_NOTE;
+  const note = cut === "provider_refusal" ? PROVIDER_POLICY_REFUSAL_MESSAGE
+    : cut === "provider_error" ? NATIVE_MID_STREAM_CUT_CONNECTION_EXHAUSTED_NOTE : THINKING_CAP_STOP_AGAIN_NOTE;
   return {
     seq: terminal.seq,
     sourceEventId: typeof event.sourceEventId === "string" ? event.sourceEventId : null,
     channel: "final",
     text: prefix ? `${prefix}${prefix.endsWith("\n") ? "" : "\n"}\n— ${note}` : note,
-    reasonCode: `native_mid_stream_cut_exhausted_${cut}`,
+    reasonCode: cut === "provider_refusal" ? PROVIDER_POLICY_REFUSAL_CODE : `native_mid_stream_cut_exhausted_${cut}`,
   };
 }
 
