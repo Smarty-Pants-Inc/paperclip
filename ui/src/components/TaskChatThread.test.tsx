@@ -24,6 +24,8 @@ import type {
   TaskBrowser,
 } from "@paperclipai/shared";
 import { heartbeatsApi } from "@/api/heartbeats";
+import { issuesApi } from "@/api/issues";
+import { AgentChatReadProvider } from "@/hooks/useAgentChatRead";
 import { nativeRunEventsToTranscript } from "./transcript/native-run-events";
 import * as nativeTranscriptTransport from "./transcript/useNativeRunTranscripts";
 import { genericPendingRequestConfirmationInteraction, pendingConnectionIntentInteraction } from "@/fixtures/issueThreadInteractionFixtures";
@@ -5925,6 +5927,49 @@ describe("TaskChatThread live transcript", () => {
     ).toBeNull();
   });
 
+  it.each(["running", "queued", "failed", "queued-message", "unfocused", "scrolled-up", "unseen-saved-reply"])("marks a seen persisted chat reply read while its runner bubble owns the response (%s)", async scenario => {
+    const commentId = "11111111-1111-4111-8111-111111111111";
+    const body = "Completed the requested streaming test.";
+    const markRead = vi.spyOn(issuesApi, "markRead").mockResolvedValue({} as never);
+    vi.spyOn(document, "hasFocus").mockReturnValue(scenario !== "unfocused");
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(scenario === "scrolled-up" ? 300 : 100);
+    vi.spyOn(HTMLElement.prototype, "scrollTop", "get").mockReturnValue(0);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(100);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ top: 0, bottom: 100, height: 100, left: 0, right: 100, width: 100, x: 0, y: 0, toJSON() {} });
+    nativeTranscriptState.transcriptByRun.set("run-runner", [
+      { kind: "assistant", ts: "2026-08-21T15:44:20.000Z", text: body, channel: "final", delta: true },
+    ]);
+    render(<AgentChatReadProvider issueId="issue-1" companyId="company-1" userId="owner-a">
+      <TaskChatThread issueId="issue-1" conversationMode conversationOwnerId="owner-a" currentUserId="owner-a"
+        comments={[{ id: commentId, companyId: "company-1", issueId: "issue-1", authorType: "agent", authorAgentId: "agent-1", authorUserId: null,
+          body: scenario === "unseen-saved-reply" ? "A different saved reply not yet shown." : body,
+          // Saved native replies carry stored run provenance even before the
+          // activity-derived runId arrives. Text alone must not clear unread.
+          presentation: null, metadata: null, createdByRunId: "run-runner",
+          runId: scenario === "unseen-saved-reply" ? "run-runner" : null,
+          createdAt: new Date("2026-08-21T15:44:22.000Z"), updatedAt: new Date("2026-08-21T15:44:22.000Z") },
+          ...(scenario === "queued-message" ? [{ id: "22222222-2222-4222-8222-222222222222", companyId: "company-1", issueId: "issue-1",
+            authorType: "user" as const, authorAgentId: null, authorUserId: "owner-a", body: "Follow up when ready.",
+            presentation: null, metadata: null, queueState: "queued" as const,
+            createdAt: new Date("2026-08-21T15:44:23.000Z"), updatedAt: new Date("2026-08-21T15:44:23.000Z") }] : [])]}
+        onAdd={async () => {}} issueStatus="in_progress"
+        activeRun={{ id: "run-runner", status: scenario === "failed" ? "failed" : scenario === "queued" ? "queued" : "running", invocationSource: "issue", triggerDetail: null,
+          startedAt: "2026-08-21T15:44:00.000Z", finishedAt: scenario === "failed" ? "2026-08-21T15:44:24.000Z" : null, createdAt: "2026-08-21T15:44:00.000Z",
+          agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner", runtimeMode: "native" }} />
+    </AgentChatReadProvider>);
+    await settleThreadLayout();
+    await act(async () => { window.dispatchEvent(new Event("focus")); });
+    expect(container.textContent).toContain(body);
+    if (scenario !== "failed") {
+      expect(container.textContent?.match(/Completed the requested streaming test\./g)).toHaveLength(1);
+      expect(container.querySelector('[data-testid="task-chat-live-transcript"]')).not.toBeNull();
+    }
+    if (scenario === "unfocused" || scenario === "scrolled-up" || scenario === "unseen-saved-reply") expect(markRead).not.toHaveBeenCalled();
+    else expect(markRead).toHaveBeenCalledWith("issue-1", commentId);
+    expect(markRead.mock.calls.every(([, id]) => id === commentId)).toBe(true);
+  });
+
   it("keeps an unlinked persisted runner reply hidden while the live turn still owns that response", () => {
     nativeTranscriptState.transcriptByRun.set("run-runner", [
       {
@@ -6732,5 +6777,111 @@ describe("compact history disclosure reaches every saved turn's steps", () => {
     await settleThreadLayout();
     expect(control()).toHaveLength(0);
     expect(container.textContent).not.toContain("run-one-source.txt");
+  });
+});
+
+// Independent judge checks: durable identity is an exact-cutoff data-safety boundary.
+describe("NOTE8 judge read-cutoff safety", () => {
+  const oldId = "11111111-1111-4111-8111-111111111111";
+  const newId = "22222222-2222-4222-8222-222222222222";
+  const unseenId = "33333333-3333-4333-8333-333333333333";
+  const comment = (id: string, body: string, second: number, extra: Record<string, unknown> = {}) => ({
+    id, companyId: "company-1", issueId: "issue-1", authorType: "agent" as const,
+    authorAgentId: "agent-1", authorUserId: null, body, presentation: null, metadata: null,
+    runId: "run-runner", createdAt: new Date(`2026-08-21T15:44:${second}.000Z`),
+    updatedAt: new Date(`2026-08-21T15:44:${second}.000Z`), ...extra,
+  });
+  async function show(comments: ComponentProps<typeof TaskChatThread>["comments"], text = "Done.") {
+    const markRead = vi.spyOn(issuesApi, "markRead").mockResolvedValue({} as never);
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(100);
+    vi.spyOn(HTMLElement.prototype, "scrollTop", "get").mockReturnValue(0);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(100);
+    // Only the live response is in view. Saved backbone bubbles are above the
+    // viewport at the latest scroll position; they have not been read here.
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function(this: HTMLElement) {
+      const inView = this.classList.contains("task-chat-scroll-viewport") ||
+        !!this.closest('[data-testid="task-chat-final-response"]');
+      const top = inView ? 0 : -200, bottom = top + 100;
+      return { top, bottom, height: 100, left: 0, right: 100, width: 100, x: 0, y: top, toJSON() {} };
+    });
+    nativeTranscriptState.transcriptByRun.set("run-runner", [
+      { kind: "assistant", ts: "2026-08-21T15:44:20.000Z", text, channel: "final", delta: true },
+    ]);
+    render(<AgentChatReadProvider issueId="issue-1" companyId="company-1" userId="owner-a">
+      <TaskChatThread issueId="issue-1" conversationMode conversationOwnerId="owner-a" currentUserId="owner-a"
+        comments={comments} onAdd={async () => {}} issueStatus="in_progress"
+        activeRun={{ id: "run-runner", status: "running", invocationSource: "issue", triggerDetail: null,
+          startedAt: "2026-08-21T15:44:00.000Z", finishedAt: null, createdAt: "2026-08-21T15:44:00.000Z",
+          agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner", runtimeMode: "native" }} />
+    </AgentChatReadProvider>);
+    await settleThreadLayout();
+    await act(async () => { window.dispatchEvent(new Event("focus")); });
+    expect(container.querySelector('[data-testid="task-chat-final-response"]')?.textContent).toContain(text.replace(/\s+/g, " "));
+    return markRead;
+  }
+  it("B2a does not substitute a later identical saved comment for the older visible reply", async () => {
+    const markRead = await show([comment(oldId, "Done.", 20), comment(newId, "Done.", 24)]);
+    expect(container.querySelectorAll('[data-conversation-message="agent"]')).toHaveLength(1);
+    expect(markRead.mock.calls.filter(([, id]) => id !== oldId)).toEqual([]);
+  });
+  it("B2b a later persistence timestamp cannot jump across an unseen newer reply", async () => {
+    const comments = [comment(unseenId, "An unseen important warning.", 22, { runId: "run-unseen" }), comment(newId, "Done.", 24)];
+    const markRead = await show(comments);
+    expect(container.textContent).toContain("An unseen important warning.");
+    const cutoffById = new Map(comments.map(c => [c.id, c.createdAt.getTime()]));
+    const unseenAt = cutoffById.get(unseenId)!;
+    expect(markRead.mock.calls.filter(([, id]) => (cutoffById.get(id!) ?? Infinity) >= unseenAt)).toEqual([]);
+  });
+  it("B2c whitespace changing Markdown paragraph structure is not an identity proof", async () => {
+    const markRead = await show([comment(newId, "Done.\n\nImportant warning.", 24)], "Done. Important warning.");
+    expect(markRead).not.toHaveBeenCalled();
+  });
+  it("B2c Markdown-source mismatch keeps the safe unread fallback", async () => {
+    const markRead = await show([comment(newId, "**Done.**", 24)]);
+    expect(markRead).not.toHaveBeenCalled();
+  });
+  it("B2d never adopts another agent's unlinked comment", async () => {
+    const markRead = await show([comment(newId, "Done.", 24, { authorAgentId: "agent-OTHER", runId: null })]);
+    expect(markRead).not.toHaveBeenCalled();
+  });
+  it("B2d never adopts a person's comment", async () => {
+    const markRead = await show([comment(newId, "Done.", 24, { authorType: "user", authorAgentId: null, authorUserId: "owner-b", runId: null })]);
+    expect(markRead).not.toHaveBeenCalled();
+  });
+  it("B3 rejects a different-text saved response even when linked to the live run", async () => {
+    const markRead = await show([comment(newId, "Unseen warning, not the visible reply.", 24)]);
+    expect(markRead).not.toHaveBeenCalled();
+  });
+  it("keeps the run agent's equal-text reply unread without provenance", async () => {
+    const markRead = await show([comment(newId, "Done.", 24, { runId: null })]);
+    expect(markRead).not.toHaveBeenCalled();
+  });
+  it("rejects a linked comment by a different agent", async () => {
+    const markRead = await show([comment(newId, "Done.", 24, { authorAgentId: "agent-OTHER" })]);
+    expect(markRead).not.toHaveBeenCalled();
+  });
+  it("does not use a fallback run link when stored provenance names another run", async () => {
+    const markRead = await show([comment(newId, "Done.", 24, { createdByRunId: "run-OTHER" })]);
+    expect(markRead).not.toHaveBeenCalled();
+  });
+  it("uses stored provenance without an activity-derived run link", async () => {
+    const markRead = await show([comment(oldId, "Done.", 24, { createdByRunId: "run-runner", runId: null })]);
+    expect(markRead).toHaveBeenCalledWith("issue-1", oldId);
+  });
+  it("chooses the earliest exact saved copy even if the input is not chronological", async () => {
+    const markRead = await show([comment(newId, "Done.", 24), comment(oldId, "Done.", 20)]);
+    expect(markRead).toHaveBeenCalledWith("issue-1", oldId);
+    expect(markRead.mock.calls.filter(([, id]) => id !== oldId)).toEqual([]);
+  });
+  it.each([20, 24])("does not sweep an unseen message at a cutoff boundary (%s)", async second => {
+    const markRead = await show([comment(unseenId, "Unseen warning.", second, { runId: "run-unseen" }), comment(newId, "Done.", 24)]);
+    expect(markRead).not.toHaveBeenCalled();
+  });
+  it("does not sweep an unseen message from another person during persistence", async () => {
+    const markRead = await show([comment(unseenId, "An unseen note.", 22,
+      { authorType: "user", authorAgentId: null, authorUserId: "owner-b", runId: null }), comment(newId, "Done.", 24)]);
+    expect(markRead).not.toHaveBeenCalled();
   });
 });
