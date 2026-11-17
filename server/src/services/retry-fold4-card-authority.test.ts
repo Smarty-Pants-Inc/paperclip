@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { taskInterruptionPresentation } from "./task-interruption-presentation.js";
+import { executionProjectionForRun } from "./execution-projection.js";
 import { decideRetryAuthority } from "./task-retry-eligibility.js";
 import { AGENT_PAUSED_RETRY_MESSAGE, AUTOMATIC_RECOVERY_MESSAGE } from "./native-runtime/held-predecessor-notice-text.js";
 
@@ -37,9 +38,10 @@ describe("retry fold 4: the card reads the one Retry authority", () => {
         fingerprint: `native-continuation:${runId}`, nextAction: "Paperclip continues the task in a fresh run from its saved work.",
         resolvedAt: recordedAt, createdAt: recordedAt, updatedAt: recordedAt,
         evidence: { runId, freshContinuationSettlement: { schema: "paperclip.fresh-continuation.v1", sourceRunId: runId },
-          freshContinuation, continuationDelivery: input.continuation } });
+          freshContinuation, continuationDelivery: input.continuation,
+          executionReconciliation: { runId, providerStopped: true, recordedAt: recordedAt.toISOString() } } });
     }
-    return { issue: issue! };
+    return { issue: issue!, companyId, runId };
   }
 
   it("R9: while Paperclip continues the conversation by itself, the card carries the authority's automatic-recovery words and no Retry", async () => {
@@ -49,6 +51,15 @@ describe("retry fold 4: the card reads the one Retry authority", () => {
     expect(presentation).toMatchObject({ state: "working", canRetry: false,
       notice: { code: authority.reason, text: authority.cardText } });
     expect(presentation!.notice!.text).toBe(AUTOMATIC_RECOVERY_MESSAGE);
+  });
+
+  it("R9 / R15: the card's automatic-recovery words are the transcript's words for the same run (routes/agents.ts serves executionProjectionForRun)", async () => {
+    const { issue, companyId, runId } = await seed({ continuation: "pending" });
+    const presentation = await taskInterruptionPresentation(db, issue);
+    const transcript = await executionProjectionForRun(db, companyId, runId);
+    expect(transcript?.nextAction).toEqual(expect.any(String));
+    expect(presentation?.notice?.text).toBe(transcript!.nextAction);
+    expect(presentation?.notice?.text).toBe(decideRetryAuthority({ automaticRecovery: true }).transcriptNotice);
   });
 
   it("R9 guard (rf-3 E): a continuation recorded with no delivery request and no wake never says 'No action is needed'", async () => {
