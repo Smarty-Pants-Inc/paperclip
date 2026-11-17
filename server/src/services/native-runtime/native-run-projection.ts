@@ -17,6 +17,7 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notificati
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
+import { publishRunLifecyclePluginEvent } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report.js";
 import { nativeRunnerOwnershipNotHeldCondition } from "./native-runner-ownership.js";
 import { explainFailedRun, explainNativeTurnFailure, NATIVE_RUN_FAILED_UNEXPLAINED } from "./native-run-failure-explanation.js";
@@ -127,6 +128,8 @@ export function recoveredExecutionFailureMetadata() {
 export async function projectCommittedRun(input: {
   db: Db;
   onlyWhenEffectsSettled?: boolean;
+  /** When db is a parent transaction, its owner publishes these only after commit. */
+  pluginEventPublications?: (typeof heartbeatRuns.$inferSelect)[];
   run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "finishedAt" | "runtimeMode" | "nativePhase" | "nativeIssueId" | "contextSnapshot">;
   coordinator: Pick<typeof nativeRunFinalizations.$inferSelect, "resultId" | "issueId">;
 }) {
@@ -216,6 +219,8 @@ export async function projectCommittedRun(input: {
 
 
   if (projected && projected.after.status !== projected.before.status) {
+    if (input.pluginEventPublications) input.pluginEventPublications.push(projected.after);
+    else publishRunLifecyclePluginEvent(projected.after);
     await emitAgentTaskRun(input.db, projected.after);
     void reportRunFailure(input.db, projected.after);
   } else if (projected && isNewTerminalRunFailure(projected.before, projected.after)) {

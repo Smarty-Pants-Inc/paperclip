@@ -1043,6 +1043,16 @@ Each event must include:
 - primary entity metadata
 - typed payload
 
+Run lifecycle events follow run-status transitions, not task-status decisions.
+Native result finalization and committed-run projection publish the same event
+as live heartbeat completion when they win the terminal status write; a late
+live completion or unchanged projection does not publish it again. The payload
+includes `runId`, `agentId`, `status`, `issueId`, `startedAt`, and `finishedAt`.
+The separate `heartbeat.run.status` live event invalidates client caches and is
+not a plugin domain event. The current domain-event bus is in-process, not a
+durable replay queue; consumers that must recover missed events need a bounded
+reconciliation path.
+
 ### 16.1 Event Filtering
 
 Plugins may provide an optional filter when subscribing to events. The filter is evaluated by the host before dispatching to the worker, so filtered-out events never cross the process boundary.

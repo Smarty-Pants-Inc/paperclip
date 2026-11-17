@@ -89,6 +89,7 @@ import {
   readNativeBoardResponseWaitSource,
 } from "./native-board-response-wait.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
+import { publishRunLifecyclePluginEvent } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report.js";
 import { isPublishedGitHubReviewCompletionContinuation, readPublishedGitHubReviewCompletionContinuation, resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
 import {
@@ -1020,6 +1021,7 @@ async function recoverCommittedNativeChatResponseInScope(
   let materialized = false;
   let conversationReply = false;
   let settledWithoutReply = false;
+  const pluginEventPublications: (typeof heartbeatRuns.$inferSelect)[] = [];
   const entered = beginRunPhase("response.transaction.entry");
   try {
     materialized = await measureRunPhase("response.transaction", () => db.transaction(async (transaction) => {
@@ -1383,7 +1385,7 @@ async function recoverCommittedNativeChatResponseInScope(
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
-      await projectCommittedRun({ db: tx, run, coordinator });
+      await projectCommittedRun({ db: tx, run, coordinator, pluginEventPublications });
       agentId = run.agentId;
       return true;
     }));
@@ -1393,6 +1395,7 @@ async function recoverCommittedNativeChatResponseInScope(
   } finally {
     entered();
   }
+  for (const run of pluginEventPublications) publishRunLifecyclePluginEvent(run);
   if (settledWithoutReply) await settleConversationTurnForRun(db, input.companyId, input.runId);
   if (materialized && agentId) {
     if (conversationReply) await settleConversationTurnForRun(db, input.companyId, input.runId);
@@ -2115,6 +2118,9 @@ export async function finalizeNativeRun(input: {
         return after ? { before, after } : null;
       });
       const updatedRun = projection?.after;
+      if (input.projectRunStatus && projection && projection.after.status !== projection.before.status) {
+        publishRunLifecyclePluginEvent(projection.after);
+      }
       if (
         input.projectRunStatus &&
         !alreadyEmittedByCommittedDecision &&

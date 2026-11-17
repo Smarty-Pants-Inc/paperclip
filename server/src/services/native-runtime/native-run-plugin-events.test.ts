@@ -2,19 +2,22 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
-import { agents, companies, completionContracts, createDb, heartbeatRuns, issues, workspaceOperations } from "@paperclipai/db";
+import { agents, companies, completionContracts, createDb, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { CONTROL_PLANE_CONFORMANCE_RESULT, CONTROL_PLANE_CONFORMANCE_TERMINAL } from "../../vendor/paperclip-runner/testing.js";
 import { setPluginEventBus } from "../activity-log.js";
 import { createPluginEventBus } from "../plugin-event-bus.js";
 import { deliverExecutionStatuses } from "../execution-status-delivery.js";
 import { createHeartbeatLifecycle } from "../heartbeat/run-lifecycle.js";
+import { publishRunLifecyclePluginEvent } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { createHeartbeatRunState } from "../heartbeat/run-state.js";
 import { createHeartbeatRunPreparation } from "../heartbeat/run-preparation.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
+import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
 import { finalizeNativeRun } from "./native-run-finalizer.js";
 import { nativeResultCommitWork } from "./native-result-commit-work.js";
 import { nativeRunProjectionWork } from "./native-run-projection-work.js";
+import { projectCommittedRun } from "./native-run-projection.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 // Recorded catch: gate 5 GAT-143 / 03e3c903 finished natively without waking
@@ -32,7 +35,7 @@ describe.skipIf(!support.supported)("native terminal plugin events", () => {
   afterEach(() => bus.clearPlugin("fleet-bridge-test"));
   afterAll(async () => { await db?.$client.end(); await temporary?.cleanup(); });
 
-  async function fixture() {
+  async function fixture(producer: "runnerd" | "control_plane" = "runnerd") {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const contractId = randomUUID(), sessionId = randomUUID(), runnerInstanceId = randomUUID();
     const contractSha256 = `contract-${contractId}`;
@@ -48,22 +51,28 @@ describe.skipIf(!support.supported)("native terminal plugin events", () => {
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native",
       status: "running", nativeSessionId: sessionId, runnerInstanceId, completionContractId: contractId,
       completionContractSha256: contractSha256, contextSnapshot: { issueId }, startedAt: new Date() });
-    const port = new PaperclipControlPlanePort(db, { companyId, agentId, issueId, runId, sessionId,
-      completionContractId: contractId, completionContractSha256: contractSha256, sourceInstanceId: runnerInstanceId,
-      controlPlaneSourceInstanceId: "plugin-events-test" });
-    await port.openRun({ identity: { companyId, agentId, issueId, runId, sessionId }, backendKind: "mock", sourceInstanceId: runnerInstanceId });
-    await port.completeRun({ result: CONTROL_PLANE_CONFORMANCE_RESULT, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
-      callerResultId: `${runId}:result` });
+    const completion = { result: CONTROL_PLANE_CONFORMANCE_RESULT, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
+      callerResultId: `${runId}:result` };
+    if (producer === "runnerd") {
+      const store = new NativeRunCoordinatorStore(db, { companyId, agentId, issueId, runId, normalizedSessionId: sessionId,
+        runnerSourceInstanceId: runnerInstanceId, completionContractId: contractId, completionContractSha256: contractSha256,
+        completionContractRevision: CONTROL_PLANE_CONFORMANCE_RESULT.completionClaim.contractRevision,
+        completionContractCriterionIds: CONTROL_PLANE_CONFORMANCE_RESULT.completionClaim.criteria.map(criterion => criterion.criterionId) });
+      expect((await store.completeRun(completion)).disposition).toBe("committed");
+    } else {
+      const port = new PaperclipControlPlanePort(db, { companyId, agentId, issueId, runId, sessionId,
+        completionContractId: contractId, completionContractSha256: contractSha256, sourceInstanceId: runnerInstanceId,
+        controlPlaneSourceInstanceId: "plugin-events-test" });
+      await port.openRun({ identity: { companyId, agentId, issueId, runId, sessionId }, backendKind: "mock", sourceInstanceId: runnerInstanceId });
+      await port.completeRun(completion);
+    }
     const events: PluginEvent[] = [];
     const committedStatuses: string[] = [];
-    const pendingHandlers: Promise<void>[] = [];
     bus.forPlugin("fleet-bridge-test").subscribe("agent.run.finished", { companyId }, async event => {
       if (event.payload.runId !== runId) return;
       events.push(event);
-      const pending = db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))
-        .then(([run]) => { committedStatuses.push(run.status); });
-      pendingHandlers.push(pending);
-      await pending;
+      const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      committedStatuses.push(run.status);
     });
     const lifecycle = createHeartbeatLifecycle(db, {
       ...createHeartbeatRunState(db), ...createHeartbeatRunPreparation(db),
@@ -73,12 +82,40 @@ describe.skipIf(!support.supported)("native terminal plugin events", () => {
       enqueueWakeup: vi.fn(), getCurrentUserRedactionOptions: vi.fn(async () => ({})),
       getAgentInvokability: vi.fn(async () => ({ invokable: true as const })), emitTerminalAgentTaskRun: vi.fn(), budgetHooks: {},
     });
-    return { companyId, agentId, issueId, runId, events, committedStatuses, pendingHandlers, lifecycle };
+    return { companyId, agentId, issueId, runId, events, committedStatuses, lifecycle };
   }
 
-  it.each(["result_commit", "committed_projection", "live_heartbeat"] as const)(
-    "publishes agent.run.finished exactly once when %s wins native completion", async winner => {
-      const f = await fixture();
+  it.each([false, true])("defers a nested projection's plugin publication until its parent commits (rollback=%s)", async rollback => {
+    const f = await fixture();
+    await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+    const pluginEventPublications: (typeof heartbeatRuns.$inferSelect)[] = [];
+    const transaction = db.transaction(async tx => {
+      await projectCommittedRun({ db: tx as unknown as Db, run, coordinator, pluginEventPublications });
+      expect(f.events).toHaveLength(0);
+      expect(pluginEventPublications).toHaveLength(1);
+      if (rollback) throw new Error("parent rollback");
+    });
+    if (rollback) {
+      await expect(transaction).rejects.toThrow("parent rollback");
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].status).toBe("running");
+      expect(f.events).toHaveLength(0);
+      // The rolled-back publication is discarded. A real later projection can
+      // still win and notify the plugin once.
+      await projectCommittedRun({ db, run, coordinator });
+    } else {
+      await transaction;
+      for (const publication of pluginEventPublications) publishRunLifecyclePluginEvent(publication);
+    }
+    await vi.waitFor(() => expect(f.committedStatuses).toEqual(["succeeded"]));
+    expect(f.events).toHaveLength(1);
+  });
+
+  it.each((["runnerd", "control_plane"] as const).flatMap(producer =>
+    (["result_commit", "committed_projection", "live_heartbeat"] as const).map(winner => ({ producer, winner }))))(
+    "publishes agent.run.finished exactly once when $winner wins $producer completion", async ({ producer, winner }) => {
+      const f = await fixture(producer);
       const scope = { companyId: f.companyId, runId: f.runId };
       const commit = nativeResultCommitWork(db);
       const projection = nativeRunProjectionWork(db);
@@ -113,8 +150,8 @@ describe.skipIf(!support.supported)("native terminal plugin events", () => {
       const publish = vi.fn();
       await expect(deliverExecutionStatuses(db, { publish, failpoint: () => { throw new Error("after publish"); } })).rejects.toThrow("after publish");
       await deliverExecutionStatuses(db, { publish });
-      await Promise.all(f.pendingHandlers);
       expect(f.events).toHaveLength(1);
+      await vi.waitFor(() => expect(f.committedStatuses).toEqual(["succeeded"]));
       expect(f.events[0]).toMatchObject({ eventType: "agent.run.finished", companyId: f.companyId,
         actorId: f.agentId, actorType: "agent", entityId: f.runId, entityType: "heartbeat_run",
         payload: { runId: f.runId, agentId: f.agentId, issueId: f.issueId, status: "succeeded",
