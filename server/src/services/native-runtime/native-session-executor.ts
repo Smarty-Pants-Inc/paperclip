@@ -2916,7 +2916,7 @@ function legacyCompanyNativeSessionScopeKey(
   ]);
 }
 
-function runnerdStateBase(): string {
+export function runnerdStateBase(): string {
   return (
     process.env.PAPERCLIP_RUNNER_STATE_DIR ??
     resolve(
@@ -6390,7 +6390,7 @@ const LOCAL_RUNNER_LIFECYCLE_COMMANDS = new Set(["runner.suspend", "runner.drain
 const GONE_REMOTE_RUNNER_DELIVERY_COMMANDS = new Set(["run.attach", "semantic_tool.result", "session.snapshot",
   "session.goal.get"]);
 
-function readSettledRunnerdProjection(root: string, identity: Record<string, string>,
+export function readSettledRunnerdProjection(root: string, identity: Record<string, string>,
   options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean; parkedGovernedWait?: boolean } = {}): SettledRunnerdProjection {
   const refuse = (refused: string): SettledRunnerdProjection => ({ refused });
   try {
@@ -6625,19 +6625,9 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
     const runnerStopped = await proveLocalRunnerStopped();
     if (!runnerStopped.stopped) return refuse(runnerStopped.reason);
   }
-  // Earlier rejected admissions can quarantine the same projection. Each copy
-  // must pass the same proof: a rebuilt root never carries the local Runner
-  // evidence that held an earlier attempt, so that evidence stays decisive.
-  const quarantine = resolve(runnerdStateBase(), "quarantine");
-  if (existsSync(quarantine)) {
-    if (!isSafeNativeStateDirectory(quarantine)) return refuse("quarantine_unsafe");
-    for (const name of readdirSync(quarantine)) {
-      if (!name.startsWith(`${basename(input.root)}.`)) continue;
-      if (quarantinedBootstrapOfOwnerHeldNoProviderWork(resolve(quarantine, name), identity, localRunner)) continue;
-      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait });
-      if (copy.refused !== undefined) return refuse(`quarantine_${copy.refused}`);
-    }
-  }
+  const quarantineRefusal = quarantinedCopiesRefusal(input.root, identity,
+    { localRunner, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait });
+  if (quarantineRefusal !== null) return refuse(quarantineRefusal);
   const recheck = async (): Promise<string | null> => {
     // Database reads can await. Retire only the exact evidence proven above.
     if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8") !== originalBytes
@@ -6658,6 +6648,26 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
     return null;
   };
   return { finished: true, run: prior.run, recheck };
+}
+
+/** Earlier rejected admissions can quarantine the same projection. Each copy
+ * must pass the same proof: a rebuilt root never carries the local Runner
+ * evidence that held an earlier attempt, so that evidence stays decisive.
+ * Returns `quarantine_<refusal>` of the first copy that fails, or null. Only
+ * copies under `<state base>/quarantine` named `<state key>.` count; the
+ * repair archive (quarantined-stop-copies.ts) is never read here. */
+export function quarantinedCopiesRefusal(root: string, identity: Record<string, string>,
+  options: { localRunner: boolean; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean; parkedGovernedWait?: boolean }): string | null {
+  const quarantine = resolve(runnerdStateBase(), "quarantine");
+  if (!existsSync(quarantine)) return null;
+  if (!isSafeNativeStateDirectory(quarantine)) return "quarantine_unsafe";
+  for (const name of readdirSync(quarantine)) {
+    if (!name.startsWith(`${basename(root)}.`)) continue;
+    if (quarantinedBootstrapOfOwnerHeldNoProviderWork(resolve(quarantine, name), identity, options.localRunner)) continue;
+    const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, options);
+    if (copy.refused !== undefined) return `quarantine_${copy.refused}`;
+  }
+  return null;
 }
 
 export function quarantinedBootstrapOfOwnerHeldNoProviderWork(root: string, identity: Record<string, string>,
@@ -6767,7 +6777,7 @@ async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof insp
 
 /** The earliest recorded moment of the person's acknowledged Stop of this
  * exact run, or null when the run carries no such Stop. */
-function acknowledgedUserStopRequestedAt(run: typeof heartbeatRuns.$inferSelect): number | null {
+export function acknowledgedUserStopRequestedAt(run: typeof heartbeatRuns.$inferSelect): number | null {
   if (run.status !== "cancelled" || !hasAcknowledgedNativeStopIntent(run)) return null;
   const result = record(run.resultJson);
   const times = [record(result.executionCancellation).requestedAt, record(result.startupCancellation).requestedAt,
@@ -6788,16 +6798,24 @@ async function pendingLifecycleCommandsIssuedByStop(db: Db, root: string, identi
   const stopAt = run ? acknowledgedUserStopRequestedAt(run) : null;
   if (stopAt === null) return false;
   try {
-    const control = record(JSON.parse(readBoundedNativeFile(resolve(root, "control-plane", "control-plane-state.json"),
-      NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8")));
-    if (record(control.identity).runId !== identity.runId) return false;
-    const unsettled = unsettledControllerCommands((Array.isArray(control.commands) ? control.commands : []).map(record));
-    return unsettled.length > 0 && unsettled.every(command => command.status === "pending"
-      && LOCAL_RUNNER_LIFECYCLE_COMMANDS.has(String(command.type))
-      && typeof command.issuedAt === "string" && Date.parse(command.issuedAt) >= stopAt);
+    return stopIssuedLifecycleCommandsOnly(JSON.parse(readBoundedNativeFile(resolve(root, "control-plane", "control-plane-state.json"),
+      NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8")), identity.runId, stopAt);
   } catch {
     return false;
   }
+}
+
+/** The pure journal half of pendingLifecycleCommandsIssuedByStop: the journal
+ * belongs to `runId`, has at least one unsettled command, and every unsettled
+ * command is a pending runner.suspend/drain/shutdown journaled at or after
+ * `stopAt` (the person's acknowledged Stop of that run). */
+export function stopIssuedLifecycleCommandsOnly(journal: unknown, runId: string, stopAt: number): boolean {
+  const control = record(journal);
+  if (record(control.identity).runId !== runId) return false;
+  const unsettled = unsettledControllerCommands((Array.isArray(control.commands) ? control.commands : []).map(record));
+  return unsettled.length > 0 && unsettled.every(command => command.status === "pending"
+    && LOCAL_RUNNER_LIFECYCLE_COMMANDS.has(String(command.type))
+    && typeof command.issuedAt === "string" && Date.parse(command.issuedAt) >= stopAt);
 }
 
 /** Commands only the close of a warm owner queues: its suspension barrier and
@@ -7902,7 +7920,7 @@ type RunnerdDurableIdentity = Record<string, unknown> & {
   environmentLeaseId: string;
 };
 
-function readRunnerdDurableIdentity(
+export function readRunnerdDurableIdentity(
   root: string,
   allowExternal = false,
 ): Record<string, unknown> | null {
