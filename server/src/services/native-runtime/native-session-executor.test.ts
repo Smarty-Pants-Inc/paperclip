@@ -14710,20 +14710,26 @@ describe("native warm session supervision", () => {
       afterAll(async () => { await proofDb?.$client.end(); await cleanupDb?.(); });
 
       it.each([
-        { holder: "exits-on-stop", delaySeconds: 0, answered: true },
-        { holder: "exits-on-stop", delaySeconds: 30, answered: true },
-        { holder: "already-exited", delaySeconds: 0, answered: true },
-        { holder: "already-exited", delaySeconds: 30, answered: true },
-        { holder: "owner-running", delaySeconds: 0, answered: false },
-        { holder: "busy", delaySeconds: 0, answered: false },
-        { holder: "busy", delaySeconds: 30, answered: false },
-        { holder: "exit-unproven", delaySeconds: 0, answered: false },
-        { holder: "probe-throws", delaySeconds: 0, answered: false },
-        { holder: "no-sandbox-runner", delaySeconds: 0, answered: false },
-      ] as const)("pl/s3-fence Stop -> message +$delaySeconds s, Runner $holder: answered on the first run = $answered",
-        async ({ holder, delaySeconds, answered }) => {
+        { holder: "exits-on-stop", delaySeconds: 0, answered: true, control: "stop" },
+        { holder: "exits-on-stop", delaySeconds: 30, answered: true, control: "stop" },
+        { holder: "already-exited", delaySeconds: 0, answered: true, control: "stop" },
+        { holder: "already-exited", delaySeconds: 30, answered: true, control: "stop" },
+        { holder: "owner-running", delaySeconds: 0, answered: false, control: "stop" },
+        { holder: "busy", delaySeconds: 0, answered: false, control: "stop" },
+        { holder: "busy", delaySeconds: 30, answered: false, control: "stop" },
+        { holder: "exit-unproven", delaySeconds: 0, answered: false, control: "stop" },
+        { holder: "probe-throws", delaySeconds: 0, answered: false, control: "stop" },
+        { holder: "no-sandbox-runner", delaySeconds: 0, answered: false, control: "stop" },
+        // Stop with queued messages, then Send: the queued-message Interrupt
+        // cancels the turn through the same native Stop (routes/issues.ts
+        // heartbeat.cancelRun) and its successor meets the same retirement.
+        { holder: "exits-on-stop", delaySeconds: 0, answered: true, control: "queued-send" },
+        { holder: "already-exited", delaySeconds: 30, answered: true, control: "queued-send" },
+        { holder: "busy", delaySeconds: 0, answered: false, control: "queued-send" },
+      ] as const)("pl/s3-fence $control -> message +$delaySeconds s, Runner $holder: answered on the first run = $answered",
+        async ({ holder, delaySeconds, answered, control }) => {
           const { companies, agents } = await import("@paperclipai/db");
-          const fixed = fixture(`s3f-${holder}-${delaySeconds}`);
+          const fixed = fixture(`s3f-${control}-${holder}-${delaySeconds}`);
           const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
           const base = { ...fixed.base, binding: { ...fixed.base.binding, companyId, agentId, issueId, runId: randomUUID() } };
           const next = { ...fixed.next, binding: { ...fixed.next.binding, companyId, agentId, issueId, runId: randomUUID() } };
@@ -14787,7 +14793,7 @@ describe("native warm session supervision", () => {
               }) : command.args?.[0] === "--version" ? "codex-cli 0.160.0" : "" };
           });
           const sandboxRunner = { execute: remoteExecute, syncIn: vi.fn(async () => undefined) };
-          const artifact = join(isolatedHome, `s3f-runnerd-${holder}-${delaySeconds}`); await writeFile(artifact, "fixture artifact");
+          const artifact = join(isolatedHome, `s3f-runnerd-${control}-${holder}-${delaySeconds}`); await writeFile(artifact, "fixture artifact");
           await createRunnerdBackend({ db, execution: base, runnerInstanceId: "runner",
             runnerRemoteBinaryPath: artifact, runnerRemoteCodexPath: artifact,
             controllerPersistence: { bootId: "s3f-boot" }, runnerIngressAuthorized: true,
@@ -14823,7 +14829,8 @@ describe("native warm session supervision", () => {
           const countTurn = (runId: string) => turns.set(runId, (turns.get(runId) ?? 0) + 1);
           state.execute.mockReset().mockImplementationOnce(async options => { await options.onSession?.({ close, cancel });
             countTurn(base.binding.runId);
-            expect(await cancelNativeSession(base.binding.runId, "Stop")).toBe(true);
+            expect(await cancelNativeSession(base.binding.runId,
+              control === "queued-send" ? "Interrupted to send queued messages" : "Stop")).toBe(true);
             taskRunId = next.binding.runId; coordinator.phase = "terminal_failure"; coordinator.leaseOwner = null;
             return { ...result, terminal: { runTerminalState: "cancelled" } };
           }).mockImplementationOnce(async () => { countTurn(next.binding.runId); return result; });
