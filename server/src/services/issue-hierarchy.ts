@@ -2,9 +2,18 @@ import { and, eq, sql } from "drizzle-orm";
 import { issues, type Db } from "@paperclipai/db";
 import { MAX_AGENT_TASK_HIERARCHY_DEPTH, type IssueParentAdjustment } from "@paperclipai/shared";
 
+export const AGENT_TASK_HIERARCHY_DEPTH_ENV = "PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH";
+
+/** Missing or invalid settings preserve the upstream agent hierarchy limit. */
+export function resolveAgentTaskHierarchyDepth(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[AGENT_TASK_HIERARCHY_DEPTH_ENV]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return MAX_AGENT_TASK_HIERARCHY_DEPTH;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : MAX_AGENT_TASK_HIERARCHY_DEPTH;
+}
+
 /**
- * `flatten` (the default) applies the agent hierarchy limit: a new parent edge
- * may not make the task deeper than MAX_AGENT_TASK_HIERARCHY_DEPTH. Board users
+ * `flatten` (the default) applies the configured agent hierarchy limit. Board users
  * pass `allow_nested` and may build trees of any depth.
  */
 export type IssueParentDepthPolicy = "flatten" | "allow_nested";
@@ -43,7 +52,7 @@ export function placeTaskParent(chain: ParentChainRow[], policy: IssueParentDept
     return { effectiveParentId: requested?.id ?? null, adjustment: null };
   }
   // A parent at depth d (root = 1) gives the new task depth d + 1.
-  const maxParentDepth = MAX_AGENT_TASK_HIERARCHY_DEPTH - 1;
+  const maxParentDepth = resolveAgentTaskHierarchyDepth() - 1;
   if (chain.length <= maxParentDepth) return { effectiveParentId: requested.id, adjustment: null };
   const targetIndex = chain.length - maxParentDepth;
   // Low-trust boundaries are subtrees. Never move a task above the root of a
