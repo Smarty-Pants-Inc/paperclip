@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
+import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -475,6 +477,52 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.id));
       expect(saved).toMatchObject({ status: "skipped", runId: null, error: "failed_run_has_successor" });
     } finally { intercept.mockRestore(); }
+  });
+
+  // F4: admission also refuses this wake, but only dispatch avoids creating
+  // a second admission receipt and accounts it as recovered, not deferred.
+  it("R-ONCE F4 dispatch alone skips before creating an admission receipt", async () => {
+    const f = await seedFailedPersonRetry();
+    const intent = await f.intent();
+    await f.successor("column", false);
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId }))
+      .toMatchObject({ scanned: 1, dispatched: 0, recovered: 1, deferred: 0 });
+    await heartbeat.drainActiveRunExecutions();
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+      .toMatchObject([{ id: intent.id, status: "skipped", runId: null, error: "failed_run_has_successor" }]);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(1);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("R-ONCE F1 rechecks a deferred dispatch receipt at promotion (answered=%s)", async answered => {
+    const f = await seedFailedPersonRetry();
+    const intent = await f.intent();
+    // This is the durable dispatch receipt after admission deferred it. The
+    // failure had no answer/successor when it entered the queue.
+    await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution",
+      requestedByActorId: `native-status-wake-dispatch:${intent.id}`,
+      payload: { ...intent.payload, _paperclipWakeContext: { issueId: f.issueId,
+        source: "native_status_decision", nativeStatusWakeIntentId: intent.id } },
+    }).where(eq(agentWakeupRequests.id, intent.id));
+    const [finishing] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "automation", status: "succeeded", finishedAt: new Date(), contextSnapshot: { issueId: f.issueId } }).returning();
+    await db.update(issues).set({ executionRunId: finishing.id }).where(eq(issues.id, f.issueId));
+    // Recovery commits while the receipt is deferred: it must be read again
+    // under the release issue lock, before promotion takes execution authority.
+    await f.successor(answered ? "none" : "column", answered);
+    const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+      resolveResponsibleUserId: async () => "responsible-user",
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+    }), recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined } });
+    const result = await release({ companyId: f.companyId, runId: finishing.id, now: new Date(), suppressImmediateRecovery: true });
+    expect(result.outcome.kind).not.toBe("promoted");
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.id));
+    expect(saved).toMatchObject({ status: "skipped", runId: null,
+      error: answered ? "person_message_already_answered" : "failed_run_has_successor" });
+    expect(saved.finishedAt).not.toBeNull();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, intent.id))).toHaveLength(0);
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].executionRunId).toBeNull();
   });
 
   it.each([true, false])("R-ONCE records a skipped retry effect without a wake (answered=%s)", async answered => {
