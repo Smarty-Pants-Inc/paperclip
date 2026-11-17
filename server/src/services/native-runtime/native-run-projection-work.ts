@@ -1,4 +1,5 @@
 import { and, asc, eq, gt, not, or, sql } from "drizzle-orm";
+import { completeNativeRunTerminal } from "./native-run-terminal.js";
 import { heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
@@ -83,7 +84,7 @@ export function nativeRunProjectionWork(db: Db, project = projectCommittedRun,
       const { recheckAt } = await preserveExport(db, entry.id);
       return recheckAt === null ? null : { ...entry, dueAt: recheckAt };
     }
-    const [run] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+    const [run] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
       status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt, nativePhase: heartbeatRuns.nativePhase,
       runtimeMode: heartbeatRuns.runtimeMode, nativeIssueId: heartbeatRuns.nativeIssueId,
       contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object('issueId', ${heartbeatRuns.contextSnapshot}->>'issueId')`,
@@ -95,6 +96,9 @@ export function nativeRunProjectionWork(db: Db, project = projectCommittedRun,
     if (!run || !coordinator) return null;
     if (signal?.aborted) throw new Error("Native run projection stopped");
     await project({ db, run, coordinator, onlyWhenEffectsSettled: true });
+    // Recovery has no live completion tail. The projection transaction must
+    // finish before the shared terminal step takes the agent-row lock.
+    await completeNativeRunTerminal(db, run.id);
     return (await candidates(scope)).length ? { ...entry, dueAt: Date.now() + 30_000 } : null;
   }
   function register(coordinator: ReturnType<typeof createDeliveryWorkCoordinator>, canRun: () => boolean,

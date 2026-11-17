@@ -124,6 +124,7 @@ import {
   nativeRunnerOwnershipNotHeldCondition,
 } from "./native-runner-ownership.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
+import { completeNativeRunTerminal } from "./native-run-terminal.js";
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -429,6 +430,7 @@ export async function endSupersededNativeFinalizationRuns(db: Db, runIds?: reado
     ended.push(runId);
     await emitAgentTaskRun(db, updatedRun);
     if (updatedRun.status === "failed") void reportRunFailure(db, updatedRun);
+    await completeNativeRunTerminal(db, runId);
   }
   return ended;
 }
@@ -801,6 +803,7 @@ async function recordRetryableFailure(input: {
   if (terminalRunToEmit) {
     await emitAgentTaskRun(input.db, terminalRunToEmit);
     void reportRunFailure(input.db, terminalRunToEmit);
+    await completeNativeRunTerminal(input.db, (terminalRunToEmit as typeof heartbeatRuns.$inferSelect).id);
   }
   return {
     ...input.coordinator,
@@ -1024,6 +1027,7 @@ async function recoverCommittedNativeChatResponseInScope(
   let materialized = false;
   let conversationReply = false;
   let settledWithoutReply = false;
+  let projectedCommittedRun = false;
   const entered = beginRunPhase("response.transaction.entry");
   try {
     materialized = await measureRunPhase("response.transaction", () => db.transaction(async (transaction) => {
@@ -1404,6 +1408,7 @@ async function recoverCommittedNativeChatResponseInScope(
         })
         .where(eq(heartbeatRuns.id, run.id));
       await projectCommittedRun({ db: tx, run, coordinator });
+      projectedCommittedRun = true;
       agentId = run.agentId;
       return true;
     }));
@@ -1422,6 +1427,8 @@ async function recoverCommittedNativeChatResponseInScope(
       eventType: "run.presentation.resolved",
     });
   }
+  // Its reply transaction projected the committed run (projectCommittedRun).
+  if (projectedCommittedRun) await completeNativeRunTerminal(db, input.runId);
   return materialized;
 }
 
@@ -1468,7 +1475,21 @@ export async function recoverCommittedNativeReviewResponse(db: Db, input: {
   return materialized !== null;
 }
 
-export async function finalizeNativeRun(input: {
+/**
+ * Finalizes a native run. When this call projects the terminal run status, the
+ * shared post-commit terminal step runs once after every finalizer branch
+ * (first write, committed replay, exhausted failure) has committed.
+ */
+export async function finalizeNativeRun(input: Parameters<typeof finalizeNativeRunAndProject>[0] & {
+  /** The caller runs completeNativeRunTerminal itself, exactly once. */
+  skipRunTerminalCompletion?: boolean;
+}) {
+  const finalized = await finalizeNativeRunAndProject(input);
+  if (input.projectRunStatus && !input.skipRunTerminalCompletion) await completeNativeRunTerminal(input.db, input.runId);
+  return finalized;
+}
+
+async function finalizeNativeRunAndProject(input: {
   db: Db;
   runId: string;
   workspaceFinalizeStatus: "succeeded" | "failed";
