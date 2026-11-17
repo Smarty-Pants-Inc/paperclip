@@ -399,6 +399,8 @@ type RequestOptions = {
   sendGuard?: () => void;
   /** Our own stop: it ends the box's lifecycle and is never revoked by it. */
   ownStop?: boolean;
+  /** F-04B: only explicitly repeatable plugin probes retain the frozen7 transient shape. */
+  intent?: "idempotent_probe";
   /** F-04: the POST /commands payload. Each send marks its command text with its own attempt nonce. */
   command?: Record<string, unknown> & { command: string };
 };
@@ -411,10 +413,11 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
   // a POST /commands whose send was under way when it failed, or that Boat
   // answered with a 5xx other than 'did not run', possibly ran. It is never sent
   // again; it surfaces as boat_command_possibly_ran with history evidence.
-  const commandSend = (init.method ?? "GET").toUpperCase() === "POST" && /^\/sandboxes\/[^/?]+\/commands$/.test(path);
+  const commandSend = (init.method ?? "GET").toUpperCase() === "POST" && /^\/sandboxes\/[^/?]+\/commands$/.test(path)
+    && responseOptions.intent !== "idempotent_probe";
   let commandInFlight = false;
   let possiblyRan: PossiblyRanReason | undefined;
-  let attemptNonce: string | undefined;
+  let attemptCommand: string | undefined;
   let direct: BoatDirectFields | undefined;
   // The evidence read is a read of the same box: never after our stop of it or a closed admission.
   let evidenceAllowed = () => false;
@@ -502,8 +505,8 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       // (Boat's history keeps the first 64 KiB of it: boat-command-history.md line 41).
       let sendBody = requestBody;
       if (responseOptions.command) {
-        attemptNonce = randomUUID();
-        sendBody = JSON.stringify({ ...responseOptions.command, command: withCommandNonce(responseOptions.command.command, attemptNonce) });
+        attemptCommand = withCommandNonce(responseOptions.command.command, randomUUID());
+        sendBody = JSON.stringify({ ...responseOptions.command, command: attemptCommand });
       }
       commandInFlight = commandSend;
       response = await fetch(`${API}${path}`, { ...init, body: sendBody, headers, redirect: "error", signal: callSignal });
@@ -628,10 +631,14 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       // the record is visible (boat-command-history.md lines 37-63), so an absent
       // record is 'unknown'. One bounded GET, none after our stop of the box.
       const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)![1];
-      const evidence = await commandEvidence(evidenceAllowed() ? attemptNonce : undefined, () =>
+      const evidence = await commandEvidence(evidenceAllowed() ? attemptCommand : undefined, () =>
         request(config, `/sandboxes/${allocation}/command-history?limit=20&mode=commands`,
-          { signal: AbortSignal.timeout(COMMAND_HISTORY_READ_MS) }, false, { maxSends: 1 }));
-      const outcome = commandPossiblyRanError(redactKey(config, `Boat POST ${path}`), httpStatus, category, reason, evidence, direct);
+          { signal: AbortSignal.timeout(COMMAND_HISTORY_READ_MS) }, false, { maxSends: 1,
+            // R5: bind the parent's admission/lifecycle to the final GET dispatch,
+            // not only to the early evidence check above. A refusal means unknown.
+            sendGuard: () => { if (!evidenceAllowed()) throw new Error("Boat sandbox lease is no longer active."); },
+          }));
+      const outcome = commandPossiblyRanError(httpStatus, category, reason, evidence, direct);
       if (outcome.stack) outcome.stack = redactKey(config, outcome.stack);
       throw outcome;
     }
@@ -943,12 +950,14 @@ async function ensurePrivateEnvDirectory(config: Config, id: string, roots: stri
   if (!directory) throw new Error("Boat env file requires a private path outside the workspace.");
   const qdir = q(directory);
   const command = `umask 077 && /bin/mkdir -p -m 0700 -- ${qdir} && test ! -L ${qdir} && test -d ${qdir} && test "$(/usr/bin/stat -c %u -- ${qdir})" = "$(/usr/bin/id -u)" && test "$(/usr/bin/stat -c %a -- ${qdir})" = 700 || exit 197`;
-  const result = await runCommand(config, id, command, 30_000);
+  // R1: fixed-path mkdir and ownership/existence checks are safe to repeat.
+  const result = await runCommand(config, id, command, 30_000, undefined, undefined, { intent: "idempotent_probe" });
   if (result.exitCode !== 0 || result.timedOut) throw new Error("Boat private env directory verification failed");
   preparedEnvDirectories.set(id, directory);
   return directory;
 }
-async function runCommand(config: Config, id: string, command: string, timeoutMs: number, cwd?: string, signal?: AbortSignal): Promise<PluginEnvironmentExecuteResult> {
+async function runCommand(config: Config, id: string, command: string, timeoutMs: number, cwd?: string, signal?: AbortSignal,
+  options: Pick<RequestOptions, "intent"> = {}): Promise<PluginEnvironmentExecuteResult> {
   const timeoutSeconds = Math.max(1, Math.min(600, Math.ceil(timeoutMs / 1000)));
   const payload = { command, timeoutSeconds, detached: timeoutMs > 600_000, ...(cwd !== undefined ? { cwd } : {}) };
   // F-04: request() puts each send's attempt nonce at the start of the command
@@ -957,7 +966,7 @@ async function runCommand(config: Config, id: string, command: string, timeoutMs
   const started = await request(config, `/sandboxes/${encodeURIComponent(id)}/commands`, {
     method: "POST", signal: signal ?? AbortSignal.timeout(timeoutMs > 600_000 ? 30_000 : timeoutSeconds * 1000 + 5_000),
     body: JSON.stringify(payload),
-  }, false, { command: payload });
+  }, false, { command: payload, ...options });
   if (!started.processId) return {
     exitCode: Number.isInteger(started.exitCode) ? started.exitCode : null,
     timedOut: started.timedOut === true,
@@ -1395,7 +1404,9 @@ async function finishAcquisition(
   }
   const expiry = ready.archiveAfter ?? ready.expiresAt ?? ready.autoStopAt ?? null;
   const workspaceSentinel = await writeWorkspaceSentinel(params, config, id, remoteCwd, {
-    request: (path, init) => request(config, path, init), run: (command, timeout) => runCommand(config, id, command, timeout),
+    request: (path, init) => request(config, path, init),
+    // R1: this helper's only command creates the fixed sentinel directory.
+    run: (command, timeout) => runCommand(config, id, command, timeout, undefined, undefined, { intent: "idempotent_probe" }),
   });
   const guardianPreflight = await stageGuardian(params.config, id, {
     request: (path, init) => request(config, path, init), run: (command, timeout) => runCommand(config, id, command, timeout),
@@ -1830,7 +1841,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       if (ttlRefresh.status === "ok") duplexLogger?.info("Boat warm lease TTL refresh", details);
       else duplexLogger?.warn("Boat warm lease TTL refresh", details);
     }
-    const workspaceSentinel = sentinel ? await verifyWorkspaceSentinel(sentinel, { request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, id, command, timeout) }) : undefined;
+    const workspaceSentinel = sentinel ? await verifyWorkspaceSentinel(sentinel, {
+      request: (path, init) => request(c, path, init),
+      // R1: sentinel cat is read-only; an ECONNRESET must retain resume recovery.
+      run: (command, timeout) => runCommand(c, id, command, timeout, undefined, undefined, { intent: "idempotent_probe" }),
+    }) : undefined;
     if (workspaceSentinel && workspaceSentinel.result !== "matched") return { providerLeaseId: null, metadata: { expired: true, workspaceSentinel, ...(ttlRefresh ? { ttlRefresh } : {}) } };
     const guardianPreflight = await stageGuardian(params.config, id, {
       request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, id, command, timeout),
@@ -1896,7 +1911,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async onEnvironmentRealizeWorkspace(params: PluginEnvironmentRealizeWorkspaceParams): Promise<PluginEnvironmentRealizeWorkspaceResult> {
     const cwd = workspaceDirectory(typeof params.lease.metadata?.remoteCwd === "string" ? params.lease.metadata.remoteCwd : params.workspace.remotePath ?? params.workspace.localPath ?? "/home/user/paperclip-workspace");
     if (params.lease.providerLeaseId) {
-      const result = await runCommand(parse(params.config), params.lease.providerLeaseId, `mkdir -p ${q(cwd)}`, 30_000);
+      const result = await runCommand(parse(params.config), params.lease.providerLeaseId, `mkdir -p ${q(cwd)}`, 30_000,
+        undefined, undefined, { intent: "idempotent_probe" });
       if (result.timedOut || result.exitCode !== 0) throw new Error("Boat workspace directory creation failed.");
     }
     return { cwd, metadata: { provider: "boat", remoteCwd: cwd } };

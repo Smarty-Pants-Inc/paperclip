@@ -27,7 +27,7 @@ export const COMMAND_HISTORY_READ_MS = 5_000;
 export const COMMAND_POSSIBLY_RAN = "boat_command_possibly_ran";
 
 export type BoatDirectFields = { boatCode?: string; boatRetryable?: boolean; boatMessage?: typeof BOAT_RESTORING };
-/** 'ran': the history holds a record with this attempt's nonce. Otherwise 'unknown', never 'not run'. */
+/** 'ran': history holds this attempt's exact prefixed text. Otherwise 'unknown', never 'not run'. */
 export type CommandEvidence = "ran" | "unknown";
 /** Why the command possibly ran: a closed reason, never provider text. */
 export type PossiblyRanReason = "network_error" | "timeout" | "aborted" | "http_5xx" | "unreadable_response";
@@ -48,8 +48,9 @@ export function boatDirectFields(body: unknown): BoatDirectFields {
   return {
     ...(typeof code === "string" ? { boatCode: code === BOAT_DIRECT_FAILED ? code : "other" } : {}),
     ...(typeof retryable === "boolean" ? { boatRetryable: retryable } : {}),
-    // Keep only the documented token, never the message text.
-    ...(typeof message === "string" && /(?:^|[^A-Za-z0-9_])sandbox_restoring(?:$|[^A-Za-z0-9_])/.test(message) ? { boatMessage: BOAT_RESTORING } : {}),
+    // Table lines 17-18 say message `sandbox_restoring`, not text containing it.
+    // Keep only that exact documented value, never the raw message text.
+    ...(message === BOAT_RESTORING ? { boatMessage: BOAT_RESTORING } : {}),
   };
 }
 
@@ -61,7 +62,9 @@ export function boatDirectFields(body: unknown): BoatDirectFields {
  * with another 5xx is surfaced as before.
  */
 export function classifyDirectFailure(status: number, fields: BoatDirectFields): DirectFailureClass {
-  if (status === 502 && fields.boatCode === BOAT_DIRECT_FAILED && (fields.boatRetryable === true || fields.boatMessage === BOAT_RESTORING)) return "did_not_run";
+  // Table line 17: explicit false means it can still be running, whatever the message.
+  if (status === 502 && fields.boatCode === BOAT_DIRECT_FAILED && fields.boatRetryable !== false
+    && (fields.boatRetryable === true || fields.boatMessage === BOAT_RESTORING)) return "did_not_run";
   return status >= 500 ? "possibly_ran" : "other";
 }
 
@@ -76,13 +79,13 @@ export function commandNonceMarker(nonce: string): string { return `: paperclip-
  */
 export function withCommandNonce(command: string, nonce: string): string { return `${commandNonceMarker(nonce)} ${command}`; }
 
-/** Does the history page (lines 61-63: `{"commands":[{...}]}`) hold this attempt's record? Only a boolean is kept. */
-export function historyHasNonce(page: unknown, nonce: string): boolean {
+/** Does the history page (lines 61-63: `{"commands":[{...}]}`) hold this exact attempt? Only a boolean is kept. */
+export function historyHasCommand(page: unknown, command: string): boolean {
   const commands = field(page, "commands");
-  if (!Array.isArray(commands)) return false;
-  const marker = commandNonceMarker(nonce);
-  // The record's text is its `command` (the history table: 'The command | Its text').
-  return commands.some(record => { const text = field(record, "command"); return typeof text === "string" && text.startsWith(marker); });
+  // History retains only the first 64 KiB (line 41). A truncated prefix cannot
+  // prove equality of the full command: conservatively keep that unknown.
+  if (!Array.isArray(commands) || Buffer.byteLength(command, "utf8") > 65_536) return false;
+  return commands.some(record => field(record, "command") === command);
 }
 
 /**
@@ -90,9 +93,9 @@ export function historyHasNonce(page: unknown, nonce: string): boolean {
  * to a send: Boat's docs promise no time by which a record is visible, so an
  * absent record is 'unknown', not 'did not run'.
  */
-export async function commandEvidence(nonce: string | undefined, read: () => Promise<unknown>): Promise<CommandEvidence> {
-  if (!nonce) return "unknown";
-  try { return historyHasNonce(await read(), nonce) ? "ran" : "unknown"; }
+export async function commandEvidence(command: string | undefined, read: () => Promise<unknown>): Promise<CommandEvidence> {
+  if (!command) return "unknown";
+  try { return historyHasCommand(await read(), command) ? "ran" : "unknown"; }
   catch { return "unknown"; }
 }
 
@@ -103,8 +106,11 @@ export type CommandPossiblyRanError = Error & {
  * The named outcome. No `status` and no transport errno: neither the host's
  * transient retry classification nor anything else may read it as safe to send again.
  */
-export function commandPossiblyRanError(text: string, httpStatus: number | null, category: string, reason: PossiblyRanReason,
+export function commandPossiblyRanError(httpStatus: number | null, category: string, reason: PossiblyRanReason,
   evidence: CommandEvidence, direct: BoatDirectFields = {}): CommandPossiblyRanError {
-  return Object.assign(new Error(`${text} failed (${httpStatus ?? "unavailable"}): ${reason}, evidence=${evidence} (possibly ran)`),
+  // R3: the real server resume predicate (environment-runtime.d2badcf4.ts:820-838)
+  // also reads RPC message text. Keep reasons (notably "timeout") structured only,
+  // and omit dynamic identifiers so they cannot accidentally become retry words.
+  return Object.assign(new Error(`Boat POST /sandboxes/{sandboxId}/commands failed (${httpStatus ?? "unavailable"}): result_unconfirmed, evidence=${evidence} (possibly ran)`),
     { code: COMMAND_POSSIBLY_RAN, evidence, reason, httpStatus, category }, direct) as CommandPossiblyRanError;
 }

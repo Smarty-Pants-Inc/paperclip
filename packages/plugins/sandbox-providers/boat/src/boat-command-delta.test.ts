@@ -121,7 +121,7 @@ describe("F-04B R2: only the exact documented restoring message; explicit false 
 
 describe("F-04B R3: possibly-ran outcomes are permanent to the REAL server resume predicate", () => {
   it.each(["network_error", "timeout", "aborted", "http_5xx", "unreadable_response"] as PossiblyRanReason[])("R3 %s is non-transient, directly and RPC-shaped", reason => {
-    const error = commandPossiblyRanError(`Boat POST /sandboxes/${id}/commands`, reason === "http_5xx" ? 502 : null, "network_error", reason, "unknown");
+    const error = commandPossiblyRanError(reason === "http_5xx" ? 502 : null, "network_error", reason, "unknown");
     expect(error.code).toBe("boat_command_possibly_ran");
     expect(error.message).toMatch(/\(possibly ran\)$/);
     expect(transientSandboxResumeFailure(error)).toBe(false);
