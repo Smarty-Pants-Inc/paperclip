@@ -38,6 +38,8 @@ export const AUTOMATIC_CONTINUATION_WAKE_REASONS = [
 ] as const;
 
 export const PERMANENT_FAILURE_CODES = [
+  // Repeating a provider policy refusal is not infrastructure recovery.
+  "provider_policy_refusal",
   "agent_interaction_delivery_denied", "adapter_engine_unavailable", "agent_not_invokable", "agent_not_found",
   "low_trust_isolation_unavailable", "low_trust_requires_isolated_workspace", "low_trust_boundary_mismatch",
   "low_trust_requires_sandbox_environment", "low_trust_runtime_services_denied",

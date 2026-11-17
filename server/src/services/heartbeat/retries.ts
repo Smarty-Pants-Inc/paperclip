@@ -564,9 +564,11 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         || ["openai_dot", "muse"].includes(String(parseObject(parseObject(parseObject(run.runnerProfileJson).nativeExecutionInput).provider).kind))) {
       return { outcome: "not_scheduled" as const, reason: "Dot external execution must be reconciled before a new assignment; Paperclip cannot confirm its external stop.", issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
     }
-    if (run.errorCode === "provider_tool_definition_invalid") {
+    if (run.errorCode === "provider_tool_definition_invalid" || run.errorCode === "provider_policy_refusal") {
       return { outcome: "not_scheduled" as const,
-        reason: "Repair the invalid tool definitions before starting a new attempt.",
+        reason: run.errorCode === "provider_policy_refusal"
+          ? "The provider refused this request; automatic retries are stopped."
+          : "Repair the invalid tool definitions before starting a new attempt.",
         issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
     }
     if (Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds) &&
