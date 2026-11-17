@@ -1,5 +1,5 @@
-import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, unansweredCardAnswerSql } from "../person-message-answer.js";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
+import { answeredPersonMessageSql, PENDING_WAIT_START_BOUND_MS, unansweredCardAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -29,7 +29,9 @@ import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
-import { personStoppedCarrierSql, runStartedAnswering, stoppedBySender } from "./person-stopped-message.js";
+import { personHeldChatMessageSql, personStoppedCarrierSql, runStartedAnswering, stoppedBySender } from "./person-stopped-message.js";
+import { automaticRecoveryPending } from "./automatic-recovery-pending.js";
+import { AGENT_PAUSE_STOP_REASON } from "../governance-pause-stop.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -69,20 +71,27 @@ export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
 /** The run that carries the message is queued or scheduled and has not started. */
 export const UNANSWERED_MESSAGE_WAITING_CODE = "waiting_to_start";
 /** A waiting note stays true only this long: if the carrying run still has not
- * started by T0 + this bound, the SAME note becomes the failure text. */
-export const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
+ * started by T0 + this bound, the SAME note becomes the failure text. For the
+ * system's own automatic recovery the bound runs from the failed run's END. */
+export { PENDING_WAIT_START_BOUND_MS };
 /** The non-failure marker row of a waiting note (no "Failure code" row). */
 const WAITING_ROW_LABEL = "Waiting code";
 const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] }]);
 /** The agent that answers the conversation is paused (or held) and will not
  * run until it is resumed. Not a failure: a waiting-kind note. */
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
-/** A resumed agent's own pause stopped this message's attempt, not a failure. */
+/** A resumed agent's own pause stopped this message's run or wake, not a failure. */
 const PAUSE_STOPPED_CODE = "agent_pause_stopped";
 /** Setup completes by itself; a stalled setup gets one factual waiting note. */
 export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
 export const SETUP_WAIT_BOUND_MS = 10 * 60_000;
-const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE]);
+/** The system's own automatic recovery of the message's run is on its way
+ * (automaticRecoveryPending): a waiting-kind note, never resend advice. */
+export const UNANSWERED_MESSAGE_RECOVERING_CODE = "automatic_recovery_pending";
+export const UNANSWERED_MESSAGE_RECOVERING_TEXT =
+  "The run answering your message was cut off. Paperclip is recovering it and will continue by itself; your message is saved.";
+const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE,
+  UNANSWERED_MESSAGE_RECOVERING_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
@@ -247,7 +256,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and (${answeredSql(rawMessage("m"))} or ${personStoppedNoticeSql("m")}))
+      and (${answeredSql(rawMessage("m"))} or ${personStoppedNoticeSql("m")} or ${personHeldChatMessageSql(rawMessage("m"))}))
     or exists (select 1 from ${issueComments} n
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
@@ -269,7 +278,7 @@ function owedCardAnswerSql(companyId: SQL, issueId: SQL, since: string): SQL {
       and not exists (select 1 from ${issueComments} later where later.company_id = ca.company_id
         and later.issue_id = ca.issue_id and later.author_type = 'user' and later.deleted_at is null
         and later.created_at > ca.resolved_at)
-      and ${unansweredCardAnswerSql("ca")}
+      and ${unansweredCardAnswerSql("ca", new Date())}
       and not exists (select 1 from ${issueComments} n where n.company_id = ca.company_id and n.issue_id = ca.issue_id
         and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ca.id::text
         and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))`;
@@ -308,13 +317,13 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and (exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-          and (${answeredSql(rawMessage("m"))} or ${personStoppedNoticeSql("m")}))
+          and (${answeredSql(rawMessage("m"))} or ${personStoppedNoticeSql("m")} or ${personHeldChatMessageSql(rawMessage("m"))}))
         or ${cardAnswerNoticeAnsweredSql(sql`${issueComments.companyId}`, sql`${issueComments.issueId}`,
           sql`${issueComments.metadata}->>'authorizationReason'`)})))`;
 }
 
 export type UnansweredMessageOutcome =
-  | { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" | "person_stopped" }
+  | { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" | "person_stopped" | "person_held" }
   | { kind: "pending"; recheckAt: number }
   | { kind: "noticed"; code: string; commentId: string };
 
@@ -365,8 +374,8 @@ export async function settleUnansweredPersonMessage(
   if (!issue) return { kind: "none" };
   if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return { kind: "out_of_scope" };
 
-  // An answer to a message supersedes that message's notice (and its
-  // retrying line): the relation is message -> answer, not the notice's time.
+  // An answer or the person-stopped held list supersedes that message's
+  // notice (and its retrying line), including notices for older held messages.
   // Written under the same issue fence, in the same order (issue row, then its
   // comments) as the notice writers.
   const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
@@ -383,7 +392,7 @@ export async function settleUnansweredPersonMessage(
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
       and (exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
-        and ${answeredSql(rawMessage("m"))})
+        and (${answeredSql(rawMessage("m"))} or ${personHeldChatMessageSql(rawMessage("m"))}))
         or ${cardAnswerNoticeAnsweredSql(sql`n.company_id`, sql`n.issue_id`, sql`n.metadata->>'authorizationReason'`)})`);
   });
 
@@ -449,7 +458,7 @@ export async function settleUnansweredPersonMessage(
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type WaitRecord = { messageId: string; runId: string | null; waitKind?: "setup"; startedAt?: string; boundMs?: number };
-type Decision = { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" }
+type Decision = { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" | "person_held" }
   | { kind: "person_stopped"; noticeId: string | null }
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: WaitRecord }
@@ -499,11 +508,30 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     const [owed] = await q.select({ id: issueThreadInteractions.id, createdAt: sql<Date>`${issueThreadInteractions.resolvedAt}` })
       .from(issueThreadInteractions).where(and(eq(issueThreadInteractions.companyId, issue.companyId),
         eq(issueThreadInteractions.issueId, issue.id), gt(issueThreadInteractions.resolvedAt, latestMessage.createdAt),
-        unansweredCardAnswerSql("issue_thread_interactions")))
+        unansweredCardAnswerSql("issue_thread_interactions", now)))
       .orderBy(desc(issueThreadInteractions.resolvedAt)).limit(1);
-    if (!owed) return { kind: "answered" };
-    message = { id: owed.id, createdAt: new Date(owed.createdAt) };
-    cardAnswer = true;
+    if (owed) {
+      message = { id: owed.id, createdAt: new Date(owed.createdAt) };
+      cardAnswer = true;
+    } else {
+      // R-ONCE (RFL 18:19Z): a reply to a later input does not settle an earlier message its run never had
+      // as pending input. The owed earlier message (in discovery's scope, one without a notice first) decides.
+      const row = { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` };
+      const [earlier] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
+        authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
+        eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+        eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+        inScopeSql(row, new Date(now.getTime() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString()),
+        sql`not ${answeredSql(row)}`))
+        .orderBy(sql`exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
+          and n.issue_id = ${issueComments.issueId}
+          and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
+          and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false))`,
+          desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+      if (!earlier) return { kind: "answered" };
+      message = earlier;
+    }
   }
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await q.select({ id: issueComments.id,
@@ -513,6 +541,17 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     .from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
+  // A message in the person's stopped chat list awaits Send, not recovery or
+  // a resend. Read the durable queue state again under the issue fence before
+  // any notice write. A clock, a cancelled carrier or a generic deferred wake
+  // alone must never silence ordinary queued-message duties.
+  if (!cardAnswer) {
+    const [held] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, issue.companyId), eq(issueComments.id, message.id),
+      personHeldChatMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}` })));
+    if (held) return { kind: "person_held" };
+  }
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
   // The SENDER stopped (Stop or Interrupt) the run that had STARTED answering
   // this message: they ended it on purpose, so "send it again" would redo the
@@ -582,7 +621,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // the fenced writer posts the one notice; a later answer supersedes it.
   let waitT0: number | null | undefined;
   let setupWaitRecord: WaitRecord | undefined;
-  const bounded = async (recheckAt: number, setup = false): Promise<Decision | null> => {
+  // `deadline`: a fixed durable end that caps this wait (the failed run's end
+  // + PENDING_WAIT_START_BOUND_MS for the system's own automatic recovery).
+  // Past it, never start or continue a wait.
+  const bounded = async (recheckAt: number, setup = false, deadline: number | null = null): Promise<Decision | null> => {
+    if (deadline !== null && deadline <= now.getTime()) return null;
     if (waitT0 === undefined) {
       const [wait] = await q.select({ at: sql<Date>`min(${activityLog.createdAt})` }).from(activityLog).where(and(
         eq(activityLog.companyId, issue.companyId), eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issue.id),
@@ -595,7 +638,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // Keep its record separate so it cannot consume a later retry's bound.
     if (setup && waitT0 === null) setupWaitRecord = { messageId: message.id, runId: messageRun?.id ?? null,
       waitKind: "setup", startedAt: message.createdAt.toISOString(), boundMs: SETUP_WAIT_BOUND_MS };
-    const bound = setup ? message.createdAt.getTime() + SETUP_WAIT_BOUND_MS : (waitT0 ?? now.getTime()) + PENDING_WAIT_BOUND_MS;
+    const bound = Math.min(setup ? message.createdAt.getTime() + SETUP_WAIT_BOUND_MS : (waitT0 ?? now.getTime()) + PENDING_WAIT_BOUND_MS,
+      deadline ?? Number.POSITIVE_INFINITY);
     if (bound <= now.getTime()) return null;
     return { kind: "pending", recheckAt: Math.min(recheckAt, bound),
       ...(waitT0 === null ? { recordWait: setupWaitRecord ?? { messageId: message.id, runId: messageRun?.id ?? null } } : {}) };
@@ -685,8 +729,50 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     inArray(issueRecoveryActions.status, ["active", "escalated"])))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
+  // The system's own automatic recovery of the message's failed run
+  // (automaticRecoveryPending) is bounded from that run's END: its finishedAt,
+  // or its coordinator's terminal failure when that came earlier. Never from
+  // the first sweep, so a late first sweep cannot start a new wait.
+  let recoveryDeadline: number | null | undefined;
+  const automaticRecoveryDeadline = async (): Promise<number | null> => {
+    if (recoveryDeadline !== undefined) return recoveryDeadline;
+    recoveryDeadline = null;
+    if (run && TERMINAL.includes(run.status) && run.status !== "succeeded"
+      && await automaticRecoveryPending(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) {
+      // The shared predicate scopes automatic recovery to THIS run. An older
+      // predecessor's board stop must not veto it, but a real stop on this run
+      // still wins, even when another action has pending restored delivery.
+      const [runBoardHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+        eq(issueRecoveryActions.ownerType, "board"), inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        or(sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+          sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${run.id}`,
+          sql`${issueRecoveryActions.evidence}->'freshContinuation'->>'sourceRunId' = ${run.id}`,
+          sql`${run.id} = any(string_to_array(${issueRecoveryActions.fingerprint}, ':'))`))).limit(1);
+      if (runBoardHold) return recoveryDeadline;
+      const [terminal] = await q.select({ at: nativeRunFinalizations.updatedAt }).from(nativeRunFinalizations).where(and(
+        eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id),
+        eq(nativeRunFinalizations.phase, "terminal_failure"), isNotNull(nativeRunFinalizations.failureCode)));
+      const end = Math.min((run.finishedAt ?? run.updatedAt).getTime(), terminal?.at?.getTime() ?? Number.POSITIVE_INFINITY);
+      recoveryDeadline = end + PENDING_WAIT_START_BOUND_MS;
+    }
+    return recoveryDeadline;
+  };
+  // Read the no-run terminal evidence before pending wakes so a NEW carrying
+  // queued wake can supersede it, without an older queue masking a later stop.
+  const terminalWakes = !run && !agentPaused && !settingUp ? await q.select({ payload: agentWakeupRequests.payload,
+    status: agentWakeupRequests.status, error: agentWakeupRequests.error, runId: agentWakeupRequests.runId,
+    updatedAt: agentWakeupRequests.updatedAt }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+    inArray(agentWakeupRequests.status, ["failed", "cancelled"]), gt(agentWakeupRequests.updatedAt, message.createdAt)))
+    .orderBy(desc(agentWakeupRequests.updatedAt), desc(agentWakeupRequests.createdAt)) : [];
+  // Only THIS issue and message's own wake is evidence; the latest terminal
+  // attempt wins over an older pause cancellation.
+  const ownWakes = terminalWakes.filter(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+  const latestWake = ownWakes[0];
   if (!boardHold && !agentPaused && !settingUp) {
-    const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
+    const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status,
+      createdAt: agentWakeupRequests.createdAt })
       .from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
         or(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
@@ -697,16 +783,24 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     const pendingExecutionWait = wakes.some(wake => ["deferred", "deferred_issue_execution"].includes(wake.status)
       && isWellFormedExecutionWait(wake.payload?.executionWait)
       && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
-    if (pendingExecutionWait || wakes.some(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id))) {
-      const wait = await bounded(now.getTime() + 30_000);
+    const issueWakes = wakes.filter(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id));
+    if (pendingExecutionWait || issueWakes.length) {
+      // Only the restored wakes of the run's own automatic recovery: that
+      // recovery's run-end deadline caps the wait.
+      const recoveryWakesOnly = !pendingExecutionWait
+        && issueWakes.every(wake => typeof ((wake.payload ?? {}) as Record<string, unknown>).recoveryActionId === "string");
+      const wait = await bounded(now.getTime() + 30_000, false, recoveryWakesOnly ? await automaticRecoveryDeadline() : null);
       if (wait) return wait;
       // After the short pending grace, use the existing waiting note and its
       // start bound below instead of telling the person to duplicate input.
-      if (pendingExecutionWait) waitingToStart = true;
+      if (pendingExecutionWait || (!run && wakes.some(wake => wake.status === "queued"
+        && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id)
+        && (!latestWake || wake.createdAt > latestWake.updatedAt)))) waitingToStart = true;
     }
   }
 
   let code: string;
+  let recovering = false;
   if (settingUp) {
     code = UNANSWERED_MESSAGE_AGENT_SETUP_CODE;
   } else if (agentPaused) {
@@ -728,19 +822,35 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // Paperclip records a deferred or coalesced wake that could not start as
     // FAILED: that is the trigger. The grace covers a wake that threw before
     // any wake row existed (the comment route logs and returns 201).
-    const failedWakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-      eq(agentWakeupRequests.status, "failed"), gt(agentWakeupRequests.updatedAt, message.createdAt)));
-    // Only THIS message's own wake (Paperclip's queued-comment attribution) is
-    // evidence; an unrelated failed wake on the issue is not.
-    const wakeFailed = failedWakes.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+    const wakeFailed = ownWakes.some(wake => wake.status === "failed");
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_NO_RUN_GRACE_MS;
     if (!wakeFailed && due > now.getTime()) return { kind: "pending", recheckAt: due };
-    code = UNANSWERED_MESSAGE_NO_RUN_CODE;
+    // The lifecycle driver's pausing stop cancels unbound queued/deferred wakes
+    // with the pause-specific error, preserving their reason and message payload
+    // (heartbeat/run-control.ts cancelPendingWakeupsForAgentsInternal). Resume
+    // does not replay them. Do not apply this while setup, a hold or live work
+    // takes precedence above, or to a stopped/terminating agent.
+    code = agentRow?.lifecycleState === "ready" && latestWake?.status === "cancelled" && latestWake.runId === null
+      && latestWake.error === AGENT_PAUSE_STOP_REASON ? PAUSE_STOPPED_CODE : UNANSWERED_MESSAGE_NO_RUN_CODE;
   } else {
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     const due = (run.finishedAt ?? run.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
+    // The system's own automatic recovery of this run is on its way: no
+    // resend advice. The same short grace, then the true waiting note, and
+    // the existing start bound: past it, today's notice below.
+    // Its bound runs from the failed run's END (automaticRecoveryDeadline).
+    const startDeadline = await automaticRecoveryDeadline();
+    if (startDeadline !== null) {
+      const wait = await bounded(now.getTime() + 30_000, false, startDeadline);
+      if (wait) return wait;
+      if (startDeadline > now.getTime()) {
+        if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_RECOVERING_CODE) {
+          return { kind: "pending", recheckAt: startDeadline };
+        }
+        recovering = true;
+      }
+    }
     if (run.issueCommentStatus === "retry_queued") {
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
@@ -803,7 +913,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     }
     // An intentional pause cancellation is not an unanswered failed attempt.
     // Resume does not replay operator-stopped work: give the true manual remedy.
-    code = run.status === "cancelled" && run.errorCode === "agent_paused" ? PAUSE_STOPPED_CODE
+    code = recovering ? UNANSWERED_MESSAGE_RECOVERING_CODE
+      : run.status === "cancelled" && run.errorCode === "agent_paused" ? PAUSE_STOPPED_CODE
       : run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
   }
 
@@ -861,6 +972,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const body = settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName)
     : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
+    : code === UNANSWERED_MESSAGE_RECOVERING_CODE ? UNANSWERED_MESSAGE_RECOVERING_TEXT
     : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : cardAnswer ? UNANSWERED_CARD_ANSWER_TEXT
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
@@ -870,7 +982,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused`
-        : pauseStopped ? `${pausedName} was paused before it answered` : waiting ? "Your message is waiting to start"
+        : pauseStopped ? `${pausedName} was paused before it answered`
+        : code === UNANSWERED_MESSAGE_RECOVERING_CODE ? "Paperclip is recovering this run"
+        : waiting ? "Your message is waiting to start"
         : cardAnswer ? "Your answer wasn't acted on" : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
@@ -886,7 +1000,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     recoveryResponsibility: "user",
     sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: pauseStopped ? null : code } : null,
     // A waiting note is not a failure: no "Failure code" row, a marker row instead.
-    failureCode: waiting ? undefined : run ? undefined : code,
+    failureCode: waiting || pauseStopped ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
   return { kind: "notice", reason, code, notice, ...(setupWaitRecord ? { recordWait: setupWaitRecord } : {}),

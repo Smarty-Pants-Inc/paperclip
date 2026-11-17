@@ -20,7 +20,7 @@ import { createHeartbeatTimerPolicy } from "./timer-policy.js";
 import { QUEUED_RUN_AGING_MS, createQueuedRunDispatcher, hasQueuedRunAged, queuedRunDispatchClass } from "./queued-run-dispatch-order.js";
 import { queuedRunDispatchFacts } from "./queued-run-line.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
-import { PersistedExecutionWaitRefusal, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
+import { PersistedExecutionWaitRefusal, UNNAMED_EXECUTION_WAIT, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import { assignmentWakePayloadSql, isAssignmentWakePayload, notifyDeferredExecutionWork } from "../deferred-execution-notifications.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { notifyQueuedRunDispatch, notifyRunDispatch } from "../run-dispatch-notifications.js";
@@ -4131,7 +4131,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             reconciledSourceRunId = sourceRunId;
           }
 
-          let continuationWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+          let continuationWait: { reason: string; message: string } = { ...UNNAMED_EXECUTION_WAIT };
           let continuationBlocked = false;
           const deferBlockedExecution = async (
             executionBlocker: Pick<NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>, "recoveryActionId" | "cause" | "nextAction">,

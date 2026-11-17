@@ -1,9 +1,10 @@
 import { assertAgentLifecycleAuthority } from "../agent-subtree-management.js";
+import { AGENT_LIFECYCLE_STOP_REASON, AGENT_PAUSE_STOP_REASON } from "../governance-pause-stop.js";
 import { withAccountingTransaction } from "../accounting-transaction.js";
 import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 export { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { isWellFormedExecutionWait, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
+import { isWellFormedExecutionWait, UNNAMED_EXECUTION_WAIT, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
 import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
@@ -762,7 +763,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         ));
         if (!comment?.body.trim()) continue;
       } else {
-        let wait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+        let wait: { reason: string; message: string } = { ...UNNAMED_EXECUTION_WAIT };
         const admitted = await admitExplicitNativeContinuation({ db, companyId: run.companyId, issueId,
           agentId: run.agentId, actorType: wake.requestedByActorType, actorId: requestedByActorId,
           reason, commentId, successorRunId: randomUUID(), dryRun: true,
@@ -1938,7 +1939,13 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       }
       const now = new Date();
       const cancelled = await tx.update(agentWakeupRequests).set({
-        status: "cancelled", finishedAt: now, error: reason, updatedAt: now,
+        // Only the driver's pausing path preserves pause-deferred work. Mark
+        // its wake cancellations distinctly: termination uses the same run
+        // stop reason, but is not evidence that a ready report was paused.
+        // Keep run reasons unchanged (budget resume relies on those records).
+        status: "cancelled", finishedAt: now,
+        error: options.preservePauseDeferred && reason === AGENT_LIFECYCLE_STOP_REASON ? AGENT_PAUSE_STOP_REASON : reason,
+        updatedAt: now,
       }).where(and(
         inArray(agentWakeupRequests.id, wakeups.map(row => row.id)),
         inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),

@@ -4,6 +4,7 @@ import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteraction
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
 import { notifyDeferredExecutionWork } from "../services/deferred-execution-notifications.js";
+import { UNNAMED_EXECUTION_WAIT } from "../services/deferred-execution-wait.js";
 import { notifyNativeRecoveryNotices } from "../services/native-recovery-notice-notifications.js";
 import { notifyNativeStatusReassessment } from "../services/native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../services/unsafe-workspace-export-notifications.js";
@@ -214,6 +215,8 @@ import { validate, validateIssueMutationBody } from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
 import { conversationDecisionReceiptsService } from "../services/conversation-decision-receipts.js";
 import { attentionHandledDetails, attentionHandledFor, type AttentionHandledFor } from "../services/attention-receipts.js";
+import { recordCommentWakeIntent, retryCommentWakeIntent, settleCommentWakeIntent } from "../services/comment-wake-intent.js";
+import { withTransactionRetry } from "../services/transaction-retry.js";
 import {
   accessService,
   agentService,
@@ -7864,7 +7867,11 @@ export function issueRoutes(
           ?? (await getNativeSessionSteeringState(steering.steeringRunId)
             .then((state) => state.disposition)
             .catch(() => "temporarily_unavailable" as const));
-    const wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    const savedWait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    // Behind a running turn, a wait no gate named is the ordinary busy turn:
+    // the queue shows its normal queued state. Every named wait still shows.
+    const wait = savedWait.reason === UNNAMED_EXECUTION_WAIT.reason && input.activeRun?.status === "running"
+      ? {} : savedWait;
     // The user's Interrupt click is delivering these messages. Its stopped run
     // settling is not something to read about under the composer; the task
     // notice owns any wait that needs the user.
@@ -7966,6 +7973,74 @@ export function issueRoutes(
       }
     }
     return entries;
+  }
+
+  /**
+   * Agent Chat keeps one wake per waiting message, and requestedAt owns their
+   * order: the read view (chatQueueTail) and the release drain both take the
+   * earliest first. A person's reorder of the whole chat queue, also while a
+   * turn runs, therefore permutes those wakes' saved requestedAt values. A
+   * stale head revision is still refused; the ids must be exactly the chat
+   * queue's, each wake's messages kept together. Returns null when the order
+   * is not a chat-queue order; the ordinary single-wake reorder then decides.
+   */
+  async function reorderChatQueue(input: {
+    issue: { id: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null; executionRunId?: string | null };
+    actor: ReturnType<typeof getActorInfo>; queueId: string; revision: string; orderedCommentIds: string[];
+  }) {
+    const { issue } = input;
+    if (!issue.conversationAgentId || !issue.assigneeAgentId) return null;
+    const activeRun = await resolveActiveIssueRun(issue, { queueStateOnly: true });
+    const publications: ActivityPublication[] = [];
+    const queue = await db.transaction(async (tx) => {
+      await tx.select({ id: issueRows.id }).from(issueRows)
+        .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId))).for("update");
+      const current = await buildQueuedCommentQueue({ executor: tx, issue, activeRun, actor: input.actor });
+      const wakeIdOf = (entry: IssueQueuedCommentQueue["entries"][number]) => entry.queueId ?? current.queueId!;
+      const currentIds = current.entries.map((entry) => entry.comment.id);
+      if (current.queueId !== input.queueId || current.state !== "deferred" ||
+          !current.entries.some((entry) => entry.queueId && entry.queueId !== current.queueId) ||
+          currentIds.length !== input.orderedCommentIds.length ||
+          [...currentIds].sort().join() !== [...input.orderedCommentIds].sort().join()) return null;
+      if (current.revision !== input.revision)
+        throw new QueuedCommentMutationError("queued_comment_revision_conflict", "The queued messages changed in another session");
+      const wakeOf = new Map(current.entries.map((entry) => [entry.comment.id, wakeIdOf(entry)]));
+      const order: string[] = [];
+      for (const id of input.orderedCommentIds) {
+        const wakeId = wakeOf.get(id)!;
+        if (order.at(-1) === wakeId) continue;
+        if (order.includes(wakeId)) throw new QueuedCommentMutationError("queued_comment_order_mismatch",
+          "The queued message order does not match the current queue");
+        order.push(wakeId);
+      }
+      const wakes = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId), inArray(agentWakeupRequests.id, order),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+      )).for("update");
+      if (wakes.length !== order.length) throw new QueuedCommentMutationError("queued_comment_already_dispatching",
+        "The queued message is already being dispatched");
+      const slots = wakes.map((wake) => wake.requestedAt).sort((a, b) => a.getTime() - b.getTime());
+      const now = new Date();
+      for (const [index, wakeId] of order.entries()) {
+        const wake = wakes.find((candidate) => candidate.id === wakeId)!;
+        const ids = input.orderedCommentIds.filter((id) => wakeOf.get(id) === wakeId);
+        const hidden = queuedCommentIdsFromWakePayload(wake.payload).filter((id) => !ids.includes(id));
+        await tx.update(agentWakeupRequests).set({ requestedAt: slots[index]!, updatedAt: now,
+          payload: withQueuedCommentIdsInWakePayload(wake.payload, [...hidden, ...ids]) })
+          .where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, issue.companyId)));
+      }
+      const next = await buildQueuedCommentQueue({ executor: tx, issue, activeRun, actor: input.actor });
+      await logActivity(tx as unknown as Db, {
+        companyId: issue.companyId, actorType: input.actor.actorType, actorId: input.actor.actorId,
+        agentId: input.actor.agentId, runId: input.actor.runId, action: "issue.queued_comments_reordered",
+        entityType: "issue", entityId: issue.id,
+        details: { queueId: next.queueId, revision: next.revision, orderedCommentIds: input.orderedCommentIds },
+      }, publications);
+      return next;
+    });
+    if (!queue) return null;
+    for (const publication of publications) publishActivity(publication);
+    return queue;
   }
 
   function assertQueueMutationTarget(input: {
@@ -18056,6 +18131,12 @@ export function issueRoutes(
       );
       if (!issue) return;
       const actor = getActorInfo(req);
+      const chatQueue = await runQueuedCommentMutation(() => reorderChatQueue({ issue, actor,
+        queueId: req.body.queueId, revision: req.body.revision, orderedCommentIds: req.body.orderedCommentIds as string[] }));
+      if (chatQueue) {
+        res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, chatQueue));
+        return;
+      }
       const { queue, activityPublication } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.reorderQueuedComments({
           issue: buildQueuedCommentIssueContext(issue),
@@ -20528,6 +20609,7 @@ export function issueRoutes(
       let comment: Awaited<ReturnType<typeof svc.addComment>>;
       let goalCommentSteered = false;
       let fastResponseEnqueued = false;
+      let commentWakeIntent: { agentId: string; commentId: string } | null = null;
       if (shouldAutoApproveReviewComment) {
         const transition = applyIssueExecutionPolicyTransition({
           issue: currentIssue,
@@ -20705,15 +20787,25 @@ export function issueRoutes(
             dbOrTx,
           );
         const needsFastResponse = actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status);
-        comment = needsFastResponse ? await db.transaction(async tx => {
+        // S004: a person's comment and the intent to wake its assignee commit
+        // together, so a wake that fails after the 201 is retried, not lost.
+        const wakeIntentAgentId = actor.actorType === "user" ? currentIssue.assigneeAgentId : null;
+        // Database-only transaction: a deadlock on it (now also the intent
+        // insert) is retried from a clean slate rather than failing the post.
+        comment = needsFastResponse || wakeIntentAgentId ? await withTransactionRetry(db, () => db.transaction(async tx => {
           const saved = await add(tx as unknown as Db);
+          if (wakeIntentAgentId) {
+            await recordCommentWakeIntent(tx as unknown as Db, { companyId: currentIssue.companyId, issueId: currentIssue.id,
+              agentId: wakeIntentAgentId, commentId: saved.id, requestedByActorId: actor.actorId });
+            commentWakeIntent = { agentId: wakeIntentAgentId, commentId: saved.id };
+          }
           if (actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status)) {
             await enqueueFastResponse(tx as unknown as Db, { companyId: currentIssue.companyId, issueId: currentIssue.id, agentId: currentIssue.assigneeAgentId,
               responsibleUserId: actor.actorId, sourceCommentId: saved.id, sourceKey: `comment:${saved.id}`, acceptedAt: new Date(saved.createdAt) });
             fastResponseEnqueued = true;
           }
           return saved;
-        }) : await add();
+        })) : await add();
       }
 
       if (!fastResponseEnqueued && actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status)) {
@@ -20902,6 +20994,21 @@ export function issueRoutes(
           currentIssue.status === "todo",
       });
 
+      // S004: the comment's durable wake intent is settled when its wake is
+      // issued (or not owed) and handed to the outbox's saved receipt when the
+      // wake fails, so the drain delivers it exactly once.
+      const pendingWakeIntent = commentWakeIntent as { agentId: string; commentId: string } | null;
+      const intentWakeKey = pendingWakeIntent ? `${pendingWakeIntent.agentId}:${currentIssue.id}` : null;
+      let intentWakeDispatched = false;
+      const retryWakeIntent = (err: unknown) => {
+        if (!pendingWakeIntent) return;
+        logger.warn({ err, issueId: currentIssue.id, commentId: pendingWakeIntent.commentId },
+          "issue comment wake failed; saving the message for the outbox drain");
+        void retryCommentWakeIntent(db, { companyId: currentIssue.companyId, issueId: currentIssue.id,
+          agentId: pendingWakeIntent.agentId, commentId: pendingWakeIntent.commentId })
+          .catch(retryErr => logger.warn({ err: retryErr, issueId: currentIssue.id },
+            "could not save a failed comment wake; the unanswered-message reconciler remains the backstop"));
+      };
       // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
       void (async () => {
         type WakeupRequest = NonNullable<
@@ -21164,9 +21271,27 @@ export function issueRoutes(
           }
         }
 
-        for (const { agentId, wakeup } of wakeups.values()) {
+        if (pendingWakeIntent && !(intentWakeKey && wakeups.has(intentWakeKey))) {
+          // No wake of the assignee is owed for this comment.
+          intentWakeDispatched = true;
+          await settleCommentWakeIntent(db, { companyId: currentIssue.companyId, commentId: pendingWakeIntent.commentId })
+            .catch(err => logger.warn({ err, issueId: currentIssue.id }, "failed to settle a comment wake intent"));
+        }
+        for (const [wakeKey, { agentId, wakeup }] of wakeups.entries()) {
+          const carriesIntent = pendingWakeIntent !== null && wakeKey === intentWakeKey;
+          if (carriesIntent) intentWakeDispatched = true;
           heartbeat
             .wakeup(agentId, wakeup)
+            .then(async (wakeRun) => {
+              if (carriesIntent) {
+                await settleCommentWakeIntent(db, { companyId: currentIssue.companyId, commentId: pendingWakeIntent!.commentId })
+                  .catch(err => logger.warn({ err, issueId: currentIssue.id }, "failed to settle a comment wake intent"));
+              }
+              return wakeRun;
+            }, (err) => {
+              if (carriesIntent) retryWakeIntent(err);
+              throw err;
+            })
             .then((wakeRun) => {
               if (wakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) return;
               const payload =
@@ -21208,7 +21333,11 @@ export function issueRoutes(
               ),
             );
         }
-      })();
+      })().catch((err) => {
+        // The wake decision itself failed before the comment's wake was issued.
+        if (!intentWakeDispatched) retryWakeIntent(err);
+        else logger.warn({ err, issueId: currentIssue.id }, "failed to wake agents on issue comment");
+      });
 
 
       await queueTaskWatchdogEvaluation(currentIssue, actor.runId);

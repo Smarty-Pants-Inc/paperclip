@@ -42,11 +42,11 @@ export function userRunStopPresentation(
   const result = run.resultJson;
   const interrupted = run.status === "interrupted" || isOperatorInterruptedRun(result, run.errorCode);
   const actorType = interrupted
-    ? result?.interruptedByActorType ?? result?.cancelledByActorType
+    ? result?.cancelledByActorType ?? result?.interruptedByActorType
     : result?.cancelledByActorType;
   if (actorType !== "user") return null;
   const actorId = interrupted
-    ? result?.interruptedByActorId ?? result?.cancelledByUserId
+    ? result?.cancelledByUserId ?? result?.interruptedByActorId
     : result?.cancelledByUserId;
   const ownStop = Boolean(currentUserId && actorId === currentUserId);
   const name = typeof actorId === "string" ? userLabelMap?.get(actorId) : undefined;

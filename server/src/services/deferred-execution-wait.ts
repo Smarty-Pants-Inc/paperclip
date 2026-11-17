@@ -11,6 +11,14 @@ export class PersistedExecutionWaitRefusal extends HttpError {
   constructor(message: string, details?: unknown) { super(409, message, details); }
 }
 
+/** The wait admission saves when it holds a message on an execution hold and
+ * no gate named a reason. Recovery machinery keys on a saved wait, so it is
+ * still stored, but it is not a named wait: behind a running turn the queue
+ * shows its normal queued state, not "waiting for recovery" (routes/issues.ts). */
+export const UNNAMED_EXECUTION_WAIT = {
+  reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved.",
+} as const;
+
 /** A saved wait is well formed when it has the shape every writer below
  * stores: a JSON object with a non-empty string `reason` and a string
  * `message` (writeDeferredExecutionWait's callers in heartbeat/queue.ts and

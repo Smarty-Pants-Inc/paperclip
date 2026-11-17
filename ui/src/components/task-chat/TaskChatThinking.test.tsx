@@ -7,6 +7,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { TaskChatThinking } from "./TaskChatThinking";
+import { paperclipRunnerUIAdapter } from "@/adapters/paperclip-runner";
+import { transcriptToTaskChatItems } from "./transcript-adapter";
 
 // Inline reasoning is plain text in the flow of the turn (Paul 11-15 05:49Z):
 // no container (border, background, rounded box, padding block), no indent,
@@ -60,6 +62,39 @@ function chromeElements(block: HTMLElement) {
 }
 
 describe("inline reasoning is plain text in the turn", () => {
+  it.each([390, 1440])("renders all streamed thinking after a cut completion at a %spx host width", width => {
+    container.style.width = `${width}px`;
+    const whole = "r".repeat(4354);
+    const parser = paperclipRunnerUIAdapter.createStdoutParser!();
+    const parse = (eventType: string, text: string) => parser.parseLine(JSON.stringify({
+      type: "paperclip.prp.event", event: { eventType, itemId: "r1", payload: {
+        kind: "reasoning", text, item: { id: "r1", type: "reasoning", text },
+      } },
+    }), "2026-11-17T12:00:00.000Z");
+    const entries = [...parse("item.delta", whole.slice(0, 2000)), ...parse("item.delta", whole.slice(2000)),
+      ...parse("item.completed", whole.slice(0, 4096) + "…[truncated]")];
+    const item = transcriptToTaskChatItems(entries, { runId: "render-whole", running: false })
+      .find(item => item.kind === "thinking")!;
+    expect(item.kind).toBe("thinking");
+    if (item.kind !== "thinking") return;
+    render(item.lines.join("\n"), true);
+    expect(container.querySelector('[data-testid="task-chat-thinking"]')!.textContent).toBe(whole);
+    expect(container.textContent).not.toContain("[truncated]");
+  });
+
+  it("renders a no-stream excerpt with the run-log notice, never the cut marker", () => {
+    const entries = paperclipRunnerUIAdapter.parseStdoutLine(JSON.stringify({
+      type: "paperclip.prp.event", event: { eventType: "item.completed", itemId: "r1",
+        payload: { kind: "reasoning", item: { type: "reasoning", text: "Stored excerpt…[truncated]" } } },
+    }), "2026-11-17T12:00:00.000Z");
+    const item = transcriptToTaskChatItems(entries, { runId: "reload", running: false })[0];
+    expect(item.kind).toBe("thinking");
+    if (item.kind !== "thinking") return;
+    render(item.lines.join("\n"), true);
+    expect(container.textContent).toContain("Stored excerpt");
+    expect(container.textContent).toContain("The full thinking is kept in the run log.");
+    expect(container.textContent).not.toContain("[truncated]");
+  });
   it("has no container, indent or bullet; only the answer's own inset", () => {
     render(CODEX, true);
     const block = container.querySelector<HTMLElement>('[data-reasoning-display="inline"]')!;

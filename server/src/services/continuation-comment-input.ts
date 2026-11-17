@@ -81,6 +81,9 @@ async function pendingPersonCommentInput(db: Pick<Db, "select">, input: {
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     inArray(issueComments.id, candidates), isNull(issueComments.deletedAt),
     or(inArray(issueComments.id, directIds), eq(issueComments.authorType, "user")),
+    // Only still-pending input: a comment with a PUBLISHED agent answer from a run that carried it as pending
+    // input is never re-presented, or every continuation re-answers it (the re-wake loop, org 19:48Z). A reply
+    // to a later input alone does not settle it (R-ONCE, RFL 18:19Z): it rides into the next run's input.
     // Keep answer attribution in the shared predicate. A live pending owner is
     // a separate duplicate-carry fence, not proof the person was answered.
     sql`not ${answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
