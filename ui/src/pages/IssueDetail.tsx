@@ -1348,7 +1348,7 @@ type IssueDetailChatTabProps = {
   ) => Promise<void>;
   onImageUpload: (file: File) => Promise<string>;
   onAttachImage: (file: File) => Promise<IssueAttachment | void>;
-  onInterruptQueued: (runId: string | null) => Promise<IssueQueuedCommentQueue | void>;
+  onInterruptQueued: (runId: string | null, commentId?: string) => Promise<IssueQueuedCommentQueue | void>;
   onRemoveCommentFromCache: (commentId: string) => Promise<void>;
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   onPauseWorkRun?: (runId: string, feedback?: "composer") => Promise<void>;
@@ -2500,12 +2500,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   );
 
   const interruptQueuedComments = useCallback(
-    async (runId: string | null) => {
-      const queuedComments = effectiveQueuedCommentQueue?.targetRunId === runId
+    async (runId: string | null, commentId?: string) => {
+      const queuedComments = (effectiveQueuedCommentQueue?.targetRunId === runId
         ? effectiveQueuedCommentQueue.entries.map((entry) => entry.comment)
         : commentsWithRunMeta.filter(
             (comment) => comment.queueState === "queued" && comment.queueTargetRunId === runId,
-          );
+          )).filter((comment) => !commentId || comment.id === commentId);
       const ids = queuedComments.map((comment) => comment.id);
       const anchorAt = new Date().toISOString();
       setClassicQueuedDeliveryError(null);
@@ -2518,7 +2518,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         return next;
       });
       try {
-        const updatedQueue = await onInterruptQueued(runId);
+        const updatedQueue = await onInterruptQueued(runId, commentId);
         if (updatedQueue?.state === "deferred" && !isQueuedInterruptHandoff(updatedQueue)) {
           const remaining = new Set(updatedQueue.entries.map(entry => entry.comment.id));
           setConsumedQueuedCommentIds(current => new Set([...current].filter(id => !remaining.has(id))));
@@ -2556,9 +2556,21 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     ],
   );
 
+  const setQueuedCommentIntent = useCallback(
+    async (commentId: string, intent: "steer" | "queue") => {
+      try {
+        storeQueuedCommentQueue(await issuesApi.setQueuedCommentIntent(issueId, commentId, intent));
+      } catch (error) {
+        await refreshQueueAfterConflict(error);
+        throw error;
+      }
+    },
+    [issueId, storeQueuedCommentQueue, refreshQueueAfterConflict],
+  );
+
   const discardQueuedComment = useCallback(
-    async (commentId: string, revision: string) => {
-      const queueId = effectiveQueuedCommentQueue?.queueId;
+    async (commentId: string, revision: string, ownQueueId?: string) => {
+      const queueId = ownQueueId ?? effectiveQueuedCommentQueue?.queueId;
       try {
         if (queueId) {
           storeQueuedCommentQueue(
@@ -2820,6 +2832,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             onReorderQueuedComments={reorderQueuedComments}
             onSteerQueuedComment={steerQueuedComment}
             onDiscardQueuedComment={discardQueuedComment}
+            onSetQueuedCommentIntent={setQueuedCommentIntent}
             onDeleteComment={onDeleteComment}
             onCancelQueued={onCancelQueued}
             interruptingQueuedRunId={interruptingQueuedRunId}
@@ -5126,8 +5139,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   });
 
   const addComment = useAccountBoundMutation({
-    mutationFn: async ({ body, reopen, interrupt, attachmentIds, clientRequestId, runSettings }: {
+    mutationFn: async ({ body, reopen, interrupt, attachmentIds, clientRequestId, runSettings, deliveryIntent }: {
       body: string; reopen?: boolean; interrupt?: boolean; attachmentIds?: string[]; clientRequestId?: string; runSettings?: ComposerRunSettings;
+      deliveryIntent?: "steer" | "queue";
     }, { assertCurrentAccount }) => {
       if (issue?.conversationAgentId) clearLegacyChatMessageRequests(`${issue.companyId}:${currentUserId}:${issue.conversationAgentId}`);
       const writableIssueId = await resolveWritableIssueId();
@@ -5149,7 +5163,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         assertCurrentAccount();
         queryClient.setQueryData(queryKeys.issues.detail(writableIssueId), updated);
       }
-      return issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid());
+      return issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid(), deliveryIntent);
     },
     onMutate: async ({ body, reopen, interrupt }) => {
       // Start cache cancellation immediately but do not put it in front of the
@@ -5745,7 +5759,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   });
 
   const interruptQueuedComment = useMutation({
-    mutationFn: (runId: string | null) => issuesApi.interruptLatestQueuedComments(issueId!, runId),
+    mutationFn: (input: string | null | { runId: string | null; commentId: string }) =>
+      input !== null && typeof input === "object"
+        ? issuesApi.interruptLatestQueuedComments(issueId!, input.runId, input.commentId)
+        : issuesApi.interruptLatestQueuedComments(issueId!, input),
     onSuccess: () => {
       invalidateIssueDetail();
       invalidateIssueRunState();
@@ -7012,7 +7029,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       attachmentIds?: string[],
       clientRequestId?: string,
       runSettings?: ComposerRunSettings,
+      sendMode?: "steer" | "queue" | "interrupt",
     ) => {
+      // Paul NOTE 6: Interrupt sends this message first (one-message interrupt);
+      // it is stored as Queue so the 5 s auto-steer never races the stop.
+      const deliveryIntent = sendMode === "interrupt" ? "queue" : sendMode;
+      if (sendMode === "interrupt" && issue?.conversationAgentId) {
+        const sent = await addComment.mutateAsync({ body, reopen, attachmentIds, clientRequestId, runSettings, deliveryIntent });
+        await interruptQueuedComment.mutateAsync({ runId: null, commentId: sent.id });
+        return;
+      }
       if (!issue?.conversationAgentId && (reassignment || runSettings)) {
         await addCommentAndReassign.mutateAsync({
           body,
@@ -7024,9 +7050,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         });
         return;
       }
-      await addComment.mutateAsync({ body, reopen, attachmentIds, clientRequestId, runSettings });
+      await addComment.mutateAsync({ body, reopen, attachmentIds, clientRequestId, runSettings, deliveryIntent,
+        ...(sendMode === "interrupt" ? { interrupt: true } : {}) });
     },
-    [addComment, addCommentAndReassign, issue?.conversationAgentId],
+    [addComment, addCommentAndReassign, interruptQueuedComment, issue?.conversationAgentId],
   );
   const handleCommentImageUpload = useCallback(
     async (file: File) => {
@@ -7042,8 +7069,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     [uploadAttachment],
   );
   const handleInterruptQueuedRun = useCallback(
-    async (runId: string | null) => {
-      return interruptQueuedComment.mutateAsync(runId);
+    async (runId: string | null, commentId?: string) => {
+      return interruptQueuedComment.mutateAsync(commentId ? { runId, commentId } : runId);
     },
     [interruptQueuedComment],
   );
@@ -8905,7 +8932,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   onCancelQueued={handleCancelQueuedComment}
                   interruptingQueuedRunId={
                     interruptQueuedComment.isPending
-                      ? (interruptQueuedComment.variables ?? null)
+                      ? (interruptQueuedComment.variables !== null && typeof interruptQueuedComment.variables === "object"
+                        ? interruptQueuedComment.variables.runId : interruptQueuedComment.variables ?? null)
                       : null
                   }
                   pausingWorkRunId={
