@@ -48,6 +48,9 @@ import { resolveNativeControllerRecovery, assertNativeRetainedSandboxBinding } f
 import { createSystemRecovery } from "../system-recovery-state.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
 import { createReusableLeaseHandoff } from "../environment-lease-handoff.js";
+import { shouldResetTaskSessionForWake } from "./run-state.js";
+import { undeliveredContinuationContext } from "../fresh-continuation-retry-fold.js";
+import { preservePiConversation, readPiConversation, selectPiConversation } from "../native-runtime/pi-conversation-record.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -468,18 +471,69 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(currentNotices(allNotes)).toEqual(allNotes);
   });
 
-  it("does not treat a forceFreshSession flag or forged recovery action id as provider-thread authority", async () => {
+  // Keep reason (f1-seed-b's intent, SEED-B/SMA-60): upstream's continuation
+  // asks for a fresh session; Pi follows that task-session reset as Codex does,
+  // so the saved message is answered once on a new conversation chained to the
+  // old one. Never two writers: a replay or an admitted run never re-mints.
+  it("answers a SEED-B continuation on a fresh Pi conversation that follows the task-session reset", async () => {
     const f = await piFixture();
+    f.input.workspace.executionWorkspace.cwd = instructionRoot;
+    await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id, authorType: "user",
+      authorUserId: "local-board", body: "Remember the word ALDER-B. Reply only: noted.", createdAt: new Date(f.run.createdAt.getTime() - 2000) });
     const first = await selectHeartbeatRuntime(db, f.input);
     if (!first.selected || !first.nativeExecution) throw new Error("Expected selection");
+    const oldId = first.nativeExecution.session.normalizedSessionId!;
+    // Control: a recovery action id without a task-session reset is no authority.
     await nextPiTurn(f);
-    f.input.task.context = { forceFreshSession: true, recoveryActionId: randomUUID(), previousRunId: f.run.id };
+    f.input.task.context = { recoveryActionId: randomUUID(), previousRunId: f.run.id };
+    expect(await selectHeartbeatRuntime(db, f.input)).toMatchObject({ nativeExecution: { session: { normalizedSessionId: oldId } } });
+    const sourceRunId = f.input.run.id;
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), nativeSessionId: oldId,
+      errorCode: "native_controller_recovery_missing_evidence:retained_sandbox_binding" }).where(eq(heartbeatRuns.id, sourceRunId));
+    const [saved] = await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id, authorType: "user",
+      authorUserId: "local-board", body: "TEST: What word did I ask you to remember? Reply with that word only." }).returning();
+    await nextPiTurn(f, false);
+    // The production wake context and reset decision (retry-fold :70, run-state :816).
+    f.input.task.context = undeliveredContinuationContext({ recoveryActionId: randomUUID(), sourceRunId, isolation: null }, {});
     await db.update(heartbeatRuns).set({ contextSnapshot: f.input.task.context }).where(eq(heartbeatRuns.id, f.input.run.id));
-    expect(await selectHeartbeatRuntime(db, f.input)).toMatchObject({ nativeExecution: {
-      session: { normalizedSessionId: first.nativeExecution.session.normalizedSessionId },
-    } });
-    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(0);
-  });
+    f.input.session.resetTaskSession = shouldResetTaskSessionForWake(f.input.task.context);
+    expect(f.input.session.resetTaskSession).toBe(true);
+    const fresh = await selectHeartbeatRuntime(db, f.input);
+    if (!fresh.selected || !fresh.nativeExecution) throw new Error("Expected fresh selection");
+    const newId = fresh.nativeExecution.session.normalizedSessionId!;
+    expect(newId).not.toBe(oldId);
+    const record = async () => (await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, f.issue.id)))[0]!.sessionParamsJson;
+    expect(await record()).toMatchObject({ sessionId: newId, __paperclipPiConversation: {
+      id: newId, generation: 2, previousId: oldId, reason: "task_session_reset", runId: f.input.run.id } });
+    // Replay of the same run reuses its record: one mint, one writer, even
+    // before the run row carries the selected id (a crash after the mint).
+    const admittedRow = await read(f.input.run.id);
+    await db.update(heartbeatRuns).set({ nativeSessionId: null, runnerProfileJson: {} }).where(eq(heartbeatRuns.id, f.input.run.id));
+    expect(await selectPiConversation(db, { companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
+      runId: f.input.run.id, resetTaskSession: true, boundary: readPiConversation(await record())!.boundary })).toMatchObject({ id: newId, generation: 2 });
+    await db.update(heartbeatRuns).set({ nativeSessionId: admittedRow.nativeSessionId, runnerProfileJson: admittedRow.runnerProfileJson })
+      .where(eq(heartbeatRuns.id, f.input.run.id));
+    expect(await selectHeartbeatRuntime(db, f.input)).toMatchObject({ nativeExecution: { session: { normalizedSessionId: newId } } });
+    expect(await record()).toMatchObject({ __paperclipPiConversation: { id: newId, generation: 2 } });
+    await db.update(issues).set({ executionRunId: f.input.run.id }).where(eq(issues.id, f.issue.id));
+    const result = await answerWithNativePeer({ db, execution: fresh.nativeExecution, runnerInstanceId: fresh.nativeRunnerInstanceId!,
+      text: "ALDER-B", getFreshSessionHandoff: createNativeSessionHandoffLoader({ db, companyId: f.agent.companyId,
+        agentId: f.agent.id, issueId: f.issue.id, before: f.input.run.createdAt }) });
+    expect(result.settled).toMatchObject({ status: "succeeded", nativeSessionId: newId });
+    expect(JSON.stringify(result.prompts)).toContain("ALDER-B");
+    expect(JSON.stringify(result.prompts)).toContain(saved.body.slice(0, 40));
+    // A late publisher of the retired id neither restores nor erases the record.
+    expect(preservePiConversation(await record(), { sessionId: oldId })).toMatchObject({ sessionId: newId,
+      __paperclipPiConversation: { id: newId, previousId: oldId } });
+    // A run already admitted to a conversation keeps it under a later reset.
+    await nextPiTurn(f);
+    await db.update(heartbeatRuns).set({ nativeSessionId: newId }).where(eq(heartbeatRuns.id, f.input.run.id));
+    f.input.run = { ...f.input.run, nativeSessionId: newId };
+    f.input.session.resetTaskSession = true;
+    expect(await selectHeartbeatRuntime(db, f.input)).toMatchObject({ nativeExecution: { session: { normalizedSessionId: newId } } });
+    expect(await record()).toMatchObject({ __paperclipPiConversation: { id: newId, generation: 2 } });
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system")).toHaveLength(0);
+  }, 60_000);
 
   it("adopts a verified legacy Pi pointer without ending the existing conversation", async () => {
     const f = await piFixture();

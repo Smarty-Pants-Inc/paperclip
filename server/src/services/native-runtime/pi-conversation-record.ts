@@ -87,6 +87,8 @@ export async function selectPiConversation(db: Db, input: {
   companyId: string; agentId: string; issueId: string; runId: string;
   boundary: PiConversationBoundary;
   predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
+  /** session-preparation's resetTaskSession for this run. */
+  resetTaskSession?: boolean;
 }): Promise<PiConversationRecord> {
   return db.transaction(async tx => {
     const [issue] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId))).for("no key update");
@@ -135,7 +137,19 @@ export async function selectPiConversation(db: Db, input: {
         reason: "adopted_existing_conversation", previousId: null, runId: owner.id };
     }
     if (!previous && input.boundary.provider !== "pi_rpc") throw new Error("pi_conversation_record_missing");
-    const reason: string | null = null; // Boundary generation policy is installed separately.
+    // The conversation follows the task-session reset, as Codex does upstream
+    // (session-preparation resetTaskSession -> taskResumeSessionId null ->
+    // runtime-selection `run.nativeSessionId ?? resumableTaskSessionId ?? randomUUID()`).
+    // Only an unadmitted run rotates: like upstream's `run.nativeSessionId ??`,
+    // a run already bound to a conversation keeps it, so a replay or restart
+    // never mints a second id or writes a second Pi file. The record that this
+    // run minted (previous.runId === runId) is reused, never re-minted. The old
+    // id stays in previousId; its Pi file (pi/<old id>.jsonl) is not touched.
+    const admitted = Boolean(run.nativeSessionId || run.runnerProfileJson?.nativeExecutionInput !== undefined
+      || run.runnerProfileJson?.sessionCheckpoint != null || run.runnerProfileJson?.nativeControllerRecovery != null
+      || run.processPid !== null || run.processGroupId !== null || run.processStartedAt !== null || run.sessionIdAfter !== null);
+    const reason: string | null = input.resetTaskSession === true && previous && previous.runId !== input.runId && !admitted
+      ? "task_session_reset" : null;
     if (run.nativeSessionId && previous && run.nativeSessionId !== previous.id) throw new Error("pi_conversation_identity_conflict");
     // A replay of this immutable run cannot reinterpret newly edited settings.
     if (previous?.runId === input.runId && reason) throw new Error("pi_conversation_admitted_boundary_changed");
@@ -167,6 +181,11 @@ export async function selectPiConversation(db: Db, input: {
 export function preservePiConversation(params: Record<string, unknown> | null | undefined, next: Record<string, unknown> | null): Record<string, unknown> | null {
   const conversation = readPiConversation(params);
   if (!conversation) return next;
+  // A late publisher of the conversation a task-session reset retired keeps
+  // the current record untouched (it can neither restore nor erase it).
+  if (next?.sessionId != null && conversation.reason === "task_session_reset" && next.sessionId === conversation.previousId) {
+    return { ...params };
+  }
   if (next?.sessionId != null && next.sessionId !== conversation.id) throw new Error("pi_conversation_identity_conflict");
   return { ...next, sessionId: conversation.id, [PI_CONVERSATION_KEY]: conversation };
 }

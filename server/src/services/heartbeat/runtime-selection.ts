@@ -124,6 +124,10 @@ export interface HeartbeatRuntimeSelectionInput {
     persistedNativeExecutionInput: NativeExecutionInput | null;
     persistedRunnerProfile: Record<string, unknown>;
     taskResumeSessionId: string | null;
+    /** session-preparation's resetTaskSession (forceFreshSession, a wake reset,
+     * config freshness). Codex follows it by losing taskResumeSessionId; the Pi
+     * conversation follows it in selectPiConversation. */
+    resetTaskSession?: boolean;
     isFailedChatRunRetry: boolean;
     getFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   };
@@ -542,10 +546,12 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       compatibleLegacyRetrySource?.nativeSessionId;
     const resumableTaskSessionId = reseedPortableSession || isDotRun ? null : taskResumeSessionId ?? legacyRetrySessionId ?? null;
     // Conversation C is durable; checkpoints and runner generations only attach
-    // to it. Framework forceFreshSession/config freshness is not New Conversation.
+    // to it. A task-session reset (as for Codex above) starts a new recorded
+    // conversation chained to the old one; the old Pi file is never touched.
     const piConversation = nativeRuntimeResolution.profile.backend === "pi_rpc"
       ? await selectPiConversation(db, {
           companyId: agent.companyId, agentId: agent.id, issueId: issueRef.id, runId: run.id,
+          resetTaskSession: input.session.resetTaskSession === true,
           predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
           boundary: {
             provider: nativeRuntimeResolution.profile.backend,

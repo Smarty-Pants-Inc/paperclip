@@ -9,6 +9,11 @@ mod skill_edit {
     }
 
     #[test]
+    fn skill_edit_deferred_terminal_prepare_waits_for_boundary() {
+        refresh_admission("deferred_terminal", "refresh_wait");
+    }
+
+    #[test]
     fn skill_edit_descendant_prepare_waits_for_boundary() {
         refresh_admission("descendant", "refresh_wait");
     }
@@ -29,13 +34,32 @@ mod skill_edit {
     }
 
     fn refresh_admission(blocker: &str, expected: &str) {
-        let (directory, mut old, mut payload) = prepared_skill_checkpoint("codex", true);
+        let provider = if blocker == "deferred_terminal" {
+            "pi_rpc"
+        } else {
+            "codex"
+        };
+        let (directory, mut old, mut payload) = prepared_skill_checkpoint(provider, true);
         let state = old.state.as_mut().unwrap();
         state.run_identity = Some(prepare_contract_identity("run-A"));
         match blocker {
             "active_turn" => {
                 state.active_provider_turn_id = Some("old-turn".to_owned());
                 state.lifecycle = "turn_active".to_owned();
+            }
+            "deferred_terminal" => {
+                state.tool_bridge =
+                    tool_result_authority_state("pi_rpc", "get_task_context").tool_bridge;
+                state
+                    .tool_bridge
+                    .begin_call(
+                        "deferred-call".to_owned(),
+                        "get_task_context".to_owned(),
+                        json!({}),
+                    )
+                    .unwrap();
+                state.tool_bridge.settle_turn("turn_completed").unwrap();
+                state.pi_deferred_terminal = Some("turn.completed".to_owned());
             }
             "descendant" => {
                 state
