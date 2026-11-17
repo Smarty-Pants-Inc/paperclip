@@ -1,13 +1,14 @@
 import { sql, type SQL } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
 export const ISSUE_IMPORTED_ACTION = "issue.imported";
 /** The import routes' audit row, written after a committed import (routes/companies.ts). */
 export const COMPANY_IMPORTED_ACTION = "company.imported";
 
-/** A person message is answered by a published agent reply attributed to it or to a later person input, or it is
- * imported history. Shared by recovery input selection (continuation-comment-input.ts) and the
+/** A person message is answered by a published agent reply attributed to it or to a later person input,
+ * its carrying run's open or answered interaction card, or imported history. Answering the card is new input;
+ * it never makes the original message unanswered again. Shared by recovery input selection (continuation-comment-input.ts) and the
  * unanswered-person-message notice, so the carry and the notice never disagree on a message.
  * - Provider acceptance/delivery alone is NOT an answer.
  * - A run-less agent comment NEVER answers (RFL 20:22Z): the Muse external agent's task.comment and agent chat
@@ -29,6 +30,16 @@ export function answeredPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: 
             or r.context_snapshot->>'conversationReplyBoundaryCommentId' = b.id::text
             or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? b.id::text
             or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? b.id::text)))
+    or exists (select 1 from ${issueThreadInteractions} q
+      join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
+      where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId}
+        and q.created_by_agent_id = r.agent_id and q.status in ('pending', 'answered')
+        and q.created_at > ${m.createdAt}
+        -- A card answers the inputs its run actually carried, never earlier queued inputs by time.
+        and (r.context_snapshot->>'wakeCommentId' = ${m.id}::text or r.context_snapshot->>'commentId' = ${m.id}::text
+          or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${m.id}::text
+          or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
+          or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${m.id}::text))
     or ${importedPersonHistorySql(m)})`;
 }
 
