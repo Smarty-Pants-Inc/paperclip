@@ -1,7 +1,7 @@
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
 import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON } from "./execution-recovery-attempt.js";
 import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-setup-command-failure.js";
-import { and, desc, eq, inArray, isNull, not, notInArray, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import { unidentifiedLocalLaunchRefusals } from "./native-local-process-stop.js";
 import { nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
 import { agents, agentWakeupRequests, approvals, chatActions, companies, environmentLeases, heartbeatRuns, issueApprovals, issueRecoveryActions,
@@ -113,6 +113,16 @@ type ProjectionState = {
   automaticDispositionAt?: number;
   waitingContinuation?: { queuedAt: number; personRequested: boolean };
   recoveryHandedToPerson?: boolean;
+  /** The issue claim refuses this never-started queued run because a
+   * predecessor's cleanup is unsettled: a sandbox lease the provider has not
+   * released, or other cleanup of the previous run. */
+  queuedStartHold?: QueuedStartHold;
+};
+
+type QueuedStartHold = "sandbox_provider" | "previous_run";
+const queuedStartHoldWaits: Record<QueuedStartHold, { reason: string; message: string }> = {
+  sandbox_provider: { reason: "sandbox_provider_wait", message: "Waiting for the sandbox provider. Your message is saved." },
+  previous_run: { reason: "previous_run_settling", message: "Waiting for the previous run to stop. Your message is saved." },
 };
 
 // A task read reports the change that made a task fail, not every later read of
@@ -292,6 +302,14 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   if (run.status === "queued" && waiting && !waiting.personRequested && run.agentId === issue.assigneeAgentId
       && now - waiting.queuedAt >= WAITING_CONTINUATION_MOVE_FORWARD_MS)
     return { ...base, state: "working", canRetry: true, retryAction: "move_forward" };
+  // A queued run that has not started within the queued-input dispatch bound,
+  // while the issue claim refuses it for its predecessor's unsettled cleanup
+  // (heartbeat/queue.ts predecessor_cleanup_pending), is not working: name the
+  // hold. No Retry: task Retry coalesces into a queued latest run, so it could
+  // not start this one, and a fresh run would meet the same claim gate.
+  if (run.status === "queued" && !run.startedAt && input.queuedStartHold && run.createdAt
+      && now - run.createdAt.getTime() >= QUEUED_INPUT_DISPATCH_GRACE_MS)
+    return { ...base, state: "failed", canRetry: false, retryWait: queuedStartHoldWaits[input.queuedStartHold] };
   if (["running", "queued"].includes(run.status)) return { ...base, state: "working" };
   // Paperclip is continuing the task by itself: no failed attempt and no Retry.
   if (input.freshContinuation?.state === "continuing") {
@@ -422,6 +440,37 @@ async function quarantineCleanupSettling(db: Db, companyId: string,
   return settling;
 }
 
+/** Never-started queued runs past the queued-input bound that the issue claim
+ * refuses for a predecessor's unsettled cleanup. The predecessors are the ones
+ * the claim checks (heartbeat/queue.ts): the task's execution owner and the
+ * run this one retries, with the claim's own predicate (hasPendingRunCleanup).
+ * A predecessor sandbox lease the provider has not released names the provider. */
+async function queuedRunStartHolds(db: Db, companyId: string,
+  entries: Array<[string, { id: string; status: string; startedAt: Date | null; createdAt: Date; retryOfRunId: string | null }]>) {
+  const holds = new Map<string, QueuedStartHold>();
+  const late = entries.filter(([, run]) => run.status === "queued" && !run.startedAt
+    && run.createdAt.getTime() <= Date.now() - QUEUED_INPUT_DISPATCH_GRACE_MS);
+  if (!late.length) return holds;
+  const owners = new Map((await db.select({ id: issues.id, executionRunId: issues.executionRunId }).from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, late.map(([issueId]) => issueId)))))
+    .map(row => [row.id, row.executionRunId]));
+  const { hasPendingRunCleanup } = await import("./execution-blocker.js");
+  for (const [issueId, run] of late) {
+    const predecessors = [...new Set([owners.get(issueId), run.retryOfRunId])]
+      .filter((id): id is string => !!id && id !== run.id);
+    const pending: string[] = [];
+    for (const id of predecessors) if (await hasPendingRunCleanup(db, companyId, id)) pending.push(id);
+    if (!pending.length) continue;
+    const [sandbox] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, pending),
+      sql`${environmentLeases.provider} is distinct from 'local'`,
+      or(isNull(environmentLeases.releasedAt), inArray(environmentLeases.status, ["active", "pending_cleanup"]),
+        eq(environmentLeases.cleanupStatus, "failed")))).limit(1);
+    holds.set(issueId, sandbox ? "sandbox_provider" : "previous_run");
+  }
+  return holds;
+}
+
 /** A scheduled retry has no outcome yet, so its provider failure is read from
  * the predecessor it retries: the countdown keeps its reason.
  * Batch list reads rather than doing seven queries per row. Keep run logs and
@@ -457,6 +506,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     db.select({ issueId: requestedIssueId, id: heartbeatRuns.id, status: heartbeatRuns.status,
       createdAt: heartbeatRuns.createdAt, finishedAt: heartbeatRuns.finishedAt, agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId,
       nativeIssueId: heartbeatRuns.nativeIssueId, runtimeMode: heartbeatRuns.runtimeMode, startedAt: heartbeatRuns.startedAt,
+      retryOfRunId: heartbeatRuns.retryOfRunId,
       processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
       agentAdapter: agents.adapterType,
       error: sql<string | null>`case when ${heartbeatRuns.errorCode} = 'setup_failed'
@@ -806,6 +856,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   const cleanupSettling = await quarantineCleanupSettling(db, companyId,
     [...runMap].flatMap(([issueId, run]) => run.errorCode === NATIVE_SESSION_CLEANUP_QUARANTINED ? [{ issueId, run }] : []));
   const confirmableLaunches = new Set(launchWaits.filter(entry => launchRefusals.get(entry.run.id) === null).map(entry => entry.issueId));
+  const queuedStartHolds = await queuedRunStartHolds(db, companyId, [...runMap]);
   const now = Date.now();
   for (const issue of selected) {
     const required = requirements.get(issue.id);
@@ -830,6 +881,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       waitingOnBlockers: waitingOnBlockers.has(issue.id),
       waitingOnOpenSubtasks: waitingOnOpenSubtasks.has(issue.id),
       cleanupSettling: cleanupSettling.has(issue.id),
+      queuedStartHold: queuedStartHolds.get(issue.id),
     }, now);
     result.set(issue.id, presentation);
     const run = facts.run;
