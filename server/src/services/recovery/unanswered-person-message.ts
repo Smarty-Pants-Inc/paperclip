@@ -29,6 +29,7 @@ import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
+import { personStoppedCarrierSql, runStartedAnswering, stoppedBySender } from "./person-stopped-message.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -246,11 +247,18 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and ${answeredSql(rawMessage("m"))})
+      and (${answeredSql(rawMessage("m"))} or ${personStoppedNoticeSql("m")}))
     or exists (select 1 from ${issueComments} n
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and ${cardAnswerNoticeAnsweredSql(sql`n.company_id`, sql`n.issue_id`, sql`n.metadata->>'authorizationReason'`)}))`;
+}
+
+/** SQL: the message m (a typed message) has a standing notice that its sender's own
+ * Stop or Interrupt may supersede (decideUnansweredMessage decides by line). */
+function personStoppedNoticeSql(alias: string): SQL {
+  return sql`(${sql.raw(`${alias}.author_type`)} = 'user' and ${personStoppedCarrierSql({ ...rawMessage(alias),
+    authorUserId: sql.raw(`${alias}.author_user_id`) })})`;
 }
 
 /** SQL: the task has a person's card answer (unansweredCardAnswerSql) in the
@@ -300,13 +308,13 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and (exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-          and ${answeredSql(rawMessage("m"))})
+          and (${answeredSql(rawMessage("m"))} or ${personStoppedNoticeSql("m")}))
         or ${cardAnswerNoticeAnsweredSql(sql`${issueComments.companyId}`, sql`${issueComments.issueId}`,
           sql`${issueComments.metadata}->>'authorizationReason'`)})))`;
 }
 
 export type UnansweredMessageOutcome =
-  | { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" }
+  | { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" | "person_stopped" }
   | { kind: "pending"; recheckAt: number }
   | { kind: "noticed"; code: string; commentId: string };
 
@@ -380,6 +388,20 @@ export async function settleUnansweredPersonMessage(
   });
 
   const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
+  if (decision.kind === "person_stopped") {
+    // The sender stopped the run that was answering this message: a standing
+    // notice for it is superseded, under the same issue fence and predicate.
+    if (decision.noticeId) await db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues)
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+      const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies);
+      if (fenced.kind !== "person_stopped" || fenced.noticeId !== decision.noticeId) return;
+      await tx.update(issueComments).set({ deletedAt: now, updatedAt: now }).where(and(
+        eq(issueComments.id, decision.noticeId!), eq(issueComments.companyId, issue.companyId),
+        eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
+    });
+    return { kind: "person_stopped" };
+  }
   if ((decision.kind === "pending" || decision.kind === "notice") && decision.recordWait) {
     await logActivity(db, { companyId: issue.companyId, actorType: "system", actorId: "recovery",
       action: PENDING_WAIT_ACTION, entityType: "issue", entityId: issue.id, issueId: issue.id,
@@ -427,7 +449,8 @@ export async function settleUnansweredPersonMessage(
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type WaitRecord = { messageId: string; runId: string | null; waitKind?: "setup"; startedAt?: string; boundMs?: number };
-type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
+type Decision = { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" }
+  | { kind: "person_stopped"; noticeId: string | null }
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: WaitRecord }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
@@ -456,14 +479,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
 
-  const [latestMessage] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
+  const [latestMessage] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
+    authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
   // No age cut here: discovery (inScopeSql) decides which messages are in
   // scope, so an open obligation is never dropped silently by age.
   if (!latestMessage) return { kind: "none" };
-  let message = latestMessage;
+  let message: { id: string; createdAt: Date; authorUserId?: string | null } = latestMessage;
   const [answer] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.id, message.id), answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
@@ -489,13 +513,31 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     .from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
+  const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
+  // The SENDER stopped (Stop or Interrupt) the run that had STARTED answering
+  // this message: they ended it on purpose, so "send it again" would redo the
+  // stopped work. Only this agent's NEWEST run on the task counts (a later
+  // attempt, live or failed, decides by its own rules), only a typed message
+  // that was that run's own input which the model read and began to answer
+  // (an unread steer or a message queued behind it keeps its notice), and
+  // only the sender's own stop (person-stopped-message.ts). A standing notice
+  // for the message is superseded.
+  if (!cardAnswer && message.authorUserId) {
+    const [newest] = await q.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+      resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+    if (newest && stoppedBySender(newest, message.authorUserId) && await runStartedAnswering(q, {
+      companyId: issue.companyId, runId: newest.id, messageId: message.id, contextSnapshot: newest.contextSnapshot })) {
+      return { kind: "person_stopped", noticeId: noticed?.id ?? null };
+    }
+  }
   // A standing WAITING note is still an open obligation: it must stay true.
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
   const upgrading = noticed?.waiting ? noticed.id : null;
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode ?? UNANSWERED_MESSAGE_WAITING_CODE : null;
 
   // The run this message started (the latest run that carries it), if any.
-  const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
   const runs = await q.select({
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
     errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
