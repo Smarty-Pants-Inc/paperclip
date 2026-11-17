@@ -22,9 +22,9 @@ import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import { activeNativeExecutionRunIds, NATIVE_PREPARATION_FENCING_VERSION } from "./native-active-runs.js";
 import {
   PROCESS_IDENTITY_RECORDED,
-  PROCESS_START_REQUESTED,
   recordNativeLocalProcessStopInTransaction,
 } from "../native-local-process-stop.js";
+import { NATIVE_EXECUTION_START_EVENT_TYPES } from "../native-process-start-events.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gt, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
@@ -271,9 +271,7 @@ async function nativeExecutionStartedSince(tx: Pick<Db, "select">, runId: string
       gt(heartbeatRunEvents.seq, watermark),
       or(
         isNotNull(heartbeatRunEvents.sourceEventId),
-        inArray(heartbeatRunEvents.eventType, [
-          "adapter.invoke", PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED, "tool.execution.started",
-        ]),
+        inArray(heartbeatRunEvents.eventType, [...NATIVE_EXECUTION_START_EVENT_TYPES]),
       ),
     ))
     .limit(1);
@@ -919,12 +917,7 @@ export async function hasNativeExecutionStartEvidence(
       eq(heartbeatRunEvents.runId, run.id),
       or(
         isNotNull(heartbeatRunEvents.sourceEventId),
-        inArray(heartbeatRunEvents.eventType, [
-          "adapter.invoke",
-          PROCESS_START_REQUESTED,
-          PROCESS_IDENTITY_RECORDED,
-          "tool.execution.started",
-        ]),
+        inArray(heartbeatRunEvents.eventType, [...NATIVE_EXECUTION_START_EVENT_TYPES]),
       ),
     ))
     .limit(1);

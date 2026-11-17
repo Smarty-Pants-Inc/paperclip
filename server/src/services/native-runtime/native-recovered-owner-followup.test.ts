@@ -17,7 +17,8 @@ import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter } from "./native-runner-checkpoint.js";
 import { createNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
-import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
+import { currentNativeControllerIdentity, hasNativeExecutionStartEvidence } from "./native-restart-recovery.js";
+import { refusedAtPriorOwnerFenceBeforeLaunch } from "./native-provider-work-proof.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { freshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
@@ -895,6 +896,23 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const next = await admitFollowUp(prior);
     expect(next.selectedRunId).toBe(prior.runId);
     expect(await next.start()).toBe("native_controller_recovery_missing_evidence:snapshot_digest_or_checkpoint_binding");
+  }, 60_000);
+
+  it.each([
+    "native.process_started", "native.process_start_requested", "native.process_identity_recorded",
+    "adapter.invoke", "tool.execution.started",
+  ])("judge metaformat: a holder with %s is not refused before launch", async eventType => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    const refused = await failUnstartedFollowUp(prior);
+    await shapeLiveFenceRefusal(prior, refused);
+    expect(await refusedAtPriorOwnerFenceBeforeLaunch(db, { companyId, runId: refused })).toBe(true);
+    expect(await hasNativeExecutionStartEvidence(db, { companyId, id: refused })).toBe(false);
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: refused, seq: 100,
+      stream: "system", payload: {}, eventType });
+    expect(await refusedAtPriorOwnerFenceBeforeLaunch(db, { companyId, runId: refused })).toBe(false);
+    expect(await hasNativeExecutionStartEvidence(db, { companyId, id: refused })).toBe(true);
+    const next = await admitFollowUp(prior);
+    expect(next.selectedRunId).toBe(refused);
   }, 60_000);
 
   it("metaformat negative: a fence-refused run with its own launch request stays the source", async () => {
