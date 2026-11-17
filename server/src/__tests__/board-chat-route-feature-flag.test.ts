@@ -1,7 +1,9 @@
 import express from "express";
 import { EventEmitter } from "node:events";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+afterEach(() => vi.unstubAllEnvs());
 
 const mockGetExperimental = vi.hoisted(() => vi.fn());
 const mockIssueService = vi.hoisted(() => ({
@@ -99,6 +101,54 @@ describe("board-chat client disconnect", () => {
     });
     return proc;
   }
+
+  // Keep: resource-admission boundary exercised through held-open HTTP streams.
+  it.each([
+    [undefined, 3], ["", 3], ["invalid", 3], ["0", 3], ["-1", 3],
+    ["1.5", 3], ["9007199254740992", 3], [" 10 ", 10],
+  ] as const)("admits %s concurrent streams and returns the unchanged busy error at the cap", async (raw, limit) => {
+    vi.clearAllMocks();
+    vi.stubEnv("PAPERCLIP_BOARD_CHAT_MAX_CONCURRENT", raw);
+    mockGetExperimental.mockResolvedValue({ enableConferenceRoomChat: true });
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-1" });
+    mockIssueService.listComments.mockResolvedValue([]);
+    const procs: ReturnType<typeof makeFakeProc>[] = [];
+    mockSpawn.mockImplementation(() => { const proc = makeFakeProc(); procs.push(proc); return proc; });
+    const app = await createApp();
+    const open: { abort: () => unknown }[] = [];
+    const pending: Promise<unknown>[] = [];
+    const earlyResponses: number[] = [];
+    try {
+      for (let index = 0; index < limit; index++) {
+        const call = request(app).post("/api/board/chat/stream")
+          .send({ companyId: "company-1", taskId: "issue-1", message: `Hello ${index}` });
+        open.push(call);
+        pending.push(call.then(res => { earlyResponses.push(res.status); }, () => undefined));
+        await vi.waitFor(() => expect(procs.length === index + 1 || earlyResponses.length > 0).toBe(true));
+        expect(earlyResponses).toEqual([]);
+        expect(procs).toHaveLength(index + 1);
+      }
+      const refused = await request(app).post("/api/board/chat/stream")
+        .send({ companyId: "company-1", taskId: "issue-1", message: "Over cap" });
+      expect(refused.status).toBe(429);
+      expect(refused.body).toEqual({ error: "Too many concurrent board chats — retry shortly", code: "BOARD_CHAT_BUSY" });
+      expect(procs).toHaveLength(limit);
+      // A closed process releases its slot.
+      procs[0].exitCode = 0;
+      procs[0].emit("close", 0);
+      const replacement = request(app).post("/api/board/chat/stream")
+        .send({ companyId: "company-1", taskId: "issue-1", message: "Replacement" });
+      open.push(replacement);
+      pending.push(replacement.then(() => undefined, () => undefined));
+      await vi.waitFor(() => expect(procs).toHaveLength(limit + 1));
+    } finally {
+      for (const call of open) call.abort();
+      for (const proc of procs) {
+        if (proc.exitCode === null) { proc.exitCode = 143; proc.emit("close", 143); }
+      }
+      await Promise.all(pending);
+    }
+  }, 20_000);
 
   it("kills the spawned subprocess when the client disconnects mid-stream", async () => {
     mockGetExperimental.mockResolvedValue({ enableConferenceRoomChat: true });
