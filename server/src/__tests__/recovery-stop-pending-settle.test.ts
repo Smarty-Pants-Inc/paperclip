@@ -97,6 +97,15 @@ describeEmbeddedPostgres("Stop-pending settles independently of the claim-releas
     expect((await f.notes())[0].body).toBe(heldNote);
   });
 
+  it.each(["done", "cancelled"])("a terminal %s task settles Stop but does not promise a Retry that its route rejects", async status => {
+    const f = await fixture();
+    await f.db.update(issues).set({ status }).where(eq(issues.id, f.issueId));
+    await release(f);
+    await f.recovery.reconcileActiveRecoveryActions({ companyId: f.companyId });
+    expect(await f.notes()).toHaveLength(1);
+    expect((await f.notes())[0].body).toBe(heldNote);
+  });
+
   it("the saved old binding is proved, not a newer task claimant, and concurrent sweeps cannot duplicate the note", async () => {
     const f = await fixture();
     const [newer] = await f.db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
@@ -109,6 +118,7 @@ describeEmbeddedPostgres("Stop-pending settles independently of the claim-releas
     expect((await f.db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
       .toMatchObject({ checkoutRunId: newer.id, executionRunId: newer.id });
     expect(await f.notes()).toHaveLength(1);
+    expect((await f.notes())[0].body).toBe(heldNote);
   });
 
   it("Stop proof removes only its annotation from an independent stronger obligation", async () => {
