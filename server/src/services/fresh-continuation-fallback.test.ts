@@ -35,7 +35,7 @@ import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapte
 import { createSystemRecovery } from "./system-recovery-state.js";
 import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
-import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
+import { NATIVE_CONTINUATION_REFUSED_ACTION, isNativeContinuationRefusal } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
 import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT } from "./recovery/unanswered-person-message.js";
 import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
@@ -1424,6 +1424,53 @@ suite("fresh-continuation fallback", () => {
     const [next] = await successors(f.runId);
     await expect(db.transaction(tx => assertAgentRunWriteAllowed(tx as unknown as typeof db, companyId, { agentId, runId: next!.id })))
       .resolves.toBeTruthy();
+  }, 60_000);
+
+  it.each(["raw", "notification", "saved_code"] as const)("row14 fences a possibly-live writer and delivers exactly one successor (%s)", async shape => {
+    const failure = "runner_process_termination_unconfirmed: runnerd process supervision failed: "
+      + "Boat POST /sandboxes/{sandboxId}/commands failed (unavailable): result_unconfirmed, evidence=unknown (possibly ran)";
+    const error = shape === "saved_code" ? "Saved supervision failure" : shape === "notification"
+      ? `Notification transport failed closed: ${failure}` : failure;
+    const errorCode = shape === "saved_code" ? failure : "notification_transport_failed";
+    const f = await unfinishedRun({ runtime: "native", error, errorCode });
+    const old = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    try {
+      await once(old, "spawn");
+      expect(isNativeContinuationRefusal({ error, errorCode })).toBe(false);
+      const workspaceId = randomUUID(), leaseId = randomUUID();
+      const location = { environmentId: randomUUID(), leaseId, providerLeaseId: "possibly-live-row14", remoteCwd: "/old-unverified-root" };
+      await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, sourceIssueId: f.issueId, mode: "isolated",
+        strategyType: "remote", name: "Old writer", providerType: "remote", providerRef: location.remoteCwd,
+        metadata: { remoteWorkspace: { schema: "paperclip.remote-workspace.v1", epoch: 3, snapshotId: null,
+          source: { kind: "empty" }, location, writerRunId: f.runId, dirty: true } } });
+      await db.update(heartbeatRuns).set({ processPid: old.pid, runnerProfileJson: { remoteWorkspace: {
+        schema: "paperclip.remote-workspace-run.v1", workspaceId, leaseId, providerLeaseId: location.providerLeaseId,
+        remoteCwd: location.remoteCwd, epoch: 3, state: "prepared", snapshotId: null } } }).where(eq(heartbeatRuns.id, f.runId));
+      await expect(db.transaction(tx => assertAgentRunWriteAllowed(tx as unknown as typeof db, companyId,
+        { agentId, runId: f.runId }))).resolves.toBeTruthy();
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+        .toMatchObject({ kind: "continued", isolation: "remote_epoch" });
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+        .toMatchObject({ kind: "already_continued" });
+      // The predecessor is ACTUALLY still alive; no stop receipt was fabricated.
+      expect(() => process.kill(old.pid!, 0)).not.toThrow();
+      await expect(db.transaction(tx => assertAgentRunWriteAllowed(tx as unknown as typeof db, companyId,
+        { agentId, runId: f.runId }))).rejects.toMatchObject({ status: 403, details: { code: "agent_run_superseded" } });
+      const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId));
+      expect(workspace!.metadata!.remoteWorkspace).toMatchObject({ epoch: 4, writerRunId: null, location: null });
+      expect(workspace!.providerRef).toBeNull();
+      await occupySlot();
+      await deliver(); // The helper deliberately delivers twice, through real admission.
+      const next = await successors(f.runId);
+      expect(next).toHaveLength(1);
+      await expect(db.transaction(tx => assertAgentRunWriteAllowed(tx as unknown as typeof db, companyId,
+        { agentId, runId: next[0]!.id }))).resolves.toBeTruthy();
+      expect(() => process.kill(old.pid!, 0)).not.toThrow();
+    } finally {
+      const exited = once(old, "exit");
+      old.kill("SIGKILL");
+      await exited;
+    }
   }, 60_000);
 
   // The staging shape: the new server cannot re-reach the old Runner, so the old

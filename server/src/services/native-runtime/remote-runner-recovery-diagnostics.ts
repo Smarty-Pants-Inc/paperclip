@@ -134,9 +134,34 @@ export function attachRemoteRunnerRecoveryDiagnostic(error: unknown, diagnostic:
 export class RemoteRunnerRecoveryError extends Error {
   readonly code = REMOTE_RUNNER_RECOVERY_ERROR_CODE;
 
-  constructor(readonly remoteRunnerRecovery: RemoteRunnerRecoveryDiagnostic) {
-    super(REMOTE_RUNNER_RECOVERY_ERROR_CODE);
+  constructor(readonly remoteRunnerRecovery: RemoteRunnerRecoveryDiagnostic, options?: ErrorOptions) {
+    super(REMOTE_RUNNER_RECOVERY_ERROR_CODE, options);
   }
+}
+
+// Keep the canonical remote-recovery envelope for existing diagnostic readers;
+// the closed failureCode distinguishes exhausted supervision from missing identity.
+export const REMOTE_RUNNER_SUPERVISION_EXHAUSTED = "runner_process_supervision_budget_exhausted";
+export const REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION =
+  "Paperclip could not verify the previous runner within the supervision allowance. Its termination is not confirmed. Your message and saved work are kept. Retry or send a new message to continue through fenced recovery; do not reuse the unverified runner.";
+
+export class RemoteRunnerSupervisionExhaustedError extends RemoteRunnerRecoveryError {
+  readonly failureCode = REMOTE_RUNNER_SUPERVISION_EXHAUSTED;
+
+  constructor(cause: unknown) {
+    super({ stage: "process_verification", reason: "probe_transport_failed" }, { cause });
+    this.name = "RemoteRunnerSupervisionExhaustedError";
+    this.message = `${REMOTE_RUNNER_SUPERVISION_EXHAUSTED}: ${REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION}`;
+  }
+}
+
+/** Reserved supervision outcomes only, including the transport's saved wrapper. */
+export function isRemoteRunnerSupervisionExhausted(error: unknown): boolean {
+  for (let current = error, depth = 0; current instanceof Error && depth < 5; current = current.cause, depth++) {
+    if (current instanceof RemoteRunnerSupervisionExhaustedError) return true;
+    if (/^(?:Error: |RemoteRunnerSupervisionExhaustedError: )?(?:Notification transport failed closed: )?(?:runner_process_termination_unconfirmed: runnerd process supervision failed: )?runner_process_supervision_budget_exhausted:/.test(current.message)) return true;
+  }
+  return false;
 }
 
 export function readRemoteRunnerRecoveryDiagnostic(value: unknown): RemoteRunnerRecoveryDiagnostic | null {

@@ -1,8 +1,9 @@
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
-import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import {
   attachRemoteRunnerRecoveryDiagnostic,
   RemoteRunnerRecoveryError,
+  RemoteRunnerSupervisionExhaustedError,
   type RemoteRunnerRecoveryDiagnostic,
 } from "./remote-runner-recovery-diagnostics.js";
 
@@ -79,5 +80,21 @@ export async function retryRemoteRunnerRecoveryAttempt<T extends { timedOut: boo
     if (!input.readOnly || deadline() - Date.now() <= delayMs) break;
     await new Promise<void>(resolve => setTimeout(resolve, delayMs));
   }
+  // Only read-only supervision is safe to retry. Exhaustion is NOT an exit
+  // receipt, and must not leak a raw provider command outcome to recovery.
+  if (input.readOnly && input.stage === "process_verification" && isPossiblyRan(lastError)) {
+    throw new RemoteRunnerSupervisionExhaustedError(lastError);
+  }
   throw lastError;
+}
+
+function isPossiblyRan(error: unknown): boolean {
+  for (let current = error, depth = 0; current instanceof Error && depth < 5; current = current.cause, depth++) {
+    if ((current as { code?: unknown }).code === "boat_command_possibly_ran") return true;
+    // The plugin worker serializes the provider's closed code into its typed
+    // RPC envelope. Ordinary provider diagnostic prose must not grant this.
+    if (current instanceof JsonRpcCallError && current.code === PLUGIN_RPC_ERROR_CODES.WORKER_ERROR
+      && current.message.startsWith("boat_command_possibly_ran: ")) return true;
+  }
+  return false;
 }
