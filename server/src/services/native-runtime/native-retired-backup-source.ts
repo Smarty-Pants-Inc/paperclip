@@ -10,6 +10,7 @@ import { sandboxLeaseSourceMatches } from "../sandbox-lease-config-compatibility
 import { hasConfirmedSandboxStopAndRetain, readStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
 import { LEGACY_WORKSPACE_RECOVERY_KEY, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../workspace-restore-recovery-state.js";
 import { readNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
+import { clearNativeHarnessBackupMissing } from "./native-harness-backup-missing.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-workspace-finalization-state.js";
 
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "./native-provider-work-proof.js";
@@ -214,14 +215,20 @@ export async function recordNativeHarnessBackupStampOnLeaseChain(db: Db, input: 
       sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableLeaseSuccessor')`) : eq(environmentLeases.id, leaseId))
     .returning({ id: environmentLeases.id })
     .then(rows => rows.length > 0), { companyId: input.companyId, runId: runId ?? undefined, leaseId });
-  const stampSessionId = readNativeHarnessBackupStamp(input.stamp, input.providerLeaseId)?.normalizedSessionId ?? null;
+  const stamp = readNativeHarnessBackupStamp(input.stamp, input.providerLeaseId);
+  const stampSessionId = stamp?.normalizedSessionId ?? null;
+  const saved = async (updated: boolean) => {
+    if (updated && stamp) await clearNativeHarnessBackupMissing(db, { companyId: input.companyId,
+      providerLeaseId: stamp.sourceProviderLeaseId, sessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt });
+    return updated;
+  };
   for (let attempt = 0; attempt < 3; attempt++) {
     const chain = await loadNativeHarnessBackupLeaseChain(db, input);
     if (!chain || chain.tip.id === input.leaseId || !chain.predecessors.some(row => row.id === input.leaseId)) break;
     if (!stampSessionId || await nativeSessionOfLeaseRun(db, chain.tip) !== stampSessionId) break;
-    if (await write(chain.tip.id, chain.tip.heartbeatRunId, true)) return true;
+    if (await write(chain.tip.id, chain.tip.heartbeatRunId, true)) return saved(true);
   }
-  return write(input.leaseId, input.runId, false);
+  return saved(await write(input.leaseId, input.runId, false));
 }
 
 /** Shared by backup restore and compatible environment draining: a valid old

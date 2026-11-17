@@ -26,6 +26,7 @@ import { readProviderFailure } from "@paperclipai/shared";
 import { nativeCancellationHasUnsettledOwner, notifyNativeCancellation, waitForNativeCancellation } from "./native-cancellation-delivery.js";
 import { readClaimedNativeStopRecovery } from "./native-cancellation-request.js";
 import { publishNativeHarnessBackup } from "./native-harness-backup-publication.js";
+import { markNativeHarnessBackupMissing, type NativeHarnessBackupMissingReason } from "./native-harness-backup-missing.js";
 import { restartRecoveryMeasurementFor, speedBudgetAdapter } from "./native-speed-budgets.js";
 import { getStartupRecoveryState } from "../../startup-recovery-state.js";
 import { assertNativeHarnessBackupOwner, durableNativeHarnessStorage, NATIVE_HARNESS_DOWNLOAD_IDLE_TIMEOUT_MS, nativeHarnessBackupOwner, persistNativeHarnessBackup,
@@ -758,6 +759,7 @@ type WarmNativeSession = {
   /** The sandbox that holds this owner's Runner, when it runs in one. */
   providerLeaseId?: string;
   sandboxLeaseDb?: Db;
+  sandboxLeaseId?: string;
   sandboxRunner?: { runner: CommandManagedRuntimeRunner; remoteCwd: string };
   closeFailureEvidenceLogged?: boolean;
   /** A successor's retirement of this owner failed; it stays registered for its own sandbox. */
@@ -1230,9 +1232,9 @@ async function warmRunnerPortTakenBySuccessor(db: Db, entry: WarmNativeSession):
 }
 
 /** A failed close is complete when its Runner is proven gone, its sandbox is destroyed, the run's own sandbox lease has a stop receipt, or a later run launched its own Runner on the same sandbox. */
-async function warmCloseFailureProvesOwnerGone(entry: WarmNativeSession, error: unknown, db = entry.sandboxLeaseDb): Promise<boolean> {
+async function warmCloseFailureProvesOwnerGone(entry: WarmNativeSession, error: unknown, db = entry.sandboxLeaseDb): Promise<false | "close_failed" | "release_without_checkpoint"> {
   const diagnostic = readRemoteRunnerRecoveryError(error);
-  if (diagnostic?.stage === "process_verification" && diagnostic.reason === "process_not_running") return true;
+  if (diagnostic?.stage === "process_verification" && diagnostic.reason === "process_not_running") return "close_failed";
   const runnerIdMissing = diagnostic?.stage === "process_verification" && diagnostic.reason === "process_runner_id_missing";
   const logEvidence = Boolean(entry.sandboxRunner) && !entry.closeFailureEvidenceLogged
     && (diagnostic !== null || error instanceof NativeSessionCloseUnrecoverableError);
@@ -1245,14 +1247,14 @@ async function warmCloseFailureProvesOwnerGone(entry: WarmNativeSession, error: 
       providerLeaseId: entry.providerLeaseId ?? null, ...warmCloseFailureEvidence(entry, error, inspection) },
     "warm native session close failed; sandbox Runner evidence");
   }
-  if (runnerIdMissing && suspendedRunnerHasExited(entry, inspection)) return true;
+  if (runnerIdMissing && suspendedRunnerHasExited(entry, inspection)) return "close_failed";
   try {
-    if (db && (await warmSandboxTerminated(db, entry) || await warmRunnerPortTakenBySuccessor(db, entry))) return true;
+    if (db && (await warmSandboxTerminated(db, entry) || await warmRunnerPortTakenBySuccessor(db, entry))) return "close_failed";
   } catch (proofError) {
     logger.warn({ err: proofError, runId: entry.runId }, "could not read the warm session's sandbox lease");
     return false;
   }
-  return db ? stopRetainedRunnerOfFinishedOwner(entry, error, db) : false;
+  return db && await stopRetainedRunnerOfFinishedOwner(entry, error, db) ? "release_without_checkpoint" : false;
 }
 
 function warmCloseFailureEvidence(entry: WarmNativeSession, error: unknown, inspection: SandboxSessionRunnerInspection | null) {
@@ -1311,8 +1313,22 @@ async function stopRetainedRunnerOfFinishedOwner(entry: WarmNativeSession, error
   return true;
 }
 
-function armWarmIdleCloseRetry(sessionId: string, entry: WarmNativeSession): void {
-  if (warmNativeSessions.get(sessionId) !== entry || entry.released || (entry.idleCloseRetries ?? 0) >= WARM_IDLE_CLOSE_MAX_RETRIES) return;
+async function markWarmNativeHarnessBackupMissing(entry: WarmNativeSession, reason: NativeHarnessBackupMissingReason, db = entry.sandboxLeaseDb): Promise<void> {
+  if (!db || !entry.environmentId || !entry.providerLeaseId) return;
+  await markNativeHarnessBackupMissing(db, { companyId: entry.companyId, environmentId: entry.environmentId,
+    providerLeaseId: entry.providerLeaseId, leaseId: entry.sandboxLeaseId, runId: entry.runId,
+    sessionId: entry.normalizedSessionId, reason });
+}
+
+async function armWarmIdleCloseRetry(sessionId: string, entry: WarmNativeSession): Promise<void> {
+  if (warmNativeSessions.get(sessionId) !== entry || entry.released) return;
+  if ((entry.idleCloseRetries ?? 0) >= WARM_IDLE_CLOSE_MAX_RETRIES) {
+    await markWarmNativeHarnessBackupMissing(entry, "retries_exhausted");
+    logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+      providerLeaseId: entry.providerLeaseId ?? null },
+    "idle warm native session close retries exhausted; native harness backup missing");
+    return;
+  }
   entry.idleCloseRetries = (entry.idleCloseRetries ?? 0) + 1;
   armWarmNativeSessionIdleTimer(sessionId, entry, WARM_IDLE_CLOSE_RETRY_MS);
 }
@@ -1384,7 +1400,9 @@ async function closeIdleWarmNativeSessions(input: {
         busy += 1;
         return;
       }
-      if (!detach && await warmCloseFailureProvesOwnerGone(entry, error, input.db ?? entry.sandboxLeaseDb)) {
+      const gone = !detach && await warmCloseFailureProvesOwnerGone(entry, error, input.db ?? entry.sandboxLeaseDb);
+      if (gone) {
+        await markWarmNativeHarnessBackupMissing(entry, gone, input.db ?? entry.sandboxLeaseDb);
         logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
           providerLeaseId: entry.providerLeaseId ?? null, reason: input.reason, closeFailure: describeWarmCloseFailure(error) },
         "warm native session's Runner or sandbox is gone; released its owner");
@@ -1428,7 +1446,7 @@ async function closeIdleWarmNativeSessions(input: {
   const concurrency = input.canRetire ? 1 : WARM_NATIVE_SESSION_CLOSE_CONCURRENCY;
   await Promise.all(Array.from({ length: Math.min(concurrency, pendingAgents.length) }, closeAgentQueues));
   if (failures.length > 0) logger.warn({ reason: input.reason, failures }, "idle warm native sessions did not close");
-  for (const [sessionId, entry] of retryIdleCloseAfterSweep) armWarmIdleCloseRetry(sessionId, entry);
+  for (const [sessionId, entry] of retryIdleCloseAfterSweep) await armWarmIdleCloseRetry(sessionId, entry);
   return { closed, busy, failed, failures };
 }
 
@@ -9360,16 +9378,23 @@ function armWarmNativeSessionIdleTimer(
           closeAttempt: (current.idleCloseRetries ?? 0) + 1 },
         released ? "idle warm native session detach failed" : "idle warm native session close failed");
         if (released) return;
-        return warmCloseFailureProvesOwnerGone(current, error).then(gone => {
+        return warmCloseFailureProvesOwnerGone(current, error).then(async gone => {
           if (gone) {
+            await markWarmNativeHarnessBackupMissing(current, gone);
             logger.warn({ runId: current.runId, issueId: current.issueId, environmentId: current.environmentId,
               providerLeaseId: current.providerLeaseId ?? null },
             "warm native session's Runner or sandbox is gone; released its owner");
             forgetWarmNativeSession(sessionId, current);
             return;
           }
-          armWarmIdleCloseRetry(sessionId, current);
+          await armWarmIdleCloseRetry(sessionId, current);
         });
+      })
+      .catch(() => {
+        // A failed custody write cannot authorize forgetting the only owner.
+        // Database exceptions can contain secrets; keep diagnostics bounded.
+        logger.warn({ runId: current.runId, providerLeaseId: current.providerLeaseId ?? null,
+          errorKind: "native_harness_backup_missing_write_failed" }, "could not record native harness backup custody; warm owner retained");
       })
       .finally(() => {
         current.busy = false;
@@ -13523,6 +13548,9 @@ async function executePaperclipNativeSessionAttempt(
                     controllerBootId: controller.bootId, controllerGeneration } : undefined;
                   existing.session = session;
                   existing.sandboxRunner = warmSandboxRunner(input.runnerExecutionTarget);
+                  existing.sandboxLeaseDb = input.db;
+                  existing.sandboxLeaseId = input.runnerExecutionTarget?.kind === "remote" && input.runnerExecutionTarget.transport === "sandbox"
+                    ? input.runnerExecutionTarget.leaseId ?? undefined : undefined;
                   existing.closeFailureEvidenceLogged = false;
                   existing.runId = input.execution.binding.runId;
                   existing.issueId = input.execution.binding.issueId;
@@ -13544,6 +13572,8 @@ async function executePaperclipNativeSessionAttempt(
                     sandboxProviderLeaseId: runnerdBackend?.sandboxRetention?.binding.providerLeaseId,
                     providerLeaseId: sandboxProviderLeaseId(input.runnerExecutionTarget) ?? undefined,
                     sandboxLeaseDb: input.db,
+                    sandboxLeaseId: input.runnerExecutionTarget?.kind === "remote" && input.runnerExecutionTarget.transport === "sandbox"
+                      ? input.runnerExecutionTarget.leaseId ?? undefined : undefined,
                     sandboxRunner: warmSandboxRunner(input.runnerExecutionTarget),
                     runId: input.execution.binding.runId,
                     issueId: input.execution.binding.issueId,

@@ -48,6 +48,8 @@ describe("compactAdjacentErrors", () => {
   });
 
   it.each([
+    "Paperclip could not start this task. Press Retry to start it.",
+    "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
     "Paperclip tried to start this task again, but it still could not start. Press Retry to start it again.",
     "Paperclip tried to continue this task again, but it still could not continue after 3 tries. Press Retry to start it again from the saved work.",
   ])("recognizes the current recovery notice: %s", (text) => {
@@ -62,6 +64,86 @@ describe("compactAdjacentErrors", () => {
     expect(compactAdjacentErrors([failed, retitled]).items).toEqual([retitled]);
     const quoted = { ...recovery, presentation: null, text: `Child task report: ${text}` };
     expect(compactAdjacentErrors([failed, quoted]).items).toEqual([failed, quoted]);
+  });
+
+  it.each([
+    "Paperclip could not start this task. Press Retry to start it.",
+    "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
+    "Paperclip tried to start this task again, but it still could not start after 2 tries. Press Retry to start it again.",
+    "Paperclip tried to continue this task again, but it still could not continue after 2 tries. Press Retry to start it again from the saved work.",
+  ])("compacts a stranded notice under the producer title and preserves Retry: %s", (text) => {
+    const notice: TaskChatMessageItem = {
+      ...recovery,
+      text,
+      presentation: { ...recovery.presentation!, title: "Automatic recovery blocked" },
+      metadata: { version: 1, sourceRunId: "run-1", sections: [{ title: "Recovery", rows: [
+        { type: "key_value", label: "Recovery action", value: "recovery-action-1" },
+      ] }] },
+    };
+    const compacted = compactAdjacentErrors([failed, notice]);
+    expect(compacted.items).toEqual([notice]);
+    expect(compacted.retryMarkers.get(notice.id)).toBe(failed);
+    expect(compactAdjacentErrors([notice, failed]).items).toEqual([failed]);
+
+    const withoutAction = { ...notice, metadata: undefined };
+    expect(compactAdjacentErrors([failed, withoutAction]).items).toEqual([failed, withoutAction]);
+  });
+
+  // Keep: stranded recovery uses these real default/classified producer titles,
+  // not just the family title. Cover both single-attempt bodies under each.
+  it.each([
+    "Automatic recovery blocked",
+    "Error: usage limit reached",
+    "Error: not logged in to Claude",
+    "Error: agent login required",
+  ].flatMap(title => [
+    "Paperclip could not start this task. Press Retry to start it.",
+    "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
+  ].map(text => ({ title, text }))))("one-note4: compacts $title / $text with its Recovery action and Retry", ({ title, text }) => {
+    const notice: TaskChatMessageItem = {
+      ...recovery, text,
+      presentation: { ...recovery.presentation!, title },
+      metadata: { version: 1, sourceRunId: "run-1", sections: [{ title: "Recovery", rows: [
+        { type: "key_value", label: "Recovery action", value: "recovery-action-1" },
+      ] }] },
+    };
+    const compacted = compactAdjacentErrors([failed, notice]);
+    expect(compacted.items).toEqual([notice]);
+    expect(compacted.retryMarkers.get(notice.id)).toBe(failed);
+    expect(compacted.retryMarkers.size).toBe(1);
+    expect(compactAdjacentErrors([notice, failed]).items).toEqual([failed]);
+
+    const withoutAction = { ...notice, metadata: undefined };
+    expect(compactAdjacentErrors([failed, withoutAction]).items).toEqual([failed, withoutAction]);
+    const emptyAction = { ...notice, metadata: { version: 1 as const, sections: [{ rows: [
+      { type: "key_value" as const, label: "Recovery action", value: " " },
+    ] }] } };
+    expect(compactAdjacentErrors([failed, emptyAction]).items).toEqual([failed, emptyAction]);
+    const unstructured = { ...notice, presentation: null, metadata: undefined };
+    expect(compactAdjacentErrors([failed, unstructured]).items).toEqual([unstructured]);
+    expect(compactAdjacentErrors([failed, unstructured]).retryMarkers.get(notice.id)).toBe(failed);
+  });
+
+  it.each([
+    // CONTINUATION_REFUSED_NOTICE in server/src/services/recovery/service.ts:
+    // the shared prefix must not turn a different recovery family into a duplicate.
+    "Paperclip could not continue this task on its own. The earlier Retry or message no longer matches the task, "
+      + "for example because the task or the message changed since. Nothing was lost. Press Retry to continue.",
+    // Successful-run disposition escalation, not stranded execution recovery.
+    "Paperclip could not resolve this issue's missing disposition automatically. The source assignment is unchanged and a board decision is required.",
+  ])("keeps other could-not notices and their retry boundaries: %s", (text) => {
+    for (const presentation of [null, { ...recovery.presentation!, title: "Automatic recovery blocked" }]) {
+      const boundary: TaskChatMessageItem = {
+        ...recovery, id: "unrelated", text, presentation,
+        metadata: { version: 1, sections: [{ title: "Recovery", rows: [
+          { type: "key_value", label: "Recovery action", value: "other-action" },
+        ] }] },
+      };
+      const items = [failed, boundary, recovery];
+      const result = compactAdjacentErrors(items);
+      expect(result.items).toEqual(items);
+      expect(result.retryMarkers.size).toBe(0);
+    }
   });
 
   it.each(["Automatic recovery blocked", "Error: usage limit reached"])(
