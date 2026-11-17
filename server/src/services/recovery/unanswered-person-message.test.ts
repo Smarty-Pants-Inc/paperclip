@@ -10,6 +10,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issueThreadInteractions,
+  issueQuestionResponseDeliveries,
   issues,
   completionContracts,
   nativeRunFinalizations,
@@ -20,6 +21,9 @@ import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
+import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { questionResponseDeliveryService } from "../question-response-delivery.js";
+import { pendingContinuationCommentInput, readContinuationCommentInput } from "../continuation-comment-input.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
@@ -1097,6 +1101,108 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
   });
+
+  // Keep: recorded PV2 gate-1 catch (11:27Z): answering the run's question
+  // removed its pending-card exemption before response delivery could wake it.
+  it.each([true, false])("PV2 card-answer: no resend notice before, during or after one answer delivery (chat=%s)", async chat => {
+    const f = await fixture({ chat, status: "in_review" });
+    const messageId = await f.message("Build the landing page.");
+    const sourceRunId = await f.run({ commentId: messageId, status: "running" });
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId,
+      addresseeUserId: f.userId, continuationPolicy: "wake_assignee", createdAt: f.at(),
+      payload: { version: 1, questions: [{ id: "name", prompt: "What is the product called?", required: true,
+        selectionMode: "single", options: [{ id: "sol", label: "Sol" }] }] } }).returning();
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, sourceRunId));
+    const noticesEver = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
+    await f.sweep();
+    expect(await noticesEver()).toHaveLength(0);
+
+    const answered = await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId }, card!.id,
+      { answers: [{ questionId: "name", optionIds: ["sol"] }] }, { userId: f.userId });
+    expect(answered.status).toBe("answered");
+    // The exact live race: the card answer committed, but no delivery wake exists yet.
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    await f.sweep();
+    expect(await noticesEver()).toHaveLength(0);
+    expect(await readContinuationCommentInput(db, { ...f, runId: sourceRunId })).toEqual({});
+
+    // Only provider dispatch is replaced: the real answer transaction, delivery
+    // claim/idempotency, durable wake, sweep and reply attribution all use PostgreSQL.
+    const delivery = questionResponseDeliveryService(db, { heartbeat: {
+      wakeup: async (agentId, wake) => {
+        const [target] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId,
+          nativeIssueId: f.issueId, runtimeMode: "native", status: "queued", contextSnapshot: wake?.contextSnapshot }).returning();
+        await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId, source: "automation",
+          reason: "issue_commented", status: "queued", runId: target!.id, idempotencyKey: wake?.idempotencyKey,
+          payload: wake?.payload });
+        return target!;
+      },
+      cancelRun: async () => { throw new Error("A question answer must not cancel a run"); },
+    } });
+    const first = await delivery.deliver(card!.id);
+    const duplicate = await delivery.deliver(card!.id);
+    expect(first).toMatchObject({ status: "fallback_queued", mode: "wake_fallback", duplicate: false });
+    expect(duplicate).toMatchObject({ targetRunId: first!.targetRunId, duplicate: true });
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.payload).toMatchObject({ interactionId: card!.id, interactionStatus: "answered" });
+    expect(await db.select().from(issueQuestionResponseDeliveries).where(eq(issueQuestionResponseDeliveries.interactionId, card!.id)))
+      .toHaveLength(1);
+    await f.sweep();
+    expect(await noticesEver()).toHaveLength(0);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, first!.targetRunId!));
+    await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, wakes[0]!.id));
+    await f.reply(first!.targetRunId!);
+    await f.sweep();
+    expect(await noticesEver()).toHaveLength(0);
+    expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent"))))
+      .toHaveLength(1);
+  });
+
+  it.each(["wakeCommentId", "commentId", "conversationReplyBoundaryCommentId", "wakeCommentIds", "firstTurnQueuedInput"])(
+    "PV2 card-answer: open and answered cards answer only their own carried input through %s", async key => {
+      const f = await fixture();
+      const earlier = await f.message("Still waiting in the queue.");
+      const messageId = await f.message("The steered input.");
+      const runId = await f.run({ status: "succeeded" });
+      const contextSnapshot = { issueId: f.issueId, steeredCommentIds: [messageId],
+        [key]: key === "wakeCommentIds" ? [messageId] : key === "firstTurnQueuedInput" ? { commentIds: [messageId] } : messageId };
+      await db.update(heartbeatRuns).set({ contextSnapshot }).where(eq(heartbeatRuns.id, runId));
+      for (const kind of ["ask_user_questions", "request_confirmation"] as const) {
+        const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+          kind, status: "pending", sourceRunId: runId, createdByAgentId: f.agentId, createdAt: f.at(),
+          payload: kind === "ask_user_questions" ? { version: 1, questions: [] } : { version: 1, prompt: "Proceed?" } }).returning();
+        for (const status of ["pending", "answered"]) {
+          await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, card!.id));
+          expect(await settleUnansweredPersonMessage(db, f), `${kind}/${status}`).toEqual({ kind: "answered" });
+          expect(await readContinuationCommentInput(db, { ...f, runId })).toEqual({});
+          const pending = await pendingContinuationCommentInput(db, { ...f, contextSnapshot: { wakeCommentIds: [earlier] } });
+          expect(pending.wakeCommentIds, "a card for the steered input must not consume earlier queued messages").toEqual([earlier]);
+          const candidates = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+            eq(issueComments.id, messageId), unansweredPersonMessageCommentCondition()));
+          expect(candidates, `${kind}/${status}: discovery and settlement agree`).toHaveLength(0);
+        }
+        await db.delete(issueThreadInteractions).where(eq(issueThreadInteractions.id, card!.id));
+      }
+    });
+
+  it.each(["cancelled", "expired", "other-run", "other-task", "other-company", "board"])(
+    "PV2 card-answer guard: %s is not an answered message", async variant => {
+      const f = await fixture();
+      const messageId = await f.message();
+      const sourceRunId = await f.run({ commentId: messageId, status: "succeeded" });
+      const other = await fixture();
+      const unrelatedRun = await f.run({ status: "succeeded" });
+      await db.insert(issueThreadInteractions).values({ companyId: variant === "other-company" ? other.companyId : f.companyId,
+        issueId: variant === "other-task" ? other.issueId : f.issueId, kind: "ask_user_questions",
+        status: ["cancelled", "expired"].includes(variant) ? variant : "answered",
+        sourceRunId: variant === "other-run" ? unrelatedRun : sourceRunId,
+        createdByAgentId: variant === "board" ? null : f.agentId, createdAt: f.at(), payload: { version: 1, questions: [] } });
+      expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "no_reply" });
+      expect(await f.visible()).toHaveLength(1);
+    });
 
   it("the blocked visit DOES include a blocked task whose person's message is unanswered", async () => {
     const f = await fixture({ status: "blocked" });
