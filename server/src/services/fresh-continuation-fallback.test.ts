@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { assignedWorkSweep } from "./recovery/assigned-work-sweep.js";
 import { currentNotices } from "./rfl-current-notice-assertions.js";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
@@ -173,6 +174,67 @@ suite("fresh-continuation fallback", () => {
     expect(await successors(f.runId)).toHaveLength(1);
     return next;
   }
+
+  // rf-3 R-SILENT (stack135, RFL 09:01Z). Keep reason: never-OK person-facing
+  // guarantee. An accepted person message whose run succeeded with no published
+  // answer is answered, or gets a successor or one truthful notice, within 120 s.
+  // Synthetic DB shape, real heartbeat wrapper + assigned-work checker. NOT live proof.
+  it("R-SILENT: succeeded chat with no published answer has a visible notice or successor after 121 seconds", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "adapter_failed", hold: "none" });
+    const ended = new Date(Date.now() - 121_000);
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please answer this accepted request.", createdAt: new Date(ended.getTime() - 60_000) }).returning();
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "active", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: ended, createdAt: new Date(ended.getTime() - 30_000),
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message.id } }).where(eq(heartbeatRuns.id, f.runId));
+    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    const upstreamSweep = assignedWorkSweep(db, { enqueueWakeup: async () => { throw new Error("unexpected unobserved wake"); } });
+    const result = await upstreamSweep.checkIssue({ companyId, issueId: f.issueId });
+    const card = await taskInterruptionPresentation(db, await issue(f.issueId));
+    const notices = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"))))
+      .filter(comment => !comment.deletedAt);
+    const live = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId, f.issueId), inArray(heartbeatRuns.status, ["queued", "running"])));
+    console.info(JSON.stringify({ rSilent: { messageId: message.id, elapsed: Date.now() - ended.getTime(), result, card, notices: notices.length, live: live.length } }));
+    expect(notices.length > 0 || live.length > 0 || ["failed", "retry_scheduled"].includes(card?.state ?? ""),
+      "a succeeded run is not evidence of an answer; conversation wait cannot silently retire accepted input").toBe(true);
+  }, 120_000);
+
+  // R-SILENT owner check (stack135 F1): the re-homed rule lives in upstream's
+  // conversation outbox, fires once per message, waits out the finalizer's
+  // grace, and stays quiet once anything answered.
+  it.each(["silent", "inside_grace", "answered", "newer_message"] as const)("R-SILENT redelivers a succeeded-but-unanswered message exactly once: %s", async shape => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "adapter_failed", hold: "none" });
+    const ended = new Date(Date.now() - (shape === "inside_grace" ? 30_000 : 121_000));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please answer this accepted request.", createdAt: new Date(ended.getTime() - 60_000) }).returning();
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "active", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: ended, createdAt: new Date(ended.getTime() - 30_000),
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message.id } }).where(eq(heartbeatRuns.id, f.runId));
+    if (shape === "answered") await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "agent", authorAgentId: agentId,
+      body: "Here is the answer.", createdAt: new Date(ended.getTime() - 1_000) });
+    if (shape === "newer_message") await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "And one more thing.", createdAt: new Date(ended.getTime() + 1_000) });
+    const deadlines: number[] = [];
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass++) {
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId, onDeferredDeadline: at => { deadlines.push(at); } });
+    }
+    const redeliveries = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${message.id}`)));
+    const original = (await db.select().from(issueComments).where(eq(issueComments.id, message.id)))[0];
+    console.info(JSON.stringify({ rSilentOwner: { shape, redeliveries: redeliveries.length, deadlines: deadlines.length,
+      runs: redeliveries.map(row => row.runId) } }));
+    expect(original).toMatchObject({ body: "Please answer this accepted request.", authorUserId: userId, deletedAt: null });
+    if (shape === "silent") {
+      expect(redeliveries).toHaveLength(1);
+      expect(redeliveries[0]).toMatchObject({ reason: "issue_commented", requestedByActorType: "user", requestedByActorId: userId });
+      const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, redeliveries[0]!.id));
+      expect(next?.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeCommentId: message.id });
+    } else expect(redeliveries).toHaveLength(0);
+    if (shape === "inside_grace") expect(deadlines).toContain(ended.getTime() + 90_000);
+  }, 120_000);
 
   // RFL 12:36Z regression probes. Keep reasons: executor exclusion is a data
   // safety boundary; these reproduce the recorded D10 failure paths.

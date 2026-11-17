@@ -1,4 +1,6 @@
 import { isContextCompactionRun } from "./context-compaction.js";
+import { SETTLING_GRACE_MS } from "./recovery/assigned-work-invariant.js";
+import { retireSupersededMessageNotes } from "./recovery/message-note-retirement.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
@@ -748,6 +750,103 @@ export async function deliverConversationComments(
       return "delivered" as const;
     });
     if (delivered !== "retry") return delivered;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/** Wake key of the one redelivery of a person's message whose turn ended
+ * without a durable response (stack135 R-SILENT). */
+export const CONVERSATION_REDELIVERY_KEY_PREFIX = "conversation-comment-redelivery:";
+
+/**
+ * A succeeded turn that `settleConversationTurn` would not park (no durable
+ * response, no interaction, no /new) did not answer the person's message it
+ * was woken for. The outbox delivered that message once; deliver it once more,
+ * so a succeeded run is never taken as the answer. One redelivery per message
+ * (wake idempotency key); a newer person message, any agent reply or question
+ * since the message, or a live run means there is nothing to redeliver.
+ * Within SETTLING_GRACE_MS of the run's end the run's own finalizer may still
+ * publish its reply: the recovery worker rechecks at that deadline instead.
+ */
+export async function redeliverUnansweredConversationTurn(
+  db: Db,
+  issue: { id: string; companyId: string; conversationAgentId: string | null },
+  runId: string,
+  enqueue: Parameters<typeof deliverConversationComments>[2],
+  options: { onDeferredDeadline?: (at: number) => void; now?: Date } = {},
+): Promise<"redelivered" | "deferred" | "none"> {
+  if (!issue.conversationAgentId) return "none";
+  const now = options.now ?? new Date();
+  const [run] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, agentId: heartbeatRuns.agentId,
+    finishedAt: heartbeatRuns.finishedAt, contextSnapshot: heartbeatRuns.contextSnapshot })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, issue.companyId)));
+  if (!run || run.status !== "succeeded" || run.agentId !== issue.conversationAgentId || !run.finishedAt) return "none";
+  const context = run.contextSnapshot ?? {};
+  const messageId = typeof context.wakeCommentId === "string" ? context.wakeCommentId
+    : typeof context.commentId === "string" ? context.commentId : null;
+  if (!messageId || context.conversationReset === true) return "none";
+  const settledAt = run.finishedAt.getTime() + SETTLING_GRACE_MS;
+  const pendingOrAnswered = async (connection: Db) => {
+    const [message] = await connection.select({ id: issueComments.id, authorUserId: issueComments.authorUserId })
+      .from(issueComments).where(and(eq(issueComments.id, messageId), eq(issueComments.companyId, issue.companyId),
+        eq(issueComments.issueId, issue.id), isNull(issueComments.deletedAt), isNull(issueComments.authorAgentId),
+        sql`${issueComments.authorUserId} is not null`));
+    if (!message) return null;
+    const after = sql`(select cursor.created_at, cursor.id from issue_comments cursor where cursor.id = ${messageId}::uuid)`;
+    const [later] = await connection.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), isNull(issueComments.deletedAt),
+      sql`(${issueComments.authorAgentId} is not null or ${issueComments.authorUserId} is not null)`,
+      sql`(${issueComments.createdAt}, ${issueComments.id}) > ${after}`)).limit(1);
+    if (later) return null;
+    const [question] = await connection.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+      eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
+      sql`${issueThreadInteractions.createdByAgentId} is not null`,
+      sql`${issueThreadInteractions.createdAt} >= (select created_at from issue_comments where id = ${messageId}::uuid)`)).limit(1);
+    if (question) return null;
+    const [live] = await connection.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
+      sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`)).limit(1);
+    if (live) return null;
+    return message;
+  };
+  if (!(await pendingOrAnswered(db))) return "none";
+  if (now.getTime() < settledAt) { options.onDeferredDeadline?.(settledAt); return "deferred"; }
+  const key = `${CONVERSATION_REDELIVERY_KEY_PREFIX}${messageId}`;
+  for (;;) {
+    const outcome = await db.transaction(async (tx) => {
+      const locks = await tx.execute(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${"conversation-delivery:" + issue.id}, 0)) as acquired`,
+      );
+      if (!locks[0]?.acquired) return "retry" as const;
+      const [sent] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.idempotencyKey, key))).limit(1);
+      if (sent) return "none" as const;
+      const message = await pendingOrAnswered(tx as unknown as Db);
+      if (!message) return "none" as const;
+      await enqueue(issue.conversationAgentId!, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "issue_commented",
+        idempotencyKey: key,
+        requestedByActorType: "user",
+        requestedByActorId: message.authorUserId,
+        payload: { issueId: issue.id, commentId: messageId, redeliveredAfterRunId: run.id },
+        contextSnapshot: {
+          issueId: issue.id,
+          taskKey: issue.id,
+          commentId: messageId,
+          wakeCommentId: messageId,
+          wakeCommentIds: [messageId],
+          source: "issue.comment",
+          redeliveredAfterRunId: run.id,
+        },
+      });
+      // This redelivery is the new current incident for the message.
+      await retireSupersededMessageNotes(tx, { companyId: issue.companyId, issueId: issue.id, messageIds: [messageId],
+        incident: { kind: "conversation_redelivery", id: key, at: now } });
+      return "redelivered" as const;
+    });
+    if (outcome !== "retry") return outcome;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
