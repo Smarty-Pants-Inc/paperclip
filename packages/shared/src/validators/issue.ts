@@ -1179,7 +1179,7 @@ export const issueCommentMetadataSchema = z
     // points the previous one at it instead of rewriting conversation history.
     supersededByCommentId: z.uuid().optional(),
     supersededByIncident: z.object({
-      kind: z.enum(["fresh_continuation", "conversation_redelivery"]),
+      kind: z.enum(["fresh_continuation", "conversation_redelivery", "answered"]),
       id: z.string().min(1).max(200),
       at: z.string().min(1).max(40),
     }).strict().optional(),

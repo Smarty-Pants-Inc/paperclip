@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { assignedWorkSweep } from "./recovery/assigned-work-sweep.js";
 import { currentNotices } from "./rfl-current-notice-assertions.js";
+import { insertIssueComment } from "./issue-comment-writes.js";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -2460,6 +2461,50 @@ suite("fresh-continuation fallback", () => {
     await settleUnrecoverableExecutions(db); await deliver();
     const again = await db.select().from(issueComments).where(eq(issueComments.id, before[0]!.id));
     expect(again[0]!.metadata).toEqual(retired.metadata);
+  }, 60_000);
+
+  // stack135 FIX3 item 4 (D074/D175). Keep reason: never-OK history guard. An
+  // agent's answer supersedes the old send-it-again / retrying notes of the
+  // messages it answers, by supersession, never deletion; a later message's
+  // note stays current, and a person's own comment retires nothing.
+  it("an agent's answer supersedes the old send-it-again notes of the messages it answers, never a later message's", async () => {
+    const [task] = await db.insert(issues).values({ companyId, title: "Answer the question", status: "in_progress",
+      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" }).returning();
+    const issueId = task!.id;
+    const [answered] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "What is the status?", createdAt: new Date(Date.now() - 10 * 60_000) }).returning();
+    const [later] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "And a follow-up written after the answer.", createdAt: new Date(Date.now() + 60 * 60_000) }).returning();
+    const legacy = (reason: string, body: string) => ({ companyId, issueId, authorType: "system" as const, body,
+      presentation: { kind: "system_notice" as const, tone: "warning" as const, density: "compact" as const, detailsDefaultOpen: true },
+      metadata: { version: 1 as const, authorizationReason: reason, recoveryResponsibility: "user" as const,
+        sections: [{ rows: [{ type: "key_value" as const, label: "Next action", value: "Send a new message to try again." }] }] } });
+    const before = await db.insert(issueComments).values([
+      legacy(`unanswered_message:${answered!.id}`, "Your message wasn't answered. Sending it again is safe."),
+      legacy(`retrying_message:${answered!.id}`, "Your message is being retried."),
+      legacy(`unanswered_message:${later!.id}`, "Your later message wasn't answered. Sending it again is safe."),
+    ]).returning();
+    const systemNotes = async () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
+    // A person's own comment is not an answer.
+    await insertIssueComment(db, { companyId, issueId, authorType: "user", authorUserId: userId, body: "Still waiting.",
+      createdAt: new Date(Date.now() - 5 * 60_000) });
+    expect(currentNotices(await systemNotes(), before)).toHaveLength(3);
+    const [answer] = await insertIssueComment(db, { companyId, issueId, authorType: "agent", authorAgentId: agentId, body: "Here is the status." });
+    const after = await systemNotes();
+    const current = currentNotices(after, before);
+    console.info(JSON.stringify({ answeredSupersession: { current: current.map(n => n.metadata?.authorizationReason),
+      retired: after.filter(n => n.metadata?.supersededByIncident).map(n => [n.metadata?.authorizationReason, n.metadata?.supersededByIncident]) } }));
+    expect(current.map(note => note.metadata?.authorizationReason)).toEqual([`unanswered_message:${later!.id}`]);
+    for (const old of before.slice(0, 2)) {
+      const retired = after.find(note => note.id === old.id)!;
+      expect(retired).toMatchObject({ body: old.body, deletedAt: null });
+      expect(retired.metadata?.supersededByIncident).toMatchObject({ kind: "answered", id: answer!.id });
+    }
+    // Idempotent: a second answer neither rewrites the marker nor reaches the later message.
+    await insertIssueComment(db, { companyId, issueId, authorType: "agent", authorAgentId: agentId, body: "One more detail." });
+    const again = await systemNotes();
+    for (const note of after) expect(again.find(row => row.id === note.id)!.metadata).toEqual(note.metadata);
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).filter(row => row.deletedAt)).toHaveLength(0);
   }, 60_000);
 
   // stack135 F3 re-home of D002/D010/D013/D018/D171 (S1-pause). The U5 paused

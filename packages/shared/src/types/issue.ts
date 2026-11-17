@@ -1272,7 +1272,7 @@ export interface IssueCommentMetadata {
   /** A later current incident for the same person message (a fresh continuation
    * or a redelivered turn) retired this older note without appending one; the
    * original body remains conversation history. */
-  supersededByIncident?: { kind: "fresh_continuation" | "conversation_redelivery"; id: string; at: string };
+  supersededByIncident?: { kind: "fresh_continuation" | "conversation_redelivery" | "answered"; id: string; at: string };
   /** Inbound channel attribution; never an authorization input. */
   sourceChannel?: ChatProvider;
   /**
