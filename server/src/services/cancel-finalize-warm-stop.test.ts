@@ -36,7 +36,7 @@ import { withNativeWorkspaceFinalizationOwnership } from "./native-runtime/nativ
 import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
 import * as nativeExecutor from "./native-runtime/native-session-executor.js";
 import { nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
-import { nativeWorkspaceSyncInternals, prepareNativeWorkspaceSync, readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
+import { nativeWorkspaceSyncInternals, prepareNativeWorkspaceSync, readNativeWorkspaceSyncReference, resumeNativeWorkspaceSync } from "./native-runtime/native-workspace-sync.js";
 import { resolveHeartbeatNativeRuntimeMode } from "./native-runtime/runtime-mode.js";
 import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
 
@@ -375,5 +375,70 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(written.map(row => normalize(row, f.runId)))
       .toEqual(fixture.events.map(row => normalize(row, fixture.run.id)));
     // ui/src/components/transcript/native-run-events.test.ts feeds the fixture to nativeRunEventsToTranscript.
+  }, 60_000);
+  // ---- pl/cancel-finalize3: rf-4's 01:24Z findings ----
+  /** A finalized stamp that a late `mv` published on the box after the deadline, for a run whose DB descriptor is still prepared. */
+  async function lateStampOnBox(f: Awaited<ReturnType<typeof stopMidTurn>>) {
+    const { descriptor } = await nativeWorkspaceSyncInternals.readDescriptor({ runId: f.runId, reference: f.reference! });
+    const hostTree = await captureDirectorySnapshot(f.host, { exclude: descriptor.baseline.exclude, diskBacked: true });
+    const hostSha256 = directorySnapshotSha256(hostTree);
+    const stamp = (finalizedRunId: string) => ({ schema: "paperclip.native-workspace-stamp/v1", workspaceId: f.workspaceId,
+      providerLeaseId: f.providerLeaseId, remoteCwd: f.box, hostSha256, finalizedRunId });
+    await mkdir(join(f.box, ...STAMP.slice(0, -1)), { recursive: true });
+    await writeFile(join(f.box, ...STAMP), `${JSON.stringify(stamp(f.runId))}\n`);
+    // The lease's last DB-recorded stamp (an earlier finalized run, same host tree).
+    await db.update(environmentLeases).set({ metadata: { nativeWorkspaceSync: stamp(randomUUID()) } })
+      .where(eq(environmentLeases.id, f.leaseId));
+  }
+
+  it("(1) a late remote stamp + a prepared descriptor: the box is not adopted as finalized", async () => {
+    const f = await stopMidTurn({ edit: false, settled: false, exportFails: false });
+    expect(f.reference).toMatchObject({ state: "prepared", finalHostSha256: null });
+    await lateStampOnBox(f);
+    // Reader 1, the reuse filter (DB only): the prepared descriptor keeps the box a protected export source.
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    expect(await nativeWorkspaceExportPendingForResource(db, lease, f.successorRunId)).toBe(true);
+    // Reader 2, warm adoption (native-workspace-sync.ts remoteStampMatches): the box stamp is trusted only when it
+    // equals the lease's DB stamp, which is written only with a finalized descriptor. The late stamp is not adopted.
+    expect(await successorOnSameBox(f)).not.toBe("adopt_remote");
+  }, 60_000);
+
+  it("(1) a late remote stamp + a prepared descriptor: recovery still runs the export (not skipped)", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
+    await lateStampOnBox(f);
+    expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
+    // Reader 3, resume (native-workspace-sync.ts resumeNativeWorkspaceSync): only a FINALIZED DB descriptor reads the box stamp.
+    expect(await resumeNativeWorkspaceSync({ db, runId: f.runId,
+      target: { kind: "remote", transport: "sandbox", providerKey: "test", leaseId: f.leaseId, remoteCwd: f.box,
+        runner: boxRunner({ fail: false, calls: 0 }), timeoutMs: 30_000,
+        sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: f.providerLeaseId } } })).toBe(true);
+    expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(EDIT);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync)).toMatchObject({ state: "finalized" });
+  }, 60_000);
+
+  it("(3) an export abandoned at the deadline writes nothing to the HOST after the lock is released", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
+    await settleLater(f);
+    let release!: () => void;
+    // Hold the copyback's first remote command (the box export) past the deadline.
+    f.runnerState.gate = { match: () => true, until: new Promise<void>(resolve => { release = resolve; }) };
+    const outcome = await finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+      nativeWorkspaceSync: f.sync, timeoutMs: 2_000 });
+    expect(outcome).toEqual({ outcome: "unproven", reason: "timed_out" });
+    expect(f.runnerState.held).toBeGreaterThanOrEqual(1);
+    // The lock is free; a second owner takes it and writes the host workspace.
+    const second = await withNativeWorkspaceFinalizationOwnership({ db, companyId: f.companyId, runId: f.runId },
+      async () => { await writeFile(join(f.host, "next.txt"), "the next owner's write\n"); return "wrote"; });
+    expect(second).toMatchObject({ acquired: true });
+    f.runnerState.gate = null;
+    release();
+    await waitFor(() => f.runnerState.inflight === 0);
+    await new Promise(resolve => setTimeout(resolve, 1_500));
+    await waitFor(() => f.runnerState.inflight === 0);
+    // The abandoned export wrote nothing to the host afterwards: the next owner's write stands, the box edit was not merged.
+    expect(await readFile(join(f.host, "next.txt"), "utf8")).toBe("the next owner's write\n");
+    expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
+    await expect(stat(join(f.box, ...STAMP))).rejects.toMatchObject({ code: "ENOENT" });
   }, 60_000);
 });
