@@ -248,6 +248,8 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
         'workspaceRestoreFailure', case when ${heartbeatRuns.resultJson} ->> 'workspaceRestoreFailure'
           in (${workspaceRestoreFailureCodesSql})
           then ${heartbeatRuns.resultJson} -> 'workspaceRestoreFailure' end,
+        'workspaceRestorePending', case when ${heartbeatRuns.resultJson} -> 'workspaceRestorePending' = 'true'::jsonb
+          then to_jsonb(true) end,
         'cancellation', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'cancellation') = 'object'
           then jsonb_strip_nulls(jsonb_build_object(
             'source', case when ${heartbeatRuns.resultJson} #>> '{cancellation,source}'
