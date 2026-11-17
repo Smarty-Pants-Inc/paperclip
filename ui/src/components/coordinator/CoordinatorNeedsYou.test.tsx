@@ -753,23 +753,10 @@ describe("Coordinator Needs You views (PAP-749 task 1b)", () => {
     fixture.viewCounts = { mine: 1, unassigned: 0, company: 1, archived: 0, all: 1 };
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await render(client);
-    expect([...container.querySelectorAll("[data-attention-card]")].map((card) => card.getAttribute("data-attention-card"))).toEqual(["stop"]);
-    const card = container.querySelector<HTMLElement>('[data-attention-card="stop"]')!;
-    expect(card.querySelector('[data-attention-evidence="approval-b"]')?.textContent).toBe("Approval this answers: budget override required — Approval is pending a board decision.");
-    expect(card.querySelector("[data-attention-type-label]")?.textContent).toBe("Resolve a budget stop");
-    const buttons = () => [...card.querySelectorAll("button")].map((button) => button.textContent);
-    // PAP-775: the new limit is asked for only once you choose to increase it; the primary action is last.
-    expect(buttons().slice(-2)).toEqual(["Keep paused", "Increase limit…"]);
-    expect(card.querySelector('input[inputmode="decimal"]')).toBeNull();
-    await click("Increase limit…");
-    expect(card.querySelector('input[inputmode="decimal"]')).not.toBeNull();
-    expect(buttons().slice(-3)).toEqual(["Keep paused", "Cancel", "Raise limit & resume"]);
-    // The approval's own Approve / Reject would skip the budget; they are not offered.
-    expect(buttons()).not.toContain("Approve");
-    expect(buttons()).not.toContain("Reject");
-    // Keep paused answers the stop, which rejects its approval on the server.
-    await click("Keep paused");
-    expect(fixture.resolveIncident).toHaveBeenCalledWith("company", "incident-1", { action: "keep_paused" });
+    expect(container.querySelector('[data-attention-card="stop"]')).toBeNull();
+    expect(container.querySelector('[data-attention-card="approval-b"]')).toBeNull();
+    expect(container.textContent).not.toMatch(/Spendy Agent|Increase limit|budget hard stop/i);
+    expect(fixture.resolveIncident).not.toHaveBeenCalled();
     client.clear();
   });
 

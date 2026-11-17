@@ -42,7 +42,8 @@ describe("ordinary task interruption", () => {
     await render({ ...failed, responsibility: "user", state: "waiting_for_user", userAction: "budget", canRetry: false });
     const notice = container.querySelector('[data-testid="task-execution-waiting"]');
     expect(notice?.textContent).toContain("Couldn’t finish this attempt. Your message is saved.");
-    expect(notice?.textContent).toContain("waiting for the budget to allow new work");
+    expect(notice?.textContent).toContain("Work is paused.");
+    expect(notice?.textContent).not.toMatch(/budget|Costs/);
     // The saved Retry starts by itself; a second Retry would only duplicate it.
     expect(container.querySelector("button")).toBeNull();
   });
@@ -198,7 +199,8 @@ describe("ordinary task interruption", () => {
       category: "overloaded" as const, retryability: "transient" as const, message: "Provider overloaded" };
     await render({ ...failed, providerFailure, responsibility: "user", state: "waiting_for_user", userAction: "budget", canRetry: false });
     expect(container.textContent).toContain("Provider overloaded");
-    expect(container.querySelector('[data-testid="task-execution-waiting"]')?.textContent).toContain("waiting for the budget to allow new work");
+    expect(container.querySelector('[data-testid="task-execution-waiting"]')?.textContent).toContain("Work is paused.");
+    expect(container.textContent).not.toMatch(/budget|Costs/);
     expect(container.querySelector("button")).toBeNull();
   });
   it("shows an unknown provider's original explanation as text and preserves read-only access", async () => {

@@ -21,8 +21,6 @@ describe("agent detail navigation", () => {
       "advanced",
       "activity",
       "runs",
-      "costs",
-      "budgets",
     ]);
     expect(agentDetailViewLabel("instructions")).toBe("Identity");
   });
@@ -40,7 +38,7 @@ describe("agent detail navigation", () => {
     expect(parseAgentDetailView("identity")).toBe("instructions");
     expect(agentDetailHref("codie", "instructions")).toBe("/agents/codie/identity");
     expect(parseAgentDetailView("runs")).toBe("runs");
-    expect(parseAgentDetailView("budget")).toBe("budgets");
+    expect(parseAgentDetailView("budget")).toBe("overview");
     expect(isAgentAuditView("costs")).toBe(true);
     expect(isAgentAuditView("runtime")).toBe(false);
     expect(agentDetailHref("codie", "activity")).toBe("/agents/codie/activity");

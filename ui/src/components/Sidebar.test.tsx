@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Sidebar } from "./Sidebar";
+import { Sidebar as ProductionSidebar } from "./Sidebar.production";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({
@@ -100,6 +101,10 @@ vi.mock("@/plugins/launchers", () => ({
   ),
 }));
 
+vi.mock("./SidebarCompanyMenu.production", () => ({ SidebarCompanyMenu: () => <div>Company menu</div> }));
+vi.mock("./SidebarAgents.production", () => ({ SidebarAgents: () => null }));
+vi.mock("./SidebarStarredProjects.production", () => ({ SidebarStarredProjects: () => null }));
+
 vi.mock("./SidebarCompanyMenu", () => ({
   SidebarCompanyMenu: () => <div>Company menu</div>,
 }));
@@ -138,7 +143,7 @@ async function flushReact() {
 describe("Sidebar", () => {
   let container: HTMLDivElement;
 
-  async function renderSidebar() {
+  async function renderSidebar(legacy = false) {
     const root = createRoot(container);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
@@ -148,7 +153,7 @@ describe("Sidebar", () => {
       root.render(
         <QueryClientProvider client={queryClient}>
           <TooltipProvider>
-            <Sidebar />
+            {legacy ? <ProductionSidebar /> : <Sidebar />}
           </TooltipProvider>
         </QueryClientProvider>,
       );
@@ -175,6 +180,17 @@ describe("Sidebar", () => {
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
+  });
+
+  it.each([true, false])("hides money navigation in sidebar legacy=%s", async legacy => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
+    const root = await renderSidebar(legacy);
+    try {
+      const more = [...container.querySelectorAll("button")].find(el => el.textContent?.trim() === "More");
+      if (more) { flushSync(() => more.click()); await flushReact(); }
+      expect(container.textContent).not.toMatch(/Costs|Budgets/);
+      expect(container.querySelector('a[href="/costs"]')).toBeNull();
+    } finally { flushSync(() => root.unmount()); }
   });
 
   it("keeps the default sidebar edge borderless", async () => {
@@ -315,7 +331,9 @@ describe("Sidebar", () => {
     expect(container.querySelector('[data-testid="sidebar-projects"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="sidebar-agents"]')?.getAttribute("data-streamlined")).toBe("undefined");
     expect(container.textContent).toContain("Organization");
-    expect(labels).toEqual(expect.arrayContaining(["Org", "Connectors", "Timeline", "Costs", "Activity", "Settings"]));
+    expect(labels).toEqual(expect.arrayContaining(["Org", "Connectors", "Timeline", "Activity", "Settings"]));
+    expect(labels).not.toContain("Costs");
+    expect(labels).not.toContain("Budgets");
     expect(labels).not.toContain("Audit");
     expect(labels).not.toContain("Projects");
     expect(container.querySelector('a[href="/agents"]')).toBeNull();

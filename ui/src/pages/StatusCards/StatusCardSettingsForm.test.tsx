@@ -38,7 +38,8 @@ describe("StatusCardSettingsForm cost preview", () => {
     render(defaultSettingsValue());
     // The label + bare cost render inline; the descriptive detail moves to a
     // hover tooltip (portalled, only mounted while open) so it is not in the DOM.
-    expect(container.textContent).toContain("Estimated cost");
+    expect(container.textContent).toContain("Estimated tokens");
+    expect(container.textContent).not.toMatch(/Estimated cost|\$/);
     expect(container.textContent).toContain("4.5k tok");
     expect(container.textContent).not.toContain("per refresh");
   });
@@ -49,7 +50,8 @@ describe("StatusCardSettingsForm cost preview", () => {
       refreshPolicy: { mode: "interval", intervalMinutes: 30, triggers: defaultSettingsValue().refreshPolicy.triggers },
     });
     // "updates/day" / "every 30 min" now live in the tooltip; only the cost shows inline.
-    expect(container.textContent).toContain("Estimated cost");
+    expect(container.textContent).toContain("Estimated tokens");
+    expect(container.textContent).not.toMatch(/Estimated cost|\$/);
     expect(container.textContent).toContain("tok");
     expect(container.textContent).not.toContain("updates/day");
   });

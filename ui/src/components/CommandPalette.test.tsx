@@ -222,6 +222,14 @@ describe("CommandPalette", () => {
     container.remove();
   });
 
+  it("offers no Costs or Budgets command", () => {
+    const { root, queryClient } = renderWithQueryClient(<CommandPalette />, container);
+    try {
+      act(() => { document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true })); });
+      expect(container.textContent).not.toMatch(/Costs|Budgets/);
+    } finally { act(() => root.unmount()); queryClient.clear(); }
+  });
+
   it("includes routine execution issues in search queries", async () => {
     const { root } = renderWithQueryClient(<CommandPalette />, container);
 
