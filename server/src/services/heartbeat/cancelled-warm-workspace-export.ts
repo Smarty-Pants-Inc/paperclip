@@ -17,7 +17,7 @@ const RETAINED_IDLE_CHECKPOINT_SCHEMA = "paperclip.native-retained-idle-checkpoi
 
 type PreparedSync = {
   readonly reference: { state: string };
-  restoreWorkspace: (assertOwnership?: () => Promise<void>) => Promise<void>;
+  restoreWorkspace: (assertOwnership?: () => Promise<void>, options?: { signal?: AbortSignal }) => Promise<void>;
 };
 
 export type CancelledWarmExportOutcome =
@@ -25,6 +25,10 @@ export type CancelledWarmExportOutcome =
   | { outcome: "not_settled" }
   | { outcome: "finalized" }
   | { outcome: "unproven"; reason: string };
+
+function deferredLine(reason: string): string {
+  return `Stopped turn's workspace export could not be proven (${reason}); the warm box stays protected and its files are not yet on the host.`;
+}
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -73,21 +77,32 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   if (!hasAcknowledgedNativeStopIntent(run) || !hasSettledCancellationReceipt(run)) return { outcome: "not_settled" };
 
   const timeoutMs = input.timeoutMs ?? CANCELLED_WARM_EXPORT_TIMEOUT_MS;
-  let expired = false;
+  // pl/cancel-finalize2: ONE aggregate bound for the whole export. At the
+  // deadline the signal aborts: the ownership callback returns at once (so the
+  // finalization lock session is released at the deadline, not when a held
+  // command joins), and every later step of the export re-checks the signal
+  // after its remote call, so nothing (no remote stamp, no finalized
+  // descriptor, no lease stamp) is written after the deadline.
+  const controller = new AbortController();
+  const timedOut = new Error("cancelled_warm_export_timed_out");
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    controller.signal.addEventListener("abort", () => reject(timedOut), { once: true });
+  });
+  aborted.catch(() => undefined);
   const work = withNativeWorkspaceFinalizationOwnership({ db: input.db, companyId: input.companyId, runId: input.runId },
     async (ownership) => {
-      // After the bound no stamp or finalized descriptor may land: the box is
-      // then handed off as a protected (still prepared) source.
       const assertHeld = async () => {
-        if (expired) throw new Error("cancelled_warm_export_timed_out");
+        if (controller.signal.aborted) throw timedOut;
         await ownership.assertHeld();
       };
-      await sync.restoreWorkspace(assertHeld);
+      const export_ = sync.restoreWorkspace(assertHeld, { signal: controller.signal });
+      export_.catch(() => undefined);
+      await Promise.race([export_, aborted]);
     });
   work.catch(() => undefined);
   const deadline = new Promise<"timed_out">((resolve) => {
-    timer = setTimeout(() => { expired = true; resolve("timed_out"); }, timeoutMs);
+    timer = setTimeout(() => { controller.abort(timedOut); resolve("timed_out"); }, timeoutMs);
     timer.unref?.();
   });
   let reason: string | null = null;
@@ -101,6 +116,12 @@ export async function finishCancelledWarmWorkspaceExport(input: {
     detail = (error instanceof Error ? error.message : String(error)).slice(0, 300);
   } finally {
     if (timer) clearTimeout(timer);
+    // Whatever the outcome, the export may not continue past this point.
+    if (!controller.signal.aborted) controller.abort(timedOut);
+  }
+  if (reason === "timed_out") {
+    // Wait (briefly, bounded) for the ownership session to be released.
+    await Promise.race([work.catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 1_000).unref?.())]);
   }
   // restoreWorkspace swaps the reference to the finalized one on success.
   if (!reason && (sync.reference as { state: string }).state !== "finalized") reason = "export_not_finalized";
@@ -117,10 +138,27 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       eventType: reason ? "workspace_export_deferred" : "workspace_export_finalized",
       stream: "system", level: reason ? "warn" : "info",
       message: reason
-        ? `Stopped turn's workspace export could not be proven (${reason}); the warm box stays protected and its files are not yet on the host.`
+        ? deferredLine(reason)
         : "Stopped turn's workspace exported to the host; the warm box stays reusable for the next message.",
       payload: { reason, detail, timeoutMs },
     });
+    if (reason) {
+      // The person must see this line: the native transcript consumer
+      // (ui native-run-events.ts nativeRunEventsToTranscript) renders only
+      // PRP-shaped events, so the warning is ALSO written as one provider
+      // notice in that schema (one transcript row).
+      await appendHeartbeatRunEvent(input.db, {
+        companyId: run.companyId, agentId: run.agentId, runId: run.id,
+        eventType: "provider.notice.recorded", stream: "system", level: "warn",
+        message: deferredLine(reason),
+        payload: { prpEvent: {
+          schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "control_plane",
+          runId: run.id, eventType: "provider.notice.recorded", emittedAt: new Date().toISOString(),
+          payload: { schema: "paperclip.provider.notice.v1", severity: "warning", category: "workspace_export_deferred",
+            summary: deferredLine(reason), message: deferredLine(reason) },
+        } },
+      });
+    }
   } catch (error) {
     logger.warn({ err: error, runId: input.runId }, "cancelled warm workspace export outcome could not be recorded");
   }
