@@ -425,6 +425,138 @@ suite("fresh-continuation fallback", () => {
     if (shape === "failed_is_latest") expect(card).toMatchObject({ state: "failed", canRetry: true });
   }, 120_000);
 
+  // F3 re-home (stack135 r3) of the PINS-DELETED-MECHANISM rows. Their deleted
+  // owner (U5 notices) is gone; the behaviour each pinned is now asserted on its
+  // current owners: the conversation recovery branch (R-SILENT redelivery) and
+  // upstream's computed card, through the real heartbeat wrapper at t+120 s.
+  // Oracle (rf-3): current notes + live runs + a failed/retry_scheduled card is
+  // exactly one for an unanswered latest message, and the message is untouched.
+  type PinShape = "D008_failed_first_message" | "D110_first_turn_input_silent" | "D110_first_turn_input_failed_then_timer"
+    | "D114_two_messages_first_answered" | "D115_earlier_runs_card_after_message" | "D116_three_messages_before_prose"
+    | "D117_scalar_commentId" | "D118_soft_deleted_later_message" | "D128_old_approval_before_failed_message"
+    | "D181_old_question_before_failed_message" | "D182_board_confirmation_for_someone_else" | "D152_first_turn_input_failed"
+    | "D139_no_wake_no_run";
+  it.each([
+    "D008_failed_first_message", "D110_first_turn_input_silent", "D110_first_turn_input_failed_then_timer",
+    "D114_two_messages_first_answered", "D115_earlier_runs_card_after_message", "D116_three_messages_before_prose",
+    "D117_scalar_commentId", "D118_soft_deleted_later_message", "D128_old_approval_before_failed_message",
+    "D181_old_question_before_failed_message", "D182_board_confirmation_for_someone_else", "D152_first_turn_input_failed",
+    "D139_no_wake_no_run",
+  ] satisfies PinShape[])("F3 pin re-home %s: the latest person message has exactly one truthful outcome by 120 s", async shape => {
+    const t = new Date(Date.now() - 600_000);
+    const at = (offset: number) => new Date(t.getTime() + offset);
+    const [task] = await db.insert(issues).values({ companyId, title: `F3 ${shape}`, status: "in_progress", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: at(-300_000) }).returning();
+    const issueId = task!.id;
+    // A chat message (clientRequestId) whose durable outbox receipt the original delivery consumed, unless `delivered` is false.
+    const message = async (body: string, offset: number, delivered = true) => {
+      const [row] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId, body,
+        clientRequestId: randomUUID(), createdAt: at(offset) }).returning();
+      if (delivered) await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented",
+        status: "completed", requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${row!.id}`,
+        payload: { issueId, commentId: row!.id }, createdAt: at(offset + 1_000), finishedAt: at(offset + 2_000) });
+      return row!;
+    };
+    const run = async (offset: number, status: string, contextSnapshot: Record<string, unknown>, extra: Partial<typeof heartbeatRuns.$inferInsert> = {}) =>
+      (await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status,
+        createdAt: at(offset - 30_000), startedAt: at(offset - 29_000), finishedAt: at(offset), responsibleUserId: userId,
+        errorCode: status === "failed" ? "adapter_failed" : null, error: status === "failed" ? "adapter failed before an answer" : null,
+        contextSnapshot: { issueId, wakeReason: "issue_commented", ...contextSnapshot }, ...extra }).returning())[0]!;
+    const reply = async (runId: string, offset: number) => db.insert(issueComments).values({ companyId, issueId, authorType: "agent",
+      authorAgentId: agentId, createdByRunId: runId, body: "Here is the answer.", createdAt: at(offset) });
+    const question = async (sourceRunId: string | null, offset: number) => db.insert(issueThreadInteractions).values({ companyId, issueId,
+      kind: "ask_user_questions", status: "pending", createdByAgentId: agentId, sourceRunId, addresseeUserId: userId, createdAt: at(offset),
+      payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
+        options: [{ id: "eu", label: "EU" }, { id: "us", label: "US" }] }] } } as never);
+    const timer = async (offset: number) => run(offset, "succeeded", { wakeReason: "heartbeat_timer", wakeSource: "timer" }, { invocationSource: "timer" });
+    let latest: typeof issueComments.$inferSelect;
+    switch (shape) {
+      case "D152_first_turn_input_failed": latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "failed", { firstTurnQueuedInput: { commentIds: [latest.id] } }); break;
+      case "D139_no_wake_no_run": latest = await message("Please answer this accepted request.", -60_000, false); break;
+      case "D008_failed_first_message": latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "failed", { wakeCommentId: latest.id }); break;
+      case "D110_first_turn_input_silent": latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "succeeded", { firstTurnQueuedInput: { commentIds: [latest.id] } }); break;
+      case "D110_first_turn_input_failed_then_timer": latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "failed", { firstTurnQueuedInput: { commentIds: [latest.id] } }); await timer(20_000); break;
+      case "D114_two_messages_first_answered": {
+        const first = await message("First question.", -120_000);
+        await reply((await run(-90_000, "succeeded", { wakeCommentId: first.id })).id, -91_000);
+        latest = await message("Second question.", -60_000);
+        await run(0, "succeeded", { wakeCommentId: latest.id }); break;
+      }
+      case "D115_earlier_runs_card_after_message": {
+        const earlierMessage = await message("Earlier request.", -200_000);
+        const earlier = await run(-150_000, "succeeded", { wakeCommentId: earlierMessage.id });
+        await reply(earlier.id, -151_000);
+        latest = await message("Please answer this accepted request.", -60_000);
+        await question(earlier.id, -30_000); // the EARLIER run's card, created after the current message
+        await run(0, "succeeded", { wakeCommentId: latest.id }); break;
+      }
+      case "D116_three_messages_before_prose": {
+        const a = await message("One.", -80_000), b = await message("Two.", -70_000);
+        latest = await message("Three.", -60_000);
+        await run(0, "succeeded", { wakeCommentIds: [a.id, b.id, latest.id] }); break;
+      }
+      case "D117_scalar_commentId": latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "succeeded", { commentId: latest.id }); break;
+      case "D118_soft_deleted_later_message": {
+        latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "succeeded", { wakeCommentId: latest.id });
+        const later = await message("Oops, ignore.", 10_000);
+        await db.update(issueComments).set({ deletedAt: at(11_000) }).where(eq(issueComments.id, later.id)); break;
+      }
+      case "D128_old_approval_before_failed_message": {
+        const prior = await message("Deploy when approved.", -200_000);
+        await reply((await run(-150_000, "succeeded", { wakeCommentId: prior.id })).id, -151_000);
+        const [approval] = await db.insert(approvals).values({ companyId, type: "deploy", requestedByAgentId: agentId, status: "pending",
+          payload: { summary: "Deploy to production" }, createdAt: at(-140_000) } as typeof approvals.$inferInsert).returning();
+        await db.insert(issueApprovals).values({ companyId, issueId, approvalId: approval!.id, linkedByAgentId: agentId, createdAt: at(-140_000) } as typeof issueApprovals.$inferInsert);
+        latest = await message("Never mind the deploy. What is the current version?", -60_000);
+        await run(0, "failed", { wakeCommentId: latest.id }); break;
+      }
+      case "D181_old_question_before_failed_message": {
+        const prior = await message("Deploy it.", -200_000);
+        const priorRun = await run(-150_000, "succeeded", { wakeCommentId: prior.id });
+        await question(priorRun.id, -151_000);
+        latest = await message("Never mind the deploy. What is the current version?", -60_000);
+        await run(0, "failed", { wakeCommentId: latest.id }); break;
+      }
+      case "D182_board_confirmation_for_someone_else": {
+        latest = await message("What is the current version?", -60_000);
+        await run(0, "failed", { wakeCommentId: latest.id });
+        await db.insert(issueThreadInteractions).values({ companyId, issueId, kind: "request_confirmation", status: "pending",
+          sourceRunId: null, continuationPolicy: "none", requestedResolverPolicy: "human_only", effectiveResolverPolicy: "human_only",
+          resolverPolicyProvenance: "explicit", addresseeUserId: "someone-else", createdByUserId: userId, title: "Other person's decision",
+          createdAt: at(30_000), payload: { version: 1, prompt: "Approve the unrelated deploy?" } } as never); break;
+      }
+    }
+    await occupySlot();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const heartbeat = heartbeatService(db);
+      for (const elapsed of [90_001, 119_999, 120_000]) {
+        vi.setSystemTime(t.getTime() + elapsed);
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
+      }
+      const card = await taskInterruptionPresentation(db, await issue(issueId));
+      const notes = (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+        eq(issueComments.authorType, "system")))).filter(c => !c.deletedAt && !(c.metadata as Record<string, unknown> | null)?.supersededByIncident);
+      const live = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])));
+      const redeliveries = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${latest.id}`)));
+      const [after] = await db.select().from(issueComments).where(eq(issueComments.id, latest.id));
+      const outcomes = notes.length + live.length + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
+      console.info(JSON.stringify({ f3PinRehome: { shape, card: card && { state: card.state, canRetry: card.canRetry },
+        notes: notes.length, live: live.map(r => r.contextSnapshot?.wakeCommentId ?? null), redeliveries: redeliveries.length, outcomes } }));
+      expect(after).toMatchObject({ body: latest.body, authorUserId: userId, deletedAt: null });
+      expect(outcomes, "exactly one truthful outcome, never zero or two").toBe(1);
+      if (live.length) expect(live.map(r => r.contextSnapshot?.wakeCommentId)).toEqual([latest.id]);
+    } finally { vi.useRealTimers(); }
+  }, 120_000);
+
   // RFL 12:36Z regression probes. Keep reasons: executor exclusion is a data
   // safety boundary; these reproduce the recorded D10 failure paths.
   it.each(["queued", "succeeded", "older_answer"])("RFL F1 checks %s before any stop or note", async shape => {

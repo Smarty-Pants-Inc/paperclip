@@ -16,6 +16,8 @@ import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import {
   agents,
   agentTaskSessions,
+  approvals,
+  issueApprovals,
   agentWakeupRequests,
   heartbeatRuns,
   issueComments,
@@ -759,11 +761,16 @@ export async function deliverConversationComments(
  * without a durable response (stack135 R-SILENT). */
 export const CONVERSATION_REDELIVERY_KEY_PREFIX = "conversation-comment-redelivery:";
 
-/** The message ids a run carried: its `wakeCommentId`, `commentId` and every
- * `wakeCommentIds` entry (a coalesced wake names its messages only there). */
+/** The message ids a run carried: its `wakeCommentId`, `commentId`, every
+ * `wakeCommentIds` entry (a coalesced wake names its messages only there) and
+ * its claimed first-turn queued input (`firstTurnQueuedInput.commentIds`), the
+ * same carrying keys the continuation replay guard reads. */
 function carriedMessageIds(context: Record<string, unknown> | null | undefined): string[] {
+  const firstTurn = context?.firstTurnQueuedInput && typeof context.firstTurnQueuedInput === "object"
+    ? (context.firstTurnQueuedInput as Record<string, unknown>).commentIds : null;
   const ids = [context?.wakeCommentId, context?.commentId,
-    ...(Array.isArray(context?.wakeCommentIds) ? context.wakeCommentIds : [])];
+    ...(Array.isArray(context?.wakeCommentIds) ? context.wakeCommentIds : []),
+    ...(Array.isArray(firstTurn) ? firstTurn : [])];
   return [...new Set(ids.filter((id): id is string => typeof id === "string" && id.length > 0))];
 }
 
@@ -796,7 +803,8 @@ export async function latestPersonMessageTurn(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, issue.conversationAgentId),
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
     sql`(coalesce(${heartbeatRuns.contextSnapshot}->>'wakeCommentId', ${heartbeatRuns.contextSnapshot}->>'commentId') = ${message.id}
-      or coalesce(${heartbeatRuns.contextSnapshot}->'wakeCommentIds', '[]'::jsonb) @> jsonb_build_array(${message.id}::text))`))
+      or coalesce(${heartbeatRuns.contextSnapshot}->'wakeCommentIds', '[]'::jsonb) @> jsonb_build_array(${message.id}::text)
+      or coalesce(${heartbeatRuns.contextSnapshot}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) @> jsonb_build_array(${message.id}::text))`))
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
   return run ? { runId: run.id, messageId: message.id } : null;
 }
@@ -848,14 +856,20 @@ export async function redeliverUnansweredConversationTurn(
   // response recovery owns that reply, so the turn is not re-offered.
   if (isPendingCommitPresentation((run.resultJson as Record<string, unknown> | null)?.presentationDecision)) return "none";
   if (run.status !== "succeeded") {
-    // Upstream still owns a failed turn that is the task's latest attempt, has
-    // a successor, or has a recovery action.
+    // Upstream still owns a failed turn that is the task's latest attempt (its
+    // card shows failed + Retry), has a successor, or has a recovery action. A
+    // pending approval that PREDATES the message turns that card into the
+    // approval's wait instead, which does not answer this message (D128/D153).
     const [later] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), sql`${heartbeatRuns.id} <> ${run.id}`,
       sql`(${heartbeatRuns.issueId} = ${issue.id} or ${heartbeatRuns.nativeIssueId} = ${issue.id}
         or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id})`,
       sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (select own.created_at, own.id from heartbeat_runs own where own.id = ${run.id}::uuid)`)).limit(1);
-    if (!later) return "none";
+    const [olderApproval] = later ? [] : await db.select({ id: approvals.id }).from(issueApprovals)
+      .innerJoin(approvals, eq(approvals.id, issueApprovals.approvalId)).where(and(
+        eq(issueApprovals.companyId, issue.companyId), eq(issueApprovals.issueId, issue.id), eq(approvals.status, "pending"),
+        sql`${approvals.createdAt} < (select created_at from issue_comments where id = ${messageId}::uuid)`)).limit(1);
+    if (!later && !olderApproval) return "none";
     const [successor] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.retryOfRunId, run.id))).limit(1);
     if (successor) return "none";
@@ -877,10 +891,15 @@ export async function redeliverUnansweredConversationTurn(
       sql`(${issueComments.authorAgentId} is not null or ${issueComments.authorUserId} is not null)`,
       sql`(${issueComments.createdAt}, ${issueComments.id}) > ${after}`)).limit(1);
     if (later) return null;
+    // A question created after the message answers it, unless an EARLIER run
+    // (one created before the carrying run) asked it: that card belongs to an
+    // earlier turn, not to this message (D115).
     const [question] = await connection.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
       eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
       sql`${issueThreadInteractions.createdByAgentId} is not null`,
-      sql`${issueThreadInteractions.createdAt} >= (select created_at from issue_comments where id = ${messageId}::uuid)`)).limit(1);
+      sql`${issueThreadInteractions.createdAt} >= (select created_at from issue_comments where id = ${messageId}::uuid)`,
+      sql`not exists (select 1 from heartbeat_runs asker, heartbeat_runs own where asker.id = ${issueThreadInteractions.sourceRunId}
+        and own.id = ${run.id}::uuid and (asker.created_at, asker.id) < (own.created_at, own.id))`)).limit(1);
     if (question) return null;
     const [live] = await connection.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
