@@ -29,7 +29,6 @@ import type {
 } from "@paperclipai/shared";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { Link } from "@/lib/router";
-import { SavedOutputNotice } from "@/components/task-chat/SavedOutputNotice";
 import { ApiError } from "../../api/client";
 import { companySkillsApi } from "../../api/companySkills";
 import { useToastActions } from "../../context/ToastContext";
@@ -905,9 +904,6 @@ function ProjectSkillBrowser({
           </ul>
         ) : (
           <div className="p-8 text-center text-sm text-muted-foreground">This folder is empty.</div>
-        )}
-        {result?.truncated && (
-          <div className="px-5 py-2"><SavedOutputNotice /></div>
         )}
       </div>
     </div>

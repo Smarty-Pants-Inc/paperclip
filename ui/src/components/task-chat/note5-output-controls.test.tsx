@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { MemoryRouter } from "@/lib/router";
@@ -9,6 +10,10 @@ import { TaskChatProtocolActivityDetails } from "./TaskChatProtocolActivityRow";
 import { TaskChatToolCard } from "./TaskChatToolCard";
 import { TaskChatBubble } from "./TaskChatBubble";
 import { CsvPreview } from "../CsvPreview";
+import { ProviderTraceStatusBadge } from "../ProviderTraceStatusBadge";
+import { parseCsv } from "@/lib/csv-preview";
+import { SheetTable as TintSheetTable } from "@/artifact-directions/directions/d2-tint/Content";
+import { SheetTable as HybridSheetTable } from "@/artifact-directions/directions/d4-hybrid/Content";
 import { TaskChatDiffView } from "./TaskChatDiffView";
 import { parseUnifiedDiffLines } from "./diff-lines";
 import { nativeRunEventsToTranscript } from "../transcript/native-run-events";
@@ -197,6 +202,32 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
     expect(container.querySelectorAll("tbody tr")).toHaveLength(501);
     expect(container.textContent).toContain("row-500");
     expect(container.textContent).not.toContain("Showing the first");
+  }, 30000);
+  it("independent: a flagged producer trace notice must contain a saved-run anchor", () => {
+    const trace = { status: "truncated", expiresAt: "2099-01-01T00:00:00Z", frameCount: 1, byteCount: 10 } as any;
+    render(<ProviderTraceStatusBadge {...{ trace, runLogHref: "/agents/agent-1/runs/run-1" }} />);
+    expect(container.textContent).toMatch(/runner saved only part|full text is kept/);
+    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')).not.toBeNull();
+  });
+  it.each([["tint", TintSheetTable], ["hybrid", HybridSheetTable]] as const)("independent: lab %s sheet should not append a custom cut label instead of a real paging control", (_name, SheetTable) => {
+    const html = renderToStaticMarkup(<SheetTable artifact={{ excerpt: "Name,Value\none,1\ntwo,2\nLAST,END" } as any} rows={1} />);
+    expect(html).not.toMatch(/more rows?|more columns?/);
+  });
+  it("independent: CSV expansion reaches the exact last row, column, and Unicode bytes", async () => {
+    const cell = (s: string) => '"' + s.replaceAll('"', '""') + '"';
+    const header = Array.from({ length: 101 }, (_, j) => `column-${j}`);
+    const rows = Array.from({ length: 503 }, (_, i) => Array.from({ length: 101 }, (_, j) => `r${i}c${j}`));
+    rows[502][100] = 'LAST,"quoted"\nユニコード🙂END';
+    const csv = [header, ...rows].map(row => row.map(cell).join(',')).join('\r\n');
+    expect(parseCsv(csv)).toEqual([header, ...rows]);
+    render(<CsvPreview text={csv} title="Independent CSV" />);
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(500);
+    const more = [...container.querySelectorAll('button')].find(b => b.textContent === 'Show 3 more rows');
+    expect(more).toBeDefined();
+    await act(async () => more!.click());
+    const actual = [...container.querySelectorAll('tbody tr')].map(row => [...row.querySelectorAll('td')].map(td => td.textContent));
+    expect(actual).toEqual(rows);
+    expect(new TextEncoder().encode(actual[502][100]!)).toEqual(new TextEncoder().encode(rows[502][100]));
   }, 30000);
   it("retains live log lines and events beyond the former hard ceilings", () => {
     const lines = Array.from({ length: 5001 }, (_, i) => `line-${i}`);

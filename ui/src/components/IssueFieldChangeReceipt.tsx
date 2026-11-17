@@ -5,7 +5,6 @@ import {
   readIssueChangeReceipt,
 } from "../lib/issue-change-receipt";
 import { cn } from "../lib/utils";
-import { SavedOutputNotice } from "./task-chat/SavedOutputNotice";
 
 /**
  * Field-level audit receipt under an `issue.updated` row in the activity stream
@@ -58,12 +57,11 @@ export function IssueFieldChangeReceipt({
             >
               <dt className="text-muted-foreground">{row.label}</dt>
               <dd className="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
-                <span className="min-w-0 break-words text-muted-foreground line-through decoration-muted-foreground/50">
+                <span className="min-w-0 whitespace-pre-wrap break-words text-muted-foreground line-through decoration-muted-foreground/50">
                   {row.from}
                 </span>
                 <ArrowRight className="size-3 shrink-0 text-muted-foreground/70" aria-hidden="true" />
-                <span className="min-w-0 break-words font-medium text-foreground">{row.to}</span>
-                {row.truncated === true ? <SavedOutputNotice /> : null}
+                <span className="min-w-0 whitespace-pre-wrap break-words font-medium text-foreground">{row.to}</span>
               </dd>
             </div>
           ))}

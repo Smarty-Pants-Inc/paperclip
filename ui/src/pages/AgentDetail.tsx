@@ -3228,6 +3228,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
             <div className="flex items-center gap-2 flex-wrap">
               <StatusBadge status={run.status} />
               <ProviderTraceStatusBadge
+                runLogHref={`/agents/${encodeURIComponent(run.agentId)}/runs/${encodeURIComponent(run.id)}`}
                 trace={providerTraceMetadata}
                 requested={runRequestedProviderTrace(run.contextSnapshot)}
                 showOff
@@ -3563,6 +3564,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
       <LogViewer run={run} adapterType={adapterType} />
       <ScrollToBottom />
       <RunnerInspector
+        runLogHref={`/agents/${encodeURIComponent(run.agentId)}/runs/${encodeURIComponent(run.id)}`}
         runId={run.id}
         run={run}
         open={inspectorOpen}

@@ -553,11 +553,25 @@ describe("WorkspaceFileBrowser", () => {
     expect(container.textContent).not.toContain("Recent changes / All");
   });
 
-  it("uses the shared producer notice for a bounded server search", () => {
-    useQueryMock.mockReturnValue(ok(availableResponse([createItem()], true)));
-    renderBrowser();
-    expect(container.textContent).toContain("The runner saved only part of this output.");
-    expect(container.textContent).toContain("Refine the search or browse a folder.");
+  it("pages bounded searches to the final file without a producer notice", () => {
+    const first = availableAllResponse([createItem()], null, true);
+    first.query.q = "proof";
+    const last = availableAllResponse([createItem({ title: "LAST_FILE.md", relativePath: "LAST_FILE.md", displayPath: "LAST_FILE.md" })], null, false, LIST_LIMIT);
+    last.query.q = "proof";
+    useQueryMock.mockImplementation((options: { queryKey: readonly unknown[] }) => {
+      const query = options.queryKey[4] as { q?: string; offset?: number } | undefined;
+      return ok(query?.offset === LIST_LIMIT ? last : first);
+    });
+    renderBrowser(vi.fn(), { initialQuery: "proof", autoFocusSearch: false });
+    expect(container.textContent).not.toMatch(/runner saved only part|full text is kept/);
+    expect(container.textContent).not.toContain("LAST_FILE.md");
+    const more = [...container.querySelectorAll("button")].find(button => button.textContent === "Show more files");
+    expect(more).toBeDefined();
+    act(() => more!.click());
+    expect(container.textContent).toContain("IssueDetail.tsx");
+    expect(container.textContent).toContain("LAST_FILE.md");
+    expect(container.textContent).not.toContain("Show more files");
+    expect(useQueryMock.mock.calls.some(([options]) => options.queryKey[4]?.q === "proof" && options.queryKey[4]?.offset === LIST_LIMIT)).toBe(true);
   });
 
   it("renders newly loaded current-folder rows after Load more", () => {

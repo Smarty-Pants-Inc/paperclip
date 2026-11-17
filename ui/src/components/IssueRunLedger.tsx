@@ -899,6 +899,7 @@ export function IssueRunLedgerContent({
                     </span>
                   ) : null}
                   <ProviderTraceStatusBadge
+                    runLogHref={`/agents/${encodeURIComponent(run.agentId)}/runs/${encodeURIComponent(run.runId)}`}
                     trace={providerTraceMetadata.get(run.runId)}
                     requested={runRequestedProviderTrace(run.contextSnapshot)}
                     showOff
@@ -1032,6 +1033,7 @@ export function IssueRunLedgerContent({
       )}
       {inspectedRun ? (
         <RunnerInspector
+          runLogHref={`/agents/${encodeURIComponent(inspectedRun.agentId)}/runs/${encodeURIComponent(inspectedRun.runId)}`}
           runId={inspectedRun.runId}
           run={inspectedRun}
           open

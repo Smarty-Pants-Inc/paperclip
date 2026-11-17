@@ -646,12 +646,14 @@ function StatCard({ label, value, detail }: { label: string; value: string | num
 
 export function RunnerInspector({
   runId,
+  runLogHref,
   run,
   open,
   onOpenChange,
   onRerunWithTrace,
 }: {
   runId: string;
+  runLogHref?: string;
   run?: { resultJson: Record<string, unknown> | null; status: string } | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -1024,7 +1026,7 @@ export function RunnerInspector({
             <SheetTitle>Runner Inspector</SheetTitle>
             {inspection?.trace ? (
               <>
-                {inspection.trace.status === "truncated" ? <SavedOutputNotice /> : null}
+                {inspection.trace.status === "truncated" ? <SavedOutputNotice kind="trace" runLogHref={runLogHref} /> : null}
                 <Badge variant={statusVariant(inspection.trace.status)}>
                   {traceBadgeLabel(inspection.trace.status, inspection.trace.expiresAt)}
                 </Badge>

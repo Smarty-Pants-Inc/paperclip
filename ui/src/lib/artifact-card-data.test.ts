@@ -48,6 +48,15 @@ describe("artifact metadata", () => {
 });
 
 describe("CSV artifact preview", () => {
+  it("independent: rich artifact CSV parser retains the exact final field beyond former row cap", () => {
+    const rows = Array.from({ length: 2003 }, (_, i) => [String(i), i === 2002 ? 'LAST,"quoted"\nユニコード🙂END' : `data-${i}`]);
+    const csv = ['id,value', ...rows.map(row => row.map(s => '"' + s.replaceAll('"', '""') + '"').join(','))].join('\r\n');
+    const parsed = parseArtifactCsv(csv);
+    expect(parsed.rows).toEqual(rows);
+    expect(parsed.rows.at(-1)?.at(-1)).toBe(rows.at(-1)?.at(-1));
+    expect(parsed.truncated).toBe(false);
+  });
+
   it("reads quoted commas, escaped quotes, embedded newlines, CRLF, BOM and empty cells", () => {
     expect(
       parseArtifactCsv(

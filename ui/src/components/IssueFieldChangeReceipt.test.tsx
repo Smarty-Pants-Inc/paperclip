@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { ActivityEvent } from "@paperclipai/shared";
 import { IssueFieldChangeReceipt } from "./IssueFieldChangeReceipt";
+import { buildIssueChanges } from "../../../server/src/services/issue-change-receipt";
 
 function event(overrides: Partial<ActivityEvent> = {}) {
   return {
@@ -15,6 +16,28 @@ function event(overrides: Partial<ActivityEvent> = {}) {
 }
 
 describe("IssueFieldChangeReceipt", () => {
+  it("independent: a real short description change must not invent a producer cut", () => {
+    const changes = buildIssueChanges({ description: "old" }, { description: "new" });
+    expect(changes.description).toEqual({ from: "old", to: "new", updated: true });
+    const html = renderToStaticMarkup(<IssueFieldChangeReceipt event={event({ details: { changes } })} />);
+    expect(html).not.toMatch(/runner saved only part|full text is kept/);
+    expect(html).toContain("old");
+    expect(html).toContain("new");
+  });
+
+  it("independent: a genuine long description cut must not give a dead run-log instruction", () => {
+    const from = "x".repeat(250);
+    const to = "y".repeat(250);
+    const changes = buildIssueChanges({ description: from }, { description: to });
+    const html = renderToStaticMarkup(<IssueFieldChangeReceipt event={event({ details: { changes } })} />);
+    // A receipt without run provenance cannot offer a saved-run instruction.
+    // The producer must retain the values instead of manufacturing a cut.
+    expect(html).not.toContain("Open the run log");
+    expect(html).not.toMatch(/runner saved only part|full text is kept/);
+    expect(html).toContain(from);
+    expect(html).toContain(to);
+  });
+
   it("shows before and after for each changed field", () => {
     const html = renderToStaticMarkup(
       <IssueFieldChangeReceipt
@@ -78,7 +101,7 @@ describe("IssueFieldChangeReceipt", () => {
     expect(html).toContain("UXDesigner");
   });
 
-  it("uses the shared producer notice for a server-shortened value", () => {
+  it("does not mistake generic updated metadata for a producer omission", () => {
     const html = renderToStaticMarkup(
       <IssueFieldChangeReceipt
         event={event({
@@ -90,7 +113,7 @@ describe("IssueFieldChangeReceipt", () => {
     );
 
     expect(html).toContain("Description");
-    expect(html).toContain("The runner saved only part of this output.");
+    expect(html).not.toMatch(/runner saved only part|full text is kept/);
     expect(html).not.toContain(">preview<");
   });
 

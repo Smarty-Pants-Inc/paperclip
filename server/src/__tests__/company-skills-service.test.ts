@@ -2738,6 +2738,15 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       }),
     ]);
 
+    // Browsing is not a runner cut: every visible directory must be reachable,
+    // even after the former 250-entry cap. Symlinks above remain excluded.
+    await Promise.all(Array.from({ length: 253 }, (_, index) =>
+      fs.mkdir(path.join(workspaceDir, `folder-${String(index).padStart(3, "0")}`))));
+    const complete = await svc.browseProjectWorkspace(companyId, { projectId, workspaceId });
+    expect(complete.entries).toHaveLength(254);
+    expect(complete.entries.at(-1)?.name).toBe("folder-252");
+    expect(complete.truncated).toBe(false);
+
     const imported = await svc.scanProjectWorkspaces(companyId, {
       projectIds: [projectId],
       mode: "import",

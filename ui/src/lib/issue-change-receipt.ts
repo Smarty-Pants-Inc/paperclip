@@ -10,9 +10,8 @@ import { formatReviewPolicyValue } from "./review-policy";
  * receipt; this module turns it into something a human can scan in the activity
  * stream without opening the audit log.
  *
- * The server already drops `updatedAt` and truncates long text (flagging it with
- * `updated: true`), so this module renders what it is given rather than
- * re-deciding what is interesting.
+ * The server drops `updatedAt` but retains complete text values. Historical
+ * `updated: true` marks description edits, not a producer omission flag.
  */
 
 /** Field names whose raw ids carry no meaning in a scannable summary. */
@@ -83,6 +82,7 @@ export function formatIssueChangeValue(
   if (value instanceof Date) return value.toLocaleString();
 
   if (typeof value === "string") {
+    if (options.field === "description" || options.field === "title") return value;
     const trimmed = value.trim();
     if (!trimmed) return "none";
     // Ids resolve to names when the directory is loaded; otherwise they shorten.
@@ -120,8 +120,6 @@ export interface IssueChangeReceiptRow {
   label: string;
   from: string;
   to: string;
-  /** Server flagged the values as truncated previews of long text. */
-  truncated: boolean;
 }
 
 function isChangeEntry(value: unknown): value is IssueChangeReceiptEntry {
@@ -148,7 +146,6 @@ export function readIssueChangeReceipt(
       label: issueChangeFieldLabel(field),
       from: formatIssueChangeValue(entry.from, { ...options, field }),
       to: formatIssueChangeValue(entry.to, { ...options, field }),
-      truncated: entry.updated === true,
     });
   }
   // Stable, scannable order regardless of JSON key order (jsonb reorders keys).

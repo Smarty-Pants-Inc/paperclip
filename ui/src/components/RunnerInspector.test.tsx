@@ -3,6 +3,7 @@
 import { createElement, type ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
+import { MemoryRouter } from "@/lib/router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/api/client";
 import { ConnectivityProvider, createConnectivityStore, type ConnectivityStore } from "@/lib/connectivity";
@@ -14,6 +15,11 @@ const traceMock = vi.hoisted(() => vi.fn());
 const revealMock = vi.hoisted(() => vi.fn());
 const downloadMock = vi.hoisted(() => vi.fn());
 const deleteMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@/context/CompanyContext", () => ({
+  useCompany: () => ({ selectedCompany: { issuePrefix: "PAP" } }),
+  useOptionalCompany: () => null,
+}));
 
 vi.mock("@/api/access", () => ({
   accessApi: { getCurrentBoardAccess: accessMock },
@@ -133,6 +139,21 @@ describe("RunnerInspector", () => {
     container.remove();
     vi.restoreAllMocks();
     vi.clearAllMocks();
+  });
+
+  it("links a genuinely bounded trace to its producing saved run", async () => {
+    const capture = traceInspection("run-1", "redacted");
+    capture.trace.status = "truncated";
+    capture.trace.expiresAt = "2099-01-01T00:00:00Z";
+    traceMock.mockResolvedValue(capture);
+    flushSync(() => root.render(
+      <MemoryRouter>
+        <RunnerInspector runId="run-1" runLogHref="/agents/agent-1/runs/run-1" open onOpenChange={vi.fn()} />
+      </MemoryRouter>,
+    ));
+    await flush();
+    expect(container.textContent).toContain("The runner saved only part of this trace.");
+    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')).not.toBeNull();
   });
 
   it("keeps canonical inspection available when raw capture was disabled", async () => {

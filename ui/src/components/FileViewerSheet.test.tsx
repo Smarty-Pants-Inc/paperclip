@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { WorkspaceFileContent } from "@paperclipai/shared";
@@ -48,6 +49,17 @@ describe("describeDenial", () => {
 });
 
 describe("FileContentViewer", () => {
+  it("independent: raw CSV source preserves through its last byte after 503 rows", () => {
+    const csv = 'id,value\n' + Array.from({ length: 503 }, (_, i) => `${i},${i === 502 ? 'LAST_ユニコード🙂END' : `value-${i}`}`).join('\n');
+    const source = { resource: { previewKind: 'text', displayPath: 'proof.csv', title: 'proof.csv', contentType: 'text/csv' }, content: { encoding: 'utf8', data: csv } } as WorkspaceFileContent;
+    const html = renderToStaticMarkup(<FileContentViewer content={source} highlightedLine={null} previewMode="raw" />);
+    const container = document.createElement('div');
+    container.innerHTML = html;
+    const recovered = [...container.querySelectorAll('pre code')].map(n => n.textContent).join('\n');
+    expect(recovered).toBe(csv);
+    expect(new TextEncoder().encode(recovered)).toEqual(new TextEncoder().encode(csv));
+  });
+
   function content(overrides: Partial<WorkspaceFileContent> = {}): WorkspaceFileContent {
     return {
       resource: {

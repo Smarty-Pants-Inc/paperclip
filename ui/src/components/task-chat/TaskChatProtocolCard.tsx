@@ -550,12 +550,6 @@ function WorkspaceChangeCard({ item }: { item: TaskChatWorkspaceChangeItem }) {
           {expanded ? "Show fewer files" : `Show ${item.files.length - 5} more files`}
         </Button>
       ) : null}
-      {fileCount > item.files.length ? (
-        <div className="mt-1 px-2 text-xs text-muted-foreground" data-testid="task-chat-workspace-change-omitted">
-          <p>The runner reported {fileCount - item.files.length} additional {fileCount - item.files.length === 1 ? "file" : "files"} without file details.</p>
-          <SavedOutputNotice kind="patch" runLogHref={item.runLogHref} />
-        </div>
-      ) : null}
     </CardShell>
   );
 }

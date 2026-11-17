@@ -18,11 +18,13 @@ export function runRequestedProviderTrace(
 
 export function ProviderTraceStatusBadge({
   trace,
+  runLogHref,
   requested = false,
   showOff = false,
   className,
 }: {
   trace?: ProviderTraceMetadata | null;
+  runLogHref: string;
   requested?: boolean;
   showOff?: boolean;
   className?: string;
@@ -31,7 +33,7 @@ export function ProviderTraceStatusBadge({
   const expired = trace
     ? new Date(trace.expiresAt).getTime() <= Date.now()
     : false;
-  if (status === "truncated" && !expired) return <SavedOutputNotice />;
+  if (status === "truncated" && !expired) return <SavedOutputNotice kind="trace" runLogHref={runLogHref} />;
   const label = expired
     ? "Trace expired"
     : status === "capturing"

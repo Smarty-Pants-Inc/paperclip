@@ -5193,7 +5193,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       && (entry.isDirectory() || entry.isFile())
     ));
     const entries: CompanySkillProjectBrowseResult["entries"] = [];
-    for (const entry of visibleDirectoryEntries.slice(0, 250)) {
+    for (const entry of visibleDirectoryEntries) {
       const entryPath = normalizedPath === "." ? entry.name : `${normalizedPath}/${entry.name}`;
       entries.push({
         name: entry.name,
@@ -5215,7 +5215,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       path: normalizedPath,
       parentPath: normalizedPath === "." ? null : path.posix.dirname(normalizedPath) || ".",
       entries,
-      truncated: visibleDirectoryEntries.length > 250,
+      truncated: false,
     };
   }
 
