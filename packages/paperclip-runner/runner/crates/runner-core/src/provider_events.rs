@@ -965,7 +965,7 @@ fn provider_performance_spans(params: &Value) -> Vec<Value> {
 
 /// A Codex reasoning item's provider-written summary parts, joined the same
 /// way the live stream separates them. `None` when the provider sent none.
-fn reasoning_summary_text(provider_item: &Value) -> Option<String> {
+fn reasoning_summary_text(provider_item: &Value, completed: bool) -> Option<String> {
     let parts: Vec<&str> = provider_item
         .get("summary")
         .and_then(Value::as_array)?
@@ -976,7 +976,16 @@ fn reasoning_summary_text(provider_item: &Value) -> Option<String> {
         })
         .filter(|part| !part.is_empty())
         .collect();
-    (!parts.is_empty()).then(|| bounded_text(&parts.join("\n\n"), MAX_TEXT_CHARS))
+    // P1c5: a completed thinking summary is person-visible text, kept whole
+    // (redacted) for the durable outbox to deliver whole or paged.
+    (!parts.is_empty()).then(|| {
+        let text = parts.join("\n\n");
+        if completed {
+            redact_sensitive_text_values(&text)
+        } else {
+            bounded_text(&text, MAX_TEXT_CHARS)
+        }
+    })
 }
 
 fn optional_bounded_text(value: Option<&Value>, max_chars: usize) -> Value {
@@ -1607,11 +1616,15 @@ pub fn normalize_codex_notification_in(
                     "text": provider_item.get("text").and_then(Value::as_str).map(|value| {
                         if completed && item_type == "agentMessage" && provider_phase == "final_answer" {
                             final_agent_message_text(value)
+                        } else if completed && item_type == "reasoning" {
+                            // P1c5: completed thinking is person-visible; the
+                            // durable outbox keeps it whole or paged.
+                            redact_sensitive_text_values(value)
                         } else {
                             bounded_text(value, MAX_TEXT_CHARS)
                         }
                     })
-                        .or_else(|| (item_type == "reasoning").then(|| reasoning_summary_text(provider_item)).flatten()),
+                        .or_else(|| (item_type == "reasoning").then(|| reasoning_summary_text(provider_item, completed)).flatten()),
                 });
                 // Preserve only actual terminal invocation identity in the compatibility
                 // projection. Arguments, arbitrary tool names and result bodies stay omitted.
@@ -4070,6 +4083,26 @@ mod tests {
             &json!({"item": {"id": "rs_2", "type": "reasoning", "summary": [], "content": []}}),
         );
         assert_eq!(empty[0].payload["text"], Value::Null);
+    }
+
+    // P1c5: a completed Codex thinking item over 4,096 bytes keeps its whole
+    // redacted text (summary or text), never the "…[truncated]" preview.
+    #[test]
+    fn p1c5_completed_codex_reasoning_keeps_whole_redacted_text() {
+        let thinking = format!(
+            "token=secret-value {}",
+            "Weighing the retry path. ".repeat(2_000)
+        );
+        assert!(thinking.len() > 4_096);
+        let whole = thinking.replace("secret-value", "[REDACTED]");
+        for item in [
+            json!({"id": "rs_3", "type": "reasoning", "summary": [thinking], "content": []}),
+            json!({"id": "rs_4", "type": "reasoning", "text": thinking}),
+        ] {
+            let completed = normalize_codex_notification("item/completed", &json!({"item": item}));
+            assert_eq!(completed[0].event_type, "item.completed");
+            assert_eq!(completed[0].payload["text"], whole);
+        }
     }
 
     #[test]

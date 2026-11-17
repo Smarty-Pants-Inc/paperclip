@@ -2085,10 +2085,13 @@ fn preserve_final_agent_message_text(
         original.get("kind").and_then(Value::as_str),
         Some("agentMessage" | "assistant_message")
     );
+    let reasoning_kind = original.get("kind").and_then(Value::as_str) == Some("reasoning");
     let channel = original.get("channel").and_then(Value::as_str);
-    // Person-visible text: the final answer, a progress message (task chat)
-    // and a failed Pi item's message (transcript).
+    // Person-visible text: the final answer, a progress message (task chat),
+    // a completed thinking item (P1c5: shown in the transcript; never the
+    // 4,096-byte "…[truncated]" preview) and a failed Pi item's message.
     let (field, noun) = match event_type {
+        "item.completed" if reasoning_kind => ("text", "thinking"),
         "item.completed" if message_kind && channel == Some("final") => ("text", "answer"),
         "item.completed" if message_kind && channel == Some("progress") => ("text", "text"),
         "item.failed" if original.get("provider").and_then(Value::as_str) == Some("pi_rpc") => {
@@ -4862,6 +4865,95 @@ mod tests {
             .unwrap();
         assert_eq!(shown, message.replace("secret-value", "[REDACTED]"));
         assert!(!shown.contains("truncat"));
+    }
+
+    // P1c5 (gate 5, run f90bc18e): the thinking stream carried 4,354 bytes but
+    // the completed reasoning item on screen was a 4,008-byte excerpt ending
+    // "…[truncated]" (sanitize_value -> redact_text). A completed reasoning
+    // item is person-visible thinking: redacted, then whole when it fits a
+    // frame, otherwise paged like the answer; never the preview marker.
+    fn completed_reasoning_text(frame: &DurableRunnerConfig, thinking: &str) -> Value {
+        let mut state = DurableState::new(frame);
+        state
+            .enqueue_event(
+                frame,
+                "item.completed",
+                EventPriority::P1,
+                json!({"provider": "pi_rpc", "itemId": "thinking-1", "kind": "reasoning",
+                    "channel": "detail", "text": thinking}),
+            )
+            .unwrap();
+        state.outbox[0]
+            .envelope
+            .pointer("/payload/payload")
+            .unwrap()
+            .clone()
+    }
+
+    fn thinking_of(bytes: usize) -> String {
+        let mut thinking = "token=secret-value ".to_owned();
+        let unit = "Thinking \"about\" the plan 🦀 naïve.\n";
+        while thinking.len() + unit.len() <= bytes {
+            thinking.push_str(unit);
+        }
+        while thinking.len() < bytes {
+            thinking.push('.');
+        }
+        assert_eq!(thinking.len(), bytes);
+        thinking
+    }
+
+    #[test]
+    fn p1c5_completed_reasoning_of_4354_bytes_leaves_the_outbox_whole_and_redacted() {
+        let frame = config(PathBuf::from("unused"));
+        let thinking = thinking_of(4_354);
+        let payload = completed_reasoning_text(&frame, &thinking);
+        let shown = payload.get("text").and_then(Value::as_str).unwrap();
+        assert!(
+            !shown.contains("truncated"),
+            "{}",
+            &shown[shown.len() - 40..]
+        );
+        assert!(!shown.contains("secret-value"));
+        assert_eq!(shown, thinking.replace("secret-value", "[REDACTED]"));
+        assert_eq!(payload["kind"], "reasoning");
+    }
+
+    #[test]
+    fn p1c5_completed_reasoning_of_50_kib_leaves_the_outbox_whole_and_redacted() {
+        // Production frame (paperclip-runnerd default 1 MiB).
+        let mut frame = config(PathBuf::from("unused"));
+        frame.max_frame_bytes = 1024 * 1024;
+        frame.max_outbox_bytes = 4 * 1024 * 1024;
+        let thinking = thinking_of(50 * 1024);
+        let payload = completed_reasoning_text(&frame, &thinking);
+        let shown = payload.get("text").and_then(Value::as_str).unwrap();
+        assert!(!shown.contains("truncated"));
+        assert!(!shown.contains("secret-value"));
+        assert_eq!(shown, thinking.replace("secret-value", "[REDACTED]"));
+    }
+
+    #[test]
+    fn p1c5_completed_reasoning_longer_than_a_frame_is_paged_never_cut() {
+        let mut frame = config(PathBuf::from("unused"));
+        frame.state_dir = temporary_directory("reasoning-notice");
+        frame.max_frame_bytes = 16_000;
+        let thinking = thinking_of(50 * 1024);
+        let whole = thinking.replace("secret-value", "[REDACTED]");
+        let payload = completed_reasoning_text(&frame, &thinking);
+        let shown = payload.get("text").and_then(Value::as_str).unwrap();
+        assert!(!shown.to_lowercase().contains("truncat"));
+        assert!(!shown.contains("secret-value"));
+        assert!(shown.starts_with("This thinking is longer than one message (52 KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the thinking, not the whole thinking):\n\ntoken=[REDACTED] "), "{}", &shown[..200]);
+        let full = payload.get("fullText").expect("fullText for the agent");
+        let path = full.get("path").and_then(Value::as_str).unwrap();
+        assert!(Path::new(path).starts_with(&frame.state_dir));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), whole);
+        assert_eq!(
+            full.get("sha256").and_then(Value::as_str).unwrap(),
+            format!("{:x}", Sha256::digest(whole.as_bytes()))
+        );
+        let _ = std::fs::remove_dir_all(&frame.state_dir);
     }
 
     // Paul NOTE 5: a projector's agent-facing reference to an answer longer
