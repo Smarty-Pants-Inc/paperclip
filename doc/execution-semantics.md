@@ -3050,6 +3050,11 @@ conversation may still have a yielded semantic result. Its completed final reply
 remains visible; a completed unknown-channel terminal reply is used only under
 that finished-turn authority and after the explicit final and non-yielded summary.
 The presentation decision records the conversation-specific choice.
+When the live path resolves before its own finalization commits (another
+finalizer holds the lease), a yielded turn's `none` is provisional: it carries
+`native_presentation_pending_commit`, stays pending, and committed-response
+recovery resolves it from the committed decision. A run's own open card still
+owns that turn; every other recorded `none` stays final.
 Stream closure without a turn terminal is not proof of success. Event
 replay uses the existing source receipts and never repeats provider work merely
 to recover recorded output.
