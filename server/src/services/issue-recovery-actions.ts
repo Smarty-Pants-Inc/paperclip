@@ -24,7 +24,10 @@ const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfi
 const MAX_UPSERT_RETRIES = 3;
 // Recheck at every ordinary write: the guarded Stop owner may have annotated
 // the action after this writer's read. A stale snapshot cannot hide that hold.
-const noTaskStopPending = sql`coalesce(${issueRecoveryActions.evidence}->'stopPending'->>'schema', '') <> ${STOP_PENDING_SCHEMA}`;
+// Built per query, never at module load: stop-pending.ts sits in an import
+// cycle with this module, and a load-time read of STOP_PENDING_SCHEMA can see
+// it before it is initialized (an empty right-hand side, a SQL syntax error).
+const noTaskStopPending = () => sql`coalesce(${issueRecoveryActions.evidence}->'stopPending'->>'schema', '') <> ${STOP_PENDING_SCHEMA}`;
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -367,7 +370,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           .where(
             and(
               eq(issueRecoveryActions.id, priorActionId),
-              noTaskStopPending,
+              noTaskStopPending(),
               inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
             ),
           )
@@ -426,7 +429,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx.update(issueRecoveryActions).set({ nextAction: input.nextAction, updatedAt: now })
             .where(and(eq(issueRecoveryActions.id, existing.id),
               inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-              noTaskStopPending,
+              noTaskStopPending(),
               sql`${issueRecoveryActions.evidence}->'workspaceOwnerStop' is null`)).returning(), { companyId: input.companyId });
           if (!updated) return retryUpsertSourceScoped(input, retryCount);
           return toReadModel(updated);
@@ -498,7 +501,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
             .where(
               and(
                 eq(issueRecoveryActions.id, existing.id),
-                noTaskStopPending,
+                noTaskStopPending(),
                 inArray(issueRecoveryActions.status, [
                   ...ACTIVE_RECOVERY_ACTION_STATUSES,
                 ]),
@@ -574,7 +577,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           .where(
             and(
               eq(issueRecoveryActions.id, existing.id),
-              noTaskStopPending,
+              noTaskStopPending(),
               inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
             ),
           )
@@ -620,7 +623,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
       // A new task path, terminal task or generic board disposition is not
       // Stop proof. Only the guarded task release removes this diagnostic.
-      noTaskStopPending,
+      noTaskStopPending(),
     ];
     if (input.actionId) {
       predicates.push(eq(issueRecoveryActions.id, input.actionId));
