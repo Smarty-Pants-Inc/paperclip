@@ -51,9 +51,11 @@ export function workspaceRestoreHoldNextAction(evidence: Record<string, unknown>
   return evidence?.[WORKSPACE_RESTORE_PENDING_KEY] === true ? RECOVERING_SAVED_WORK_NEXT_ACTION : UNRESTORED_FILES_NEXT_ACTION;
 }
 /** For producers that pin a source before any restore: the files are only owed
- * unless the run already records a real restore/copy-back failure. */
+ * unless the run already records a real restore/copy-back failure. A run whose
+ * marker is still pending is owed: a repeat producer must not read its own owed
+ * marker as an adapter-reported failure. */
 export function workspaceRestoreOnlyOwed(run: Pick<Run, "resultJson">): boolean {
-  return !hasWorkspaceRestoreFailure(run.resultJson);
+  return !hasWorkspaceRestoreFailure(run.resultJson) || isWorkspaceRestorePending(run.resultJson);
 }
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
@@ -269,13 +271,21 @@ export async function terminalizeLegacyExecution(input: {
         && JSON.stringify(existing.evidence.workspaceRestoreRecovery) === JSON.stringify(updated.resultJson!.workspaceRestoreRecovery))))
         return updated;
       const now = new Date();
+      // The hold keeps the persisted owed fact (run or existing hold) unless
+      // THIS call records a real restore failure: a non-owed recorded failure,
+      // or a terminal patch reporting one. Those cleared the run's fact above.
+      const recordsRealFailure = input.recordRestoreFailureOnly
+        ? input.workspaceRestorePending !== true : hasWorkspaceRestoreFailure(input.patch?.resultJson);
+      const restorePending = input.workspaceRestorePending === true || (!recordsRealFailure
+        && (updated.resultJson?.[WORKSPACE_RESTORE_PENDING_KEY] === true
+          || existing?.evidence?.[WORKSPACE_RESTORE_PENDING_KEY] === true));
       const evidence = {
         ...existing?.evidence,
         runId: run.id,
         originalFailureCode: updated.errorCode,
         workspaceRestoreFailure: updated.resultJson!.workspaceRestoreFailure,
         workspaceRestoreRecovery: updated.resultJson!.workspaceRestoreRecovery,
-        [WORKSPACE_RESTORE_PENDING_KEY]: input.workspaceRestorePending === true ? true : undefined,
+        [WORKSPACE_RESTORE_PENDING_KEY]: restorePending ? true : undefined,
         executionReconciliation: undefined,
         continuationDelivery: "invalidated",
         automaticRecovery: { policy: "preserve_without_replay_v1", runId: run.id, replay: "blocked",
