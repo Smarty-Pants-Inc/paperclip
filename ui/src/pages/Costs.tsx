@@ -41,7 +41,7 @@ import { useCompany } from "../context/CompanyContext";
 import { useDateRange, PRESET_KEYS, PRESET_LABELS } from "../hooks/useDateRange";
 import { retainQuotaWindows } from "../lib/quota-refresh";
 import { queryKeys } from "../lib/queryKeys";
-import { billingTypeDisplayName, cn, formatCents, formatConfiguredCents, formatTokens, providerDisplayName } from "../lib/utils";
+import { billingTypeDisplayName, cn, formatCents, formatConfiguredCents, formatSpendPercent, formatTokens, providerDisplayName } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -678,7 +678,7 @@ export function Costs({
               label="Budget"
               value={activeBudgetIncidents.length > 0 ? String(activeBudgetIncidents.length) : (
                 spendData?.summary.budgetCents && spendData.summary.budgetCents > 0
-                  ? preset === "mtd" ? `${spendData.summary.utilizationPercent}%` : formatConfiguredCents(spendData.summary.budgetCents)
+                  ? preset === "mtd" ? formatSpendPercent(spendData.summary.utilizationPercent) : formatConfiguredCents(spendData.summary.budgetCents)
                   : "Open"
               )}
               subtitle={
@@ -836,7 +836,7 @@ export function Costs({
                                             costCents={modelRow.costCents}
                                             eventCount={modelRow.eventCount}
                                             estimatedEventCount={modelRow.estimatedEventCount}
-                                            suffix={<span className="ml-1 font-normal text-muted-foreground">({sharePct}%)</span>}
+                                            suffix={<span className="ml-1 font-normal text-muted-foreground">({formatSpendPercent(sharePct)})</span>}
                                           />
                                           <div className="text-muted-foreground">
                                             {formatTokens(modelRow.inputTokens + modelRow.cachedInputTokens + modelRow.outputTokens)} tok

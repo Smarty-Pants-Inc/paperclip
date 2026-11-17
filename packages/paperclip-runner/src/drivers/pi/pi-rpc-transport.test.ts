@@ -74,7 +74,12 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
       const records = await queuedRecords(child);
       const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
       const projected = projector.project(records[0]);
-      expect(projected[0]).toMatchObject({ eventType: "item.started", payload: { input: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+      // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was input: stringContaining("[Pi projection truncated]").
+      // The oversized input is spilled whole to a referenced file, not cut.
+      expect(projected[0]).toMatchObject({ eventType: "item.started", payload: { input: expect.stringMatching(/\[Full (?:input|text): \//u) }, debug: { piProjection: { truncated: true } } });
+      const spillPath = /\[Full (?:input|text): (\/[^\s\]]+)/u.exec(String(projected[0].payload.input))![1]!;
+      expect((await import("node:fs")).readFileSync(spillPath, "utf8")).toContain("x".repeat(300000));
+      expect(JSON.stringify(projected)).not.toContain("truncated]");
       expect(projector.project(records[1]).some(event => event.payload.output === "second")).toBe(true);
       expect(records.slice(0, 2).map(record => ((record.partialResult as PiRpcRecord).content as Array<{ text: string }>)[0].text)).toEqual(["first", "second"]);
       expect(records[1]).toMatchObject({ args: { input: "safe" } });
@@ -215,10 +220,16 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
     } finally { await child.close(); }
   });
 
+  // On gcp4, three focused runs at both 97feb9ef and ecfccc88 put each
+  // 64 MiB framing case at 25-30s (one 30s timeout per revision). Redaction
+  // alone took 111-183ms for 64 MiB and 1.3-2.1ms for a 300 KiB F1 answer;
+  // this transport-only case does not project. Give only this fixture a 45s
+  // ACK budget inside the 60s test budget: raising Vitest alone still hit the
+  // default 30s ACK deadline. Production redaction, bounds and deadlines stay.
   it.each([0, 1])("enforces the default 64 MiB record byte boundary (+%i)", async extra => {
     const limit = 64 * 1024 * 1024;
     const overhead = Buffer.byteLength(JSON.stringify({ type: "tool_execution_update", toolCallId: "boundary", text: "" }));
-    const child = emittingTransport(`await emit({ type: "tool_execution_update", toolCallId: "boundary", text: "x".repeat(${limit - overhead + extra}) });`);
+    const child = emittingTransport(`await emit({ type: "tool_execution_update", toolCallId: "boundary", text: "x".repeat(${limit - overhead + extra}) });`, { requestTimeoutMs: 45_000 });
     try {
       if (extra) await expect(child.request("emit")).rejects.toThrow(`record exceeded ${limit} bytes`);
       else {
@@ -228,7 +239,7 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
         expect((record.text as string).length).toBe(limit - overhead);
       }
     } finally { await child.close(); }
-  }, 30_000);
+  }, 60_000);
 
   it("counts UTF-8 bytes rather than UTF-16 units and splits only on LF, accepting CRLF", async () => {
     const record = { type: "message_end", text: "é😀\u2028\u2029".repeat(100) };

@@ -68,6 +68,93 @@ afterEach(async () => {
 const begin = { companyId: "co1", agentId: "ag1", runId: "run1" };
 
 describe("createDurableRunLogStore", () => {
+  // Data safety: page decoding must preserve saved bytes, including mirror
+  // fallback and live writes paused partway through a UTF-8 character.
+  describe.each([false, true])("UTF-8 page edges (S3 fallback: %s)", (remote) => {
+    async function saved(bytes: Buffer) {
+      const { provider, objects } = createMemoryProvider();
+      const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+      const handle = await store.begin(begin);
+      await fs.writeFile(path.join(baseDir, handle.logRef), bytes);
+      if (remote) {
+        objects.set(handle.logRef, bytes);
+        await fs.rm(baseDir, { recursive: true, force: true });
+      }
+      return { store, handle, objects };
+    }
+
+    it.each(["é", "中", "🧪"])("preserves %s at every possible page-edge split", async (character) => {
+      for (let cut = 1; cut < Buffer.byteLength(character); cut++) {
+        const bytes = Buffer.from(`prefix-${character}-tail-${character}`);
+        const { store, handle } = await saved(bytes);
+        const pages: string[] = [];
+        let offset = 0;
+        for (let page = 0; page < bytes.length; page++) {
+          const result = await store.read(handle, { offset, limitBytes: 7 + cut });
+          expect(result.content).not.toContain("\uFFFD");
+          expect(result.content.length).toBeGreaterThan(0);
+          pages.push(result.content);
+          if (result.nextOffset === undefined) break;
+          expect(result.nextOffset).toBeGreaterThan(offset);
+          expect(result.nextOffset).toBe(offset + Buffer.byteLength(result.content));
+          offset = result.nextOffset;
+        }
+        expect(Buffer.from(pages.join(""))).toEqual(bytes);
+      }
+    });
+
+    it.each(["é", "中", "🧪"])("progresses when the limit is smaller than %s", async (character) => {
+      for (let limitBytes = 1; limitBytes < Buffer.byteLength(character); limitBytes++) {
+        const bytes = Buffer.from(`${character}x${character}`);
+        const { store, handle } = await saved(bytes);
+        let offset = 0;
+        let content = "";
+        for (let page = 0; page < bytes.length; page++) {
+          const result = await store.read(handle, { offset, limitBytes });
+          expect(result.content.length).toBeGreaterThan(0);
+          expect(result.content).not.toContain("\uFFFD");
+          content += result.content;
+          if (result.nextOffset === undefined) break;
+          expect(result.nextOffset).toBeGreaterThan(offset);
+          offset = result.nextOffset;
+        }
+        expect(Buffer.from(content)).toEqual(bytes);
+      }
+    });
+
+    it.each(["é", "中", "🧪"])("preserves the aligned start while trimming %s at the end", async (character) => {
+      const bytes = Buffer.from(`older\nrecord-${character}-tail\n`);
+      const { store, handle } = await saved(bytes);
+      for (let cut = 1; cut < Buffer.byteLength(character); cut++) {
+        const first = await store.read(handle, { offset: 9, limitBytes: 4 + cut, alignStartToRecord: true });
+        expect(first).toEqual({ content: "record-", nextOffset: 13 });
+        const rest = await store.read(handle, { offset: first.nextOffset });
+        expect(Buffer.from(first.content + rest.content)).toEqual(bytes.subarray(6));
+      }
+    });
+
+    it("progresses an aligned tiny page starting inside a character", async () => {
+      const { store, handle } = await saved(Buffer.from("older\nrecord-🧪-tail\n"));
+      const result = await store.read(handle, { offset: 14, limitBytes: 1, alignStartToRecord: true });
+      expect(result).toEqual({ content: "record-🧪", nextOffset: 17 });
+      expect(result.nextOffset).toBeGreaterThan(14);
+    });
+
+    it.each(["é", "中", "🧪"])("leaves an incomplete live EOF %s for the next read", async (character) => {
+      const complete = Buffer.from(`ok${character}`);
+      for (let cut = 1; cut < Buffer.byteLength(character); cut++) {
+        const { store, handle, objects } = await saved(complete.subarray(0, 2 + cut));
+        for (const alignStartToRecord of [false, true]) {
+          const result = await store.read(handle, { offset: 1, limitBytes: 100, alignStartToRecord });
+          expect(result).toEqual({ content: alignStartToRecord ? "ok" : "k", nextOffset: 2 });
+        }
+        expect(await store.read(handle, { offset: 2, limitBytes: 1 })).toEqual({ content: "", nextOffset: 2 });
+        if (remote) objects.set(handle.logRef, complete);
+        else await fs.writeFile(path.join(baseDir, handle.logRef), complete);
+        expect(await store.read(handle, { offset: 2, limitBytes: 100 })).toEqual({ content: character, nextOffset: undefined });
+      }
+    });
+  });
   it.each([false, true])("reads a complete long final record from a compact tail (S3 fallback: %s)", async (remote) => {
     const { provider, objects, calls } = createMemoryProvider();
     const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });

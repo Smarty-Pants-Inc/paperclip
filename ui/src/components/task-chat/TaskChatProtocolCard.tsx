@@ -55,6 +55,8 @@ import { RichWorkProductCard } from "./RichWorkProductCard";
 import { planPreviewContent, TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 import { TaskChatDiffCounts, TaskChatDiffView } from "./TaskChatDiffView";
 import { parseUnifiedDiffLines } from "./diff-lines";
+import { SavedOutputNotice } from "./SavedOutputNotice";
+import { savedOutputForDisplay } from "./saved-output";
 import { useArtifactsV1Enabled } from "@/hooks/useArtifactsV1Enabled";
 import { ArtifactFileRow, ArtifactRow, fileRowSourceFromAttachment, fileRowSourceFromWorkProduct, subjectFromAttachment, subjectFromDocumentSummary, subjectFromWorkProduct, workProductStateBadge } from "@/components/artifacts/v1";
 
@@ -292,17 +294,18 @@ function PlanProposalCard({ item }: { item: TaskChatProviderActivityItem }) {
 }
 
 function ProviderActivityCard({
-  item,
+  item: rawItem,
 }: {
   item: TaskChatProviderActivityItem;
 }) {
+  const item = { ...rawItem, ...savedOutputForDisplay(rawItem.output, rawItem.outputTruncated), summary: savedOutputForDisplay(rawItem.summary).output };
   if (item.family === "plan_proposal") return <PlanProposalCard item={item} />;
   const Icon = FAMILY_ICON[item.family];
   const hasDetails =
     item.details.length > 0 ||
     item.links.length > 0 ||
     item.children.length > 0 ||
-    Boolean(item.output);
+    Boolean(item.output) || Boolean(item.outputTruncated);
   return (
     <CardShell
       icon={Icon}
@@ -405,9 +408,7 @@ function ProviderActivityCard({
             </pre>
           ) : null}
           {item.outputTruncated ? (
-            <p className="mt-1 text-xs text-muted-foreground">
-              Output truncated to 8 KiB.
-            </p>
+            <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} />
           ) : null}
         </details>
       ) : null}
@@ -419,7 +420,9 @@ function WorkspaceChangeFileRow({
   file,
   open,
   onToggle,
+  runLogHref,
 }: {
+  runLogHref?: string;
   file: TaskChatWorkspaceChangeItem["files"][number];
   open: boolean;
   onToggle: () => void;
@@ -468,12 +471,13 @@ function WorkspaceChangeFileRow({
         ) : parsed?.lines.length ? (
           <TaskChatDiffView
             className="ml-7 mt-1"
+            runLogHref={runLogHref}
             lines={parsed.lines}
             truncated={parsed.truncated || file.diffTruncated === true}
           />
-        ) : (
-          <p className="ml-7 mt-1 text-xs text-muted-foreground">This patch is too large to show here.</p>
-        )
+        ) : file.diffTruncated === true ? (
+          <div className="ml-7 mt-1"><SavedOutputNotice kind="patch" runLogHref={runLogHref} /></div>
+        ) : null
       ) : null}
     </div>
   );
@@ -529,6 +533,7 @@ function WorkspaceChangeCard({ item }: { item: TaskChatWorkspaceChangeItem }) {
           <WorkspaceChangeFileRow
             key={`${file.operation}:${file.path}`}
             file={file}
+            runLogHref={item.runLogHref}
             open={openPaths.has(file.path)}
             onToggle={() => toggle(file.path)}
           />
@@ -544,12 +549,6 @@ function WorkspaceChangeCard({ item }: { item: TaskChatWorkspaceChangeItem }) {
         >
           {expanded ? "Show fewer files" : `Show ${item.files.length - 5} more files`}
         </Button>
-      ) : null}
-      {fileCount > item.files.length ? (
-        <p className="mt-1 px-2 text-xs text-muted-foreground" data-testid="task-chat-workspace-change-omitted">
-          {fileCount - item.files.length} more {fileCount - item.files.length === 1 ? "file" : "files"} changed.
-          This change set is too large to list them here.
-        </p>
       ) : null}
     </CardShell>
   );
@@ -628,9 +627,7 @@ function WorkspaceFileCard({ item }: { item: TaskChatWorkspaceFileItem }) {
             </pre>
           )}
           {item.previewTruncated ? (
-            <p className="text-xs text-muted-foreground">
-              Preview truncated by the runner.
-            </p>
+            <SavedOutputNotice kind="file preview" runLogHref={item.runLogHref} />
           ) : null}
         </DialogContent>
       </Dialog>

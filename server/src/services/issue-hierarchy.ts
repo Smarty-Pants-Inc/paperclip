@@ -1,10 +1,17 @@
 import { and, eq, sql } from "drizzle-orm";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { issues, type Db } from "@paperclipai/db";
 import { MAX_AGENT_TASK_HIERARCHY_DEPTH, type IssueParentAdjustment } from "@paperclipai/shared";
 
+export const AGENT_TASK_HIERARCHY_DEPTH_ENV = "PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH";
+
+/** Absence preserves the upstream limit; malformed settings refuse startup. */
+export function resolveAgentTaskHierarchyDepth(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntegerEnvironment(env, AGENT_TASK_HIERARCHY_DEPTH_ENV, MAX_AGENT_TASK_HIERARCHY_DEPTH);
+}
+
 /**
- * `flatten` (the default) applies the agent hierarchy limit: a new parent edge
- * may not make the task deeper than MAX_AGENT_TASK_HIERARCHY_DEPTH. Board users
+ * `flatten` (the default) applies the configured agent hierarchy limit. Board users
  * pass `allow_nested` and may build trees of any depth.
  */
 export type IssueParentDepthPolicy = "flatten" | "allow_nested";
@@ -43,7 +50,7 @@ export function placeTaskParent(chain: ParentChainRow[], policy: IssueParentDept
     return { effectiveParentId: requested?.id ?? null, adjustment: null };
   }
   // A parent at depth d (root = 1) gives the new task depth d + 1.
-  const maxParentDepth = MAX_AGENT_TASK_HIERARCHY_DEPTH - 1;
+  const maxParentDepth = resolveAgentTaskHierarchyDepth() - 1;
   if (chain.length <= maxParentDepth) return { effectiveParentId: requested.id, adjustment: null };
   const targetIndex = chain.length - maxParentDepth;
   // Low-trust boundaries are subtrees. Never move a task above the root of a
@@ -207,10 +214,16 @@ export async function planIssueParentChange(
   return planParentChange(existing, chain, requestedParentId, Boolean(child), currentParent ?? null, policy);
 }
 
-/** Adds `parentAdjusted` to a create/update result only when the parent was adjusted. */
+/** Adds the structured adjustment and an agent-readable warning when depth placement changed the parent. */
 export function withParentAdjustment<T extends object>(
   issue: T,
   adjustment: IssueParentAdjustment | null,
-): T & { parentAdjusted?: IssueParentAdjustment } {
-  return adjustment ? { ...issue, parentAdjusted: adjustment } : issue;
+): T & { parentAdjusted?: IssueParentAdjustment; parentAdjustmentWarning?: string } {
+  if (!adjustment) return issue;
+  const warning = adjustment.reason === "max_agent_depth" && adjustment.applied
+    ? `Requested parent ${adjustment.requestedParent?.id ?? "unknown"} was not used: the agent task hierarchy depth limit `
+      + `(${AGENT_TASK_HIERARCHY_DEPTH_ENV}) re-parented this task to ${adjustment.effectiveParent?.id ?? "top level"}. `
+      + "Inspect parentAdjusted before delegating further."
+    : undefined;
+  return { ...issue, parentAdjusted: adjustment, ...(warning ? { parentAdjustmentWarning: warning } : {}) };
 }

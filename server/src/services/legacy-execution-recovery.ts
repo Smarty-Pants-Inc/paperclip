@@ -37,6 +37,22 @@ import { recordLegacyShutdownBeforeDispatch, SERVER_SHUTDOWN_INTERRUPTED_CODE } 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const UNRESTORED_FILES_NEXT_ACTION = "The task's saved files could not be put back after the run stopped. "
   + "They are kept where they were and are not applied. Press Retry to continue from the last saved version in a new workspace.";
+/** Files are owed but no restore has been tried or has failed yet. */
+export const RECOVERING_SAVED_WORK_NEXT_ACTION = "Recovering your saved work; your message is kept and runs when it's back.";
+/** Hold evidence key: the files were pinned before any restore was tried. It
+ * changes only the words; the hold, its predicates and recovery key on
+ * workspaceRestoreFailure/workspaceRestoreRecovery exactly as before. */
+export const WORKSPACE_RESTORE_PENDING_KEY = "workspaceRestorePending";
+/** One authority for the restore-hold words: only a recorded restore failure
+ * says the files could not be put back; owed files say they are recovering. */
+export function workspaceRestoreHoldNextAction(evidence: Record<string, unknown> | null | undefined): string {
+  return evidence?.[WORKSPACE_RESTORE_PENDING_KEY] === true ? RECOVERING_SAVED_WORK_NEXT_ACTION : UNRESTORED_FILES_NEXT_ACTION;
+}
+/** For producers that pin a source before any restore: the files are only owed
+ * unless the run already records a real restore/copy-back failure. */
+export function workspaceRestoreOnlyOwed(run: Pick<Run, "resultJson">): boolean {
+  return !hasWorkspaceRestoreFailure(run.resultJson);
+}
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 const unusedReconciliationContextKeys = [
@@ -123,6 +139,8 @@ export async function terminalizeLegacyExecution(input: {
   /** Adapter settlement records a copy-back failure before host finalization. */
   recordRestoreFailureOnly?: boolean;
   workspaceRestoreSource?: LegacyWorkspaceRestoreSource;
+  /** The files are pinned before any restore was tried; words only. */
+  workspaceRestorePending?: boolean;
 }) {
   const { db, run, status } = input;
   let patch = input.patch;
@@ -249,16 +267,17 @@ export async function terminalizeLegacyExecution(input: {
         originalFailureCode: updated.errorCode,
         workspaceRestoreFailure: updated.resultJson!.workspaceRestoreFailure,
         workspaceRestoreRecovery: updated.resultJson!.workspaceRestoreRecovery,
+        [WORKSPACE_RESTORE_PENDING_KEY]: input.workspaceRestorePending === true ? true : undefined,
         executionReconciliation: undefined,
         continuationDelivery: "invalidated",
         automaticRecovery: { policy: "preserve_without_replay_v1", runId: run.id, replay: "blocked",
           actionOutcome: "unknown", recordedAt: now.toISOString() },
       };
-      const values = { status: "resolved", outcome: "blocked", ownerType: "board", ownerAgentId: null,
+      const holdValues = { status: "resolved", outcome: "blocked", ownerType: "board", ownerAgentId: null,
         ownerUserId: null, returnOwnerAgentId: null, evidence, resolvedAt: now, updatedAt: now,
         wakePolicy: null, monitorPolicy: null,
-        nextAction: UNRESTORED_FILES_NEXT_ACTION,
       };
+      const values = { ...holdValues, nextAction: workspaceRestoreHoldNextAction(evidence) };
       if (existing) await tx.update(issueRecoveryActions).set(values).where(eq(issueRecoveryActions.id, existing.id));
       else await tx.insert(issueRecoveryActions).values({ ...values, companyId: run.companyId,
         sourceIssueId: task.id, kind: "active_run_watchdog",
@@ -337,7 +356,7 @@ export async function terminalizeLegacyExecution(input: {
           attempt: executionFailureRetryCount(run) + 1,
         },
         nextAction: hasRequiredWorkspaceRecovery(updated.resultJson)
-          || hasWorkspaceRestoreFailure(updated.resultJson) ? UNRESTORED_FILES_NEXT_ACTION
+          || hasWorkspaceRestoreFailure(updated.resultJson) ? workspaceRestoreHoldNextAction(null)
           : "The run stopped before it finished, and Paperclip cannot tell which of its last actions took effect. "
             + "Press Retry to continue the task in a fresh run; the agent checks those actions before repeating any.",
         maxAttempts: 3,
@@ -548,9 +567,11 @@ export async function recordLegacyWorkspaceRestoreFailure(db: Db, run: Run, evid
   return recordRequiredWorkspaceRestoreFailure(db, run, evidence, source);
 }
 
-export async function recordRequiredWorkspaceRestoreFailure(db: Db, run: Run, evidence: Record<string, unknown>, source?: LegacyWorkspaceRestoreSource) {
+export async function recordRequiredWorkspaceRestoreFailure(db: Db, run: Run, evidence: Record<string, unknown>, source?: LegacyWorkspaceRestoreSource,
+  options: { restorePending?: boolean } = {}) {
   if (!hasWorkspaceRestoreFailure(evidence)) return;
   return terminalizeLegacyExecution({ db, run, status: run.status,
     recordRestoreFailureOnly: true, patch: { resultJson: evidence }, workspaceRestoreSource: source,
+    workspaceRestorePending: options.restorePending === true,
   });
 }

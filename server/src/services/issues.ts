@@ -68,6 +68,7 @@ import {
 import { Buffer } from "node:buffer";
 import { isDeepStrictEqual } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
 import { markdownToPlainText, parseMarkdown } from "chat";
@@ -301,6 +302,12 @@ export const ISSUE_SUBTREE_DIAGNOSTICS_MAX_WAKE_REQUESTS_PER_NODE = 5;
 export const ISSUE_SUBTREE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS_PER_NODE = 5;
 const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
+export const MAX_ACTIVE_CHILD_ISSUES_ENV = "PAPERCLIP_MAX_ACTIVE_CHILD_ISSUES";
+
+/** Absence preserves the upstream limit; malformed settings refuse startup. */
+export function resolveMaxActiveChildIssues(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntegerEnvironment(env, MAX_ACTIVE_CHILD_ISSUES_ENV, MAX_CHILD_ISSUES_CREATED_BY_HELPER);
+}
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
 // Non-human author sentinels that agents post under. These ARE eligible for
@@ -7128,6 +7135,12 @@ async function lockIssueForCommentMutation(tx: DbTransaction, commentId: string)
   return Boolean(issue);
 }
 
+/** The posted body is the accepted summary, or the whole answer that the
+ * schema-capped (12,000-character) summary previews. */
+function presentsAcceptedSummary(summary: unknown, body: string): boolean {
+  return typeof summary === "string" && (summary === body || (summary.length >= 12_000 && body.startsWith(summary)));
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -10069,9 +10082,10 @@ export function issueService(db: Db) {
             notInArray(issues.status, ["done", "cancelled"]),
           ),
         );
-      if (childCount >= MAX_CHILD_ISSUES_CREATED_BY_HELPER) {
+      const maxActiveChildren = resolveMaxActiveChildIssues();
+      if (childCount >= maxActiveChildren) {
         throw unprocessable(
-          `Parent issue already has the maximum ${MAX_CHILD_ISSUES_CREATED_BY_HELPER} active child issues for this helper`,
+          `Parent issue already has the maximum ${maxActiveChildren} active child issues for this helper`,
         );
       }
 
@@ -11249,6 +11263,20 @@ export function issueService(db: Db) {
           [enriched],
           tx,
         );
+        const placementReceipt = withParentAdjustment(withRelations, parentAdjustment);
+        if (placementReceipt.parentAdjustmentWarning) {
+          await logActivity(tx as unknown as Db, {
+            companyId,
+            actorType: issueData.createdByAgentId ? "agent" : issueData.createdByUserId ? "user" : "system",
+            actorId: issueData.createdByAgentId ?? issueData.createdByUserId ?? "issue-hierarchy",
+            agentId: issueData.createdByAgentId ?? null,
+            runId: actorRunId ?? null,
+            action: "issue.parent_adjusted",
+            entityType: "issue",
+            entityId: issue.id,
+            details: { parentAdjusted: parentAdjustment, warning: placementReceipt.parentAdjustmentWarning },
+          });
+        }
         insertedNewIssue = true;
         return withRelations;
       };
@@ -13827,7 +13855,7 @@ export function issueService(db: Db) {
         if (
           presentationRun?.resultJson?.finalizationReasonCode ===
             "governed_response_waiting" &&
-          (parseObject(presentationRun.resultJson.nativeResult).summary !== body ||
+          (!presentsAcceptedSummary(parseObject(presentationRun.resultJson.nativeResult).summary, body) ||
             !(await authorizeNativeChatReviewPresentation(
               dbOrTx,
               {

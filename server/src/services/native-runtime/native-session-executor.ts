@@ -71,7 +71,7 @@ import { createRunUsageRecorder } from "../usage-receipts.js";
 import { syncPluginTaskCredentialHandoff, registerPluginTaskCredentialHandoff } from "../plugin-task-credential-writeback.js";
 import { resolvePluginTaskResume, type PluginTaskDescription } from "../environment-task-runtime.js";
 import { assertAttachedPortableTask, readyPortableTaskSource, unlaunchedPortableTaskLease } from "../plugin-task-ownership.js";
-import { environmentTaskOperationSchema, environmentTaskResultSchema } from "@paperclipai/plugin-sdk";
+import { environmentTaskOperationSchema, environmentTaskResultSchema, JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { preparePluginRunnerCredentials } from "./plugin-runner-credentials.js";
 import { createPluginRunnerTaskOwner, verifyPluginRunnerTaskReattachment } from "./plugin-runner-task.js";
 import { createSandboxRunnerRetention, createSandboxRunnerSupervision, type SandboxRunnerRetention } from "./sandbox-runner-retention.js";
@@ -490,6 +490,16 @@ type NativeSessionStartup = {
   settle: () => void;
 };
 const nativeSessionStartups = new Map<string, NativeSessionStartup>();
+/**
+ * Tools still open in a native run's governed-wait observation, by run id.
+ * An early answer on an external chat must not cancel the source run while one
+ * of the person's tools (a foreground command) is still running; the turn parks
+ * on its own once the last sibling has closed, and the answer is delivered then.
+ */
+const nativeGovernedWaitOpenTools = new Map<string, number>();
+export function nativeRunHasOpenGovernedWaitTool(runId: string): boolean {
+  return (nativeGovernedWaitOpenTools.get(runId) ?? 0) > 0;
+}
 
 function detachActiveNativeSessionForRestart(active: ActiveNativeSession) {
   active.restartDetach ??= active.session.detachControllerForRestart!();
@@ -828,9 +838,43 @@ export type WarmNativeSessionCloseResult = {
   failures: WarmNativeSessionCloseFailure[];
 };
 
+/** The harness-storage fence's permanent refusal of a predecessor's checkpoint:
+ * the task's execution (or a newer backup) already belongs to a later run and
+ * this owner never committed (native-harness-backup-storage.ts fence()). */
+function isSupersededCheckpointRefusal(error: unknown): boolean {
+  for (let current = error, depth = 0; current instanceof Error && depth < 8; current = current.cause, depth++) {
+    if (current.message === "native_harness_storage_owner_superseded") return true;
+  }
+  return false;
+}
+
+/** Boat/remote checkpoint receipts (persistRemoteRunnerCheckpoint): the fence
+ * refused this owner BEFORE any remote state was inspected or copied, and the
+ * transport passed `settled`, which it does only for a Runner whose durable
+ * suspension it proved (runnerd-codex-transport close: runnerSettled implies
+ * runnerSuspended, never a Runner retained alive). The transport then
+ * force-stops in `finally` and rethrows this same ordinary error; a force-stop
+ * failure replaces it (releaseRunnerProcessOwnership). */
+const remoteCheckpointOwnerRefusals = new WeakMap<Error, { settlement: "settled" | "unsettled" }>();
+
+function isSuspendedRemoteCheckpointRefusal(error: unknown): boolean {
+  const pending: unknown[] = [error];
+  for (let seen = 0; pending.length > 0 && seen < 16; seen++) {
+    const current = pending.shift();
+    if (!(current instanceof Error)) continue;
+    if (remoteCheckpointOwnerRefusals.get(current)?.settlement === "settled") return true;
+    if (current instanceof AggregateError) pending.push(...current.errors);
+    if (current.cause !== undefined) pending.push(current.cause);
+  }
+  return false;
+}
+
 async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, options?: {
   preserveInstructionsForRunId?: string;
   discardUnsettledSession?: boolean;
+  /** Retirement by a successor: a checkpoint the fence refused as superseded
+   * is discarded like an unsettled session, under the same stop proofs. */
+  discardSupersededCheckpoint?: boolean;
   onForcedStopFailed?: (error: unknown) => void;
 }) {
   if (entry.controllerDetachedForRestart) return detachReleasedWarmNativeSession(entry);
@@ -851,14 +895,29 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
       // outlived the close grace: the old journal lives in the discarded
       // session's own state root, and its Runner is stopped. Without a task
       // owner, other close errors can mean controller authority is still live.
-      const discardable = options?.discardUnsettledSession === true;
+      // A successor's own claim supersedes a cancelled owner's checkpoint for
+      // good (a person's Stop or Interrupt, then the next message): no retry
+      // of this close can save it, so only containment decides, as above.
+      const discardable = options?.discardUnsettledSession === true
+        || (options?.discardSupersededCheckpoint === true && isSupersededCheckpointRefusal(error));
       const owner = discardable ? pluginTaskSessionOwners.get(entry.session) : undefined;
       const retiredWithoutCheckpoint = discardable && (owner
         ? owner.isRetired() || await owner.retireSupersededTask().catch(stopError => {
           options?.onForcedStopFailed?.(stopError);
           return false;
         })
-        : error instanceof NativeSessionCloseUnrecoverableError && error.settlement?.runnerSuspended === true);
+        : (error instanceof NativeSessionCloseUnrecoverableError && error.settlement?.runnerSuspended === true)
+          // The Boat remote path (no task owner): the transport proved the
+          // Runner suspended, the fence refused before reading its state, and
+          // the force-stop that followed did not fail. Its saved bytes stay
+          // where they are (the box and the last durable backup).
+          || (options?.discardSupersededCheckpoint === true && isSuspendedRemoteCheckpointRefusal(error))
+          // pl/s3-fence: the same refusal for a Runner the transport did NOT
+          // prove suspended (a mid-turn Stop leaves it unsettled). Accepted only
+          // when this exact session's Runner is proven exited: a finished, idle
+          // holder is stopped first; a busy one stays refused.
+          || (options?.discardSupersededCheckpoint === true && isSupersededCheckpointRefusal(error)
+            && await supersededOwnerRunnerExited(entry)));
       if (retiredWithoutCheckpoint) {
         logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
           providerLeaseId: entry.providerLeaseId ?? null, reason, closeFailure: describeWarmCloseFailure(error) },
@@ -922,7 +981,7 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
   const directoryWaitDeadline = Date.now() + warmRetirementDirectoryWait.timeoutMs;
   for (;;) {
     try {
-      await closeWarmNativeSession(entry, reason, options);
+      await closeWarmNativeSession(entry, reason, { ...options, discardSupersededCheckpoint: true });
       return;
     } catch (error) {
       if (error instanceof AgentDirectoryOperationBusyError) {
@@ -941,7 +1000,10 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
   }
 }
 
-export const warmRetirementDirectoryWait = { timeoutMs: 300_000, pollMs: 1_000 };
+// chat-retire3 F2: a follow-up may first wait out its predecessor's release
+// (warmSessionReleaseWait, 30 s); with this directory wait the follow-up waits
+// at most 60 s in all before it proceeds or fails typed (was 300 s).
+export const warmRetirementDirectoryWait = { timeoutMs: 30_000, pollMs: 1_000 };
 
 /**
  * An owner whose retirement stayed unproven lives only in its own sandbox,
@@ -1055,6 +1117,24 @@ async function waitForWarmNativeSessionSettled(scope: string): Promise<void> {
   ]).finally(() => clearTimeout(timer));
 }
 
+/** Waits, within warmSessionReleaseWait, while the previous turn's owner is
+ * still releasing (busy without a successor's claim, settling or closing). A
+ * session still busy at the deadline fails its caller as before. */
+async function waitForWarmNativeSessionRelease(scope: string, entry: WarmNativeSession): Promise<void> {
+  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+  while (Date.now() < deadline && (settlingNativeSessionScopes.has(scope)
+    || (warmNativeSessions.get(scope) === entry && entry.busy && !entry.preparingRunId))) {
+    await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
+  }
+  const closing = closingWarmNativeSessions.get(scope);
+  if (!closing) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    closing.catch(() => undefined),
+    new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, deadline - Date.now())); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 /** Reserve the existing physical copy before heartbeat composes AGENT_HOME and
  * task guidance. The final execution/configuration fence still owns admission. */
 export async function claimWarmNativeInstructionCopy(input: {
@@ -1134,10 +1214,19 @@ export async function reserveWarmNativeInstructionDirectory(input: {
   companyId: string; agentId: string; previousRunId: string; runId: string; target?: AdapterExecutionTarget | null;
   observabilityCompatibilityKey?: string;
   canReuse: () => Promise<boolean>;
-}): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
+}, releaseWaited = false): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
     if (await forgetUnretiredOwnerOnOtherSandbox(id, entry, input.target)) return null;
+    // T9 (chat-retire3): a quick follow-up (no Stop) meets the previous turn's
+    // release still finishing: a Boat Runner is a release/resume pair owner,
+    // busy until its finishRelease in that run's final cleanup. Wait it out
+    // once, bounded like claimWarmNativeInstructionCopy's wait, then re-read.
+    // Another run's claim (preparingRunId) is a real concurrent owner.
+    if (!releaseWaited && !entry.preparingRunId && (entry.busy || settlingNativeSessionScopes.has(id) || closingWarmNativeSessions.has(id))) {
+      await waitForWarmNativeSessionRelease(id, entry);
+      return reserveWarmNativeInstructionDirectory(input, true);
+    }
     if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
@@ -1292,10 +1381,12 @@ function suspendedRunnerHasExited(entry: WarmNativeSession, inspection: SandboxS
 
 export const warmRetainedRunnerStopWait = { waitMs: 10_000, pollMs: 500 };
 
-async function stopRetainedRunnerOfFinishedOwner(entry: WarmNativeSession, error: unknown, db: Db): Promise<boolean> {
-  if (!entry.sandboxRunner || !(error instanceof NativeSessionCloseUnrecoverableError)
-    || error.settlement?.runnerRetained !== true || error.settlement.runnerSuspended === true) return false;
-  const { runner, remoteCwd } = entry.sandboxRunner;
+/** Stop this exact session's Runner if it is a finished owner's idle holder
+ * (retireSandboxRunnerPortHolders: same company/agent/run, terminal run status,
+ * idle state, else `owner_not_settled`), then require the exit proof. */
+async function stopSessionRunnerAndProveExit(entry: WarmNativeSession, db: Db,
+  sandboxRunner: NonNullable<WarmNativeSession["sandboxRunner"]>): Promise<boolean> {
+  const { runner, remoteCwd } = sandboxRunner;
   const runtimeRoot = posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner");
   const sessionDirectory = createHash("sha256").update(entry.normalizedSessionId).digest("hex");
   try {
@@ -1307,7 +1398,34 @@ async function stopRetainedRunnerOfFinishedOwner(entry: WarmNativeSession, error
       "could not stop the retained Runner of a finished warm session");
     return false;
   }
-  if (!await sandboxSessionRunnerExited({ runner, runtimeRoot, sessionDirectory })) return false;
+  return sandboxSessionRunnerExited({ runner, runtimeRoot, sessionDirectory });
+}
+
+/** pl/s3-fence: a successor's retirement met the s3 fence's superseded refusal
+ * of an owner whose Runner the transport did not prove suspended. The refusal
+ * is permanent (no retry can save that checkpoint), so only containment
+ * decides: true only when this session's Runner is proven exited. False when
+ * the sandbox runner or lease database is missing, on any throw, and for a
+ * Runner that is not idle (its stop is refused, owner_not_settled). */
+async function supersededOwnerRunnerExited(entry: WarmNativeSession): Promise<boolean> {
+  if (!entry.sandboxRunner || !entry.sandboxLeaseDb) return false;
+  try {
+    if (!await stopSessionRunnerAndProveExit(entry, entry.sandboxLeaseDb, entry.sandboxRunner)) return false;
+  } catch (proofError) {
+    logger.warn({ runId: entry.runId, providerLeaseId: entry.providerLeaseId ?? null, proofFailure: describeWarmCloseFailure(proofError) },
+      "could not prove the superseded warm owner's Runner exited");
+    return false;
+  }
+  logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+    providerLeaseId: entry.providerLeaseId ?? null },
+  "the superseded warm owner's Runner is proven exited; retired it without a checkpoint");
+  return true;
+}
+
+async function stopRetainedRunnerOfFinishedOwner(entry: WarmNativeSession, error: unknown, db: Db): Promise<boolean> {
+  if (!entry.sandboxRunner || !(error instanceof NativeSessionCloseUnrecoverableError)
+    || error.settlement?.runnerRetained !== true || error.settlement.runnerSuspended === true) return false;
+  if (!await stopSessionRunnerAndProveExit(entry, db, entry.sandboxRunner)) return false;
   logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
     providerLeaseId: entry.providerLeaseId ?? null },
   "stopped the retained Runner of a finished warm session whose suspend was refused; released it without a checkpoint");
@@ -2045,8 +2163,23 @@ export function nativeConversationReplyResult(input: {
  */
 export function createGovernedWaitEventObservation(
   resolvePending: () => Promise<PrpStructuredRunResult | null>,
+  runId?: string,
 ) {
+  // Open tools, keyed by the tool's OWN identity: payload.executionId whenever
+  // present, envelope itemId only as a fallback, because runnerd shares one
+  // attachment itemId across every tool execution of a turn (runner-core
+  // durable state). A runnerd tool reported both as an item and as an
+  // execution record stays open until both have closed, so it closes (and can
+  // park) exactly once.
   const pendingTools = new Set<string>();
+  // The question's own tool identities: open until (or past) the park by
+  // design, so they never block the wait they created.
+  const questionTools = new Set<string>();
+  const publishOpenTools = () => {
+    if (!runId) return;
+    if (pendingTools.size > 0) nativeGovernedWaitOpenTools.set(runId, pendingTools.size);
+    else nativeGovernedWaitOpenTools.delete(runId);
+  };
   let providerLost = false;
   let generation = 0;
   let observation: {
@@ -2063,20 +2196,49 @@ export function createGovernedWaitEventObservation(
       const payload = record(event.payload);
       providerLost ||= event.eventType === "runtime_request.expired" && payload.reason === "provider_process_lost";
       const kind = payload.kind;
-      const tool = ["dynamicToolCall", "mcpToolCall", "commandExecution"].includes(String(kind));
-      if (event.itemId) {
-        if (tool && event.eventType === "item.started") pendingTools.add(event.itemId);
-        // Terminal error events can omit kind; the tracked ID owns cleanup.
-        if (event.eventType === "item.completed" || event.eventType === "item.failed") {
-          pendingTools.delete(event.itemId);
+      // Pi and Cursor Cloud report every tool execution as kind "tool" (bash
+      // stays commandExecution). Pi starts a whole batch before its host
+      // callbacks reach the Runner one at a time, so a question's answered
+      // callback must not park the turn while a sibling still runs: that
+      // sibling's callback would never get a result and the Runner's saved
+      // state would keep it pending.
+      // Through runnerd (Boat), Codex-shaped tool items arrive only as
+      // tool.execution.* (runner-core provider_events.rs) and Pi tool items as
+      // item.* kind "tool_use"; both must count as open tools.
+      const execution = event.eventType.startsWith("tool.execution.");
+      const tool = execution || ["dynamicToolCall", "mcpToolCall", "commandExecution", "builtinToolCall", "tool", "tool_use"].includes(String(kind));
+      const toolId = typeof payload.executionId === "string" && payload.executionId
+        ? payload.executionId
+        : event.itemId;
+      const item = record(payload.item);
+      const toolName = [payload.name, payload.toolName, payload.tool, item.name, item.tool].find(value => typeof value === "string");
+      if (toolId) {
+        // An execution reported under its own item's id (in-process providers)
+        // is that item; one reported under a different, shared envelope id
+        // (runnerd) is a separate record that closes on its own.
+        const key = `${execution && event.itemId !== toolId ? "execution" : "item"}:${toolId}`;
+        if (tool && toolName === "request_human_input") {
+          // Exclude only the question's own identity, in both shapes; never a
+          // shared envelope key that a running sibling also maps to.
+          questionTools.add(toolId);
+          pendingTools.delete(`item:${toolId}`);
+          pendingTools.delete(`execution:${toolId}`);
+        } else if (tool && !questionTools.has(toolId) && (event.eventType === "item.started" || event.eventType === "tool.execution.started")) {
+          pendingTools.add(key);
         }
+        // Terminal error events can omit kind; the tracked ID owns cleanup.
+        if (["item.completed", "item.failed", "tool.execution.completed"].includes(event.eventType)) {
+          pendingTools.delete(key);
+        }
+        publishOpenTools();
       }
-      // Usage/model messages can arrive while the tool creating the card is
-      // still awaiting its response. Parking then interrupts that in-flight
-      // response and cannot produce a durable suspension checkpoint.
-      if (event.eventType === "item.completed" && (
-        pendingTools.size > 0 || (!tool && !(kind === "agentMessage" && payload.channel === "final"))
-      )) return;
+      // Never park while a sibling tool is still open, whatever the trigger
+      // (a tool completion, a final message or a durable question fallback):
+      // the park cancels the provider and would cut that tool off. Usage/model
+      // messages can arrive while the tool creating the card is still awaiting
+      // its response; parking then cannot produce a durable checkpoint.
+      if (pendingTools.size > 0) return;
+      if (event.eventType === "item.completed" && !tool && !(kind === "agentMessage" && payload.channel === "final")) return;
       // A replacement question preserves human input after a provider crash;
       // it does not authorize a successful suspension of the failed execution.
       if (providerLost || !eligible) return;
@@ -9449,6 +9611,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "pi_conversation_identity_missing" ||
     sourceFailureCode === "native_session_cleanup_quarantined" ||
     sourceFailureCode === "native_adopted_runner_authentication_timeout" ||
+    sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED ||
     sourceFailureCode === "native_provider_usage_limit" ||
     sourceFailureCode === NATIVE_PROVIDER_SESSION_CLOSED ||
     sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED ||
@@ -9647,6 +9810,7 @@ export function nativeSessionFailureSourceCode(
   | typeof NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER
   | "native_session_cleanup_quarantined"
   | "native_adopted_runner_authentication_timeout"
+  | typeof REMOTE_RUNNER_OBSERVATION_EXHAUSTED
   | "runner_remote_provider_artifact_incompatible"
   | "runner_remote_provider_verification_unavailable"
   | "provider_process_exited"
@@ -9677,6 +9841,8 @@ export function nativeSessionFailureSourceCode(
   | typeof NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE
   | "native_session_interrupted"
   | FreshThreadRefusalCode {
+  if (error instanceof Error && /^(?:Notification transport failed closed: )?runner_process_observation_budget_exhausted:/.test(error.message))
+    return REMOTE_RUNNER_OBSERVATION_EXHAUSTED;
   const freshRefusal = freshThreadRefusalCode(error);
   if (freshRefusal) return freshRefusal;
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
@@ -12272,8 +12438,10 @@ async function executePaperclipNativeSessionAttempt(
   let runnerSessionStartupScope: NativeRunSpanScope | null = null;
   let agentTurnScope: NativeRunSpanScope | null = null;
   let taskSettleScope: NativeRunSpanScope | null = null;
+  nativeGovernedWaitOpenTools.delete(input.execution.binding.runId);
   const governedWaitObservation = createGovernedWaitEventObservation(
     resolvePendingGovernedWait,
+    input.execution.binding.runId,
   );
   const projectSessionGoalEvent = (event: PrpEvent) =>
     applyRunnerGoalPrpEvent(
@@ -12732,7 +12900,7 @@ async function executePaperclipNativeSessionAttempt(
         }
         await controllerSteps.measure("governed_wait", () => governedWaitObservation.observe(
           event,
-          event.eventType === "item.completed" || questionFallback !== null,
+          ["item.completed", "tool.execution.completed"].includes(event.eventType) || questionFallback !== null,
         ));
         await controllerSteps.measure("rate_limits", () => recordRateLimits(event));
         await controllerSteps.measure("plan_synchronization", () => recordPlanSynchronization(
@@ -12760,7 +12928,7 @@ async function executePaperclipNativeSessionAttempt(
         }));
         await controllerSteps.measure("governed_wait", () => governedWaitObservation.observe(
           event,
-          event.eventType === "item.completed" || questionFallback !== null,
+          ["item.completed", "tool.execution.completed"].includes(event.eventType) || questionFallback !== null,
         ));
         await controllerSteps.measure("rate_limits", () => recordRateLimits(event));
         const planSynchronization = await synchronizeCompletedProviderPlan({
@@ -14237,6 +14405,8 @@ async function executePaperclipNativeSessionAttempt(
                   ? NATIVE_PROVIDER_SESSION_CLOSED_ACTION
                   : sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED
                   ? startupRejectedAction
+                  : sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED
+                  ? REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION
                   : sourceFailureCode === NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER
                   ? NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER_ACTION
                   : sourceFailureCode === "native_session_cleanup_quarantined"
@@ -14525,6 +14695,8 @@ async function executePaperclipNativeSessionAttempt(
               ? NATIVE_PROVIDER_SESSION_CLOSED_ACTION
               : sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED
               ? startupRejectedAction
+              : sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED
+              ? REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION
               : sourceFailureCode === NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER
               ? NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER_ACTION
               : sourceFailureCode === "native_session_cleanup_quarantined"
@@ -16426,6 +16598,28 @@ export async function readRemoteRunnerProviderState(input: {
 
 const REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS = 20_000;
 const REMOTE_RUNNER_PROCESS_POLL_MS = 5_000;
+// A named sandbox refusal is no observation, not exit. Charge failed probes
+// AND their event-wakeable waits; healthy reads/parking never replenish this.
+const REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS = 10 * 60_000;
+export const REMOTE_RUNNER_OBSERVATION_EXHAUSTED = "runner_process_observation_budget_exhausted";
+export const REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION =
+  "The sandbox is still changing state after the ten-minute observation allowance. Runner termination is not confirmed. Wait for archiving to finish, then retry recovery of this run after verifying the retained runner. Do not start a replacement while that runner may still be alive.";
+
+function remoteRunnerObservationExhausted(cause: unknown): Error {
+  return Object.assign(new Error(`${REMOTE_RUNNER_OBSERVATION_EXHAUSTED}: ${REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION}`, { cause }),
+    { code: REMOTE_RUNNER_OBSERVATION_EXHAUSTED });
+}
+
+function remoteRunnerSandboxTransitionRefusal(error: unknown): boolean {
+  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
+    if ((cause as { code?: unknown }).code === "boat_sandbox_state_transition") return true;
+    // Worker RPC drops string codes. Only Boat's exact closed-code prefix in
+    // its typed envelope qualifies, never the acquisition-only prose classifier.
+    if (cause instanceof JsonRpcCallError && cause.code === PLUGIN_RPC_ERROR_CODES.WORKER_ERROR &&
+        cause.message.startsWith("boat_sandbox_state_transition: ")) return true;
+  }
+  return false;
+}
 
 // Linux boot identity plus start ticks identifies a process generation across
 // PID reuse. exec preserves both the launch shell's PID and its start ticks.
@@ -17424,6 +17618,7 @@ export function createRemoteRunnerProcessLauncher(input: {
       });
 
       let supervisionUnknownSince: number | null = null;
+      let retainedTransitionMs = 0;
       // A socket close alone is never permission to replace a possibly live PID.
       while (true) {
         const supervision = input.sandboxRetention?.supervision;
@@ -17432,10 +17627,13 @@ export function createRemoteRunnerProcessLauncher(input: {
         if (supervision?.detached) return await new Promise<Awaited<RunnerProcessHandle["completion"]>>(() => {});
         const monitorGeneration = supervision?.generation;
         verificationRequested = false;
+        const observationStartedAt = Date.now();
+        let transitionRefusal: unknown;
         const observed = await readRemoteRunnerRecoveryProbe({
           runner,
           stage: "process_verification",
-          deadline: Date.now() + REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS,
+          deadline: observationStartedAt + Math.min(REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS,
+            REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS - retainedTransitionMs),
           readOnly: true,
           request: {
             command: "sh",
@@ -17454,12 +17652,30 @@ export function createRemoteRunnerProcessLauncher(input: {
         }).catch(error => {
           if (supervision && !supervision.accepts(monitorGeneration!)) return null;
           supervisionUnknownSince ??= Date.now();
+          if (remoteRunnerSandboxTransitionRefusal(error)) {
+            if (pendingSignal) throw error;
+            retainedTransitionMs += Math.max(0, Date.now() - observationStartedAt);
+            if (retainedTransitionMs >= REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS) throw remoteRunnerObservationExhausted(error);
+            transitionRefusal = error;
+            return null;
+          }
+          // Preserve this line's independent connected-runner grace for other
+          // observation errors. A named refusal alone may outlive disconnect.
           if (spec.isRunnerConnected?.() !== true || Date.now() - supervisionUnknownSince >= REMOTE_RUNNER_RECONNECT_GRACE_MS) throw error;
           return null;
         });
         if (supervision && !supervision.accepts(monitorGeneration!)) continue;
         if (!observed) {
-          await waitForExitVerification(REMOTE_RUNNER_PROCESS_POLL_MS);
+          const waitStartedAt = Date.now();
+          await waitForExitVerification(transitionRefusal
+            ? Math.min(REMOTE_RUNNER_PROCESS_POLL_MS, REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS - retainedTransitionMs)
+            : REMOTE_RUNNER_PROCESS_POLL_MS);
+          if (supervision && !supervision.accepts(monitorGeneration!)) continue;
+          if (transitionRefusal) {
+            retainedTransitionMs += Math.max(0, Date.now() - waitStartedAt);
+            if (pendingSignal) throw transitionRefusal;
+            if (retainedTransitionMs >= REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS) throw remoteRunnerObservationExhausted(transitionRefusal);
+          }
           continue;
         }
         supervisionUnknownSince = null;
@@ -19631,7 +19847,11 @@ async function createRunnerdBackendWithinSessionClaim(
     const currentAuthority = sessionToolAuthorityEpochs.get(sessionScopeId);
     const backupOwner = durableStorage && currentAuthority ? sessionHarnessBackupOwners.get(currentAuthority) : null;
     if (durableStorage && !backupOwner) throw new Error("native_harness_storage_owner_missing");
-    if (backupOwner) await assertNativeHarnessBackupOwner(input.db, backupOwner);
+    if (backupOwner) await assertNativeHarnessBackupOwner(input.db, backupOwner).catch((error: unknown) => {
+      // Nothing of this owner's remote state was read or copied yet.
+      if (error instanceof Error && isSupersededCheckpointRefusal(error)) remoteCheckpointOwnerRefusals.set(error, { settlement });
+      throw error;
+    });
     // Transport release also runs when provider bootstrap failed. In that case
     // runnerd has no durable provider identity (and may not have created the
     // provider persistence directory at all), so attempting a failover backup

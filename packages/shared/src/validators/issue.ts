@@ -979,10 +979,15 @@ export const createChildIssueSchema = withCreateIssueStatusDefault(
 
 export type CreateChildIssue = z.infer<typeof createChildIssueSchema>;
 
-export const createAcceptedPlanDecompositionSchema = z.object({
-  acceptedPlanRevisionId: z.string().guid(),
-  children: z.array(createChildIssueSchema).min(1).max(25),
-});
+/** Server callers may supply an operator limit without exposing environment reads to the UI. */
+export function createAcceptedPlanDecompositionSchemaWithLimit(maxChildren: number) {
+  return z.object({
+    acceptedPlanRevisionId: z.string().guid(),
+    children: z.array(createChildIssueSchema).min(1).max(maxChildren),
+  });
+}
+
+export const createAcceptedPlanDecompositionSchema = createAcceptedPlanDecompositionSchemaWithLimit(25);
 
 export type CreateAcceptedPlanDecomposition = z.infer<
   typeof createAcceptedPlanDecompositionSchema

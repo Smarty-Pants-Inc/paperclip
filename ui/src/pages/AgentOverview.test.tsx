@@ -38,6 +38,8 @@ describe("AgentOverview", () => {
       adapterType: "codex_local",
       adapterConfig: { model: "gpt-5.6-sol" },
       runtimeConfig: {},
+      budgetMonthlyCents: 50000,
+      spentMonthlyCents: 57230,
       chainOfCommand: [],
       access: { canAssignTasks: true, taskAssignSource: "explicit_grant", membership: null, grants: [] },
     } as unknown as AgentDetail;
@@ -76,6 +78,13 @@ describe("AgentOverview", () => {
     for (const page of ["activity", "runs", "costs", "budgets"]) {
       expect(markup).toContain(`href="/agents/codexcoder/${page}"`);
     }
+    const rendered = document.createElement("div");
+    rendered.innerHTML = markup;
+    const budgetTile = rendered.querySelector('a[href="/agents/codexcoder/budgets"]');
+    expect(budgetTile?.textContent).toContain("Budget used");
+    expect(budgetTile?.textContent).toContain("—");
+    expect(budgetTile?.textContent).toContain("of $500.00 this month");
+    expect(budgetTile?.textContent).not.toContain("114%");
     expect(markup).toContain("2 enabled");
     expect(markup).toContain("Explore skills");
     expect(markup).toContain('href="/agents/codexcoder/skills"');

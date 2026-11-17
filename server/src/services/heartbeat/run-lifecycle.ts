@@ -1,3 +1,5 @@
+import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
+import { writeRuntimeRunPointer } from "./runtime-run-pointer.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
@@ -85,7 +87,6 @@ import {
 } from "@paperclipai/shared";
 import {
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   activityLog,
   approvals,
@@ -129,6 +130,8 @@ import {
   hasAcceptedSemanticResult,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
+  readTruncatedCompletedAgentMessageItemId,
+  readTruncatedCompletedAssistantMessageCandidate,
   selectHeartbeatRunFinalAgentMessage,
   type RunPresentationDecision,
 } from "../heartbeat-run-summary.js";
@@ -2481,7 +2484,29 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         prpEvent,
         proposedItemIds,
       });
-      if (candidate) candidates.push(candidate);
+      if (candidate) {
+        candidates.push(candidate);
+        continue;
+      }
+      // dl-n5-66k: a completed answer stored as {truncated, byteSize} keeps
+      // its text in the item's stored deltas; rebuild it there so the
+      // semantic summary never replaces the answer.
+      const truncatedItemId = readTruncatedCompletedAgentMessageItemId(prpEvent);
+      if (!truncatedItemId) continue;
+      const deltaRows = await db
+        .select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.companyId, companyId),
+            eq(heartbeatRunEvents.runId, runId),
+            eq(heartbeatRunEvents.eventType, "item.delta"),
+            sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' = ${truncatedItemId}`,
+          ),
+        )
+        .orderBy(heartbeatRunEvents.seq);
+      const rebuilt = readTruncatedCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent, deltaRows });
+      if (rebuilt) candidates.push(rebuilt);
     }
     const recoveryBoundary = await db
       .select({
@@ -2614,6 +2639,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         )
         .then((rows) => rows[0] ?? null);
       if (!issue) return null;
+      await lockAgentForRunAdmission(tx, { companyId: run.companyId, agentId: run.agentId });
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -3224,17 +3250,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     normalizedUsage?: UsageTotals | null,
   ) {
     await ensureRuntimeState(agent);
-    await db
-      .update(agentRuntimeState)
-      .set({
-        adapterType: agent.adapterType,
-        sessionId: session.legacySessionId,
-        lastRunId: run.id,
-        lastRunStatus: run.status,
-        lastError: run.error ?? null,
-        updatedAt: new Date(),
-      })
-      .where(eq(agentRuntimeState.agentId, agent.id));
+    await writeRuntimeRunPointer(db, agent, run, { sessionId: session.legacySessionId });
 
   }
 

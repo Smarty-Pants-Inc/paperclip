@@ -21,13 +21,9 @@ const LOG_POLL_INTERVAL_MS = 2000;
 const LOG_READ_LIMIT_BYTES = 256_000;
 const REALTIME_FALLBACK_POLL_INTERVAL_MS = 30_000;
 const EMPTY_RUN_LOG_CHUNKS: RunLogChunk[] = [];
-// Retained transcript payload budget for full task views. A byte budget (rather
-// than a tiny chunk count) keeps the whole streamed scrollback intact — a
-// delta-streaming run emits thousands of one-token chunks in seconds, and the
-// old 200-chunk cap discarded just-rendered messages off the top irreversibly.
-// If a run genuinely exceeds this, the oldest output collapses behind a visible
-// marker instead of vanishing (see `applyRetentionBudget`).
-const TASK_VIEW_MAX_BYTES_PER_RUN = 2_000_000;
+// Full task views retain every received chunk. Compact dashboard consumers may
+// still opt into a bounded preview; never discard full task scrollback.
+const TASK_VIEW_MAX_BYTES_PER_RUN = Number.POSITIVE_INFINITY;
 // Grace period before an accumulated transcript buffer is pruned for a run that
 // has vanished from the `runs` list. The parent refetches runs on its own
 // interval, and a single transient empty/errored poll would otherwise wipe the
@@ -76,17 +72,9 @@ function canReadPersistedLog(run: RunTranscriptSource): boolean {
   return run.status === "running" || isTerminalStatus(run.status);
 }
 
-function runKnownLogBytes(run: RunTranscriptSource): number | null {
-  const bytes = run.status === "queued"
-    ? run.logBytes
-    : run.lastOutputBytes ?? run.logBytes;
-  return typeof bytes === "number" && Number.isFinite(bytes) && bytes > 0 ? bytes : null;
-}
-
-export function resolveInitialLogOffset(run: RunTranscriptSource, limitBytes: number): number {
-  const knownBytes = runKnownLogBytes(run);
-  if (knownBytes === null) return 0;
-  return Math.max(0, knownBytes - Math.max(0, limitBytes));
+export function resolveInitialLogOffset(_run: RunTranscriptSource, _limitBytes: number): number {
+  // limitBytes is the page size, not permission to omit all preceding pages.
+  return 0;
 }
 
 export function useLiveRunTranscripts({
@@ -99,8 +87,7 @@ export function useLiveRunTranscripts({
   enableRealtimeUpdates = true,
   enabled = true,
 }: UseLiveRunTranscriptsOptions) {
-  // Ticker consumers opt into the silent chunk-count cap; full task views use a
-  // byte budget that collapses (not discards) the oldest output when exceeded.
+  // Only explicit compact-preview consumers opt into retention limits.
   const { visible } = usePageVisibility();
   const retentionBudget: ChunkRetentionBudget = useMemo(
     () =>

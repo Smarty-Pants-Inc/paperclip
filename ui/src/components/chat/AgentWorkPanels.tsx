@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { ArrowUpDown, File, FileText, Image, Search, Video } from "lucide-react";
 import type { CompanyArtifact, Issue } from "@paperclipai/shared";
 import { artifactsApi } from "@/api/artifacts";
@@ -32,7 +32,6 @@ import { companyProjectsQuery } from "@/lib/company-projects-query";
 
 const AGENT_TASK_LIMIT = 200;
 const ARTIFACT_PAGE_SIZE = 100;
-const ARTIFACT_MAX_PAGES = 5;
 
 export type AgentTaskSortField = "updated" | "created" | "status" | "title";
 
@@ -278,27 +277,12 @@ export function AgentArtifactCard({ artifact }: { artifact: CompanyArtifact }) {
   );
 }
 
-/**
- * This agent's artifacts, newest first, filtered on the server. Pages are
- * capped so an unusually prolific agent can't stall the panel; the cap only
- * ever drops its oldest artifacts.
- */
-async function listAgentArtifacts(companyId: string, agentId: string) {
-  const artifacts: CompanyArtifact[] = [];
-  let cursor: string | undefined;
-  for (let page = 0; page < ARTIFACT_MAX_PAGES; page += 1) {
-    const response = await artifactsApi.list(companyId, { agentId, limit: ARTIFACT_PAGE_SIZE, cursor });
-    artifacts.push(...response.artifacts);
-    if (!response.nextCursor) return { artifacts, truncated: false };
-    cursor = response.nextCursor;
-  }
-  return { artifacts, truncated: true };
-}
-
 export function AgentArtifactsPanel({ companyId, agentId }: { companyId: string; agentId: string }) {
-  const artifactsQuery = useQuery({
+  const artifactsQuery = useInfiniteQuery({
     queryKey: queryKeys.artifacts.byAgent(companyId, agentId),
-    queryFn: () => listAgentArtifacts(companyId, agentId),
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) => artifactsApi.list(companyId, { agentId, limit: ARTIFACT_PAGE_SIZE, cursor: pageParam }),
+    getNextPageParam: (page) => page.nextCursor ?? undefined,
   });
 
   const artifactsView = useQueryView(artifactsQuery);
@@ -318,14 +302,17 @@ export function AgentArtifactsPanel({ companyId, agentId }: { companyId: string;
   }
   const loaded = artifactsQuery.data;
   if (!loaded) return null;
-  const { artifacts, truncated } = loaded;
+  const artifacts = loaded.pages.flatMap(page => page.artifacts);
   if (artifacts.length === 0) return <PanelMessage>This agent hasn't produced any artifacts yet.</PanelMessage>;
   return (
     <section className="flex flex-col gap-2" aria-label="Agent artifacts">
       {artifacts.map((artifact) => <AgentArtifactCard key={artifact.id} artifact={artifact} />)}
-      {truncated ? (
-        <p className="px-1 text-xs text-muted-foreground">Showing this agent's {artifacts.length} most recent artifacts.</p>
+      {artifactsQuery.hasNextPage ? (
+        <Button variant="ghost" disabled={artifactsQuery.isFetchingNextPage} onClick={() => void artifactsQuery.fetchNextPage()}>
+          {artifactsQuery.isFetchingNextPage ? "Loading artifacts…" : "Load more artifacts"}
+        </Button>
       ) : null}
+      {artifactsQuery.isFetchNextPageError ? <QueryErrorState error={artifactsQuery.error} action="load more artifacts" onRetry={() => void artifactsQuery.fetchNextPage()} /> : null}
     </section>
   );
 }

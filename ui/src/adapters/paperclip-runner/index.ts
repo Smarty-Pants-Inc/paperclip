@@ -1,5 +1,5 @@
-import type { PaperclipQuestion, PaperclipQuestionResponse, PaperclipQuestionSet, TranscriptEntry } from "@paperclipai/adapter-utils";
-import type { UIAdapterModule } from "../types";
+import type { PaperclipQuestion, PaperclipQuestionResponse, PaperclipQuestionSet } from "@paperclipai/adapter-utils";
+import type { TranscriptEntry, UIAdapterModule } from "../types";
 import { parseCodexStdoutLine, buildPaperclipRunnerConfig } from "@paperclipai/adapter-codex-local/ui";
 import { CodexLocalConfigFields } from "../codex-local/config-fields";
 import { isRunLogOnlyProviderEvent } from "@/components/transcript/run-log-only-events";
@@ -12,7 +12,7 @@ interface PaperclipRunnerParserState {
   usageReceiptItemIds: Set<string>;
   completedTextItemIds: Set<string>;
   resultSummaries: Set<string>;
-  toolOutputItemIds: Set<string>;
+  commandOutputById: Map<string, string>;
   itemChannels: Map<string, "progress" | "final" | "summary" | "detail" | "unknown">;
   structuredFinalItemIds: Set<string>;
   runtimeRequests: Map<string, Extract<TranscriptEntry, { kind: "runtime_request" }>>;
@@ -100,11 +100,31 @@ function toolFailure(item: JsonRecord): boolean {
     || ["failed", "error", "errored", "cancelled"].includes(status);
 }
 
+/** Completed aliases describe one snapshot, not extra chunks. Prefer the
+ * Codex aggregate (camel, then legacy snake), provider item output, Pi envelope
+ * output, then proxy item/envelope text. Empty placeholders must not mask bytes.
+ */
+function commandOutput(item: JsonRecord, payload: JsonRecord): string {
+  return [item.aggregatedOutput, item.aggregated_output, item.output, payload.output, item.text, payload.text]
+    .find((value): value is string => typeof value === "string" && value.length > 0) ?? "";
+}
+
+/** A snapshot may fill a missed delta or lag the stream. Keep the longer
+ * prefix; if it is a distinct tail, retain both without trimming or separators.
+ */
+function reconcileCommandOutput(previous: string, snapshot: string): string {
+  if (snapshot.startsWith(previous)) return snapshot;
+  if (previous.startsWith(snapshot)) return previous;
+  return previous + snapshot;
+}
+
 function commandEntries(
   event: JsonRecord,
   item: JsonRecord,
+  payload: JsonRecord,
   phase: "started" | "completed",
   ts: string,
+  state: PaperclipRunnerParserState,
 ): TranscriptEntry[] {
   const id = itemId(event, item);
   const commandActions = Array.isArray(item.commandActions) ? item.commandActions : [];
@@ -112,7 +132,8 @@ function commandEntries(
   if (phase === "started") {
     return [{ kind: "tool_call", ts, name: "command", toolUseId: id, input: { command } }];
   }
-  const output = text(item.aggregatedOutput, text(item.aggregated_output));
+  const output = reconcileCommandOutput(state.commandOutputById.get(id) ?? "", commandOutput(item, payload));
+  state.commandOutputById.delete(id);
   const exitCode = item.exitCode ?? item.exit_code;
   const detail = [
     typeof exitCode === "number" ? `exit_code: ${exitCode}` : "",
@@ -125,6 +146,7 @@ function commandEntries(
     toolName: "command",
     content: detail || text(item.status, "command completed"),
     isError: toolFailure(item),
+    ...(item.outputTruncated === true || payload.outputTruncated === true ? { outputTruncated: true } : {}),
   }];
 }
 
@@ -216,6 +238,7 @@ function genericToolEntries(
     toolName: name,
     content: stringify(item.content ?? item.result ?? item.output ?? item.error) || `${name} completed`,
     isError: toolFailure(item),
+    ...(item.outputTruncated === true ? { outputTruncated: true } : {}),
   }];
 }
 
@@ -266,18 +289,19 @@ function parseItemEvent(
       itemId: id,
     }];
   }
-  if (type === "commandexecution") {
-    const entries = commandEntries(event, item, phase, ts);
-    if (phase === "completed" && state.toolOutputItemIds.has(id)) {
-      const result = entries[0];
-      if (result?.kind === "tool_result") result.content = "";
-    }
-    return entries;
+  if (type === "commandexecution" || (phase === "completed" && !type && state.commandOutputById.has(id))) {
+    return commandEntries(event, item, payload, phase, ts, state);
   }
   if (type === "filechange") return fileChangeEntries(event, item, phase, ts);
   if (type === "dynamictoolcall") return dynamicToolEntries(event, item, phase, ts);
   if (type === "tooluse" || type === "toolresult" || type === "mcptoolcall") {
-    const normalized = { ...item, output: payload.output ?? item.output, isError: payload.isError === true || item.isError === true };
+    const isCommand = text(payload.kind).replaceAll("_", "").toLowerCase() === "commandexecution";
+    const output = isCommand && phase === "completed"
+      ? reconcileCommandOutput(state.commandOutputById.get(id) ?? "", commandOutput(item, payload))
+      : payload.output ?? item.output;
+    if (isCommand && phase === "completed") state.commandOutputById.delete(id);
+    const normalized = { ...item, output, isError: payload.isError === true || item.isError === true,
+      outputTruncated: payload.outputTruncated === true || item.outputTruncated === true };
     // Some providers learn structured arguments only at completion. Re-emit
     // the same call identity as an update before its correlated result.
     return phase === "completed" && (item.input !== undefined || item.arguments !== undefined)
@@ -297,8 +321,8 @@ function parseDeltaEvent(
   state: PaperclipRunnerParserState,
 ): TranscriptEntry[] {
   const kind = text(payload.kind).replaceAll("_", "").toLowerCase();
-  const value = text(payload.text);
-  const id = text(event.itemId, `${kind || "item"}-delta`);
+  const value = kind === "commandexecution" ? text(payload.text) || text(payload.output) : text(payload.text);
+  const id = text(event.itemId, text(record(payload.item).id, `${kind || "item"}-delta`));
   const explicitChannel = itemChannel(payload);
   const channel = explicitChannel === "unknown" ? state.itemChannels.get(id) ?? "unknown" : explicitChannel;
   if (!value) return [];
@@ -315,15 +339,24 @@ function parseDeltaEvent(
     return [{ kind: "thinking", ts, text: value, delta: true, channel: channel === "detail" ? "detail" : channel === "summary" ? "summary" : "unknown", itemId: id }];
   }
   if (kind === "commandexecution") {
-    state.toolOutputItemIds.add(id);
+    const previous = state.commandOutputById.get(id) ?? "";
+    // Codex payload.text is an ordered chunk; Pi payload.output is a cumulative
+    // partialResult snapshot. Emit only the new suffix, preserving live status.
+    const output = text(payload.text)
+      ? previous + value
+      : reconcileCommandOutput(previous, value);
+    state.commandOutputById.set(id, output);
+    const suffix = output.slice(previous.length);
+    if (!suffix) return [];
     return [{
       kind: "tool_result",
       ts,
       toolUseId: id,
       toolName: "command",
-      content: value,
+      content: suffix,
       isError: false,
       delta: true,
+      ...(payload.outputTruncated === true || record(payload.item).outputTruncated === true ? { outputTruncated: true } : {}),
     }];
   }
   if (kind === "filechange" || kind === "diff") {
@@ -375,7 +408,6 @@ export function workspaceChangeEntry(payload: JsonRecord, ts: string): Transcrip
   const files = (Array.isArray(payload.files) ? payload.files : [])
     .map(record)
     .filter((file) => SAFE_WORKSPACE_PATH.test(text(file.path)))
-    .slice(0, 2000)
     .map((file) => {
       const rawOperation = text(file.operation);
       const operation: "create" | "modify" | "delete" | "rename" | "mode_change" = rawOperation === "create" || rawOperation === "delete" || rawOperation === "rename" || rawOperation === "mode_change"
@@ -471,8 +503,7 @@ function runtimeRequestEntry(
   const explicitChoices = (Array.isArray(request.choices) ? request.choices : [])
     .map(record)
     .map((choice) => ({ key: text(choice.key), label: text(choice.label) }))
-    .filter((choice) => choice.key && choice.label)
-    .slice(0, 32);
+    .filter((choice) => choice.key && choice.label);
   const actionLabels: Record<string, string> = {
     accept: "Allow once",
     accept_for_session: "Allow for session",
@@ -503,11 +534,10 @@ function runtimeRequestEntry(
     .map(record)
     .map((field, index) => ({
       name: text(field.name, `answer_${index + 1}`).slice(0, 160),
-      label: text(field.label, text(field.name, `Answer ${index + 1}`)).slice(0, 240),
-      placeholder: nullableText(field.placeholder)?.slice(0, 500) ?? null,
+      label: text(field.label, text(field.name, `Answer ${index + 1}`)),
+      placeholder: nullableText(field.placeholder),
     }))
-    .filter((field) => field.name && field.label)
-    .slice(0, 16);
+    .filter((field) => field.name && field.label);
   const questionSet = parseQuestionSet(request.input) ?? previous?.questionSet ?? null;
   const response = parseQuestionResponse(request.response ?? payload.response)
     ?? previous?.response
@@ -536,14 +566,13 @@ function parseQuestionResponse(value: unknown): PaperclipQuestionResponse | null
   if (response.schema !== "paperclip.question_response.v1") return null;
   const rawAnswers = record(response.answers);
   const answers: PaperclipQuestionResponse["answers"] = {};
-  for (const [questionId, rawAnswer] of Object.entries(rawAnswers).slice(0, 64)) {
+  for (const [questionId, rawAnswer] of Object.entries(rawAnswers)) {
     const answer = record(rawAnswer);
     const selectedOptionIds = (Array.isArray(answer.selectedOptionIds) ? answer.selectedOptionIds : [])
       .filter((optionId): optionId is string => typeof optionId === "string")
-      .slice(0, 128)
       .map((optionId) => optionId.slice(0, 160));
-    const textAnswer = nullableText(answer.text)?.slice(0, 12_000);
-    const customText = nullableText(answer.customText)?.slice(0, 12_000);
+    const textAnswer = nullableText(answer.text);
+    const customText = nullableText(answer.customText);
     answers[questionId.slice(0, 160)] = {
       ...(selectedOptionIds.length > 0 ? { selectedOptionIds } : {}),
       ...(textAnswer != null ? { text: textAnswer } : {}),
@@ -563,12 +592,12 @@ function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
   if (input.schema !== undefined
     && input.schema !== "paperclip.question_set.v1"
     && input.schema !== "***REDACTED***") return null;
-  const questions = input.questions.map(record).slice(0, 64).map((question, questionIndex): PaperclipQuestion => {
+  const questions = input.questions.map(record).map((question, questionIndex): PaperclipQuestion => {
     const answerMode: PaperclipQuestion["answerMode"] = question.answerMode === "single_select" || question.answerMode === "multi_select" ? question.answerMode : "text";
-    const options = (Array.isArray(question.options) ? question.options : []).map(record).slice(0, 128).map((option, optionIndex) => ({
+    const options = (Array.isArray(question.options) ? question.options : []).map(record).map((option, optionIndex) => ({
       id: text(option.id, `option-${optionIndex + 1}`).slice(0, 160),
-      label: text(option.label, `Option ${optionIndex + 1}`).slice(0, 1_000),
-      ...(nullableText(option.description) ? { description: text(option.description).slice(0, 4_000) } : {}),
+      label: text(option.label, `Option ${optionIndex + 1}`),
+      ...(nullableText(option.description) ? { description: text(option.description) } : {}),
     }));
     const customAnswer = record(question.customAnswer);
     const validation = record(question.textValidation);
@@ -578,16 +607,16 @@ function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
         : undefined;
     const parsedQuestion: PaperclipQuestion = {
       id: text(question.id, `question-${questionIndex + 1}`).slice(0, 160),
-      ...(nullableText(question.header) ? { header: text(question.header).slice(0, 1_000) } : {}),
-      prompt: text(question.prompt, `Question ${questionIndex + 1}`).slice(0, 4_000),
-      ...(nullableText(question.helpText) ? { helpText: text(question.helpText).slice(0, 4_000) } : {}),
+      ...(nullableText(question.header) ? { header: text(question.header) } : {}),
+      prompt: text(question.prompt, `Question ${questionIndex + 1}`),
+      ...(nullableText(question.helpText) ? { helpText: text(question.helpText) } : {}),
       required: question.required === true,
       answerMode,
       ...(answerMode !== "text" ? { options } : {}),
       ...(customAnswer.enabled === true ? { customAnswer: {
         enabled: true as const,
-        ...(nullableText(customAnswer.label) ? { label: text(customAnswer.label).slice(0, 1_000) } : {}),
-        ...(nullableText(customAnswer.placeholder) ? { placeholder: text(customAnswer.placeholder).slice(0, 1_000) } : {}),
+        ...(nullableText(customAnswer.label) ? { label: text(customAnswer.label) } : {}),
+        ...(nullableText(customAnswer.placeholder) ? { placeholder: text(customAnswer.placeholder) } : {}),
       } } : {}),
       ...(Object.keys(validation).length > 0 ? { textValidation: {
         ...(typeof validation.minLength === "number" ? { minLength: validation.minLength } : {}),
@@ -602,11 +631,11 @@ function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
   });
   return {
     schema: "paperclip.question_set.v1",
-    ...(nullableText(input.title) ? { title: text(input.title).slice(0, 1_000) } : {}),
+    ...(nullableText(input.title) ? { title: text(input.title) } : {}),
     // Native plan decisions bind to the complete canonical question context.
     // The event boundary rejects oversized context rather than approving a slice.
     ...(nullableText(input.description) ? { description: text(input.description) } : {}),
-    ...(nullableText(input.submitLabel) ? { submitLabel: text(input.submitLabel).slice(0, 200) } : {}),
+    ...(nullableText(input.submitLabel) ? { submitLabel: text(input.submitLabel) } : {}),
     questions,
   };
 }
@@ -624,13 +653,13 @@ function runResultEntry(payload: JsonRecord, ts: string): Extract<TranscriptEntr
     disposition,
     summary: text(payload.summary, "Run completed"),
     objectiveSatisfied: typeof completion.objectiveSatisfied === "boolean" ? completion.objectiveSatisfied : null,
-    verification: (Array.isArray(payload.verification) ? payload.verification : []).map(record).slice(0, 64).map((item) => ({
+    verification: (Array.isArray(payload.verification) ? payload.verification : []).map(record).map((item) => ({
       commandOrCheck: text(item.commandOrCheck, "Verification"),
       status: item.status === "passed" || item.status === "failed" ? item.status : "not_run",
       detail: nullableText(item.detail) ?? undefined,
       artifactRef: nullableText(item.artifactRef) ?? undefined,
     })),
-    remainingWork: (Array.isArray(completion.remainingWork) ? completion.remainingWork : []).map(record).slice(0, 64).map((item) => ({
+    remainingWork: (Array.isArray(completion.remainingWork) ? completion.remainingWork : []).map(record).map((item) => ({
       description: text(item.description, "Remaining work"),
       blocksCompletion: item.blocksCompletion === true,
     })),
@@ -639,7 +668,7 @@ function runResultEntry(payload: JsonRecord, ts: string): Extract<TranscriptEntr
       unblockAction: text(blocker.unblockAction, "Resolve the blocker to continue."),
       scope: blocker.scope === "task_wide" ? "task_wide" : "current_track",
     } : null,
-    artifacts: (Array.isArray(payload.artifacts) ? payload.artifacts : []).map(record).slice(0, 64).map((item) => ({
+    artifacts: (Array.isArray(payload.artifacts) ? payload.artifacts : []).map(record).map((item) => ({
       kind: text(item.kind, "artifact"),
       ref: text(item.ref),
       title: nullableText(item.title) ?? undefined,
@@ -835,7 +864,7 @@ function createParserState(): PaperclipRunnerParserState {
     usageReceiptItemIds: new Set(),
     completedTextItemIds: new Set(),
     resultSummaries: new Set(),
-    toolOutputItemIds: new Set(),
+    commandOutputById: new Map(),
     itemChannels: new Map(),
     structuredFinalItemIds: new Set(),
     runtimeRequests: new Map(),

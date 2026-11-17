@@ -238,6 +238,66 @@ it("proves a run.prepare-only bootstrap and its same-run retries never authentic
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+it("proves a never-connected run.prepare bootstrap whose failed open queued only its close cleanup (Row B)", async () => {
+  // The transport's failed-open close queues runner.drain then runner.suspend
+  // (runnerd-codex-transport.ts close: queueDrain / queueSuspend) with empty
+  // payloads; with no connection they stay pending. That is still a bootstrap
+  // that never authenticated. The real close path is driven end to end in
+  // server native-startup-never-connected-real-close.integration.test.ts.
+  const template = { provider: { provider: "codex", command: "fixture" }, authorizedTools: {} };
+  const journal = async (extra: (core: DurablePrpControlPlane) => void) => {
+    const root = mkdtempSync(resolve(tmpdir(), "runner-prepare-cleanup-bootstrap-"));
+    let checkpoint!: DurablePrpCheckpoint;
+    const core = new DurablePrpControlPlane({ stateDirectory: resolve(root, "control-plane"), identity, expectedRunnerVersion, expectedRunnerDigest });
+    core.setCheckpointPersistence(async value => { checkpoint = value; });
+    try {
+      core.persistRunAttachTemplate(template);
+      core.queueCommand("run.prepare", template);
+      core.issueBootstrapTicket(60_000);
+      extra(core);
+      await core.flushCheckpoint();
+    } finally { await core.stop(); rmSync(root, { recursive: true, force: true }); }
+    return checkpoint.records;
+  };
+  const cleanup = (core: DurablePrpControlPlane) => {
+    core.queueCommand("runner.drain", {}, "command_close_drain_fixture", true);
+    core.queueCommand("runner.suspend", {}, "command_close_suspend_fixture", true);
+  };
+  for (const shape of [
+    (core: DurablePrpControlPlane) => { core.queueCommand("runner.suspend", {}, "command_close_suspend_fixture", true); },
+    cleanup,
+    // A same-run retry reopens that journal: one more prepare and drain; the pending suspend is reused.
+    (core: DurablePrpControlPlane) => {
+      cleanup(core); core.queueCommand("run.prepare", template); core.issueBootstrapTicket(60_000);
+      core.queueCommand("runner.drain", {}, "command_close_drain_retry", true);
+    },
+  ]) expect(inspectUnauthenticatedBootstrapCheckpoint(await journal(shape), identity)).toBe(true);
+
+  const records = await journal(cleanup);
+  const edited = (key: string, edit: (value: Record<string, any>) => void) => {
+    const changed = new Map(records), value = JSON.parse(changed.get(key)!);
+    edit(value); changed.set(key, JSON.stringify(value));
+    return changed;
+  };
+  const suspendKey = [...records.keys()].find(key => key.startsWith("command:") && JSON.parse(records.get(key)!).type === "runner.suspend")!;
+  for (const [name, changed] of [
+    ["authenticated connection", edited("header", header => { header.state.connectionCount = 1; })],
+    ["used ticket", edited("header", header => {
+      for (const ticket of Object.values<Record<string, unknown>>(header.state.tickets)) ticket.usedAt = "2026-01-01T00:00:00.000Z";
+    })],
+    ["delivered cleanup", edited("header", header => { header.state.commandDeliveryCounts = { [JSON.parse(records.get(suspendKey)!).commandId]: 1 }; })],
+    ["answered cleanup", edited(suspendKey, command => { command.status = "completed"; command.result = { status: "completed" }; })],
+    ["cleanup with a payload", edited(suspendKey, command => { command.payload = { reason: "not the close's empty suspend" }; })],
+  ] as const) expect(inspectUnauthenticatedBootstrapCheckpoint(changed, identity), name).toBe(false);
+  for (const [name, shape] of [
+    ["non-cleanup extra command", (core: DurablePrpControlPlane) => { cleanup(core); core.queueCommand("turn.start", { prompt: "not a cleanup" }); }],
+    ["provider turn stop", (core: DurablePrpControlPlane) => { core.queueCommand("turn.stop", { reason: "x" }, "command_close_stop_fixture", true); cleanup(core); }],
+    // Empty payloads too: only the close's own cleanup types qualify.
+    ["empty-payload turn.stop", (core: DurablePrpControlPlane) => { cleanup(core); core.queueCommand("turn.stop", {}, "command_close_stop_empty", true); }],
+    ["empty-payload work command", (core: DurablePrpControlPlane) => { cleanup(core); core.queueCommand("turn.interrupt", {}, "command_work_empty", true); }],
+  ] as const) expect(inspectUnauthenticatedBootstrapCheckpoint(await journal(shape), identity), name).toBe(false);
+});
+
 it("hands the ticket refresh to the process owner for the first launch only", () => {
   const launches: RunnerProcessLaunchSpec[] = [];
   const refreshBootstrapTicket = vi.fn(async () => "fresh-ticket");

@@ -1629,13 +1629,13 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     definitionMetadata: { version: 6, copilotFileValidation: "exact-read-only-byte-check-v1", qualification: "pending", scheduling: "explicit-only", admission: "host-exact-candidate-and-model", authenticatedDiscoveryDate: "2026-09-28", piFileEvidence: "seed-edit-single-execute-public-download-v2", piFileArtifactTitle: "exact-filename", piFileCommandTransport: "fenced-bash-markdown-paste" },
   },
   {
-    id: "instruction-persistence", label: "Instruction Persistence",
-    description: "Agent-owned text and binary files round trip through the editor, survive a server restart and fresh task, and synchronize concurrent edits per file with last-sync-wins.",
+    id: "instruction-persistence", label: "supersedes: Instruction Persistence — canonical and conflict-copy persistence",
+    description: "Agent-owned text and binary files round trip through the editor, survive a server restart and fresh task; another writer's saved version stays canonical and this run's divergent edit is saved as <name>.conflict-<run8>-<epochms>.<ext>.",
     groups: [], profiles: codexContinuityProfiles,
     environments: [localEnvironment, runnerEnvironments.find(environment => environment.id === "daytona")!], tasks: [instructionPersistenceTask],
     excludedExecutionIds: ["instruction-persistence.legacy-codex.daytona.private-copy-persists"],
     expectedMatrixSize: 3, manualOnly: true,
-    definitionMetadata: { version: 6, oracle: "current-directory-independent-nonce-binary-last-sync-wins-and-nonblocking-storage-quota", providerTurns: 6, restart: "between-tasks", instructions: "production" },
+    definitionMetadata: { version: 7, oracle: "current-directory-independent-nonce-binary-canonical-conflict-copy-and-nonblocking-storage-quota", providerTurns: 6, restart: "between-tasks", instructions: "production" },
   },
   {
     id: "grok-subscription-qualification", label: "Grok Build Subscription Qualification", manualOnly: true,

@@ -9,7 +9,7 @@ import { useOptionalToastActions } from "../context/ToastContext";
 import { invalidateAttentionRecordViews } from "../lib/attention-record-views";
 import { taskRetryNotStartedReason } from "../hooks/useTaskRetry";
 import { queryKeys } from "../lib/queryKeys";
-import { cn, formatCents, formatConfiguredCents } from "../lib/utils";
+import { cn, COST_FIGURES_HIDDEN, formatCents, formatConfiguredCents, formatSpendPercent } from "../lib/utils";
 import { DecisionCardFooter } from "./DecisionCardFooter";
 import { NeedsYouPanel, NeedsYouPanelNote, NeedsYouPanelRow } from "./coordinator/NeedsYouCardKit";
 import { Button } from "./ui/button";
@@ -232,10 +232,10 @@ export function BudgetAlertActions({
       <NeedsYouPanel>
         <div className="flex items-baseline justify-between gap-3">
           <span className="truncate text-(length:--text-compact) font-medium text-foreground">{`${formatCents(observed)} spent of ${formatConfiguredCents(limit)}`}</span>
-          <span className="shrink-0 text-xs text-muted-foreground">{`${percent}% used`}</span>
+          <span className="shrink-0 text-xs text-muted-foreground">{`${formatSpendPercent(percent)} used`}</span>
         </div>
-        <div className="h-1 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="Budget used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(percent, 100)}>
-          <div className={cn("h-full rounded-full", !isWarning || percent >= 100 ? "bg-destructive" : "bg-amber-500")} style={{ width: `${Math.min(percent, 100)}%` }} />
+        <div className="h-1 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="Budget used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={COST_FIGURES_HIDDEN ? undefined : Math.min(percent, 100)} aria-valuetext={COST_FIGURES_HIDDEN ? "—" : undefined}>
+          <div className={cn("h-full rounded-full", !isWarning || percent >= 100 ? "bg-destructive" : "bg-amber-500")} style={{ width: `${COST_FIGURES_HIDDEN ? 0 : Math.min(percent, 100)}%` }} />
         </div>
         <NeedsYouPanelNote>
           {[scope ? `${scope[0]!.toUpperCase()}${scope.slice(1)} limit` : "Limit", isWarning ? "Work continues until the limit is reached" : "New runs are paused"].join(" · ")}

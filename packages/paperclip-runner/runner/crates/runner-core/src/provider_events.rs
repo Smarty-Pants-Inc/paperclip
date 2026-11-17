@@ -15,7 +15,8 @@ const MAX_TEXT_CHARS: usize = 4_000;
 /// preview. It keeps its complete (redacted) text up to this transport-safe
 /// bound; the durable outbox applies its own frame check.
 pub(crate) const MAX_FINAL_AGENT_MESSAGE_CHARS: usize = 32_000;
-/// Pi final replies and synthesized result summaries share the result schema's cap.
+/// Pi synthesized result summaries keep the result schema's cap. The Pi final
+/// reply itself (item.completed, channel final) is never cut to this bound.
 pub(crate) const MAX_PI_FINAL_TEXT_CHARS: usize = 12_000;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -633,6 +634,20 @@ fn final_agent_message_text(value: &str) -> String {
     let mut bounded: String = redacted.chars().take(retained_chars).collect();
     bounded.push_str(marker);
     bounded
+}
+
+/// The agent-facing reference to the whole text of an answer longer than one
+/// record: only a well-formed {path, sha256, bytes} is carried.
+pub(crate) fn full_text_reference(value: Option<&Value>) -> Option<Value> {
+    let value = value?;
+    let path = value.get("path").and_then(Value::as_str)?;
+    let sha256 = value.get("sha256").and_then(Value::as_str)?;
+    let bytes = value.get("bytes").and_then(Value::as_u64)?;
+    (!path.is_empty()
+        && path.len() <= 4_096
+        && sha256.len() == 64
+        && sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| json!({"path": path, "sha256": sha256, "bytes": bytes}))
 }
 
 fn bounded_text(value: &str, max_chars: usize) -> String {
@@ -1658,6 +1673,43 @@ pub(crate) fn normalize_pi_notification_in(
     params: &Value,
     cwd: Option<&str>,
 ) -> Vec<NormalizedProviderEvent> {
+    // Pi pages streamed answer/reasoning text to its record budget upstream.
+    // These are live text, not diagnostic previews: bypass bounded_text, while
+    // retaining redaction and the durable outbox's unchanged frame guard.
+    let streamed = match method {
+        "item/agentMessage/delta" => Some(("agentMessage", "progress", params.get("delta"))),
+        "item/reasoning/summaryTextDelta" => Some(("reasoning", "summary", params.get("delta"))),
+        // Pi's facade forwards reasoning item.delta as item/delta (not the
+        // Codex summary notification). Do not drop this real wire shape.
+        "item/delta" => match string(params.get("kind").or_else(|| item(params).get("type"))) {
+            "agentMessage" => Some((
+                "agentMessage",
+                "progress",
+                params.get("text").or_else(|| item(params).get("text")),
+            )),
+            "reasoning" => Some((
+                "reasoning",
+                "summary",
+                params.get("text").or_else(|| item(params).get("text")),
+            )),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((kind, channel, text)) = streamed {
+        return vec![NormalizedProviderEvent {
+            event_type: "item.delta".to_owned(),
+            priority: EventPriority::P2,
+            payload: json!({
+                "provider": "pi_rpc",
+                "itemId": stable_id(string(params.get("itemId").or_else(|| item(params).get("id"))), "pi-item"),
+                "kind": kind,
+                "channel": channel,
+                "providerMethod": method,
+                "text": redact_sensitive_text_values(string(text)),
+            }),
+        }];
+    }
     // item/failed is a Pi compatibility notification, not a Codex terminal.
     // Preserve it as an item failure; only Pi's turn terminal settles the run.
     if method == "item/failed" {
@@ -1677,7 +1729,11 @@ pub(crate) fn normalize_pi_notification_in(
                 },
                 "text": params.get("text").or_else(|| provider_item.get("text"))
                     .and_then(Value::as_str).map(|text| bounded_text(text, MAX_TEXT_CHARS)),
-                "message": bounded_text(string(params.get("message")), MAX_TEXT_CHARS),
+                // Shown in the person's transcript (ui adapters/paperclip-runner
+                // index.ts item.failed): whole and redacted, never cut. The Pi
+                // projector already bounds it to one record. (`text` above is
+                // not rendered for a failed item and keeps its preview.)
+                "message": redact_sensitive_text_values(string(params.get("message"))),
             }),
         }];
     }
@@ -1711,13 +1767,31 @@ pub(crate) fn normalize_pi_notification_in(
                     event.payload["text"] = item(params)
                         .get("text")
                         .and_then(Value::as_str)
-                        .map(|text| {
-                            json!(redact_sensitive_text_values(text)
-                                .chars()
-                                .take(MAX_PI_FINAL_TEXT_CHARS)
-                                .collect::<String>())
-                        })
+                        // The person's complete answer: redacted, never cut.
+                        // The durable outbox keeps it whole when it fits a frame.
+                        .map(|text| json!(redact_sensitive_text_values(text)))
                         .unwrap_or(Value::Null);
+                    // An answer longer than one record: the person's text is a
+                    // plain line and a labelled excerpt; the path and sha256 of
+                    // the whole text are for the agent, never shown.
+                    if let Some(full) = full_text_reference(params.get("fullText")) {
+                        event.payload["fullText"] = full;
+                    }
+                }
+            }
+        }
+    }
+    // A Pi progress message is shown in the person's task chat. The Pi
+    // projector already bounds it to one record: keep it whole (redacted), not
+    // the 4,000-character "…[truncated]" preview.
+    if method == "item/completed"
+        && string(params.get("channel")) == "progress"
+        && string(item(params).get("type")) == "agentMessage"
+    {
+        for event in &mut events {
+            if event.payload.get("kind").and_then(Value::as_str) == Some("agentMessage") {
+                if let Some(text) = item(params).get("text").and_then(Value::as_str) {
+                    event.payload["text"] = json!(redact_sensitive_text_values(text));
                 }
             }
         }
@@ -2595,6 +2669,36 @@ fn has_rfc_uri_scheme_prefix(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    // Keep reason: Paul NOTE 5's real Pi facade -> PRP boundary must not
+    // turn a live answer into a preview (or drop a reasoning delta).
+    #[test]
+    fn dl_n5_delta_agent_message_normalizes_whole() {
+        assert_pi_delta_normalizes_whole("item/agentMessage/delta", "agentMessage");
+    }
+
+    #[test]
+    fn dl_n5_delta_reasoning_normalizes_whole() {
+        assert_pi_delta_normalizes_whole("item/delta", "reasoning");
+        assert_pi_delta_normalizes_whole("item/reasoning/summaryTextDelta", "reasoning");
+    }
+
+    fn assert_pi_delta_normalizes_whole(method: &str, kind: &str) {
+        let text = "x".repeat(6_000);
+        let events = normalize_pi_notification_in(
+            method,
+            &json!({"threadId": "native", "turnId": "turn", "itemId": "stream",
+                "kind": kind, "text": text, "delta": text,
+                "item": {"id": "stream", "type": kind, "text": text}}),
+            None,
+        );
+        assert_eq!(events.len(), 1, "{method} must reach the outbox");
+        assert_eq!(events[0].event_type, "item.delta");
+        assert_eq!(events[0].payload["kind"], kind);
+        assert_eq!(events[0].payload["text"].as_str().unwrap().len(), 6_000);
+        assert_eq!(events[0].payload["text"], text);
+        assert!(!events[0].payload.to_string().contains("…[truncated]"));
+    }
+
     // Keep reason: L17's JSON-RPC -> canonical PRP boundary dropped item/failed
     // after the Pi proxy had already forwarded it. Never turn it into settlement.
     #[test]
@@ -2620,6 +2724,68 @@ mod tests {
         assert!(!events[0].payload.to_string().contains("pi-failure-secret"));
         let codex = normalize_codex_notification("item/failed", &json!({}));
         assert!(codex.is_empty());
+    }
+
+    // Paul NOTE 5 (RFL 11-17): an answer longer than one record is shown as a
+    // plain line and a labelled excerpt; the path and sha256 of the whole text
+    // travel in the event for the agent, never in the person's text.
+    #[test]
+    fn pi_final_answer_carries_the_full_text_reference_for_the_agent() {
+        let full = json!({"path": "/runner/tmp/paperclip-pi-spill/abc.txt",
+            "sha256": "0".repeat(64), "bytes": 800_000});
+        let events = normalize_pi_notification_in(
+            "item/completed",
+            &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:reply",
+                "kind":"agentMessage", "channel":"final", "fullText": full,
+                "item":{"id":"turn:reply", "type":"agentMessage", "text":"This answer is longer than one message (800 KB)."}}),
+            None,
+        );
+        let reply = events
+            .iter()
+            .find(|event| event.event_type == "item.completed")
+            .unwrap();
+        assert_eq!(reply.payload["channel"], "final");
+        assert_eq!(reply.payload["fullText"], full);
+        assert!(!reply.payload["text"].as_str().unwrap().contains("/runner"));
+    }
+
+    // Paul NOTE 5: a Pi progress message and a failed Pi item's message reach
+    // the person's task chat and transcript; neither is cut at 4,000
+    // characters with "…[truncated]".
+    #[test]
+    fn pi_progress_message_and_failed_item_message_arrive_whole() {
+        let long = format!(
+            "token=pi-secret {}",
+            "Checking the next file, then the tests. ".repeat(250)
+        );
+        assert!(long.chars().count() > 4_000);
+        let progress = normalize_pi_notification_in(
+            "item/completed",
+            &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:note",
+                "kind":"agentMessage", "channel":"progress",
+                "item":{"id":"turn:note", "type":"agentMessage", "text": long, "phase":"commentary"}}),
+            None,
+        );
+        let note = progress
+            .iter()
+            .find(|event| event.event_type == "item.completed")
+            .unwrap();
+        assert_eq!(note.payload["channel"], "progress");
+        assert_eq!(
+            note.payload["text"],
+            long.replace("pi-secret", "[REDACTED]")
+        );
+        let failed = normalize_pi_notification_in(
+            "item/failed",
+            &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:tool",
+                "kind":"commandExecution", "message": long}),
+            None,
+        );
+        assert_eq!(
+            failed[0].payload["message"],
+            long.replace("pi-secret", "[REDACTED]")
+        );
+        assert!(!failed[0].payload.to_string().contains("truncat"));
     }
 
     #[test]

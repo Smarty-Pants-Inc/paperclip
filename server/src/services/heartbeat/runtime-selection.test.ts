@@ -110,6 +110,17 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     };
     return { input, issue, run, agent };
   }
+  it("projects the prepared agent-file conflict notice into the selected native model input", async () => {
+    const { input } = await fixture();
+    const notice = 'Note: "memory/x.md" was also saved by another run; that version was kept. Your earlier edit is saved as "memory/x.conflict-ab12cd34-1731840000000.md".';
+    input.task.context.paperclipAgentFileConflictNotice = notice;
+    const selected = await selectHeartbeatRuntime(db, input);
+    expect(selected.selected).toBe(true);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected native selection");
+    const envelope = buildNativeModelEnvelope(selected.nativeExecution);
+    expect(envelope.task.prompt).toContain(notice);
+    expect(envelope.task.prompt.split(notice)).toHaveLength(2);
+  });
   // Keep: recorded row-5 failure across the actual remote-read/driver/runtime
   // contract, then into the durable fresh-history owner, without prose authority.
   it("RFL round4 F2 row5 remote state read failure ends at upstream's plain recovery failure (D-B1 + D-B2)", async () => {

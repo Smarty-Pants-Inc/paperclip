@@ -5,7 +5,7 @@ import { notifyInstructionCommit, type InstructionCommitScope } from "./instruct
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { registerScopedDeadlineWork } from "./scoped-deadline-work.js";
-import { AgentDirectoryOperationBusyError, agentDirectoryWorkingCopyService, isAgentDirectoryCopy, trackAgentFileCheckpoint } from "./agent-directory-working-copies.js";
+import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryOperationBusyError, agentDirectoryWorkingCopyService, agentFileSaveHeld, isAgentDirectoryCopy, trackAgentFileCheckpoint } from "./agent-directory-working-copies.js";
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -83,7 +83,7 @@ export async function collectStoppedInstructionCopyWithRetries<T extends Pick<Co
 }
 
 export function instructionWorkingCopyGuidance(copy: Pick<Copy, "executionRoot" | "entryFile" | "receipt">) {
-  if (isAgentDirectoryCopy(copy)) return `Your persistent agent directory is ${copy.executionRoot} (AGENT_HOME). Your instruction entry is ${copy.executionRoot}/${copy.entryFile}. Read and write your own files and subfolders there. This directory belongs to this agent across tasks and sessions; task files belong in the task working directory. Paperclip restores this directory before execution and saves validated changes at turn boundaries. A warm native Codex session keeps the same writable directory between turns. Other sessions collect after the provider stops. Regular files, including binary files, persist; symlinks and special files are unsupported. Check the agent-files save receipt before claiming persistence; Only files you change or delete are synchronized. If another run changes the same file, the last completed synchronization wins. Temporary copies are removed when the owning session stops; there is no per-run file history. Storage allows 256 MiB per file, 2 GiB total, and 100,000 entries; the instruction entry must remain UTF-8 and at most 1 MiB. Reaching a storage limit never prevents this or future tasks from running. Remove or shrink files to free space; changes that exceed the limits will not be saved.${typeof copy.receipt?.storageWarning === "string" ? `\n\n${copy.receipt.storageWarning}` : ""}`;
+  if (isAgentDirectoryCopy(copy)) return `Your persistent agent directory is ${copy.executionRoot} (AGENT_HOME). Your instruction entry is ${copy.executionRoot}/${copy.entryFile}. Read and write your own files and subfolders there. This directory belongs to this agent across tasks and sessions; task files belong in the task working directory. Paperclip restores this directory before execution and saves validated changes at turn boundaries. A warm native Codex session keeps the same writable directory between turns. Other sessions collect after the provider stops. Regular files, including binary files, persist; symlinks and special files are unsupported. Check the agent-files save receipt before claiming persistence; Only files you change or delete are synchronized. Another writer's saved version stays canonical; this run's divergent edit is saved as <name>.conflict-<run8>-<epochms>.<ext>; the save receipt names both. A stale deletion is not applied. Temporary copies are removed when the owning session stops; there is no per-run file history. Storage allows 256 MiB per file, 2 GiB total, and 100,000 entries; the instruction entry must remain UTF-8 and at most 1 MiB. Reaching a storage limit never prevents this or future tasks from running. Remove or shrink files to free space; changes that exceed the limits will not be saved.${typeof copy.receipt?.storageWarning === "string" ? `\n\n${copy.receipt.storageWarning}` : ""}`;
   return `Your editable agent instruction file is ${copy.executionRoot}/${copy.entryFile}. Edit this registered private copy normally. After this run stops, Paperclip saves changed content as a persistent revision if your responsible user still has permission and the baseline has not changed. Check the run's instruction-save receipt before claiming persistence. Use read_agent_instructions, update_agent_instructions, get_agent_instruction_history, and restore_agent_instructions for immediate saves and history. Read first and pin the returned revision. Preserve conflicts; never silently retry against a newer head. Repository instructions, skills, and the loaded prompt are separate and are not collected.`;
 }
 
@@ -391,7 +391,9 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     return !row.receipt?.retainedByRunId && (
       row.attempts < MAX_COLLECTION_ATTEMPTS && (["prepared", "pending_collection", "unchanged_turn", "warm_saved"].includes(row.state)
         || row.state === "preparing" && isAgentDirectoryCopy(row))
-      || row.state === "unavailable" && !row.processStoppedAt && row.location.startsWith("remote:") && isAgentDirectoryCopy(row));
+      || row.state === "unavailable" && !row.processStoppedAt && row.location.startsWith("remote:") && isAgentDirectoryCopy(row)
+      // A held stopped save is retried durably until it verifies.
+      || agentFileSaveHeld(row) && Boolean(row.processStoppedAt));
   }
   function strandsAgent(row: Copy) {
     const handedOff = row.state === "superseded" && typeof row.receipt?.successorRunId === "string"
@@ -413,11 +415,15 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       (${copies.attempts} < 3 AND (${copies.state} IN ('prepared', 'pending_collection', 'unchanged_turn', 'warm_saved')
         OR (${copies.state} = 'preparing' AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1')))
       OR (${copies.state} = 'unavailable' AND ${copies.processStoppedAt} IS NULL
-        AND ${copies.location} LIKE 'remote:%' AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1'))`,
+        AND ${copies.location} LIKE 'remote:%' AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1')
+      OR (${copies.receipt} ? 'savePending' AND ${copies.state} NOT IN ('saved', 'unchanged', 'resolved')
+        AND ${copies.processStoppedAt} IS NOT NULL AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1'))`,
       inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"]));
   }
-  type StopEvidence = "directory_unavailable" | "directory_preparing" | "local" | "remote" | null;
+  type StopEvidence = "directory_save_pending" | "directory_unavailable" | "directory_preparing" | "local" | "remote" | null;
   async function stopEvidence(row: Copy, runtimeMode: string | null): Promise<StopEvidence> {
+    // The hold itself records stop proof; retry the save, never a discard.
+    if (agentFileSaveHeld(row) && row.processStoppedAt) return "directory_save_pending";
     if (row.state === "unavailable" && isAgentDirectoryCopy(row)) return "directory_unavailable";
     if (row.state === "preparing" && isAgentDirectoryCopy(row)) return "directory_preparing";
     if (row.location === "local") return row.processStoppedAt || runtimeMode === "native" &&
@@ -430,7 +436,11 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       nextAttemptAt: instructionCopyRetryAt(waitingSince) };
   }
   async function collectRecovered(row: Copy, evidence: Exclude<StopEvidence, null>, retryAt: Date): Promise<Copy | null | undefined> {
-    if (evidence === "directory_unavailable") {
+    if (evidence === "directory_save_pending") {
+      // Retry the held save through the same collector. Success releases;
+      // another failure re-holds with a later durable retry.
+      await collectStopped({ companyId: row.companyId, runId: row.runId, target: liveTargets.get(targetKey(row.companyId, row.runId)) });
+    } else if (evidence === "directory_unavailable") {
       await recoverDirectoryCleanup(row, retryAt, () => directories.recoverUnavailable(row));
     } else if (evidence === "directory_preparing") {
       await directories.release(await patch(row, { state: "unavailable", processStoppedAt: new Date(),
@@ -438,12 +448,21 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     } else if (evidence === "local") {
       const result = await collectStopped({ companyId: row.companyId, runId: row.runId });
       if (result && isAgentDirectoryCopy(result) && completed.has(result.state)) await directories.release(result);
-    } else if (row.receipt?.warm === true) {
+    } else if (row.receipt?.warm === true && isAgentDirectoryCopy(row) && await directories.destroyedRemote(row)) {
+      // Exact destruction is proven: the tail is already lost. Settle truthfully.
       const unavailable = await patch(row, { state: "unavailable", errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
         errorMessage: "The last completed checkpoint remains saved. Files changed afterwards could not be collected after remote termination.", nextAttemptAt: null });
       if (isAgentDirectoryCopy(unavailable)) {
         await directories.release(await patch(unavailable, { processStoppedAt: unavailable.processStoppedAt ?? new Date() }));
       }
+    } else if (row.receipt?.warm === true) {
+      // A remote stop is not destruction. Files changed after the last
+      // checkpoint may exist only in the stopped sandbox: hold, do not release.
+      const stoppedAt = row.processStoppedAt ?? new Date();
+      await patch(row, { state: "unavailable", errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
+        errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION, nextAttemptAt: retryAt, processStoppedAt: stoppedAt,
+        ...(isAgentDirectoryCopy(row) ? { receipt: { ...row.receipt, savePending: { since: stoppedAt.toISOString(), code: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE",
+          reason: "The remote provider stopped before files changed after the last checkpoint were collected.", failures: 1 } } } : {}) });
     } else if (isAgentDirectoryCopy(row)) {
       const result = await directories.recoverStoppedRemote(row);
       if (result && collectionCandidate(result) && !result.processStoppedAt && (result.nextAttemptAt?.getTime() ?? 0) < retryAt.getTime()) {
@@ -523,7 +542,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
   type DirectoryCleanupEntry = { id: string; companyId: string; dueAt: number };
   function directoryCleanupEntry(row: Copy | null): DirectoryCleanupEntry | null {
     return row && ["saved", "unchanged", "resolved", "unavailable"].includes(row.state)
-      && row.processStoppedAt && isAgentDirectoryCopy(row) && !row.receipt?.retainedByRunId
+      && row.processStoppedAt && isAgentDirectoryCopy(row) && !row.receipt?.retainedByRunId && !agentFileSaveHeld(row)
       && (row.receipt?.cleanupPending === false ? row.nextAttemptAt !== null
         : Object.hasOwn(row.receipt!, "baseline") || row.receipt?.cleanupPending === true)
       ? { id: row.runId, companyId: row.companyId, dueAt: row.nextAttemptAt?.getTime() ?? 0 } : null;
@@ -533,6 +552,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       AND ${copies.processStoppedAt} IS NOT NULL
       AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1'
       AND coalesce(${copies.receipt}->>'retainedByRunId', '') = ''
+      AND NOT (${copies.state} = 'unavailable' AND ${copies.receipt} ? 'savePending')
       AND ((${copies.receipt}->>'cleanupPending' = 'false' AND ${copies.nextAttemptAt} IS NOT NULL)
         OR (${copies.receipt}->>'cleanupPending' IS DISTINCT FROM 'false'
           AND (${copies.receipt} ? 'baseline' OR ${copies.receipt}->>'cleanupPending' = 'true')))`;
@@ -688,5 +708,5 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     }
     return row;
   }
-  return { registerStoppedCollectionWork, registerDirectoryCleanupWork, registerCapturedCommitWork, prepare, checkpointWarm, canReuseWarm: directories.canReuse, adopt, reportRetirementUnconfirmed, get, hasChanges, acknowledgeExplicitSave, collectStopped, recoverCaptured, recoverStopped, list, resolve, reportUnavailable, release };
+  return { registerStoppedCollectionWork, registerDirectoryCleanupWork, registerCapturedCommitWork, prepare, checkpointWarm, claimConflictNotice: directories.claimConflictNotice, canReuseWarm: directories.canReuse, adopt, reportRetirementUnconfirmed, get, hasChanges, acknowledgeExplicitSave, collectStopped, recoverCaptured, recoverStopped, list, resolve, reportUnavailable, release };
 }

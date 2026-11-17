@@ -666,6 +666,16 @@ export function inspectUnclaimedBootstrapCheckpoint(
   } catch { return null; }
 }
 
+// A failed open still awaits its transport close, which queues these lifecycle
+// commands with empty payloads (runnerd-codex-transport.ts close: queueDrain,
+// queueSuspend) even when no Runner ever connected. Undelivered and unanswered,
+// they are not evidence that anything authenticated (Row B).
+const FAILED_OPEN_CLEANUP_COMMAND_TYPES = new Set(["runner.drain", "runner.suspend"]);
+function isUndeliveredFailedOpenCleanup(state: StoredCoreState, command: DurableRecoveryCoreCommand): boolean {
+  return FAILED_OPEN_CLEANUP_COMMAND_TYPES.has(command.type) && canonicalJson(command.payload) === "{}"
+    && !Object.hasOwn(state.commandDeliveryCounts, command.commandId);
+}
+
 function isUnauthenticatedBootstrapState(state: StoredCoreState, expected: Partial<DurableRecoveryIdentity>): boolean {
   const history = state.bootstrapHistory;
   const matches = (candidate: DurableRecoveryIdentity | undefined) => candidate !== undefined
@@ -681,9 +691,11 @@ function isUnauthenticatedBootstrapState(state: StoredCoreState, expected: Parti
       || Object.keys(state.leases).length !== 0 || state.lastLeaseId !== null || state.lastLeaseExpiresAt !== null
       || state.replayDeliveries !== 0 || state.duplicateCommandResults !== 0
       // session.open is queued only after run.prepare is answered; until then a
-      // start and each same-run retry of it leave only pending run.prepare commands.
+      // start and each same-run retry of it leave only pending run.prepare commands,
+      // plus the cleanup each failed open's close queued after them.
       || state.commands[0]?.type !== "run.prepare"
-      || (state.commands[1]?.type !== "session.open" && state.commands.some(command => command.type !== "run.prepare"))
+      || (state.commands[1]?.type !== "session.open" && state.commands.some(command => command.type !== "run.prepare"
+        && !isUndeliveredFailedOpenCleanup(state, command)))
       || state.commands.some(command => command.status !== "pending" || command.result !== null));
 }
 

@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { redactProviderDiagnostic } from "../diagnostic-redaction.js";
 import { piPerformanceEntrySpans } from "./pi-performance-diagnostics.js";
@@ -15,10 +18,18 @@ export interface PiProjectedEvent extends PiEventOrigin {
   payload: Record<string, unknown>;
   debug?: Record<string, unknown>;
 }
-interface Block { id: string; kind: string; text: string; terminal: boolean; truncated?: boolean }
+interface Block { id: string; kind: string; text: string; terminal: boolean }
 interface Tool { id: string; name: string; args?: unknown; input: string; terminal: boolean; started: boolean }
+/** Per-record frame safety bound. Never raised: larger text is spilled or paged, not cut. */
 const MAX_RECORD_BYTES = 256 * 1024;
-const MAX_TEXT_BYTES = 64 * 1024;
+/** Inline budget for one display field (tool items carry the body twice). */
+const MAX_TEXT_BYTES = 112 * 1024;
+/** Inline budget for a single final answer field: the whole record minus envelope room. */
+const MAX_ANSWER_BYTES = MAX_RECORD_BYTES - 6 * 1024;
+/** Preview kept next to a spill reference; the referenced file holds the whole text. */
+const SPILL_PREVIEW_BYTES = 16 * 1024;
+/** Page size for streamed text deltas that would not fit one record. */
+const PAGE_BYTES = 96 * 1024;
 const MAX_IDENTITIES = 1024; // Per native message's content indexes, not lifetime work.
 const MAX_ACTIVE_TOOLS = 1024;
 const MAX_RECEIPTS = 65_536; // Compact, turn-local hashes; overflow is display-only.
@@ -26,26 +37,86 @@ const record = (value: unknown): Record<string, unknown> => value !== null && ty
 const text = (value: unknown): string => typeof value === "string" ? value : "";
 const nativeId = (value: unknown): string | undefined => typeof value === "string" && value.length > 0 ? `s:${value}` : typeof value === "number" && Number.isSafeInteger(value) ? `n:${value}` : undefined;
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
-const TEXT_TRUNCATION_MARKER = "[Pi projection truncated]";
-/** Display copies only; Pi executes and persists the untouched native input. */
-function boundedText(value: string, budget = MAX_TEXT_BYTES): string {
-  if (Buffer.byteLength(JSON.stringify(value)) <= budget) return value;
+const jsonBytes = (value: string): number => Buffer.byteLength(JSON.stringify(value));
+/** Longest UTF-16-safe prefix of value (plus suffix) whose JSON form fits budget. */
+function fittingPrefix(value: string, budget: number, suffix = ""): string {
   let low = 0, high = Math.min(value.length, budget);
   while (low < high) {
     const mid = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(JSON.stringify(value.slice(0, mid) + TEXT_TRUNCATION_MARKER)) <= budget) low = mid;
+    if (jsonBytes(value.slice(0, mid) + suffix) <= budget) low = mid;
     else high = mid - 1;
   }
   if (low > 0 && /[\uD800-\uDBFF]/u.test(value[low - 1]!)) low--;
-  return value.slice(0, low) + TEXT_TRUNCATION_MARKER;
+  return value.slice(0, low);
+}
+/**
+ * Never cut what a person or the model needs. Text that fits its budget is
+ * returned whole. Larger text is written WHOLE to a content-addressed file in
+ * the Runner's TMPDIR (the same TMPDIR Pi's own read tool opens) and the
+ * display copy is a leading excerpt plus a plain reference to that file.
+ */
+export function spillText(value: string, label: "input" | "output" | "text" | "answer", budget = MAX_TEXT_BYTES, directory?: string): string {
+  if (jsonBytes(value) <= budget) return value;
+  const root = directory ?? join(tmpdir(), "paperclip-pi-spill");
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const path = join(root, `${createHash("sha256").update(value).digest("hex").slice(0, 32)}.txt`);
+  writeFileSync(path, value, { mode: 0o600 });
+  chmodSync(path, 0o600);
+  const reference = `\n\n[Full ${label}: ${path} (${Buffer.byteLength(value)} bytes; the excerpt above is its beginning; open the file to read all of it)]`;
+  return fittingPrefix(value, Math.max(256, Math.min(SPILL_PREVIEW_BYTES, budget) - jsonBytes(reference))) + reference;
+}
+/** Where the whole of a final answer longer than one record is kept, for the agent (never shown to the person). */
+export interface PiFullTextReference { path: string; sha256: string; bytes: number }
+/**
+ * A final answer that fits one record is returned whole. A longer one is kept
+ * WHOLE (the same content-addressed spill file Pi's read tool can open; the
+ * durable copy is the answer itself in Pi's own session transcript, which the
+ * server checkpoints and restores). The person's text is one plain, true line
+ * and a clearly labelled excerpt: no path, digest or cut marker. The path and
+ * sha256 travel in the event's fullText for the agent.
+ */
+function finalAnswerText(value: string, budget = MAX_ANSWER_BYTES, directory?: string): { text: string; fullText?: PiFullTextReference } {
+  if (jsonBytes(value) <= budget) return { text: value };
+  const root = directory ?? join(tmpdir(), "paperclip-pi-spill");
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const sha256 = digest(value);
+  const path = join(root, `${sha256.slice(0, 32)}.txt`);
+  writeFileSync(path, value, { mode: 0o600 });
+  chmodSync(path, 0o600);
+  const bytes = Buffer.byteLength(value);
+  const notice = `This answer is longer than one message (${Math.ceil(bytes / 1000)} KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n`;
+  return { text: notice + fittingPrefix(value, Math.max(256, Math.min(SPILL_PREVIEW_BYTES, budget) - jsonBytes(notice))), fullText: { path, sha256, bytes } };
+}
+/** Live partial output only: a labelled tail; the whole output arrives with the tool result. */
+function liveOutputPreview(value: string, budget = SPILL_PREVIEW_BYTES): string {
+  if (jsonBytes(value) <= budget) return value;
+  const label = `[Live output: showing the latest part of ${Buffer.byteLength(value)} bytes so far; the whole output arrives with the tool result]\n`;
+  let start = Math.max(0, value.length - budget);
+  while (start < value.length && jsonBytes(label + value.slice(start)) > budget) start += Math.max(1, Math.ceil((jsonBytes(label + value.slice(start)) - budget) / 6));
+  if (start < value.length && /[\uDC00-\uDFFF]/u.test(value[start]!)) start++;
+  return label + value.slice(start);
+}
+/** Split text into UTF-16-safe pages whose JSON form each fits budget. */
+export function pages(value: string, budget = PAGE_BYTES): string[] {
+  if (jsonBytes(value) <= budget) return [value];
+  const out: string[] = [];
+  let rest = value;
+  while (rest) {
+    const page = fittingPrefix(rest, budget) || rest.slice(0, /[\uD800-\uDBFF]/u.test(rest[0]!) ? 2 : 1);
+    out.push(page); rest = rest.slice(page.length);
+  }
+  return out;
 }
 /** Same sensitive-parent rule as codex-boundaries.ts:364-385, before flattening. */
 function displayValue(value: unknown, depth = 0, preview = (value: string) => value, previewStrings = false): unknown {
   if (depth > 32) throw new Error("pi_projection_depth_limit");
-  if (typeof value === "string") return redactProviderDiagnostic(previewStrings && Buffer.byteLength(value) > MAX_TEXT_BYTES ? preview(value) : value);
+  if (typeof value === "string") {
+    const safe = redactProviderDiagnostic(value);
+    return previewStrings && Buffer.byteLength(safe) > MAX_ANSWER_BYTES ? preview(safe) : safe;
+  }
   if (Array.isArray(value)) return value.map(entry => displayValue(entry, depth + 1, preview, previewStrings));
   if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key,
-    /token|secret|password|api.?key|authorization|credential|thinkingSignature|thoughtSignature/i.test(key) && !/^(?:totalTokens|inputTokens|outputTokens|cachedInputTokens|cacheWriteTokens|tokensBefore|estimatedTokensAfter)$/u.test(key) ? "[REDACTED]" : displayValue(entry, depth + 1, preview, previewStrings || /^(?:args|arguments|text|thinking|content|delta|errorMessage)$/u.test(key)),
+    /token|secret|password|api.?key|authorization|credential|thinkingSignature|thoughtSignature/i.test(key) && !/^(?:totalTokens|inputTokens|outputTokens|cachedInputTokens|cacheWriteTokens|tokensBefore|estimatedTokensAfter)$/u.test(key) ? "[REDACTED]" : displayValue(entry, depth + 1, preview, previewStrings || /^(?:args|arguments|text|thinking|content|errorMessage)$/u.test(key)),
   ]));
   return value;
 }
@@ -59,19 +130,6 @@ function projectionUsage(value: unknown): unknown {
   const usage = record(value), cost = record(usage.cost);
   return { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, totalTokens: usage.totalTokens,
     cost: { total: cost.total, totalFromProvider: cost.totalFromProvider } };
-}
-/** Display-only preview; budget counts JSON escaping, not just native UTF-8. */
-function toolOutputPreview(value: string, budget: number): string {
-  if (Buffer.byteLength(JSON.stringify(value)) <= budget) return value;
-  const marker = "[Pi tool output truncated] ";
-  let low = 0, high = Math.min(value.length, budget);
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(JSON.stringify(marker + value.slice(0, mid))) <= budget) low = mid;
-    else high = mid - 1;
-  }
-  if (low > 0 && /[\uD800-\uDBFF]/u.test(value[low - 1]!)) low--;
-  return marker + value.slice(0, low);
 }
 /** Keep tool receipt fields and bounded child correlation; arbitrary details stay in Pi. */
 function toolControlRecord(event: Record<string, unknown>): Record<string, unknown> {
@@ -120,7 +178,7 @@ function toolControlRecord(event: Record<string, unknown>): Record<string, unkno
  * and its captured old origin. It never borrows the next turn's projector.
  * Every output carries its captured origin; native payloads cannot select it.
  */
-export function createPiEventProjector(options: PiEventOrigin & { includeThinking?: boolean }): { project(value: unknown): PiProjectedEvent[] } {
+export function createPiEventProjector(options: PiEventOrigin & { includeThinking?: boolean; spillDirectory?: string }): { project(value: unknown): PiProjectedEvent[] } {
   if (typeof options.runId !== "string" || !options.runId || options.runId.length > 240) throw new Error("pi_projection_run_id_invalid");
   if (typeof options.turnId !== "string" || !options.turnId || options.turnId.length > 240) throw new Error("pi_projection_turn_id_invalid");
   // Copy primitive IDs: callers may reuse/mutate their current-origin holder.
@@ -147,10 +205,12 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   const pendingChildren = new Set<string>();
   const childRunTools = new Map<string, string>();
   let displayTruncated = false;
-  const projectText = (value: string, budget = MAX_TEXT_BYTES): string => {
-    const preview = boundedText(value, budget);
-    if (preview !== value) displayTruncated = true;
-    return preview;
+  const spillDirectory = options.spillDirectory;
+  // Whole when it fits; otherwise spilled whole and referenced. Never a cut marker.
+  const projectText = (value: string, budget = MAX_TEXT_BYTES, label: "input" | "output" | "text" | "answer" = "text"): string => {
+    const shown = spillText(value, label, budget, spillDirectory);
+    if (shown !== value) displayTruncated = true;
+    return shown;
   };
   let originalToolOutput: { body: string; truncated: boolean } | undefined;
   const diagnostic = (type: string, code = "pi_unknown_event"): PiProjectedEvent[] => {
@@ -211,8 +271,8 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   const argumentsFor = (tool: Tool, args: unknown) => {
     if (args === undefined) throw new Error("pi_projection_tool_arguments_missing");
     const serialized = JSON.stringify(args);
-    tool.input = projectText(serialized);
-    tool.args = tool.input === serialized ? structuredClone(args) : { truncated: true, preview: tool.input };
+    tool.input = projectText(serialized, MAX_TEXT_BYTES, "input");
+    tool.args = tool.input === serialized ? structuredClone(args) : { spilled: true, preview: tool.input };
   };
   const usageFor = (message: Record<string, unknown>, key: string, output: PiProjectedEvent[]) => {
     if (message.usage === undefined) {
@@ -293,8 +353,10 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     startTool(tool, output);
     const end = event.type === "tool_execution_end";
     const result = record(end ? event.result : event.partialResult);
-    const fullBody = contentText(result.content);
-    const body = Buffer.byteLength(fullBody) <= MAX_TEXT_BYTES ? fullBody : toolOutputPreview(fullBody, MAX_TEXT_BYTES);
+    // project() already made this display body whole, spilled+referenced, or (live only) a labelled preview.
+    const body = contentText(result.content);
+    const fullBody = originalToolOutput?.body ?? body;
+    // outputTruncated: the output FIELD is an excerpt (its whole text is in the referenced spill file).
     const outputWasTruncated = originalToolOutput?.truncated === true || body !== fullBody;
     if (outputWasTruncated) displayTruncated = true;
     const failed = event.isError === true;
@@ -349,12 +411,15 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       const key = source.type === "message_end" ? "message" : source.type === "tool_execution_update" ? "partialResult" : "result";
       const nativeResult = record(source[key]);
       const fullBody = contentText(nativeResult.content);
-      const preview = Buffer.byteLength(fullBody) <= MAX_TEXT_BYTES ? fullBody : toolOutputPreview(fullBody, MAX_TEXT_BYTES);
+      // A final result is whole inline or spilled whole (redacted) and referenced.
+      // A cumulative live update is a labelled preview; its result follows whole.
+      const preview = key === "partialResult" ? liveOutputPreview(fullBody)
+        : jsonBytes(fullBody) <= MAX_TEXT_BYTES ? fullBody : spillText(redactProviderDiagnostic(fullBody), "output", MAX_TEXT_BYTES, spillDirectory);
       const omittedContent = Array.isArray(nativeResult.content) && nativeResult.content.some(part => record(part).type !== "text");
-      if (omittedContent) displayTruncated = true;
+      if (omittedContent || preview !== fullBody) displayTruncated = true;
       // Bound before diagnostic redaction: ignored megabyte details, images and
       // cumulative output must not enter its regular-expression passes.
-      originalToolOutput = { body: fullBody, truncated: preview !== fullBody || omittedContent };
+      originalToolOutput = { body: fullBody, truncated: omittedContent };
       observed = { ...control, [key]: { ...record(control[key]), content: [{ type: "text", text: preview }] } };
     }
     const event = record(displayValue(observed, 0, projectText));
@@ -395,19 +460,10 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         const payload = { kind, channel: thinking ? "detail" : "unknown" };
         if (!existing) output.push(emit("item.started", block.id, { ...payload, text: "" }));
         if (type.endsWith("_delta")) {
-          if (!block.truncated) {
-            const combined = block.text + text(update.delta);
-            // Reserve room for the marker even when prior deltas already filled
-            // the preview. A terminal snapshot replaces this streamed display.
-            const next = projectText(combined, MAX_TEXT_BYTES - 128);
-            block.truncated = next !== combined;
-            const delta = block.truncated && next.length - TEXT_TRUNCATION_MARKER.length < block.text.length
-              ? TEXT_TRUNCATION_MARKER : next.slice(block.text.length);
-            block.text = next;
-            if (delta) output.push(emit("item.delta", block.id, { ...payload, text: delta }));
-          }
+          // Every streamed delta reaches the person whole; one too large for a
+          // record is paged across consecutive deltas, never cut.
+          for (const page of pages(text(update.delta))) if (page) output.push(emit("item.delta", block.id, { ...payload, text: page }));
         } else if (type.endsWith("_end")) {
-          block.text = projectText(text(update.content));
           // The block-end snapshot is not a delta. message_end publishes its
           // authoritative final content/status without duplicating streamed text.
         }
@@ -436,6 +492,8 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         const failed = message.stopReason === "error" || message.stopReason === "aborted";
         if (failed) { usageComplete = false; costComplete = false; }
         const content = Array.isArray(message.content) ? message.content : [];
+        const nativeMessageContent = record(source.message).content;
+        const nativeContent: unknown[] = Array.isArray(nativeMessageContent) ? nativeMessageContent : [];
         for (const [index, entry] of content.entries()) {
           const part = record(entry);
           if (part.type === "toolCall") {
@@ -448,8 +506,15 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
             const kind = part.type === "thinking" ? "reasoning" : "agentMessage";
             const block = blockFor(index, kind);
             if (block.terminal) continue;
-            block.text = projectText(text(kind === "reasoning" ? part.thinking : part.text)); block.terminal = true;
+            // The person's whole answer: inline up to the record bound; a longer answer is kept whole
+            // and shown as a plain line plus a labelled excerpt (fullText names it for the agent).
+            // Read the native text: displayValue already replaced an oversized string with a spill reference.
+            const answer = kind === "reasoning" ? undefined
+              : finalAnswerText(redactProviderDiagnostic(text(record(nativeContent[index]).text)), MAX_ANSWER_BYTES, spillDirectory);
+            if (answer?.fullText) displayTruncated = true;
+            block.text = answer ? answer.text : projectText(text(part.thinking), MAX_ANSWER_BYTES, "text"); block.terminal = true;
             output.push(emit(failed ? "item.failed" : "item.completed", block.id, { kind, channel: kind === "reasoning" ? "detail" : message.stopReason === "toolUse" ? "progress" : "final", text: block.text,
+              ...(answer?.fullText ? { fullText: answer.fullText } : {}),
               ...(failed ? { message: projectText(text(message.errorMessage) || `Pi ${message.stopReason}`) } : {}),
             }));
           }
@@ -535,20 +600,21 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       // Duplicate structured arguments can dominate the wire budget even when
       // each preview fits. Degrade only display fields, retaining identity,
       // terminal status and accounting. Never throw a record-size failure.
+      // Spill (never cut) the largest display strings until the record fits.
       if (isTool) {
         const item = record(projected.payload.item);
-        if (item.input !== undefined || item.arguments !== undefined) {
-          const preview = projectText(JSON.stringify(item.input ?? item.arguments), 8192);
-          projected.payload.item = { ...item, input: { truncated: true, preview }, arguments: { truncated: true, preview } };
+        if ((item.input !== undefined || item.arguments !== undefined) && Buffer.byteLength(JSON.stringify(item.input ?? item.arguments)) > 8192) {
+          const preview = projectText(JSON.stringify(item.input ?? item.arguments), 8192, "input");
+          projected.payload.item = { ...item, input: { spilled: true, preview }, arguments: { spilled: true, preview } };
         }
-        if (typeof projected.payload.input === "string") projected.payload.input = projectText(projected.payload.input, 8192);
       }
-      const keys = ["text", "output", "message", "name", "model"].filter(key => typeof projected.payload[key] === "string");
-      const base = { ...projected, payload: { ...projected.payload } };
-      for (const key of keys) base.payload[key] = "";
-      const budget = Math.max(128, Math.floor((MAX_RECORD_BYTES - 2048 - Buffer.byteLength(JSON.stringify(base))) / Math.max(keys.length, 1)));
-      for (const key of keys) projected.payload[key] = toolOutputPreview(text(projected.payload[key]), budget);
-      if (projected.eventType.startsWith("tool.execution.")) projected.payload.outputTruncated = true;
+      for (let budget = MAX_TEXT_BYTES; Buffer.byteLength(JSON.stringify(projected)) > MAX_RECORD_BYTES - 2048 && budget >= 1024; budget = Math.floor(budget / 2)) {
+        const spillAll = (value: unknown, key = ""): unknown => typeof value === "string"
+          ? projectText(value, budget, key === "output" ? "output" : key === "input" || key === "arguments" ? "input" : "text")
+          : Array.isArray(value) ? value.map(entry => spillAll(entry, key))
+          : value !== null && typeof value === "object" ? Object.fromEntries(Object.entries(value).map(([name, entry]) => [name, spillAll(entry, name)])) : value;
+        projected.payload = spillAll(projected.payload) as Record<string, unknown>;
+      }
       displayTruncated = true;
     }
     if (displayTruncated) {

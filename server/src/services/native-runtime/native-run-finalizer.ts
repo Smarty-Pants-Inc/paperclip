@@ -32,6 +32,9 @@ import { settleExternalConversation } from "../slack-conversation-lifecycle.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { isFailedTurnContinuationRun } from "./native-failed-turn-continuation.js";
 import { readPersistedNativeFailureEvidence } from "./native-provider-failure-evidence.js";
+// Fork: upstream reads nativeRunHasStopRequest from native-tool-receipt-limit.ts (#21913, not carried).
+import { nativeRunHasStopRequest } from "./native-run-stop-request.js";
+import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE, isNativeEnvironmentBlocker } from "./native-environment-blocker.js";
 import { explainFailedRun, explainNativeTurnFailure, NATIVE_RUN_FAILED_UNEXPLAINED } from "./native-run-failure-explanation.js";
 import { dismissAutomaticCompletionReviews } from "./automatic-completion-reviews.js";
 import { findSupersededExternalReviewRequests } from "./superseded-external-review-requests.js";
@@ -102,9 +105,12 @@ import {
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
   findHeartbeatRunCompletionComment,
   isExternalChatPresentationContext,
+  isPendingCommitPresentation,
   readAcceptedTaskContinuationSummary,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
+  readTruncatedCompletedAgentMessageItemId,
+  readTruncatedCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
 } from "../heartbeat-run-summary.js";
@@ -120,6 +126,7 @@ import {
   nativeRunnerOwnershipNotHeldCondition,
 } from "./native-runner-ownership.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
+import { completeNativeRunTerminal } from "./native-run-terminal.js";
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -425,6 +432,7 @@ export async function endSupersededNativeFinalizationRuns(db: Db, runIds?: reado
     ended.push(runId);
     await emitAgentTaskRun(db, updatedRun);
     if (updatedRun.status === "failed") void reportRunFailure(db, updatedRun);
+    await completeNativeRunTerminal(db, runId);
   }
   return ended;
 }
@@ -797,6 +805,7 @@ async function recordRetryableFailure(input: {
   if (terminalRunToEmit) {
     await emitAgentTaskRun(input.db, terminalRunToEmit);
     void reportRunFailure(input.db, terminalRunToEmit);
+    await completeNativeRunTerminal(input.db, (terminalRunToEmit as typeof heartbeatRuns.$inferSelect).id);
   }
   return {
     ...input.coordinator,
@@ -1020,6 +1029,7 @@ async function recoverCommittedNativeChatResponseInScope(
   let materialized = false;
   let conversationReply = false;
   let settledWithoutReply = false;
+  let projectedCommittedRun = false;
   const entered = beginRunPhase("response.transaction.entry");
   try {
     materialized = await measureRunPhase("response.transaction", () => db.transaction(async (transaction) => {
@@ -1107,7 +1117,9 @@ async function recoverCommittedNativeChatResponseInScope(
       const recordedPresentation = record(record(run.resultJson).presentationDecision);
       if (
         typeof recordedPresentation.commentId === "string" ||
-        (recordedPresentation.commentAction !== undefined && recordedPresentation.commentAction !== "create") ||
+        (recordedPresentation.commentAction !== undefined && recordedPresentation.commentAction !== "create" &&
+          // A provisional live none recorded before this commit is still pending.
+          !isPendingCommitPresentation(recordedPresentation)) ||
         record(run.contextSnapshot).skipIssueComment === true
       )
         return false;
@@ -1255,11 +1267,37 @@ async function recoverCommittedNativeChatResponseInScope(
             eq(heartbeatRunEvents.runId, run.id),
             eq(heartbeatRunEvents.eventType, "plan.proposed"),
           )).limit(200));
+        // dl-n5-66k: a completed answer stored as {truncated, byteSize} (no
+        // kind, channel or text) is rebuilt from its stored deltas, so the
+        // semantic summary never replaces it.
+        const truncatedRows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+          .from(heartbeatRunEvents).where(and(
+            eq(heartbeatRunEvents.companyId, input.companyId),
+            eq(heartbeatRunEvents.runId, run.id),
+            eq(heartbeatRunEvents.eventType, "item.completed"),
+            sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${accepted.turnId}`,
+            sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,truncated}' = 'true'`,
+          )).orderBy(desc(heartbeatRunEvents.seq)).limit(20);
+        const rebuiltCandidates = [];
+        for (const row of truncatedRows) {
+          const prpEvent = record(row.payload).prpEvent;
+          const itemId = readTruncatedCompletedAgentMessageItemId(prpEvent);
+          if (!itemId) continue;
+          const deltaRows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+            .from(heartbeatRunEvents).where(and(
+              eq(heartbeatRunEvents.companyId, input.companyId),
+              eq(heartbeatRunEvents.runId, run.id),
+              eq(heartbeatRunEvents.eventType, "item.delta"),
+              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' = ${itemId}`,
+            )).orderBy(heartbeatRunEvents.seq);
+          const rebuilt = readTruncatedCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent, deltaRows });
+          if (rebuilt) rebuiltCandidates.push(rebuilt);
+        }
         const finalAgentMessage = selectHeartbeatRunFinalAgentMessage({
-          candidates: rows.flatMap((row) => {
+          candidates: [...rows.flatMap((row) => {
             const candidate = readCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent: record(row.payload).prpEvent, proposedItemIds });
             return candidate ? [candidate] : [];
-          }),
+          }), ...rebuiltCandidates],
         });
         if (!finalAgentMessage && !blockedTaskReply) return false;
         const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation })
@@ -1338,12 +1376,26 @@ async function recoverCommittedNativeChatResponseInScope(
         CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON
       )
         return false;
+      // The summary is a 12,000-character schema-capped preview of the reply
+      // event it cites. Present the WHOLE reply when the summary was cut from it.
+      const replyEventId = (Array.isArray(result.evidence) ? result.evidence : [])
+        .map((entry) => record(entry).ref).find((ref): ref is string => typeof ref === "string" && ref.startsWith("run-event:"))
+        ?.slice("run-event:".length);
+      const [replyRow] = replyEventId ? await tx.select({ payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents).where(and(
+          eq(heartbeatRunEvents.companyId, input.companyId),
+          eq(heartbeatRunEvents.runId, run.id),
+          eq(heartbeatRunEvents.sourceEventId, replyEventId),
+        )).limit(1) : [];
+      const replyPayload = record(record(record(replyRow?.payload).prpEvent).payload);
       const resolved = resolveHeartbeatRunResponse({
         resultJson: {
           nativeResult: result,
           finalizationPhase: "committed",
           finalizationReasonCode: decision.reasonCode,
         },
+        finalAgentMessage: replyEventId && replyPayload.kind === "agentMessage" && replyPayload.channel === "final"
+          && typeof replyPayload.text === "string" ? { text: replyPayload.text, sourceEventId: replyEventId, channel: "final" } : null,
         preferFinalResponseOverExistingComment: true,
         externalChatResponseWakeSummaryAuthorized: true,
         externalChatCommittedResponseWakeSummaryAuthorized: true,
@@ -1384,6 +1436,7 @@ async function recoverCommittedNativeChatResponseInScope(
         })
         .where(eq(heartbeatRuns.id, run.id));
       await projectCommittedRun({ db: tx, run, coordinator });
+      projectedCommittedRun = true;
       agentId = run.agentId;
       return true;
     }));
@@ -1402,6 +1455,8 @@ async function recoverCommittedNativeChatResponseInScope(
       eventType: "run.presentation.resolved",
     });
   }
+  // Its reply transaction projected the committed run (projectCommittedRun).
+  if (projectedCommittedRun) await completeNativeRunTerminal(db, input.runId);
   return materialized;
 }
 
@@ -1448,7 +1503,21 @@ export async function recoverCommittedNativeReviewResponse(db: Db, input: {
   return materialized !== null;
 }
 
-export async function finalizeNativeRun(input: {
+/**
+ * Finalizes a native run. When this call projects the terminal run status, the
+ * shared post-commit terminal step runs once after every finalizer branch
+ * (first write, committed replay, exhausted failure) has committed.
+ */
+export async function finalizeNativeRun(input: Parameters<typeof finalizeNativeRunAndProject>[0] & {
+  /** The caller runs completeNativeRunTerminal itself, exactly once. */
+  skipRunTerminalCompletion?: boolean;
+}) {
+  const finalized = await finalizeNativeRunAndProject(input);
+  if (input.projectRunStatus && !input.skipRunTerminalCompletion) await completeNativeRunTerminal(input.db, input.runId);
+  return finalized;
+}
+
+async function finalizeNativeRunAndProject(input: {
   db: Db;
   runId: string;
   workspaceFinalizeStatus: "succeeded" | "failed";
@@ -1626,6 +1695,12 @@ export async function finalizeNativeRun(input: {
   const allowIncompleteContinuation = record(sourceWake?.payload).continuationIdempotencyKey !== "native-completion-incomplete";
   let supersedesAssessmentId: string | null = coordinator.assessmentId;
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    // From upstream #21913 (prerequisite of #21959): re-read the run's saved
+    // stop on each attempt so a stop that lands during finalization wins.
+    const savedStop = attempt === 0 ? run.resultJson : await input.db.select({ resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
+      .then(rows => rows[0]?.resultJson ?? run.resultJson);
+    const stopRequested = nativeRunHasStopRequest(savedStop);
     const authoritativeIssue = await input.db
       .select()
       .from(issues)
@@ -1714,7 +1789,8 @@ export async function finalizeNativeRun(input: {
         issueId: authoritativeIssue.id,
         runId: run.id,
       }),
-      (terminalState === "failed" || (assessment.reportedDisposition === "yielded" &&
+      (terminalState === "failed" || (terminalState === "succeeded" && isNativeEnvironmentBlocker(result)) ||
+      (assessment.reportedDisposition === "yielded" &&
       assessment.continuation?.kind === "response_wake" &&
       assessment.hasBlockingRemainingWork))
         ? issueTreeControlService(input.db).getActivePauseHoldGate(
@@ -1792,6 +1868,8 @@ export async function finalizeNativeRun(input: {
       providerModelRejected: providerFailure?.errorCode === "native_provider_model_rejected" && ownsProviderFailureDecision,
       providerOverloaded: providerFailure?.errorCode === "native_provider_overloaded" && ownsProviderFailureDecision,
       providerFailureSuperseded: providerFailure?.errorCode === "native_provider_overloaded" && !ownsProviderFailureDecision,
+      environmentBlocker: terminalState === "succeeded" && ownsProviderFailureDecision && !reviewContext && !stopRequested
+        && isNativeEnvironmentBlocker(result),
       failureRetryCount: executionFailureRetryCount(run),
       // Only the task's current owner may turn its own failed continuation
       // into a blocker; the committer rechecks that under the issue lock.
@@ -1952,6 +2030,8 @@ export async function finalizeNativeRun(input: {
           : undefined,
         requireProviderFailureOwner: decision.reasonCode?.startsWith("native_provider_overloaded")
           || decision.reasonCode === "native_run_failed_continuation_exhausted"
+          || decision.reasonCode === NATIVE_ENVIRONMENT_BLOCKER_CODE
+          || decision.reasonCode === NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE
           ? { agentId: run.agentId, reviewContext } : undefined,
         requireBoardResponseWaitSource:
           decision.reasonCode === "board_response_waiting" || repairBoardResponseWait

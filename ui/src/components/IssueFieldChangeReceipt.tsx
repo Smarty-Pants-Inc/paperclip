@@ -57,18 +57,11 @@ export function IssueFieldChangeReceipt({
             >
               <dt className="text-muted-foreground">{row.label}</dt>
               <dd className="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
-                <span className="min-w-0 break-words text-muted-foreground line-through decoration-muted-foreground/50">
+                <span className="min-w-0 whitespace-pre-wrap break-words text-muted-foreground line-through decoration-muted-foreground/50">
                   {row.from}
                 </span>
                 <ArrowRight className="size-3 shrink-0 text-muted-foreground/70" aria-hidden="true" />
-                <span className="min-w-0 break-words font-medium text-foreground">{row.to}</span>
-                {/* Long text is stored as a preview, so the receipt says so
-                    rather than implying the whole value is shown. */}
-                {row.truncated ? (
-                  <span className="text-(length:--text-nano) uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
-                    preview
-                  </span>
-                ) : null}
+                <span className="min-w-0 whitespace-pre-wrap break-words font-medium text-foreground">{row.to}</span>
               </dd>
             </div>
           ))}

@@ -27,8 +27,8 @@ use crate::durable::{
 };
 use crate::provider_bridge::{
     authorized_tool_catalog_digest, semantic_value_digest, AuthorizedToolSet, DurableReplayFilter,
-    PendingToolCall, ProviderBridgeError, ProviderToolBridge, ToolResult, MAX_PENDING_CALLS,
-    TOOL_SET_SCHEMA,
+    PendingToolCall, ProviderBridgeError, ProviderToolBridge, ToolResult, EXPIRED_RESULT_CODE,
+    MAX_PENDING_CALLS, TOOL_SET_SCHEMA, UNDELIVERABLE_RESULT_CODE,
 };
 use crate::provider_events::{
     codex_context_usage, normalize_codex_notification, normalize_codex_notification_in,
@@ -4141,7 +4141,9 @@ impl CodexCommandExecutor {
         Ok(false)
     }
 
-    fn attach_run(&mut self, payload: &Value) -> Result<(), DurableRunnerError> {
+    /// Returns the calls a closed turn left pending that this attachment
+    /// settled as expired.
+    fn attach_run(&mut self, payload: &Value) -> Result<Vec<ToolResult>, DurableRunnerError> {
         self.attach_run_with_provider_refresh(payload, false)
     }
 
@@ -4149,7 +4151,7 @@ impl CodexCommandExecutor {
         &mut self,
         payload: &Value,
         refresh_provider: bool,
-    ) -> Result<(), DurableRunnerError> {
+    ) -> Result<Vec<ToolResult>, DurableRunnerError> {
         self.retain_completed_accounting_tail()?;
         let mut next_state = self
             .state
@@ -4184,6 +4186,29 @@ impl CodexCommandExecutor {
         }
         if next_state.ambiguous_turn_start_pending {
             blockers.push("durable_ambiguous_turn_start");
+        }
+        // A call left pending by a closed provider turn can never be answered:
+        // the provider stopped waiting when its turn ended, and the new run's
+        // controller never delivers the old run's results. Record it as an
+        // expired failure with an unknown outcome so the session continues.
+        // A call the live provider still waits on keeps blocking attachment.
+        let expired_tool_calls = if blockers.is_empty() {
+            next_state
+                .tool_bridge
+                .expire_closed_turn_calls()
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "run.attach could not settle tool calls left by a closed turn: {error}"
+                    ))
+                })?
+        } else {
+            Vec::new()
+        };
+        if !expired_tool_calls.is_empty() {
+            // Expiry settles the old call as an unknown-outcome failure, just
+            // as a recorded result releases Pi's deferred provider terminal.
+            // Retain that terminal in the predecessor FIFO before rebinding.
+            next_state.settle_deferred_pi_terminal()?;
         }
         if next_state.tool_bridge.pending_calls().next().is_some() {
             blockers.push("durable_pending_tool_calls");
@@ -4483,7 +4508,7 @@ impl CodexCommandExecutor {
         };
         self.persist_state(&next_state)?;
         self.state = Some(next_state);
-        Ok(())
+        Ok(expired_tool_calls)
     }
 
     fn open_session(&mut self) -> Result<CommandExecution, DurableRunnerError> {
@@ -5864,15 +5889,54 @@ impl CodexCommandExecutor {
             .pending_calls()
             .find(|call| call.call_id == result.call_id)
             .map(|call| (call.operation_id.clone(), call.input.clone()));
-        next_state
-            .tool_bridge
-            .apply_result(result.clone())
-            .map_err(|error| {
-                DurableRunnerError::invalid(format!(
+        // A recorded result that this bridge rejects must still settle its
+        // pending call. Otherwise the provider waits until its own client
+        // times out, and the call blocks every later turn and run.
+        let mut undeliverable = None;
+        let result = match next_state.tool_bridge.apply_result(result.clone()) {
+            Ok(_) => result,
+            Err(error) => {
+                let rejected = DurableRunnerError::invalid(format!(
                     "semantic tool result was rejected for call {} operation {}: {error}",
                     result.call_id, result.operation_id
-                ))
-            })?;
+                ));
+                if was_completed {
+                    // An exact replay of a delivery whose result was already
+                    // rejected and settled (for example after a crash before
+                    // the command finished) is a duplicate, not a conflict.
+                    if next_state
+                        .tool_bridge
+                        .is_settled_undeliverable_replay(&result)
+                    {
+                        return Ok(CommandExecution {
+                            result: json!({ "status": "duplicate", "callId": result.call_id }),
+                            events: vec![(
+                                "harness.diagnostic".to_owned(),
+                                EventPriority::P0,
+                                json!({
+                                    "code": "semantic_tool_result_duplicate", "severity": "warning",
+                                    "callId": result.call_id, "operationId": result.operation_id,
+                                    "resultDigest": semantic_value_digest(&result.result),
+                                }),
+                            )],
+                        });
+                    }
+                    return Err(rejected);
+                }
+                match next_state.tool_bridge.settle_undeliverable_result(&result) {
+                    Ok(Some(settlement)) => {
+                        undeliverable = Some(json!({
+                            "code": UNDELIVERABLE_RESULT_CODE, "severity": "warning",
+                            "callId": result.call_id, "operationId": settlement.operation_id,
+                            "reason": error.to_string(),
+                            "resultDigest": semantic_value_digest(&result.result),
+                        }));
+                        settlement
+                    }
+                    _ => return Err(rejected),
+                }
+            }
+        };
         if was_completed {
             return Ok(CommandExecution {
                 result: json!({ "status": "duplicate", "callId": result.call_id }),
@@ -5904,11 +5968,24 @@ impl CodexCommandExecutor {
         next_state.settle_deferred_pi_terminal()?;
         self.persist_state(&next_state)?;
         self.state = Some(next_state);
+        let diagnostics = undeliverable
+            .map(|diagnostic| {
+                (
+                    "harness.diagnostic".to_owned(),
+                    EventPriority::P0,
+                    diagnostic,
+                )
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
         if delivery_detached {
-            return Ok(CommandExecution::result(json!({
-                "status": "settled_after_turn",
-                "callId": result.call_id,
-            })));
+            return Ok(CommandExecution {
+                result: json!({
+                    "status": "settled_after_turn",
+                    "callId": result.call_id,
+                }),
+                events: diagnostics,
+            });
         }
         let provider = self.ensure_provider()?;
         if terminal_tool_authoritative {
@@ -5925,10 +6002,13 @@ impl CodexCommandExecutor {
                 "failed to return semantic tool result to Codex: {error}"
             ))
         })?;
-        Ok(CommandExecution::result(json!({
-            "status": "delivered",
-            "callId": result.call_id,
-        })))
+        Ok(CommandExecution {
+            result: json!({
+                "status": "delivered",
+                "callId": result.call_id,
+            }),
+            events: diagnostics,
+        })
     }
 
     fn stop_owned_provider(&mut self) -> Result<(), DurableRunnerError> {
@@ -6918,12 +6998,26 @@ impl CommandExecutor for CodexCommandExecutor {
             match command.command_type.as_str() {
                 "run.prepare" => self.prepare_with_legacy_attachment(&command.payload, true),
                 "run.attach" => {
-                    if self.state.is_none() && command.payload.get("provider").is_some() {
-                        self.prepare(&command.payload)?;
-                    } else {
-                        self.attach_run(&command.payload)?;
-                    }
+                    let expired =
+                        if self.state.is_none() && command.payload.get("provider").is_some() {
+                            self.prepare(&command.payload)?;
+                            Vec::new()
+                        } else {
+                            self.attach_run(&command.payload)?
+                        };
                     let mut execution = self.open_session()?;
+                    if !expired.is_empty() {
+                        execution.events.push((
+                            "harness.diagnostic".to_owned(),
+                            EventPriority::P0,
+                            json!({
+                                "code": EXPIRED_RESULT_CODE, "severity": "warning",
+                                "calls": expired.iter().map(|call| json!({
+                                    "callId": call.call_id, "operationId": call.operation_id,
+                                })).collect::<Vec<_>>(),
+                            }),
+                        ));
+                    }
                     let provider = self
                         .state
                         .as_ref()
@@ -10134,6 +10228,124 @@ done
         fs::remove_dir_all(directory).unwrap();
     }
 
+    // Keep reason: #21490's closed-turn expiry crosses P1's durable Pi
+    // terminal/result authority boundary. Exercise real attach and persistence,
+    // including the retained FIFO, rather than weakening its state validator.
+    #[test]
+    fn pi_rpc_attach_expiry_releases_the_deferred_terminal_and_persists_fifo() {
+        for event_type in [
+            "turn.completed",
+            "turn.failed",
+            "turn.interrupted",
+            "turn.cancelled",
+        ] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+            let authority = tool_result_authority_state("pi_rpc", "get_task_context");
+            let state = executor.state.as_mut().unwrap();
+            state.tool_bridge = authority.tool_bridge;
+            state.completion_contract = authority.completion_contract;
+            state.run_identity = Some(prepare_contract_identity("run-A"));
+            state.last_agent_message = Some("The previous run's final answer.".to_owned());
+            state
+                .admit_tool_call("expiry-probe", "get_task_context", &json!({}))
+                .unwrap();
+            state
+                .tool_bridge
+                .settle_turn("provider_turn_terminated")
+                .unwrap();
+            state.active_provider_turn_id = None;
+            // Fill both durable FIFO segments; the released predecessor terminal
+            // must follow them, not precede or overwrite retained facts.
+            for index in 0..MAX_EVENTS_PER_POLL + 2 {
+                state
+                    .push_event(NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({"code": "retained-predecessor-fact", "index": index}),
+                    })
+                    .unwrap();
+            }
+            let expected = terminal_events(state, event_type, None);
+            assert!(!expected.is_empty());
+            let outcome = state
+                .defer_pi_terminal_outcome(event_type, expected.clone())
+                .unwrap();
+            assert!(outcome.is_empty());
+            state.extend_terminal_events(outcome).unwrap();
+            assert_eq!(state.pi_deferred_terminal.as_deref(), Some(event_type));
+            state
+                .validate()
+                .expect("P1 deferred-terminal state is valid before expiry");
+            let retained: Vec<_> = state
+                .pending_events
+                .iter()
+                .chain(state.queued_events.iter())
+                .cloned()
+                .collect();
+            let operations: Vec<_> = state.tool_bridge.authorized_tools().cloned().collect();
+            payload["authorizedTools"] = serde_json::to_value(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(&operations).unwrap(),
+                operations,
+            })
+            .unwrap();
+            payload["completionContract"] =
+                serde_json::to_value(&state.completion_contract).unwrap();
+            payload["completionContract"]["revision"] = json!("new-run-contract");
+            payload["paperclipNextAuthority"] = json!({"identity": {
+                "runnerInstanceId": "contract-runner", "environmentLeaseId": "lease",
+                "runId": "run-B", "normalizedSessionId": "contract-session",
+                "turnId": "turn-run-B", "itemId": "item-run-B",
+            }});
+            executor.save_state().unwrap();
+            let expired = executor
+                .attach_run(&payload)
+                .expect("attach expiry must leave the deferred Pi terminal persistable");
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0].call_id, "expiry-probe");
+            assert!(expired[0].is_error);
+            let state = executor.state.as_ref().unwrap();
+            assert!(state.tool_bridge.pending_calls().next().is_none());
+            assert!(state.pi_deferred_terminal.is_none());
+            assert!(state.pi_deferred_terminal_deadline_unix_ms.is_none());
+            assert_eq!(state.run_identity.as_ref().unwrap().run_id, "run-B");
+            assert_eq!(
+                state.completion_contract.as_ref().unwrap().revision,
+                "new-run-contract"
+            );
+            let events: Vec<_> = state
+                .pending_events
+                .iter()
+                .chain(state.queued_events.iter())
+                .cloned()
+                .collect();
+            assert_eq!(&events[..retained.len()], retained.as_slice());
+            let released = &events[retained.len()..];
+            assert_eq!(released.len(), expected.len());
+            for (actual, expected) in released.iter().zip(&expected) {
+                assert_eq!(actual.event_type, expected.event_type);
+                assert_eq!(actual.payload, expected.payload);
+            }
+            let terminal = released
+                .iter()
+                .find(|event| event.event_type == "run.terminal")
+                .unwrap();
+            assert_eq!(
+                terminal.payload["turnTerminalState"],
+                event_type.strip_prefix("turn.").unwrap()
+            );
+            state.validate().expect("attached state validates");
+            let persisted: CodexProviderState =
+                serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+            persisted
+                .validate()
+                .expect("persisted state validates after reload");
+            assert_eq!(&persisted, state);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     #[test]
     fn pi_rpc_deferred_terminal_waits_for_every_authoritative_result() {
         for provider in ["pi_rpc", "codex"] {
@@ -10726,8 +10938,37 @@ done
         }
     }
 
+    // C4 (pack-n5): the person's final answer is never cut. A 40,000-character
+    // Pi final answer (as streamed: quotes, newlines, multi-byte text) must
+    // arrive whole, byte-equal to the text in the raw Pi JSONL record.
     #[test]
-    fn b7_pi_final_channel_is_bounded_at_12000_characters() {
+    fn c4_pi_final_answer_of_40000_characters_arrives_whole() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let unit = "Line \"quoted\" 🦀 naïve\n";
+        let mut answer = unit.repeat(40_000 / unit.chars().count() + 1);
+        answer = answer.chars().take(40_000).collect();
+        assert_eq!(answer.chars().count(), 40_000);
+        let raw_jsonl = serde_json::to_string(&json!({"threadId": "thread-1", "turnId": "turn-1",
+            "channel": "final", "item": {"id": "pi-message", "type": "agentMessage", "text": answer}}))
+        .unwrap();
+        let raw: Value = serde_json::from_str(&raw_jsonl).unwrap();
+        let raw_text = raw["item"]["text"].as_str().unwrap().to_owned();
+        let events = normalize_provider_notification(&mut state, "item/completed", &raw).unwrap();
+        assert_eq!(events[0].event_type, "item.completed");
+        assert_eq!(events[0].payload["channel"], "final");
+        let text = events[0].payload["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), 40_000);
+        assert_eq!(text.as_bytes(), raw_text.as_bytes());
+        assert!(!text.contains("[truncated]"));
+    }
+
+    #[test]
+    // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): replaces
+    // b7_pi_final_channel_is_bounded_at_12000_characters, which pinned the silent
+    // 12,000-character cut of the person's final answer. The final channel is
+    // whole; c4_pi_final_answer_of_40000_characters_arrives_whole is stricter.
+    fn b7_pi_final_channel_is_not_cut_at_12000_characters() {
         let mut state = opencode_result_state();
         state.config.provider = "pi_rpc".to_owned();
         for length in [12_000, 12_001, 33_000] {
@@ -10741,8 +10982,8 @@ done
             .unwrap();
             assert_eq!(events[0].payload["channel"], "final");
             let text = events[0].payload["text"].as_str().unwrap();
-            assert_eq!(text.chars().count(), 12_000, "input length {length}");
-            assert_eq!(text, "🦀".repeat(12_000));
+            assert_eq!(text.chars().count(), length, "input length {length}");
+            assert_eq!(text, "🦀".repeat(length));
         }
     }
 
@@ -10782,8 +11023,18 @@ done
                 .collect::<Vec<_>>();
                 let actual =
                     normalize_provider_notification(&mut state, "item/completed", &params).unwrap();
-                assert_eq!(actual, expected, "{provider} {channel}");
                 assert_eq!(actual[0].payload["channel"], "progress");
+                // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z):
+                // was assert_eq!(actual, expected) and a 4,000-character text
+                // ("…[truncated]") for every provider, pi_rpc included. A Pi
+                // progress message is shown in the person's task chat: it now
+                // arrives whole. Other providers keep the codex preview.
+                if provider == "pi_rpc" {
+                    assert_eq!(actual[0].payload["text"], "x".repeat(5_000));
+                    assert!(!actual[0].payload.to_string().contains("truncat"));
+                    continue;
+                }
+                assert_eq!(actual, expected, "{provider} {channel}");
                 assert_eq!(
                     actual[0].payload["text"].as_str().unwrap().chars().count(),
                     4_000

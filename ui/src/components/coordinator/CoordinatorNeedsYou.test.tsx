@@ -757,6 +757,13 @@ describe("Coordinator Needs You views (PAP-749 task 1b)", () => {
     const card = container.querySelector<HTMLElement>('[data-attention-card="stop"]')!;
     expect(card.querySelector('[data-attention-evidence="approval-b"]')?.textContent).toBe("Approval this answers: budget override required — Approval is pending a board decision.");
     expect(card.querySelector("[data-attention-type-label]")?.textContent).toBe("Resolve a budget stop");
+    expect(card.textContent).toContain("— spent of $100.00");
+    expect(card.textContent).toContain("— used");
+    expect(card.textContent).not.toContain("100%");
+    const budgetBar = card.querySelector<HTMLElement>('[role="progressbar"][aria-label="Budget used"]')!;
+    expect(budgetBar.hasAttribute("aria-valuenow")).toBe(false);
+    expect(budgetBar.getAttribute("aria-valuetext")).toBe("—");
+    expect((budgetBar.firstElementChild as HTMLElement).style.width).toBe("0%");
     const buttons = () => [...card.querySelectorAll("button")].map((button) => button.textContent);
     // PAP-775: the new limit is asked for only once you choose to increase it; the primary action is last.
     expect(buttons().slice(-2)).toEqual(["Keep paused", "Increase limit…"]);

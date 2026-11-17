@@ -90,7 +90,7 @@ import { sentryReady, shutdownSentry, captureException } from "./sentry.js";
 import { setSentryRunLinkResolver } from "./sentry-links.js";
 import { createSentryRunLinkResolver } from "./services/sentry-run-links.js";
 import { waitForPendingRunFailureReports } from "./services/run-failure-report.js";
-import { verifyStoppedNativeSessionForAutomaticReplacement } from "./services/native-runtime/native-session-executor.js";
+import { nativeRunHasOpenGovernedWaitTool, verifyStoppedNativeSessionForAutomaticReplacement } from "./services/native-runtime/native-session-executor.js";
 import { registerNativeCleanupReleaseWake } from "./services/native-runtime/native-cleanup-release-wake.js";
 import { logNativeCleanupQuarantines } from "./services/native-runtime/native-cleanup-quarantine-log.js";
 import { embeddedPostgresOwnerPort } from "./embedded-postgres-owner.js";
@@ -1418,6 +1418,7 @@ async function startServerWithDatabaseTeardown(
   const questionResponseDeliveries = questionResponseDeliveryService(db as any, {
     heartbeat: environmentLeaseCleanupHeartbeat,
     resolveNativeQuestion: (interaction) => deliverNativeQuestionResponse(db as any, interaction),
+    sourceRunHasOpenTool: nativeRunHasOpenGovernedWaitTool,
   });
   const externalObjectWork = externalObjects.registerRefreshWork(deliveryWork,
     () => !heartbeatSchedulerStopped && !isIdleTaskDrainActive() && !isWarmStandby());

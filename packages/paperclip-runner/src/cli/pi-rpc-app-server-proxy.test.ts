@@ -408,7 +408,7 @@ describe("Pi RPC app-server facade proxy", () => {
     } finally { await proxy.close(); }
   });
 
-  it("dispatches compact on the open session and settles the control envelope, not a prompt", async () => {
+  it.each([false, true])("dispatches compact and settles the control envelope, not a prompt (noop=%s)", async noop => {
     const sink = new FakeSink();
     let finish!: (value: Record<string, unknown>) => void;
     const calls: unknown[] = [];
@@ -425,17 +425,20 @@ describe("Pi RPC app-server facade proxy", () => {
       expect(session.turnInputs).toEqual([]);
       const turnId = (accepted.result as any).turn.id;
       expect(sink.decoded().filter(frame => frame.method === "turn/started")).toHaveLength(1);
-      finish({ tokensBefore: 100, estimatedTokensAfter: 25, firstKeptEntryId: "entry", summary: "private summary" });
+      finish(noop ? { noop: true } : { tokensBefore: 100, estimatedTokensAfter: 25, firstKeptEntryId: "entry", summary: "private summary" });
       // The event iterator is independent of the native command promise. A
-      // delayed success event must be durable before the control terminal.
-      setImmediate(() => session.push("context.compacted", { schema: "paperclip.context.compacted.v1", compactionId: "native-compact", reason: "manual", preTokens: 100, postTokens: 25, sameSession: true }));
+      // delayed success or no-op notice must precede the control terminal.
+      setImmediate(() => noop
+        ? session.push("provider.notice.recorded", { category: "context_compaction", severity: "info", summary: "Nothing to compact yet", details: [{ name: "Phase", value: "completed" }, { name: "Outcome", value: "noop" }] })
+        : session.push("context.compacted", { schema: "paperclip.context.compacted.v1", compactionId: "native-compact", reason: "manual", preTokens: 100, postTokens: 25, sameSession: true }));
       await waitFor(() => sink.decoded().some(frame => frame.method === "turn/completed"));
       const notifications = sink.decoded().filter(frame => frame.method);
-      const compactIndex = notifications.findIndex(frame => frame.method === "thread/compacted");
+      const compactIndex = notifications.findIndex(frame => frame.method === (noop ? "warning" : "thread/compacted"));
       expect(compactIndex).toBeGreaterThanOrEqual(0);
       expect(compactIndex).toBeLessThan(notifications.findIndex(frame => frame.method === "turn/completed"));
-      expect(notifications[compactIndex]).toMatchObject({ params: { threadId: session.id, turnId, preTokens: 100, postTokens: 25 } });
-      expect(sink.decoded().find(frame => frame.method === "turn/completed")).toMatchObject({ params: { turn: { id: turnId, status: "completed" } } });
+      expect(notifications[compactIndex]).toMatchObject({ params: { threadId: session.id, turnId, ...(noop ? { severity: "info", message: "Nothing to compact yet" } : { preTokens: 100, postTokens: 25 }) } });
+      expect(sink.decoded().find(frame => frame.method === "turn/completed")).toMatchObject({ params: { turn: { id: turnId, status: "completed" }, ...(noop ? { compaction: { noop: true } } : {}) } });
+      if (noop) expect(notifications.some(frame => frame.method === "thread/compacted" || frame.method === "turn/failed")).toBe(false);
       expect(JSON.stringify(sink.decoded())).not.toContain("private summary");
       expect(sink.decoded().some(frame => frame.method === "item/agentMessage/delta")).toBe(false);
       expect((await request(proxy, sink, 92, "thread/read")).result).toMatchObject({ thread: { id: session.id, turns: [] } });
@@ -740,7 +743,10 @@ describe("Pi RPC app-server facade proxy", () => {
       session.push("item.completed", { ...payload, text: final, output: final }, "turn-1", "tool");
       await new Promise<void>(resolve => setImmediate(resolve));
       const frames = sink.decoded().filter(frame => typeof frame.method === "string" && frame.method.startsWith("item/"));
-      expect(JSON.stringify(frames[0])).toContain("[Pi tool output truncated");
+      // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was toContain("[Pi tool output truncated").
+      // A live partial frame is a labelled preview; the final frame below is whole.
+      expect(JSON.stringify(frames[0])).toContain("Live output");
+      for (const frame of frames) expect(JSON.stringify(frame)).not.toMatch(/truncated\]|for display/u);
       for (const frame of frames) expect(Buffer.byteLength(JSON.stringify(frame))).toBeLessThan(1024 * 1024);
       expect(frames[1]).toMatchObject({ params: { output: "short output" } });
       expect(frames[2]).toMatchObject({ params: { output: final, text: final } });

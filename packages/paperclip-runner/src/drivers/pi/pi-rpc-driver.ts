@@ -1080,10 +1080,23 @@ export class PiRpcHarnessSession implements HarnessSession {
           this.#manualCompaction = { runId: this.#runId, compactionId: `pi-compact-${randomUUID()}`, ended: resolve };
         });
         const owner = this.#manualCompaction!;
-        const response = await this.#transport.request("compact", input.customInstructions === undefined ? {} : { customInstructions: input.customInstructions }, { timeoutMs: 120_000 });
+        let response: PiRpcRecord = {};
+        let noop = false;
+        try {
+          response = await this.#transport.request("compact", input.customInstructions === undefined ? {} : { customInstructions: input.customInstructions }, { timeoutMs: 120_000 });
+        } catch (error) {
+          // Pi 1.5.2 has no typed no-op result (rpc-types.d.ts): compact()
+          // throws this prefix before summarization when preparation is empty.
+          if (!(error instanceof PiRpcCommandError && error.command === "compact" && error.message.startsWith("Nothing to compact"))) throw error;
+          noop = true;
+        }
         await withTimeout(ended, this.#admissionTimeoutMs ?? 5000, "Pi compaction end event missing");
         if (owner.failed) throw new Error("Pi compaction ended unsuccessfully");
         if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session closed during compaction");
+        if (noop) {
+          await this.#admit(); // A no-op still proves the same idle session.
+          return { noop: true };
+        }
         const result = record(response.data);
         if (typeof result.firstKeptEntryId !== "string" || !result.firstKeptEntryId || typeof result.summary !== "string") throw new Error("Pi compact returned no compaction receipt");
         await this.#admit(); // Same native identity and idle state, not just a successful ACK.
@@ -1513,9 +1526,11 @@ export class PiRpcHarnessSession implements HarnessSession {
     const compaction = this.#manualCompaction;
     if (compaction && ["compaction_start", "compaction_end"].includes(String(event.type))) {
       const completed = event.type === "compaction_end";
-      const failed = event.aborted === true || event.errorMessage !== undefined;
+      // Pi wraps the same command error in its compaction_end event.
+      const noop = completed && event.aborted !== true && typeof event.errorMessage === "string" && event.errorMessage.startsWith("Compaction failed: Nothing to compact");
+      const failed = !noop && (event.aborted === true || event.errorMessage !== undefined);
       this.#emit("provider.notice.recorded", { schema: "paperclip.provider.notice.v1", noticeId: compaction.compactionId, severity: failed ? "warning" : "info", category: "context_compaction", scope: "session", recoverable: true, userActionable: false,
-        summary: completed ? failed ? "Context compaction failed" : "Context compaction finished" : "Compacting context", details: [{ name: "Phase", value: completed ? failed ? "failed" : "completed" : "started" }] }, compaction);
+        summary: noop ? "Nothing to compact yet" : completed ? failed ? "Context compaction failed" : "Context compaction finished" : "Compacting context", details: [{ name: "Phase", value: completed ? failed ? "failed" : "completed" : "started" }, ...(noop ? [{ name: "Outcome", value: "noop" }] : [])] }, compaction);
       if (completed) { compaction.failed = failed; compaction.ended(); }
       return;
     }
@@ -1707,7 +1722,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         // provenance/session/effect gates remain unchanged. Budget exhaustion
         // drops only the unrouteable display record with an explicit marker.
         if (this.#activeIdentityCount >= 65_536) {
-          if (!this.#identityLimited) this.#emit("harness.diagnostic", { code: "pi_native_identity_projection_limit", message: "[Pi projection truncated]: turn identity budget reached." }, turn);
+          if (!this.#identityLimited) this.#emit("harness.diagnostic", { code: "pi_native_identity_projection_limit", message: "Pi turn identity budget reached; further native identities are not projected." }, turn);
           this.#identityLimited = true;
           return false;
         }
@@ -2034,7 +2049,7 @@ function usageDelta(usage: Record<string, unknown>): Record<string, unknown> {
 
 const SAFE_PI_ENV_KEYS = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SystemRoot", "WINDIR", "PATHEXT"] as const;
 
-export function piProcessEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+function piProcessEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   for (const key of SAFE_PI_ENV_KEYS) if (process.env[key] !== undefined) environment[key] = process.env[key];
   for (const [key, value] of Object.entries(overrides)) if (value !== undefined) environment[key] = value;

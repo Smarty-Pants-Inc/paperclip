@@ -389,12 +389,13 @@ describe('GitHub skill repository discovery', () => {
     await expect(previewGitHubSkillFile({ ...input, commitSha: 'b'.repeat(40) }, read)).rejects.toThrow('commit did not match');
     expect(skillSourcePreviewSchema.safeParse({ ...input, filePath: '../shared.md' }).success).toBe(false);
   });
-  it('bounds text previews without truncating installed package bytes', async () => {
-    const content = 'Reference text.\n'.repeat(10000);
+  it('previews every admitted package byte including the UTF-8 tail beyond 64 KiB', async () => {
+    const content = 'Reference text.\n'.repeat(10000) + 'LAST_ユニコード🙂END';
     const input = { repositoryUrl: 'https://github.com/acme/skills', commitSha: sha, skillPath: 'SKILL.md', filePath: 'references/long.md' };
     const preview = await previewGitHubSkillFile(input, githubFixture({ 'SKILL.md': md('one'), 'references/long.md': content }));
-    expect(preview.truncated).toBe(true);
-    expect(preview.content).toHaveLength(65536);
+    expect(preview.truncated).toBe(false);
+    expect(preview.content).toBe(content);
+    expect(Buffer.from(preview.content!, 'utf8')).toEqual(Buffer.from(content, 'utf8'));
     expect(preview.file.sizeBytes).toBe(Buffer.byteLength(content));
   });
 

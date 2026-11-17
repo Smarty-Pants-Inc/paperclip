@@ -1,4 +1,5 @@
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
+import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, agentFileSaveHeld } from "./agent-directory-working-copies.js";
 import { registerCompletedTurnCleanupResumer } from "./native-runtime/completed-turn-cleanup-hold-settlement.js";
 import { endStorageOutageWaitOn, reportStorageOutageWaitsTo, runInOwnStorageScope } from "../storage/storage-unavailable.js";
 import { createStorageWaitNotice } from "./heartbeat/storage-wait-notice.js";
@@ -64,7 +65,7 @@ import { reconcileMuseNativeTerminalRun } from "./native-runtime/muse-terminal-r
 import { prepareHeartbeatWorkspace, RetryWorkspaceRefused } from "./heartbeat/workspace-preparation.js";
 import { nativeRecoveryClaimRelinquished, ownNativeExecutionLeaseLapsed, releaseLapsedNativeRestartClaim } from "./native-runtime/native-execution-lease.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
-import { preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
+import { nativeStopWorkspaceOutcome, preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
 import { nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { prepareAndSelectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
 import { createHeartbeatRunCompletion } from "./heartbeat/run-completion.js";
@@ -3128,7 +3129,7 @@ export function heartbeatService(
         }
         const enforceContinuationOwnership = Boolean(issueId && (isFailedChatRunRetry || isResolvedInteractionContinuationWakeContext(context) ||
           typeof context.workspaceReconstructionActionId === "string" ||
-          ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? "")));
+          ["native_safe_replacement", "native_provider_overloaded", "native_environment_blocker"].includes(run.scheduledRetryReason ?? "")));
         if (issueId && enforceContinuationOwnership) {
           await options.beforeResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
           await options.afterResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
@@ -3875,7 +3876,10 @@ export function heartbeatService(
           return;
         }
         if (err instanceof NativeCancellationPendingRecoveryError) {
-          await preserveNativeWorkspaceOnFailure();
+          // The shared Stop policy: an ordinary Stop on a warm (keep_running) box is
+          // a handoff and writes no hold; only a stopping box needs one.
+          if (nativeStopWorkspaceOutcome({ admittedDisposition: providerResourceDispositionForRun, stopped: true })
+            !== "handoff") await preserveNativeWorkspaceOnFailure();
           await cancelRunInternal(
             run.id,
             "Recovered durable native run cancellation",
@@ -4214,6 +4218,15 @@ export function heartbeatService(
               payload: { state: "unavailable", code: uncapturedInstructions.errorCode } });
           }
           await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+          // Fail closed: an unverified agent-file save is held in this box.
+          // Stop it and retain the lease; never destroy or expire its source.
+          const heldInstructions = await instructionCopies.get(run.companyId, run.id);
+          if (agentFileSaveHeld(heldInstructions)) {
+            providerResourceDispositionForRun = "stop_and_retain";
+            await appendRunEvent(run, { eventType: "instruction_save", stream: "system", level: "warn",
+              message: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
+              payload: { state: "pending_collection", savePending: true, code: heldInstructions?.errorCode ?? null } });
+          }
           await withAdapterExecutionPhase(executionPhaseContext, "lease_release", () => releaseEnvironmentLeasesForRun({
             runId: run.id,
             companyId: run.companyId,

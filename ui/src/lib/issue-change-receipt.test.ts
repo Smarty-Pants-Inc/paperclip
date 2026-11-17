@@ -75,11 +75,9 @@ describe("formatIssueChangeValue", () => {
     expect(formatIssueChangeValue([{ a: 1 }])).toBe("1 items");
   });
 
-  it("truncates long free text", () => {
+  it("preserves long free text", () => {
     const long = "x".repeat(200);
-    const formatted = formatIssueChangeValue(long);
-    expect(formatted.endsWith("…")).toBe(true);
-    expect(formatted.length).toBeLessThan(long.length);
+    expect(formatIssueChangeValue(long)).toBe(long);
   });
 
   it("reports structural objects as 'updated'", () => {
@@ -101,15 +99,14 @@ describe("readIssueChangeReceipt", () => {
       field: "status",
       from: "todo",
       to: "in progress",
-      truncated: false,
     });
   });
 
-  it("flags server-truncated long text", () => {
+  it("does not infer omitted values from generic updated metadata", () => {
     const rows = readIssueChangeReceipt({
       changes: { description: { from: "old text", to: "new text", updated: true } },
     });
-    expect(rows[0]).toMatchObject({ label: "Description", truncated: true });
+    expect(rows[0]).toEqual({ field: "description", label: "Description", from: "old text", to: "new text" });
   });
 
   it("returns nothing for events without a receipt", () => {

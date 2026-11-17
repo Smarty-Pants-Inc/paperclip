@@ -867,6 +867,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                 configuredSecretGuidance(input.config.configuredSecretNames ?? []),
               ].filter(Boolean).join("\n\n"),
               initialCommunicationGuidance: nativeReviewRequest ? null : readNonEmptyString(context.paperclipTaskCommunicationGuidance),
+              agentFileConflictNotice: readNonEmptyString(context.paperclipAgentFileConflictNotice),
               wakePayload: context.paperclipWake,
               caseContext: nativeReviewRequest ? null : context.paperclipCase as CaseExecutionContext | undefined,
               turnContext: context.paperclipTurnContext,

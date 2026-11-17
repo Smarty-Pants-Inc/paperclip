@@ -87,7 +87,8 @@ import {
   type ActivityPublication,
 } from "../activity-log.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
-import { materializeNativeProviderCapacityRetry } from "./native-provider-capacity-retry.js";
+import { materializeNativeEnvironmentBlockerRetry, materializeNativeProviderCapacityRetry } from "./native-provider-capacity-retry.js";
+import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE } from "./native-environment-blocker.js";
 import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 
@@ -895,8 +896,10 @@ async function materializeDecisionEffect(input: {
   }
   if (effect.kind === "schedule_retry") {
     failAt("continuation_materialization", input.failpoint);
-    if (effect.cause === NATIVE_PROVIDER_OVERLOADED_CODE) {
-      const retryId = await materializeNativeProviderCapacityRetry({
+    if (effect.cause === NATIVE_PROVIDER_OVERLOADED_CODE || effect.cause === NATIVE_ENVIRONMENT_BLOCKER_CODE) {
+      const materialize = effect.cause === NATIVE_ENVIRONMENT_BLOCKER_CODE
+        ? materializeNativeEnvironmentBlockerRetry : materializeNativeProviderCapacityRetry;
+      const retryId = await materialize({
         tx: input.tx as unknown as Db, companyId: input.companyId,
         issueId: input.issue.id, runId: input.runId, agentId: effect.agentId,
       });
@@ -1699,7 +1702,8 @@ export async function commitNativeStatusDecision(input: {
   if (reasonCode === "native_provider_model_rejected" && !input.requireModelRejectionOwner) {
     throw new Error("native_model_rejection_owner_required");
   }
-  if ((reasonCode.startsWith("native_provider_overloaded") || reasonCode === "native_run_failed_continuation_exhausted")
+  if ((reasonCode.startsWith("native_provider_overloaded") || reasonCode === "native_run_failed_continuation_exhausted"
+      || reasonCode === NATIVE_ENVIRONMENT_BLOCKER_CODE || reasonCode === NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE)
       && !input.requireProviderFailureOwner) {
     throw new Error("native_provider_failure_owner_required");
   }

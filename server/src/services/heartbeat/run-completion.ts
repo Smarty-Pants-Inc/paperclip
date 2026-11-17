@@ -16,6 +16,7 @@ import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js"
 import { measureRunPhase } from "../execution-preparation-timing.js";
 import { PROJECT_ACCESS_DENIED, ProjectAccessDeniedError } from "../project-access-denial.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
+import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { NON_RETRYABLE_PREFLIGHT_FAILURE_CODES, isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { ChatControlRecoveryUnresolvedError } from "./queue.js";
 import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspacePreparationCode } from "./retries.js";
@@ -48,7 +49,8 @@ import { logger } from "../../middleware/logger.js";
 import { allowlistedErrnoCode, allowlistedIngressReason, allowlistedSyscall, finiteSafeInteger } from "../../realtime/ingress-error-summary.js";
 import { normalizeResponsibleUserDenialCode } from "../responsible-user-denial-run-outcomes.js";
 import { parseObject } from "../../adapters/utils.js";
-import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON, isChatOriginPublicationCandidate, isExternalChatPresentationContext, mergeHeartbeatRunResultJson, resolveHeartbeatRunResponse, type RunPresentationDecision } from "../heartbeat-run-summary.js";
+import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON, isChatOriginPublicationCandidate, isExternalChatPresentationContext, mergeHeartbeatRunResultJson, NATIVE_PRESENTATION_PENDING_COMMIT, resolveHeartbeatRunResponse, type RunPresentationDecision } from "../heartbeat-run-summary.js";
+import { notifyNativeResponsePresentation } from "../native-response-presentation-notifications.js";
 import { normalizeMaxTurnStopReason } from "../heartbeat-stop-metadata.js";
 import { CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE } from "../chat-control-recovery-stop.js";
 import { logActivity } from "../activity-log.js";
@@ -402,6 +404,16 @@ export async function recordRunPresentationDecision(db: Db, input: {
 }
 
 export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunCompletionDependencies) {
+  const { settleAgentAfterCommittedRun } = createHeartbeatAgentStatus(db);
+  // A native run's terminal status can be committed by its finalizer, which
+  // never settles the agent. When this live owner then loses the
+  // compare-and-set it must still settle the agent (smarty-dev#21005).
+  const settleAgentOfCommittedNativeRun = async (committed: typeof heartbeatRuns.$inferSelect | null) => {
+    if (!committed || committed.runtimeMode !== "native" || !isHeartbeatRunTerminalStatus(committed.status)) return;
+    await settleAgentAfterCommittedRun(committed).catch((err) => {
+      logger.warn({ err, runId: committed.id }, "could not settle the agent of a committed native run; stranded-agent recovery will retry");
+    });
+  };
   const {
     getRun,
     getAgent,
@@ -770,6 +782,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           },
           "skipping late run finalization because the run already left running state",
         );
+        await settleAgentOfCommittedNativeRun(persistedRunWrite.run);
         return;
       }
     }
@@ -875,10 +888,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           livenessRun.contextSnapshot,
           externalChatPresentationAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
         );
+        const interactionOwnsResponse = Boolean(issueId && readAcceptedTaskContinuationSummary(persistedResultJson) &&
+          await hasChatRunOwnedProviderInteraction(db, { companyId: livenessRun.companyId, issueId, runId: livenessRun.id }));
         const resolved = resolveHeartbeatRunResponse({
           resultJson: persistedResultJson,
-          interactionOwnsResponse: Boolean(issueId && readAcceptedTaskContinuationSummary(persistedResultJson) &&
-            await hasChatRunOwnedProviderInteraction(db, { companyId: livenessRun.companyId, issueId, runId: livenessRun.id })),
+          interactionOwnsResponse,
           conversationTurnFinished: Boolean(issueId) && isConversation(issueContext) && livenessRun.status === "succeeded"
             && await measureRunPhase("response.resolve", () => conversationTurnPresentsAnswer({
               db, companyId: livenessRun.companyId, issueId: issueId!, runId: livenessRun.id,
@@ -902,6 +916,22 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         });
         let presentationDecision: RunPresentationDecision =
           resolved.decision;
+        // The native finalizer did not commit on this path (its lease was
+        // busy), so the answered rule cannot be read yet: the fields above are
+        // precommit. Keep the publication pending; committed-response recovery
+        // resolves it from the committed decision, where a run's own open card
+        // still owns the turn.
+        const presentationPendingCommit = Boolean(issueId) && Boolean(adapterResult.nativeFinalization) &&
+          livenessRun.runtimeMode === "native" && livenessRun.status === "succeeded" && isConversation(issueContext) &&
+          persistedResultJson?.finalizationPhase !== "committed" && !interactionOwnsResponse &&
+          presentationDecision.commentAction === "none" &&
+          presentationDecision.reasonCodes.includes("interaction_owns_conversation_response");
+        if (presentationPendingCommit) {
+          presentationDecision = {
+            ...presentationDecision,
+            reasonCodes: [...presentationDecision.reasonCodes, NATIVE_PRESENTATION_PENDING_COMMIT],
+          };
+        }
         if (
           issueId &&
           !skipRunIssueComment &&
@@ -976,6 +1006,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           payload: { presentationDecision },
         });
         resolvedPresentationDecision = presentationDecision;
+        if (presentationPendingCommit) {
+          await notifyNativeResponsePresentation(db, { companyId: livenessRun.companyId, issueId: issueId!, runId: livenessRun.id });
+        }
       } catch (err) {
         await onLog(
           "stderr",
@@ -1457,6 +1490,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         },
         "skipping late adapter failure finalization because the run already left running state",
       );
+      await settleAgentOfCommittedNativeRun(failedRunWrite.run);
       return;
     }
 

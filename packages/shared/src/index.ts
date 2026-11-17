@@ -2025,6 +2025,7 @@ export {
   createIssueInputSchema,
   createChildIssueSchema,
   createAcceptedPlanDecompositionSchema,
+  createAcceptedPlanDecompositionSchemaWithLimit,
   resolveCreateIssueStatusDefault,
   createIssueLabelSchema,
   upsertIssueWatchdogSchema,

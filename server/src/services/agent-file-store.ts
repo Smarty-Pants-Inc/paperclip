@@ -2,7 +2,7 @@ import { updateAgentConfigurationInTransaction } from "./agent-configuration-tra
 import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
 import { extractAgentMentionIds } from "@paperclipai/shared";
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { cachedAgentFileManifest, checkpointSnapshot, type AgentFileManifest } from "./agent-file-checkpoints.js";
 import { constants } from "node:fs";
@@ -10,7 +10,7 @@ import { Readable } from "node:stream";
 import path from "node:path";
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import { agents, activityLog, agentInstructionHeads, agentInstructionRevisions, resourceLifecycleEvents, fileStorageDb, type Db } from "@paperclipai/db";
-import { captureDirectorySnapshot, mergeDirectoryWithBaseline, type DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { captureDirectorySnapshot, mergeDirectoryWithBaseline, type DirectorySnapshot, type SnapshotEntry } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
 import { authorizeInstructionCommit, authorizeInstructionRead } from "./agent-instruction-authorization.js";
 import { assertInstructionPathSafe, instructionPath, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
@@ -46,6 +46,34 @@ function storageWarning(size: number, count: number, fullFile?: string) {
   if (count >= MAX_AGENT_DIRECTORY_ENTRIES) return agentStorageWarning("The agent folder has reached its 100,000-entry limit");
   if (fullFile) return agentStorageWarning(`Agent file "${fullFile}" has reached its 256 MiB limit`);
   return null;
+}
+
+/** A file another writer saved after this run's base, which this run also
+ * changed. The saved file stays canonical; the run's version, when it has one,
+ * is kept as `conflictCopy`. A topology replacement can still remove the saved
+ * file; `currentKept: false` records that limitation instead of claiming it was
+ * kept. Hashes are SHA-256 of content; null is absent. */
+export type AgentFileConflict = {
+  path: string; baseHash: string | null; currentHash: string; incomingHash: string | null; conflictCopy: string | null;
+  /** Absent in existing receipts means kept. False never claims a recovery copy. */
+  currentKept?: false;
+};
+const entryHash = (entry: SnapshotEntry | undefined) => entry?.kind === "file" ? entry.hash : null;
+const sameContent = (a: SnapshotEntry | undefined, b: SnapshotEntry | undefined) =>
+  a?.kind === "file" ? b?.kind === "file" && a.hash === b.hash : JSON.stringify(a) === JSON.stringify(b);
+
+/** `memory/x.md` -> `memory/x.conflict-<run8>-<epoch ms>.md`, unused in `taken`. */
+export function agentFileConflictCopyPath(relative: string, tag: string, epochMs: number, taken: (name: string) => boolean): string {
+  const dir = path.posix.dirname(relative);
+  const base = path.posix.basename(relative);
+  const ext = path.posix.extname(base);
+  let stem = base.slice(0, base.length - ext.length);
+  for (let attempt = 1; ; attempt++) {
+    const suffix = `.conflict-${tag}-${epochMs}${attempt > 1 ? `-${attempt}` : ""}${ext}`;
+    while (stem.length > 1 && Buffer.byteLength(stem + suffix) > 255) stem = stem.slice(0, -1);
+    const name = agentFilePath(dir === "." ? `${stem}${suffix}` : `${dir}/${stem}${suffix}`);
+    if (!taken(name.toLowerCase())) return name;
+  }
 }
 
 export function agentFilePath(value: string): string {
@@ -188,6 +216,26 @@ export async function isAgentFileSaveRecorded(tx: Tx, agent: Agent, relative: st
     eq(sql<string>`${activityLog.details}->>'path'`, relative), contentHash === null ? isNull(hash) : eq(hash, contentHash),
   )).limit(1);
   return Boolean(recorded);
+}
+
+/** Copy the run's version to its unused conflict path, verified against the
+ * hash the run reported, then publish it with one rename. */
+async function writeConflictCopy(sourceDir: string, root: string, item: AgentFileConflict, entry: SnapshotEntry) {
+  if (entry.kind !== "file" || !item.conflictCopy) throw new Error("Agent file conflict copy needs a file");
+  const from = await assertInstructionPathSafe(sourceDir, item.path);
+  const to = await assertInstructionPathSafe(root, item.conflictCopy);
+  const temporary = path.join(path.dirname(to), `.paperclip-merge-${randomUUID()}`);
+  try {
+    await fs.copyFile(from, temporary, constants.COPYFILE_EXCL);
+    await fs.chmod(temporary, entry.mode);
+    const handle = await fs.open(temporary, "r");
+    try { await handle.sync(); } finally { await handle.close(); }
+    if ((await inspectAgentFile(path.dirname(to), path.basename(temporary), 0))?.hash !== item.incomingHash) {
+      throw new Error("Agent file conflict copy does not match the run's file");
+    }
+    if (await fs.lstat(to).then(() => true, () => false)) throw conflict("Agent file conflict copy path is in use; retry the file synchronization");
+    await fs.rename(temporary, to);
+  } finally { await fs.rm(temporary, { force: true }); }
 }
 
 export function agentFileStore(db: Db) {
@@ -343,14 +391,38 @@ export function agentFileStore(db: Db) {
         });
         await assertAgentInteraction(tx, { companyId: input.companyId, actorAgentId: bound.type === "agent" ? bound.agentId : null,
           operation: "mention", texts });
-        // Rebase only the run's changed paths onto the current tree. This makes
-        // same-file edits/deletions last-sync-wins while untouched files retain
-        // changes from other runs. Ancestors may need recreating after a writer
-        // replaced a directory with a file.
+        // Rebase only the run's changed paths onto the current tree, so
+        // untouched files retain changes from other runs. Ancestors may need
+        // recreating after a writer replaced a directory with a file.
         const entries = new Map(input.baseline.entries);
         const changed = [...new Set([...input.baseline.entries, ...incoming.entries].map(([name]) => name))]
           .filter(name => JSON.stringify(input.baseline.entries.get(name)) !== JSON.stringify(incoming.entries.get(name)));
+        // Three-way compare before rebasing: a file whose current content
+        // differs from both this run's base and its result was saved by another
+        // writer since this run started. That file stays canonical. The run's
+        // version is kept beside it as a named conflict copy, indexed and
+        // persisted like any file in this same commit, never silently overwritten.
+        const sourceRunId = currentPluginInteractionOrigin()?.runId ?? actor.runId;
+        const tag = (sourceRunId ?? randomUUID()).replaceAll("-", "").slice(0, 8).toLowerCase();
+        const epochMs = Date.now();
+        const taken = new Set([...current.entries, ...incoming.entries].map(([name]) => name.toLowerCase()));
+        const conflicts: AgentFileConflict[] = [];
         for (const name of changed) {
+          const present = current.entries.get(name), base = input.baseline.entries.get(name), next = incoming.entries.get(name);
+          if (present?.kind !== "file" || next?.kind === "dir" || sameContent(present, base) || sameContent(present, next)) continue;
+          const conflictCopy = next?.kind === "file" ? agentFileConflictCopyPath(name, tag, epochMs, candidate => taken.has(candidate)) : null;
+          if (conflictCopy) taken.add(conflictCopy.toLowerCase());
+          conflicts.push({ path: name, baseHash: entryHash(base), currentHash: present.hash, incomingHash: entryHash(next), conflictCopy });
+        }
+        const held = new Set(conflicts.map(item => item.path));
+        for (const name of changed) {
+          if (held.has(name)) {
+            // Present the run's own result as its base so the merge neither
+            // copies over nor deletes the canonical file.
+            const next = incoming.entries.get(name);
+            if (next) entries.set(name, next); else entries.delete(name);
+            continue;
+          }
           const present = current.entries.get(name);
           if (present) entries.set(name, present); else entries.delete(name);
           if (incoming.entries.has(name)) {
@@ -362,10 +434,11 @@ export function agentFileStore(db: Db) {
           }
         }
         const applyBaseline = { ...input.baseline, entries };
-        const finalEntries = new Map([...current.entries].map(([name, value]) => [name, { value, root }]));
-        for (const name of changed) if (!incoming.entries.has(name)) finalEntries.delete(name);
+        const finalEntries = new Map<string, { value: SnapshotEntry; root: string; source?: string }>(
+          [...current.entries].map(([name, value]) => [name, { value, root }]));
+        for (const name of changed) if (!incoming.entries.has(name) && !held.has(name)) finalEntries.delete(name);
         for (const [name, value] of incoming.entries) {
-          if (JSON.stringify(input.baseline.entries.get(name)) === JSON.stringify(value)) continue;
+          if (JSON.stringify(input.baseline.entries.get(name)) === JSON.stringify(value) || held.has(name)) continue;
           if (value.kind !== "dir") for (const child of finalEntries.keys()) if (child.startsWith(`${name}/`)) finalEntries.delete(child);
           finalEntries.set(name, { value, root: input.sourceDir });
           for (let parent = path.posix.dirname(name); parent !== "."; parent = path.posix.dirname(parent)) {
@@ -379,10 +452,20 @@ export function agentFileStore(db: Db) {
             if (!finalEntries.has(parent)) finalEntries.set(parent, { value: { kind: "dir" }, root });
           }
         }
+        for (const item of conflicts) if (item.conflictCopy) {
+          finalEntries.set(item.conflictCopy, { value: incoming.entries.get(item.path)!, root: input.sourceDir, source: item.path });
+        }
+        // An incoming ancestor file can remove a held descendant. Topology
+        // preservation is separate work; this receipt must describe the result,
+        // not claim the other writer's bytes survived when they did not.
+        for (const item of conflicts) {
+          const kept = finalEntries.get(item.path)?.value;
+          if (kept?.kind !== "file" || kept.hash !== item.currentHash) item.currentKept = false;
+        }
         let total = 0;
         let fullFile: string | undefined;
         for (const [name, item] of finalEntries) if (item.value.kind === "file") {
-          const size = (await fs.stat(path.join(item.root, name))).size;
+          const size = (await fs.stat(path.join(item.root, item.source ?? name))).size;
           assertFileSize(size, name);
           if (size >= MAX_AGENT_FILE_BYTES) fullFile ??= name;
           total += size;
@@ -390,8 +473,11 @@ export function agentFileStore(db: Db) {
         assertDirectorySize(total, finalEntries.size);
         await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root,
           ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
-        await audit(tx, agent, bound, { sourceRunId: currentPluginInteractionOrigin()?.runId ?? actor.runId, contract: AGENT_FILES_CONTRACT });
-        return { storageWarning: storageWarning(total, finalEntries.size, fullFile) };
+        for (const item of conflicts) if (item.conflictCopy) await writeConflictCopy(input.sourceDir, root, item, incoming.entries.get(item.path)!);
+        // Recorded in the transaction that commits the durable head, before any
+        // caller can acknowledge the save or clean up the run's copy.
+        await audit(tx, agent, bound, { sourceRunId, contract: AGENT_FILES_CONTRACT, ...(conflicts.length ? { conflicts } : {}) });
+        return { storageWarning: storageWarning(total, finalEntries.size, fullFile), conflicts };
       }, [...changedMentions.values()].map(value => value.text));
     },
   };

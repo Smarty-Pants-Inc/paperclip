@@ -1810,6 +1810,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       }
       const acceptedSummary = acceptedSemanticResultSummary(meta?.resultJson);
       const parsedSource = transcriptToTaskChatItems(entries, {
+        runLogHref: meta?.agentId ? `/agents/${encodeURIComponent(agentMap?.get(meta.agentId)?.urlKey ?? meta.agentId)}/runs/${encodeURIComponent(source.id)}` : undefined,
         runId: source.id,
         agentName: meta?.agentName,
         running: false,
@@ -2163,6 +2164,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       });
       const projectedSegments = segments.map((segment) => {
         const parsedTranscript = reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(segment.entries, {
+          runLogHref: meta?.agentId ? `/agents/${encodeURIComponent(agentMap?.get(meta.agentId)?.urlKey ?? meta.agentId)}/runs/${encodeURIComponent(source.id)}` : undefined,
           runId: source.id,
           agentName: meta?.agentName,
           running: false,
@@ -2353,6 +2355,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         for (const [segmentIndex, segment] of segments.slice(0, -1).entries()) {
           if (segment.entries.length === 0) continue;
           const parsedTranscript = reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(segment.entries, {
+            runLogHref: `/agents/${encodeURIComponent(agentMap?.get(liveRun.agentId)?.urlKey ?? liveRun.agentId)}/runs/${encodeURIComponent(liveRun.id)}`,
             runId: liveRun.id,
             agentName: liveRun.agentName,
             running: false,
@@ -2742,6 +2745,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         runId: tailRunId, agentName: tailAgentName, running: tailStreaming,
       });
       const parsed = reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(tailEntries, {
+        runLogHref: tailAgentId ? `/agents/${encodeURIComponent(tailAgent?.urlKey ?? tailAgentId)}/runs/${encodeURIComponent(tailRunId)}` : undefined,
         runId: tailRunId,
         agentName: tailAgentName,
         running: tailStreaming,
@@ -2757,6 +2761,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       tailContentKey,
       tailStreaming,
       tailAgentName,
+      tailAgentId,
+      tailAgent?.urlKey,
       tailPlanContentKey,
     ],
   );

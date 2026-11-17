@@ -1,6 +1,7 @@
 import { notifyStatusCardEvaluation } from "./status-card-notifications.js";
 import { issueDisplayStatusSql } from "./issue-display-status.js";
 import { createHash } from "node:crypto";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { and, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, ne, or, sql, type SQL } from "drizzle-orm";
 import {
   agents,
@@ -46,6 +47,13 @@ import {
   type StatusCardDeltaChange,
   type StatusCardFingerprint,
 } from "./status-card-update-engine.js";
+
+export const STATUS_CARD_AGENT_MAX_CARDS_ENV = "PAPERCLIP_STATUS_CARD_AGENT_MAX_CARDS";
+
+/** Absence preserves the upstream limit; malformed settings refuse startup. */
+export function resolveStatusCardAgentMaxCards(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntegerEnvironment(env, STATUS_CARD_AGENT_MAX_CARDS_ENV, STATUS_CARD_AGENT_MAX_CARDS);
+}
 
 type StatusCardActor = { agentId: string | null; userId: string | null };
 type StatusCardWriter = { agentId: string | null; runId: string | null };
@@ -305,8 +313,9 @@ export function statusCardService(
         .from(statusCards)
         .where(and(eq(statusCards.companyId, companyId), eq(statusCards.createdByAgentId, agentId)))
         .then((rows) => rows[0]?.count ?? 0);
-      if (authoredCount >= STATUS_CARD_AGENT_MAX_CARDS) {
-        throw unprocessable(`Agents can author at most ${STATUS_CARD_AGENT_MAX_CARDS} status cards`);
+      const maxCards = resolveStatusCardAgentMaxCards();
+      if (authoredCount >= maxCards) {
+        throw unprocessable(`Agents can author at most ${maxCards} status cards`);
       }
 
       return tx.insert(statusCards).values(values).returning().then((rows) => rows[0]!);

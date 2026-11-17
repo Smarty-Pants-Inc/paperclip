@@ -1,3 +1,4 @@
+import { createServerAcceptedPlanDecompositionSchema } from "../services/plan-decomposition-limit.js";
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../services/agent-interaction-delivery.js";
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
@@ -127,7 +128,6 @@ import {
   createIssueThreadInteractionSchema,
   createIssueWorkProductSchema,
   createIssueLabelSchema,
-  createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
@@ -14373,7 +14373,7 @@ export function issueRoutes(
 
   router.post(
     "/issues/:id/accepted-plan-decompositions",
-    validateIssueMutationBody(createAcceptedPlanDecompositionSchema),
+    validateIssueMutationBody(createServerAcceptedPlanDecompositionSchema()),
     async (req, res) => {
       const sourceIssueId = req.params.id as string;
       const sourceIssue = await getAccessibleResource(

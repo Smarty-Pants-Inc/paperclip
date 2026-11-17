@@ -29,7 +29,7 @@ export const agentSkillAssignmentModeSchema = z.enum([
 
 export const agentDesiredSkillEntrySchema = z.object({
   key: z.string().min(1),
-  versionId: z.string().guid().nullable(),
+  versionId: z.string().guid().nullable().describe("null selects Latest; a non-null version id is a Beta skills pin"),
 });
 
 export const agentDesiredSkillSelectionSchema = z.union([
@@ -66,7 +66,7 @@ export const agentSkillSnapshotSchema = z.object({
 
 export const agentSkillSyncSchema = z.object({
   mode: agentSkillAssignmentModeSchema,
-  desiredSkills: z.array(agentDesiredSkillSelectionSchema),
+  desiredSkills: z.array(agentDesiredSkillSelectionSchema).describe("Skill keys (Latest). Object entries pin a version and need Beta skills."),
 });
 
 export type AgentSkillSync = z.infer<typeof agentSkillSyncSchema>;

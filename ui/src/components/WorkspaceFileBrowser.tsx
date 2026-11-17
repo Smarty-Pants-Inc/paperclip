@@ -15,7 +15,7 @@ import { cn, formatDateTime } from "@/lib/utils";
 import { fileResourcesApi } from "@/api/file-resources";
 import { ApiError } from "@/api/client";
 import { describeError } from "@/api/errors";
-import { queryViewKind } from "@/components/QueryView";
+import { QueryErrorState, queryViewKind } from "@/components/QueryView";
 import { queryKeys } from "@/lib/queryKeys";
 import { usePageVisibility } from "@/lib/page-visibility";
 import { parseWorkspaceFileRef } from "@/lib/workspace-file-parser";
@@ -686,9 +686,9 @@ export function WorkspaceFileBrowser({
       .sort();
   }, [currentFolderKey, expandedLazyFolders, isLazyBrowse, selectedFolders]);
   const folderPageSpecs = useMemo(() => {
-    if (!canListFiles || !isLazyBrowse) return [];
+    if (!canListFiles) return [];
     const specs: Array<{ path: string; pageIndex: number; offset: number }> = [];
-    for (const path of loadedLazyFolders) {
+    for (const path of isLazyBrowse ? loadedLazyFolders : []) {
       const pageCount = folderPageCounts[path] ?? 1;
       for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
         specs.push({ path, pageIndex, offset: pageIndex * LIST_LIMIT });
@@ -706,8 +706,8 @@ export function WorkspaceFileBrowser({
         workspace: effectiveWorkspace,
         projectId: targetProjectId,
         workspaceId: targetWorkspaceId,
-        mode: "all",
-        q: null,
+        mode: isLazyBrowse ? "all" : mode,
+        q: isLazyBrowse ? null : q,
         limit: LIST_LIMIT,
         offset: spec.offset,
         path: spec.path || null,
@@ -716,13 +716,13 @@ export function WorkspaceFileBrowser({
         workspace: effectiveWorkspace,
         projectId: targetProjectId,
         workspaceId: targetWorkspaceId,
-        mode: "all",
-        q: null,
+        mode: isLazyBrowse ? "all" : mode,
+        q: isLazyBrowse ? null : q,
         limit: LIST_LIMIT,
         offset: spec.offset,
         path: spec.path || null,
       }, { signal }),
-      enabled: queriesEnabled && isLazyBrowse,
+      enabled: queriesEnabled,
       staleTime: 15_000,
       refetchOnWindowFocus: false,
       refetchOnReconnect: false,
@@ -730,7 +730,7 @@ export function WorkspaceFileBrowser({
   });
   const lazyItemsByFolder = useMemo(() => {
     const map = new Map<string, WorkspaceFileListItem[]>();
-    if (isLazyBrowse) map.set(currentFolderKey, [...items]);
+    map.set(currentFolderKey, [...items]);
     folderPageSpecs.forEach((spec, index) => {
       const response = folderPageQueries[index]?.data;
       if (!response || response.state !== "available") return;
@@ -742,7 +742,7 @@ export function WorkspaceFileBrowser({
   }, [currentFolderKey, folderPageQueries, folderPageSpecs, isLazyBrowse, items]);
   const lazyTruncatedFolders = useMemo(() => {
     const pageState = new Map<string, { pageIndex: number; truncated: boolean }>();
-    if (isLazyBrowse) pageState.set(currentFolderKey, { pageIndex: 0, truncated: Boolean(data?.truncated) });
+    pageState.set(currentFolderKey, { pageIndex: 0, truncated: Boolean(data?.truncated) });
     folderPageSpecs.forEach((spec, index) => {
       const response = folderPageQueries[index]?.data;
       if (!response) return;
@@ -771,10 +771,7 @@ export function WorkspaceFileBrowser({
     });
     return set;
   }, [folderPageQueries, folderPageSpecs]);
-  const allLoadedItems = useMemo(() => {
-    if (!isLazyBrowse) return items;
-    return Array.from(lazyItemsByFolder.values()).flat();
-  }, [isLazyBrowse, items, lazyItemsByFolder]);
+  const allLoadedItems = useMemo(() => Array.from(lazyItemsByFolder.values()).flat(), [lazyItemsByFolder]);
   const allLoadedFileItems = useMemo(
     () => allLoadedItems.filter((item): item is WorkspaceFileListFileItem => item.kind === "file"),
     [allLoadedItems],
@@ -783,8 +780,8 @@ export function WorkspaceFileBrowser({
     if (isLazyBrowse) {
       return buildWorkspaceDirectoryTree(lazyItemsByFolder.get(currentFolderKey) ?? items);
     }
-    return buildWorkspaceFileTree(items, folderPath);
-  }, [currentFolderKey, folderPath, isLazyBrowse, items, lazyItemsByFolder]);
+    return buildWorkspaceFileTree(allLoadedItems, folderPath);
+  }, [allLoadedItems, currentFolderKey, folderPath, isLazyBrowse, items, lazyItemsByFolder]);
   const selectedItemIndex = selectedPath
     ? allLoadedFileItems.findIndex((item) =>
       item.relativePath === selectedPath &&
@@ -1157,19 +1154,24 @@ export function WorkspaceFileBrowser({
 
       <div ref={scrollContainerRef} className="min-h-0 flex-1 overflow-y-auto">{body}</div>
 
-      {lazyTruncatedFolders.has(currentFolderKey) || (data?.truncated && !isLazyBrowse) ? (
+      {lazyErroredFolders.has(currentFolderKey) ? (
+        <QueryErrorState
+          size="inline"
+          error={folderPageQueries.find((query) => query.isError)?.error}
+          action="load more files"
+          onRetry={() => { void Promise.all(folderPageQueries.filter((query) => query.isError).map((query) => query.refetch())); }}
+          retrying={lazyFetchingFolders.has(currentFolderKey)}
+        />
+      ) : lazyTruncatedFolders.has(currentFolderKey) ? (
         <div className="border-t border-border pt-2 text-(length:--text-micro) text-muted-foreground">
-          {isLazyBrowse ? (
-            <button
-              type="button"
-              onClick={() => loadMoreFolder(currentFolderKey)}
-              className="rounded px-1 py-0.5 text-left hover:bg-accent hover:text-foreground"
-            >
-              Load more from this folder
-            </button>
-          ) : (
-            <>Showing first {items.length} — refine the search to narrow.</>
-          )}
+          <button
+            type="button"
+            disabled={lazyFetchingFolders.has(currentFolderKey) || listQuery.isFetching}
+            onClick={() => loadMoreFolder(currentFolderKey)}
+            className="rounded px-1 py-0.5 text-left hover:bg-accent hover:text-foreground disabled:opacity-50"
+          >
+            {lazyFetchingFolders.has(currentFolderKey) ? "Loading more files…" : isLazyBrowse ? "Load more from this folder" : "Show more files"}
+          </button>
         </div>
       ) : null}
     </div>
