@@ -72,7 +72,7 @@ import { ScrollToBottom } from "../components/ScrollToBottom";
 import { SourceResolvedFoldCallout } from "../components/SourceResolvedFoldCallout";
 import { SourceResolvedFoldBadge } from "../components/SourceResolvedFoldBadge";
 import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-fold";
-import { formatCents, formatConfiguredCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd, visibleRunTokenTotal, hasUnavailableProviderAccounting, supportsRawProviderTrace } from "../lib/utils";
+import { formatCents, formatConfiguredCents, formatSpendPercent, formatDate, relativeTime, formatTokens, visibleRunCostUsd, visibleRunTokenTotal, hasUnavailableProviderAccounting, supportsRawProviderTrace } from "../lib/utils";
 import { cn, COST_FIGURES_HIDDEN } from "../lib/utils";
 import { RunRetryDetails } from "../components/RunRetryDetails";
 import { Button } from "@/components/ui/button";
@@ -1478,7 +1478,7 @@ export function AgentOverview({
         />
         <AgentMetricTile
           icon={Gauge}
-          value={budgetPercent === null ? "–" : `${budgetPercent}%`}
+          value={budgetPercent === null ? "–" : formatSpendPercent(budgetPercent)}
           label="Budget used"
           description={budgetPercent === null ? "No monthly budget set" : `of ${formatConfiguredCents(budget)} this month`}
           to={agentDetailHref(agentRef, "budgets")}
