@@ -12,7 +12,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import type { NativeStatusDecision } from "./native-runtime/status-arbiter.js";
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
   agents,
   agentTaskSessions,
@@ -930,10 +930,16 @@ export async function redeliverUnansweredConversationTurn(
   // RFL 19:17Z ruling 3 (D160): a native turn whose finalization is still
   // workspace_pending can commit later, and committed-response recovery then
   // publishes its reply. A re-offer before that is a second answer. The
-  // finalizer owns the turn, as for a pending-commit presentation.
+  // finalizer owns the turn, as for a pending-commit presentation. The same
+  // holds mid-finalization (rf-3 D160 residual): the executor settles the run
+  // succeeded even when finalizeNativeRun threw after writing
+  // ready_for_assessment or arbitrating (heartbeat/runtime-execution.ts catch,
+  // "the reconciliation loop will retry"), and the reconciler
+  // (native-finalization-reconciler.ts candidates: any phase but
+  // terminal_failure) can still commit and publish that reply.
   const [finishing] = await db.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id),
-    eq(nativeRunFinalizations.phase, "workspace_pending"))).limit(1);
+    inArray(nativeRunFinalizations.phase, ["workspace_pending", "ready_for_assessment", "arbitrating"]))).limit(1);
   if (finishing) return "none";
   if (run.status !== "succeeded") {
     // Upstream still owns a failed turn that is the task's latest attempt (its
