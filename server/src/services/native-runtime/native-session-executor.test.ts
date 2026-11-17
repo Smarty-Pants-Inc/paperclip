@@ -25325,13 +25325,16 @@ describe("runnerd provider runtime wiring", () => {
       ({ providerSessionId: threadId, providerBackendSessionId: null, providerSessionIdentity: null });
 
     async function floorFixture(label: string, proof: "none" | "destroyed" = "none",
-      leaseOutcome: "created" | "resumed" = "created") {
+      leaseOutcome: "created" | "resumed" = "created",
+      extra: { current?: Record<string, unknown>; driverKind?: string; runContextSnapshot?: Record<string, unknown> } = {}) {
       const remoteCwd = join(isolatedStateDirectory, `remote-j322-${label}`);
       const current: NativeExecutionInputV1 = { ...execution,
         binding: { ...execution.binding, companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(),
           runId: randomUUID(), executionWorkspaceId: randomUUID() },
-        session: { ...execution.session, normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 } },
-      };
+        session: { ...execution.session, normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
+          ...(extra.driverKind ? { driverKind: extra.driverKind } : {}) },
+        ...(extra.current ?? {}),
+      } as NativeExecutionInputV1;
       const runnerInstanceId = `j322-runner-${label}`;
       const backupDirectory = { root: "" };
       const conversation = { id: randomUUID(), sessionParamsJson: {
@@ -25443,6 +25446,7 @@ describe("runnerd provider runtime wiring", () => {
       state.createBackend.mockReturnValueOnce({ kind: "test", openSession, recoverSession } as never);
       const onLog = vi.fn(async () => undefined);
       const backend = await createRunnerdBackend({ db, execution: current, runnerInstanceId, runnerIngressAuthorized: true, onLog,
+        ...(extra.runContextSnapshot ? { runContextSnapshot: extra.runContextSnapshot } : {}),
         runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment",
           leaseId: "lease-created", providerKey: "daytona", reusableLeaseConfigured: true,
           effectiveCapabilities: { runnerWebSocketIngress: true },
@@ -25789,11 +25793,11 @@ describe("runnerd provider runtime wiring", () => {
       type ChatFixture = Awaited<ReturnType<typeof floorFixture>> & { boxState: (overrides?: Record<string, unknown>) => Promise<void>;
         oldStateAtFreshOpen: boolean[] };
       async function chatFixture(label: string, refusal: ReturnType<typeof refreshRefusal>,
-        box: Record<string, unknown> = {}): Promise<ChatFixture> {
+        box: Record<string, unknown> = {}, extra: Parameters<typeof floorFixture>[3] = {}): Promise<ChatFixture> {
         // A created lease, as F20's runtime dress: this fixture has no live
         // runnerd controller, so a resumed lease cannot prove the fresh
         // session's unconnected bootstrap (claimUntouchedRemoteSession).
-        const fixture = await floorFixture(`refresh-${label}`, "none", "created");
+        const fixture = await floorFixture(`refresh-${label}`, "none", "created", extra);
         // The warm session's state on the box (the conversation's provider thread).
         const boxState = async (overrides: Record<string, unknown> = {}) => {
           await mkdir(join(fixture.remoteSession, "runner"), { recursive: true });
@@ -25829,7 +25833,8 @@ describe("runnerd provider runtime wiring", () => {
         dispositionOnlyRecoveryConsumed: false, dispositionOnlyRecoveryTurnId: null,
         providerRecoveryPolicy: "allow_replacement_after_resume_failure", ...overrides }) as never;
       // The person's message, through the real runtime (NSR) and the server's backend.
-      async function sendPersonMessage(fixture: ChatFixture) {
+      async function sendPersonMessage(fixture: ChatFixture, checkpointOverrides: Record<string, unknown> = {},
+        controlPlaneExtra: Record<string, unknown> = {}) {
         const ident = { runId: fixture.current.binding.runId, sessionId: fixture.current.session.normalizedSessionId! };
         const startTurn = vi.fn(async (_turn: { message: { text: string } }) => ({ turnId: "turn-fresh" }));
         Object.assign(fixture.fresh, {
@@ -25860,10 +25865,11 @@ describe("runnerd provider runtime wiring", () => {
         const controlPlane = {
           openRun: async () => undefined, completeRun: async () => {}, checkpointSession: async () => {},
           // The chat's warm checkpoint (the prior answered run, rebound): the runtime RECOVERS.
-          loadSessionCheckpoint: async () => warmCheckpoint(fixture),
+          loadSessionCheckpoint: async () => warmCheckpoint(fixture, checkpointOverrides),
           appendEvent: async (event: unknown) => { events.push(event);
             return { cursor: events.length, highestContiguousSourceSeq: events.length, disposition: "committed" }; },
           replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
+          ...controlPlaneExtra,
         };
         const getFreshSessionHandoff = vi.fn(async () => HANDOFF);
         const outcome = await executeNativeSession({ input: fixture.current, backend: fixture.backend, controlPlane,
@@ -25967,6 +25973,82 @@ describe("runnerd provider runtime wiring", () => {
       ])("guard: a checkpoint with %s keeps the refusal (no run authority re-applied on a new thread)", async (_name, overrides) => {
         const fixture = await chatFixture(`checkpoint-${Object.keys(overrides)[0]}`, refreshRefusal("provider_contract_changed"));
         await expectNamedRefusalKept(fixture, await recover(fixture, overrides), "provider_contract_changed");
+      });
+
+      // S2p (Paul's shape (2), gate 5 N23c 3/3, 11-17). A Paul-shaped Boat
+      // agent_files pi_rpc agent: the turn PARKED in a governed wait
+      // (request_human_input; only the question itself open), a sibling saved
+      // memory/<note>.md, then the person answered via /respond OR sent a
+      // plain message. The first run's run.attach failed: 'Codex warm run
+      // attachment requires an idle live provider with no pending work
+      // (pending_messages)' -> prepareRefusalCode=provider_reconciliation_required,
+      // refreshWaitForTurn=false, toolBridge.pending EMPTY -> 'keeping the
+      // refresh refusal: checkpoint is not replaceable' -> a failed run.
+      // The checkpoint policy here is the one PRODUCTION derives: both rebinds
+      // (rebindNativeSessionCheckpoint, native-session-resume.ts, and the warm
+      // controller rebind loadWarmNativeCheckpoint, native-session-executor.ts)
+      // call nativeProviderRecoveryPolicy on the prior run's own checkpoint;
+      // after a request_human_input park that checkpoint's semanticResult is
+      // yielded with a response_wake continuation, and both rebinds clear
+      // governedWait. Required: the SAME first run rotates to a fresh thread
+      // with the saved history, the person's answer/message answered once.
+      describe("S2p: a governed-wait park, then the person's answer or new message, refused provider_reconciliation_required", () => {
+        const parkedPriorCheckpoint = { goal: null, semanticResult: { reportedWorkDisposition: "yielded",
+          continuation: { kind: "response_wake", interactionId: "question-1" } } };
+        const derivedPolicy = () => nativeSessionResume.nativeProviderRecoveryPolicy(parkedPriorCheckpoint, false);
+        const reconciliation = refreshRefusal("provider_reconciliation_required");
+        // The sandbox runnerd wiring of this fixture launches codex: the
+        // helper treats codex and pi_rpc alike (one provider kind check, one
+        // codex-provider-state.json on the box); a pi_rpc launch here would
+        // need a verified bundled image pack on a real box.
+        const piRpc = {};
+        // The box as attached-read in the live run: no pending tool call, the
+        // runner marked the session for reconciliation.
+        const parkedBox = { lifecycle: "reconciliation_required", toolBridge: { pending: {} } };
+        const ANSWER = "Use the blue logo.";
+        const variants = [
+          ["answered the question via /respond", { current: { ...piRpc, interactionResponses: [{ interactionId: "question-1",
+            kind: "ask_user_questions", response: { result: { answers: [{ questionId: "q1", answer: ANSWER }] } } }] } }],
+          ["sent a plain new message", { current: piRpc, runContextSnapshot: { wakeReason: "issue_commented",
+            wakeCommentId: "comment-plain-1" } }],
+        ] as const;
+        it("the policy production derives for this shape is allow_replacement_after_governed_wait", () => {
+          expect(derivedPolicy()).toBe("allow_replacement_after_governed_wait");
+        });
+        it.each(variants)("the person %s: the FIRST run continues on a fresh thread with its history, answered once", async (label, extra) => {
+          const fixture = await chatFixture(`s2p-${label.split(" ")[0]}`, reconciliation, parkedBox,
+            { ...extra } as never);
+          const provesNoRunProviderWork = vi.fn(async () => true);
+          const sent = await sendPersonMessage(fixture, { providerRecoveryPolicy: derivedPolicy() }, { provesNoRunProviderWork });
+          await expectAnsweredOnFreshThread(fixture, sent);
+          // Never a replay: this run's provider work was proven absent before the fresh thread.
+          expect(provesNoRunProviderWork).toHaveBeenCalled();
+          // The answer reaches the fresh thread once (one turn), never through the old thread.
+          const text = sent.startTurn.mock.calls[0]![0].message.text;
+          if (label.startsWith("answered")) expect(text.split(ANSWER).length - 1).toBe(1);
+          // The refusal is logged with its typed code; the notice states its real cause, never a skill change.
+          expect(fixture.onLog).toHaveBeenCalledWith("stderr",
+            expect.stringContaining("prepareRefusalCode=provider_reconciliation_required refreshWaitForTurn=false"));
+          expect(fixture.onLog).toHaveBeenCalledWith("stdout", expect.stringContaining("Continued on a fresh thread with your history"));
+          expect(fixture.onLog).not.toHaveBeenCalledWith(expect.anything(), expect.stringMatching(/skill change/i));
+          expect(fixture.onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining("keeping the refresh refusal"));
+        });
+        it("guard: the governed-wait policy WITHOUT an answer or a new message in this run keeps the refusal", async () => {
+          const fixture = await chatFixture("s2p-unconsumed", reconciliation, parkedBox, { current: piRpc } as never);
+          await expectNamedRefusalKept(fixture, await recover(fixture, { providerRecoveryPolicy: derivedPolicy() }),
+            "provider_reconciliation_required");
+        });
+        it("guard: a governed-wait checkpoint whose cursor progressed (not the untouched rebind NSR's fresh start requires) keeps the refusal", async () => {
+          const fixture = await chatFixture("s2p-cursor", reconciliation, parkedBox, { ...variants[0][1] } as never);
+          await expectNamedRefusalKept(fixture, await recover(fixture, { providerRecoveryPolicy: derivedPolicy(), cursor: "57" }),
+            "provider_reconciliation_required");
+        });
+        it("guard: the governed-wait policy with a pending tool call on the box keeps the refusal", async () => {
+          const fixture = await chatFixture("s2p-pending", reconciliation,
+            { ...parkedBox, toolBridge: { pending: { "call-1": { callId: "call-1" } } } }, { ...variants[0][1] } as never);
+          await expectNamedRefusalKept(fixture, await recover(fixture, { providerRecoveryPolicy: derivedPolicy() }),
+            "provider_reconciliation_required");
+        });
       });
     });
   });
