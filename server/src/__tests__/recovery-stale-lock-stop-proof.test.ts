@@ -732,6 +732,50 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     expect((cards[0]!.evidence as Record<string, any>).stopPending.personStop).toBeFalsy();
   });
 
+  // Keep reason: adopt-stopu-d4752 (rf-3). On U a person's Stop is never a warm
+  // handoff: run-control releases the box stop_and_retain (runner-environment-
+  // lifecycle errorCode "cancelled"). U's executor still writes the settled-turn
+  // receipt (nativeRetainedIdleCheckpoint) in the cancellation settle, BEFORE
+  // the release site, so for that window the lease is still active
+  // reuse_by_environment. That receipt must not prove Stop: the sweep clears no
+  // claim (nothing may adopt the lease being stopped), before the release and
+  // while the stop_and_retain request is open; only the stop receipt releases.
+  it.each(["before release", "stop requested", "stop in flight"] as const)(
+    "U real Stop shape with the executor's settled-turn receipt, %s: the sweep clears 0 claims", async shape => {
+      const f = await warmStopFixture("settled");
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(heartbeatRuns).set({ errorCode: "cancelled", resultJson: { ...run!.resultJson,
+        nativeCancellation: { ...(run!.resultJson!.nativeCancellation as Record<string, unknown>), recordedAt: new Date().toISOString() } } })
+        .where(eq(heartbeatRuns.id, f.runId));
+      if (shape !== "before release") {
+        await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata, pluginId: randomUUID() } })
+          .where(eq(environmentLeases.id, f.lease.id));
+        const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+        const requested = await prepareSandboxStopAndRetain(db, lease!);
+        expect(requested).not.toBeNull();
+        if (shape === "stop in flight") await db.update(environmentLeases).set({ metadata: { ...requested!.metadata,
+          pendingCleanupInFlight: true, pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000 } })
+          .where(eq(environmentLeases.id, f.lease.id));
+      }
+      const before = await task(f.issueId);
+      expect(before).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
+      const swept = await recoveryService(db, { enqueueWakeup: vi.fn() })
+        .sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+      expect(swept.cleared).toBe(0);
+      expect(await task(f.issueId)).toEqual(before);
+      expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+      // The receipt-bearing path itself produces no card once U's stop_and_retain
+      // request is open (bounded person Stop); before the release site U's own
+      // no-stop-intent rule applies (as "U control no-stop-intent still cards").
+      if (shape !== "before release") expect(await stopActions(f.issueId)).toEqual([]);
+      // Only the box's stop receipt from the stop_and_retain release releases them.
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+        metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId, state: "stopped" }) } })
+        .where(eq(environmentLeases.id, f.lease.id));
+      expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
+    });
+
   it("a stop_and_retain Stop with no receipt yet keeps the card even with a settled-turn receipt", async () => {
     const f = await warmStopFixture("settled");
     await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata, sandboxStopAndRetain: { requestedAt: new Date().toISOString() } } })
