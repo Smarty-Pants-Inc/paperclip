@@ -14435,6 +14435,80 @@ describe("native warm session supervision", () => {
       },
     );
 
+    // Independent RF4 trust-boundary regression: invokes the real remote checkpoint and storage fence.
+    it.each(["stop", "interrupt"] as const)("RF4 real remote checkpoint: answers first follow-up after %s without a plugin-task owner", async route => {
+      const { base, next } = fixture(`rf4-remote-${route}`);
+      const coordinator = { phase: "observed", resultId: null as string | null, leaseOwner: "remote-owner" as string | null,
+        leaseExpiresAt: new Date(Date.now() + 120_000), controllerGeneration: 1, controllerBootId: "rf4-boot" };
+      let taskRunId = base.binding.runId;
+      const db = leaseDb(base), select = db.select.bind(db);
+      const query = (rows: unknown[]) => { const promise = Promise.resolve(rows);
+        const q = { then: promise.then.bind(promise), where: () => q, limit: () => q, for: () => q }; return q; };
+      db.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => {
+        if (table === nativeRunFinalizations) return query([coordinator]);
+        if (table === issues) return query([{ executionRunId: taskRunId, checkoutRunId: null }]);
+        return select(fields as never).from(table as never);
+      } })) as unknown as Db["select"];
+      const fenceTx = { select: db.select, execute: async () => [{ now: new Date() }],
+        $with: () => ({ as: () => ({}) }),
+        with: () => ({ select: () => ({ from: () => query([{ ...coordinator, now: new Date() }]) }) }),
+      };
+      db.transaction = (async operation => operation(fenceTx as never)) as Db["transaction"];
+      const storage = vi.spyOn(harnessStorage, "durableNativeHarnessStorage").mockReturnValue({ provider: "s3" } as never);
+      const validate = vi.spyOn(harnessStorage, "assertNativeHarnessBackupOwner");
+      const backup = vi.spyOn(harnessStorage, "persistNativeHarnessBackup");
+      const checkpointRegistration = vi.spyOn(runnerCheckpoint, "nativeRunnerCheckpointRegistration").mockReturnValue(async () => undefined);
+      onTestFinished(() => { storage.mockRestore(); validate.mockRestore(); backup.mockRestore(); checkpointRegistration.mockRestore(); });
+      const remoteExecute = vi.fn(async (command: { args?: string[] }) => ({
+        exitCode: command.args?.[1]?.includes("base64") ? 1 : 0, timedOut: false, stderr: "", stdout:
+          command.args?.[0] === "--build-metadata" ? JSON.stringify({
+            schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner",
+            binaryContractVersion: 2, durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+          }) : command.args?.[0] === "--version" ? "codex-cli 0.160.0" : "",
+      }));
+      const artifact = join(isolatedHome, "rf4-runnerd"); await writeFile(artifact, "fixture artifact");
+      await createRunnerdBackend({ db, execution: base, runnerInstanceId: "runner",
+        runnerRemoteBinaryPath: artifact, runnerRemoteCodexPath: artifact,
+        controllerPersistence: { bootId: "rf4-boot" }, runnerIngressAuthorized: true,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", environmentId: "rf4-env", leaseId: "rf4-lease",
+          providerKey: "boat", sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "rf4-box" },
+          effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute: remoteExecute, syncIn: vi.fn(async () => undefined) },
+          getRunnerIngressEndpoint: async () => ({ kind: "authenticated_websocket", websocketUrl: "wss://sandbox.invalid/runner",
+            secretHeaders: [], generation: "1", refresh: vi.fn(), close: vi.fn(async () => undefined) }),
+        } as never });
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+        controlPlaneRegistration: NonNullable<import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"]>;
+      };
+      const controller = new DurablePrpControlPlane({ stateDirectory: join(options.stateDirectory!, "control-plane"),
+        identity: options.prpIdentity! as ConstructorParameters<typeof DurablePrpControlPlane>[0]["identity"],
+        expectedRunnerVersion: "rf4-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+      controller.queueCommand("run.prepare", {}); controller.queueCommand("session.open", { reuse: "same_session" });
+      const registration = await options.controlPlaneRegistration(controller);
+      const collectStopped = vi.fn(async () => undefined), retirementFailed = vi.fn(async () => undefined);
+      let checkpointError: unknown;
+      const close = vi.fn(async () => { try { await registration.checkpoint!("settled"); }
+        catch (error) { checkpointError = error; throw error; } });
+      const session = { close };
+      state.execute.mockReset().mockImplementationOnce(async options => { await options.onSession?.(session);
+        taskRunId = next.binding.runId; coordinator.phase = "terminal_failure"; coordinator.leaseOwner = null;
+        return { ...result, terminal: { runTerminalState: "cancelled" } };
+      }).mockImplementationOnce(async () => result);
+      try {
+        await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner",
+          instructionWorkingCopy: { hasChanges: async () => false, collectStopped, retirementFailed } });
+        expect(String(checkpointError)).toContain("native_harness_storage_owner_superseded");
+        expect(validate).toHaveBeenCalled(); expect(backup).not.toHaveBeenCalled();
+        const followUp = { ...next, session: base.session };
+        const attempt = executePaperclipNativeSession({ db: leaseDb(followUp), execution: followUp, runnerInstanceId: "runner", refreshTools: true });
+        await expect(attempt).resolves.toBeDefined();
+        expect(state.execute).toHaveBeenCalledTimes(2);
+      } finally {
+        close.mockResolvedValue(undefined); await closeIdleWarmNativeSessionsForRestart();
+        await registration.release(); await controller.stop();
+      }
+    });
+
     it.each(["contained", "handoff-unconfirmed"] as const)(
       "stops an idle warm owner whose close cannot settle when its environment is deleted (%s)", async mode => {
         const { base } = fixture(`idle-unsettled-${mode}`);
