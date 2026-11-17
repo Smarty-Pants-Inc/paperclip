@@ -26,6 +26,7 @@ import {
   sandboxResumeRefusedForGood,
   sandboxStateTransitionFailure,
 } from "./reusable-sandbox-resume-replacement.js";
+import { assertSandboxNotKeptAfterReplacement } from "./reusable-sandbox-kept-marker.js";
 import { admittedSandboxLeaseConfig, sandboxLeaseIdentityConfig, sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import { HttpError } from "../errors.js";
@@ -2520,17 +2521,20 @@ function createSandboxEnvironmentDriver(
         if (rolloverLease && input.heartbeatRunId) {
           await retireCompatibleConfigurationSource(rolloverLease, recordedLease, input.heartbeatRunId);
         }
+        // The kept box is blocked on its lease with the reason: out of selection,
+        // every sweep and every channel (assertSandboxNotKeptAfterReplacement)
+        // until a person's consented environment delete destroys it.
         if (replacementReason === "identity_mismatch" && reusableLease && input.heartbeatRunId) {
           await keepReplacedReusableSandboxLease({
             db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
-            replacementLeaseId: recordedLease.id,
+            replacementLeaseId: recordedLease.id, reason: "identity_mismatch",
           });
         }
         if (replacementReason === "resume_failed" && reusableLease && input.heartbeatRunId) {
           if (replacementPlan === "keep") {
             await keepReplacedReusableSandboxLease({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
-              replacementLeaseId: recordedLease.id,
+              replacementLeaseId: recordedLease.id, reason: "resume_failed", predecessorRetirementUnproven: replacingUnretiredOwner,
             });
           } else if (input.adapterType !== "paperclip_runner") {
             await retireReplacedReusableSandboxLease({
@@ -5093,6 +5097,9 @@ export function environmentRuntimeService(
     },
 
     async resumeRunLease(input: EnvironmentDriverResumeInput): Promise<PluginEnvironmentLease | EnvironmentLease | null> {
+      // Write fence: a box kept after its chat moved to a new box is never woken,
+      // read or reached again (see assertSandboxNotKeptAfterReplacement).
+      await assertSandboxNotKeptAfterReplacement(db, { lease: input.lease, channel: "resume" });
       if (await legacyShutdownWorkspaceResourceProtected(db, input.lease)) return null;
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.resumeRunLease) {
@@ -5146,6 +5153,7 @@ export function environmentRuntimeService(
     },
 
     async execute(input: EnvironmentDriverExecuteInput): Promise<PluginEnvironmentExecuteResult> {
+      await assertSandboxNotKeptAfterReplacement(db, { lease: input.lease, channel: "execute" });
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.execute) {
         throw new Error(`Environment driver "${driver.driver}" does not support command execution.`);
@@ -5187,6 +5195,7 @@ export function environmentRuntimeService(
     },
 
     async syncOut(input: EnvironmentDriverSyncInput): Promise<PluginEnvironmentSyncResult> {
+      await assertSandboxNotKeptAfterReplacement(db, { lease: input.lease, channel: "sync_out" });
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.syncOut) {
         throw new Error(`Environment driver "${driver.driver}" does not support native file sync.`);
@@ -5197,6 +5206,7 @@ export function environmentRuntimeService(
     async openDuplexChannel(
       input: EnvironmentDriverOpenDuplexChannelInput,
     ): Promise<CommandManagedDuplexChannel> {
+      await assertSandboxNotKeptAfterReplacement(db, { lease: input.lease, channel: "duplex_channel" });
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.openDuplexChannel) {
         throw new Error(`Environment driver "${driver.driver}" does not support duplex channels.`);
@@ -5218,6 +5228,9 @@ export function environmentRuntimeService(
     async getRunnerIngressEndpoint(
       input: EnvironmentDriverRunnerIngressInput,
     ): Promise<RunnerIngressEndpoint> {
+      // Every PRP event, checkpoint, result and tool call from a box arrives on
+      // the ingress connection Paperclip opens here (and on each reconnect).
+      await assertSandboxNotKeptAfterReplacement(db, { lease: input.lease, channel: "runner_ingress" });
       const driver = requireDriverKey(
         getLeaseDriverKey(input.lease, input.environment),
       );

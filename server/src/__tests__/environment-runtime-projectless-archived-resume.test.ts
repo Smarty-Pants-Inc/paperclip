@@ -37,6 +37,9 @@ import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.j
 import { createStorageService } from "../storage/service.js";
 import { findReusableSandboxResumeError, REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION,
   ReusableSandboxBackupUnrestorableError } from "../services/reusable-sandbox-resume-error.js";
+import { ReusableSandboxKeptFencedError } from "../services/reusable-sandbox-kept-marker.js";
+import { stopWarmSandboxesPastWindow } from "../services/warm-sandbox-expiry.js";
+import { releasableRetainedOrphanCondition } from "../services/environment-retained-orphan-settlement.js";
 
 // The original resume-policy cases stub this boundary in beforeEach. The
 // never-OK cases below restore the real verifier and exercise durable storage.
@@ -159,10 +162,11 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
   }
 
   function worker(seeded: Awaited<ReturnType<typeof seed>>, resume: (attempt: number, timeoutMs: number) => Promise<unknown>,
-    options: { acquireFails?: boolean } = {}) {
+    options: { acquireFails?: boolean; destroySucceeds?: boolean } = {}) {
     let attempts = 0;
     const call = vi.fn(async (_pluginId: string, method: string, _params: unknown, timeoutMs?: number) => {
       if (method === "environmentResumeLease") return await resume(++attempts, timeoutMs ?? 0);
+      if (method === "environmentDestroyLease" && options.destroySucceeds) return {};
       if (method === "environmentAcquireLease") {
         if (options.acquireFails) throw new JsonRpcCallError({ code: -32000, message: "create refused" });
         return { providerLeaseId: "bx_new", metadata: { provider: "boat", image: "boat:test", timeoutMs: 300_000, reuseLease: true,
@@ -397,7 +401,101 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
     expect(destroyCalls(call)).toHaveLength(0);
     const kept = await environmentService(db).getLeaseById(seeded.lease.id);
     expect(kept).toMatchObject({ status: "retained", providerLeaseId: BOX, cleanupStatus: null, failureReason: null });
-    expect(kept?.metadata?.reusableSandboxKeptAfterReplacement).toMatchObject({ runId: seeded.runId, replacementLeaseId: acquired.lease.id });
+    expect(kept?.metadata?.reusableSandboxKeptAfterReplacement).toMatchObject({ runId: seeded.runId, replacementLeaseId: acquired.lease.id,
+      reason: "identity_mismatch" });
+  });
+
+  // step 2e (1): the mismatch block is recorded ON THE LEASE with its reason and
+  // nothing automatic clears it: not a sweep tick, not a Retry (the Retry's run
+  // acquires through this same path). Only a person's consented environment
+  // delete (DELETE /api/environments/:id?destroyReusableSandboxLeases=true,
+  // routes/environments.ts) destroys the box and removes the block.
+  it("keeps the mismatch block across a sweep tick and a Retry; only the operator's consented environment delete clears it", async () => {
+    const seeded = await seed();
+    const first = worker(seeded, async () => ({ providerLeaseId: null, metadata: { workspaceSentinel: { result: "mismatched" } } }));
+    const rotated = await acquire(seeded, first.runtime);
+    expect(rotated.lease.providerLeaseId).toBe("bx_new");
+    const blocked = (await environmentService(db).getLeaseById(seeded.lease.id))!;
+    const block = blocked.metadata?.reusableSandboxKeptAfterReplacement;
+    expect(block).toMatchObject({ reason: "identity_mismatch", runId: seeded.runId, replacementLeaseId: rotated.lease.id });
+
+    // The run ends and a sweep tick a year later finds nothing to stop or release.
+    await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, rotated.lease.id));
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, seeded.runId));
+    const later = new Date(Date.now() + 365 * 24 * 60 * 60_000);
+    await stopWarmSandboxesPastWindow(db, later);
+    const releasable = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(releasableRetainedOrphanCondition(later));
+    expect(releasable.map(row => row.id)).not.toContain(seeded.lease.id);
+    await first.runtime.flushDeferredOrphanCleanups();
+    expect(await environmentService(db).getLeaseById(seeded.lease.id)).toMatchObject({ status: "retained", cleanupStatus: null,
+      metadata: expect.objectContaining({ reusableSandboxKeptAfterReplacement: block }) });
+
+    // Retry: the person's Retry starts a run whose acquisition takes this path.
+    const retryRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: retryRunId, companyId: seeded.companyId, agentId: seeded.agentId,
+      invocationSource: "on_demand", status: "running", retryOfRunId: seeded.runId });
+    const retry = worker(seeded, async () => ({ providerLeaseId: "bx_new", metadata: { remoteCwd: "/home/boat/paperclip-workspace" } }));
+    const retried = await retry.runtime.acquireRunLease({ companyId: seeded.companyId, environment: seeded.environment,
+      issueId: seeded.issueId, agentId: seeded.agentId, adapterType: "paperclip_runner", heartbeatRunId: retryRunId,
+      persistedExecutionWorkspace: null });
+    expect(retried.lease.providerLeaseId).toBe("bx_new");
+    expect(retry.call.mock.calls.filter(([, , params]) => JSON.stringify(params ?? null).includes(`"providerLeaseId":"${BOX}"`))).toEqual([]);
+    expect(await environmentService(db).getLeaseById(seeded.lease.id)).toMatchObject({ status: "retained", cleanupStatus: null,
+      metadata: expect.objectContaining({ reusableSandboxKeptAfterReplacement: block }) });
+
+    // The operator action: the consented environment delete's teardown.
+    await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, retried.lease.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, retryRunId));
+    const operator = worker(seeded, async () => { throw new Error("no resume"); }, { destroySucceeds: true });
+    const torn = await operator.runtime.destroyReusableSandboxLeasesForEnvironment({ environmentId: seeded.environment.id,
+      failureReason: "environment_deleted", consentedBy: "operator-user" });
+    expect(torn.skippedLiveRun).toBe(0);
+    expect(destroyCalls(operator.call).map(([, , params]) => (params as { providerLeaseId?: string }).providerLeaseId)).toContain(BOX);
+    const cleared = await environmentService(db).getLeaseById(seeded.lease.id);
+    expect(cleared?.metadata?.reusableSandboxKeptAfterReplacement).toBeUndefined();
+    expect(cleared?.status).not.toBe("retained");
+  });
+
+  // step 2e (2): the write fence. A Runner may survive on the kept box (Boat:
+  // a resume within ~10 minutes may return the same machine "with memory and
+  // programs"). Paperclip refuses every channel to it by lease identity, even
+  // through a stale lease object an older controller still holds, and records
+  // each refusal on the kept lease. The provider is never called for it.
+  it("refuses and records every write, callback and checkpoint channel from the kept box after the switch", async () => {
+    const seeded = await seed();
+    const first = worker(seeded, async () => { throw boatRefusal(410, "snapshot_data_expired"); });
+    const rotated = await acquire(seeded, first.runtime);
+    expect(rotated.lease.providerLeaseId).toBe("bx_new");
+    const switchedAt = first.call.mock.calls.length;
+    const staleKeptLease = seeded.lease; // read before the switch: carries no block
+    expect(staleKeptLease.metadata?.reusableSandboxKeptAfterReplacement).toBeUndefined();
+    const { environment } = seeded;
+    const channels: Array<[string, () => Promise<unknown>]> = [
+      ["runner_ingress", () => first.runtime.getRunnerIngressEndpoint({ environment, lease: staleKeptLease, port: 7777, path: "/api/runner/v1/connect/x" })],
+      ["duplex_channel", () => first.runtime.openDuplexChannel({ environment, lease: staleKeptLease, command: ["paperclip-callback-bridge"] })],
+      ["execute", () => first.runtime.execute({ environment, lease: staleKeptLease, command: "true" })],
+      ["sync_out", () => first.runtime.syncOut({ environment, lease: staleKeptLease, operations: [] })],
+      ["resume", () => first.runtime.resumeRunLease({ environment, lease: staleKeptLease })],
+    ];
+    const refusals: unknown[] = [];
+    for (const [, open] of channels) refusals.push(await open().then(() => null, (error: unknown) => error));
+    // Nothing reached the provider for the kept box after the switch.
+    expect(first.call.mock.calls.slice(switchedAt).map(([, method]) => method)).toEqual([]);
+    channels.forEach(([channel], index) => {
+      expect(refusals[index]).toMatchObject({ code: "reusable_sandbox_kept_fenced", providerLeaseId: BOX, channel });
+      expect(refusals[index]).toBeInstanceOf(ReusableSandboxKeptFencedError);
+    });
+    const kept = await environmentService(db).getLeaseById(seeded.lease.id);
+    expect(kept).toMatchObject({ status: "retained", providerLeaseId: BOX, cleanupStatus: null });
+    expect(kept?.metadata?.reusableSandboxKeptAfterReplacement).toMatchObject({ reason: "resume_failed",
+      replacementLeaseId: rotated.lease.id, fenceRefusals: channels.length, lastFenceRefusal: { channel: "resume" } });
+
+    // The new box is not fenced: its channel goes on to the provider checks.
+    const own = await first.runtime.getRunnerIngressEndpoint({ environment, lease: rotated.lease, port: 7777,
+      path: "/api/runner/v1/connect/x" }).then(() => null, (error: unknown) => error);
+    expect(own).not.toBeInstanceOf(ReusableSandboxKeptFencedError);
+    const after = await environmentService(db).getLeaseById(rotated.lease.id);
+    expect(after?.metadata?.reusableSandboxKeptAfterReplacement).toBeUndefined();
   });
 
   // B fix (iv): the kept old box has a selection fence, not a provider write

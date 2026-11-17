@@ -12,7 +12,8 @@ import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
 import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import { nativeHarnessBackupHasLaterProviderWork } from "./native-runtime/native-retired-backup-source.js";
 import { sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
-import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
+import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY, type ReusableSandboxKeptMarker,
+  type ReusableSandboxKeptReason } from "./reusable-sandbox-kept-marker.js";
 import { nativeHarnessBackupFailureReason, ReusableSandboxBackupUnrestorableError,
   type ReusableSandboxBackupFailure } from "./reusable-sandbox-resume-error.js";
 
@@ -280,19 +281,29 @@ export async function retireReplacedReusableSandboxLease(input: {
   return Boolean(claimed);
 }
 
+/**
+ * Block the kept box on its lease, with the reason. The block keeps it out of
+ * selection, every sweep and every channel (`assertSandboxNotKeptAfterReplacement`)
+ * until a person's consented environment delete destroys it; see
+ * `ReusableSandboxKeptMarker`.
+ */
 export async function keepReplacedReusableSandboxLease(input: {
   db: Db;
   lease: EnvironmentLease;
   companyId: string;
   heartbeatRunId: string;
   replacementLeaseId: string;
+  reason: ReusableSandboxKeptReason;
+  predecessorRetirementUnproven?: boolean;
 }): Promise<boolean> {
   const { db, lease } = input;
   if (!lease.providerLeaseId) return false;
   const now = new Date();
-  const marker = { [REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY]: {
+  const block: ReusableSandboxKeptMarker = {
     runId: input.heartbeatRunId, replacementLeaseId: input.replacementLeaseId, recordedAt: now.toISOString(),
-  } };
+    reason: input.reason, ...(input.predecessorRetirementUnproven ? { predecessorRetirementUnproven: true as const } : {}),
+  };
+  const marker = { [REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY]: block };
   const [kept] = await db.update(environmentLeases).set({
     metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify(marker)}::jsonb`,
     updatedAt: now,
