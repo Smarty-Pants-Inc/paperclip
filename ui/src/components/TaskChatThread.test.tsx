@@ -2270,6 +2270,37 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(marker?.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
   });
 
+  // restore-card3: the run marker reads the server's owed fact, not the raw
+  // workspaceRestoreFailure value: owed files say recovering, never failed.
+  it.each([true, false])("labels a restore_failed run by the owed fact (pending=%s)", (pending) => {
+    renderThread({
+      issueId: "issue-1",
+      comments: [],
+      onAdd: async () => {},
+      issueStatus: "blocked",
+      onRetryFailedRun: vi.fn(),
+      linkedRuns: [{
+        runId: "owed-run", runtimeMode: "legacy", status: "failed", errorCode: "setup_failed",
+        agentId: "agent-1", agentName: "Runner", adapterType: "grok_local",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z", finishedAt: "2026-08-25T18:00:02.000Z",
+        resultJson: { workspaceRestoreFailure: "restore_failed", ...(pending ? { workspaceRestorePending: true } : {}) },
+      }],
+    });
+    const marker = container.querySelector('[data-testid="task-chat-collapsible-marker"]');
+    expect(marker).not.toBeNull();
+    flushSync(() => marker!.querySelector<HTMLButtonElement>('button[aria-expanded]')!.click());
+    if (pending) {
+      expect(marker?.textContent).toContain("Recovering saved work");
+      expect(marker?.textContent).toContain("Recovering your saved work");
+      expect(marker?.textContent?.toLowerCase()).not.toContain("failed");
+      expect(marker?.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+    } else {
+      expect(marker?.textContent).toContain("Workspace restore failed");
+      expect(marker?.textContent).toContain("Workspace files need recovery");
+      expect(marker?.textContent).not.toContain("Recovering");
+    }
+  });
+
   it("uses neutral wording for an unclassified historical legacy failure", () => {
     renderThread({
       comments: [],
