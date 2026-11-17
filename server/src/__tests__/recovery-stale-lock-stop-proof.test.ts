@@ -793,4 +793,49 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       const { cards } = await onePass(f);
       expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
     });
+
+  // Keep reason: adopt-h6-xred3 rf-3 must-fix 1 (smarty-dev#20787). The shared
+  // retainedWarmHandoffLease bound the lease to this run/company and the markers
+  // to this run, but never compared the LEASE's issue with the run's issue: a
+  // lease of another issue (or with no issue), otherwise valid, passed BOTH H6's
+  // card proof and the Send gate. The only producer (environment-runtime.ts
+  // acquisition, issueId: input.issueId) always writes the run's task issue for
+  // a remote warm box (workspace-preparation.ts: remote storage requires a task).
+  it.each(["active", "retained"] as const)("XRED negative other_issue_lease (%s): another issue's lease, otherwise valid, is refused by H6's proof and the Send gate", async state => {
+    const f = await crossUnitFixture();
+    if (state === "retained") await release(f);
+    const otherIssueId = randomUUID();
+    await db.insert(issues).values({ id: otherIssueId, companyId: f.companyId, title: "Another task", status: "in_progress" });
+    await db.update(environmentLeases).set({ issueId: otherIssueId }).where(eq(environmentLeases.id, f.lease.id));
+    const r = await bothCallers(f);
+    expect(r.lease).toMatchObject({ issueId: otherIssueId, companyId: f.companyId, heartbeatRunId: f.runId, releasedAt: null });
+    expect({ h6: r.h6, send: r.send }).toEqual({ h6: false, send: false });
+    const { cards } = await onePass(f);
+    expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+  });
+
+  it("XRED negative null_issue_lease: a lease with no issue, otherwise valid, is refused by H6's proof and the Send gate", async () => {
+    const f = await crossUnitFixture();
+    await release(f);
+    await db.update(environmentLeases).set({ issueId: null }).where(eq(environmentLeases.id, f.lease.id));
+    const r = await bothCallers(f);
+    expect(r.lease).toMatchObject({ issueId: null, status: "retained", cleanupStatus: "success" });
+    expect({ h6: r.h6, send: r.send }).toEqual({ h6: false, send: false });
+  });
+
+  // Keep reason: adopt-h6-xred3 rf-3 must-fix 2. 01ad8f4e widened H6's accepted
+  // lease policies to reuse_by_execution_workspace, but no warm Stop produces
+  // one: the warm acquisition writes reuse_by_environment
+  // (environment-runtime.ts:4059) and the keep_running release accepts only
+  // that policy (:4724) and throws for any other (:4747-4752). H6 must refuse it.
+  it.each(["active", "retained"] as const)("XRED negative reuse_by_execution_workspace (%s): H6's card proof refuses it even with valid markers", async state => {
+    const f = await crossUnitFixture();
+    if (state === "retained") await release(f);
+    await db.update(environmentLeases).set({ leasePolicy: "reuse_by_execution_workspace" }).where(eq(environmentLeases.id, f.lease.id));
+    const r = await bothCallers(f);
+    expect(r.lease).toMatchObject({ leasePolicy: "reuse_by_execution_workspace", issueId: f.issueId, releasedAt: null });
+    expect(r.h6).toBe(false);
+    const { cards } = await onePass(f);
+    expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+  });
 });
