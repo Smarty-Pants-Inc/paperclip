@@ -1207,13 +1207,61 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     // The live row 8757f468: the SAME note (created while paused) now carries
     // the resend text, Source run = the pause's stop, Failure code
     // unclassified_failure (agent_paused is not a shown code).
-    expect(after[0]!.body).not.toBe(NOT_ANSWERED);
+    expect(after[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
+    expect(after[0]!.presentation).toMatchObject({ title: "Managed Pi was paused before it answered" });
     expect(codeOf(after[0]!)).not.toBe("unclassified_failure");
+    expect(rowsOf(after[0]!).some(row => row.label === "Failure code")).toBe(false);
+    expect(JSON.stringify(after[0])).not.toContain("if it fails again");
+  });
+
+  it("pause-stop guard: a later failed carrying attempt keeps its own failure, not the predecessor's pause", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "cancelled", errorCode: "agent_paused" });
+    await pause(f);
+    await f.sweep();
+    await resume(f);
+    await f.run({ commentId, status: "failed", error: "provider_process_exited: exit 1", errorCode: "adapter_failed" });
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices.map(n => n.body)).toEqual([NOT_ANSWERED]);
+    expect(codeOf(notices[0]!)).toBe("provider_process_exited");
+  });
+
+  it.each([false, true])("pause-stop guard: an answer %s after the resumed stop note supersedes it", async afterNotice => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const stopped = await f.run({ commentId, status: "cancelled", errorCode: "agent_paused" });
+    await pause(f);
+    await f.sweep();
+    await resume(f);
+    if (afterNotice) {
+      await f.sweep();
+      expect((await f.visible())[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
+    }
+    await f.reply(stopped);
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+  });
+
+  it("pause-stop guard: another agent's pause cannot replace the assignee's true failure notice", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "failed", error: "provider_process_exited: exit 1", errorCode: "adapter_failed" });
+    const otherId = randomUUID();
+    await db.insert(agents).values({ id: otherId, companyId: f.companyId, name: "Other agent" });
+    const unrelated = await f.run({ commentId, status: "cancelled", errorCode: "agent_paused" });
+    await db.update(heartbeatRuns).set({ agentId: otherId }).where(eq(heartbeatRuns.id, unrelated));
+    // Exercise this message's classifier, not the other agent's assigned-work recovery.
+    await settleAt(f, 0);
+    const notices = await f.visible();
+    expect(notices.map(n => n.body)).toEqual([NOT_ANSWERED]);
+    expect(codeOf(notices[0]!)).toBe("provider_process_exited");
   });
 
   // The guard: a run that FAILED on an agent that is not paused keeps its true
-  // notice (the resend text, its own failure code), and a run cancelled for a
-  // pause after the agent is resumed is not treated as paused either.
+  // notice (the resend text and its own failure code), unlike an intentional pause stop.
   it("guard: a failed (not paused) run on an active agent keeps its true resend notice", async () => {
     const f = await fixture();
     const commentId = await f.message("Please continue.");
