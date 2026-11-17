@@ -2007,6 +2007,23 @@ fn preserve_bounded_display_content(
         validate_question_set,
     };
 
+    // Live answer/reasoning deltas are text, not diagnostic previews. Restore
+    // only their text after generic sanitization; tool output and every other
+    // field keep today's bounds. Oversized records still hit the frame guard.
+    if event_type == "item.delta"
+        && matches!(
+            original.get("kind").and_then(Value::as_str),
+            Some("agentMessage" | "reasoning")
+        )
+    {
+        if let (Some(text), Some(target)) = (
+            original.get("text").and_then(Value::as_str),
+            sanitized.get_mut("text"),
+        ) {
+            *target = Value::String(redact_sensitive_text_values(text));
+        }
+    }
+
     // Rich display payloads are already closed and byte-bounded by their exact
     // protocol schemas. Applying a diagnostic preview cap again would silently
     // change complete output into a truncated artifact without its metadata.
@@ -4945,6 +4962,108 @@ mod tests {
         );
         assert!(payload.get("fullText").is_none());
         let _ = std::fs::remove_dir_all(&frame.state_dir);
+    }
+
+    // Keep reason: Paul NOTE 5; test the provider -> durable outbox boundary
+    // that supplies the server, not just the already-correct completed answer.
+    #[test]
+    fn dl_n5_delta_agent_message_reaches_server_bound_record_whole() {
+        assert_pi_delta_reaches_outbox_whole("item/agentMessage/delta", "agentMessage");
+    }
+
+    #[test]
+    fn dl_n5_delta_reasoning_reaches_server_bound_record_whole() {
+        assert_pi_delta_reaches_outbox_whole("item/delta", "reasoning");
+    }
+
+    fn assert_pi_delta_reaches_outbox_whole(method: &str, kind: &str) {
+        let text = "x".repeat(6_000);
+        let events = crate::provider_events::normalize_pi_notification_in(
+            method,
+            &json!({"threadId": "native", "turnId": "turn", "itemId": "stream",
+                "kind": kind, "text": text, "delta": text,
+                "item": {"id": "stream", "type": kind, "text": text}}),
+            None,
+        );
+        assert_eq!(events.len(), 1, "{method} must not disappear");
+        let frame = config(PathBuf::from("unused"));
+        let mut state = DurableState::new(&frame);
+        for event in events {
+            state
+                .enqueue_event(&frame, event.event_type, event.priority, event.payload)
+                .unwrap();
+        }
+        assert_eq!(state.outbox.len(), 1);
+        let envelope = &state.outbox[0].envelope;
+        assert_eq!(
+            envelope.pointer("/payload/payload/text").unwrap(),
+            &json!(text)
+        );
+        assert!(!envelope.to_string().contains("…[truncated]"));
+    }
+
+    // Isolate the second cut: normalization must not mask outbox truncation.
+    #[test]
+    fn dl_n5_delta_agent_message_outbox_does_not_cut_text() {
+        assert_delta_outbox_preserves_text("agentMessage");
+    }
+
+    #[test]
+    fn dl_n5_delta_reasoning_outbox_does_not_cut_text() {
+        assert_delta_outbox_preserves_text("reasoning");
+    }
+
+    fn assert_delta_outbox_preserves_text(kind: &str) {
+        let mut frame = config(PathBuf::from("unused"));
+        frame.max_outbox_bytes = 128 * 1024;
+        let mut state = DurableState::new(&frame);
+        // Include multibyte/JSON-escaped text and a secret after the old cut.
+        let text: String = "é\"\n".repeat(2_000);
+        assert_eq!(text.chars().count(), 6_000);
+        let raw = format!("{text} token=delta-secret");
+        state
+            .enqueue_event(
+                &frame,
+                "item.delta",
+                EventPriority::P2,
+                json!({"kind": kind, "text": raw, "diagnostic": "x".repeat(6_000)}),
+            )
+            .unwrap();
+        let envelope = &state.outbox[0].envelope;
+        assert_eq!(
+            envelope.pointer("/payload/payload/text").unwrap(),
+            &json!(format!("{text} token=[REDACTED]"))
+        );
+        assert!(!envelope.to_string().contains("delta-secret"));
+        // Only TEXT is exempt, not arbitrary diagnostic fields on the item.
+        assert_eq!(
+            envelope.pointer("/payload/payload/diagnostic").unwrap(),
+            &json!(format!("{}…[truncated]", "x".repeat(4_096)))
+        );
+    }
+
+    #[test]
+    fn dl_n5_delta_tool_output_keeps_existing_preview_bound() {
+        let frame = config(PathBuf::from("unused"));
+        let mut state = DurableState::new(&frame);
+        state
+            .enqueue_event(
+                &frame,
+                "item.delta",
+                EventPriority::P2,
+                json!({"kind": "commandExecution", "text": "x".repeat(6_000),
+                "output": "x".repeat(6_000)}),
+            )
+            .unwrap();
+        for field in ["text", "output"] {
+            assert_eq!(
+                state.outbox[0]
+                    .envelope
+                    .pointer(&format!("/payload/payload/{field}"))
+                    .unwrap(),
+                &json!(format!("{}…[truncated]", "x".repeat(4_096)))
+            );
+        }
     }
 
     #[test]
