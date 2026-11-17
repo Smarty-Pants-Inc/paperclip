@@ -419,6 +419,7 @@ describe("IssuesList", () => {
   });
 
   it("waits for the initial tree but keeps loaded rows visible while new ancestors load", async () => {
+    localStorage.setItem("paperclip:test-issues:company-1", JSON.stringify({ hideAgentCreatedTasks: true, hideAgentCreatedTasksExplicit: true }));
     const first = createIssue({ id: "child-one", parentId: "parent-one", title: "First nested task" });
     const second = createIssue({ id: "child-two", parentId: "parent-two", title: "Second nested task" });
     let resolveAncestors: (rows: Issue[]) => void = () => undefined;
@@ -909,6 +910,7 @@ describe("IssuesList", () => {
   });
 
   it("offers hierarchy retry after a reachable first-read 429 while keeping matching tasks", async () => {
+    localStorage.setItem("paperclip:test-tree:company-1", JSON.stringify({ hideAgentCreatedTasks: true, hideAgentCreatedTasksExplicit: true }));
     const parent = createIssue({ id: "human-root", title: "Readable root task", createdByUserId: "person" });
     let failed = true;
     mockIssuesApi.list.mockImplementation(async (_company, filters) => {
@@ -1821,13 +1823,13 @@ describe("IssuesList", () => {
         displayStatus: "backlog",
         limit: 200,
         includeRoutineExecutions: true,
-        includeAgentCreatedTasks: false,
+        includeAgentCreatedTasks: true,
       }), { signal: expect.any(AbortSignal) });
       expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", expect.objectContaining({
         displayStatus: "done",
         limit: 200,
         includeRoutineExecutions: true,
-        includeAgentCreatedTasks: false,
+        includeAgentCreatedTasks: true,
       }), { signal: expect.any(AbortSignal) });
       expect(mockKanbanBoard).toHaveBeenLastCalledWith(expect.objectContaining({
         issues: expect.arrayContaining([
@@ -2021,6 +2023,7 @@ describe("IssuesList", () => {
 
   it.each([true, false])("retains loaded context while revealing a large automated tree (streamlined=%s)", async (streamlined) => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
+    localStorage.setItem("paperclip:test-tree:company-1", JSON.stringify({ hideAgentCreatedTasks: true, hideAgentCreatedTasksExplicit: true }));
     const parent = createIssue({ id: "human-root", createdByUserId: "person", originKind: "manual" });
     const children = Array.from({ length: 250 }, (_, index) => createIssue({
       id: `automated-child-${index}`, title: `Automated child ${index}`,
@@ -2587,7 +2590,7 @@ describe("IssuesList", () => {
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Manual issue");
-      expect(container.textContent).not.toContain("Routine issue");
+      expect(container.textContent).toContain("Routine issue");
     });
 
     await act(async () => {
@@ -2600,33 +2603,33 @@ describe("IssuesList", () => {
 
     await waitForAssertion(() => {
       const toggle = Array.from(document.body.querySelectorAll("label")).find(
-        (label) => label.textContent?.includes("Show agent-created tasks"),
+        (label) => label.textContent?.includes("Hide agent-created tasks"),
       );
       expect(toggle).not.toBeUndefined();
     });
 
     await act(async () => {
       const toggle = Array.from(document.body.querySelectorAll("label")).find(
-        (label) => label.textContent?.includes("Show agent-created tasks"),
+        (label) => label.textContent?.includes("Hide agent-created tasks"),
       );
       toggle?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
     });
 
     await waitForAssertion(() => {
-      expect(container.textContent).toContain("Routine issue");
-      expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("true");
+      expect(container.textContent).not.toContain("Routine issue");
+      expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("false");
     });
     const preferenceKey = taskCollectionPreferencesStorageKey({ companyId: "company-1", collectionKey: "paperclip:test-issues" });
     const envelope = JSON.parse(localStorage.getItem(preferenceKey)!);
     await act(async () => {
-      localStorage.setItem(preferenceKey, JSON.stringify({ ...envelope, viewState: { ...envelope.viewState, showAgentCreatedTasks: false } }));
+      localStorage.setItem(preferenceKey, JSON.stringify({ ...envelope, viewState: { ...envelope.viewState, hideAgentCreatedTasks: false } }));
       window.dispatchEvent(new StorageEvent("storage", { key: preferenceKey }));
     });
     await waitForAssertion(() => {
-      expect(container.textContent).not.toContain("Routine issue");
-      expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("false");
-      const label = Array.from(document.body.querySelectorAll("label")).find((element) => element.textContent?.includes("Show agent-created tasks"));
+      expect(container.textContent).toContain("Routine issue");
+      expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("true");
+      const label = Array.from(document.body.querySelectorAll("label")).find((element) => element.textContent?.includes("Hide agent-created tasks"));
       const checkbox = label?.querySelector("[role='checkbox'], input[type='checkbox']");
       expect(checkbox).not.toBeNull();
       expect(checkbox instanceof HTMLInputElement ? checkbox.checked : checkbox?.getAttribute("aria-checked") === "true").toBe(false);
@@ -2634,14 +2637,14 @@ describe("IssuesList", () => {
     act(() => root.unmount());
   });
 
-  it("defaults the agent-created filter to the instance setting, keeps an explicit toggle, and clears back to the setting", async () => {
-    mockInstanceSettingsApi.getGeneral.mockResolvedValue({ censorUsernameInLogs: false, taskListsShowAgentCreatedByDefault: true });
+  it.each([true, false])("migrates the old preference, saves Hide and clears back to the shown default (streamlined=%s)", async streamlined => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
     const collectionKey = "paperclip:test-agent-default";
     const preferenceKey = taskCollectionPreferencesStorageKey({ companyId: "company-1", collectionKey });
-    // Written by a build before the setting existed: its false is no choice.
+    // Even an explicit false saved by the retired Show control is reset.
     localStorage.setItem(preferenceKey, JSON.stringify({
       version: 1, companyId: "company-1", collectionKey, viewStateSource: "stored", columns: ["id"],
-      viewState: { showAgentCreatedTasks: false, boardCardDensity: "compact" },
+      viewState: { showAgentCreatedTasks: false, showAgentCreatedTasksExplicit: true, boardCardDensity: "compact" },
     }));
     function PreferenceProbe() {
       return <span data-testid="creation-preference">{String(useShowAgentCreatedTasks("company-1", collectionKey))}</span>;
@@ -2656,7 +2659,7 @@ describe("IssuesList", () => {
       container,
     );
     const checkboxState = () => {
-      const label = Array.from(document.body.querySelectorAll("label")).find((element) => element.textContent?.includes("Show agent-created tasks"));
+      const label = Array.from(document.body.querySelectorAll("label")).find((element) => element.textContent?.includes("Hide agent-created tasks"));
       const checkbox = label?.querySelector("[role='checkbox'], input[type='checkbox']");
       return checkbox instanceof HTMLInputElement ? checkbox.checked : checkbox?.getAttribute("aria-checked") === "true";
     };
@@ -2671,20 +2674,21 @@ describe("IssuesList", () => {
       // On by default is not an active filter.
       expect(filterButton()?.title).toBe("Filter");
       await act(async () => { filterButton()!.click(); await Promise.resolve(); });
-      await waitForAssertion(() => expect(checkboxState()).toBe(true));
+      await waitForAssertion(() => expect(checkboxState()).toBe(false));
 
       await act(async () => {
-        Array.from(document.body.querySelectorAll("label")).find((label) => label.textContent?.includes("Show agent-created tasks"))!
+        Array.from(document.body.querySelectorAll("label")).find((label) => label.textContent?.includes("Hide agent-created tasks"))!
           .dispatchEvent(new MouseEvent("click", { bubbles: true }));
         await Promise.resolve();
       });
       await waitForAssertion(() => {
         expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("false");
         expect(container.textContent).not.toContain("Agent task");
-        expect(checkboxState()).toBe(false);
+        expect(checkboxState()).toBe(true);
       });
       const saved = JSON.parse(localStorage.getItem(preferenceKey)!);
-      expect(saved.viewState).toMatchObject({ showAgentCreatedTasks: false, showAgentCreatedTasksExplicit: true, boardCardDensity: "compact" });
+      expect(saved.viewState).toMatchObject({ hideAgentCreatedTasks: true, hideAgentCreatedTasksExplicit: true, boardCardDensity: "compact" });
+      expect(saved.viewState.showAgentCreatedTasks).toBeUndefined();
 
       await act(async () => {
         Array.from(document.body.querySelectorAll("button")).find((button) => button.textContent === "Clear")!.click();
@@ -2694,10 +2698,50 @@ describe("IssuesList", () => {
         expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("true");
         expect(container.textContent).toContain("Agent task");
       });
-      expect(JSON.parse(localStorage.getItem(preferenceKey)!).viewState.showAgentCreatedTasksExplicit).not.toBe(true);
+      expect(JSON.parse(localStorage.getItem(preferenceKey)!).viewState.hideAgentCreatedTasksExplicit).not.toBe(true);
     } finally {
       act(() => root.unmount());
       queryClient.clear();
+    }
+  });
+
+  it.each([[true, 1280], [false, 1280], [true, 390], [false, 390]])("shows agent tasks by default, hides on request and clears (streamlined=%s, width=%s)", async (streamlined, width) => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
+    const previousWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    const manual = createIssue({ id: "person-task", title: "Person work", createdByUserId: "person" });
+    const agent = createIssue({ id: "agent-task", title: "Agent work", createdByAgentId: "agent" });
+    const { root, queryClient } = renderWithQueryClient(<IssuesList
+      issues={[manual, agent]} agents={[]} projects={[]} viewStateKey="note3-default"
+      enableAgentCreatedVisibilityFilter onUpdateIssue={() => undefined}
+    />, container);
+    const filterButton = () => [...document.body.querySelectorAll("button")].find(button =>
+      button.title === "Filter" || button.title.startsWith("Filters:") || button.textContent?.includes("Filters:"));
+    const checkbox = () => [...document.body.querySelectorAll("label")].find(label => label.textContent === "Hide agent-created tasks")
+      ?.querySelector<HTMLElement>('[role="checkbox"], input[type="checkbox"]');
+    try {
+      await waitForAssertion(() => expect(container.textContent).toContain("Agent work"));
+      await act(async () => { filterButton()!.click(); });
+      await waitForAssertion(() => expect(checkbox()?.getAttribute("aria-checked")).toBe("false"));
+      await act(async () => { checkbox()!.click(); });
+      await waitForAssertion(() => {
+        expect(container.textContent).not.toContain("Agent work");
+        expect(container.textContent).toContain("Person work");
+      });
+      // Classic remounts the toolbar while the hidden-mode hierarchy loads.
+      // Reopen only after the list settles, then inspect the saved control.
+      if (!checkbox()) await act(async () => { filterButton()!.click(); });
+      await waitForAssertion(() => expect(checkbox()?.getAttribute("aria-checked")).toBe("true"));
+      const stored = JSON.parse(localStorage.getItem(taskCollectionPreferencesStorageKey({ companyId: "company-1", collectionKey: "note3-default" }))!);
+      expect(stored.viewState.hideAgentCreatedTasks).toBe(true);
+      expect(stored.viewState.showAgentCreatedTasks).toBeUndefined();
+      await act(async () => { [...document.body.querySelectorAll("button")].find(button => button.textContent === "Clear")!.click(); });
+      await waitForAssertion(() => expect(container.textContent).toContain("Agent work"));
+      if (!checkbox()) await act(async () => { filterButton()!.click(); });
+      await waitForAssertion(() => expect(checkbox()?.getAttribute("aria-checked")).toBe("false"));
+    } finally {
+      act(() => root.unmount()); queryClient.clear();
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: previousWidth });
     }
   });
 
