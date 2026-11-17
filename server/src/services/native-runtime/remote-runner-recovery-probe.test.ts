@@ -67,6 +67,15 @@ it("shares the remaining deadline across timed-out reads", async () => {
   await vi.runAllTimersAsync();
   expect(await result).toEqual({ stage: "identity_marker", reason: "probe_timeout" });
   expect(execute.mock.calls.map(([request]) => request.timeoutMs)).toEqual([10_000, 4_750]);
+  expect(execute.mock.calls.map(([request]) => request.commandTimeoutMs)).toEqual([10_000, 4_750]);
+});
+
+it.each([0, 2_000])("caps the command abort allowance at the smaller existing deadline (%s)", async commandTimeoutMs => {
+  const execute = vi.fn().mockResolvedValue({ ...timeout, timedOut: false, exitCode: 0 });
+  await readRemoteRunnerRecoveryProbe({ runner: { execute }, request: { command: "sh", commandTimeoutMs },
+    stage: "process_verification", readOnly: true, deadline: Date.now() + 6_000 });
+  expect(execute.mock.calls[0]![0].commandTimeoutMs).toBeGreaterThan(0);
+  expect(execute.mock.calls[0]![0].commandTimeoutMs).toBeLessThanOrEqual(commandTimeoutMs || 6_000);
 });
 
 it("never retries a signal when its acknowledgement is lost", async () => {
