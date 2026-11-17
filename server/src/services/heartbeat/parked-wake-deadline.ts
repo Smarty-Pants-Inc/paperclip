@@ -22,13 +22,38 @@ import { PENDING_WAIT_BOUND_MS, UNANSWERED_MESSAGE_NO_RUN_CODE, UNANSWERED_MESSA
  * A new press (the queue's Send, which is the note's Retry) writes a newer
  * queuedCommentInterrupt.requestedAt: that is a new park with a fresh anchor.
  *
- * A wake that carries payload.executionWait is NOT a silent park: its resume
- * was refused into a named wait (paused agent, budget, ...), which waits for
- * its eligibility commit and may rightly last hours. It has no anchor, no
- * deadline, no re-arm and no note; the scan's rewrite drops any anchor it
- * held, so a park that resumes after the wait anchors afresh.
+ * S124c (RFL ruling): only a NAMED wait the PERSON controls may stay
+ * unbounded, because its true reason and action are on screen and only the
+ * person ends it. That is an explicit allowlist (PERSON_CONTROLLED_WAIT_REASONS).
+ * Such a wake has no anchor, no deadline, no re-arm and no note; the scan's
+ * rewrite drops any anchor it held, so a park that resumes after the wait
+ * anchors afresh. Every OTHER executionWait on a parked Send (interrupt_handoff,
+ * remote_cleanup, cleanup_pending, controller_settling, execution_recovery, ...)
+ * is the silent loop S124 bounds: first-park anchor, 30 s cadence, ONE note.
  */
 export const PARKED_WAKE_RETRY_MS = 30_000;
+
+/**
+ * The executionWait reasons the person controls, by writer:
+ * - "agent.not_invokable": the person's own agent pause (heartbeat/queue.ts
+ *   enqueueWakeup invokability refusal, saveDeferredMessage/writeSkippedRequest).
+ * - "budget.blocked": a budget limit (heartbeat/queue.ts budget refusal, same writers).
+ * Nothing else: a wait the person cannot end is never left silent.
+ */
+export const PERSON_CONTROLLED_WAIT_REASONS = ["agent.not_invokable", "budget.blocked"] as const;
+
+/** The wake waits on a person-controlled named wait (unbounded by S124). */
+export function personControlledWait(payload: Payload) {
+  const wait = payload?.executionWait;
+  if (!wait || typeof wait !== "object" || Array.isArray(wait)) return false;
+  return (PERSON_CONTROLLED_WAIT_REASONS as readonly string[]).includes(String((wait as Record<string, unknown>).reason ?? ""));
+}
+
+/** SQL twin of personControlledWait over a wake payload column. */
+export function personControlledWaitSql(payload: SQLWrapper) {
+  return sql<boolean>`(coalesce(${payload}->'executionWait'->>'reason', '') in (${sql.join(
+    PERSON_CONTROLLED_WAIT_REASONS.map(reason => sql`${reason}`), sql`, `)}))`;
+}
 /** Read at call time (no module-init read across the import graph). */
 export function parkedWakeDeadlineMs() { return PENDING_WAIT_BOUND_MS; }
 
@@ -44,7 +69,7 @@ function pressedAt(payload: Payload): number | null {
 /** The current park's anchor (ms), or null when it has none yet or the stored
  * one belongs to an earlier press. */
 export function parkedWakeAnchor(payload: Payload): number | null {
-  if (!payload?.queuedCommentInterrupt || payload.executionWait) return null;
+  if (!payload?.queuedCommentInterrupt || personControlledWait(payload)) return null;
   const anchor = Date.parse(String(payload.firstParkedAt ?? ""));
   if (!Number.isFinite(anchor)) return null;
   const press = pressedAt(payload);
@@ -58,7 +83,7 @@ export function parkedWakeNoticed(payload: Payload) {
 
 /** SQL twin of parkedWakeNoticed over a wake payload column. */
 export function parkedWakeNoticedSql(payload: SQLWrapper) {
-  return sql<boolean>`(${payload}->'queuedCommentInterrupt' is not null and ${payload}->'executionWait' is null
+  return sql<boolean>`(${payload}->'queuedCommentInterrupt' is not null and not ${personControlledWaitSql(payload)}
     and ${payload}->>'parkedNoticeAt' is not null and ${payload}->>'firstParkedAt' is not null
     and coalesce(${payload}->'queuedCommentInterrupt'->>'requestedAt', '') <= ${payload}->>'firstParkedAt')`;
 }
@@ -67,7 +92,7 @@ export function parkedWakeNoticedSql(payload: SQLWrapper) {
  * than the bound). The periodic re-dispatch scan skips it: the receipt worker
  * writes the one note instead of another silent retry. */
 export function parkedWakeExpiredSql(payload: SQLWrapper, now = Date.now()) {
-  return sql<boolean>`(${payload}->'queuedCommentInterrupt' is not null and ${payload}->'executionWait' is null
+  return sql<boolean>`(${payload}->'queuedCommentInterrupt' is not null and not ${personControlledWaitSql(payload)}
     and ${payload}->>'firstParkedAt' is not null
     and coalesce(${payload}->'queuedCommentInterrupt'->>'requestedAt', '') <= ${payload}->>'firstParkedAt'
     and ${payload}->>'firstParkedAt' <= ${new Date(now - parkedWakeDeadlineMs()).toISOString()})`;
@@ -132,7 +157,7 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
 
 /** The current park has no anchor yet (none stored, or a newer press). */
 export function parkedWakeNeedsAnchorSql(payload: SQLWrapper) {
-  return sql<boolean>`(${payload}->'queuedCommentInterrupt' is not null and ${payload}->'executionWait' is null
+  return sql<boolean>`(${payload}->'queuedCommentInterrupt' is not null and not ${personControlledWaitSql(payload)}
     and (${payload}->>'firstParkedAt' is null
       or coalesce(${payload}->'queuedCommentInterrupt'->>'requestedAt', '') > ${payload}->>'firstParkedAt'))`;
 }
@@ -145,7 +170,7 @@ export function parkedWakeNeedsAnchorSql(payload: SQLWrapper) {
  */
 export function anchorParkedWakePayloadSql(payload: SQLWrapper, updatedAt: SQLWrapper) {
   const press = sql`${payload}->'queuedCommentInterrupt'->>'requestedAt'`;
-  return sql`case when ${payload}->'executionWait' is not null then ${payload} - 'firstParkedAt' - 'parkedNoticeAt'
+  return sql`case when ${personControlledWaitSql(payload)} then ${payload} - 'firstParkedAt' - 'parkedNoticeAt'
     when ${parkedWakeNeedsAnchorSql(payload)} then (${payload} - 'parkedNoticeAt') || jsonb_build_object('firstParkedAt',
     to_char(greatest(${updatedAt}, case when ${press} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$' then (${press})::timestamptz end)
       at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
