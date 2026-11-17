@@ -141,6 +141,11 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       // pl/lockloss: losing the lock session aborts the same controller, so the
       // cancel-finalize3 fence stops the copyback's late host writes too.
       const onLost = () => controller.abort(ownership.lost.reason);
+      // adopt-drain: at the deadline (or lock loss) no new host mutation
+      // starts; the ownership release then drains the in-flight host calls.
+      const closeHostMutations = () => ownership.hostMutations.close(controller.signal.reason);
+      if (controller.signal.aborted) closeHostMutations();
+      else controller.signal.addEventListener("abort", closeHostMutations, { once: true });
       if (ownership.lost.aborted) onLost();
       else ownership.lost.addEventListener("abort", onLost, { once: true });
       const assertHeld = async () => {

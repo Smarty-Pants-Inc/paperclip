@@ -22,6 +22,14 @@ import {
 import { currentWorkspaceWorker, requestWorkspaceWorkerStopProof, type WorkspaceWorker, type WorkspaceWorkerStopProof } from "./native-workspace-platform-proof.js";
 import { currentProcessGroupId, proveCopybackOwnerGone, proveLocalWorkspaceOwnerStopped, type LocalWorkspaceOwnerStop } from "./native-workspace-owner-stop-proof.js";
 import { currentDeploymentIdentity, proveOwnerGone } from "../owner-proof.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { logger } from "../../middleware/logger.js";
+import {
+  createHostMutationDrain,
+  HOST_MUTATION_DRAIN_CAP_MS,
+  withHostMutationDrain,
+  type HostMutationDrain,
+} from "@paperclipai/adapter-utils/host-mutation-drain";
 
 const OWNER_KEY = "nativeWorkspaceFinalizationOwner";
 
@@ -71,7 +79,53 @@ export type NativeWorkspaceFinalizationOwnership = {
    * as soon as the lock session is known dead (a failed keepalive ping or a failed
    * assertHeld). Work that may write after losing the lock passes it as its signal. */
   lost: AbortSignal;
+  /** adopt-drain: every host mutation the action issues (through adapter-utils
+   * hostMutation) is tracked here. The ownership closes it on the deadline the
+   * caller sets (close()), on lock loss, and when the action returns, and it
+   * releases the lock session and the durable owner only after it drained. */
+  hostMutations: HostMutationDrain;
 };
+
+/** adopt-drain: the true line a person sees when a host write of the owner is
+ * still running at the drain cap. The ownership stays held meanwhile. */
+export function hostWriteDrainOverdueLine(capMs: number): string {
+  return `A file write on this host from this run's workspace export has not finished after ${Math.round(capMs / 1000)} s. `
+    + "The workspace stays held, so nothing else writes to it until that write ends.";
+}
+
+/**
+ * adopt-drain (rf-4 22:35Z/22:40Z): close the owner's host-mutation drain and
+ * wait for the in-flight host fs calls BEFORE the ownership is released. Past
+ * the cap the person gets a true line and the ownership is still NOT released:
+ * this keeps waiting until the stuck call returns (the next owner meanwhile is
+ * refused by the held advisory lock and the active owner token).
+ */
+async function drainHostMutationsBeforeRelease(drain: HostMutationDrain, input: {
+  db: Db; companyId: string; runId: string; agentId: string | null; capMs: number;
+}): Promise<void> {
+  const result = await drain.closeAndDrain(input.capMs);
+  if (result.drained) return;
+  const line = hostWriteDrainOverdueLine(input.capMs);
+  logger.warn({ runId: input.runId, inFlight: result.inFlight, capMs: input.capMs },
+    "workspace finalization ownership held past the drain cap: a host write is still running");
+  if (input.agentId) {
+    try {
+      await appendHeartbeatRunEvent(input.db, {
+        companyId: input.companyId, agentId: input.agentId, runId: input.runId,
+        eventType: "provider.notice.recorded", stream: "system", level: "warn", message: line,
+        payload: { prpEvent: {
+          schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "control_plane",
+          runId: input.runId, eventType: "provider.notice.recorded", emittedAt: new Date().toISOString(),
+          payload: { schema: "paperclip.provider.notice.v1", severity: "warning", category: "workspace_host_write_draining",
+            summary: line, message: line },
+        } },
+      });
+    } catch (error) {
+      logger.warn({ err: error, runId: input.runId }, "host write drain notice could not be recorded");
+    }
+  }
+  await drain.drained();
+}
 export class NativeWorkspaceFinalizationBusyError extends Error {
   constructor() { super("native_workspace_finalization_busy"); }
 }
@@ -109,7 +163,7 @@ export function nativeWorkspaceFinalizationOwnerCanUpgrade(profile: Record<strin
  * There is deliberately no wall-clock timeout that can steal a slow export.
  */
 export async function withNativeWorkspaceFinalizationOwnership<T>(
-  input: { db: Db; companyId: string; runId: string; retainedRepairActionId?: string },
+  input: { db: Db; companyId: string; runId: string; retainedRepairActionId?: string; hostDrainCapMs?: number },
   action: (ownership: NativeWorkspaceFinalizationOwnership) => Promise<T>,
 ): Promise<{ acquired: false; reason: NativeWorkspaceFinalizationWaitReason } | { acquired: true; value: T }> {
   const identity = await currentNativeControllerIdentity();
@@ -140,6 +194,9 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
         reason: !input.retainedRepairActionId && activeRunOwners.get(runKey)?.db === input.db ? "owner_active" : "busy",
       } as const;
       const lost = new AbortController();
+      const hostMutations = createHostMutationDrain();
+      // Lock loss: no new host mutation starts; the release still drains.
+      lost.signal.addEventListener("abort", () => hostMutations.close(lost.signal.reason), { once: true });
       const markLost = (cause: unknown) => {
         if (!lost.signal.aborted) lost.abort(new NativeWorkspaceFinalizationOwnershipLostError({ cause }));
       };
@@ -316,6 +373,7 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
         const ownership: NativeWorkspaceFinalizationOwnership = {
           token: owner.token,
           lost: lost.signal,
+          hostMutations,
           assertHeld: async () => {
             if (lost.signal.aborted) throw lost.signal.reason;
             try {
@@ -344,7 +402,18 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
           inArray(issueRecoveryActions.status, ["active", "escalated"]),
         ));
         finishAcquisition();
-        actionPromise = action(ownership);
+        // adopt-drain: the action runs under its host-mutation drain, and the
+        // drain is closed and awaited before this callback returns (so before
+        // the lock transaction ends) and before the finally below releases the
+        // durable owner (it joins actionPromise).
+        actionPromise = (async () => {
+          try {
+            return await withHostMutationDrain(hostMutations, () => action(ownership));
+          } finally {
+            await drainHostMutationsBeforeRelease(hostMutations, { db: input.db, companyId: input.companyId,
+              runId: input.runId, agentId: run.agentId ?? null, capMs: input.hostDrainCapMs ?? HOST_MUTATION_DRAIN_CAP_MS });
+          }
+        })();
         const value = await actionPromise;
         await ownership.assertHeld();
         return { acquired: true, value } as const;

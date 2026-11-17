@@ -7,6 +7,7 @@ import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, ty
 import { shouldExcludePath } from "./exclude-patterns.js";
 import { runSnapshotThread } from "./workspace-snapshot-thread.js";
 import type { WorkspaceRestoreDiagnostic } from "./workspace-restore-diagnostics.js";
+import { hostCleanup, hostMutation } from "./host-mutation-drain.js";
 
 export type SnapshotEntry =
   | { kind: "dir" }
@@ -38,7 +39,7 @@ export async function disposeDirectorySnapshot(snapshot: DirectorySnapshot | nul
     snapshot.entries.close();
     const ownedDirectory = ownedDirectorySnapshots.get(snapshot);
     ownedDirectorySnapshots.delete(snapshot);
-    if (ownedDirectory) await fs.rm(ownedDirectory, { recursive: true, force: true });
+    if (ownedDirectory) await hostCleanup(() => fs.rm(ownedDirectory, { recursive: true, force: true }));
   }
 }
 
@@ -417,7 +418,7 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
   // The parent is private (0700), including while a new file is chmodded.
   const database = new DatabaseSync(databasePath, { allowExtension: false });
   try {
-    await fs.chmod(databasePath, 0o600);
+    await hostCleanup(() => fs.chmod(databasePath, 0o600));
     // Never block the event loop while another async operation holds the lock.
     database.exec("PRAGMA busy_timeout=0;");
     while (true) {
@@ -440,10 +441,12 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
       throw error;
     })) await waitForLock(path.join(lockDir, "owner.json"));
 
-    const owner = await fs.open(ownerPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW, 0o600);
-    try {
-      await owner.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`, "utf8");
-    } finally { await owner.close(); }
+    await hostCleanup(async () => {
+      const owner = await fs.open(ownerPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW, 0o600);
+      try {
+        await owner.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`, "utf8");
+      } finally { await owner.close(); }
+    });
     activeDirectoryMergeLocks.add(lockDir);
     let released = false;
     return async () => {
@@ -452,7 +455,7 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
       try {
         // This sidecar is diagnostic only. A failed removal cannot retain
         // ownership, and the next holder replaces it while holding the DB lock.
-        await fs.unlink(ownerPath).catch(() => undefined);
+        await hostCleanup(() => fs.unlink(ownerPath).catch(() => undefined));
       } finally {
         activeDirectoryMergeLocks.delete(lockDir);
         database.close();
@@ -524,7 +527,7 @@ async function resolveDirectoryMergeLockRoot(env: NodeJS.ProcessEnv = process.en
     }
     return lockRoot;
   }
-  await fs.mkdir(lockRoot, { recursive: true, mode: DIRECTORY_MERGE_LOCK_ROOT_MODE });
+  await hostCleanup(() => fs.mkdir(lockRoot, { recursive: true, mode: DIRECTORY_MERGE_LOCK_ROOT_MODE }));
   const created = await fs.lstat(lockRoot);
   if (created.isSymbolicLink() || !created.isDirectory()) {
     throw new Error(`Directory merge lock root at ${lockRoot} is not a plain directory.`);
@@ -613,20 +616,20 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
     }
     if (existing) {
       guard();
-      await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
+      await hostMutation(() => fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined));
     }
     guard();
-    await fs.mkdir(targetPath, { recursive: true });
+    await hostMutation(() => fs.mkdir(targetPath, { recursive: true }));
     return;
   }
 
   guard();
-  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await hostMutation(() => fs.mkdir(path.dirname(targetPath), { recursive: true }));
   if (entry.kind === "symlink") {
     guard();
-    await fs.rm(targetPath, { recursive: true, force: true });
+    await hostMutation(() => fs.rm(targetPath, { recursive: true, force: true }));
     guard();
-    await fs.symlink(entry.target, targetPath);
+    await hostMutation(() => fs.symlink(entry.target, targetPath));
     return;
   }
   // An interrupted restore must not leave a truncated current file. Keep the
@@ -636,21 +639,22 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
   // removes it after an abort (it is never another owner's file).
   try {
     guard();
-    await fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE).catch(async () => {
+    await hostMutation(() => fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE)).catch(async (error) => {
+      if ((error as { code?: unknown }).code === "HOST_MUTATION_REFUSED") throw error;
       guard();
-      await fs.copyFile(sourcePath, temporary);
+      await hostMutation(() => fs.copyFile(sourcePath, temporary));
     });
     guard();
-    await fs.chmod(temporary, entry.mode);
+    await hostMutation(() => fs.chmod(temporary, entry.mode));
     const file = await fs.open(temporary, "r");
     try { await file.sync(); } finally { await file.close(); }
     const existing = await fs.lstat(targetPath).catch(() => null);
     // An aborted owner publishes nothing more: check before the replace.
     guard();
-    if (existing?.isDirectory()) await fs.rm(targetPath, { recursive: true, force: true });
+    if (existing?.isDirectory()) await hostMutation(() => fs.rm(targetPath, { recursive: true, force: true }));
     guard();
-    await fs.rename(temporary, targetPath);
-  } finally { await fs.rm(temporary, { force: true }); }
+    await hostMutation(() => fs.rename(temporary, targetPath));
+  } finally { await hostCleanup(() => fs.rm(temporary, { force: true })); }
 
 }
 
@@ -678,7 +682,7 @@ export async function captureDirectorySnapshot(
     return snapshot;
   } catch (error) {
     writer?.close(false);
-    if (writer) await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
+    if (writer) await hostCleanup(() => fs.rm(path.dirname(writer!.filePath), { recursive: true, force: true }));
     throw error;
   } finally { ignored.close(); }
 }
@@ -694,7 +698,7 @@ export async function captureDirectorySnapshotOffThread(
     ownedDirectorySnapshots.set(snapshot, result.directory);
     return snapshot;
   } catch (error) {
-    await fs.rm(result.directory, { recursive: true, force: true });
+    await hostCleanup(() => fs.rm(result.directory, { recursive: true, force: true }));
     throw error;
   }
 }
@@ -717,7 +721,7 @@ export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, optio
     return result;
   } catch (error) {
     writer.close(false);
-    await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
+    await hostCleanup(() => fs.rm(path.dirname(writer.filePath), { recursive: true, force: true }));
     throw error;
   }
 }
@@ -817,14 +821,14 @@ export async function mergeDirectoryWithBaseline(input: {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
           if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
           signal?.throwIfAborted();
-          await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
+          await hostMutation(() => fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true }));
         }
         // Reverse path order visits descendants before their parent directory.
         for (const [relative, entry] of orderedEntries(input.baseline, true)) {
           if (entry.kind === "dir" && !source.entries.has(relative)) signal?.throwIfAborted();
-          if (entry.kind === "dir" && !source.entries.has(relative)) await fs.rmdir(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
+          if (entry.kind === "dir" && !source.entries.has(relative)) await hostMutation(() => fs.rmdir(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
             if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
-          });
+          }));
         }
         for (const [relative, entry] of orderedEntries(source)) {
           if (!entriesMatch(input.baseline.entries.get(relative), entry) &&
