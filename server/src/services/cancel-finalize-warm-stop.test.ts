@@ -32,6 +32,7 @@ import { createAdapterExecutionControl } from "./adapter-execution-control.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./heartbeat/runtime-execution.js";
 import { finishCancelledWarmWorkspaceExport } from "./heartbeat/cancelled-warm-workspace-export.js";
+import { registerCleanupSettledResumer, resetCleanupSettledWakesForTest, wakeAfterCleanupSettled } from "./native-runtime/cleanup-settled-wake.js";
 import { issueRecoveryActions, nativeRunFinalizations } from "@paperclipai/db";
 import { recoveryService } from "./recovery/service.js";
 import { runExecutionsStoppedOrHandedOffWarm } from "./agent-execution-stop.js";
@@ -325,6 +326,36 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(f.excluded).toBe(false);
     expect(await successorOnSameBox(f)).toBe("adopt_remote");
     expect(sha(await readFile(join(f.box, "task.txt"), "utf8"))).toBe(sha(expected));
+  }, 60_000);
+
+  it("S048 (ii): the finalized export WAKES the parked message by that event, once, after the mark committed", async () => {
+    resetCleanupSettledWakesForTest();
+    const wakes: { runId: string; markCommitted: boolean; at: number }[] = [];
+    let readDb: ReturnType<typeof createDb> | null = db;
+    const unregister = registerCleanupSettledResumer(async ({ runId }) => {
+      const [row] = await readDb!.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      wakes.push({ runId, markCommitted: (row?.profile as Record<string, any> | null)?.nativeCancelledWarmExport?.state === "finalized", at: Date.now() });
+    });
+    try {
+      const f = await stopMidTurn({ edit: true, settled: true, exportFails: false });
+      const own = wakes.filter(wake => wake.runId === f.runId);
+      // Base: no wake at all (the message waits for the 30 s re-poll).
+      expect(own.length).toBe(1);
+      expect(own[0]!.markCommitted).toBe(true);
+      // R-ONCE: the same event again is a no-op.
+      expect(await wakeAfterCleanupSettled({ companyId: f.companyId, runId: f.runId, event: "export_finalized" })).toBe(false);
+      expect(wakes.filter(wake => wake.runId === f.runId).length).toBe(1);
+    } finally { unregister(); readDb = null; }
+  }, 60_000);
+
+  it("S048 (ii) negative: an UNPROVEN export wakes nothing (the cleanup is still pending)", async () => {
+    resetCleanupSettledWakesForTest();
+    const woken: string[] = [];
+    const unregister = registerCleanupSettledResumer(async ({ runId }) => { woken.push(runId); });
+    try {
+      const f = await stopMidTurn({ edit: true, settled: true, exportFails: true });
+      expect(woken.filter(id => id === f.runId)).toEqual([]);
+    } finally { unregister(); }
   }, 60_000);
 
   it("export failure: no silent new box; the box stays protected and the run says so", async () => {
