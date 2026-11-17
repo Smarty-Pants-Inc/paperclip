@@ -235,6 +235,7 @@ export interface WakeQueueTransaction {
     companyId: string;
     issueId: string;
     agentId: string;
+    runId?: string;
     contextSnapshot: unknown;
   }): Promise<Record<string, unknown>>;
   queueReviewParticipantRecoveryRun(input: {

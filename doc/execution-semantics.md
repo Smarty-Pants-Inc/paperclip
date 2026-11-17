@@ -3087,6 +3087,21 @@ an intermediate run failed. A proven pending continuation keeps a waiting note,
 not resend text, until it starts or terminates. This attribution does not change
 automatic retry budgets or the ordinary first-start bounds.
 
+A fresh recovery carries every still-unanswered person comment from its source
+chain as the restored run's own pending input, once and oldest first. The shared
+`pendingContinuationCommentInput` / `readContinuationCommentInput` reader takes
+the trusted source run and agent. It collects wake and first-turn input IDs from
+previous/retry edges and older runs on the same native thread, within the same
+company, task, agent, and conversation generation. A reset ends that lineage.
+It does not turn arbitrary task history into pending work. The answer rule above
+removes answered comments before the new seed is saved. The successor owns a new
+first-turn receipt; it never borrows an ancestor's delivery claim. A person's
+card answer still takes priority over the asking turn's origin comment, unchanged.
+There is no count cap on `wakeCommentIds` in the existing queue contract. Carry
+adds none; the finite chain bounds the candidate set. Existing prompt-body limits
+and complete-comment reads still apply. This input read does not admit work,
+change retry budgets, bypass a hold, or repeat provider actions.
+
 A delegated-task completion callback can finish native execution before its
 accepted final reply is saved. The completion outbox must retain that callback's
 queued target and attempt while the existing presentation selector finds pending
