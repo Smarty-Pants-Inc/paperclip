@@ -11,7 +11,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -833,7 +833,10 @@ import {
           runId: wake.runId, payload: wake.payload })), actions: actions.map((action) => action.cause) })}`);
       };
       const heldIds = async () => (await db.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.agentId, runtimeAgent), eq(agentWakeupRequests.status, "deferred_issue_execution"))))
+        eq(agentWakeupRequests.agentId, runtimeAgent), eq(agentWakeupRequests.status, "deferred_issue_execution")))
+        // Read the held wakes in the order they were saved: a select with no ORDER BY returns heap order, which
+        // an update of a wake row reorders (seen as [C,B,A] at :850 under load, before any Stop).
+        .orderBy(asc(agentWakeupRequests.createdAt), asc(agentWakeupRequests.id)))
         .flatMap((wake) => {
           const ids = (wake.payload as Record<string, any>)?._paperclipWakeContext?.wakeCommentIds;
           return Array.isArray(ids) ? ids : [];
