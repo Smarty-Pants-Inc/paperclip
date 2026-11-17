@@ -319,7 +319,7 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
     const second = await thinkingCapStop({ retryOfRunId: first.runId,
       contextSnapshot: { previousRunId: first.runId, wakeReason: "issue_recovery_action_restored" } }, first);
     const again = await lifecycle.findLatestCompletedFinalAgentMessage(second.runId, second.companyId);
-    expect(again?.text).toBe("The model ran out of output budget again before answering. Press Retry to try once more.");
+    expect(again?.text).toBe("The model ran out of output budget before answering. Press Retry to try once more.");
     for (const text of [note?.text, again?.text]) expect(text).not.toMatch(/wasn't answered|Sending it again is safe/u);
     // A person's Retry is a new ask: its own cap stop gets the first note again.
     const retried = await thinkingCapStop({ contextSnapshot: { previousRunId: second.runId, wakeReason: "task_retry" } }, first);
@@ -382,7 +382,7 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
     const { readThinkingCapStop } = await import("../thinking-cap-stop.js");
     expect((await readThinkingCapStop(db, { companyId: second.companyId, runId: second.runId }))?.repeated).toBe(true);
     expect((await createHeartbeatLifecycle(db, callbacks(db)).findLatestCompletedFinalAgentMessage(second.runId, second.companyId))?.text)
-      .toBe("The model ran out of output budget again before answering. Press Retry to try once more.");
+      .toBe("The model ran out of output budget before answering. Press Retry to try once more.");
   });
 
   // dl-n5-cont2 C1 (rf-2 2x4) on the live completion path.

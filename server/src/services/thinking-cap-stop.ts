@@ -3,6 +3,7 @@ import { heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { resolvePaperclipRunnerPiRpcThinkingLevel } from "@paperclipai/adapter-utils";
 import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../vendor/paperclip-runner/index.js";
 import { isRecoveryRun } from "./continuation-cause.js";
+import { NATIVE_MID_STREAM_CUT_CODE } from "./native-runtime/native-mid-stream-cut-cause.js";
 import { parseIssueAssigneeAdapterOverrides, type ParsedIssueAssigneeAdapterOverrides } from "./execution-workspace-policy.js";
 import {
   readThinkingOnlyCapStop,
@@ -33,9 +34,10 @@ const object = (value: unknown): Record<string, unknown> =>
  * dl-n5-cont2 item 3: a run whose last turn stopped at the output cap having
  * streamed no answer text (the model used its whole output budget thinking).
  *
- * `repeated` is the COST GUARD: the run is the ONE automatic continuation of
- * an ask whose previous run also stopped that way. Then nothing continues
- * automatically again; the person gets one note with the choice to Retry. A
+ * `repeated` is the COST GUARD: the automatic successor budget is spent,
+ * whether its parent capped or failed with another mid-stream cut. The lane's
+ * durable marking is the same proof the finalizer uses to stop automatic
+ * sends. The person gets one note with the choice to Retry. A
  * person's Retry (not a recovery run) starts a new ask with its own one
  * automatic continuation.
  */
@@ -46,9 +48,9 @@ export async function readThinkingCapStop(tx: Pick<Db, "select">, input: { compa
 } | null> {
   const stop = readThinkingOnlyCapStop(await readRunAnswerEvents(tx, input.companyId, input.runId));
   if (!stop) return null;
-  const parentRunId = await readRecoveryRunParentId(tx, input);
-  const repeated = Boolean(parentRunId
-    && readThinkingOnlyCapStop(await readRunAnswerEvents(tx, input.companyId, parentRunId)));
+  const recovery = await readRecoveryRunParent(tx, input);
+  const repeated = Boolean(recovery && (recovery.automaticCutSuccessor
+    || readThinkingOnlyCapStop(await readRunAnswerEvents(tx, input.companyId, recovery.parentRunId))));
   return { ...stop, repeated };
 }
 
@@ -66,16 +68,21 @@ export function thinkingCapStopCandidate(stop: { seq: number; sourceEventId: str
 
 /**
  * The run this run automatically continues (retryOfRunId, else the context's
- * previousRunId), when it is a recovery run; null for a person's ask or Retry.
+ * previousRunId), and whether it spent the cut lane's one-successor budget.
+ * Null for a person's ask or Retry, even when it carries a previousRunId.
  */
-async function readRecoveryRunParentId(tx: Pick<Db, "select">, input: { companyId: string; runId: string }): Promise<string | null> {
+async function readRecoveryRunParent(tx: Pick<Db, "select">, input: { companyId: string; runId: string }): Promise<{
+  parentRunId: string; automaticCutSuccessor: boolean;
+} | null> {
   const [run] = await tx.select({ retryOfRunId: heartbeatRuns.retryOfRunId, scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
     contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId))).limit(1);
   const context = object(run?.contextSnapshot);
   const parentRunId = run?.retryOfRunId
     ?? (typeof context.previousRunId === "string" && context.previousRunId ? context.previousRunId : null);
-  return run && parentRunId && parentRunId !== input.runId && isRecoveryRun(run) ? parentRunId : null;
+  return run && parentRunId && parentRunId !== input.runId && isRecoveryRun(run)
+    ? { parentRunId, automaticCutSuccessor: Boolean(run.retryOfRunId) && run.scheduledRetryReason === NATIVE_MID_STREAM_CUT_CODE }
+    : null;
 }
 
 /**
@@ -98,8 +105,8 @@ export async function isThinkingCapStopRecoveryRun(tx: Pick<Db, "select">, input
   const [run] = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId))).limit(1);
   if (object(run?.contextSnapshot).forceFreshSession !== true) return false;
-  const parentRunId = await readRecoveryRunParentId(tx, input);
-  return Boolean(parentRunId && readThinkingOnlyCapStop(await readRunAnswerEvents(tx, input.companyId, parentRunId)));
+  const recovery = await readRecoveryRunParent(tx, input);
+  return Boolean(recovery && readThinkingOnlyCapStop(await readRunAnswerEvents(tx, input.companyId, recovery.parentRunId)));
 }
 
 /**
