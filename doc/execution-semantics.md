@@ -1631,6 +1631,8 @@ lease row for that sandbox is no longer active or retained, the host has given t
 sandbox up: the warm owner is released and the next run on the task prepares its
 instructions fresh. A follow-up whose predecessor's warm instruction copy cannot be
 handed off retires that owner and prepares fresh instead of failing.
+A failed close that releases its owner without a backup, or exhausts its retries,
+sets `nativeHarnessBackupMissing` on its exact lease: destroy is refused; stop keeps the disk.
 
 A remote runner also keeps working while its controller is offline, and the host
 reattaches it within the remote runner reconnect grace (7 minutes). Daytona counts
@@ -3469,6 +3471,8 @@ without first trying to resume, and its transcript shows the session as started
 rather than resumed. A failure before the result is accepted, a backup that
 saves after a retry, a retained sandbox, an SSH host, and records saved without
 the key keep the resume path described next.
+For retained disks, a later successful server backup of the same session clears
+`nativeHarnessBackupMissing`; an older backup or another session does not clear it.
 
 A Runner that keeps no control-plane state for the saved session (none is live
 and no archived authority epoch matches it) reports a typed refusal. This
