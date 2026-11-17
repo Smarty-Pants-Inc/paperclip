@@ -55,7 +55,13 @@ export function registerIssueRecoveryWork(
             ? alsoBlockedWhen
               ? or(inArray(issues.status, statuses), and(eq(issues.status, "blocked"), alsoBlockedWhen()))
               : inArray(issues.status, statuses)
-            : or(isNotNull(issues.checkoutRunId), isNotNull(issues.executionRunId)),
+            : or(isNotNull(issues.checkoutRunId), isNotNull(issues.executionRunId),
+                // A diagnostic outlives its old binding. Keep re-checking its
+                // named owners even when no stale lock remains on the task.
+                sql`exists (select 1 from ${issueRecoveryActions} stop_pending
+                  where stop_pending.company_id = ${issues.companyId} and stop_pending.source_issue_id = ${issues.id}
+                    and stop_pending.status in ('active', 'escalated')
+                    and stop_pending.evidence->'stopPending'->>'schema' = 'paperclip.task-stop-pending.v1')`),
           statuses ? isNull(issues.hiddenAt) : undefined,
           statuses ? isNull(issues.assigneeUserId) : undefined,
           statuses ? or(isNotNull(issues.assigneeAgentId), eq(issues.status, "in_review")) : undefined,
