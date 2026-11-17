@@ -695,7 +695,9 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     const rows = freshRows.filter(row => row.issueId === issueId && row.runId === runId);
     // Only the primary record (it carries `freshContinuation`) says whether a
     // continuation is still on its way; holds coalesced into it never do.
-    if (rows.some(row => row.recorded && ["not_requested", "pending"].includes(row.delivery ?? ""))) {
+    // rf-3 E (R-SILENT): 'not_requested' is continuing only with a live wake.
+    if (rows.some(row => row.recorded && (row.delivery === "pending"
+      || (row.delivery === "not_requested" && liveSuccessorIssueIds.has(issueId))))) {
       const pendingSince = Math.max(...rows.filter(row => row.recorded && row.delivery === "pending" && row.status === "resolved"
         && row.schema === pendingSchema && row.reconciledRunId === runId).map(row => Date.parse(row.recordedAt ?? "")));
       return Number.isFinite(pendingSince) ? { state: "continuing", pendingSince } : { state: "continuing" };
