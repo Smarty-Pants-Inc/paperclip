@@ -994,6 +994,20 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
         });
         throw new NativePredecessorRetirementDirectoryBusyError(entry.runId, error);
       }
+      // S8 (186f55fc): a close refused because the sandbox lease is terminal
+      // (Boat's typed stop/destroy receipt on the lease: destroyed, or stopped
+      // by this owner's own run) proves the old session cannot run. Retirement
+      // is proven at once, by the same predicate as the idle close sweep
+      // (warmCloseFailureProvesOwnerGone); never by the close error's text. Any
+      // other failure (a transient download-url error, no receipt) stays unproven.
+      const gone = await warmCloseFailureProvesOwnerGone(entry, error);
+      if (gone) {
+        await markWarmNativeHarnessBackupMissing(entry, gone);
+        logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+          providerLeaseId: entry.providerLeaseId ?? null, reason, closeFailure: describeWarmCloseFailure(error) },
+        "superseded warm owner's sandbox lease is terminal; retirement proven");
+        return;
+      }
       entry.retirementUnproven = true;
       throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId ?? null, error);
     }
