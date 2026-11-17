@@ -1467,6 +1467,32 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await quarantined()).toEqual([]);
   }, 60_000);
 
+  // settle-sites total budget: on a Stop follow-up the successor first joins
+  // its stopped predecessor's warm release in heartbeat preparation (S072,
+  // reserveWarmNativeInstructionDirectory, which derives the successor's
+  // ownPredecessorSettleDeadline), then meets the Stop's own pending
+  // runner.suspend here (createRunnerdBackend -> migrate -> the s6409 wait).
+  // The two waits share ONE warmSessionReleaseWait, never a fresh bound each.
+  it("settle-sites budget: the Stop-command wait after the S072 join ends at the successor's one shared deadline", async () => {
+    const { followUp } = await seedStoppedOwnerWithPendingSuspend();
+    const executor = await import("./native-session-executor.js") as Record<string, unknown>;
+    const derive = executor.ownPredecessorSettleDeadline as ((runId: string) => number) | undefined;
+    const bound = warmSessionReleaseWait.timeoutMs;
+    warmSessionReleaseWait.timeoutMs = 1_500;
+    try {
+      const started = Date.now();
+      // The S072 join of this same successor derived the deadline and spent 1 s of it.
+      derive?.(followUp.runId);
+      await new Promise(resolve => setTimeout(resolve, 1_000));
+      expect(await followUp.start()).toBe("native_controller_recovery_waiting_for_owner");
+      expect(Date.now() - started).toBeLessThan(1_500 + 700);
+    } finally {
+      warmSessionReleaseWait.timeoutMs = bound;
+    }
+    expect(followUp.failures.at(-1)).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect(await quarantined()).toEqual([]);
+  }, 60_000);
+
   it("keeps refusing a pending runner.suspend that the acknowledged Stop did not issue", async () => {
     const { followUp } = await seedStoppedOwnerWithPendingSuspend("after suspend");
     expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
