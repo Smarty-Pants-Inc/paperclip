@@ -5330,6 +5330,126 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       .resolves.toMatchObject({ stdout: `served:${config[key]}` });
   });
 
+  // CR6: harness custody does not include a detached writer's workspace files.
+  // KEEP: never-OK data loss. Exercise each obsolete destroy arm and the
+  // already-stopped released population through real DB admission and cleanup.
+  it.each(["known non-native", "verified native backup", "previous-boot closed active tip", "already-stopped released", "already-stopped released without receipt"] as const)(
+    "CR6 source-change keeps workspace bytes: %s", async arm => {
+    const pluginId = randomUUID();
+    const providerConfig = { provider: "fake-plugin", from: "snapshot-a", reuseLease: true, timeoutMs: 1234 };
+    const { companyId, agentId, environment, runId } = await seedEnvironment({ driver: "sandbox", config: providerConfig });
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Detached workspace writer", status: "in_progress", assigneeAgentId: agentId });
+    await insertSandboxProviderPlugin(pluginId, { environmentDrivers: [{
+      driverKey: "fake-plugin", kind: "sandbox_provider", displayName: "CR6 custody fixture", supportsReusableLeases: true,
+      configSchema: { type: "object" },
+    }] });
+    const boxes = new Map<string, { state: string; detachedFile?: string }>();
+    let acquisitions = 0;
+    const workerManager = {
+      isRunning: () => true,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease",
+        "environmentStopLease", "environmentInspectLease"] }),
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        if (method === "environmentAcquireLease") {
+          const providerLeaseId = `cr6-${++acquisitions}`;
+          boxes.set(providerLeaseId, { state: "running" });
+          return { providerLeaseId, metadata: { ...params.config, remoteCwd: "/workspace" } };
+        }
+        if (method === "environmentResumeLease") {
+          boxes.get(params.providerLeaseId)!.state = "running";
+          return { providerLeaseId: params.providerLeaseId, metadata: { ...params.config, remoteCwd: "/workspace" } };
+        }
+        if (method === "environmentDestroyLease") {
+          boxes.delete(params.providerLeaseId);
+          return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
+        }
+        if (method === "environmentStopLease") boxes.get(params.providerLeaseId)!.state = "stopped";
+        if (["environmentStopLease", "environmentInspectLease"].includes(method)) {
+          return { providerLeaseId: params.providerLeaseId, state: boxes.get(params.providerLeaseId)!.state };
+        }
+        throw new Error(`Unexpected CR6 provider method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const service = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const adapterType = arm === "known non-native" ? "codex_local" : "paperclip_runner";
+    const acquire = (selected: Environment, selectedRunId: string) => service.acquireRunLease({
+      companyId, environment: selected, issueId, agentId, adapterType, heartbeatRunId: selectedRunId, persistedExecutionWorkspace: null,
+    });
+    const first = await acquire(environment, runId);
+    const providerLeaseId = first.lease.providerLeaseId!;
+    const normalizedSessionId = randomUUID(), runnerInstanceId = "cr6-runner", sessionScopeId = randomUUID();
+    const backupBase = await mkdtemp(path.join(os.tmpdir(), "cr6-backup-"));
+    const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = backupBase;
+    try {
+      const current = path.join(backupBase, createHash("sha256").update(sessionScopeId).digest("hex"), "failover-backups", "current");
+      await mkdir(path.join(current, "runner"), { recursive: true });
+      await mkdir(path.join(current, "pi"), { recursive: true });
+      await mkdir(path.join(current, "pi-agent"), { recursive: true });
+      await writeFile(path.join(current, "runner", "runner-state.json"), "finalized harness checkpoint");
+      await writeFile(path.join(current, "pi", `${normalizedSessionId}.jsonl`), '{"role":"user","content":"hello"}\n');
+      const manifest = buildNativeHarnessBackupManifest({ backupRoot: current, runnerInstanceId, sourceProviderLeaseId: providerLeaseId,
+        providerSessionIdentity: { providerSessionId: "pi-thread" },
+        execution: { provider: { kind: "pi_rpc" }, binding: { companyId, runId, issueId, agentId, executionWorkspaceId: null },
+          workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+          session: { normalizedSessionId, driverKind: "pi_rpc", protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300000 } },
+        } as never });
+      const manifestPath = path.join(current, "manifest.json");
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      const stamp = createNativeHarnessBackupStamp({ manifestPath, sessionScopeId, normalizedSessionId, runnerInstanceId,
+        authorizedProviderLeaseId: providerLeaseId, completedAt: manifest.completedAt });
+      const closedActive = arm === "previous-boot closed active tip";
+      const alreadyStopped = arm.startsWith("already-stopped");
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(Date.now() - 10 * 60_000),
+        runtimeMode: "native", nativeSessionId: normalizedSessionId }).where(eq(heartbeatRuns.id, runId));
+      const before = (await environmentService(db).getLeaseById(first.lease.id))!;
+      await db.update(environmentLeases).set({ status: closedActive ? "active" : alreadyStopped ? "released" : "retained",
+        ...(alreadyStopped ? { releasedAt: new Date(), cleanupStatus: "success" } : {}),
+        metadata: { ...before.metadata, nativeHarnessBackup: stamp,
+          ...(closedActive ? { leaseController: { ...(before.metadata!.leaseController as object), bootId: randomUUID(), pid: 2_147_000_000 } } : {}),
+          ...(arm === "already-stopped released" ? { remoteExecutionTermination: remoteTerminationReceipt(before, { providerLeaseId, state: "stopped" }) } : {}),
+        },
+      }).where(eq(environmentLeases.id, first.lease.id));
+      // This write is box-only, later than the finalized harness checkpoint.
+      const detachedFile = "written after turn finalize";
+      boxes.get(providerLeaseId)!.detachedFile = detachedFile;
+      if (alreadyStopped) boxes.get(providerLeaseId)!.state = "stopped";
+      const stoppedBefore = (await environmentService(db).getLeaseById(first.lease.id))!;
+      const changed = { ...environment, config: { ...providerConfig, from: "snapshot-b" } };
+      await environmentService(db).update(environment.id, { config: changed.config });
+      const nextRunId = randomUUID();
+      await insertRunningManualRun(nextRunId, companyId, agentId);
+      vi.mocked(workerManager.call).mockClear();
+      const next = await acquire(changed, nextRunId);
+      expect(next.lease.providerLeaseId).not.toBe(providerLeaseId);
+      expect(next.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "created" });
+      expect(acquisitions).toBe(2);
+      expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
+      const pending = (await environmentService(db).getLeaseById(first.lease.id))!;
+      if (alreadyStopped) {
+        expect(pending).toEqual(stoppedBefore);
+      } else {
+        expect(pending).toMatchObject({ status: "pending_cleanup", failureReason: "sandbox_stop_pending",
+          metadata: { sandboxStopAndRetain: { reason: "sandbox_source_changed" } } });
+      }
+      await heartbeatService(db, { environmentRuntime: service, pluginWorkerManager: workerManager }).sweepPendingCleanupLeases({ backoffMs: 0 });
+      if (alreadyStopped) {
+        expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentStopLease", expect.anything(), expect.anything());
+      } else {
+        expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentStopLease", expect.objectContaining({ providerLeaseId }), expect.any(Number));
+      }
+      expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentResumeLease", expect.anything(), expect.anything());
+      expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
+      expect(boxes.get(providerLeaseId)).toEqual({ state: "stopped", detachedFile });
+      await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "released", cleanupStatus: "success" });
+    } finally {
+      if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
+      await rm(backupBase, { recursive: true, force: true });
+    }
+  });
+
   // b8626bba (gate 5, 11-16): a warm owner admitted on lease L1; a later turn
   // resumed the SAME box as a new row L2 (verified handoff chain); the close
   // stamped L1. The recall's obsolete cleanup must read the newest stamp on the
@@ -5586,7 +5706,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   // retained branch does, but only when its run is terminal, its holder is a
   // previous boot that no warm owner here holds, the close's chain stamp follows
   // the run's end, and nothing holds its files. Keep: place-losing custody bug.
-  it.each(["kept (custody destroy)", "kept (stop intent)", "live owner in this process", "holder is this boot",
+  it.each(["kept (verified custody)", "kept (stop intent)", "live owner in this process", "holder is this boot",
     "run not terminal", "no close stamp", "stamp before run end", "other box stamp", "other company"] as const)(
     "previous-boot active tip: the first recall after an image swap retires a closed tip: %s", async scenario => {
     const pluginId = randomUUID();
@@ -5708,13 +5828,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       const restore = () => retiredSourceAuthorizesNativeBackupRestore(db, { companyId, currentRunId: recallRunId, normalizedSessionId,
         manifest: { sourceProviderLeaseId: providerLeaseId, runnerInstanceId, normalizedSessionId },
         manifestSha256: stamp.manifestSha256, targetProviderLeaseId: recall.lease.providerLeaseId });
-      if (scenario === "kept (custody destroy)") {
-        // Verified chain custody: destroyed exactly as a retained tip would be.
-        expect(calls).toContain("environmentDestroyLease");
-        expect(tip).toMatchObject({ status: "expired", cleanupStatus: "success", failureReason: "lease_fingerprint_mismatch" });
-        await expect(restore()).resolves.toBe(true);
-      } else if (scenario === "kept (stop intent)") {
-        // Not verifiable here: stopped and kept exactly as a retained tip would be.
+      if (scenario === "kept (verified custody)" || scenario === "kept (stop intent)") {
+        // CR6: a source change stops and keeps even with verified harness custody.
         expect(calls).not.toContain("environmentDestroyLease");
         expect(tip).toMatchObject({ status: "pending_cleanup",
           metadata: { sandboxStopAndRetain: { reason: "sandbox_source_changed", leaseId: tip.id, runId: tipRunId } } });
@@ -5860,9 +5975,10 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         expect(calls).not.toContain("environmentDestroyLease");
         expect(tip).toEqual(before);
       } else {
-        // Admitted on its own session's close stamp: destroyed under verified custody.
-        expect(calls).toContain("environmentDestroyLease");
-        expect(tip).toMatchObject({ status: "expired", cleanupStatus: "success", failureReason: "lease_fingerprint_mismatch" });
+        // Admitted on its own session's close stamp: source changes keep workspace bytes.
+        expect(calls).not.toContain("environmentDestroyLease");
+        expect(tip).toMatchObject({ status: "pending_cleanup", failureReason: "sandbox_stop_pending",
+          metadata: { sandboxStopAndRetain: { reason: "sandbox_source_changed" } } });
       }
     } finally {
       if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
