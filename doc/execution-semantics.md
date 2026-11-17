@@ -3094,7 +3094,13 @@ the trusted source run and agent. It collects wake and first-turn input IDs from
 previous/retry edges and older runs on the same native thread, within the same
 company, task, agent, and conversation generation. A reset ends that lineage.
 It does not turn arbitrary task history into pending work. The answer rule above
-removes answered comments before the new seed is saved. The successor owns a new
+removes answered comments before the new seed is saved. Separately, a queued,
+running, or scheduled-retry run on the same company, task and agent that already
+carries the message as pending input blocks a second carry; pending is not an
+answer. This check excludes the run being seeded or restored from, so its own
+first-turn revalidation does not discard its input. The shared sender-stop
+exclusion also removes the stopped turn's own input, never the waiting list
+that a person later authorizes with Send. The successor owns a new
 first-turn receipt; it never borrows an ancestor's delivery claim. A person's
 card answer still takes priority over the asking turn's origin comment, unchanged.
 There is no count cap on `wakeCommentIds` in the existing queue contract. Carry
