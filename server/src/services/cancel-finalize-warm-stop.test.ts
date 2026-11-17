@@ -25,6 +25,7 @@ import {
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { recoveryService } from "./recovery/service.js";
+import { prepareSandboxStopAndRetain } from "./sandbox-stop-and-retain.js";
 import { hasRemoteTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { captureDirectorySnapshot, directorySnapshotSha256, withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -360,20 +361,19 @@ const support = await getEmbeddedPostgresTestSupport();
     console.info(`[adopt-stopu r2 absent lines ${_label}] ${JSON.stringify({ sources: seen.sources, found: [] })}`);
   }, 60_000);
 
-  // adopt-stopu step 6/7 (H6 decision): a stale-lock sweep BETWEEN the person's
-  // Stop and the stop receipt (export in progress, lease still active), then
-  // after the stop_and_retain release. Records whether a Stop-pending card appears.
-  // Finding (decides step 6): a Stop-pending card CAN appear in this window under U
-  // (onlyUnreleasedLeasesWithinBoundBlockStop refuses a recorded Stop request), and
-  // h6-narrow cannot suppress it: its card path keys off provedWarmTurnHandoff
-  // (agent-execution-stop.ts), which needs nativeRetainedIdleCheckpoint, never written
-  // under stop_and_retain. Recorded here; h6-narrow is dropped.
-  it("H6 window: a sweep between the Stop and the stop receipt raises a Stop-pending card; after the release the next sweep retires it", async () => {
+  // U's own bound stop-only intent, not H6's retained-idle receipt, defers the
+  // diagnostic while provider Stop is in flight. Stop proof itself stays strict.
+  it("H6 window: U's bounded Stop in flight raises no card; receipt lands and the next turn adopts the box", async () => {
     const f = await stopMidTurn({ edit: true, settled: true, exportFails: false });
     const [released] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
     // Rewind to the window: the lease not yet released, no receipt yet; both claims held by the stopped run.
-    await db.update(environmentLeases).set({ status: "active", cleanupStatus: null, releasedAt: null, metadata: {} })
-      .where(eq(environmentLeases.id, f.leaseId));
+    await db.update(environmentLeases).set({ status: "active", cleanupStatus: null, releasedAt: null,
+      metadata: { pluginId: randomUUID() } }).where(eq(environmentLeases.id, f.leaseId));
+    const [active] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    const requested = await prepareSandboxStopAndRetain(db, active!);
+    expect(requested).not.toBeNull();
+    await db.update(environmentLeases).set({ metadata: { ...requested!.metadata, pendingCleanupInFlight: true,
+      pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000 } }).where(eq(environmentLeases.id, f.leaseId));
     await db.update(issues).set({ checkoutRunId: f.runId, executionRunId: f.runId, executionLockedAt: new Date(),
       conversationAgentId: f.agentId, conversationUserId: "board", conversationState: "active" }).where(eq(issues.id, f.issueId));
     const sweep = async () => {
@@ -386,7 +386,9 @@ const support = await getEmbeddedPostgresTestSupport();
       releasedAt: released.releasedAt, metadata: released.metadata }).where(eq(environmentLeases.id, f.leaseId));
     const after = await sweep();
     console.info(`[adopt-stopu H6 window] ${JSON.stringify({ during, after })}`);
-    expect({ during, after }).toEqual({ during: ["execution_stop_pending:escalated"], after: ["execution_stop_pending:resolved"] });
+    expect({ during, after }).toEqual({ during: [], after: [] });
+    expect(await successorOnSameBox(f)).toBe("adopt_remote");
+    expect(await readFile(join(f.box, "task.txt"), "utf8")).toBe(EDIT);
   }, 60_000);
 
   it("a Stop whose cancellation is NOT settled runs no export", async () => {
