@@ -232,6 +232,54 @@ describe("S124 parked wake: monotonic first-park deadline", () => {
     expect(Date.parse(String(row.payload?.firstParkedAt))).toBeGreaterThanOrEqual(parkedAt.getTime() - 1_000);
   });
 
+  // S124c (RFL ruling): only a NAMED wait the person controls (their own
+  // pause, a budget limit) may stay unbounded. A Stop/Send park refused into
+  // any other executionWait (the live case: interrupt_handoff, "Sending your
+  // messages." for 5+ min with no run) is exactly the silent loop S124 bounds.
+  it.each([
+    ["interrupt_handoff", "Sending your messages."],
+    ["remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically."],
+  ])("a Send parked in executionWait %s whose re-dispatch keeps failing gets ONE note at first park + deadline", async (reason, message) => {
+    const f = await fixture(), parkedAt = new Date();
+    const wake = await park(f, parkedAt, { executionWait: { reason, message } });
+    const deps = createHeartbeatQueueTestDependencies(db), queue = createHeartbeatQueue(db, deps);
+    await registerDeferredReceiptWork(db, coordinator, { resume: scope => queue.resumeDeferredExecutionReceipts(scope),
+      settleTaskChat: async () => {}, createNativeBatch: () => async () => {}, schedulingSuppressed: async () => false }, () => true).ready;
+    const at = parkedAt.getTime();
+    for (let t = at + 5_000; t <= at + DEADLINE_MS - 5_000; t += 5_000) await tick(queue, t);
+    expect(deps.resumeQueuedCommentInterrupt.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(await notes(f.issue.id)).toHaveLength(0);
+    for (let t = at + DEADLINE_MS - 4_000; t <= at + DEADLINE_MS + 1_000; t += 1_000) await tick(queue, t);
+    await waitForReal(async () => expect(await notes(f.issue.id)).toHaveLength(1));
+    const atDeadline = deps.resumeQueuedCommentInterrupt.mock.calls.length;
+    expect(atDeadline).toBeLessThanOrEqual(DEADLINE_MS / RETRY_MS);
+    const row = await readWake(wake.id);
+    expect(row.payload?.firstParkedAt).toBe(parkedAt.toISOString());
+    expect(typeof row.payload?.parkedNoticeAt).toBe("string");
+    const [note] = await notes(f.issue.id);
+    expect(note.body).toMatch(/did not start/i);
+    expect(note.body).toMatch(/Retry/);
+    for (let i = 1; i <= 6; i++) await tick(queue, at + DEADLINE_MS + 1_000 + i * RETRY_MS);
+    expect(deps.resumeQueuedCommentInterrupt).toHaveBeenCalledTimes(atDeadline);
+    expect(await notes(f.issue.id)).toHaveLength(1);
+  });
+
+  it("a Send held by the person's own pause (executionWait agent.not_invokable) stays unbounded: no anchor, no note", async () => {
+    const f = await fixture(), parkedAt = new Date();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agent.id));
+    const wake = await park(f, parkedAt, { executionWait: { reason: "agent.not_invokable",
+      message: "This agent is paused. Resume it to send your saved message." } });
+    const deps = createHeartbeatQueueTestDependencies(db), queue = createHeartbeatQueue(db, deps);
+    await registerDeferredReceiptWork(db, coordinator, { resume: scope => queue.resumeDeferredExecutionReceipts(scope),
+      settleTaskChat: async () => {}, createNativeBatch: () => async () => {}, schedulingSuppressed: async () => false }, () => true).ready;
+    for (let t = parkedAt.getTime() + 5_000; t <= parkedAt.getTime() + 2 * DEADLINE_MS; t += 5_000) await tick(queue, t);
+    expect(await notes(f.issue.id)).toHaveLength(0);
+    const row = await readWake(wake.id);
+    expect(row.payload?.firstParkedAt).toBeUndefined();
+    expect(row.payload?.parkedNoticeAt).toBeUndefined();
+    expect(row.status).toBe("deferred_issue_execution");
+  });
+
   async function issueServiceDone(issueId: string) {
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
   }
