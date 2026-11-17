@@ -5,6 +5,7 @@ import { executionBlockerPredicate, NEW_TASK_CONTINUE_ACTION, restoreHoldPredica
   withoutUnavailableRetry } from "./execution-blocker.js";
 import { WORKSPACE_RESTORE_PENDING_KEY, workspaceRestoreHoldNextAction } from "./legacy-execution-recovery.js";
 import { exhaustedStopWait, readSystemRecovery } from "./system-recovery-state.js";
+import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import {
   AGENT_PAUSED_ACTION, AGENT_PAUSED_RETRY_MESSAGE, AUTOMATIC_RECOVERY_MESSAGE, HELD_CONDITION, HELD_PREDECESSOR_NOTICE,
   HELD_NEW_TASK_MESSAGE, HELD_RECOVERED_NEW_TASK_MESSAGE, HELD_RECOVERED_WORK_MESSAGE, HELD_RETRY_ACTION, NEW_TASK_ACTION, NO_SAVED_WORK_NEW_TASK_MESSAGE, NO_SAVED_WORK_RETRY_ACTION, NO_SAVED_WORK_RETRY_MESSAGE,
@@ -87,6 +88,10 @@ export type RetryAuthorityFacts = {
 
 export type RetryAuthority = {
   canRetry: boolean;
+  /** fam-retry2 (upstream's restore-hold semantics): "held" = Retry is accepted
+   * once and held behind the restore hold; it runs through upstream's
+   * restore-held admission when the files are back (no immediate wake). */
+  admission?: "held";
   userAction: RetryUserAction;
   /** The card's text; null keeps the surface's own neutral text (no instruction to contradict). */
   cardText: string | null;
@@ -127,11 +132,13 @@ export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority
     return decision("wait", RESTORE_STOP_WAIT_REASON, text, text);
   }
   // Restore hold: the words are legacy-execution-recovery.ts's (restore-card),
-  // never a second mapping here. Files owed: wait while they are recovered.
+  // never a second mapping here. fam-retry2 (upstream wins): while Paperclip can
+  // still put the files back, Retry is ACCEPTED and HELD (the hold's words: "your
+  // message is kept and runs when it's back"); only a failed restore refuses.
   if (facts.restoreHold) {
     const text = workspaceRestoreHoldNextAction(facts.restoreHold);
-    return facts.restoreHold[WORKSPACE_RESTORE_PENDING_KEY] === true
-      ? decision("wait", "workspace_repair_required", text, text)
+    return restoreHoldHoldsRetry(facts.restoreHold)
+      ? { ...decision("wait", "workspace_repair_required", text, text), canRetry: true, admission: "held" }
       : decision("new_task", "workspace_repair_required", withoutUnavailableRetry(text, false), NEW_TASK_CONTINUE_ACTION);
   }
   const recovered = facts.savedWork === "recovered";
@@ -174,6 +181,20 @@ export async function readRetryAuthorityFacts(db: Db, input: { companyId: string
   ]);
   return { agentPaused: assignee?.status === "paused", heldConversation: Boolean(notice),
     heldRefusal: refusals.get(input.issueId) ?? null, restoreStopWait } satisfies RetryAuthorityFacts;
+}
+
+/** fam-retry2: a restore hold behind which upstream accepts and holds a Retry
+ * (task-retry.ts admission records it deferred and binds it to the hold's
+ * systemRecovery; heartbeat admission defers it on the execution blocker until
+ * the files are back): the files are owed (pending marker), Paperclip's
+ * workspace recovery owns them (hasRequiredWorkspaceRecovery: admission adopts
+ * a systemRecovery for it), or a native export awaits reconciliation (no restore
+ * failure recorded). A FAILED restore is the rest: a recorded restore failure
+ * with no recovery that can put the files back (restoreHoldPredicate's
+ * restore_unsafe_archive arm without a recovery record). */
+export function restoreHoldHoldsRetry(evidence: Record<string, unknown>) {
+  return evidence[WORKSPACE_RESTORE_PENDING_KEY] === true || hasRequiredWorkspaceRecovery(evidence)
+    || typeof evidence.workspaceRestoreFailure !== "string";
 }
 
 export const RESTORE_STOP_WAIT_REASON = "workspace_restore_stop_wait";
@@ -236,21 +257,31 @@ export async function readRestoreHoldEvidence(db: Db, input: { companyId: string
 //   stop; a repeat refuses too (the fact does not depend on the click).
 const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["agent_paused", "workspace_repair_required", "execution_stop_unproven",
   RESTORE_STOP_WAIT_REASON]);
-// A repeat of an already accepted Retry (`repeat`) is refused only where the card
-// now refuses for good (an expired Stop, a pause, a restore that failed): a
-// restore still pending is a wait whose own words keep the message and run it
-// when the files are back, and it is often the accepted Retry's own recovery.
-export async function retryRefusedBeforeAdmission(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null;
-  repeat?: boolean }): Promise<RetryAuthority | null> {
+// fam-retry2: a restore hold Paperclip can still release is an accept-held
+// outcome (canRetry, admission "held"), not a refusal, for a new click and for
+// an idempotent repeat alike (the repeat returns the same held acceptance; no
+// second wake). A failed restore, a pause, an expired Stop and card7's
+// exhausted stop wait still refuse, a repeat included.
+export async function readRetryAdmissionAuthority(db: Db, input: { companyId: string; issueId: string;
+  sourceRunId?: string | null }): Promise<RetryAuthority> {
   const [{ getExecutionBlocker }, { readRetryStopGate }] = await Promise.all([import("./execution-blocker.js"), import("./task-retry-stop-gate.js")]);
   const hold = await readRestoreHoldEvidence(db, input);
-  const restoreHold = hold && !(input.repeat && hold[WORKSPACE_RESTORE_PENDING_KEY] === true)
-    && (await getExecutionBlocker(db, input.companyId, input.issueId))?.canRetry === false ? hold : null;
+  const restoreHold = hold && (await getExecutionBlocker(db, input.companyId, input.issueId))?.canRetry === false ? hold : null;
   const gate = input.sourceRunId
     ? (await readRetryStopGate(db, { companyId: input.companyId, issueId: input.issueId, sourceRunId: input.sourceRunId }))?.state : null;
-  const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, input), restoreHold,
+  return decideRetryAuthority({ ...await readRetryAuthorityFacts(db, input), restoreHold,
     stopGate: gate === "expired" ? "expired" : null, retrySource: true });
+}
+export function retryRefusedBeforeAdmissionReason(reason: string) { return REFUSED_BEFORE_ADMISSION.has(reason); }
+export async function retryRefusedBeforeAdmission(db: Db, input: { companyId: string; issueId: string;
+  sourceRunId?: string | null }): Promise<RetryAuthority | null> {
+  const authority = await readRetryAdmissionAuthority(db, input);
   return !authority.canRetry && REFUSED_BEFORE_ADMISSION.has(authority.reason) ? authority : null;
+}
+/** fam-retry2: the accept-held outcome of the one authority, or null. */
+export async function retryHeldBehindRestore(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
+  const authority = await readRetryAdmissionAuthority(db, input);
+  return authority.admission === "held" ? authority : null;
 }
 
 /** retry-fold6 (rf-3 FAIL 3): a held conversation's note states the held
