@@ -255,17 +255,26 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
 
   /** RFL 19:51Z guard (supbusy 30 s bound): a run written failed
    * native_predecessor_retirement_unproven must project either a real
-   * continuation (working, a scheduled retry exists) or the failed attempt
-   * with Retry at once; never "working" with no Retry and no continuation. */
+   * continuation or the failed attempt with Retry; never "working" with no
+   * Retry while nothing is about to run. Read through the DB projection over a
+   * fake clock (t = the continuation's due time, the failure's bound):
+   * - dispatched: the scheduler promoted the continuation, so working is true at
+   *   +0, +60 s and +120 s, and it completes;
+   * - not started: before due it names its time (retry_scheduled); once due it
+   *   is working only for the 30 s no-work hand-off; past that the failed
+   *   attempt offers Retry (+31 s, +60 s, +120 s), not at 120 s;
+   * - refused (prepared remote workspace sync): no continuation, failed with
+   *   Retry at once. */
   it.each([
-    { name: "the fallback schedules the continuation", workspaceSync: false },
-    { name: "the fallback refuses (prepared remote workspace sync)", workspaceSync: true },
-  ])("projects a run failed native_predecessor_retirement_unproven truthfully when $name", async ({ workspaceSync }) => {
+    { name: "the fallback schedules the continuation and it is dispatched", mode: "dispatched" },
+    { name: "the fallback schedules the continuation and it never starts", mode: "not_started" },
+    { name: "the fallback refuses (prepared remote workspace sync)", mode: "refused" },
+  ] as const)("projects a run failed native_predecessor_retirement_unproven truthfully when $name", async ({ mode }) => {
     const { companyId } = fixture.current;
     const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
     const [environment] = await db.insert(environments).values({ name: `reused-${randomUUID()}`, driver: "sandbox" }).returning();
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db,
-      { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id, workspaceSync } }) });
+      { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id, workspaceSync: mode === "refused" } }) });
     try {
       const { issueId, runId } = await startTask(db, heartbeat);
       const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -274,20 +283,55 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
       const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.retryOfRunId, runId)));
       const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
-      const presentation = await taskInterruptionPresentation(db, issue!);
-      if (!workspaceSync) {
-        expect(successors).toEqual([expect.objectContaining({ status: "scheduled_retry", scheduledRetryReason: "interrupted_preparation" })]);
-        expect(presentation).toMatchObject({ state: "working", canRetry: false });
-      } else {
+      const projectAt = async (time: number) => {
+        vi.useFakeTimers({ toFake: ["Date"], now: time });
+        try {
+          const presentation = await taskInterruptionPresentation(db, issue!);
+          return { state: presentation?.state, canRetry: presentation?.canRetry, nextRetryAt: presentation?.nextRetryAt ?? null };
+        } finally {
+          vi.useRealTimers();
+        }
+      };
+      if (mode === "refused") {
         expect(successors).toEqual([]);
         // preparePredecessorRetirementFallback refused: no fallback record.
         expect(failed!.resultJson).not.toHaveProperty("predecessorRetirementFallback");
         expect({ errorCode: failed!.errorCode, continuationScheduling: failed!.resultJson?.continuationScheduling ?? null })
           .toEqual({ errorCode: "adapter_failed", continuationScheduling: null });
         // No continuation is coming: the failed attempt and its Retry, now.
-        expect(presentation).toMatchObject({ state: "failed", canRetry: true });
+        expect(await projectAt(failed!.finishedAt!.getTime())).toEqual({ state: "failed", canRetry: true, nextRetryAt: null });
+        return;
       }
+      // The first interrupted-preparation attempt is due at once (no backoff).
+      expect(successors).toEqual([expect.objectContaining({ status: "scheduled_retry", scheduledRetryReason: "interrupted_preparation",
+        scheduledRetryAttempt: 1 })]);
+      const due = successors[0]!.scheduledRetryAt!.getTime();
+      expect(due - failed!.finishedAt!.getTime()).toBeLessThan(5_000);
+      const working = { state: "working", canRetry: false, nextRetryAt: null };
+      if (mode === "dispatched") {
+        expect(await projectAt(due)).toEqual(working);
+        expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 1 });
+        // Promoted: the queue starts it, so working is true however long it takes.
+        for (const offset of [0, 60_000, 120_000]) expect(await projectAt(due + offset)).toEqual(working);
+        await heartbeat.resumeQueuedRuns();
+        await waitForCondition("the continuation to succeed", async () =>
+          (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successors[0]!.id)))[0]?.status === "succeeded");
+        await waitForCondition("the continuation to settle", () => heartbeat.getTaskDrainStatus().quiescent);
+        expect((await projectAt(Date.now()))?.state).not.toBe("failed");
+        return;
+      }
+      // Not yet due: the true line is the automatic retry and its time.
+      expect(await projectAt(due - 10_000)).toEqual({ state: "retry_scheduled", canRetry: false,
+        nextRetryAt: new Date(due).toISOString() });
+      // Due: the scheduler is starting it, for the 30 s no-work hand-off only.
+      expect(await projectAt(due)).toEqual(working);
+      expect(await projectAt(due + 29_000)).toEqual(working);
+      // Not started by then: the failed attempt and its Retry.
+      for (const offset of [31_000, 60_000, 120_000, 600_000])
+        expect(await projectAt(due + offset)).toEqual({ state: "failed", canRetry: true, nextRetryAt: null });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successors[0]!.id)))[0]?.status).toBe("scheduled_retry");
     } finally {
+      vi.useRealTimers();
       await heartbeat.drainActiveRunExecutions();
       await closeIdleWarmNativeSessionsForRestart();
       await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(and(
@@ -532,7 +576,9 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
       expect((await heartbeat.promoteDueScheduledRetries()).runIds).not.toContain(second!.id);
       expect(failure.failedRuns).toHaveLength(2);
       const [waiting] = await db.select().from(issues).where(eq(issues.id, issueId));
-      expect(await taskInterruptionPresentation(db, waiting!)).toMatchObject({ state: "working", canRetry: false });
+      // Backed off, not yet due: the automatic retry and its time, no Retry.
+      expect(await taskInterruptionPresentation(db, waiting!)).toMatchObject({ state: "retry_scheduled", canRetry: false,
+        nextRetryAt: second!.scheduledRetryAt!.toISOString() });
 
       await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 12, scheduledRetryAt: new Date(Date.now() - 1_000),
         contextSnapshot: { ...second!.contextSnapshot, executionRetryAccounting: {
