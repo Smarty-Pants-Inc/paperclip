@@ -1631,6 +1631,8 @@ lease row for that sandbox is no longer active or retained, the host has given t
 sandbox up: the warm owner is released and the next run on the task prepares its
 instructions fresh. A follow-up whose predecessor's warm instruction copy cannot be
 handed off retires that owner and prepares fresh instead of failing.
+A failed close that releases its owner without a backup, or exhausts its retries,
+sets `nativeHarnessBackupMissing` on its exact lease: destroy is refused; stop keeps the disk.
 
 A remote runner also keeps working while its controller is offline, and the host
 reattaches it within the remote runner reconnect grace (7 minutes). Daytona counts
@@ -1768,7 +1770,7 @@ Connected task Retry can continue a failed legacy setup before provider dispatch
 
 An explicit recovery action is a typed liveness repair path for a source issue. It is the recovery primitive; the action can be rendered directly on the source issue or backed by a separate recovery issue when the repair needs its own work item.
 
-A terminal native failure can retain a result accepted before checkpoint or cleanup failed. That result is historical evidence, not a live controller. New user input may start a fresh turn after the controller and execution environment have stopped and ordinary admission checks pass. Preserve the failed run, its result, and its recovery budget. Do not commit the old result, infer action outcomes, or replay the failed turn. A message saved while cleanup is pending must be reconsidered after verified cleanup and delivered once. External chat messages retain their original inbound action, wake receipt and actor. Cleanup delegates reconsideration to the live inbound owner, which revalidates the endpoint, conversation generation, principal and exact saved source before normal admission. The existing stranded-queue sweep uses the same owner after a lost callback or restart; it cannot substitute a generic assignment wake. A rejected source must not prevent other saved messages from being reconsidered. Admission must consume its deferred receipt in the same transaction that creates the new run, including in agent chat, where later messages keep their separate turns. Completing that run must not promote the consumed receipt again. Workspace-export repair retains its separate saved-result recovery path.
+A terminal native failure can retain a result accepted before checkpoint or cleanup failed. That result is historical evidence, not a live controller. New user input may start a fresh turn after the controller and execution environment have stopped and ordinary admission checks pass. Preserve the failed run, its result, and its recovery budget. Do not commit the old result, infer action outcomes, or replay the failed turn. A message saved while cleanup is pending must be reconsidered after verified cleanup and delivered once. External chat messages retain their original inbound action, wake receipt and actor. Cleanup delegates reconsideration to the live inbound owner, which revalidates the endpoint, conversation generation, principal and exact saved source before normal admission. The existing stranded-queue sweep uses the same owner after a lost callback or restart; it cannot substitute a generic assignment wake. A rejected source must not prevent other saved messages from being reconsidered. Admission must consume its deferred receipt in the same transaction that creates the new run, including in agent chat. There, a message never joins the running turn: the owner's plain messages sent during a turn share one ordered deferred wake, which the next turn answers together, while a `/new` reset always keeps its own wake, so no message merges across it. Completing that run must not promote the consumed receipt again. Workspace-export repair retains its separate saved-result recovery path.
 
 When a native run's accepted result reports a failed turn without a classified provider error (`run_failed_partial_evidence_preserved`, for example an OpenCode server that was killed or ended without an answer), the status decision keeps the task's status and queues one same-agent `schedule_retry` wake. The wake dispatcher accepts that committed decision effect as the continuation's provenance, exactly like an `enqueue_continuation` effect, so the task always has queued work, and the retry answers the same external chat conversation. The automatic continuation is used once per chain: if the run started from that wake fails the same way, the decision is `native_run_failed_continuation_exhausted`, the task is blocked with a board blocker, and the visible Retry starts the next attempt.
 
@@ -3469,6 +3471,8 @@ without first trying to resume, and its transcript shows the session as started
 rather than resumed. A failure before the result is accepted, a backup that
 saves after a retry, a retained sandbox, an SSH host, and records saved without
 the key keep the resume path described next.
+For retained disks, a later successful server backup of the same session clears
+`nativeHarnessBackupMissing`; an older backup or another session does not clear it.
 
 A Runner that keeps no control-plane state for the saved session (none is live
 and no archived authority epoch matches it) reports a typed refusal. This
@@ -4553,7 +4557,7 @@ Real gates still apply: company and task ownership, active provider ownership, b
 
 A source that already stopped and was released remains fenced until its export settles; restart reconciliation scans these released sources too. Both provider reuse and destruction check the physical allocation for a shutdown fence or file-repair pin, including historical lease rows.
 
-An operator Stop waits for provider termination. Remote sandbox providers may return a stopped/deleted receipt after their control-plane operation completes. Paperclip binds that receipt to the company, run, and exact lease; successful file cleanup, a terminal run row, or an in-sandbox shutdown event is not sufficient. Legacy conversational runs and native runs with an audited run-only Stop receive their shared cancellation acknowledgement after all remote leases have confirmed termination. A native interrupt acknowledgement alone does not establish containment. Workspace preservation remains a separate obligation and its recovery hold survives this acknowledgement. Stop alone never creates a continuation. A user message queued during remote cleanup is reconsidered when the provider confirms termination; it still passes normal admission and adopts pending comment IDs in order. Once stopped, the next explicit wake uses the same queue. A compatible saved ACP session can resume, and an unavailable or incompatible session can start fresh with the full task context. Run credentials and scratch paths remain scoped to the new run. A subtree pause requires Resume; a message does not bypass it.
+An operator Stop waits for provider termination. Remote sandbox providers may return a stopped/deleted receipt after their control-plane operation completes. Paperclip binds that receipt to the company, run, and exact lease; successful file cleanup, a terminal run row, or an in-sandbox shutdown event is not sufficient. Legacy conversational runs and native runs with an audited run-only Stop receive their shared cancellation acknowledgement after all remote leases have confirmed termination. A native interrupt acknowledgement alone does not establish containment. Workspace preservation remains a separate obligation and its recovery hold survives this acknowledgement. Stop alone never creates a continuation. In an Agent Chat this holds too: a person's Stop sends none of the messages waiting behind the stopped turn. They stay listed as one queue, in the order sent, with the line "Stopped. These messages are waiting: Send them, or delete any first." The chat owner's Send (`POST /api/issues/:id/queued-comments/interrupt`) starts one turn with the messages still waiting, each once and in order; a paused agent or a chat pause hold refuses Send with its reason and runs nothing. A user message queued during remote cleanup is reconsidered when the provider confirms termination; it still passes normal admission and adopts pending comment IDs in order. Once stopped, the next explicit wake uses the same queue. A compatible saved ACP session can resume, and an unavailable or incompatible session can start fresh with the full task context. Run credentials and scratch paths remain scoped to the new run. A subtree pause requires Resume; a message does not bypass it.
 
 Native workspace finalization can complete after an operator Stop has cancelled
 its run. The accepted provider result and saved-file receipts remain available,
@@ -5848,6 +5852,19 @@ PRP event persistence. It locks and rereads the run after acknowledgement before
 merging the receipt, preserving concurrent provider updates.
 If the run stops during that wait, the request fails with a stale-target error
 and retains the queued input for continuation.
+
+Agent Chat steers like any native task, with the live session probe deciding
+`available`, and steer is the default through the same 5 s auto-steer. Only the
+chat owner may steer, as for Interrupt; a manager agent may not. Only the first
+queued message of the chat is eligible, in the browser and on the server: a
+later message, a `/new` reset and anything queued behind a `/new` are refused
+(409) without contacting the provider, and so is a turn from an earlier chat
+session generation. A steered message is recorded as carried by the turn that
+took it (its comment id joins that run's `wakeCommentIds`, and for a chat it
+becomes the run's reply boundary), so settlement and the answered-message check
+treat it like the turn's own input. A runner that cannot take a mid-turn steer
+reports `unsupported` or `temporarily_unavailable` through the probe; the
+message stays queued and is delivered at the turn boundary.
 
 ### Preserve work across handoff and deliver requested files
 

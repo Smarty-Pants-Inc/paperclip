@@ -1205,7 +1205,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
         toMs(liveRun.createdAt))
       : (settlingRun?.startedAtMs ?? null);
-  const heldPaperclipRunnerFinalText = useMemo(() => {
+  const heldPaperclipRunnerFinalMessage = useMemo(() => {
     if (!heldPaperclipRunnerRunId) return null;
     const entries = transcriptByRun.get(heldPaperclipRunnerRunId) ?? [];
     for (let index = entries.length - 1; index >= 0; index -= 1) {
@@ -1215,11 +1215,41 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         entry.channel === "final" &&
         entry.text.trim()
       ) {
-        return entry.text;
+        return entry;
       }
     }
     return null;
   }, [heldPaperclipRunnerRunId, transcriptByRun]);
+  const heldPaperclipRunnerFinalText = heldPaperclipRunnerFinalMessage?.text ?? null;
+
+  // Reading a live response may adopt only its own run's saved identity, not
+  // an equal-text reply from another turn. Prefer the earliest exact copy so
+  // a repeated final cannot move the read cutoff to a later unseen message.
+  const heldPaperclipRunnerResponseComment = useMemo(() => {
+    if (!heldPaperclipRunnerRunId || !heldPaperclipRunnerFinalMessage) return undefined;
+    const run = [activeRun, ...(liveRuns ?? [])].find(run => run?.id === heldPaperclipRunnerRunId)
+      ?? linkedRunMetaById.get(heldPaperclipRunnerRunId);
+    const visibleAtMs = new Date(heldPaperclipRunnerFinalMessage.ts).getTime();
+    if (!run?.agentId || !Number.isFinite(visibleAtMs)) return undefined;
+    let comment: TaskChatThreadProps["comments"][number] | undefined;
+    for (const candidate of projectedComments) {
+      if (candidate.deletedAt || candidate.authorType !== "agent" ||
+        candidate.authorAgentId !== run.agentId ||
+        (candidate.createdByRunId ?? candidate.runId) !== heldPaperclipRunnerRunId ||
+        candidate.body !== heldPaperclipRunnerFinalMessage.text ||
+        !Number.isFinite(new Date(candidate.createdAt).getTime())) continue;
+      if (!comment || toMs(candidate.createdAt) < toMs(comment.createdAt)) comment = candidate;
+    }
+    if (!comment) return undefined;
+    const savedAtMs = toMs(comment.createdAt);
+    // The API uses the saved comment's timestamp, not the transcript's. A
+    // persistence delay must never sweep an intervening, unrendered message
+    // (including one at the same timestamp) into that read receipt.
+    if (projectedComments.some(other => !other.deletedAt && other.id !== comment.id &&
+      toMs(other.createdAt) >= Math.min(visibleAtMs, savedAtMs) &&
+      toMs(other.createdAt) <= savedAtMs)) return undefined;
+    return { id: comment.id, text: comment.body, createdAtIso: new Date(comment.createdAt).toISOString() };
+  }, [projectedComments, heldPaperclipRunnerRunId, heldPaperclipRunnerFinalMessage, activeRun, liveRuns, linkedRunMetaById]);
 
   // Runs observed non-terminal while mounted: their turns ANIMATE the fold when
   // they settle. Runs already terminal at mount collapse instantly.
@@ -3597,6 +3627,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                                       agentIcon={visibleTailAgentIcon}
                                       agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                       items={tailItems}
+                                      responseComment={heldPaperclipRunnerResponseComment}
                                       preparationLabel={optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
                                       allowSummaryFallback={!paperclipRunnerTail ||
                                         terminalHydratedRunIds.has(tailRunId ?? "") ||
@@ -3724,6 +3755,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                           onEdit={beginQueuedEdit}
                           editingCommentId={queuedEdit?.commentId ?? null}
                           autoSteerDelayMs={queuedMessageAutoSteerDelayMs}
+                          steerHeadOnly={conversationMode === true}
                           onReorder={async (orderedCommentIds, revision) => {
                             if (!onReorderQueuedComments)
                               throw new Error("Queue reordering is unavailable.");

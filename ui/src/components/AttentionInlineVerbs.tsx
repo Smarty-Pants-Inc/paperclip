@@ -9,7 +9,7 @@ import { useOptionalToastActions } from "../context/ToastContext";
 import { invalidateAttentionRecordViews } from "../lib/attention-record-views";
 import { taskRetryNotStartedReason } from "../hooks/useTaskRetry";
 import { queryKeys } from "../lib/queryKeys";
-import { cn, formatCents } from "../lib/utils";
+import { cn, formatCents, formatConfiguredCents } from "../lib/utils";
 import { DecisionCardFooter } from "./DecisionCardFooter";
 import { NeedsYouPanel, NeedsYouPanelNote, NeedsYouPanelRow } from "./coordinator/NeedsYouCardKit";
 import { Button } from "./ui/button";
@@ -231,7 +231,7 @@ export function BudgetAlertActions({
     return <>
       <NeedsYouPanel>
         <div className="flex items-baseline justify-between gap-3">
-          <span className="truncate text-(length:--text-compact) font-medium text-foreground">{`${formatCents(observed)} spent of ${formatCents(limit)}`}</span>
+          <span className="truncate text-(length:--text-compact) font-medium text-foreground">{`${formatCents(observed)} spent of ${formatConfiguredCents(limit)}`}</span>
           <span className="shrink-0 text-xs text-muted-foreground">{`${percent}% used`}</span>
         </div>
         <div className="h-1 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="Budget used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(percent, 100)}>
@@ -262,7 +262,7 @@ export function BudgetAlertActions({
   return (
     <div className="space-y-3" data-attention-budget-actions>
       <p className="text-sm text-muted-foreground">
-        {`Spend is ${formatCents(observed)} of a ${formatCents(limit)} limit.`}
+        {`Spend is ${formatCents(observed)} of a ${formatConfiguredCents(limit)} limit.`}
         {isWarning ? " This warning does not pause work." : " Work in this scope is paused."}
       </p>
       {limitInput}

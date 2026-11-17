@@ -73,9 +73,10 @@ export function isSystemOwnedFailureCode(code: string | null | undefined): boole
 }
 
 /**
- * A first start whose Runner never connected (runner_ingress_startup_failed,
- * proven by the controller checkpoint before each same-run retry) used up its
- * bounded retries. No provider thread ever existed, so there is nothing to
+ * A first start whose Runner never connected (runner_ingress_startup_failed),
+ * or whose endpoint acquisition failed with HTTP 429/5xx, used up its bounded
+ * retries. The coordinator proves no agent work, exactly as for startup
+ * failure. No provider thread ever existed, so there is nothing to
  * restore. The task still continues automatically in a fresh run (a new box
  * usually answers); only its note differs (r104c). Reads the coordinator's
  * own durable record of that proof (R1-04, rf4).
@@ -84,8 +85,12 @@ export function nativeStartupNeverConnectedExhausted(coordinator: {
   phase: string; failureCode: string | null; failureDetail: Record<string, unknown> | null;
 } | null | undefined): boolean {
   const detail = coordinator?.failureDetail;
+  const httpStatus = object(detail?.runnerIngressFailure).httpStatus;
   return coordinator?.phase === "terminal_failure" && coordinator.failureCode === "native_session_retry_exhausted"
-    && detail?.originalFailureCode === "runner_ingress_startup_failed" && detail.recoveryMode === "bootstrap_retry"
+    && (detail?.originalFailureCode === "runner_ingress_startup_failed"
+      || detail?.originalFailureCode === "runner_ingress_acquisition_failed" && typeof httpStatus === "number"
+        && Number.isInteger(httpStatus) && (httpStatus === 429 || (httpStatus >= 500 && httpStatus <= 599)))
+    && detail.recoveryMode === "bootstrap_retry"
     && detail.providerSessionEstablished === false && detail.providerEventsExist === false && detail.checkpointExists === false;
 }
 

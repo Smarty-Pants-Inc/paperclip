@@ -178,7 +178,7 @@ export interface WakeQueueTransaction {
     issueId: string;
     finishingRunId: string;
     commentIds: string[];
-  }): Promise<{ allSelfAuthored: boolean }>;
+  }): Promise<{ allSelfAuthored: boolean; includesPersonComment: boolean }>;
   /** Proves all candidate comments only report completed child work in the finishing parent's own run. */
   isCompletedDelegationMention(input: {
     companyId: string;
@@ -451,6 +451,12 @@ export interface WakeAdmissionReader {
       /** Matches only deferred wakes for this chat conversation or for no conversation. */
       chatConversationId?: string | null;
       durableActor?: { type: string | null; id: string | null };
+      /**
+       * Agent Chat: only the issue's LATEST deferred wake, and only when it
+       * holds plain person messages (no /new reset, card response or fresh
+       * session), so a merge never reorders messages or crosses a reset.
+       */
+      conversationTail?: boolean;
     },
   ): Promise<ExistingDeferredWake | null>;
 }

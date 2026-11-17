@@ -29,7 +29,9 @@ export function queuedMessageAutoSteerKey(entry: IssueQueuedCommentEntry): strin
 /**
  * Only the author's own plain follow-up, while the runner can take same-turn
  * input. Everything else keeps the ordinary queue (Steer and Interrupt stay
- * explicit).
+ * explicit). A /new chat reset runs only at a turn boundary, and an Agent Chat
+ * (`headOnly`) steers only its first queued message, so messages keep the
+ * order they were sent in.
  */
 export function queuedMessageAutoSteerEligible(input: {
   queue: IssueQueuedCommentQueue;
@@ -37,6 +39,7 @@ export function queuedMessageAutoSteerEligible(input: {
   cancelledIds: ReadonlySet<string>;
   attemptedKeys: ReadonlySet<string>;
   editingCommentId: string | null;
+  headOnly?: boolean;
 }): boolean {
   const { queue, entry } = input;
   return queue.steeringDisposition === "available"
@@ -48,5 +51,7 @@ export function queuedMessageAutoSteerEligible(input: {
     && !entry.comment.id.startsWith("optimistic-")
     && !input.cancelledIds.has(entry.comment.id)
     && !input.attemptedKeys.has(queuedMessageAutoSteerKey(entry))
-    && input.editingCommentId !== entry.comment.id;
+    && input.editingCommentId !== entry.comment.id
+    && entry.comment.body.trim() !== "/new"
+    && (!input.headOnly || queue.entries[0]?.comment.id === entry.comment.id);
 }

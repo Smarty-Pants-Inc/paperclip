@@ -24,7 +24,9 @@ export function answeredPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: 
       and a.created_at > ${m.createdAt}
       and exists (select 1 from ${issueComments} b
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
-          and (b.id = ${m.id} or b.created_at > ${m.createdAt})
+          and (b.id = ${m.id} or (b.created_at > ${m.createdAt}
+            -- A steered message can overtake earlier queued ones; it answers only itself.
+            and not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text))
           and (r.context_snapshot->>'wakeCommentId' = b.id::text or r.context_snapshot->>'commentId' = b.id::text
             or r.context_snapshot->>'conversationReplyBoundaryCommentId' = b.id::text
             or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? b.id::text

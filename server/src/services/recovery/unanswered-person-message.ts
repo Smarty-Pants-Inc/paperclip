@@ -21,6 +21,7 @@ import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-noti
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
+import { noticeMetadataReferencesRecoveryAction } from "./successful-run-handoff.js";
 import { keyValueRow } from "./notice-format.js";
 import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
@@ -542,10 +543,12 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
 
   // A board-owned hold means nothing moves by itself: queued wakes behind it
   // do not count as a further attempt.
-  const [boardHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+  const [activeRecovery] = await q.select({ id: issueRecoveryActions.id, nextAction: issueRecoveryActions.nextAction,
+    ownerType: issueRecoveryActions.ownerType, wakePolicy: issueRecoveryActions.wakePolicy }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-    inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
+    inArray(issueRecoveryActions.status, ["active", "escalated"])))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
+  const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
   if (!boardHold && !agentPaused) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
@@ -647,6 +650,28 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       }
     }
     code = run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
+  }
+
+  // A recovery notice attached to this message's failed run already gives
+  // the Retry remedy, even when classified as system-owned recovery. Do not
+  // contradict it with "send the message again". A hold alone, a deleted
+  // notice, an older run's notice, or an automatic continuation is not enough.
+  // Prefer the existing structured manual Retry policy. Older recovery
+  // records have only nextAction prose: Retry can follow setup instructions
+  // ("restore access, then press Retry"), but a negated remedy cannot cover it.
+  // This decision is re-read unchanged under the issue fence before writing.
+  const retryRemedy = activeRecovery?.wakePolicy?.type === "manual_retry"
+    || (activeRecovery && /\bretry\b/i.test(activeRecovery.nextAction)
+      && !/\b(?:do\s+not\s+retry|automatic\s+retr(?:y|ies)\s+(?:(?:is|are)\s+)?stopped|retry\s+is\s+not\s+available)\b/i.test(activeRecovery.nextAction));
+  if (run && activeRecovery && retryRemedy) {
+    const recoveryNotices = await q.select({ metadata: issueComments.metadata }).from(issueComments).where(and(
+      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
+      sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
+      sql`${issueComments.metadata}->>'sourceRunId' = ${run.id}`));
+    if (recoveryNotices.some(notice => noticeMetadataReferencesRecoveryAction(notice.metadata, activeRecovery.id))) {
+      return { kind: "explained" };
+    }
   }
 
   // Already explained: the executor's held notice for this conversation, or a

@@ -4864,6 +4864,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   wakeupRequestId: activeExecutionRun.wakeupRequestId,
                 },
                 allowRunCoalescing: isConversation(issue) ? false : opts.allowRunCoalescing,
+                // A chat never joins its running turn, but the owner's plain
+                // messages share one ordered queue. A /new keeps its own wake.
+                conversationDeferredMerge: isConversation(issue) && Boolean(resetComment) &&
+                  !verifiedConversationReset && opts.allowRunCoalescing !== false &&
+                  enrichedContextSnapshot.forceFreshSession !== true,
                 durableReceipt: receiptRequest
                   ? {
                       id: receiptRequest.id,

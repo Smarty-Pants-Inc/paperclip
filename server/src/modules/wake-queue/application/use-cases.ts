@@ -1,5 +1,5 @@
 import { readWakeChatConversationId } from "../../run-dispatch/index.js";
-import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun } from "../domain/context.js";
+import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun, withMergedWakeReasons } from "../domain/context.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../domain/policy.js";
 import {
   decideQueuedCommentAction,
@@ -386,6 +386,7 @@ async function promoteDeferredWake(
     shouldReopen =
       !selfAuthorship.allSelfAuthored &&
       (workingCandidate.requestedByActorType === "user" ||
+        selfAuthorship.includesPersonComment ||
         workingCandidate.wakeReason === "issue_reopened_via_comment" ||
         // The agent watching the task posted it while the run that closed the
         // task was active. That agent receives the completed result and can
@@ -834,6 +835,15 @@ export type AdmitWakeBehindIssueExecutionInput = {
   issueExecutionAgentNameKey: string | null;
   activeExecutionRun: WakeAdmissionActiveExecutionRun;
   allowRunCoalescing?: boolean;
+  /**
+   * `allowRunCoalescing: false` means both "never join the active run" and
+   * "never merge into a deferred wake". Agent Chat keeps the first for every
+   * message and sets this for a plain person message (never a /new reset):
+   * it may then join only the issue's latest deferred wake, and only when that
+   * wake holds plain person messages, so a merge never reorders messages or
+   * crosses a reset.
+   */
+  conversationDeferredMerge?: boolean;
   durableReceipt?: DurableWakeAdmissionReceipt;
   reason?: string | null;
   /** Tracks which runs are still live in this process, for the zombie-run filter. */
@@ -955,13 +965,14 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     }
 
     const existingDeferred =
-      (interactionReceipt || input.allowRunCoalescing === false)
+      (interactionReceipt || (input.allowRunCoalescing === false && input.conversationDeferredMerge !== true))
         ? null
         : await deps.reader.findExistingDeferredWake(scope, {
             companyId: input.companyId,
             agentId: input.agentId,
             issueId: input.issueId,
             chatConversationId: readWakeChatConversationId(input.contextSnapshot),
+            ...(input.conversationDeferredMerge === true ? { conversationTail: true } : {}),
             ...(input.durableReceipt
               ? {
                   durableActor: {
@@ -973,12 +984,16 @@ export function createAdmitWakeBehindIssueExecution(deps: {
           });
 
     if (existingDeferred && !existingDeferred.payload?.interactionId && !existingDeferred.deferredContext.interactionId) {
-      const mergedDeferredContext = deps.helpers.mergeCoalescedContextSnapshot(
+      const mergedDeferredContext = withMergedWakeReasons(
+        deps.helpers.mergeCoalescedContextSnapshot(
+          existingDeferred.deferredContext,
+          input.contextSnapshot,
+          {
+            preserveExistingInteractionContinuation: true,
+          },
+        ),
         existingDeferred.deferredContext,
         input.contextSnapshot,
-        {
-          preserveExistingInteractionContinuation: true,
-        },
       );
       const mergedPayload = {
         ...existingDeferred.payload,

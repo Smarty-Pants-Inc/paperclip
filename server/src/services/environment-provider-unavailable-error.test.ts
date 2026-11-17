@@ -76,6 +76,14 @@ describe("readTransientEnvironmentProviderFailure", () => {
 });
 
 describe("EnvironmentProviderUnavailableError", () => {
+  it("does not promise automatic retries when native-mode failure handling may keep the task held", () => {
+    const error = new EnvironmentProviderUnavailableError({
+      environmentName: "Sandbox", driver: "boat", evidence: { httpStatus: 503 }, cause: null,
+    });
+    expect(error.providerFailure.message).not.toContain("Paperclip retries automatically");
+    expect(error.providerFailure.message).toContain("If the task stays blocked, use Retry once the provider is available.");
+  });
+
   it.each([
     [{ httpStatus: 429 }, "rate_limit"],
     [{ httpStatus: 408 }, "timeout"],
