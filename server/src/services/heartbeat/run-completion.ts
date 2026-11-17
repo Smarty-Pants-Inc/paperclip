@@ -48,7 +48,8 @@ import { logger } from "../../middleware/logger.js";
 import { allowlistedErrnoCode, allowlistedIngressReason, allowlistedSyscall, finiteSafeInteger } from "../../realtime/ingress-error-summary.js";
 import { normalizeResponsibleUserDenialCode } from "../responsible-user-denial-run-outcomes.js";
 import { parseObject } from "../../adapters/utils.js";
-import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON, isChatOriginPublicationCandidate, isExternalChatPresentationContext, mergeHeartbeatRunResultJson, resolveHeartbeatRunResponse, type RunPresentationDecision } from "../heartbeat-run-summary.js";
+import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON, isChatOriginPublicationCandidate, isExternalChatPresentationContext, mergeHeartbeatRunResultJson, NATIVE_PRESENTATION_PENDING_COMMIT, resolveHeartbeatRunResponse, type RunPresentationDecision } from "../heartbeat-run-summary.js";
+import { notifyNativeResponsePresentation } from "../native-response-presentation-notifications.js";
 import { normalizeMaxTurnStopReason } from "../heartbeat-stop-metadata.js";
 import { CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE } from "../chat-control-recovery-stop.js";
 import { logActivity } from "../activity-log.js";
@@ -875,10 +876,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           livenessRun.contextSnapshot,
           externalChatPresentationAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
         );
+        const interactionOwnsResponse = Boolean(issueId && readAcceptedTaskContinuationSummary(persistedResultJson) &&
+          await hasChatRunOwnedProviderInteraction(db, { companyId: livenessRun.companyId, issueId, runId: livenessRun.id }));
         const resolved = resolveHeartbeatRunResponse({
           resultJson: persistedResultJson,
-          interactionOwnsResponse: Boolean(issueId && readAcceptedTaskContinuationSummary(persistedResultJson) &&
-            await hasChatRunOwnedProviderInteraction(db, { companyId: livenessRun.companyId, issueId, runId: livenessRun.id })),
+          interactionOwnsResponse,
           conversationTurnFinished: Boolean(issueId) && isConversation(issueContext) && livenessRun.status === "succeeded"
             && await measureRunPhase("response.resolve", () => conversationTurnPresentsAnswer({
               db, companyId: livenessRun.companyId, issueId: issueId!, runId: livenessRun.id,
@@ -902,6 +904,22 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         });
         let presentationDecision: RunPresentationDecision =
           resolved.decision;
+        // The native finalizer did not commit on this path (its lease was
+        // busy), so the answered rule cannot be read yet: the fields above are
+        // precommit. Keep the publication pending; committed-response recovery
+        // resolves it from the committed decision, where a run's own open card
+        // still owns the turn.
+        const presentationPendingCommit = Boolean(issueId) && Boolean(adapterResult.nativeFinalization) &&
+          livenessRun.runtimeMode === "native" && livenessRun.status === "succeeded" && isConversation(issueContext) &&
+          persistedResultJson?.finalizationPhase !== "committed" && !interactionOwnsResponse &&
+          presentationDecision.commentAction === "none" &&
+          presentationDecision.reasonCodes.includes("interaction_owns_conversation_response");
+        if (presentationPendingCommit) {
+          presentationDecision = {
+            ...presentationDecision,
+            reasonCodes: [...presentationDecision.reasonCodes, NATIVE_PRESENTATION_PENDING_COMMIT],
+          };
+        }
         if (
           issueId &&
           !skipRunIssueComment &&
@@ -976,6 +994,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           payload: { presentationDecision },
         });
         resolvedPresentationDecision = presentationDecision;
+        if (presentationPendingCommit) {
+          await notifyNativeResponsePresentation(db, { companyId: livenessRun.companyId, issueId: issueId!, runId: livenessRun.id });
+        }
       } catch (err) {
         await onLog(
           "stderr",
