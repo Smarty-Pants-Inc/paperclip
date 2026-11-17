@@ -14349,6 +14349,127 @@ describe("native warm session supervision", () => {
       expect(state.execute).toHaveBeenCalledTimes(2);
     });
 
+    // Live gate-1 rows (run 116e7f2f): after /new the next message reached the
+    // superseded warm-owner retirement while the old owner's idle close (run
+    // 141e0676, box bx_5xs37eag, closeAttempt 2) was still retrying a transient
+    // Boat download-url failure; the plain supervisor-busy throw failed the run.
+    describe("superseded owner whose Boat close is still retrying after /new", () => {
+      const oldRunId = "141e0676-ff6c-4f74-bd9c-06c94a7883b8";
+      const newRunId = "116e7f2f-6d4e-4321-9d84-2ed48029ccb9";
+      const environmentId = "24aa5da6-5915-407b-80a6-614428781583";
+      const providerLeaseId = "bx_5xs37eag";
+      const boatTransient = () => new Error(
+        `Boat POST /sandboxes/${providerLeaseId}/files/download-url failed (unavailable): request_error`);
+      function supbusyFixture(name: string) {
+        const base = { ...execution,
+          binding: { ...execution.binding, runId: `${oldRunId}-${name}`, executionWorkspaceId: `supbusy-${name}` },
+          session: { ...execution.session, normalizedSessionId: `ba3883c5-c372-4f7b-84b9-96e7dcd176db-${name}`,
+            lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 20 } },
+        } as NativeExecutionInputV1;
+        // /new rotates the session identity; the task, workspace and box stay.
+        const next = { ...base, binding: { ...base.binding, runId: `${newRunId}-${name}` },
+          session: { ...base.session, normalizedSessionId: `574a53f4-50c2-410b-9a55-1e173b84150f-${name}` } } as NativeExecutionInputV1;
+        const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId,
+          remoteCwd: `/tmp/supbusy-${name}`, sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId },
+          runner: { execute: vi.fn(async () => ({ exitCode: 0, timedOut: false, stdout: "", stderr: "" })) } };
+        const run = (input: NativeExecutionInputV1) => executePaperclipNativeSession({ db: leaseDb(input), execution: input,
+          runnerInstanceId: "runner", useRunnerd: true, runnerExecutionTarget: target as never });
+        return { base, next, run };
+      }
+      /** Old owner warm and idle; its first idle close failed on Boat, the retry
+       * (closeAttempt 2) is in flight and settles only when the test says so. */
+      async function oldOwnerCloseRetrying(name: string) {
+        const { logger } = await import("../../middleware/logger.js");
+        const f = supbusyFixture(name);
+        let settleAttempt2!: (error?: Error) => void;
+        const close = vi.fn<() => Promise<void>>()
+          .mockRejectedValueOnce(boatTransient())
+          .mockImplementationOnce(() => new Promise<void>((resolve, reject) => {
+            settleAttempt2 = error => error ? reject(error) : resolve();
+          }));
+        state.execute.mockReset().mockImplementationOnce(async options => {
+          await options.onSession?.({ close });
+          return { ...result, normalizedSessionId: f.base.session.normalizedSessionId };
+        });
+        const warn = vi.spyOn(logger, "warn");
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        try {
+          await f.run(f.base);
+          await vi.advanceTimersByTimeAsync(20);
+          expect(close).toHaveBeenCalledTimes(1);
+          await vi.waitFor(() => expect(warn).toHaveBeenCalledWith(expect.objectContaining({ runId: f.base.binding.runId,
+            environmentId, providerLeaseId, closeAttempt: 1 }), "idle warm native session close failed"));
+          await vi.advanceTimersByTimeAsync(WARM_IDLE_CLOSE_RETRY_MS);
+          expect(close).toHaveBeenCalledTimes(2);
+        } finally { vi.useRealTimers(); }
+        expect(readNativeSessionIdleWork()).toBe("present");
+        return { ...f, close, warn, settleAttempt2: (error?: Error) => settleAttempt2(error) };
+      }
+
+      it("waits for the retrying close, then answers the next message on its first run", async () => {
+        const f = await oldOwnerCloseRetrying("completes");
+        const answered = vi.fn(async () => ({ ...result, normalizedSessionId: f.next.session.normalizedSessionId }));
+        state.execute.mockImplementationOnce(answered);
+        try {
+          const nextRun = f.run(f.next).then(value => ({ value }), (error: Error) => ({ error }));
+          // Same second as the live failure: the run is parked at the
+          // retirement site, not failed.
+          await new Promise(resolve => setTimeout(resolve, 250));
+          expect(answered).not.toHaveBeenCalled();
+          f.settleAttempt2();
+          const outcome = await nextRun;
+          expect(outcome).not.toHaveProperty("error");
+          expect(answered).toHaveBeenCalledOnce();
+          expect(f.close).toHaveBeenCalledTimes(2);
+        } finally { f.warn.mockRestore(); }
+      });
+
+      it("after the retry fails again (as live), retires the old owner itself and still answers on the first run", async () => {
+        const f = await oldOwnerCloseRetrying("fails-again");
+        f.close.mockResolvedValue(undefined);
+        const answered = vi.fn(async () => ({ ...result, normalizedSessionId: f.next.session.normalizedSessionId }));
+        state.execute.mockImplementationOnce(answered);
+        try {
+          const nextRun = f.run(f.next).then(value => ({ value }), (error: Error) => ({ error }));
+          await new Promise(resolve => setTimeout(resolve, 250));
+          f.settleAttempt2(boatTransient());
+          const outcome = await nextRun;
+          expect(outcome).not.toHaveProperty("error");
+          expect(answered).toHaveBeenCalledOnce();
+          expect(f.close).toHaveBeenCalledTimes(3);
+          expect(f.close).toHaveBeenLastCalledWith({ reason: "warm native session identity changed" });
+        } finally { f.warn.mockRestore(); }
+      });
+
+      it("a close that never completes ends in the typed retirement fallback after one bounded wait, keeping the old owner", async () => {
+        const { NativePredecessorRetirementUnprovenError } = await import("./predecessor-retirement.js");
+        const f = await oldOwnerCloseRetrying("never");
+        const answered = vi.fn(async () => result);
+        state.execute.mockImplementationOnce(answered);
+        const bound = warmSessionReleaseWait.timeoutMs;
+        warmSessionReleaseWait.timeoutMs = 300;
+        try {
+          const started = Date.now();
+          const error = await f.run(f.next).then(() => null, (failure: Error) => failure);
+          expect(Date.now() - started).toBeGreaterThanOrEqual(250);
+          expect(error).toBeInstanceOf(NativePredecessorRetirementUnprovenError);
+          expect(error).toMatchObject({ code: "native_predecessor_retirement_unproven",
+            predecessorRunId: f.base.binding.runId, providerLeaseId });
+          expect(error?.message).not.toBe("native_session_supervisor_busy");
+          expect(answered).not.toHaveBeenCalled();
+          // Never two writers: no new provider session; the old owner is not forgotten.
+          expect(readNativeSessionIdleWork()).toBe("present");
+          expect(f.close).toHaveBeenCalledTimes(2);
+        } finally {
+          warmSessionReleaseWait.timeoutMs = bound;
+          f.warn.mockRestore();
+          f.close.mockResolvedValue(undefined);
+          f.settleAttempt2();
+          state.execute.mockReset();
+        }
+      });
+    });
+
     it.each(["completed", "different-allocation", "foreign-company", "different-workspace", "live-owner", "unaccounted-owner", "changed-controller", "forged-allocation", "foreign-writer", "foreign-active-lease", "reassigned-child", "parent-already-started", "writer-lock-race", "stop-after-claim", "controller-change-during-close", "stop-during-close", "writer-change-during-close", "retirement-fails", "foreign-logical-session", "stopped-parent"] as const)("retires the completed child listener before a different parent task uses the same sandbox: %s", async scenario => {
       const { createServer } = await import("node:net");
       const { createNativeWarmIngressFixture } = await import("../../__tests__/helpers/native-warm-ingress-fixture.js");
