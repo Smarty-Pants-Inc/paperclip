@@ -43,8 +43,8 @@ const QUEUED_INTERRUPT_HANDOFF_GRACE_MS = 5 * 60_000;
 const QUEUED_INPUT_DISPATCH_GRACE_MS = 2 * 60_000;
 const AUTOMATIC_DISPOSITION_GRACE_MS = 2 * 60_000;
 const WAITING_CONTINUATION_MOVE_FORWARD_MS = 15 * 60_000;
-// A run a person asked for that has not started by this long after it was
-// queued is a failed start for that person: the card shows it with Retry
+// A run a person asked for that has not started by this long after it became
+// STARTABLE (the agent's slot was free) is a failed start for that person: the card shows it with Retry
 // instead of "working" forever (D157/D168). Upstream's own queued-run bounds
 // are not person-facing: the dispatch redrive (queued-run-dispatch-liveness.ts:6-7)
 // only re-pokes the dispatcher, the I7 report (recovery/ownership-invariant-report.ts:150)
@@ -130,6 +130,10 @@ type ProjectionState = {
   waitingContinuation?: { queuedAt: number; personRequested: boolean };
   /** The queued run is one a person asked for (the dispatcher's own person-origin rule). */
   personQueuedRun?: boolean;
+  /** When that queued run became startable: the agent's slot is free now and was
+   * last freed at this time (RFL S9 queued-time rule). Absent while the agent is
+   * busy, so a message waiting behind a turn is waiting, never failed. */
+  queuedRunStartableSince?: number;
   recoveryHandedToPerson?: boolean;
 };
 
@@ -316,10 +320,12 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
       && Number.isFinite(interruptAt) && now - interruptAt < QUEUED_INTERRUPT_HANDOFF_GRACE_MS
       && !(retryWait?.sourceRunId === run.id && retryWait.preparationStatus) && system?.state !== "exhausted")
     return { ...base, intentId: interruptWait.id, state: "working" };
-  // A person's run that never started is a failed start, with Retry, once
-  // its bound passes; until then it is working (D157/D168).
-  if (run.status === "queued" && input.personQueuedRun && run.createdAt
-      && now - run.createdAt.getTime() >= PERSON_QUEUED_RUN_START_BOUND_MS)
+  // A person's run that never started is a failed start, with Retry, once it
+  // has been startable for the bound; until then, and while the agent is busy
+  // with another run, it is waiting and shows working (D157/D168, RFL S9).
+  const startableSince = input.queuedRunStartableSince;
+  if (run.status === "queued" && input.personQueuedRun && startableSince !== undefined
+      && now - startableSince >= PERSON_QUEUED_RUN_START_BOUND_MS)
     return { ...base, state: "failed", canRetry: true };
   const waiting = input.waitingContinuation;
   if (run.status === "queued" && waiting && !waiting.personRequested && run.agentId === issue.assigneeAgentId
@@ -757,6 +763,41 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       inArray(heartbeatRuns.id, overdueQueuedIds), personOriginRunSql(sql`${companyId}::uuid`, sql`${heartbeatRuns.id}`)));
     for (const row of rows) personQueuedRunIds.add(row.id);
   }
+  // When each such run became startable (RFL S9: the queued-time clock starts at
+  // the END of the preceding run, never at enqueue). No new state:
+  // - busy is the dispatcher's own rule (heartbeat/queue.ts:2638-2641): the
+  //   agent's running count against parseHeartbeatPolicy(agent).maxConcurrentRuns.
+  //   A busy agent has no startable time, so the card stays working.
+  // - otherwise startable since = the latest heartbeat_runs.finished_at of the
+  //   agent's other runs that ended after this run was queued (the busy turn that
+  //   freed the slot, whether it succeeded or failed); with no such run (no
+  //   previous run, or the slot was already free), startable since enqueue
+  //   (heartbeat_runs.created_at).
+  const queuedRunStartableSince = new Map<string, number>();
+  const personQueued = runs.filter(run => personQueuedRunIds.has(run.id) && run.createdAt);
+  if (personQueued.length) {
+    const agentIds = [...new Set(personQueued.map(run => run.agentId))];
+    const [agentRows, runningRows, endRows] = await Promise.all([
+      db.select().from(agents).where(and(eq(agents.companyId, companyId), inArray(agents.id, agentIds))),
+      db.select({ agentId: heartbeatRuns.agentId, count: sql<number>`count(*)::int` }).from(heartbeatRuns)
+        .where(and(inArray(heartbeatRuns.agentId, agentIds), eq(heartbeatRuns.status, "running"))).groupBy(heartbeatRuns.agentId),
+      Promise.all(personQueued.map(async run => {
+        const [row] = await db.select({ endedAt: sql<string | null>`max(${heartbeatRuns.finishedAt})` }).from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.agentId, run.agentId), sql`${heartbeatRuns.id} <> ${run.id}`,
+            sql`${heartbeatRuns.finishedAt} > ${run.createdAt!.toISOString()}::timestamptz`));
+        return { runId: run.id, endedAt: row?.endedAt ? new Date(row.endedAt).getTime() : null };
+      })),
+    ]);
+    const { parseHeartbeatPolicy } = await import("./heartbeat/timer-policy.js");
+    const running = new Map(runningRows.map(row => [row.agentId, Number(row.count)]));
+    const busy = new Set(agentRows.filter(agent => (running.get(agent.id) ?? 0) >= parseHeartbeatPolicy(agent).maxConcurrentRuns)
+      .map(agent => agent.id));
+    const endedAt = new Map(endRows.map(row => [row.runId, row.endedAt]));
+    for (const run of personQueued) {
+      if (busy.has(run.agentId)) continue;
+      queuedRunStartableSince.set(run.id, Math.max(run.createdAt!.getTime(), endedAt.get(run.id) ?? 0));
+    }
+  }
   const waitingContinuationRunIds = new Set(continuationRows.map(row => row.runId));
   const personRequestedRunIds = new Set(personRows.flatMap(row => row.runId ? [row.runId] : []));
   const waitingContinuationFor = (run: typeof runs[number] | undefined): ProjectionState["waitingContinuation"] =>
@@ -885,6 +926,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       automaticDispositionAt: automaticDispositionAt.get(issue.id),
       waitingContinuation: waitingContinuationFor(facts.run),
       personQueuedRun: facts.run ? personQueuedRunIds.has(facts.run.id) : false,
+      queuedRunStartableSince: facts.run ? queuedRunStartableSince.get(facts.run.id) : undefined,
       recoveryHandedToPerson: handedToPerson.has(issue.id),
       interruptWait: interruptWaitFor(issue.id),
       projectAccessAllowed: denied?.length === 0,

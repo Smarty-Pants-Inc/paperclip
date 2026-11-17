@@ -10448,6 +10448,10 @@ export function issueRoutes(
         runId: scheduledRetry.scheduledRetry?.runId ?? scheduledRetryRunId ?? null,
         details: { outcome: scheduledRetry.outcome, message: scheduledRetry.message, source: "task_retry" } });
     }
+    // Retry on a person's queued run that never started starts it now (D157/D168).
+    const startQueuedRunId = "startQueuedRunId" in receipt ? receipt.startQueuedRunId : undefined;
+    if (startQueuedRunId && issue.assigneeAgentId)
+      await heartbeat.resumeQueuedRunsForAgent(issue.companyId, issue.assigneeAgentId);
     const chatActionId = "chatActionId" in receipt ? receipt.chatActionId : undefined;
     const finalizeRunId = "finalizeRunId" in receipt ? receipt.finalizeRunId : undefined;
     // Admit a plain Retry before answering, so the answer never reports as

@@ -536,6 +536,7 @@ suite("fresh-continuation fallback", () => {
   ] satisfies PinShape[])("F3 pin re-home %s: the latest person message has exactly one truthful outcome by 120 s", async shape => {
     const t = new Date(Date.now() - 600_000);
     const at = (offset: number) => new Date(t.getTime() + offset);
+    let busyTurnId: string | null = null;
     const [task] = await db.insert(issues).values({ companyId, title: `F3 ${shape}`, status: "in_progress", assigneeAgentId: agentId,
       conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: at(-300_000) }).returning();
     const issueId = task!.id;
@@ -692,10 +693,13 @@ suite("fresh-continuation fallback", () => {
         const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
           createdAt: at(-59_000), responsibleUserId: userId, wakeupRequestId: wake!.id,
           contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: latest.id } }).returning();
-        await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id)); break;
+        await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id));
+        // RFL 19:59Z: the message waits behind the conversation's own long turn, which later FAILS.
+        busyTurnId = (await run(-120_000, "running", {}, { finishedAt: null, startedAt: at(-120_000), createdAt: at(-121_000) })).id; break;
       }
     }
-    await occupySlot();
+    // D168 waits behind its own busy turn (one slot); every other shape behind other work.
+    if (!busyTurnId) await occupySlot();
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       const heartbeat = heartbeatService(db);
@@ -709,14 +713,13 @@ suite("fresh-continuation fallback", () => {
       };
       // A person's queued run that never starts (D157/D168, RFL 19:17Z): at enqueue + 10 min it is
       // a failed start the card owns (failed + Retry), not a live run; the queued run is no second outcome.
-      const startBoundMs = 600_000;
       const observe = async () => {
         const card = await taskInterruptionPresentation(db, await issue(issueId));
         const notes = (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
           eq(issueComments.authorType, "system")))).filter(c => !c.deletedAt && !(c.metadata as Record<string, unknown> | null)?.supersededByIncident);
         const live = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
           sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])))).filter(r =>
-          !(r.status === "queued" && !r.startedAt && Date.now() - r.createdAt.getTime() >= startBoundMs));
+          r.id !== busyTurnId && !(card?.state === "failed" && card.observedRunId === r.id));
         const redeliveries = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
           eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${latest.id}`)));
         const [after] = await db.select().from(issueComments).where(eq(issueComments.id, latest.id));
@@ -746,16 +749,55 @@ suite("fresh-continuation fallback", () => {
       if (shape === "D160_workspace_pending") expect(first.redeliveries, "the finishing turn is not re-offered (D160)").toBe(0);
       if (shape === "D157_queued_wake_never_runs" || shape === "D168_carrying_queued_run_never_starts") {
         expect(first.card, "inside the start bound the person's queued run is working").toMatchObject({ state: "working" });
-        // Enqueued at t - 59 s: the bound passes at t + 541 s.
+        // RFL 19:59Z (S9 queued-time rule): queued at t - 59 s behind a busy turn. At enqueue + 10 min
+        // the turn still runs, so the message is WAITING: working, never failed (red when the bound
+        // counts from enqueue).
         for (const elapsed of [540_999, 541_000]) await tick(elapsed);
+        const waiting = await observe();
+        expect(waiting.card, "behind a busy turn at enqueue + 10 min: waiting, not failed").toMatchObject({ state: "working" });
+        expect(waiting.card!.observedRunId, "the card is the queued message's own run").not.toBe(busyTurnId);
+        // The busy turn ends at t + 660 s (a 12-min turn): D157 other work succeeds; D168 the
+        // conversation's own turn FAILS. The slot is free from then on (startable since its finishedAt).
+        const [busy] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
+        await db.update(heartbeatRuns).set(busyTurnId
+          ? { status: "failed", errorCode: "adapter_failed", error: "adapter failed before an answer", finishedAt: at(660_000) }
+          : { status: "succeeded", finishedAt: at(660_000) }).where(eq(heartbeatRuns.id, busy!.id));
+        for (const elapsed of [661_000, 1_259_999]) await tick(elapsed);
+        const startable = await observe();
+        expect(startable.card, "startable for under 10 min: working, never the failed turn's card").toMatchObject({ state: "working" });
+        expect(startable.card!.observedRunId).not.toBe(busy!.id);
+        // Kept (D157/D168): startable for 10 min and the dispatcher never took it: failed + Retry.
+        await tick(1_260_000);
         const bounded = await observe();
-        expect(bounded.card, "at enqueue + 10 min: failed + Retry").toMatchObject({ state: "failed", canRetry: true });
+        expect(bounded.card, "at startable + 10 min: failed + Retry").toMatchObject({ state: "failed", canRetry: true });
+        expect(bounded.card!.observedRunId, "the queued message's own failed start, not the busy turn's").not.toBe(busy!.id);
         expect(bounded.redeliveries, "the card is the one outcome; no redelivery beside it").toBe(0);
-        // The Retry is real: it is accepted for the run the card shows and joins it, never a second run.
+        // rf-3 19:59Z: Retry is not a dead end. It does not just join the stuck queued run: the receipt
+        // names that run for the caller (routes/issues.ts) to start now through the dispatcher.
+        const queuedId = bounded.card!.observedRunId!;
         const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: userId, idempotencyKey: randomUUID(),
-          observedRunId: bounded.card!.observedRunId });
-        expect(receipt).toMatchObject({ accepted: true, stale: false });
-        expect((await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.issueId, issueId)))).length).toBe(1);
+          observedRunId: queuedId });
+        expect(receipt).toMatchObject({ accepted: true, stale: false, startQueuedRunId: queuedId });
+        const messageRuns = async () => (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.issueId, issueId)))).filter(r => r.id !== busyTurnId);
+        // What routes/issues.ts does with that receipt: the dispatcher starts the run now.
+        await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
+        const [started] = await messageRuns();
+        expect(await messageRuns(), "Retry starts the message's own run, never a second").toHaveLength(1);
+        expect(started, "the stuck run STARTED (claimed by the dispatcher), carrying the message once").toMatchObject({ id: queuedId });
+        expect(started!.startedAt, "started within seconds of the press").not.toBeNull();
+        expect(started!.status).not.toBe("queued");
+        expect(started!.contextSnapshot).toMatchObject({ wakeCommentId: latest.id });
+        const afterRetry = await taskInterruptionPresentation(db, await issue(issueId));
+        expect(afterRetry?.state === "failed" && afterRetry.observedRunId === queuedId, "the failed start card clears").toBe(false);
+        // A second press starts nothing: the message's run is no longer a stuck queued run.
+        const second = await requestTaskRetry({ db, companyId, issueId, actorId: userId, idempotencyKey: randomUUID(),
+          observedRunId: afterRetry?.observedRunId ?? queuedId }).catch((error: unknown) => ({ error: String(error) }));
+        expect(second).not.toHaveProperty("startQueuedRunId");
+        expect(await messageRuns(), "the second press starts no run").toHaveLength(1);
+        console.info(JSON.stringify({ f3QueuedStart: { shape, waiting: waiting.card!.state, startable: startable.card!.state,
+          bounded: bounded.card!.state, receipt, started: { id: started!.id, status: started!.status, startedAt: started!.startedAt },
+          afterRetry: afterRetry?.state ?? null, second } }));
       }
     } finally { vi.useRealTimers(); }
   }, 120_000);

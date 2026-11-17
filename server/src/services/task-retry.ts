@@ -519,9 +519,20 @@ function admitTaskRetry(input: TaskRetryRequest) {
       details: { requestId: active?.id ?? id, sourceRunId: latest.id, attachedToExistingWork: Boolean(active || busy),
         ...(replacedRequestId ? { replacedRequestId } : {}),
         ...(input.initiatedBy ? { initiatedBy: input.initiatedBy, onBehalfOfUserId: input.actorId } : {}) } });
+    // A person's queued run the card shows as a failed start (startable for the
+    // bound, never taken: D157/D168) is not joined and left stuck: the receipt
+    // names it so the caller starts it now through the dispatcher, as a
+    // scheduled retry is started now. Same card decision, no second rule.
+    const startQueuedRunId = latest.status === "queued" && !active
+      ? await (async () => {
+        const { taskInterruptionPresentation } = await import("./task-interruption-presentation.js");
+        const card = await taskInterruptionPresentation(db, issue);
+        return card?.state === "failed" && card.observedRunId === latest.id ? latest.id : undefined;
+      })() : undefined;
     return { requestId: active?.id ?? id, accepted: true, stale: false, observedRunId: latest.id,
       chatActionId: intent.chatActionId,
-      ...(!active && latest.status === "scheduled_retry" ? { scheduledRetryRunId: latest.id } : {}) };
+      ...(!active && latest.status === "scheduled_retry" ? { scheduledRetryRunId: latest.id } : {}),
+      ...(startQueuedRunId ? { startQueuedRunId } : {}) };
   }, { companyId: input.companyId });
 }
 
