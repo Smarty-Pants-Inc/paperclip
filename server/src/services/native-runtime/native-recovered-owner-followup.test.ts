@@ -1881,10 +1881,19 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
       expiresAt: new Date(Date.now() + 900_000), metadata: { remoteCwd: "/workspace", agentId } }).returning();
     await db.update(issues).set({ checkoutRunId: prior.runId, executionRunId: prior.runId }).where(eq(issues.id, prior.issueId));
-    // The person's next message, saved behind the task lock.
+    // The person's next message, SENT after the Stop (adopt-h6-neg2: the
+    // explicit-Send marker, by that person, later than the Stop), saved behind
+    // the task lock. Input queued before the Stop is the Send-only row below.
+    const [stoppedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    const sentAt = new Date(stoppedRun!.finishedAt!.getTime() + 1_000);
     const [saved] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
-      reason: "issue_commented", status: "deferred_issue_execution",
-      payload: { issueId: prior.issueId, executionWait: { runId: prior.runId } } }).returning();
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user",
+      requestedByActorId: "board-user", requestedAt: sentAt,
+      payload: { issueId: prior.issueId, executionWait: { runId: prior.runId },
+        queuedCommentInterrupt: { actorId: "board-user", targetRunId: null, requestedAt: sentAt.toISOString() } } }).returning();
+    const { queuedSendAfterStop, userStopBoundaryAt } = await import("../run-cancellation.js");
+    expect(queuedSendAfterStop(saved!.payload, { stoppedAt: userStopBoundaryAt(stoppedRun!)!, actorId: "board-user" }))
+      .toEqual({ actorId: "board-user", requestedAt: sentAt.toISOString() });
     expect(await runExecutionsHaveStopped(db, companyId, [prior.runId])).toBe(true);
     const enqueueWakeup = vi.fn();
     const sweep = () => recoveryService(db, { enqueueWakeup }).sweepStaleIssueLocks({ companyId, issueId: prior.issueId,
@@ -1924,4 +1933,135 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await lease()).toEqual(warmLease);
     expect(enqueueWakeup).not.toHaveBeenCalled();
   }, 60_000);
+
+  /** adopt-h6-neg2: the positive test's Stop and warm box, with one fact
+   * changed so the Stop is UNPROVEN. Every fact is written through the same
+   * rows the positive test writes; nothing else is seeded. */
+  type WarmStop = "proven" | "no idle-checkpoint receipt" | "an unacknowledged Stop" | "a stop_and_retain lease"
+    | "a live runner (coordinator lease held)";
+  async function seedWarmStop(variant: WarmStop) {
+    const prior = await seedRecoveredPriorRun();
+    await stopSettledOwner(prior, { ack: variant === "an unacknowledged Stop" ? "none" : "own",
+      leaseOwner: variant === "a live runner (coordinator lease held)" ? "still-running-controller" : undefined, events: [
+        { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
+      ] });
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, prior.runId));
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    const stoppedAt = new Date();
+    await db.update(heartbeatRuns).set({ finishedAt: stoppedAt, runnerProfileJson: variant === "no idle-checkpoint receipt"
+      ? stopped!.runnerProfileJson : { ...stopped!.runnerProfileJson,
+        nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1", companyId, issueId: prior.issueId,
+          runId: prior.runId, sessionId: stopped!.nativeSessionId, bootId: coordinator!.controllerBootId,
+          generation: coordinator!.controllerGeneration } } }).where(eq(heartbeatRuns.id, prior.runId));
+    const environmentId = randomUUID(), providerLeaseId = `sandbox-${prior.runId}`;
+    await db.insert(environments).values({ id: environmentId, name: `warm-${environmentId}`, driver: "sandbox" });
+    const [warmLease] = await db.insert(environmentLeases).values({ companyId, environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
+      expiresAt: new Date(Date.now() + 900_000), metadata: { remoteCwd: "/workspace", agentId,
+        ...(variant === "a stop_and_retain lease" ? { sandboxStopAndRetain: { requestedAt: stoppedAt.toISOString() } } : {}) } })
+      .returning();
+    await db.update(issues).set({ checkoutRunId: prior.runId, executionRunId: prior.runId, executionLockedAt: stoppedAt })
+      .where(eq(issues.id, prior.issueId));
+    return { prior, warmLease: warmLease!, environmentId, providerLeaseId, stoppedAt };
+  }
+  const sweepIssue = (issueId: string, enqueueWakeup = vi.fn()) =>
+    recoveryService(db, { enqueueWakeup }).sweepStaleIssueLocks({ companyId, issueId, onDeferredDeadline: () => {} });
+
+  // adopt-h6-neg2 (RFL 17:40Z): an UNPROVEN Stop keeps BOTH claims exactly as
+  // at base through the same real sweep, and lock_released never fires.
+  it.each([
+    "no idle-checkpoint receipt", "an unacknowledged Stop", "a stop_and_retain lease", "a live runner (coordinator lease held)",
+  ] as const)("an unproven warm Stop with %s keeps both claims and promotes nothing", async variant => {
+    const { runExecutionsHaveStopped } = await import("../agent-execution-stop.js");
+    const { agentWakeupRequests } = await import("@paperclipai/db");
+    const { prior, warmLease } = await seedWarmStop(variant);
+    const [saved] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      reason: "issue_commented", status: "deferred_issue_execution",
+      payload: { issueId: prior.issueId, executionWait: { runId: prior.runId } } }).returning();
+    const [before] = await db.select().from(issues).where(eq(issues.id, prior.issueId));
+    expect(before).toMatchObject({ checkoutRunId: prior.runId, executionRunId: prior.runId });
+    expect(await runExecutionsHaveStopped(db, companyId, [prior.runId])).toBe(false);
+    const enqueueWakeup = vi.fn();
+    expect(await sweepIssue(prior.issueId, enqueueWakeup)).toMatchObject({ cleared: 0, issueIds: [] });
+    const [after] = await db.select().from(issues).where(eq(issues.id, prior.issueId));
+    expect({ checkoutRunId: after!.checkoutRunId, executionRunId: after!.executionRunId,
+      executionAgentNameKey: after!.executionAgentNameKey, executionLockedAt: after!.executionLockedAt }).toEqual({
+      checkoutRunId: before!.checkoutRunId, executionRunId: before!.executionRunId,
+      executionAgentNameKey: before!.executionAgentNameKey, executionLockedAt: before!.executionLockedAt });
+    // No lock_released promotion: the saved message keeps its 30 s backoff.
+    const [held] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, saved!.id));
+    expect(held).toMatchObject({ status: "deferred_issue_execution", updatedAt: saved!.updatedAt });
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, warmLease.id)))[0]).toEqual(warmLease);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  }, 60_000);
+
+  // adopt-h6-neg2 Send-only row (RFL 17:51Z, org 17:30Z): M2 and M3 were
+  // queued behind the running turn BEFORE the person's Stop and never Sent.
+  // A proven warm handoff then releases the claims and lock_released fires.
+  // The held messages stay deferred and nothing starts them; only the
+  // person's Send releases them, once, in order.
+  it.each(["plain", "with an execution wait"] as const)(
+    "messages held before a proven warm Stop stay deferred after the claim release until the person's Send (%s)", async shape => {
+      const { agentWakeupRequests, issueComments } = await import("@paperclipai/db");
+      const { withQueuedCommentIdsInWakePayload, queuedCommentIdsFromWakePayload } = await import("../issue-queued-comment-queue.js");
+      const { heartbeatService } = await import("../heartbeat.js");
+      const { prior, stoppedAt } = await seedWarmStop("proven");
+      const queuedAt = new Date(stoppedAt.getTime() - 10_000);
+      const held: Array<{ commentId: string; wakeId: string; updatedAt: Date }> = [];
+      for (const body of ["M2", "M3"]) {
+        const [comment] = await db.insert(issueComments).values({ companyId, issueId: prior.issueId, authorUserId: "board-user",
+          body, createdAt: queuedAt }).returning();
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+          triggerDetail: "system", reason: "issue_commented", status: "deferred_issue_execution",
+          requestedByActorType: "user", requestedByActorId: "board-user", requestedAt: queuedAt,
+          payload: withQueuedCommentIdsInWakePayload({ issueId: prior.issueId, mutation: "comment", commentId: comment!.id,
+            ...(shape === "with an execution wait" ? { executionWait: { reason: "execution_recovery",
+              message: "Waiting for execution recovery. Your message is saved." } } : {}),
+            _paperclipWakeContext: { issueId: prior.issueId, taskId: prior.issueId, wakeReason: "issue_commented",
+              source: "issue.comment", wakeCommentIds: [comment!.id], wakeCommentId: comment!.id } }, [comment!.id]) }).returning();
+        held.push({ commentId: comment!.id, wakeId: wake!.id, updatedAt: wake!.updatedAt });
+      }
+      const issueRuns = async () => (await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+        contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+        .where(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${prior.issueId} or ${heartbeatRuns.nativeIssueId} = ${prior.issueId}`))
+        .filter(run => run.id !== prior.runId);
+      const wakes = async () => db.select().from(agentWakeupRequests).where(inArray(agentWakeupRequests.id, held.map(row => row.wakeId)));
+      // The proven warm handoff: the real sweep releases both claims (lock_released fires).
+      expect(await sweepIssue(prior.issueId)).toMatchObject({ cleared: 1, issueIds: [prior.issueId] });
+      expect((await db.select().from(issues).where(eq(issues.id, prior.issueId)))[0])
+        .toMatchObject({ checkoutRunId: null, executionRunId: null });
+      for (const wake of await wakes()) expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      // lock_released only waives the 30 s backoff of a wake with an execution
+      // wait (work-intent-outbox.ts promoteDeferredWorkIntents); it starts nothing.
+      for (const wake of await wakes()) {
+        const before = held.find(row => row.wakeId === wake.id)!.updatedAt.getTime();
+        if (shape === "plain") expect(wake.updatedAt.getTime()).toBe(before);
+        else expect(wake.updatedAt.getTime()).toBeLessThanOrEqual(Date.now() - 29_000);
+      }
+      // 60 s pass (every 30 s age gate expires): the real admission passes
+      // that run on their own find nothing to start. A message queued before
+      // the Stop is not the person's Send.
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 61_000) })
+        .where(inArray(agentWakeupRequests.id, held.map(row => row.wakeId)));
+      const hb = heartbeatService(db, { runtimeEnv: { PAPERCLIP_NATIVE_RUNTIME_ENABLED: "true" } });
+      await hb.resumeExecutionWaitComments({ companyId });
+      for (const row of held) await hb.resumeExecutionWaitComments({ companyId, requestId: row.wakeId });
+      expect(await issueRuns()).toEqual([]);
+      for (const wake of await wakes()) expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect((await wakes()).flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)).sort())
+        .toEqual(held.map(row => row.commentId).sort());
+      // The person's Send (the queue's explicit-Send marker, written after the
+      // Stop by that person) releases them: one turn, M2 then M3.
+      const [queue] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held[0]!.wakeId));
+      await db.update(agentWakeupRequests).set({ payload: { ...withQueuedCommentIdsInWakePayload(queue!.payload,
+        held.map(row => row.commentId)), queuedCommentInterrupt: { actorId: "board-user", targetRunId: null,
+        requestedAt: new Date().toISOString() } }, coalescedCount: 1 }).where(eq(agentWakeupRequests.id, held[0]!.wakeId));
+      await db.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, held[1]!.wakeId));
+      await hb.resumeQueuedCommentInterrupt(companyId, held[0]!.wakeId).catch(() => undefined);
+      await hb.resumeQueuedCommentInterrupt(companyId, held[0]!.wakeId).catch(() => undefined);
+      const started = await issueRuns();
+      expect(started).toHaveLength(1);
+      expect((started[0]!.contextSnapshot as Record<string, unknown>).wakeCommentIds).toEqual(held.map(row => row.commentId));
+    }, 60_000);
 });
