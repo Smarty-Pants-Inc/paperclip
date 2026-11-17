@@ -1146,6 +1146,51 @@ suite("fresh-continuation fallback", () => {
     expect(old.startedAt, "the reachable person-facing Retry must change the stalled path").not.toBeNull();
   },120_000);
 
+  // fix12 item 1 (rf-3 (1), RFL bar as fix10b): a person's ASSIGNMENT with no carried comment reaches
+  // failed + Retry. Retry through the real route cancels the stuck run only while queued and starts
+  // ONE fresh run carrying the assignment once, none of the old run's context; a second press and
+  // later liveness passes start nothing; the old run never starts.
+  it("fix12 dead chat: a no-comment assignment's Retry starts ONE fresh assignment run, never a re-poke", async () => {
+    const f = await judgeQueued(false), heartbeat = heartbeatService(db);
+    const OLD = "OLD-CONTEXT-fix12 rotate the signing keys";
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...f.queued.contextSnapshot, paperclipAgentMessage: { text: OLD },
+      paperclipTaskMarkdown: OLD, executionStage: { stage: "execute", instructions: OLD } } }).where(eq(heartbeatRuns.id, f.queued.id));
+    expect(await taskInterruptionPresentation(db, await issue(f.issueId))).toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
+    const app = retryRouteApp();
+    const first = await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+    expect(first.status, JSON.stringify(first.body)).toBeLessThan(300);
+    await heartbeat.drainActiveRunExecutions();
+    const others = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId)))
+      .filter(r => r.id !== f.source.id && r.id !== f.queued.id);
+    const [old] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+    expect(old, "the stuck run is cancelled while still queued").toMatchObject({ status: "cancelled", startedAt: null });
+    const fresh = await others();
+    console.info(JSON.stringify({ fix12NoComment: { route: first.status, receipt: first.body, old: { status: old!.status, startedAt: old!.startedAt },
+      fresh: fresh.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt, retryOfRunId: r.retryOfRunId, context: r.contextSnapshot })) } }));
+    expect(fresh, "ONE fresh run").toHaveLength(1);
+    expect(fresh[0]!.startedAt, "the fresh run STARTED (the dispatcher took it)").not.toBeNull();
+    expect(fresh[0]!.retryOfRunId, "no retry ancestry").toBeNull();
+    expect(fresh[0]!.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeReason: "issue_assigned", replacedQueuedRunId: f.queued.id });
+    expect(fresh[0]!.contextSnapshot).not.toHaveProperty("wakeCommentIds");
+    const { context, provider } = await providerInputFor(fresh[0]!, f.issueId);
+    expect((context.paperclipWake as Record<string, unknown> | undefined)?.reason, "the provider gets the assignment").toBe("issue_assigned");
+    expect(provider, "none of the old run's context").not.toContain("OLD-CONTEXT-fix12");
+    expect((await taskInterruptionPresentation(db, await issue(f.issueId)))?.observedRunId, "the card follows the fresh run").not.toBe(f.queued.id);
+    const second = await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+    await heartbeat.drainActiveRunExecutions();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      for (const later of [600_001, 1_200_000]) {
+        vi.setSystemTime(Date.now() + later);
+        await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+      }
+    } finally { vi.useRealTimers(); }
+    const [oldAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+    console.info(JSON.stringify({ fix12NoCommentOnce: { second: second.status, secondBody: second.body, runs: (await others()).map(r => r.id) } }));
+    expect(oldAfter, "the old run never starts later").toMatchObject({ status: "cancelled", startedAt: null });
+    expect((await others()).map(r => r.id), "a second press and later passes start nothing").toEqual([fresh[0]!.id]);
+  }, 120_000);
+
   it.each(["issue_owner_cleanup", "issue_owner_running", "agent_setup", "budget_accounting", "budget_hard_stop", "case_handoff", "native_cleanup"] as const)("JUDGE named hold %s has its own truthful card, not a Retry requeue loop", async hold => {
     const { budgetPolicies, cases, caseHandoffs } = await import("@paperclipai/db");
     const f = await judgeQueued(), heartbeat = heartbeatService(db);
