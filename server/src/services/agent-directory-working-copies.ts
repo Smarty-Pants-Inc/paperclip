@@ -1,4 +1,8 @@
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
+import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
+import { notifyDirectoryCleanup } from "./directory-cleanup-notifications.js";
+import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
+import { persistActivity, publishActivity } from "./activity-log.js";
 import { agentFileHoldWriteCondition, pinLeaseForCollection, unpinLeaseForCollection } from "./agent-file-save-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -46,11 +50,6 @@ export function agentFileSaveHeld(row: Pick<Copy, "state" | "receipt"> | null | 
  * preparation failed before provider use, or exact destruction was proven. */
 function settled(row: Copy): boolean {
   return completed.has(row.state) || row.state === "unavailable" && !agentFileSaveHeld(row);
-}
-const SAVE_RETRY_MS = 30_000;
-const SAVE_MAX_RETRY_MS = 6 * 60 * 60_000;
-function saveRetryAt(since: Date, now = Date.now()) {
-  return new Date(now + Math.min(SAVE_MAX_RETRY_MS, Math.max(SAVE_RETRY_MS, Math.floor(Math.max(0, now - since.getTime()) / 2))));
 }
 function withoutSaveHold(receipt: Record<string, unknown> | null | undefined) {
   const { savePending: _savePending, ...rest } = receipt ?? {};
@@ -464,6 +463,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (row.location !== "local" && target?.kind !== "remote") {
       // A missing controller cache is not the remote directory. Retain the
       // pending save until its exact remote collector or destruction proof exists.
+      if (agentFileSaveHeld(row)) return retryHeldSave(row);
       return patch(row, { ...(stopped ? { state: "pending_collection", processStoppedAt: row.processStoppedAt ?? new Date() } : {}),
         errorCode: "INSTRUCTION_REMOTE_COLLECTOR_UNAVAILABLE", errorMessage: "The remote agent directory is retained; its collector is unavailable. No save or discard is claimed.",
         nextAttemptAt: stopped ? new Date(Date.now() + 30_000) : null });
@@ -506,13 +506,18 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     return holdUnsaved(row, storageLimit ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED", failure,
       storageLimit ? agentStorageWarning(failure instanceof AgentFileLimitError ? failure.message : "Agent folder exceeds a storage limit") : null);
   }
+  function retryHeldSave(row: Copy) {
+    const since = (row.receipt?.savePending as { since?: string } | undefined)?.since;
+    return patch(row, { errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
+      nextAttemptAt: instructionCopyRetryAt(typeof since === "string" ? new Date(since) : row.processStoppedAt ?? row.createdAt) });
+  }
   function holdUnsaved(row: Copy, errorCode: string, failure: unknown, storageWarning: string | null, mirrorHash?: string) {
     const stoppedAt = row.processStoppedAt ?? new Date();
     const previous = row.receipt?.savePending as { since?: string; failures?: number } | undefined;
     const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
     const reason = failure instanceof HttpError || failure instanceof AgentFileLimitError || failure instanceof Error ? failure.message : String(failure);
     return patch(row, { state: "unavailable", processStoppedAt: stoppedAt, errorCode, errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
-      nextAttemptAt: saveRetryAt(since),
+      nextAttemptAt: instructionCopyRetryAt(since),
       receipt: { ...row.receipt, storageWarning, savePending: { since: since.toISOString(), code: errorCode, reason: reason.slice(0, 500),
         failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}) } } },
       // Same lease row lock as every destroy claim; refused once a destroy is claimed.
@@ -603,6 +608,38 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (pin !== "unbound") await unpinLeaseForCollection(db, leaseId, copyKey, pin);
     return collected;
   }
+  /** Called only by the instance-operator route: an explicit loss, never a save.
+   * Serialize with collection and commit the receipt and attribution together
+   * before giving cleanup permission to remove any bytes. */
+  async function discardHeld(input: { companyId: string; runId: string; actorId: string; reason: string }) {
+    const row = await get(input.companyId, input.runId);
+    if (!row || !isAgentDirectoryCopy(row)) throw notFound("Agent-file hold not found");
+    return serial(row, async current => {
+      if (!agentFileSaveHeld(current) || !current.processStoppedAt || current.receipt?.retainedByRunId)
+        throw conflict("Only this run's stopped held save can be discarded");
+      const discardedAt = new Date().toISOString();
+      const discard = { actorId: input.actorId, reason: input.reason, discardedAt };
+      const committed = await db.transaction(async tx => {
+        await notifyDirectoryCleanup(tx, { companyId: current.companyId, runId: current.runId });
+        const leaseId = (current.receipt?.cleanup as { leaseId?: string } | undefined)?.leaseId;
+        if (leaseId) await notifyEnvironmentCleanup(tx, { companyId: current.companyId, runId: current.runId, leaseId });
+        const [updated] = await tx.update(copies).set({ state: "resolved", nextAttemptAt: new Date(),
+          errorCode: "AGENT_FILES_SAVE_DISCARDED", errorMessage: "An operator discarded this unsaved agent-file copy. No save is claimed.",
+          receipt: { ...withoutSaveHold(current.receipt), discard, cleanupPending: true }, updatedAt: new Date() })
+          .where(and(eq(copies.companyId, current.companyId), eq(copies.runId, current.runId),
+            eq(copies.state, current.state), sql`${copies.receipt} IS NOT DISTINCT FROM ${JSON.stringify(current.receipt)}::jsonb`)).returning();
+        if (!updated) throw conflict("The held save changed before discard");
+        const { publication } = await persistActivity(tx as unknown as Db, { companyId: current.companyId,
+          actorType: "user", actorId: input.actorId, action: "agent_files.save_discarded", entityType: "agent", entityId: current.agentId,
+          agentId: current.agentId, runId: current.runId, details: { ...discard, previousErrorCode: current.errorCode } });
+        return { updated, publication };
+      });
+      publishActivity(committed.publication);
+      // The discard is durable even if cleanup needs its existing recovery worker.
+      await release(committed.updated).catch(error => logger.warn({ err: error, runId: current.runId }, "Discarded agent-file cleanup deferred"));
+      return (await get(current.companyId, current.runId))!;
+    }, "agent_directory_release");
+  }
   function releaseIsNoop(row: Copy) {
     return row.state === "superseded" || !row.processStoppedAt ||
       settled(row) && row.receipt?.cleanupPending === false;
@@ -659,6 +696,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         return;
       }
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
+        ...(row.receipt?.discard ? { discard: row.receipt.discard } : {}),
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
         ...(row.receipt?.directoryRunId ? { directoryRunId: row.receipt.directoryRunId } : {}),
         ...(cleanupPending ? { cleanup: row.receipt?.cleanup, ...(destroyedOnly ? { cleanupDestroyedOnly: true } : {}) } : {}) },
@@ -713,6 +751,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const destroyed = lease && hasRemoteTerminationReceipt(lease)
       && (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed";
     if (!destroyed) {
+      if (agentFileSaveHeld(row)) return retryHeldSave(row);
       // execute (including bypassSession) may restart a stopped sandbox. Keep
       // the only remaining bytes; a stop receipt is not a destruction receipt.
       return patch(row, { state: "pending_collection", errorCode: lease ? "INSTRUCTION_STOPPED_REMOTE_COLLECTION_PENDING" : "INSTRUCTION_REMOTE_LEASE_UNVERIFIED",
@@ -772,7 +811,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       return withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), run);
     }));
   }
-  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable,
+  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable, discardHeld,
     /** Exact-allocation destruction proof (the only loss that ends a hold without a save). */
     destroyedRemote: (row: Copy) => destroyedRemoteCopy(row),
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),

@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { conflict, notFound } from "../errors.js";
+import { persistActivity, publishActivity } from "./activity-log.js";
+import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 
 type HoldLease = { id: string; companyId: string; providerLeaseId?: string | null };
 
@@ -155,6 +158,28 @@ export async function unpinLeaseForCollection(db: Db, leaseId: string, copyKey: 
       when (metadata->${AGENT_FILE_COLLECTION_PINS_KEY}::text) - ${copyKey}::text = '{}'::jsonb then metadata - ${AGENT_FILE_COLLECTION_PINS_KEY}::text
       else jsonb_set(metadata, array[${AGENT_FILE_COLLECTION_PINS_KEY}::text], (metadata->${AGENT_FILE_COLLECTION_PINS_KEY}::text) - ${copyKey}::text) end
     where id = ${leaseId} and metadata->${AGENT_FILE_COLLECTION_PINS_KEY}::text->>${copyKey}::text = ${token}::text`);
+}
+
+/** Instance-operator recovery after independently confirming the collector is
+ * stopped. Match one token under the lease lock; never clear another pin or a
+ * replacement collector. This grants no save/discard authority over a copy. */
+export async function clearLeaseCollectionPin(db: Db, input: {
+  companyId: string; leaseId: string; copyKey: string; token: string; actorId: string; reason: string;
+}): Promise<void> {
+  const { publication } = await db.transaction(async tx => {
+    const rows = await tx.execute(sql`select metadata from environment_leases
+      where id = ${input.leaseId} and company_id = ${input.companyId} for update`);
+    if (!rows.length) throw notFound("Environment lease not found");
+    const metadata = rows[0]!.metadata as Record<string, unknown> | null;
+    const pins = metadata?.[AGENT_FILE_COLLECTION_PINS_KEY] as Record<string, unknown> | undefined;
+    if (!pins || pins[input.copyKey] !== input.token) throw conflict("The collection pin changed or no longer exists");
+    await unpinLeaseForCollection(tx as unknown as Db, input.leaseId, input.copyKey, input.token);
+    await notifyEnvironmentCleanup(tx, { companyId: input.companyId, leaseId: input.leaseId });
+    return persistActivity(tx as unknown as Db, { companyId: input.companyId, actorType: "user", actorId: input.actorId,
+      action: "agent_files.collection_pin_cleared", entityType: "environment_lease", entityId: input.leaseId,
+      details: { copyKey: input.copyKey, reason: input.reason, collectorStopped: true, clearedAt: new Date().toISOString() } });
+  });
+  publishActivity(publication);
 }
 
 /**

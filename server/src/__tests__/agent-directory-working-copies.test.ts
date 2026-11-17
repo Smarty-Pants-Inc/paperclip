@@ -1,3 +1,8 @@
+import express from "express";
+import request from "supertest";
+import { environmentRoutes } from "../routes/environments.js";
+import { errorHandler } from "../middleware/index.js";
+import { activityLog } from "@paperclipai/db";
 import { gitExclusionRetryContract } from "./helpers/git-exclusion-retry-contract.js";
 import { queueGitExclusionNextTry } from "./helpers/git-exclusion-next-try.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -1093,6 +1098,182 @@ describe("persistent agent directories", () => {
       await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
     }, 60_000);
 
+    it("old warm-remote hold without collector keeps its backoff and one instruction", async () => {
+      const { copy, held } = await holdUnsavedNote(true, "quota");
+      const environmentId = randomUUID(), leaseId = randomUUID(), remoteCwd = "/fixture/old-hold";
+      await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: copy.runId,
+        provider: "boat", providerLeaseId: leaseId, status: "released", releasedAt: new Date(), metadata: { remoteCwd } });
+      await db.update(agentInstructionWorkingCopies).set({ location: `remote:${environmentId}`,
+        executionRoot: path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", agentId, copy.runId),
+        receipt: { ...held.receipt, cleanup: { leaseId, remoteCwd }, savePending: { ...(held.receipt?.savePending as object),
+          since: new Date(Date.now() - 48 * 3600_000).toISOString() } } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      const before = Date.now();
+      const retry = (await copies.collectStopped({ companyId, runId: copy.runId }))!;
+      expect(retry.errorMessage).toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
+      expect(retry.nextAttemptAt!.getTime() - before).toBeGreaterThanOrEqual(6 * 3600_000);
+      expect(agentFileSaveHeld(retry)).toBe(true);
+      expect(await fs.readFile(path.join(copy.localRoot, "unsaved-note.txt"), "utf8")).toContain("unsaved note");
+    });
+
+    it.each(["apply", "quota", "authorization", "timeout"] as const)("warm-remote stopped failure retains the actual remote tree and retries (%s)", async kind => {
+      const runId = randomUUID(), environmentId = randomUUID(), leaseId = randomUUID();
+      const remoteCwd = await fs.mkdtemp(path.join(home, "warm-remote-"));
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+      await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: runId,
+        provider: "boat", providerLeaseId: leaseId, status: "active", metadata: { remoteCwd } });
+      const remote = { kind: "remote" as const, transport: "sandbox" as const, environmentId, leaseId, remoteCwd, runner: { execute: vi.fn() } };
+      // Only the transport boundary is local: execute the production remote checkpoint
+      // program against a separate provider tree and transfer its real payloads.
+      vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async options => {
+        const assetDirs: Record<string, string> = {};
+        for (const asset of options.assets ?? []) {
+          const destination = path.join(remoteCwd, "assets", randomUUID(), asset.key);
+          await fs.mkdir(path.dirname(destination), { recursive: true });
+          await fs.cp(asset.localDir, destination, { recursive: true }); assetDirs[asset.key] = destination;
+        }
+        if (options.syncWorkspace && options.workspaceInboundMode !== "adopt_remote") {
+          await fs.mkdir(options.workspaceRemoteDir!, { recursive: true });
+          await fs.cp(options.workspaceLocalDir, options.workspaceRemoteDir!, { recursive: true });
+        }
+        return { target: remote, workspaceRemoteDir: options.workspaceRemoteDir!, runtimeRootDir: options.runtimeRootDir ?? null, assetDirs,
+          additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
+          restoreWorkspace: async () => { await fs.cp(options.workspaceRemoteDir!, options.workspaceLocalDir, { recursive: true }); } };
+      });
+      let timeout = false;
+      vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand").mockImplementation(async (_runId, _target, command) => {
+        if (timeout && command.includes("--checkpoint")) {
+          await execFile("sh", ["-c", "sleep 1"], { timeout: 20 }).catch(() => undefined);
+          return { exitCode: null, signal: "SIGTERM", timedOut: true, stdout: "", stderr: "checkpoint deadline", pid: null, startedAt: null };
+        }
+        const result = await execFile("sh", ["-c", command], { cwd: remoteCwd, maxBuffer: 16 * 1024 * 1024 });
+        return { ...result, exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: null };
+      });
+      const service = kind === "apply" ? failingService(kind) : copies;
+      const copy = (await service.prepare({ ...target(), runId, cwd: home, warm: true, target: remote }))!;
+      expect(copy.location).toBe(`remote:${environmentId}`);
+      expect(copy.executionRoot).not.toBe(copy.localRoot);
+      const note = `remote-only-${randomUUID()}`;
+      await fs.writeFile(path.join(copy.executionRoot, "unsaved-note.txt"), note);
+      if (kind === "quota") await sparseFile(path.join(copy.executionRoot, "oversized.bin"), MAX_AGENT_FILE_BYTES + 1);
+      if (kind === "authorization") await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId));
+      timeout = kind === "timeout";
+      const held = (await service.collectStopped({ companyId, runId, target: remote }))!;
+      expect(agentFileSaveHeld(held)).toBe(true);
+      expect(held.errorMessage).toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
+      await service.release(companyId, runId);
+      expect(await fs.readFile(path.join(copy.executionRoot, "unsaved-note.txt"), "utf8")).toBe(note);
+      await expect(fs.stat(path.join(root, "unsaved-note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await agentFileSaveHeldOnLease(db, { id: leaseId, companyId })).toBe(true);
+      timeout = false;
+      if (kind === "quota") await fs.rm(path.join(copy.executionRoot, "oversized.bin"));
+      if (kind === "authorization") await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: userId,
+        permissionKey: "agents:configure", scope: { agentIds: [agentId] } });
+      expect((await copies.collectStopped({ companyId, runId, target: remote }))?.state).toBe("saved");
+      expect(await fs.readFile(path.join(root, "unsaved-note.txt"), "utf8")).toBe(note);
+      await expect(fs.stat(copy.executionRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await agentFileSaveHeldOnLease(db, { id: leaseId, companyId })).toBe(false);
+    }, 60_000);
+
+    function operatorApp(actor: Express.Request["actor"]) {
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = actor; next(); });
+      app.use("/api", environmentRoutes(db)); app.use(errorHandler); return app;
+    }
+    const discardUrl = (runId: string) => `/api/companies/${companyId}/agent-file-holds/${runId}/discard`;
+    it("operator clears only an acknowledged crashed collector pin with its exact token", async () => {
+      const fx = await boundLeaseFixture();
+      const key = `${companyId}:${fx.copy.runId}:${agentId}`, otherKey = `${companyId}:${randomUUID()}:${agentId}`;
+      const token = randomUUID(), otherToken = randomUUID();
+      await db.update(environmentLeases).set({ metadata: { ...(await fx.lease()).metadata,
+        agentFileCollectionPins: { [key]: token, [otherKey]: otherToken } } }).where(eq(environmentLeases.id, fx.leaseId));
+      const url = `/api/companies/${companyId}/environment-leases/${fx.leaseId}/collection-pins/clear`;
+      const admin = operatorApp({ type: "board", source: "local_implicit", userId });
+      const payload = { copyKey: key, token, reason: "Collector crashed; its process is gone", collectorStopped: true };
+      expect(await claimLeaseForDestroyUnlessHeld(db, await fx.lease())).toBeNull();
+      expect((await request(operatorApp({ type: "agent", companyId, agentId, source: "agent_key" }))
+        .post(url).send(payload)).status).toBe(403);
+      expect((await request(admin).post(url).send({ ...payload, token: randomUUID() })).status).toBe(409);
+      expect((await request(admin).post(url).send({ ...payload, collectorStopped: false })).status).toBe(422);
+      expect((await request(admin).post(url).send(payload)).status).toBe(200);
+      expect((await fx.lease()).metadata?.agentFileCollectionPins).toEqual({ [otherKey]: otherToken });
+      expect(await claimLeaseForDestroyUnlessHeld(db, await fx.lease())).toBeNull();
+      // An old clear cannot erase a replacement collector's token.
+      await db.update(environmentLeases).set({ metadata: { ...(await fx.lease()).metadata,
+        agentFileCollectionPins: { [key]: "replacement", [otherKey]: otherToken } } }).where(eq(environmentLeases.id, fx.leaseId));
+      expect((await request(admin).post(url).send(payload)).status).toBe(409);
+      expect((await request(admin).post(url).send({ ...payload, token: "replacement" })).status).toBe(200);
+      expect((await request(admin).post(url).send({ ...payload, copyKey: otherKey, token: otherToken })).status).toBe(200);
+      expect((await fx.lease()).metadata).not.toHaveProperty("agentFileCollectionPins");
+      const claim = await claimLeaseForDestroyUnlessHeld(db, await fx.lease());
+      expect(claim).toEqual(expect.any(String));
+      await releaseLeaseDestroyClaim(db, fx.leaseId, claim!);
+      expect(await fx.surviving()).toBe(fx.note);
+      expect(fx.call).not.toHaveBeenCalled();
+      const records = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+      const clears = records.filter(row => row.action === "agent_files.collection_pin_cleared");
+      expect(clears).toHaveLength(3);
+      expect(clears[0]).toMatchObject({ actorType: "user", actorId: userId,
+        details: { copyKey: key, reason: payload.reason, collectorStopped: true, clearedAt: expect.any(String) } });
+    });
+    it("operator discard removes exactly one held save and atomically records who why and when", async () => {
+      const first = await holdUnsavedNote(true, "quota"), second = await holdUnsavedNote(false, "authorization");
+      const before = Date.now();
+      const response = await request(operatorApp({ type: "board", source: "session", userId, isInstanceAdmin: true, companyIds: [companyId] }))
+        .post(discardUrl(first.copy.runId)).send({ reason: "Permanent quota failure; operator accepts losing this unsaved copy" });
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ state: "resolved", errorCode: "AGENT_FILES_SAVE_DISCARDED" });
+      expect(agentFileSaveHeld((await copies.get(companyId, first.copy.runId))!)).toBe(false);
+      await expect(fs.stat(first.copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      await assertRetained(second.copy, second.note);
+      await expect(fs.stat(path.join(root, "unsaved-note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      const records = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+      const discarded = records.filter(row => row.action === "agent_files.save_discarded");
+      expect(discarded).toHaveLength(1);
+      expect(discarded[0]).toMatchObject({ actorType: "user", actorId: userId, runId: first.copy.runId,
+        details: { reason: "Permanent quota failure; operator accepts losing this unsaved copy", discardedAt: expect.any(String) } });
+      expect(new Date(String(discarded[0]!.details?.discardedAt)).getTime()).toBeGreaterThanOrEqual(before);
+      expect((await copies.get(companyId, first.copy.runId))?.receipt?.discard).toMatchObject({ actorId: userId });
+      // Repeating cannot silently discard any other copy or fabricate another activity.
+      expect((await request(operatorApp({ type: "board", source: "local_implicit", userId }))
+        .post(discardUrl(first.copy.runId)).send({ reason: "repeat" })).status).toBe(409);
+      await assertRetained(second.copy, second.note);
+    });
+    it("operator discard unblocks normal provider destruction only for the selected allocation", async () => {
+      const first = await boundLeaseFixture(), second = await boundLeaseFixture();
+      for (const fx of [first, second]) {
+        expect(agentFileSaveHeld(await copies.collectStopped({ companyId, runId: fx.copy.runId }))).toBe(true);
+        await fx.runtime.destroyRunLease({ environment: fx.environment, lease: await fx.lease() });
+        expect(fx.call).not.toHaveBeenCalled();
+      }
+      const response = await request(operatorApp({ type: "board", source: "local_implicit", userId }))
+        .post(discardUrl(first.copy.runId)).send({ reason: "Release this permanently over-quota allocation" });
+      expect(response.status).toBe(200);
+      await first.runtime.destroyRunLease({ environment: first.environment, lease: await first.lease() });
+      await second.runtime.destroyRunLease({ environment: second.environment, lease: await second.lease() });
+      expect(await first.surviving()).toBe("MISSING:ENOENT");
+      expect(first.call.mock.calls.map(call => call[1])).toEqual(["environmentDestroyLease"]);
+      expect(await second.surviving()).toBe(second.note);
+      expect(second.call).not.toHaveBeenCalled();
+      expect(agentFileSaveHeld(await copies.get(companyId, second.copy.runId))).toBe(true);
+      console.log("OPERATOR_DISCARD_PROVIDER", JSON.stringify({ discardedRun: first.copy.runId, retainedRun: second.copy.runId,
+        firstSurviving: await first.surviving(), secondSurviving: await second.surviving(),
+        firstProviderCalls: first.call.mock.calls.map(call => call[1]), secondProviderCalls: second.call.mock.calls.map(call => call[1]) }));
+    });
+
+    it.each(["agent", "member", "anonymous"] as const)("operator discard refuses unauthorized %s caller without touching the hold", async kind => {
+      const { copy, note } = await holdUnsavedNote(false, "apply");
+      const caller: Express.Request["actor"] = kind === "agent" ? { type: "agent", companyId, agentId, source: "agent_key" }
+        : kind === "member" ? { type: "board", userId, source: "session", companyIds: [companyId], isInstanceAdmin: false }
+          : { type: "none" };
+      const response = await request(operatorApp(caller)).post(discardUrl(copy.runId)).send({ reason: "unauthorized loss" });
+      expect([401, 403]).toContain(response.status);
+      await assertRetained(copy, note);
+      const records = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+      expect(records.filter(row => row.action === "agent_files.save_discarded")).toHaveLength(0);
+    });
+
     it("a held save does not block the next message: the next run starts from canonical and the instruction stays visible", async () => {
       const { copy, note } = await holdUnsavedNote(false, "apply");
       const next = await run();
@@ -1229,6 +1410,9 @@ describe("persistent agent directories", () => {
     } finally { open.mockRestore(); }
   });
 
+  // Authority for all six supersedes records below (seven cases): RFL's 11:16Z
+  // ruling, as cited in review-fleet-4's rc2 verdict (F5). The old deletion
+  // assertions are replaced by retained-source proofs, not dropped safety guards.
   // supersedes (fail-closed): the old test asserted the temporary copy was deleted
   // (ENOENT + compacted baseline) after an over-quota save. That discarded the only
   // copy of "changed instructions". It now asserts retention under a held save.
@@ -1326,6 +1510,10 @@ describe("persistent agent directories", () => {
     expect(result).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
     // supersedes (fail-closed): the limit reason moved from errorMessage to the held save receipt.
     expect((result?.receipt?.savePending as { reason?: string }).reason).toContain("2 GiB total storage limit");
+    expect(agentFileSaveHeld(result)).toBe(true);
+    expect(result?.nextAttemptAt).toBeInstanceOf(Date);
+    expect((await fs.stat(path.join(copy.localRoot, "part-0.bin"))).size).toBe(MAX_AGENT_FILE_BYTES);
+    expect(await fs.readFile(path.join(copy.localRoot, entryFile), "utf8")).toBe(initial);
     expect(await fs.readdir(root)).toEqual(["policy"]);
   });
 
