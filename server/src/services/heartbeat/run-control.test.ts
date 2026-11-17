@@ -1188,3 +1188,56 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
   });
 
 });
+
+// Hold50 (RFL FAIL 1): the bypass needs the executor's own wait shape, a JSON
+// object with a string reason and message (deferred-execution-wait.ts). Ported
+// from the judge's door checks: JSON null, false, a string, an array and {}
+// were accepted because only SQL NULL was refused.
+describe.skipIf(!runControlPostgresSupport.supported)("Hold50 executionWait shape door", () => {
+  let db: Db;
+  const { fixture } = setupRunControlDatabase("paperclip-hold50-execution-wait-shape", value => { db = value; });
+  async function seed() {
+    const { company, agent } = await fixture();
+    const issueId = randomUUID(), id = randomUUID();
+    const stopped = new Date("2026-11-17T08:00:00.123-04:00");
+    const [run] = await db.insert(heartbeatRuns).values({ id, companyId: company.id, agentId: agent.id,
+      runtimeMode: "native", nativeIssueId: issueId, contextSnapshot: { issueId }, status: "cancelled",
+      startedAt: new Date(stopped.getTime() - 1000), createdAt: new Date(stopped.getTime() - 1000),
+      finishedAt: new Date(stopped.getTime() + 5000), processPid: 999999999,
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "hold50",
+        cancellation: { source: "operator", expected: true, initiator: { type: "user", id: "hold50" }, reason: "Stop",
+          recordedAt: "2026-11-17T08:00:00.123-04:00" },
+        nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: id, companyId: company.id, issueId,
+          scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+          intentAuditId: "hold50", acknowledgementAuditId: "hold50" } } }).returning();
+    await db.insert(issues).values({ id: issueId, companyId: company.id, title: "Hold50 shape", status: "in_progress",
+      assigneeAgentId: agent.id });
+    await db.insert(nativeRunFinalizations).values({ companyId: company.id, issueId, runId: id, phase: "terminal_failure",
+      leaseOwner: null });
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+      source: "issue_comment", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "hold50", requestedAt: new Date(stopped.getTime() + 1),
+      payload: { issueId, executionWait: { reason: "controller_settling", message: "Waiting" } } }).returning();
+    const control = createHeartbeatRunControl(db, callbacks(db));
+    return { run, wake, check: () => control.executionWaitSourceStopped(company.id, wake.id) };
+  }
+
+  it("a well-formed wait after a proven Stop opens the door", async () => {
+    const f = await seed();
+    expect((await f.check())?.id).toBe(f.run.id);
+  });
+
+  it.each([
+    ["JSON null", null], ["false", false], ["a string", "not-a-wait"], ["an array", []], ["an empty object", {}],
+    ["a reason without a message", { reason: "controller_settling" }], ["an empty reason", { reason: " ", message: "Waiting" }],
+  ] as const)("refuses %s as executionWait", async (_label, executionWait) => {
+    const f = await seed();
+    await db.update(agentWakeupRequests).set({ payload: { ...f.wake.payload, executionWait } })
+      .where(eq(agentWakeupRequests.id, f.wake.id));
+    const [stored] = await db.select({ wait: sql<string | null>`jsonb_typeof(${agentWakeupRequests.payload}->'executionWait')` })
+      .from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wake.id));
+    // Stored as JSON (not SQL NULL): the old `is not null` test let it through.
+    expect(stored.wait).not.toBeNull();
+    expect(await f.check()).toBeNull();
+  });
+});

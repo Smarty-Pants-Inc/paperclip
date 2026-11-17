@@ -1,4 +1,4 @@
-import { PersistedExecutionWaitRefusal } from "../deferred-execution-wait.js";
+import { isWellFormedExecutionWait, PersistedExecutionWaitRefusal, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
@@ -20,6 +20,9 @@ export function registerDeferredReceiptWork(
     resume(scope: DeferredReceiptRecoveryOptions): Promise<unknown>;
     /** S8q: the native run an Interrupt stopped has proven it can no longer write. */
     interruptTargetStopped?(scope: Required<DeferredExecutionScope>): Promise<boolean>;
+    /** Hold50: a person's message saved after a native Stop whose exact source
+     * run has the same stop proof. Not covered: a failed run (no acknowledged Stop). */
+    executionWaitSourceStopped?(scope: Required<DeferredExecutionScope>): Promise<boolean>;
     settleTaskChat(scope: DeferredExecutionScope): Promise<unknown>;
     createNativeBatch(): (scope: NativeIntentOptions) => Promise<unknown>;
     schedulingSuppressed(): Promise<boolean>;
@@ -41,6 +44,19 @@ export function registerDeferredReceiptWork(
       and r.runtime_mode = 'native' and r.status = 'cancelled'
       and r.result_json->>'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text
       and f.lease_owner is null and f.phase in ('terminal_failure', 'applied'))`;
+  // Hold50 cheap hint: a person's non-interrupt saved message whose task has
+  // a stopped native run with a released controller. It is no time filter: a
+  // native run finishes after its Stop request (run-cancellation.ts). check()
+  // requires the full stop proof, the exact source and a post-Stop request.
+  const stoppedNativeSource = sql<boolean>`(agent_wakeup_requests.requested_by_actor_type = 'user'
+    and ${wellFormedExecutionWaitSql(sql.raw("agent_wakeup_requests.payload"))}
+    and agent_wakeup_requests.payload->'queuedCommentInterrupt' is null
+    and exists (select 1 from heartbeat_runs r
+      join native_run_finalizations f on f.company_id = r.company_id and f.run_id = r.id
+      where r.company_id = agent_wakeup_requests.company_id and r.agent_id = agent_wakeup_requests.agent_id
+        and r.context_snapshot->>'issueId' = agent_wakeup_requests.payload->>'issueId'
+        and r.runtime_mode = 'native' and r.status = 'cancelled'
+        and f.lease_owner is null and f.phase in ('terminal_failure', 'applied')))`;
   let unsubscribeRefresh: (() => void) | undefined;
   function releaseRefresh() {
     unsubscribeRefresh?.();
@@ -90,6 +106,7 @@ export function registerDeferredReceiptWork(
           // Cheap hint only: the run's controller released its native session.
           // check() requires the full stop proof before skipping the age gate.
           interruptedNative: owner.interruptTargetStopped ? interruptedNativeReleased : sql<boolean>`false`,
+          stoppedSource: owner.executionWaitSourceStopped ? stoppedNativeSource : sql<boolean>`false`,
         };
         const eligible = and(
           scope ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
@@ -136,7 +153,7 @@ export function registerDeferredReceiptWork(
         return { rows: [...prioritized, ...rows].map(row => {
           const deadline = kind === "native" && row.status === "claimed" && row.claimedAt ? row.claimedAt.getTime() + 60_000
             : kind === "native" && row.error ? row.updatedAt.getTime() + 30_000
-            : kind === "deferred" && row.delayed && !row.interruptedLegacy && !row.interruptedNative
+            : kind === "deferred" && row.delayed && !row.interruptedLegacy && !row.interruptedNative && !row.stoppedSource
               ? row.updatedAt.getTime() + 30_000
             : null;
           const immediate = deadline === null || deadline <= now;
@@ -167,7 +184,11 @@ export function registerDeferredReceiptWork(
           const stoppedInterrupt = kind === "deferred" && due !== null && due > Date.now() &&
             Boolean(current.payload?.queuedCommentInterrupt) && owner.interruptTargetStopped &&
             await owner.interruptTargetStopped({ companyId: entry.companyId, requestId: entry.id });
-          if (due !== null && due > Date.now() && !stoppedInterrupt) return { ...entry, dueAt: due, immediate: false };
+          const stoppedSource = kind === "deferred" && due !== null && due > Date.now() && !stoppedInterrupt &&
+            isWellFormedExecutionWait(current.payload?.executionWait) && !current.payload?.queuedCommentInterrupt &&
+            owner.executionWaitSourceStopped &&
+            await owner.executionWaitSourceStopped({ companyId: entry.companyId, requestId: entry.id });
+          if (due !== null && due > Date.now() && !stoppedInterrupt && !stoppedSource) return { ...entry, dueAt: due, immediate: false };
         }
         const errors: unknown[] = [];
         let next: number | null = null;

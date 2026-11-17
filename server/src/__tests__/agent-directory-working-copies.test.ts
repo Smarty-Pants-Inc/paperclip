@@ -34,11 +34,15 @@ import type { EnvironmentRuntimeService } from "../services/environment-runtime.
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createReusableLeaseHandoff } from "../services/environment-lease-handoff.js";
 import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService, agentFileSaveHeld } from "../services/agent-directory-working-copies.js";
-import { agentFileSaveHeldOnLease } from "../services/agent-file-save-hold.js";
+import { agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim } from "../services/agent-file-save-hold.js";
+import * as checkpointsModule from "../services/agent-file-checkpoints.js";
 import { collectStoppedInstructionCopyWithRetries } from "../services/agent-instruction-working-copies.js";
 import { HttpError } from "../errors.js";
 import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
-import { heartbeatRunEvents } from "@paperclipai/db";
+import { heartbeatRunEvents, plugins } from "@paperclipai/db";
+import { PgDialect } from "drizzle-orm/pg-core";
+import { environmentRuntimeService } from "../services/environment-runtime.js";
+import { environmentService } from "../services/environments.js";
 import { agentFileRoots } from "@paperclipai/db";
 import * as storageModule from "../storage/index.js";
 import { Readable } from "node:stream";
@@ -712,6 +716,144 @@ describe("persistent agent directories", () => {
     await expect(fs.stat(path.join(root, reserved))).rejects.toMatchObject({ code: "ENOENT" });
     expect(await run()).toBeTruthy();
   });
+
+  it("F2 race (rf4 judge port): save hold committed after guard read still forbids provider destruction", async () => {
+    
+    const copy = await run({ warm: true });
+    const note = `race-unsaved-${randomUUID()}`;
+    await fs.writeFile(path.join(copy.localRoot, "race-note.txt"), note);
+    const quotaFile = await fs.open(path.join(copy.localRoot, "over-quota.bin"), "w");
+    await quotaFile.truncate(MAX_AGENT_FILE_BYTES + 1); await quotaFile.close();
+    const pluginId = randomUUID(), environmentId = randomUUID(), leaseId = randomUUID(), provider = `judge-boat-${pluginId}`;
+    const providerRoot = path.join(home, `race-box-${leaseId}`);
+    await fs.mkdir(providerRoot); await fs.writeFile(path.join(providerRoot, "race-note.txt"), note);
+    await db.insert(plugins).values({ id: pluginId, pluginKey: provider, packageName: provider, version: "1.0.0", apiVersion: 1,
+      categories: ["automation"], status: "ready", manifestJson: { id: provider, apiVersion: 1, version: "1.0.0", displayName: "Judge Boat", description: "Controlled judge provider", author: "Judge", categories: ["automation"], capabilities: ["environment.drivers.register"], entrypoints: { worker: "dist/worker.js" }, environmentDrivers: [{ driverKey: provider, kind: "sandbox_provider", displayName: "Judge Boat", supportsReusableLeases: true, configSchema: { type: "object" } }] } } as any);
+    await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox", config: { provider, reuseLease: true } });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: copy.runId,
+      provider, providerLeaseId: `race-${leaseId}`, leasePolicy: "reuse_by_environment", status: "released",
+      metadata: { driver: "sandbox", sandboxProviderPlugin: true, pluginId, provider, reuseLease: true, remoteCwd: providerRoot } });
+    await db.update(agentInstructionWorkingCopies).set({ receipt: { ...copy.receipt, cleanup: { leaseId, remoteCwd: providerRoot } } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, copy.runId));
+    let heldBeforeDestroy = false;
+    const call = vi.fn(async (_plugin: string, method: string, input: any) => {
+      if (method !== "environmentDestroyLease") throw new Error(`Unexpected ${method}`);
+      const current = await copies.get(companyId, copy.runId);
+      heldBeforeDestroy = Boolean(current?.receipt?.savePending);
+      await fs.rm(providerRoot, { recursive: true, force: true });
+      return { providerLeaseId: input.providerLeaseId, state: "destroyed" };
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: { isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentDestroyLease"] }) } as any });
+    const envs = environmentService(db), environment = (await envs.getById(environmentId))!, lease = (await envs.getLeaseById(leaseId))!;
+    const execute = db.execute.bind(db), dialect = new PgDialect();
+    let injected = false;
+    const spy = vi.spyOn(db, "execute").mockImplementation((async (statement: any) => {
+      const result = await execute(statement);
+      if (!injected && dialect.sqlToQuery(statement).sql.includes("held_copy")) {
+        injected = true;
+        expect(result).toHaveLength(0); // The real read, NOT a forged response.
+        const failed = await copies.collectStopped({ companyId, runId: copy.runId });
+        expect(failed?.receipt?.savePending).toBeTruthy();
+      }
+      return result;
+    }) as any);
+    try {
+      await runtime.destroyRunLease({ environment, lease });
+      expect(injected).toBe(true);
+      const surviving = await fs.readFile(path.join(providerRoot, "race-note.txt"), "utf8").catch(error => `MISSING:${error.code}`);
+      const evidence = { injected, heldBeforeDestroy, providerCalls: call.mock.calls.map(c => c[1]), surviving, expected: note };
+      console.log("JUDGE_DESTROY_RACE", JSON.stringify(evidence));
+      if (process.env.TASK_OUT) await fs.writeFile(path.join(process.env.TASK_OUT, "judge-destroy-race-evidence.json"), JSON.stringify(evidence, null, 2) + "\n");
+      expect.soft(call).not.toHaveBeenCalled();
+      expect.soft(surviving).toBe(note);
+    } finally { spy.mockRestore(); vi.restoreAllMocks(); }
+  }, 60_000);
+
+  // F2b: the collector pins its bound lease (same lease row lock as the destroy
+  // claim) before collection starts. A destroy already claimed refuses the
+  // collection; a destroy during a pinned collection is refused. The claim is
+  // released only by the token that took it.
+  async function boundLeaseFixture() {
+    const copy = await run({ warm: true });
+    const note = `pin-unsaved-${randomUUID()}`;
+    await fs.writeFile(path.join(copy.localRoot, "race-note.txt"), note);
+    const quotaFile = await fs.open(path.join(copy.localRoot, "over-quota.bin"), "w");
+    await quotaFile.truncate(MAX_AGENT_FILE_BYTES + 1); await quotaFile.close();
+    const pluginId = randomUUID(), environmentId = randomUUID(), leaseId = randomUUID(), provider = `judge-boat-${pluginId}`;
+    const providerRoot = path.join(home, `pin-box-${leaseId}`);
+    await fs.mkdir(providerRoot); await fs.writeFile(path.join(providerRoot, "race-note.txt"), note);
+    await db.insert(plugins).values({ id: pluginId, pluginKey: provider, packageName: provider, version: "1.0.0", apiVersion: 1,
+      categories: ["automation"], status: "ready", manifestJson: { id: provider, apiVersion: 1, version: "1.0.0", displayName: "Judge Boat", description: "Controlled judge provider", author: "Judge", categories: ["automation"], capabilities: ["environment.drivers.register"], entrypoints: { worker: "dist/worker.js" }, environmentDrivers: [{ driverKey: provider, kind: "sandbox_provider", displayName: "Judge Boat", supportsReusableLeases: true, configSchema: { type: "object" } }] } } as any);
+    await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox", config: { provider, reuseLease: true } });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: copy.runId,
+      provider, providerLeaseId: `pin-${leaseId}`, leasePolicy: "reuse_by_environment", status: "released",
+      metadata: { driver: "sandbox", sandboxProviderPlugin: true, pluginId, provider, reuseLease: true, remoteCwd: providerRoot } });
+    await db.update(agentInstructionWorkingCopies).set({ receipt: { ...copy.receipt, cleanup: { leaseId, remoteCwd: providerRoot } } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, copy.runId));
+    const call = vi.fn(async (_plugin: string, method: string, input: any) => {
+      if (method !== "environmentDestroyLease") throw new Error(`Unexpected ${method}`);
+      await fs.rm(providerRoot, { recursive: true, force: true });
+      return { providerLeaseId: input.providerLeaseId, state: "destroyed" };
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: { isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentDestroyLease"] }) } as any });
+    const envs = environmentService(db);
+    const environment = (await envs.getById(environmentId))!;
+    const lease = async () => (await envs.getLeaseById(leaseId))!;
+    const surviving = () => fs.readFile(path.join(providerRoot, "race-note.txt"), "utf8").catch(error => `MISSING:${error.code}`);
+    return { copy, note, leaseId, call, runtime, environment, lease, surviving };
+  }
+
+  it("F2b: a collection that starts after a destroy claim is refused, and only the claim's own token releases it", async () => {
+    const fx = await boundLeaseFixture();
+    const claim = await claimLeaseForDestroyUnlessHeld(db, await fx.lease());
+    expect(claim).toEqual(expect.any(String));
+    const refused = await copies.collectStopped({ companyId, runId: fx.copy.runId });
+    expect(refused?.receipt?.savePending).toBeUndefined();
+    expect((await fx.lease()).metadata).not.toHaveProperty("agentFileCollectionPins");
+    // An old cleanup's release (another token) leaves the current claim in force.
+    await releaseLeaseDestroyClaim(db, fx.leaseId, randomUUID());
+    expect((await fx.lease()).metadata).toMatchObject({ agentFileDestroyClaim: claim });
+    const stillRefused = await copies.collectStopped({ companyId, runId: fx.copy.runId });
+    expect(stillRefused?.receipt?.savePending).toBeUndefined();
+    // The claim's own release ends it; the collection then runs and holds the unsaved source.
+    await releaseLeaseDestroyClaim(db, fx.leaseId, claim!);
+    expect((await fx.lease()).metadata).not.toHaveProperty("agentFileDestroyClaim");
+    const held = await copies.collectStopped({ companyId, runId: fx.copy.runId });
+    expect(held?.receipt?.savePending).toBeTruthy();
+    expect((await fx.lease()).metadata).not.toHaveProperty("agentFileCollectionPins");
+    expect(await claimLeaseForDestroyUnlessHeld(db, await fx.lease())).toBeNull();
+    expect(await fx.surviving()).toBe(fx.note);
+  }, 60_000);
+
+  it("F2b: a destroy during a pinned collection is refused (collection then fails closed and holds)", async () => {
+    const fx = await boundLeaseFixture();
+    const capture = checkpointsModule.captureAgentFileCheckpoint;
+    let duringCollection: { pinned: unknown; destroyed: unknown } | null = null;
+    const spy = vi.spyOn(checkpointsModule, "captureAgentFileCheckpoint").mockImplementation(async (...args) => {
+      if (!duringCollection) {
+        const lease = await fx.lease();
+        duringCollection = { pinned: lease.metadata?.agentFileCollectionPins ?? null,
+          destroyed: await fx.runtime.destroyRunLease({ environment: fx.environment, lease }) };
+      }
+      return capture(...args);
+    });
+    try {
+      const collected = await copies.collectStopped({ companyId, runId: fx.copy.runId });
+      expect(duringCollection).not.toBeNull();
+      console.log("F2B_PINNED_COLLECTION", JSON.stringify({ duringCollection, providerCalls: fx.call.mock.calls.map(c => c[1]), surviving: await fx.surviving() }));
+      expect.soft(fx.call).not.toHaveBeenCalled();
+      expect.soft(await fx.surviving()).toBe(fx.note);
+      expect(collected?.receipt?.savePending).toBeTruthy();
+      expect((await fx.lease()).metadata).not.toHaveProperty("agentFileCollectionPins");
+      expect((await fx.lease()).metadata).not.toHaveProperty("agentFileDestroyClaim");
+    } finally { spy.mockRestore(); }
+    // After the collection settled, the durable hold still refuses the destroy.
+    await fx.runtime.destroyRunLease({ environment: fx.environment, lease: await fx.lease() });
+    expect(fx.call).not.toHaveBeenCalled();
+    expect(await fx.surviving()).toBe(fx.note);
+  }, 60_000);
 
   it("round trips nested text, empty directories and binary bytes independently of task files", async () => {
     const first = await run();
