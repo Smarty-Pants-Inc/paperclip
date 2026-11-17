@@ -1882,9 +1882,13 @@ function createSandboxEnvironmentDriver(
       // A closed ACTIVE tip (J3-26) always needs verified custody before a destroy.
       const knownNonNative = !closedActiveTipIds.has(lease.id) && input.adapterType !== "paperclip_runner" && typeof scope?.adapterType === "string"
         && scope.adapterType !== "paperclip_runner" && (AGENT_ADAPTER_TYPES as readonly string[]).includes(scope.adapterType);
-      if (!knownNonNative
-        && (!lease.providerLeaseId || !await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
-          stamp: await obsoleteLeaseCustodyStamp(lease), providerLeaseId: lease.providerLeaseId }))) {
+      // Harness custody excludes workspace writes after finalize: a changed
+      // source must stop and keep even with a verified backup or non-native adapter.
+      // Boat keeps stopped disks >=14 days, without compute: https://docs.boat.dev/limits
+      if (!sandboxLeaseSourceMatches(input.environment.config, lease.metadata ?? {})
+        || (!knownNonNative
+          && (!lease.providerLeaseId || !await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
+            stamp: await obsoleteLeaseCustodyStamp(lease), providerLeaseId: lease.providerLeaseId })))) {
         const [stale] = await db.select().from(environmentLeases).where(and(
           eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.id, lease.id),
         ));
