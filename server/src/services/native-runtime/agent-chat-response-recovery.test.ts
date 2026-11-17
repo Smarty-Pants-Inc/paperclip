@@ -14,6 +14,10 @@ import { instanceSettingsService } from "../instance-settings.js";
 import { issueService } from "../issues.js";
 import * as nativeResponseNotifications from "../native-response-presentation-notifications.js";
 import { compactRunLogChunk } from "../heartbeat/run-log.js";
+import { createAgentLifecycle, createAgentLifecycleEffects } from "../agent-lifecycle.js";
+import { createLifecycleStore } from "../../modules/agent-lifecycle/adapters/postgres.js";
+import { createLifecycleWorker } from "../../modules/agent-lifecycle/application/worker.js";
+import { nativeRunProjectionWork } from "./native-run-projection-work.js";
 
 const runLogReads = vi.hoisted(() => [] as unknown[]);
 vi.mock("../run-log-store.js", async (importOriginal) => {
@@ -37,13 +41,32 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
 
   async function fixture(conversation = true, options: { succeed?: boolean; disposition?: "done" | "needs_review" | "yielded"; channel?: "final" | "unknown";
     beforeFinalize?: (ids: { companyId: string; issueId: string; runId: string; agentId: string }) => Promise<void>;
-    reply?: string; logRef?: string } = {}) {
+    reply?: string; logRef?: string; freshHire?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const sessionId = randomUUID(), runnerId = randomUUID(), userId = `fixture-${randomUUID()}`, wakeId = randomUUID();
     await db.insert(authUsers).values({ id: userId, name: "Conversation owner", email: `${userId}@example.test`,
       createdAt: new Date("2020-01-01T00:00:00Z"), updatedAt: new Date("2020-01-01T00:00:00Z") });
     await db.insert(companies).values({ id: companyId, name: "Reply recovery fixture", issuePrefix: companyId.slice(0, 8) });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Conversation agent", adapterType: "paperclip_runner" });
+    if (options.freshHire) {
+      await db.update(companies).set({ requireBoardApprovalForNewAgents: false }).where(eq(companies.id, companyId));
+      const hired = await createAgentLifecycle(db).requestHire(companyId, { id: agentId, name: "Fresh Pi agent",
+        adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "test/model" },
+        runtimeConfig: { heartbeat: { enabled: false } } });
+      expect(hired.lifecycleState).toBe("preparing");
+      const phases: string[] = [];
+      // External preparation/verification succeeds deterministically. The actual
+      // hire, persisted lifecycle worker and ready transition are not mocked.
+      const worker = createLifecycleWorker(createLifecycleStore(db, createAgentLifecycleEffects()), {
+        requiredPluginIds: async () => [], runPlugin: async () => "complete",
+        runHost: async agent => { phases.push(agent.lifecycleState); return "complete"; },
+      }, (_context, error) => { throw error; });
+      try { await worker.process(agentId); } finally { await worker.stop(); }
+      expect(phases).toEqual(["preparing", "verifying"]);
+      expect((await db.select().from(agents).where(eq(agents.id, agentId)))[0])
+        .toMatchObject({ lifecycleState: "ready", lifecycleHolds: [], status: "idle", lastHeartbeatAt: null });
+    } else {
+      await db.insert(agents).values({ id: agentId, companyId, name: "Conversation agent", adapterType: "paperclip_runner" });
+    }
     await db.insert(issues).values({ id: issueId, companyId, title: "Conversation reply", status: "in_progress", assigneeAgentId: agentId,
       ...(conversation ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", conversationSessionGeneration: 0 } : {}) });
     await db.insert(issueComments).values({ id: wakeId, companyId, issueId, authorUserId: userId, body: "Hire one teammate and tell me when ready.",
@@ -58,6 +81,11 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       ...(options.logRef ? { logStore: "local_file", logRef: options.logRef } : {}),
       contextSnapshot: { issueId, source: "issue.comment", wakeCommentId: wakeId, ...(conversation ? { conversationSessionGeneration: 0 } : {}) } });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    if (options.freshHire) {
+      // Execution-start's ready/invokable agent write, after its FIRST chat run
+      // was admitted. There is no prior heartbeat or earlier run to hide behind.
+      await db.update(agents).set({ status: "running" }).where(and(eq(agents.id, agentId), eq(agents.lifecycleState, "ready")));
+    }
     const port = new NativeRunCoordinatorStore(db, { companyId, issueId, runId, agentId, normalizedSessionId: sessionId,
       runnerSourceInstanceId: runnerId, completionContractId: contract.id, completionContractSha256: contract.canonicalSha256,
       completionContractRevision: "test", completionContractCriterionIds: [] });
@@ -81,6 +109,27 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     const input = { companyId, issueId, runId };
     return { ...input, input, agentId, userId, wakeId, prpEvent, reply };
   }
+  // Keep reason: recorded incident smarty-dev#21005, fresh-hire L1 attempt 5.
+  // No live completion tail is assumed: the durable projection worker owns the
+  // committed result after the live owner has left. The Pi provider boundary is
+  // deterministic; this is database integration proof, not a live model run.
+  it.each([null, "queued", "running"] as const)("settles a fresh hire's first succeeded chat through durable projection (other=%s)", async other => {
+    const f = await fixture(true, { freshHire: true, succeed: false });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+    if (other) await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: other, runtimeMode: "native" });
+    const work = nativeRunProjectionWork(db);
+    const [entry] = await work.load({ companyId: f.companyId, runId: f.runId });
+    expect(entry).toBeDefined();
+    expect(await work.check(entry)).toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0])
+      .toMatchObject({ status: "succeeded", nativePhase: "committed" });
+    const [active] = await db.execute(sql`select count(*)::int as count from heartbeat_runs
+      where agent_id = ${f.agentId} and status in ('queued', 'running')`);
+    expect(active.count).toBe(other ? 1 : 0);
+    expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0])
+      .toMatchObject({ lifecycleState: "ready", lifecycleHolds: [], status: other ? "running" : "idle" });
+  });
+
   it("settles the exact claimed wake when recovery projects a committed native run", async () => {
     // The provider and result are already committed. Recovery owns terminal
     // projection because the live executor will not return to completeRun.
