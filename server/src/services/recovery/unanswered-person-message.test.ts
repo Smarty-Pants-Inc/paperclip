@@ -1735,4 +1735,162 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notices).toHaveLength(1);
       expect(notices[0]!.body).toBe(NO_REPLY);
     });
+  // Card-answer duty (org 15:22Z + RFL 15:20Z, option A): a person's answer to
+  // an agent's card is a person input with the typed message's duty, by the
+  // SAME chain rule. Adapted from rf5 RF5_ALL_FAILED_WITH_ANSWER
+  // (rf5-cardline-supplemental.test.ts:262-275) onto the production
+  // answerQuestions/accept/reject/withdraw services.
+  describe("card answer duty: answered, or exactly one true notice", () => {
+    const cardNotices = (f: Awaited<ReturnType<typeof fixture>>) => db.select().from(issueComments).where(and(
+      eq(issueComments.issueId, f.issueId), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
+    async function answeredCard(f: Awaited<ReturnType<typeof fixture>>, sourceRunId: string,
+      how: "answer" | "accept" | "reject" | "agent-withdraw" | "system-expiry" = "answer") {
+      const kind = how === "answer" ? "ask_user_questions" : "request_confirmation";
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, sourceRunId,
+        kind, status: "pending", createdByAgentId: f.agentId, addresseeUserId: f.userId, continuationPolicy: "none", createdAt: f.at(),
+        payload: kind === "ask_user_questions"
+          ? { version: 1, questions: [{ id: "scope", prompt: "Which scope?", required: true, selectionMode: "single", options: [{ id: "first", label: "First" }] }] }
+          : { version: 1, prompt: "Proceed?", supersedeOnUserComment: false } } as never).returning();
+      const scope = { id: f.issueId, companyId: f.companyId }; const svc = issueThreadInteractionService(db);
+      const user = { userId: f.userId };
+      const resolved = how === "answer" ? await svc.answerQuestions(scope, card!.id, { answers: [{ questionId: "scope", optionIds: ["first"] }] } as never, user)
+        : how === "accept" ? (await svc.acceptInteraction({ ...scope, projectId: null, goalId: null }, card!.id, {}, user)).interaction
+        : how === "reject" ? await svc.rejectInteraction(scope, card!.id, { reason: "No." }, user)
+        : how === "agent-withdraw" ? await svc.withdrawInteraction(scope, card!.id, {}, { agentId: f.agentId })
+        : (await svc.expirePendingInteractionsForTerminalIssue({ ...scope, status: "cancelled" }, { systemId: "expiry" } as never))[0];
+      // The answer happens on the fixture clock, after the card.
+      await db.update(issueThreadInteractions).set({ resolvedAt: f.at() }).where(eq(issueThreadInteractions.id, card!.id));
+      return { id: card!.id, status: resolved?.status, resolvedByUserId: resolved?.resolvedByUserId ?? null };
+    }
+    const resume = async (f: Awaited<ReturnType<typeof fixture>>, cardId: string, status: string, retryOfRunId?: string) => {
+      const id = await f.run({ status, retryOfRunId, errorCode: ["failed"].includes(status) ? "native_run_failed" : null });
+      if (!retryOfRunId) {
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, interactionId: cardId,
+          interactionStatus: "answered", source: "issue.interaction.respond" } }).where(eq(heartbeatRuns.id, id));
+        // The answer reached the agent's resume run (a pending delivery is still an attempt in progress).
+        await db.update(issueQuestionResponseDeliveries).set({ targetRunId: id, status: "fallback_queued", deliveryMode: "wake_fallback" })
+          .where(eq(issueQuestionResponseDeliveries.interactionId, cardId));
+      }
+      return id;
+    };
+
+    it("RED (rf5 RF5_ALL_FAILED_WITH_ANSWER): answer, failed answer-resume, failed successor: ONE true notice for the answer", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
+      const card = await answeredCard(f, root);
+      expect(card).toMatchObject({ status: "answered", resolvedByUserId: f.userId });
+      const first = await resume(f, card.id, "failed");
+      const last = await resume(f, card.id, "failed", first);
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      console.log("CARD_DUTY_RED", JSON.stringify({ m, card: card.id, first, last, notices: notices.map(n => ({ id: n.id,
+        reason: n.metadata?.authorizationReason, sourceRunId: n.metadata?.sourceRunId, body: n.body })) }));
+      expect(notices, "exactly one true notice, never one for the answer and one for the original message").toHaveLength(1);
+      expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
+      expect(notices[0]!.metadata?.sourceRunId).toBe(last);
+      expect(notices[0]!.body).toBe(NOT_ANSWERED);
+      expect(await f.visible()).toHaveLength(1);
+      // A later reply on the answer's chain supersedes the notice; nothing new is posted.
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, last));
+      await f.reply(last); await f.sweep(); await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+      expect(await cardNotices(f)).toHaveLength(1);
+    });
+
+    it.each(["accept", "reject"] as const)("a %sed confirmation whose answer-resume chain all failed gets ONE notice", async how => {
+      const f = await fixture({ status: "in_progress" });
+      const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
+      const card = await answeredCard(f, root, how);
+      expect(card).toMatchObject({ status: `${how}ed`, resolvedByUserId: f.userId });
+      const first = await resume(f, card.id, "failed");
+      await resume(f, card.id, "failed", first);
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
+    });
+
+    it("guard: answer, answer-resume answers: no notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "succeeded");
+      await f.reply(first); await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    });
+
+    it("guard: answer, answer-resume fails, successor answers: no notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      const successor = await resume(f, card.id, "succeeded", first);
+      await f.reply(successor); await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+    });
+
+    it("guard: answer, answer-resume fails, successor answers with a new card: no notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      const successor = await resume(f, card.id, "succeeded", first);
+      await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, sourceRunId: successor,
+        kind: "request_confirmation", status: "pending", createdByAgentId: f.agentId, addresseeUserId: f.userId,
+        continuationPolicy: "none", createdAt: f.at(), payload: { version: 1, prompt: "And this?" } } as never);
+      await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+    });
+
+    it.each(["running", "queued"])("guard: answer, answer-resume chain still %s: no notice", async status => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, status === "running" ? "running" : "failed");
+      if (status === "queued") await resume(f, card.id, "queued", first);
+      await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+      expect((await settleUnansweredPersonMessage(db, f)).kind).toBe("pending");
+    });
+
+    it("guard: an answer still being delivered (pending delivery) is a pending attempt: no notice yet", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      await resume(f, card.id, "failed", first);
+      await db.update(issueQuestionResponseDeliveries).set({ status: "pending" }).where(eq(issueQuestionResponseDeliveries.interactionId, card.id));
+      await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+    });
+
+    it.each(["agent-withdraw", "system-expiry"] as const)("guard: an agent/system-resolved card (%s) creates no duty", async how => {
+      const f = await fixture({ status: "in_progress" });
+      const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
+      const card = await answeredCard(f, root, how);
+      expect(card.resolvedByUserId).toBeNull();
+      const first = await resume(f, card.id, "failed");
+      await resume(f, card.id, "failed", first);
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      // The original message keeps its existing behaviour; the card itself owes nothing.
+      expect(notices.filter(n => n.metadata?.authorizationReason === `unanswered_message:${card.id}`)).toHaveLength(0);
+      expect(notices.length).toBeLessThanOrEqual(1);
+    });
+
+    it("guard: a newer typed message after the answer is the owed input, not the answer", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      await resume(f, card.id, "failed", first);
+      const later = await f.message("Hello?");
+      await f.run({ commentId: later, status: "failed", errorCode: "adapter_failed" });
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${later}`);
+    });
+  });
 });
