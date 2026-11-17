@@ -5,7 +5,7 @@ import { remoteWorkspaceAuthoritySchema, remoteWorkspaceRunReferenceSchema } fro
 import { adapterExecutionControls } from "../adapter-execution-control.js";
 import { logActivity } from "../activity-log.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
-import { recordRequiredWorkspaceRestoreFailure } from "../legacy-execution-recovery.js";
+import { recordRequiredWorkspaceRestoreFailure, workspaceRestoreOnlyOwed } from "../legacy-execution-recovery.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain, hasStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
@@ -176,7 +176,10 @@ export async function pinFailedObservedWorkspace(db: Db, companyId: string, runI
     if (!active) return false;
     await notifyNativeEnvironmentSettlement(tx, { companyId, runId, issueId: task.id });
     await notifyDeliveryWork(tx, DELIVERY_QUEUES.ownershipInvariantReport, JSON.stringify({ companyId, runId }));
-    const retained = await recordRequiredWorkspaceRestoreFailure(tx, run, { workspaceRestoreFailure: "restore_failed" }, lease);
+    // Pinned on the active source before Stop: no restore has been tried, so the
+    // files are owed unless the run already records a real restore failure.
+    const retained = await recordRequiredWorkspaceRestoreFailure(tx, run, { workspaceRestoreFailure: "restore_failed" }, lease,
+      { restorePending: workspaceRestoreOnlyOwed(run) });
     if (!retained || !hasRequiredWorkspaceRecovery(retained.resultJson)) throw new Error("observed_workspace_retention_missing");
     const [action] = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId),
       eq(issueRecoveryActions.sourceIssueId, task.id), eq(issueRecoveryActions.fingerprint, `native-workspace:${run.id}`))).for("update", { noWait: true });
