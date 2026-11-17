@@ -81,6 +81,14 @@ export async function preserveLegacyWorkspaceRestoreSources(db: Db, run: Run, so
       if (source && run.runtimeMode === "native" && hasConfirmedSandboxStopAndRetain(lease)
         && ["reuse_by_environment", "reuse_by_execution_workspace"].includes(lease.leasePolicy)
         && await stoppedReusableSourceProof(db, run.runnerProfileJson, lease)) {
+        // The lease hold the other branches write: reusable expiry and warm
+        // reuse are fenced by it (legacyShutdownWorkspaceResourceProtected).
+        // Keep the reusable policy so expiry stays on that fenced path.
+        await db.update(environmentLeases).set({
+          metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ workspaceRestoreRecovery: {
+            schema: LEGACY_WORKSPACE_RECOVERY_SCHEMA, runId: run.id, originalLeasePolicy: lease.leasePolicy,
+          } })}::jsonb`,
+        }).where(eq(environmentLeases.id, lease.id));
         retained.push(lease.id); continue;
       }
       // Cancellation can finish the dedicated stop before copy-back reports its
