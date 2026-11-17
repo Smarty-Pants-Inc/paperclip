@@ -3349,7 +3349,7 @@ describe("remote provider pack manifest", () => {
     return JSON.stringify(value);
   };
 
-  it.each(["opencode", "opencode-new-durable", "opencode-new-durable-reset", "opencode-new-durable-inspect-reset", "opencode-new-durable-provider-reset", "opencode-new-durable-store-failed", "opencode-new-durable-publish-failed", "opencode-new-durable-slow-capture", "opencode-new-durable-ready", "opencode-continuation", "opencode-continuation-missing", "opencode-continuation-no-receipt", "opencode-continuation-replacement", "opencode-continuation-cold", "opencode-continuation-legacy-durable", "opencode-continuation-prior-receipt", "opencode-dirty", "opencode-diagnostics", "opencode-diagnostics-stale", "cursor", "claude-x64", "claude-arm64", "pi-rpc-low", "pi-rpc-xhigh", "pi-rpc-max", "pi-rpc-missing-native", "pi-rpc-start-same", "pi-rpc-start-digest", "pi-rpc-start-box", "pi-rpc-start-lease"] as const)("uses the bundled Linux image authority for remote %s without controller overrides", async provider => {
+  it.each(["opencode", "opencode-new-durable", "opencode-new-durable-reset", "opencode-new-durable-inspect-reset", "opencode-new-durable-provider-reset", "opencode-new-durable-store-failed", "opencode-new-durable-publish-failed", "opencode-new-durable-slow-capture", "opencode-new-durable-ready", "opencode-continuation", "opencode-continuation-missing", "opencode-continuation-no-receipt", "opencode-continuation-replacement", "opencode-continuation-cold", "opencode-continuation-legacy-durable", "opencode-continuation-prior-receipt", "opencode-dirty", "opencode-diagnostics", "opencode-diagnostics-stale", "cursor", "claude-x64", "claude-arm64", "pi-rpc-low", "pi-rpc-xhigh", "pi-rpc-max", "pi-rpc-missing-native", "pi-rpc-start-same", "pi-rpc-start-digest", "pi-rpc-start-box", "pi-rpc-start-lease", "pi-rpc-start-inflight-box", "pi-rpc-start-inflight-physical-lease", "pi-rpc-start-inflight-digest"] as const)("uses the bundled Linux image authority for remote %s without controller overrides", async provider => {
     const firstDurable = provider.startsWith("opencode-new-durable");
     // A sandbox connection drops once while the settled state is read out.
     let checkpointReadResets = provider === "opencode-new-durable-reset" ? 1 : 0;
@@ -3518,32 +3518,52 @@ describe("remote provider pack manifest", () => {
     });
     const runLogs: string[] = [];
     let changeManifest = false;
+    let selectedManifest: ReturnType<typeof packAuthorityModule.resolveRemoteProviderPackAuthority>["manifest"] | undefined;
+    let inflightChanged = false;
     if (startMemo) {
       const original = packAuthorityModule.resolveRemoteProviderPackAuthority;
-      const authority = vi.spyOn(packAuthorityModule, "resolveRemoteProviderPackAuthority").mockImplementation((input) => original({
-        ...input, current: () => {
-          const selected = structuredClone(input.current());
-          if (changeManifest) {
-            selected.payload.runnerSourceRevision = "b".repeat(40);
-            selected.digest = "sha256:" + createHash("sha256").update(canonical(selected.payload)).digest("hex");
-          }
-          return selected;
-        },
-      }));
+      const authority = vi.spyOn(packAuthorityModule, "resolveRemoteProviderPackAuthority").mockImplementation((input) => {
+        const resolved = original({
+          ...input, current: () => {
+            const selected = structuredClone(input.current());
+            if (changeManifest) {
+              selected.payload.runnerSourceRevision = "b".repeat(40);
+              selected.digest = "sha256:" + createHash("sha256").update(canonical(selected.payload)).digest("hex");
+            }
+            return selected;
+          },
+        });
+        selectedManifest = resolved.manifest;
+        return resolved;
+      });
       onTestFinished(() => authority.mockRestore());
-      execute.mockImplementation(async (command) => ({
-        exitCode: command.args?.[1]?.includes("base64 <") || command.args?.[1]?.startsWith("test -f ") ? 1 : 0,
-        signal: null, timedOut: false, stderr: "",
-        stdout: command.args?.[0] === "--build-metadata" ? JSON.stringify({
-          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
-          packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
-          durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"], providerPacks: [],
-        }) : command.args?.[0] === "--version" ? "1.18.34\n"
-          : command.args?.[0] === "-e" ? `\npaperclip-pack-manifest=${Buffer.from(JSON.stringify(installed)).toString("base64")}\n` : "",
-      }));
+      execute.mockImplementation(async (command) => {
+        if (!inflightChanged && provider.includes("-inflight-") && command.args?.[1]?.includes("const differing=")) {
+          // Interrupt the actual full verifier, not a later archive/reset.
+          // Its reply proves the inputs sent before this await, not the new box.
+          inflightChanged = true;
+          if (provider === "pi-rpc-start-inflight-box") startTarget!.environmentId = "replacement-box";
+          if (provider === "pi-rpc-start-inflight-physical-lease") startTarget!.sandboxLeaseAcquisition!.providerLeaseId = "replacement-physical-lease";
+          if (provider === "pi-rpc-start-inflight-digest") {
+            selectedManifest!.payload.runnerSourceRevision = "b".repeat(40);
+            selectedManifest!.digest = "sha256:" + createHash("sha256").update(canonical(selectedManifest!.payload)).digest("hex");
+          }
+        }
+        return {
+          exitCode: command.args?.[1]?.includes("base64 <") || command.args?.[1]?.startsWith("test -f ") ? 1 : 0,
+          signal: null, timedOut: false, stderr: "",
+          stdout: command.args?.[0] === "--build-metadata" ? JSON.stringify({
+            schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+            packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+            durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"], providerPacks: [],
+          }) : command.args?.[0] === "--version" ? "1.18.34\n"
+            : command.args?.[0] === "-e" ? `\npaperclip-pack-manifest=${Buffer.from(JSON.stringify(installed)).toString("base64")}\n` : "",
+        };
+      });
     }
     const startTarget = startMemo ? { kind: "remote", transport: "sandbox", remoteCwd: "/workspace",
       environmentId: "environment", leaseId: "lease", providerKey: "daytona",
+      sandboxLeaseAcquisition: provider === "pi-rpc-start-inflight-physical-lease" ? { providerLeaseId: "original-physical-lease" } : undefined,
       effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute, syncIn } } : null;
     try {
       let coldAdmission: ReturnType<typeof admittedNativeProviderPack> = null;
@@ -3562,6 +3582,12 @@ describe("remote provider pack manifest", () => {
       }
       if (provider === "pi-rpc-missing-native") {
         await expect(prepare).rejects.toThrow("image provider pack did not match the bundled release identity");
+        expect(state.createBackend).not.toHaveBeenCalled();
+        return;
+      }
+      if (provider.includes("-inflight-")) {
+        await expect(prepare).rejects.toThrow("runner_remote_provider_artifact_incompatible: provider pack verification inputs changed during verification");
+        expect(inflightChanged).toBe(true);
         expect(state.createBackend).not.toHaveBeenCalled();
         return;
       }

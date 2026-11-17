@@ -18680,7 +18680,7 @@ async function createRunnerdBackendWithinSessionClaim(
   // This existing per-start memo also survives a provider-thread archive: that
   // moves session state, not the admitted pack. Bind the success to every input
   // of the exact verifier rather than a boolean or just the pack's path.
-  const providerPackVerificationKey = (packRoot: string) => nativeSha256({
+  const providerPackVerificationKey = (packRoot: string, verifierInputs: Record<string, unknown>, manifest = expectedProviderPackManifest) => nativeSha256({
     transport: remoteTarget?.transport, environmentId: remoteTarget?.environmentId,
     providerKey: remoteTarget?.transport === "sandbox" ? remoteTarget.providerKey : undefined,
     leaseId: remoteTarget?.leaseId,
@@ -18690,13 +18690,28 @@ async function createRunnerdBackendWithinSessionClaim(
       host: remoteTarget.spec.host, port: remoteTarget.spec.port, username: remoteTarget.spec.username,
       remoteWorkspacePath: remoteTarget.spec.remoteWorkspacePath,
     } : undefined,
-    cwd: remoteTarget?.remoteCwd, packRoot, manifest: expectedProviderPackManifest,
-    provider: packProvider, requireExactIdentity: false,
-    requireCurrentOpenCodeProxy: false, acceptProvenance: false,
+    cwd: remoteTarget?.remoteCwd, packRoot, manifest,
+    provider: packProvider, verifierInputs,
   });
-  let providerPackVerified: string | null = null;
-  const isProviderPackVerified = () => providerPackVerified !== null
-    && providerPackVerified === providerPackVerificationKey(activeRemoteProviderPackRoot ?? providerArtifacts?.launchRoot ?? "");
+  type ProviderPackProof = { key: string; verifierInputs: Record<string, unknown> };
+  let providerPackVerified: ProviderPackProof | null = null;
+  const captureProviderPackProof = (packRoot: string, verifierInputs: Record<string, unknown>, manifest = expectedProviderPackManifest): ProviderPackProof => ({
+    key: providerPackVerificationKey(packRoot, verifierInputs, manifest), verifierInputs,
+  });
+  const assertProviderPackProofCurrent = (packRoot: string, proof: ProviderPackProof) => {
+    // Never relabel an old allocation's successful reply with the identity that
+    // happens to be current after an await. Fail closed, without retrying startup
+    // on an allocation/manifest that its caller did not admit.
+    if (proof.key !== providerPackVerificationKey(packRoot, proof.verifierInputs)) {
+      throw providerPackIncompatible("verification_inputs_changed", "provider pack verification inputs changed during verification");
+    }
+  };
+  const completeProviderPackProof = (packRoot: string, proof: ProviderPackProof) => {
+    assertProviderPackProofCurrent(packRoot, proof);
+    providerPackVerified = proof;
+  };
+  const isProviderPackVerified = (packRoot = activeRemoteProviderPackRoot ?? providerArtifacts?.launchRoot ?? "") => providerPackVerified !== null
+    && providerPackVerified.key === providerPackVerificationKey(packRoot, providerPackVerified.verifierInputs);
   // Set when a persisted-runner reattachment finds that runner settled and
   // exited. The transport then relaunches it from durable state, which needs
   // the admitted provider pack's launch inputs that adoption does not.
@@ -18849,9 +18864,13 @@ async function createRunnerdBackendWithinSessionClaim(
   if (input.retainedSandboxOwner) (resolveRemoteRunnerProcessSpawned as (() => void) | null)?.();
 
   const verifyRemoteProviderPack = async (packRoot: string) => {
-    if (providerPackVerified === providerPackVerificationKey(packRoot)) return;
+    if (isProviderPackVerified(packRoot)) return;
     if (!remoteTarget || !remoteCommandRunner || !expectedProviderPackManifest)
       return;
+    const proof = captureProviderPackProof(packRoot, {
+      requireExactIdentity: false, requireCurrentOpenCodeProxy: false, acceptProvenance: false,
+      memoScope: remoteProviderPackMemoScope(remoteTarget),
+    });
     await verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
       cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: packProvider,
       memoScope: remoteProviderPackMemoScope(remoteTarget),
@@ -18859,7 +18878,7 @@ async function createRunnerdBackendWithinSessionClaim(
         name: "provider_pack.verify_memo_hit", startedAtMs, endedAtMs,
       }); },
     });
-    providerPackVerified = providerPackVerificationKey(packRoot);
+    completeProviderPackProof(packRoot, proof);
   };
 
   const remoteNativeArtifacts = remoteTarget && remoteCommandRunner && remoteBinary && remoteRuntimeRoot
@@ -18887,23 +18906,37 @@ async function createRunnerdBackendWithinSessionClaim(
     const expected = expectedProviderPackManifest;
     if (!expected || !remoteTarget || !remoteCommandRunner) return false;
     for (const installation of remoteNativeArtifacts?.providerPackInventory() ?? []) {
+      const requireExactIdentity = retainProviderPack || explicitProviderPackSelection;
+      const requireCurrentOpenCodeProxy = !retainProviderPack
+        && runnerEnvironment?.PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS === "1";
+      const proof = captureProviderPackProof(installation.root, {
+        installation, requestedManifest: expected, requireExactIdentity, requireCurrentOpenCodeProxy, acceptProvenance: false,
+      });
+      // Compatibility can deliberately select a different installation. Both
+      // the requested identity and that known candidate are captured before the
+      // await; neither can acquire an after-await identity by being selected.
+      const selectedProof = captureProviderPackProof(installation.root, proof.verifierInputs,
+        installation.manifest as RemoteProviderPackManifest);
+      let manifest: RemoteProviderPackManifest;
       try {
-        const manifest = await measureNativeRunnerSpan(input.trace, "provider_pack.compatibility", () => verifyRemoteProviderPackIdentity({
+        manifest = await measureNativeRunnerSpan(input.trace, "provider_pack.compatibility", () => verifyRemoteProviderPackIdentity({
           runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd, packRoot: installation.root,
           manifest: expected, installation,
           provider: packProvider,
-          requireExactIdentity: retainProviderPack || explicitProviderPackSelection,
-          requireCurrentOpenCodeProxy: !retainProviderPack
-            && runnerEnvironment?.PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS === "1",
+          requireExactIdentity, requireCurrentOpenCodeProxy,
         }), { attributes: { target: installation.root === stagedRemoteProviderPackRoot ? "workspace" : "image" } });
-        if (!retainProviderPack) providerPackAuthority!.select(manifest);
-        expectedProviderPackManifest = manifest;
-        activeRemoteProviderPackRoot = installation.root;
-        providerPackVerified = providerPackVerificationKey(installation.root);
-        return true;
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") throw error;
+        continue;
       }
+      // Outside the compatibility fallback catch: a changed allocation must not
+      // fall through to another installation or an upload on the new box.
+      assertProviderPackProofCurrent(installation.root, proof);
+      if (!retainProviderPack) providerPackAuthority!.select(manifest);
+      expectedProviderPackManifest = manifest;
+      activeRemoteProviderPackRoot = installation.root;
+      completeProviderPackProof(installation.root, selectedProof);
+      return true;
     }
     return false;
   };
@@ -18936,9 +18969,11 @@ async function createRunnerdBackendWithinSessionClaim(
       remotePrepared = true;
       return;
     }
+    const artifactProof = artifactStorage && providerArtifacts
+      ? captureProviderPackProof(providerArtifacts.launchRoot, { providerArtifacts }) : null;
     await remoteNativeArtifacts?.prepare(requiredMode);
-    if (artifactStorage && providerArtifacts) {
-      providerPackVerified = providerPackVerificationKey(providerArtifacts.launchRoot);
+    if (artifactStorage && providerArtifacts && artifactProof) {
+      completeProviderPackProof(providerArtifacts.launchRoot, artifactProof);
       remotePrepared = true;
       return;
     }
@@ -18955,21 +18990,29 @@ async function createRunnerdBackendWithinSessionClaim(
       const startupSignal = nativeSessionStartups.get(sourceRunId)?.providerPackSourceAbort.signal;
       const contextSignal = input.executionContext?.active ? input.executionContext.signal : undefined;
       const sourceSignals = [startupSignal, contextSignal].filter((signal): signal is AbortSignal => !!signal);
+      const acceptProvenanceDifferences = providerPackProvenanceReuseAllowed({ retainProviderPack, explicitProviderPackSelection,
+        authoritySelectable: providerPackAuthority !== null });
+      const proof = captureProviderPackProof(stagedRemoteProviderPackRoot, {
+        configuredProviderPackRoot, acceptProvenanceDifferences,
+        requireExactIdentity: false, requireCurrentOpenCodeProxy: false,
+        memoScope: remoteProviderPackMemoScope(remoteTarget),
+      });
       const prepared = await prepareRemoteProviderPackOnTarget({
         target: remoteTarget, runner: remoteCommandRunner, configuredProviderPackRoot,
         manifest: expectedProviderPackManifest, provider: packProvider, trace: input.trace, onLog: input.onLog,
         signal: sourceSignals.length ? AbortSignal.any(sourceSignals) : undefined,
-        acceptProvenanceDifferences: providerPackProvenanceReuseAllowed({ retainProviderPack, explicitProviderPackSelection,
-          authoritySelectable: providerPackAuthority !== null }),
+        acceptProvenanceDifferences,
       });
+      completeProviderPackProof(prepared.root, proof);
       if (prepared.manifest.digest !== expectedProviderPackManifest.digest) {
         providerPackAuthority!.select(prepared.manifest);
         expectedProviderPackManifest = prepared.manifest;
       }
       activeRemoteProviderPackRoot = prepared.root;
-      // Provenance reuse returns the sealed selected manifest, so the full
-      // verifier has proved this exact identity, not just the requested digest.
-      providerPackVerified = providerPackVerificationKey(prepared.root);
+      // A provenance-selected manifest was not known before the installer's
+      // await. Verify its exact identity under a new pre-await key rather than
+      // transferring the requested manifest's proof to it.
+      if (!isProviderPackVerified(prepared.root)) await verifyRemoteProviderPack(prepared.root);
     }
     remotePrepared = true;
   };
