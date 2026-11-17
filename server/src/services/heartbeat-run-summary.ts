@@ -526,20 +526,27 @@ export function answerPartContent(body: string, part: AnswerPartMetadata): strin
 /**
  * H5 round 2: the WHOLE logical answer `anchor` belongs to, assembled from all
  * its parts in `comments` in part order (label-stripped, fence-unwrapped), so
- * it is byte-equal to the source. Null when `anchor` is not a part or a part is
- * missing or does not match its recorded additions.
+ * it is byte-equal to the source. Part identity/order come from metadata, not
+ * the display label. If additions cannot be identified safely, retain ALL part
+ * bodies whole instead. Null when `anchor` is not a part or a part is missing.
  */
 export function assembleAnswerParts<T extends { id: string; body?: string | null; metadata?: unknown }>(
   anchor: T, comments: readonly T[]): { text: string; partIds: string[]; first: T } | null {
   const anchorPart = readAnswerPartMetadata(anchor.metadata);
   if (!anchorPart) return null;
-  const byIndex = new Map<number, { comment: T; content: string }>();
+  const byIndex = new Map<number, { comment: T; content: string | null; body: string }>();
   for (const comment of comments) {
     const part = readAnswerPartMetadata(comment.metadata);
     if (!part || part.answerId !== anchorPart.answerId || part.count !== anchorPart.count) continue;
-    const content = typeof comment.body === "string" ? answerPartContent(comment.body, part) : null;
-    if (content === null) return null;
-    byIndex.set(part.index, { comment, content });
+    if (typeof comment.body !== "string") return null;
+    let content = answerPartContent(comment.body, part);
+    if (content === null) {
+      // Labels are editable display text. Recognise a damaged label line, but
+      // use only metadata for identity/order and validate the stored wrappers.
+      const label = /^part [1-9]\d* of [1-9]\d*\r?\n/iu.exec(comment.body)?.[0];
+      if (label) content = answerPartContent(comment.body, { ...part, label });
+    }
+    byIndex.set(part.index, { comment, content, body: comment.body });
   }
   const ordered = [];
   for (let index = 1; index <= anchorPart.count; index++) {
@@ -547,7 +554,9 @@ export function assembleAnswerParts<T extends { id: string; body?: string | null
     if (!entry) return null;
     ordered.push(entry);
   }
-  return { text: ordered.map(entry => entry.content).join(""), partIds: ordered.map(entry => entry.comment.id), first: ordered[0]!.comment };
+  const unwrapped = ordered.every(entry => entry.content !== null);
+  return { text: ordered.map(entry => unwrapped ? entry.content : entry.body).join(""),
+    partIds: ordered.map(entry => entry.comment.id), first: ordered[0]!.comment };
 }
 
 /**
