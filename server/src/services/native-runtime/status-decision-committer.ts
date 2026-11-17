@@ -2365,7 +2365,8 @@ export async function commitNativeStatusDecision(input: {
         const successor = await nativeStatusSuccessorState(tx as unknown as Db, {
           companyId: input.companyId, issueId: input.issueId, reason: "issue_status_changed",
           originRunId: input.runId, payload: { nativeDecisionId: decisionRow.id,
-            ...(effect.kind === "schedule_retry" ? { retryCause: effect.cause } : {}) },
+            ...(effect.kind === "schedule_retry" ? { retryCause: effect.cause } : {}),
+            ...(effect.kind === "enqueue_continuation" ? { continuationKind: effect.continuationKind } : {}) },
         });
         if (successor.skipReason) {
           delivered.deliveryState = "skipped";

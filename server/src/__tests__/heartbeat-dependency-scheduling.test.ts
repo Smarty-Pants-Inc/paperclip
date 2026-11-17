@@ -494,14 +494,66 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
+  it("R-ONCE F2 permits exactly one recovery after a native_mid_stream_cut partial reply", async () => {
+    const f = await seedFailedPersonRetry();
+    await db.update(heartbeatRuns).set({ errorCode: "native_mid_stream_cut" }).where(eq(heartbeatRuns.id, f.failedRunId));
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: f.failedRunId, body: "First half only; connection cut." });
+    await db.delete(statusDecisions).where(eq(statusDecisions.id, f.decisionId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.failedRunId,
+      phase: "assessed", resultId: f.resultId, assessmentId: f.assessmentId });
+    const committed = await commitNativeStatusDecision({ db, companyId: f.companyId, issueId: f.issueId, runId: f.failedRunId,
+      assessmentId: f.assessmentId, priorStatus: "in_progress", priorStatusVersion: 0, priorDecisionId: null,
+      decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "preserve", toStatus: "in_progress",
+        reasonCode: "run_failed_partial_evidence_preserved", unblockDescriptor: null,
+        effects: [{ kind: "schedule_retry", agentId: f.agentId, cause: "native_mid_stream_cut", summary: "Recover the cut reply" }] } });
+    expect((await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, committed.decision.id)))[0].targetId)
+      .not.toBeNull();
+    const dispatched = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    console.log("RONCE_F2_CUT", JSON.stringify({ dispatched,
+      wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)),
+      runs: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+        .map(run => ({ id: run.id, status: run.status, error: run.error, context: run.contextSnapshot })) }));
+    expect(dispatched.dispatched).toBe(1);
+    await heartbeat.drainActiveRunExecutions();
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
+    expect(mockAdapterExecute).toHaveBeenCalledOnce();
+  });
+
+  it.each(["enqueue_continuation", "notify_owner"] as const)("R-ONCE F3 materializes the scoped effect receipt (%s)", async kind => {
+    const f = await seedFailedPersonRetry();
+    await f.successor("none", true);
+    await db.delete(statusDecisions).where(eq(statusDecisions.id, f.decisionId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.failedRunId,
+      phase: "assessed", resultId: f.resultId, assessmentId: f.assessmentId });
+    const effect = kind === "notify_owner"
+      ? { kind, agentId: f.agentId, reason: "Owner still needs to know about the failure" }
+      : { kind, agentId: f.agentId, continuationKind: "same_agent" as const, summary: "Continue work", idempotencyKey: randomUUID() };
+    const committed = await commitNativeStatusDecision({ db, companyId: f.companyId, issueId: f.issueId, runId: f.failedRunId,
+      assessmentId: f.assessmentId, priorStatus: "in_progress", priorStatusVersion: 0, priorDecisionId: null,
+      decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "preserve", toStatus: "in_progress",
+        reasonCode: "run_failed_partial_evidence_preserved", unblockDescriptor: null, effects: [effect] } });
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    const effects = await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, committed.decision.id));
+    if (kind === "notify_owner") {
+      expect(wakes).toHaveLength(1);
+      expect(effects).toMatchObject([{ effectKind: kind, deliveryState: "delivered", targetId: wakes[0].id }]);
+    } else {
+      expect(wakes).toHaveLength(0);
+      expect(effects).toMatchObject([{ effectKind: kind, deliveryState: "skipped", targetId: null,
+        lastError: "person_message_already_answered", payload: { skipReason: "person_message_already_answered" } }]);
+    }
+  });
+
   it.each([true, false])("R-ONCE F1 rechecks a deferred dispatch receipt at promotion (answered=%s)", async answered => {
     const f = await seedFailedPersonRetry();
     const intent = await f.intent();
     // This is the durable dispatch receipt after admission deferred it. The
     // failure had no answer/successor when it entered the queue.
-    await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution",
+    await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", reason: "issue_execution_deferred",
       requestedByActorId: `native-status-wake-dispatch:${intent.id}`,
-      payload: { ...intent.payload, _paperclipWakeContext: { issueId: f.issueId,
+      payload: { ...intent.payload, _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_status_changed",
         source: "native_status_decision", nativeStatusWakeIntentId: intent.id } },
     }).where(eq(agentWakeupRequests.id, intent.id));
     const [finishing] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
