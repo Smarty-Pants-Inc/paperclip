@@ -1347,6 +1347,115 @@ suite("fresh-continuation fallback", () => {
     expect(text).not.toMatch(/operator must|recover its result|recover .*execution state|authorize rerunning/i);
   }, 60_000);
 
+  // dl-n5-cont (Paul NOTE 5; gate 1 runs 00e31d20 -> 2b6822e1): the cut turn
+  // streamed items 0001-0262 and failed with pi_output_truncated. The run
+  // posted that prefix first; its continuation must pick up at item 0263, never
+  // restart the identical ask, and never point at text the person did not see.
+  it.each([["posted", true], ["not posted", false]] as const)(
+    "dl-n5-cont rule 3: a cut answer (%s) is continued from its exact end, or restarted plainly", async (_label, posted) => {
+      const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+      const item = (n: number) => `Item ${String(n).padStart(4, "0")}: ${"body text of this numbered item; ".repeat(7)}\n`;
+      const prefix = Array.from({ length: 262 }, (_, i) => item(i + 1)).join("");
+      const turnId = `runner-1:${f.runId}:turn-1`, itemId = `${turnId}:pi-message:2:block:0`;
+      const rows = [];
+      let seq = 1;
+      for (let offset = 0; offset < prefix.length; offset += 997) rows.push({ companyId, runId: f.runId, agentId, seq: seq++,
+        eventType: "item.delta", stream: "system", level: "info", message: "delta",
+        payload: { prpEvent: { eventType: "item.delta", itemId, turnId, payload: { kind: "agentMessage", channel: "progress",
+          text: prefix.slice(offset, offset + 997) } } } });
+      rows.push({ companyId, runId: f.runId, agentId, seq: seq++, eventType: "turn.failed", stream: "system", level: "error",
+        message: "turn failed", payload: { prpEvent: { eventType: "turn.failed", turnId,
+          payload: { status: "failed", error: { code: "pi_output_truncated", recoverable: false } } } } });
+      await db.insert(heartbeatRunEvents).values(rows);
+      const { readFailedTurnStreamedAnswer } = await import("./heartbeat-run-summary.js");
+      const cut = readFailedTurnStreamedAnswer(rows.map(row => ({ seq: row.seq, payload: row.payload })));
+      expect(cut?.text).toBe(prefix);
+      if (posted) await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorAgentId: agentId,
+        createdByRunId: f.runId, body: cut!.candidate.text });
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" })).toMatchObject({ kind: "continued" });
+      const continuation = await buildExecutionContinuation({ db, companyId, issueId: f.issueId, agentId,
+        context: { previousRunId: f.runId }, summary: null, exposeLowTrustRaw: false });
+      const text = JSON.stringify(continuation);
+      if (posted) {
+        expect(text).toMatch(/Continue exactly where it stopped/u);
+        expect(text).toContain(JSON.stringify(item(262).trim()).slice(1, -1));
+        expect(text).toMatch(/Do not repeat or summarize any of the posted text and do not restart the answer/u);
+      } else {
+        expect(text).toMatch(/none of it was shown to them/u);
+        expect(text).toMatch(/starting the answer again from the beginning/u);
+        expect(text).not.toMatch(/Continue exactly where it stopped/u);
+      }
+      expect(text).not.toMatch(/wasn't answered|Sending it again is safe/u);
+    }, 60_000);
+
+  // dl-n5-cont2 item 3: a run that ends pi_output_truncated having streamed
+  // only thinking. ONE continuation, told to write the answer now; if that
+  // continuation also ends at the cap with no text, NO third run.
+  const capStopEvents = (runId: string) => {
+    const turnId = `runner-1:${runId}:turn-1`;
+    return [
+      { companyId, runId, agentId, seq: 1, eventType: "item.delta", stream: "system", level: "info", message: "delta",
+        payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`, turnId,
+          payload: { kind: "reasoning", text: "thinking only ".repeat(500) } } } },
+      { companyId, runId, agentId, seq: 2, eventType: "turn.failed", stream: "system", level: "error", message: "turn failed",
+        payload: { prpEvent: { eventType: "turn.failed", turnId,
+          payload: { status: "failed", error: { code: "pi_output_truncated", recoverable: false } } } } },
+    ];
+  };
+
+  it("dl-n5-cont2 item 3 RED: a thinking-only cap stop gets ONE continuation told to write the answer now", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await db.insert(heartbeatRunEvents).values(capStopEvents(f.runId));
+    // dl-n5-cont3 (3): the recovery run is a FRESH session with no history:
+    // its opening carries the person's ORIGINAL ask and says no answer was shown.
+    const ask = "Write the 50 KiB capacity plan: \"every host\", its role, and the 128k cap 🦀.\nSecond line of the ask.";
+    await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "An older message.", createdAt: new Date(Date.now() - 20 * 60_000) });
+    await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: ask, createdAt: new Date(Date.now() - 12 * 60_000) });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" })).toMatchObject({ kind: "continued" });
+    const continuation = await buildExecutionContinuation({ db, companyId, issueId: f.issueId, agentId,
+      context: { previousRunId: f.runId }, summary: null, exposeLowTrustRaw: false });
+    const text = JSON.stringify(continuation);
+    expect(text).toContain("Write the answer now; keep further thinking short. The person has not seen any answer yet.");
+    expect(text).not.toMatch(/Continue exactly where it stopped|wasn't answered|Sending it again is safe/u);
+    const { thinkingCapStopRecoveryOpening } = await import("./fresh-continuation-fallback.js");
+    const opening = thinkingCapStopRecoveryOpening(ask);
+    expect(opening).toBe("Write the answer now; keep further thinking short. The person has not seen any answer yet. "
+      + "This is a new session with no earlier history. The person's original ask, exactly as they wrote it:\n\n"
+      + `<<<PERSON'S ASK\n${ask}\nEND OF PERSON'S ASK>>>\n\nAnswer that ask now, in full.`);
+    expect(text).toContain(JSON.stringify(opening).slice(1, -1));
+    expect(text).not.toContain("An older message.\\nEND OF PERSON'S ASK");
+    expect(await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, f.issueId),
+      sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}' = ${f.runId}`))).toHaveLength(1);
+  }, 60_000);
+
+  it("dl-n5-cont2 item 3 COST GUARD RED: the continuation also stops at the cap with no text: no third run", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    const parentId = randomUUID();
+    const finishedAt = new Date(Date.now() - 30 * 60_000);
+    await db.insert(heartbeatRuns).values({ id: parentId, companyId, agentId, invocationSource: "assignment", issueId: f.issueId,
+      nativeIssueId: f.issueId, runtimeMode: "native", status: "failed", errorCode: "native_session_interrupted",
+      startedAt: new Date(finishedAt.getTime() - 60_000), finishedAt, createdAt: new Date(finishedAt.getTime() - 120_000),
+      responsibleUserId: userId, contextSnapshot: { issueId: f.issueId, wakeReason: "issue_assigned" } });
+    await db.update(heartbeatRuns).set({ retryOfRunId: parentId,
+      contextSnapshot: { issueId: f.issueId, previousRunId: parentId, wakeReason: "issue_recovery_action_restored" } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(heartbeatRunEvents).values([...capStopEvents(parentId), ...capStopEvents(f.runId)]);
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
+      .toEqual({ kind: "person_owned", reason: "output_budget_exhausted_again" });
+    expect(await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, f.issueId),
+      sql`${issueRecoveryActions.evidence}->'freshContinuation' is not null`))).toHaveLength(0);
+  }, 60_000);
+
+  it("dl-n5-cont2 NEGATIVE: a run with no streamed text and no cap stop continues with no answer instruction", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" })).toMatchObject({ kind: "continued" });
+    const text = JSON.stringify(await buildExecutionContinuation({ db, companyId, issueId: f.issueId, agentId,
+      context: { previousRunId: f.runId }, summary: null, exposeLowTrustRaw: false }));
+    expect(text).not.toMatch(/Write the answer now|Continue exactly where it stopped/u);
+  }, 60_000);
+
   // A task whose run completes normally gets no fallback activity at all, even
   // with an older hold on the task (a run queued across a swap that then ran).
   it("leaves a task that completes normally alone, even with an older run's hold", async () => {

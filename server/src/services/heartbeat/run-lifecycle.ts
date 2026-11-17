@@ -1,6 +1,7 @@
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { writeRuntimeRunPointer } from "./runtime-run-pointer.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { readRunAnswerEvents, readThinkingCapStop, thinkingCapStopCandidate } from "../thinking-cap-stop.js";
 import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
 import { isContextCompactionRun } from "../context-compaction.js";
@@ -130,6 +131,7 @@ import {
   hasAcceptedSemanticResult,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
+  readFailedTurnStreamedAnswer,
   readTruncatedCompletedAgentMessageItemId,
   readTruncatedCompletedAssistantMessageCandidate,
   selectHeartbeatRunFinalAgentMessage,
@@ -2531,10 +2533,29 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
               "semantic_result_missing",
           )?.seq ?? null,
       );
-    return selectHeartbeatRunFinalAgentMessage({
+    const selected = selectHeartbeatRunFinalAgentMessage({
       candidates,
       semanticResultRecoveryAfterSeq: recoveryBoundary,
     });
+    // dl-n5-cont (Paul NOTE 5): a turn that streamed its answer and then
+    // failed (pi_output_truncated at the output cap, a provider EOF) has no
+    // completed answer. Its streamed prefix, rebuilt from the stored deltas,
+    // is posted first, with one true note; the continuation picks up at its end.
+    // dl-n5-cont4 (rf-2 D-completed-first): the failed turn is checked BEFORE
+    // a completed candidate wins. When the selected completed item is one of
+    // that failed turn's own items (or there is none), the reply is ALL the
+    // turn's answer items in order, completed and streamed, posted whole once;
+    // the completed item is inside it, never posted on its own as well. A
+    // completed answer of an EARLIER turn keeps its selection unchanged.
+    const streamedRows = await readRunAnswerEvents(db, companyId, runId);
+    const cut = readFailedTurnStreamedAnswer(streamedRows);
+    if (cut && (!selected || selected.seq >= cut.startSeq)) return cut.candidate;
+    if (selected) return selected;
+    // dl-n5-cont2 item 3: the turn stopped at the output cap having streamed
+    // no answer text. The person gets ONE true note (with Retry when the one
+    // automatic continuation stopped the same way), never a resend notice.
+    const capStop = await readThinkingCapStop(db, { companyId, runId });
+    return capStop ? thinkingCapStopCandidate(capStop) : null;
   }
 
   async function refreshContinuationSummaryForRun(

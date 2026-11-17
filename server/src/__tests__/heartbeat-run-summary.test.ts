@@ -1355,3 +1355,217 @@ describe("dl-n5-66k a final answer stored without text is never replaced by the 
     expect(reassembleAgentMessageFromDeltas(deltas, itemId)).toBe(answerOf(1000));
   });
 });
+
+// dl-n5-cont (Paul NOTE 5, H5; gate 1 runs 00e31d20 -> 2b6822e1 and
+// 822ce371 -> d5ac6a7f): a pi_rpc chat turn streams its answer as item.delta
+// events and then FAILS (pi_output_truncated at the 128k output cap; a
+// provider EOF mid-stream). No item.completed carries the answer. The person
+// must get the streamed prefix FIRST, and the continuation must start from
+// exactly its end, so the posted replies hold the whole answer once, in order.
+describe("dl-n5-cont a failed turn's streamed answer is posted first; the continuation picks up at its end", () => {
+  const module = runSummary as Record<string, unknown>;
+  type Candidate = ReturnType<typeof selectHeartbeatRunFinalAgentMessage>;
+  const readFailedTurnStreamedAnswer = (module.readFailedTurnStreamedAnswer
+    ?? (() => null)) as (rows: { seq: number; payload: unknown }[]) =>
+      { itemId: string; text: string; cause: "output_limit" | "stream_ended" | "failed"; candidate: NonNullable<Candidate> } | null;
+  const cutAnswerContinuationInstruction = (module.cutAnswerContinuationInstruction
+    ?? (() => "")) as (input: { text: string; cause: string; posted: boolean }) => string;
+  const turnId = "runner-1:run-00e31d20:turn-1";
+  const itemId = `${turnId}:pi-message:2:block:0`;
+  // The live shape: numbered items, 0001..0280, of which 0001..0262 streamed before the cut.
+  const item = (n: number) => `Item ${String(n).padStart(4, "0")}: ${"body text of this numbered item; ".repeat(7)}\n`;
+  const whole = Array.from({ length: 280 }, (_, i) => item(i + 1)).join("") + "END\n";
+  const streamedUpTo = (n: number) => Array.from({ length: n }, (_, i) => item(i + 1)).join("");
+  const failedRunRows = (streamed: string, code: string, chunk = 61) => {
+    const rows: { seq: number; payload: unknown }[] = [];
+    let seq = 10;
+    rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`, turnId,
+      payload: { kind: "reasoning", text: "planning the items" } } } });
+    for (let offset = 0; offset < streamed.length; offset += chunk) {
+      rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta", itemId, turnId, sourceEventId: `d-${seq}`,
+        payload: { kind: "agentMessage", channel: "progress", text: streamed.slice(offset, offset + chunk) } } } });
+    }
+    rows.push({ seq: seq++, payload: { prpEvent: { eventType: "turn.failed", turnId,
+      payload: { status: "failed", error: { code, message: "x", recoverable: false } } } } });
+    return rows;
+  };
+
+  it("(a) 67 KB streamed then pi_output_truncated: the posted reply holds items 0001-0262 exactly, then one true note", () => {
+    const prefix = streamedUpTo(262);
+    expect(Buffer.byteLength(prefix)).toBeGreaterThan(60_000);
+    const cut = readFailedTurnStreamedAnswer(failedRunRows(prefix, "pi_output_truncated"));
+    expect(cut).not.toBeNull();
+    expect(cut!.cause).toBe("output_limit");
+    expect(cut!.text).toBe(prefix);
+    const resolved = resolveHeartbeatRunResponse({ resultJson: {}, nativeConversationFinalResponse: true,
+      finalAgentMessage: selectHeartbeatRunFinalAgentMessage({ candidates: [cut!.candidate] }) });
+    expect(resolved.decision.commentAction).toBe("create");
+    expect(resolved.text!.startsWith(prefix)).toBe(true);
+    for (const n of [1, 131, 262]) expect(resolved.text).toContain(item(n));
+    expect(resolved.text).not.toContain(item(263));
+    const note = resolved.text!.slice(prefix.length);
+    expect(note).toMatch(/output limit/u);
+    expect(note).toMatch(/continu/iu);
+    expect(note).not.toMatch(/wasn't answered|send(ing)? (it )?again/iu);
+  });
+
+  // dl-n5-cont3 F4: the "whole once" check reads the POSTED comments back from
+  // the DB (run-completion.test.ts); here only the instruction's content.
+  it("(a) the continuation is told exactly where the posted text ends", () => {
+    const prefix = streamedUpTo(262);
+    const cut = readFailedTurnStreamedAnswer(failedRunRows(prefix, "pi_output_truncated"))!;
+    const instruction = cutAnswerContinuationInstruction({ text: cut.text, cause: cut.cause, posted: true });
+    expect(instruction).toMatch(/continue exactly where/iu);
+    expect(instruction).toContain(prefix.slice(-200).trim());
+    expect(instruction).toMatch(/do not repeat/iu);
+    expect(instruction).toMatch(/never (say|claim)|do not (say|claim)/iu);
+  });
+
+  // dl-n5-cont3 F1 (judge rf-2 5x5): at 300 KiB the person was shown a 16 KB
+  // excerpt while the continuation quoted the last 600 chars of the FULL
+  // prefix: 291,070 bytes never shown, and the quoted ending unseen. The
+  // rebuilt prefix is now posted WHOLE, so the quoted ending really was posted.
+  it.each([["pi_provider_error", 269_000, /connection to the model ended/u], ["pi_output_truncated", 300 * 1024, /output limit/u]] as const)(
+    "F1 RED: %s after %d B: the WHOLE prefix is posted (no excerpt), and the quoted ending is the posted text's ending", (code, size, note) => {
+    const prefix = "x".repeat(40) + "\n" + "Paragraph of the long answer, streamed before the cut. ".repeat(Math.ceil(size / 55));
+    expect(Buffer.byteLength(prefix)).toBeGreaterThan(size);
+    const cut = readFailedTurnStreamedAnswer(failedRunRows(prefix, code, 997))!;
+    expect(cut.text).toBe(prefix);
+    const resolved = resolveHeartbeatRunResponse({ resultJson: {}, nativeConversationFinalResponse: true,
+      finalAgentMessage: selectHeartbeatRunFinalAgentMessage({ candidates: [cut.candidate] }) });
+    expect(resolved.decision.commentAction).toBe("create");
+    expect(resolved.text!.startsWith(prefix)).toBe(true);
+    expect(resolved.text).not.toMatch(/longer than one message|Excerpt \(the start/u);
+    expect(resolved.text!.slice(prefix.length)).toMatch(note);
+    expect(resolved.text).not.toMatch(/wasn't answered|send(ing)? (it )?again/iu);
+    const instruction = cutAnswerContinuationInstruction({ text: cut.text, cause: cut.cause, posted: true });
+    const quoted = /<<<END OF POSTED TEXT\n([\s\S]*)\nEND OF POSTED TEXT>>>/u.exec(instruction)![1]!;
+    expect(resolved.text!.slice(0, prefix.length).endsWith(quoted)).toBe(true);
+    expect(instruction).toMatch(/posted to the person as your reply, exactly as written/u);
+    expect(instruction).not.toMatch(/only the start of it was shown|excerpt/iu);
+  });
+
+  // dl-n5-cont3 F3 (judge rf-2 3x5): only the LAST streamed agentMessage item
+  // was rebuilt; a failed turn with two answer items dropped the first.
+  it("F3 RED: a failed turn with two answer items posts BOTH, in seq order", () => {
+    const first = streamedUpTo(40), second = Array.from({ length: 30 }, (_, i) => item(i + 41)).join("");
+    const rows = failedRunRows(first, "pi_output_truncated");
+    const failed = rows.pop()!;
+    rows.push({ seq: 5_000, payload: { prpEvent: { eventType: "item.started", itemId: `${turnId}:tool:1`, turnId,
+      payload: { kind: "toolCall" } } } });
+    let seq = 5_001;
+    for (let offset = 0; offset < second.length; offset += 61) rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta",
+      itemId: `${turnId}:pi-message:4:block:0`, turnId, payload: { kind: "agentMessage", channel: "progress", text: second.slice(offset, offset + 61) } } } });
+    rows.push({ ...failed, seq: seq++ });
+    const cut = readFailedTurnStreamedAnswer(rows)!;
+    expect(cut.text.indexOf(item(1))).toBe(0);
+    expect(cut.text.indexOf(item(40))).toBeLessThan(cut.text.indexOf(item(41)));
+    for (let n = 1; n <= 70; n++) expect(cut.text.split(item(n)).length - 1).toBe(1);
+    expect(cut.text.endsWith(item(70))).toBe(true);
+    expect(cut.candidate.text.startsWith(cut.text)).toBe(true);
+  });
+
+  it("(rule 3) a cut answer that was NOT posted is restarted whole, and the continuation says so plainly", () => {
+    const instruction = cutAnswerContinuationInstruction({ text: streamedUpTo(262), cause: "output_limit", posted: false });
+    expect(instruction).toMatch(/none of it was shown/iu);
+    expect(instruction).toMatch(/start(ing)? the (whole )?answer again from the beginning/iu);
+    expect(instruction).not.toMatch(/continue exactly where/iu);
+  });
+
+  it("NEGATIVE: a normal completed answer is not a cut answer (posted once, by the completed path)", () => {
+    const rows = failedRunRows(whole, "pi_output_truncated").filter(row =>
+      (row.payload as { prpEvent: { eventType: string } }).prpEvent.eventType !== "turn.failed");
+    rows.push({ seq: 9_000, payload: { prpEvent: { eventType: "item.completed", itemId, turnId,
+      payload: { kind: "agentMessage", channel: "final", text: whole } } } });
+    rows.push({ seq: 9_001, payload: { prpEvent: { eventType: "turn.completed", turnId, payload: { status: "completed" } } } });
+    expect(readFailedTurnStreamedAnswer(rows)).toBeNull();
+  });
+
+  it("NEGATIVE: a failed turn that streamed no answer text (only thinking) has no prefix, so the true notice still applies", () => {
+    const rows = failedRunRows("", "pi_output_truncated");
+    expect(readFailedTurnStreamedAnswer(rows)).toBeNull();
+    const blank = failedRunRows("   \n", "pi_output_truncated");
+    expect(readFailedTurnStreamedAnswer(blank)).toBeNull();
+  });
+});
+
+// dl-n5-cont2 (rf-2 C1 2x4, C2 3x3): a truncated completed final whose stored
+// deltas include a cut piece cannot be rebuilt; the resolver silently posted
+// the semantic summary. And the EXTERNAL response-wake branch read only an
+// intact completed payload, so a truncated reply there lost to the summary.
+describe("dl-n5-cont2 a truncated completed final never yields to the summary", () => {
+  const module = runSummary as Record<string, unknown>;
+  const PLAIN = "The answer couldn't be delivered whole here; it's kept in the conversation; ask me to show it.";
+  const itemId = "runner-1:run-1:turn-1:pi-message:2:block:0";
+  const summary = "S".repeat(238);
+  const answer = "Line \"quoted\" 🦀 naïve\n".repeat(400);
+  const deltasOf = (text: string) => {
+    const rows: { seq: number; payload: unknown }[] = [];
+    let seq = 100;
+    for (let offset = 0; offset < text.length; offset += 27) rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta",
+      itemId, payload: { kind: "agentMessage", channel: "progress", text: text.slice(offset, offset + 27) } } } });
+    return rows;
+  };
+  const withCutPiece = () => {
+    const rows = deltasOf(answer);
+    (rows[3]!.payload as { prpEvent: { payload: Record<string, unknown> } }).prpEvent.payload = { truncated: true, byteSize: 70000 };
+    return rows;
+  };
+  const completed = { eventType: "item.completed", itemId, sourceEventId: "completed-2667", payload: { byteSize: 66220, truncated: true } };
+  // The base build's candidate read (no truncated rebuild on the external branch).
+  const readCandidate = (module.readCompletedOrTruncatedFinalCandidate ?? (async (input: { seq: number; prpEvent: unknown }) =>
+    readCompletedAssistantMessageCandidate(input))) as (input: { seq: number; prpEvent: unknown;
+      loadDeltaRows: (itemId: string) => Promise<{ seq: number; payload: unknown }[]> }) => Promise<ReturnType<typeof readCompletedAssistantMessageCandidate>>;
+
+  it("C1 RED: a truncated final with a cut delta posts the one plain line, never the summary", async () => {
+    const candidate = await readCandidate({ seq: 9000, prpEvent: completed, loadDeltaRows: async () => withCutPiece() });
+    const finalAgentMessage = selectHeartbeatRunFinalAgentMessage({ candidates: candidate ? [candidate] : [] });
+    const resolved = resolveHeartbeatRunResponse({ resultJson: { nativeResult: { schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "done", summary } }, nativeConversationFinalResponse: true, conversationTurnFinished: true, finalAgentMessage });
+    expect(resolved.text).toBe(PLAIN);
+    expect(resolved.text).not.toContain(summary);
+    expect(resolved.decision.chosenSource).toBe("final_agent_message");
+    // The ordinary (non-conversation) completion path too.
+    const ordinary = resolveHeartbeatRunResponse({ resultJson: { nativeResult: { schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "done", summary } }, finalAgentMessage });
+    expect(ordinary.text).toBe(PLAIN);
+  });
+
+  // The exact resolver inputs of native-run-finalizer.ts's external response-wake branch.
+  const externalResolve = (finalAgentMessage: Parameters<typeof resolveHeartbeatRunResponse>[0]["finalAgentMessage"]) =>
+    resolveHeartbeatRunResponse({
+      resultJson: { nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "yielded", summary,
+        continuation: { kind: "response_wake", summary: "Wait for the next message", idempotencyKey: "k" } },
+        finalizationPhase: "committed", finalizationReasonCode: "external_chat_response_waiting" },
+      finalAgentMessage, preferFinalResponseOverExistingComment: true,
+      externalChatResponseWakeSummaryAuthorized: true, externalChatCommittedResponseWakeSummaryAuthorized: true });
+
+  it("C2 RED: an external response wake whose completed final is stored truncated posts the answer whole", async () => {
+    const candidate = await readCandidate({ seq: 9000, prpEvent: completed, loadDeltaRows: async () => deltasOf(answer) });
+    const resolved = externalResolve(candidate?.channel === "final" ? { ...candidate, sourceEventId: "completed-2667", channel: "final" } : null);
+    expect(resolved.text).toBe(answer);
+    expect(resolved.text).not.toBe(summary);
+  });
+
+  it("C2 + C1: an external response wake whose truncated final has a cut delta posts the plain line", async () => {
+    const candidate = await readCandidate({ seq: 9000, prpEvent: completed, loadDeltaRows: async () => withCutPiece() });
+    expect(externalResolve(candidate?.channel === "final" ? { ...candidate, sourceEventId: "c", channel: "final" } : null).text).toBe(PLAIN);
+  });
+
+  it("NEGATIVE: an intact external reply that begins with the summary still posts whole, once (no delta load)", async () => {
+    const whole = `${summary} and the rest of the answer.`;
+    let loads = 0;
+    const candidate = await readCandidate({ seq: 1, prpEvent: { eventType: "item.completed", itemId, payload: { kind: "agentMessage",
+      channel: "final", text: whole } }, loadDeltaRows: async () => { loads++; return []; } });
+    expect(externalResolve({ ...candidate!, sourceEventId: "c", channel: "final" }).text).toBe(whole);
+    expect(loads).toBe(0);
+  });
+
+  it("NEGATIVE: a normal completed answer posts once, as itself", () => {
+    const candidate = readCompletedAssistantMessageCandidate({ seq: 5, prpEvent: { eventType: "item.completed", itemId,
+      payload: { kind: "agentMessage", channel: "final", text: "The answer." } } });
+    const resolved = resolveHeartbeatRunResponse({ resultJson: { nativeResult: { schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "done", summary } }, finalAgentMessage: selectHeartbeatRunFinalAgentMessage({ candidates: [candidate!] }) });
+    expect(resolved).toMatchObject({ text: "The answer.", decision: { commentAction: "create", chosenSource: "final_agent_message" } });
+  });
+});

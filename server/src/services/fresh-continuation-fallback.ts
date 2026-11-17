@@ -34,6 +34,9 @@ import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.
 import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuationCauseIsSystemOwnedSql, continuesAutomaticallySql,
   isPersonOwnedFailureCode } from "./continuation-cause.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
+import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, readThinkingOnlyCapStop, shownCutAnswer,
+  THINKING_CAP_STOP_CONTINUATION_INSTRUCTION, type CutAnswerCause } from "./heartbeat-run-summary.js";
+import { readRunAnswerEvents, readThinkingCapStop } from "./thinking-cap-stop.js";
 
 export { AUTOMATIC_CONTINUATION_WAKE_REASONS, PERSON_OWNED_FAILURE_CODES, isPersonOwnedFailureCode, isRecoveryRun } from "./continuation-cause.js";
 
@@ -227,7 +230,9 @@ async function createdObjects(tx: Db, run: typeof heartbeatRuns.$inferSelect): P
 
 /** The opening context of the continuation. It names no person who must act. */
 export function freshContinuationNote(input: { runId: string; unverified: string[]; workspace: "restored_last_save" | "kept";
-  created?: FreshContinuationCreatedObjects }) {
+  created?: FreshContinuationCreatedObjects;
+  /** dl-n5-cont: the run's answer was cut after streaming text; where to pick it up. */
+  cutAnswer?: { text: string; cause: CutAnswerCause; posted: boolean; partial?: boolean } | { thinkingOnlyCapStop: true; ask?: string | null } | null }) {
   const actions = input.unverified.length
     ? `These actions of that run have unverified outcomes: ${input.unverified.join(", ")}. For each one, first check whether it took effect.`
     : "No action of that run is recorded with an unknown outcome; check the task's recent history before repeating any side effect.";
@@ -254,7 +259,60 @@ export function freshContinuationNote(input: { runId: string; unverified: string
       created.documents.length ? `saved documents ${created.documents.join(", ")}` : null,
     ].filter(Boolean).join("; ")}. Do not create or post them again; read them and continue from where they leave off.`
     : "";
-  return `The previous attempt (run ${input.runId}) was cut off before it finished. ${files}${read}${edited}${existing} ${actions} ${guidance}`;
+  const answer = !input.cutAnswer ? ""
+    : "thinkingOnlyCapStop" in input.cutAnswer ? ` ${thinkingCapStopRecoveryOpening(input.cutAnswer.ask ?? null)}`
+    : ` ${cutAnswerContinuationInstruction(input.cutAnswer)}`;
+  return `The previous attempt (run ${input.runId}) was cut off before it finished. ${files}${read}${edited}${existing} ${actions} ${guidance}${answer}`;
+}
+
+/**
+ * dl-n5-cont3: the opening of the ONE recovery run after a thinking-only cap
+ * stop. That run starts a FRESH session with no history, so it carries the
+ * person's original ask verbatim and says that no answer has been shown yet.
+ */
+export function thinkingCapStopRecoveryOpening(ask: string | null): string {
+  return ask
+    ? `${THINKING_CAP_STOP_CONTINUATION_INSTRUCTION} This is a new session with no earlier history. The person's original ask, exactly as they wrote it:\n\n<<<PERSON'S ASK\n${ask}\nEND OF PERSON'S ASK>>>\n\nAnswer that ask now, in full.`
+    : THINKING_CAP_STOP_CONTINUATION_INSTRUCTION;
+}
+
+/**
+ * dl-n5-cont: the streamed answer of the source run's failed turn, and whether
+ * the run posted it (run completion posts it first). Null when it streamed none.
+ * dl-n5-cont3: for a thinking-only cap stop, the person's original ask (their
+ * latest message before the run ended, else the task's description or title).
+ */
+export async function readSourceRunCutAnswer(tx: Pick<Db, "select">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId"> & Partial<Pick<typeof heartbeatRuns.$inferSelect, "finishedAt">>,
+  issue?: Pick<typeof issues.$inferSelect, "id" | "title" | "description"> | null):
+  Promise<{ text: string; cause: CutAnswerCause; posted: boolean; partial?: boolean } | { thinkingOnlyCapStop: true; ask: string | null } | null> {
+  const rows = await readRunAnswerEvents(tx, run.companyId, run.id);
+  const cut = readFailedTurnStreamedAnswer(rows);
+  // dl-n5-cont2 item 3: a pi_output_truncated turn that streamed no answer
+  // text spent its whole output budget thinking; the continuation is told to
+  // write the answer now (dl-n5-cont3: at the 'high' run-level override).
+  if (!cut) return readThinkingOnlyCapStop(rows) ? { thinkingOnlyCapStop: true, ask: await readPersonAsk(tx, run, issue ?? null) } : null;
+  // dl-n5-cont4: compared with what the run REALLY posted (its comments in the
+  // DB), item by item: the opening quotes the ending the person was shown and
+  // never says none was shown when some was.
+  const postedBodies = (await tx.select({ body: issueComments.body }).from(issueComments).where(and(
+    eq(issueComments.companyId, run.companyId), eq(issueComments.createdByRunId, run.id), isNull(issueComments.deletedAt)))
+    .orderBy(asc(issueComments.createdAt), asc(issueComments.id))).map(row => row.body);
+  const shown = shownCutAnswer(cut, postedBodies);
+  if (!shown) return { text: cut.text, cause: cut.cause, posted: false };
+  return { text: shown.text, cause: cut.cause, posted: true, ...(shown.whole ? {} : { partial: true }) };
+}
+
+async function readPersonAsk(tx: Pick<Db, "select">, run: { companyId: string; finishedAt?: Date | null },
+  issue: Pick<typeof issues.$inferSelect, "id" | "title" | "description"> | null): Promise<string | null> {
+  if (!issue) return null;
+  const [comment] = await tx.select({ body: issueComments.body }).from(issueComments).where(and(
+    eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issue.id), isNull(issueComments.deletedAt),
+    isNull(issueComments.createdByRunId), sql`${issueComments.authorUserId} is not null`,
+    ...(run.finishedAt ? [sql`${issueComments.createdAt} <= ${run.finishedAt.toISOString()}::timestamptz`] : [])))
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+  const ask = comment?.body?.trim() ? comment.body : issue.description?.trim() ? issue.description : issue.title;
+  return ask?.trim() ? ask : null;
 }
 
 const USER_TEXT = "The previous run was cut off. Paperclip continues the task in a fresh run from its last saved work.";
@@ -699,6 +757,11 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   const chain = await freshContinuationChain(tx, { companyId, issueId: issue.id, runId: run.id });
   if (chain.attempts >= resolveFreshContinuationsPerChain())
     return { kind: "not_applicable", reason: "fresh_continuation_chain_exhausted" };
+  // dl-n5-cont2 item 3 COST GUARD: at most ONE automatic continuation per ask
+  // after a thinking-only output-cap stop. When that continuation stopped the
+  // same way, its reply is one note with Retry; nothing runs again by itself.
+  if ((await readThinkingCapStop(tx, { companyId, runId: run.id }))?.repeated)
+    return { kind: "person_owned", reason: "output_budget_exhausted_again" };
 
   // The holds this decision owns: reconciliation holds that still block the
   // task. Workspace restore/repair holds stay with workspace recovery, and
@@ -891,7 +954,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   if (isolation === "fresh_isolated_workspace" && delivery === "saved_input") delivery = "recorded";
   const unverified = await unverifiedActions(tx, run);
   const created = await createdObjects(tx, run);
-  const note = freshContinuationNote({ runId: run.id, unverified, created,
+  const cutAnswer = await readSourceRunCutAnswer(tx, run, issue);
+  const note = freshContinuationNote({ runId: run.id, unverified, created, cutAnswer,
     workspace: isolation === "writer_ended" ? "kept" : "restored_last_save" });
   const decision: ExecutionReconciliation & { providerStopProof: "writer_ended" | "isolated" } = { runId: run.id, providerStopped: true,
     // Only a proven end is a stop. `isolated` means exactly: the old run's agent

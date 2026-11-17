@@ -244,6 +244,165 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
     expect(persisted?.processStartedAt?.toISOString()).toBe("2026-11-16T04:20:00.000Z");
   });
 
+  // dl-n5-cont (Paul NOTE 5; gate 1 run 00e31d20): 67,391 B streamed as
+  // item.delta (items 0001-0262), then turn.failed pi_output_truncated. NOTHING
+  // was posted. The run's reply is the streamed prefix, first, with one true note.
+  it.each([
+    ["pi_output_truncated", /output limit/u],
+    ["pi_provider_error", /connection to the model ended/u],
+  ] as const)("dl-n5-cont posts the streamed prefix of a turn that failed with %s", async (code, note) => {
+    const { run, agent } = await fixture({ status: "failed", finishedAt: new Date() });
+    const item = (n: number) => `Item ${String(n).padStart(4, "0")}: ${"body text of this numbered item; ".repeat(7)}\n`;
+    const prefix = Array.from({ length: 262 }, (_, i) => item(i + 1)).join("");
+    const turnId = `runner-1:${run.id}:turn-1`, itemId = `${turnId}:pi-message:2:block:0`;
+    const base = { companyId: run.companyId, runId: run.id, agentId: agent.id, stream: "system", level: "info", message: "e" };
+    const rows: (typeof heartbeatRunEvents.$inferInsert)[] = [{ ...base, seq: 1, eventType: "item.delta",
+      payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`, turnId, payload: { kind: "reasoning", text: "plan" } } } }];
+    let seq = 2;
+    for (let offset = 0; offset < prefix.length; offset += 257) rows.push({ ...base, seq: seq++, eventType: "item.delta",
+      payload: { prpEvent: { eventType: "item.delta", itemId, turnId, payload: { kind: "agentMessage", channel: "progress",
+        text: prefix.slice(offset, offset + 257) } } } });
+    rows.push({ ...base, seq: seq++, eventType: "turn.failed", payload: { prpEvent: { eventType: "turn.failed", turnId,
+      payload: { status: "failed", error: { code, recoverable: false } } } } });
+    await db.insert(heartbeatRunEvents).values(rows);
+    const lifecycle = createHeartbeatLifecycle(db, callbacks(db));
+    const final = await lifecycle.findLatestCompletedFinalAgentMessage(run.id, run.companyId);
+    expect(final?.channel).toBe("final");
+    expect(final?.text.startsWith(prefix)).toBe(true);
+    expect(final?.text).not.toContain(item(263));
+    expect(final?.text.slice(prefix.length)).toMatch(note);
+    expect(final?.text).not.toMatch(/wasn't answered|Sending it again is safe|are in that reply/u);
+  });
+
+  // dl-n5-cont2 item 3 changes 484ba17f's thinking-only negative: a cap stop
+  // with only thinking now gets ONE true note. A failed turn with no streamed
+  // text and NO cap stop keeps no reply here (the existing true notice applies).
+  it("dl-n5-cont NEGATIVE: a failed turn that streamed only thinking, without a cap stop, has no reply (the true notice applies)", async () => {
+    const { run, agent } = await fixture({ status: "failed", finishedAt: new Date() });
+    const turnId = `runner-1:${run.id}:turn-1`;
+    const base = { companyId: run.companyId, runId: run.id, agentId: agent.id, stream: "system", level: "info", message: "e" };
+    await db.insert(heartbeatRunEvents).values([
+      { ...base, seq: 1, eventType: "item.delta", payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`,
+        turnId, payload: { kind: "reasoning", text: "thinking only ".repeat(500) } } } },
+      { ...base, seq: 2, eventType: "turn.failed", payload: { prpEvent: { eventType: "turn.failed", turnId,
+        payload: { status: "failed", error: { code: "pi_provider_error" } } } } },
+    ]);
+    expect(await createHeartbeatLifecycle(db, callbacks(db)).findLatestCompletedFinalAgentMessage(run.id, run.companyId)).toBeNull();
+  });
+
+  // dl-n5-cont2 item 3: the runner reports pi_output_truncated with NO answer
+  // text (pi-rpc-driver.ts :1689-1696); the person got only a notice.
+  const thinkingCapStop = async (patch: Partial<typeof heartbeatRuns.$inferInsert> = {}, existing?: { companyId: string; agentId: string }) => {
+    const ids = existing ?? await (async () => { const f = await fixture({ status: "failed", finishedAt: new Date() });
+      return { companyId: f.run.companyId, agentId: f.agent.id }; })();
+    const [run] = existing ? await db.insert(heartbeatRuns).values({ companyId: ids.companyId, agentId: ids.agentId, status: "failed",
+      runtimeMode: "native", finishedAt: new Date(), ...patch }).returning() : await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, ids.companyId));
+    if (!existing && Object.keys(patch).length) await db.update(heartbeatRuns).set(patch).where(eq(heartbeatRuns.id, run!.id));
+    const turnId = `runner-1:${run!.id}:turn-1`;
+    const base = { companyId: ids.companyId, runId: run!.id, agentId: ids.agentId, stream: "system", level: "info", message: "e" };
+    await db.insert(heartbeatRunEvents).values([
+      { ...base, seq: 1, eventType: "item.delta", payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`,
+        turnId, payload: { kind: "reasoning", text: "thinking only ".repeat(500) } } } },
+      { ...base, seq: 2, eventType: "turn.failed", payload: { prpEvent: { eventType: "turn.failed", turnId,
+        payload: { status: "failed", error: { code: "pi_output_truncated", recoverable: false } } } } },
+    ]);
+    return { ...ids, runId: run!.id };
+  };
+
+  it("dl-n5-cont2 item 3 RED: a thinking-only cap stop gets ONE true note, then its continuation's cap stop ONE note with Retry", async () => {
+    const first = await thinkingCapStop();
+    const lifecycle = createHeartbeatLifecycle(db, callbacks(db));
+    const note = await lifecycle.findLatestCompletedFinalAgentMessage(first.runId, first.companyId);
+    expect(note?.text).toBe("The model used its whole output budget thinking; continuing with the answer.");
+    expect(note?.channel).toBe("final");
+    const second = await thinkingCapStop({ retryOfRunId: first.runId,
+      contextSnapshot: { previousRunId: first.runId, wakeReason: "issue_recovery_action_restored" } }, first);
+    const again = await lifecycle.findLatestCompletedFinalAgentMessage(second.runId, second.companyId);
+    expect(again?.text).toBe("The model ran out of output budget again before answering. Press Retry to try once more.");
+    for (const text of [note?.text, again?.text]) expect(text).not.toMatch(/wasn't answered|Sending it again is safe/u);
+    // A person's Retry is a new ask: its own cap stop gets the first note again.
+    const retried = await thinkingCapStop({ contextSnapshot: { previousRunId: second.runId, wakeReason: "task_retry" } }, first);
+    expect((await lifecycle.findLatestCompletedFinalAgentMessage(retried.runId, retried.companyId))?.text)
+      .toBe("The model used its whole output budget thinking; continuing with the answer.");
+  });
+
+  // dl-n5-cont3: the ONE automatic recovery run after a thinking-only cap stop
+  // runs at 'high' (capacity-lead's probe: xhigh 128k all thinking, high the
+  // whole answer at 78k), as a run-level override through the task-override
+  // path heartbeat applies (heartbeat.ts -> projectPaperclipRunnerTaskConfig ->
+  // the native input's piRpcThinkingLevel, a FRESH session admits it).
+  it("dl-n5-cont3 (1)(2) RED: the cap-stop recovery run's native input carries 'high'; the stored config and the next normal run stay xhigh", async () => {
+    const { resolveRunAssigneeAdapterOverrides } = await import("../thinking-cap-stop.js");
+    const { projectPaperclipRunnerTaskConfig, resolvePaperclipRunnerNativeProviderInput } = await import("../native-runtime/provider-profile.js");
+    const first = await thinkingCapStop();
+    const stored = { provider: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "xhigh" };
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: stored }).where(eq(agents.id, first.agentId));
+    const [agent] = await db.select().from(agents).where(eq(agents.id, first.agentId));
+    const nativeInputLevel = async (runId: string) => {
+      const overrides = await resolveRunAssigneeAdapterOverrides(db, { companyId: first.companyId, runId, agent: agent!,
+        issueContext: { assigneeAgentId: agent!.id, assigneeAdapterOverrides: null } });
+      const provider = resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc",
+        adapterConfig: projectPaperclipRunnerTaskConfig("pi_rpc", agent!.adapterConfig, overrides?.adapterConfig) });
+      return provider.provider === "pi_rpc" ? provider.piRpcThinkingLevel : null;
+    };
+    // The source run (the person's ask) ran at the stored level.
+    expect(await nativeInputLevel(first.runId)).toBe("xhigh");
+    const [recovery] = await db.insert(heartbeatRuns).values({ companyId: first.companyId, agentId: first.agentId, status: "queued",
+      runtimeMode: "native", retryOfRunId: first.runId,
+      contextSnapshot: { previousRunId: first.runId, wakeReason: "issue_recovery_action_restored", forceFreshSession: true } }).returning();
+    // (1) the recovery run runs at 'high' ...
+    expect(await nativeInputLevel(recovery!.id)).toBe("high");
+    // ... while the agent's stored config stays 'xhigh'.
+    expect((await db.select().from(agents).where(eq(agents.id, first.agentId)))[0]!.adapterConfig).toEqual(stored);
+    // (2) the NEXT normal run (the person's next message) is xhigh again.
+    const [next] = await db.insert(heartbeatRuns).values({ companyId: first.companyId, agentId: first.agentId, status: "queued",
+      runtimeMode: "native", contextSnapshot: { wakeReason: "issue_commented", previousRunId: recovery!.id } }).returning();
+    expect(await nativeInputLevel(next!.id)).toBe("xhigh");
+    // A same-session retry of the cap stop keeps the stored level (pi_rpc
+    // refuses a per-turn level change in a live session; a named residual).
+    const [sameSession] = await db.insert(heartbeatRuns).values({ companyId: first.companyId, agentId: first.agentId, status: "queued",
+      runtimeMode: "native", retryOfRunId: first.runId, scheduledRetryReason: "transient_failure",
+      contextSnapshot: { previousRunId: first.runId, wakeReason: "transient_failure_retry" } }).returning();
+    expect(await nativeInputLevel(sameSession!.id)).toBe("xhigh");
+    // A person's Retry of the cap stop is a new ask at the stored level.
+    const [retry] = await db.insert(heartbeatRuns).values({ companyId: first.companyId, agentId: first.agentId, status: "queued",
+      runtimeMode: "native", contextSnapshot: { wakeReason: "task_retry", previousRunId: first.runId } }).returning();
+    expect(await nativeInputLevel(retry!.id)).toBe("xhigh");
+    // A task's own lower override is never raised.
+    expect((await resolveRunAssigneeAdapterOverrides(db, { companyId: first.companyId, runId: recovery!.id, agent: agent!,
+      issueContext: { assigneeAgentId: agent!.id, assigneeAdapterOverrides: { adapterConfig: { piRpcThinkingLevel: "medium" } } } }))
+      ?.adapterConfig).toEqual({ piRpcThinkingLevel: "medium" });
+  });
+
+  it("dl-n5-cont3 (4): the cost guard holds: a second cap stop gets ONE note with Retry, no 'continuing' note", async () => {
+    const first = await thinkingCapStop();
+    const second = await thinkingCapStop({ retryOfRunId: first.runId,
+      contextSnapshot: { previousRunId: first.runId, wakeReason: "issue_recovery_action_restored" } }, first);
+    const { readThinkingCapStop } = await import("../thinking-cap-stop.js");
+    expect((await readThinkingCapStop(db, { companyId: second.companyId, runId: second.runId }))?.repeated).toBe(true);
+    expect((await createHeartbeatLifecycle(db, callbacks(db)).findLatestCompletedFinalAgentMessage(second.runId, second.companyId))?.text)
+      .toBe("The model ran out of output budget again before answering. Press Retry to try once more.");
+  });
+
+  // dl-n5-cont2 C1 (rf-2 2x4) on the live completion path.
+  it("dl-n5-cont2 C1 RED: a truncated completed final whose deltas include a cut piece is the plain line, not null (the summary)", async () => {
+    const { run, agent } = await fixture({ status: "succeeded", finishedAt: new Date() });
+    const turnId = `runner-1:${run.id}:turn-1`, itemId = `${turnId}:pi-message:2:block:0`;
+    const base = { companyId: run.companyId, runId: run.id, agentId: agent.id, stream: "system", level: "info", message: "e" };
+    await db.insert(heartbeatRunEvents).values([
+      { ...base, seq: 1, eventType: "item.delta", payload: { prpEvent: { eventType: "item.delta", itemId, turnId,
+        payload: { kind: "agentMessage", channel: "progress", text: "The first part. " } } } },
+      { ...base, seq: 2, eventType: "item.delta", payload: { prpEvent: { eventType: "item.delta", itemId, turnId,
+        payload: { truncated: true, byteSize: 70000 } } } },
+      { ...base, seq: 3, eventType: "item.completed", payload: { prpEvent: { eventType: "item.completed", itemId, turnId,
+        payload: { truncated: true, byteSize: 90000 } } } },
+    ]);
+    const final = await createHeartbeatLifecycle(db, callbacks(db)).findLatestCompletedFinalAgentMessage(run.id, run.companyId);
+    expect(final?.text).toBe("The answer couldn't be delivered whole here; it's kept in the conversation; ask me to show it.");
+    expect(final?.channel).toBe("final");
+  });
+
   it("keeps one terminal outcome and reports only the winner of competing writes", async () => {
     const { run } = await fixture();
     const deps = callbacks(db);

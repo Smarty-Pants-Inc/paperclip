@@ -342,6 +342,30 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     }
   });
 
+  // dl-n5-cont rule 4 (gate 1 runs 822ce371 / d5ac6a7f): a run that streamed
+  // answer text and failed has its streamed prefix posted as its reply, so the
+  // sweep never says "wasn't answered" / "Sending it again is safe" for it. A
+  // run that streamed nothing still gets the true notice.
+  it.each([true, false])("dl-n5-cont a failed run whose streamed prefix was posted gets no resend notice (posted: %s)", async (posted) => {
+    const f = await fixture();
+    const runId = await f.run({ commentId: await f.message("Write the 300 KiB report."), status: "failed",
+      errorCode: "adapter_failed", error: "pi_provider_error: unexpected EOF" });
+    if (posted) {
+      const { readFailedTurnStreamedAnswer } = await import("../heartbeat-run-summary.js");
+      const cut = readFailedTurnStreamedAnswer([
+        { seq: 1, payload: { prpEvent: { eventType: "item.delta", itemId: "t:m", turnId: "t",
+          payload: { kind: "agentMessage", text: "Section 1 of the report.\n".repeat(100) } } } },
+        { seq: 2, payload: { prpEvent: { eventType: "turn.failed", turnId: "t", payload: { error: { code: "pi_provider_error" } } } } },
+      ])!;
+      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: cut.candidate.text,
+        authorType: "agent", authorAgentId: f.agentId, createdByRunId: runId, createdAt: f.at() });
+    }
+    await f.sweep();
+    const notices = await f.visible();
+    if (posted) expect(notices.filter(notice => /wasn't answered|Sending it again is safe/u.test(notice.body))).toHaveLength(0);
+    else expect(notices.map(notice => notice.body)).toEqual([NOT_ANSWERED]);
+  });
+
   it("D10b SMAA-143 exhausted backup refusal gets exactly one factual unanswered notice", async () => {
     const f = await fixture({ status: "blocked" });
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_session_interrupted",

@@ -37,6 +37,7 @@ import { ASSIGNED_WORK_CONTINUED_ACTION, taskAutomaticAttempts } from "./task-au
 import { isReattachPhaseActive, reattachPhaseRecheckAt } from "../heartbeat/run-admission.js";
 import { ensureFreshContinuation, type FreshContinuationResult } from "../fresh-continuation-fallback.js";
 import { canContinueRecoveryRunAutomatically } from "../continuation-cause.js";
+import { readThinkingCapStop } from "../thinking-cap-stop.js";
 import { wakeBecameFreshContinuation } from "./wake-became-fresh-continuation.js";
 import { STRANDED_CONTINUATION_MAX_AGE_MS, STRANDED_KIND, strandedHoldContinuesAutomatically, type StrandedHoldRun } from "./stranded-hold-continuation.js";
 import {
@@ -97,7 +98,7 @@ export type AssignedWorkDeps = {
 
 export type AssignedWorkCheck = {
   verdict: AssignedWorkVerdict;
-  outcome: "ok" | "settling" | "repaired" | "settled_lost_run" | "deferred_rate_limit" | "deferred_cap" | "deferred_reattach_phase" | "stale_reported" | "left_to_hold_owner" | "left_to_native_recovery" | "changed" | "enqueue_refused"
+  outcome: "ok" | "settling" | "repaired" | "settled_lost_run" | "deferred_rate_limit" | "deferred_cap" | "deferred_reattach_phase" | "stale_reported" | "left_to_hold_owner" | "left_to_native_recovery" | "changed" | "enqueue_refused" | "left_to_person"
     | "waiting_on_recovery" | "left_to_handover";
   retryAt: Date | null;
 };
@@ -614,6 +615,16 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       if (claimed.restoredTo && fresh.kind === "exact_recovery_pending") await revertRestoredBlock(issue, claimed);
       await settleContinuationActivity(claimed, claimed.reason, "not_started", { waitingUntil: fresh.retryAt.toISOString() });
       return { verdict: claimed.verdict, outcome: fresh.kind === "backoff" ? "deferred_cap" : "waiting_on_recovery", retryAt: fresh.retryAt };
+    }
+    // dl-n5-cont3 (5): the thinking-only cap-stop COST GUARD holds here too.
+    // When the one automatic continuation of a cap stop also stopped at the
+    // cap, its reply is one note with Retry; the sweep never starts a third run.
+    // Read directly, so it holds also when the fresh-continuation path was not
+    // taken (fresh === null) or refused for this reason.
+    if (facts.latestRun && (await readThinkingCapStop(db, { companyId: issue.companyId, runId: facts.latestRun.id }))?.repeated) {
+      if (claimed.restoredTo) await revertRestoredBlock(issue, claimed);
+      await settleContinuationActivity(claimed, claimed.reason, "not_started", { waitingFor: "output_budget_exhausted_again" });
+      return { verdict: claimed.verdict, outcome: "left_to_person", retryAt: claimed.nextCheckAt };
     }
     const continuedBefore = await wakeBecameFreshContinuation(db, issue.companyId, issue.id);
     const run = await deps.enqueueWakeup(issue.assigneeAgentId!, {

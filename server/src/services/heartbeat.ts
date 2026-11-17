@@ -322,6 +322,7 @@ import {
 } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
+import { resolveRunAssigneeAdapterOverrides } from "./thinking-cap-stop.js";
 import {
   getExecutionBlocker,
 } from "./execution-blocker.js";
@@ -507,7 +508,6 @@ import {
 import {
   applyDefaultIsolatedExecutionWorkspacePolicy,
   buildExecutionWorkspaceAdapterConfig,
-  parseIssueAssigneeAdapterOverrides,
   gateProjectExecutionWorkspacePolicy,
   parseIssueExecutionWorkspaceSettings,
   resolveExecutionWorkspaceMode,
@@ -2475,12 +2475,11 @@ export function heartbeatService(
         context[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY] = true;
       }
       const wakeCommentId = deriveCommentId(context, null);
-      let issueAssigneeOverrides =
-        issueContext && issueContext.assigneeAgentId === agent.id
-          ? parseIssueAssigneeAdapterOverrides(
-              issueContext.assigneeAdapterOverrides,
-            )
-          : null;
+      // dl-n5-cont3: the task's assignee overrides; the ONE automatic recovery
+      // run after a thinking-only output-cap stop also runs at 'high' in its
+      // fresh session (a run-level override; the agent's stored level is unchanged).
+      let issueAssigneeOverrides = await resolveRunAssigneeAdapterOverrides(db, {
+        companyId: agent.companyId, runId: run.id, agent, issueContext });
       const experimentalInstanceSettings =
         await timePreparation("instance_settings", () => instanceSettings.getExperimental());
       const isolatedWorkspacesEnabled =
