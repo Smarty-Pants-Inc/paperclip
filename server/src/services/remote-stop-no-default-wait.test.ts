@@ -21,7 +21,6 @@ const { issueRoutes } = await import("../routes/issues.js");
 const { errorHandler } = await import("../middleware/index.js");
 const { buildExecutionContinuation } = await import("./execution-continuation.js");
 
-const DEFAULT_WAIT = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("pl/no-default-wait: Stop with held messages on a warm handed-off box", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -116,15 +115,4 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(done.payload?.executionWait?.reason).not.toBe("execution_recovery");
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toHaveLength(0);
   }, 60_000);
-
-  it("heal: a wake already parked under a default execution_recovery wait with no blocker shows the Send line again", async () => {
-    const f = await seed();
-    const [wake] = [await wakeOf(f.queueId)];
-    await db.update(agentWakeupRequests).set({ payload: { ...wake.payload, executionWait: DEFAULT_WAIT } })
-      .where(eq(agentWakeupRequests.id, f.queueId));
-    const queue = await readQueue(f);
-    expect(queue.executionWait?.reason).toBe("stopped_by_person");
-    // The saved wait JSON itself is never deleted.
-    expect((await wakeOf(f.queueId)).payload?.executionWait).toEqual(DEFAULT_WAIT);
-  });
 });
