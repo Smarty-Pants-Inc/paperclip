@@ -2527,4 +2527,59 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       } finally { answerDelivery.paused = false; }
     }, 90_000);
   });
+
+  // h3-c1x port (minimal piece): app-lead's card-answer-duty helpers (c531cc3e cardNotices/answeredCard/resume, 'without'
+  // only) are not on c1x. The answer-only answeredCard and the resume helper are ported here, as written there, for
+  // the H3 card carry row (36a5dbaa) alone; the rest of that describe is app-lead's line and is not ported.
+  describe("H3 card carry on c1x (36a5dbaa)", () => {
+    const cardNotices = (f: Awaited<ReturnType<typeof fixture>>) => db.select().from(issueComments).where(and(
+      eq(issueComments.issueId, f.issueId), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
+    async function answeredCard(f: Awaited<ReturnType<typeof fixture>>, sourceRunId: string) {
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, sourceRunId,
+        kind: "ask_user_questions", status: "pending", createdByAgentId: f.agentId, addresseeUserId: f.userId, continuationPolicy: "none", createdAt: f.at(),
+        payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?", required: true, selectionMode: "single", options: [{ id: "first", label: "First" }] }] } } as never).returning();
+      const scope = { id: f.issueId, companyId: f.companyId };
+      const resolved = await issueThreadInteractionService(db).answerQuestions(scope, card!.id,
+        { answers: [{ questionId: "scope", optionIds: ["first"] }] } as never, { userId: f.userId });
+      // The answer happens on the fixture clock, after the card.
+      await db.update(issueThreadInteractions).set({ resolvedAt: f.at() }).where(eq(issueThreadInteractions.id, card!.id));
+      return { id: card!.id, status: resolved?.status, resolvedByUserId: resolved?.resolvedByUserId ?? null };
+    }
+    const resume = async (f: Awaited<ReturnType<typeof fixture>>, cardId: string, status: string) => {
+      const id = await f.run({ status, errorCode: ["failed"].includes(status) ? "native_run_failed" : null });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, interactionId: cardId,
+        interactionStatus: "answered", source: "issue.interaction.respond" } }).where(eq(heartbeatRuns.id, id));
+      // The answer reached the agent's resume run (a pending delivery is still an attempt in progress).
+      await db.update(issueQuestionResponseDeliveries).set({ targetRunId: id, status: "fallback_queued", deliveryMode: "wake_fallback" })
+        .where(eq(issueQuestionResponseDeliveries.interactionId, cardId));
+      return id;
+    };
+
+    // H3 card carry, the COLLECTING side of RFL F2 (app-lead 23:36Z): the real carry (readContinuationCommentInput, the seam
+    // every successor seed uses) WRITES the card's interaction id into the successor's own pending input, so the successor's
+    // completed final answer is attributed to the card. Without it the person gets a false "not answered" notice.
+    it("H3 card carry: the REAL carry writes the card into the successor's own pending input; its completed answer is ANSWERED; no notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      const seed = await readContinuationCommentInput(db, { ...f, runId: first });
+      expect.soft(seed, "the failed answer-resume run's card answer is carried").toMatchObject({ interactionIds: [card.id], interactionId: card.id });
+      const successor = await f.run({ status: "succeeded", retryOfRunId: first });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_continuation_needed", ...seed } })
+        .where(eq(heartbeatRuns.id, successor));
+      await f.reply(successor);
+      const m = { id: sql`${card.id}::uuid`, companyId: sql`${f.companyId}::uuid`, issueId: sql`${f.issueId}::uuid`,
+        createdAt: sql`${(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card.id)))[0]!.resolvedAt!.toISOString()}::timestamptz` };
+      const [row] = await db.select({ answered: completedPersonMessageAnswerSql(m) }).from(issues).where(eq(issues.id, f.issueId));
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      console.log("H3_CARD_CARRY_ATTRIBUTED", JSON.stringify({ card: card.id, first, successor, seed, answered: row!.answered,
+        notices: notices.map(n => ({ id: n.id, body: n.body })) }));
+      expect(row!.answered, "the successor's completed final answer is ANSWERED for the carried card").toBe(true);
+      expect(notices, "no false notice").toHaveLength(0);
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+      expect((await readContinuationCommentInput(db, { ...f, runId: first })).interactionIds ?? [], "answered: never carried again").not.toContain(card.id);
+    });
+  });
 });
