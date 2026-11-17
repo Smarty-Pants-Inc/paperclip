@@ -498,8 +498,41 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     now = new Date(),
     abort?: AbortSignal,
   ) {
+    // Per-phase receipts localize the next slow shutdown (ids and durations
+    // only; no intent contents or credentials).
+    const startedAt = performance.now();
+    const phases: Record<string, number> = {};
+    let phaseStartedAt = startedAt;
+    const phase = (name: string) => {
+      const at = performance.now();
+      phases[name] = Math.round(at - phaseStartedAt);
+      phaseStartedAt = at;
+    };
+    let outcome = "failed";
+    try {
+      const result = await prepareHotRestartShutdownPhases(signal, now, abort, phase);
+      outcome = result.mode;
+      return result;
+    } catch (error) {
+      if (abort?.aborted) outcome = "aborted";
+      throw error;
+    } finally {
+      logger.info(
+        { signal, outcome, phases, totalMs: Math.round(performance.now() - startedAt) },
+        "hot-restart shutdown preparation phases",
+      );
+    }
+  }
+
+  async function prepareHotRestartShutdownPhases(
+    signal: "SIGINT" | "SIGTERM",
+    now: Date,
+    abort: AbortSignal | undefined,
+    phase: (name: string) => void,
+  ) {
     enterShutdown();
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
+    phase("idleCleanupMs");
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native session cleanup failed before controller shutdown");
     }
@@ -507,6 +540,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     let intent: Awaited<ReturnType<typeof readHotRestartIntent>>;
     try {
       intent = await readHotRestartIntent();
+      phase("intentReadMs");
     } catch (err) {
       logger.warn(
         { err },
@@ -552,6 +586,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
+    phase("runSelectMs");
     abort?.throwIfAborted();
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
@@ -570,6 +605,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         drainRunIds: activeServerStdioRunIds,
         capturedAt: now,
       });
+      phase("snapshotWriteMs");
 
       logger.warn(
         {
@@ -598,6 +634,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       activeRuns: snapshotRuns,
       capturedAt: now,
     });
+    phase("snapshotWriteMs");
     for (const { run } of activeRuns) {
       abort?.throwIfAborted();
       await appendRunEvent(run, {
@@ -615,6 +652,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         },
       });
     }
+    phase("runEventsMs");
 
     const nativeRunIds = activeRuns
       .filter(
@@ -629,6 +667,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // concurrent batch; a run still detaching at that deadline is pending.
     const detachedNativeSessions =
       await detachNativeSessionsForRestart(nativeRunIds, undefined, { signal: abort, reportFailures: true });
+    phase("nativeDetachMs");
 
     logger.info(
       {
