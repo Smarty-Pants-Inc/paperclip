@@ -34,7 +34,7 @@ function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageS
 // delivery; cancelled cards need evidence of a human skip/withdraw/cancel reply.
 const PERSON_MESSAGE_ANSWER_CARD_STATUSES = ["pending", "answered", "accepted", "rejected"] as const;
 
-/** A person message is answered by a published agent reply attributed to it or to a later person input,
+/** DELIVERED (legacy name): a person message was carried or partly answered by a published agent reply attributed to it or to a later person input,
  * an open or resolved interaction card on its run chain, or imported history. Answering the card is new input;
  * it never makes the original message unanswered again. Shared by recovery input selection (continuation-comment-input.ts) and the
  * unanswered-person-message notice, so the carry and the notice never disagree on a message.
@@ -47,14 +47,7 @@ const PERSON_MESSAGE_ANSWER_CARD_STATUSES = ["pending", "answered", "accepted", 
  *   With neither provenance nor an arrival record, nothing is history.
  */
 export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
-  return sql`(exists (select 1 from ${issueComments} a
-    join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
-    where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
-      and a.created_at > ${m.createdAt}
-      and exists (select 1 from ${issueComments} b
-        where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
-          and (b.id = ${m.id} or b.created_at > ${m.createdAt})
-          and ${chainCarriesCommentSql("r", sql`b.id`, m)}))
+  return sql`(${personMessageReplySql(m, false)}
     or exists (select 1 from ${issueThreadInteractions} q
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
       where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId}
@@ -66,6 +59,33 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
         -- A card answers only inputs carried on its chain, never queued inputs by time.
         and ${chainCarriesCommentSql("r", m.id, m)})
     or ${importedPersonHistorySql(m)})`;
+}
+
+/** ANSWERED: a completed run's published final reply to this message.
+ * A cut/failed/running run's partial reply, a card, or imported history proves
+ * DELIVERED only. Keep recovery input selection and notices on the legacy
+ * predicate above; only duplicate retry/continuation fences use this one.
+ * `succeeded` is the persisted completed-run status. When publication recorded
+ * a final comment receipt, only that comment counts (not earlier progress).
+ */
+export function completedPersonMessageAnswerSql(m: PersonMessageSql): SQL {
+  return personMessageReplySql(m, true);
+}
+
+// Both definitions share the run attribution and durable comment-chain match.
+// DELIVERED additionally allows a reply to later input; ANSWERED requires this
+// exact input and successful completion, not merely evidence that it was read.
+function personMessageReplySql(m: PersonMessageSql, completed: boolean): SQL {
+  return sql`exists (select 1 from ${issueComments} a
+    join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
+    where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
+      and a.created_at > ${m.createdAt}
+      ${completed ? sql`and r.status = 'succeeded'
+        and coalesce(r.result_json#>>'{presentationDecision,commentId}', a.id::text) = a.id::text` : sql``}
+      and exists (select 1 from ${issueComments} b
+        where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
+          and ${completed ? sql`b.id = ${m.id}` : sql`(b.id = ${m.id} or b.created_at > ${m.createdAt})`}
+          and ${chainCarriesCommentSql("r", sql`b.id`, m)}))`;
 }
 
 /** SQL: message m is a PERSON comment that arrived by a company import (see answeredPersonMessageSql). */

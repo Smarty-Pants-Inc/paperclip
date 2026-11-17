@@ -1,7 +1,7 @@
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issueComments, issueRecoveryActions, statusDecisions, type Db } from "@paperclipai/db";
 import { carryContinuationCommentInput } from "../../modules/wake-queue/domain/continuation-comment-input.js";
-import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { completedPersonMessageAnswerSql } from "../person-message-answer.js";
 import { freshContinuationSourceChainSql } from "../fresh-continuation-chain.js";
 
 export type NativeStatusSuccessorSkipReason = "person_message_already_answered" | "failed_run_has_successor";
@@ -14,7 +14,11 @@ export async function nativeStatusSuccessorState(db: Db, input: {
   payload: Record<string, unknown>; originRunId?: string;
 }): Promise<{ failedRunId: string | null; skipReason: NativeStatusSuccessorSkipReason | null }> {
   const eligible = { failedRunId: null, skipReason: null };
-  if (input.reason !== "issue_status_changed") return eligible;
+  // These are fallback execution effects, not notifications/owner routing.
+  // All boundaries (enqueue, admission, dispatch and promotion) share this
+  // scope, so a successor can never swallow notify_owner or bind_blocker.
+  if (input.reason !== "issue_status_changed" ||
+      (typeof input.payload.retryCause !== "string" && typeof input.payload.continuationKind !== "string")) return eligible;
   const decisionId = input.payload.nativeDecisionId;
   const runId = input.originRunId ?? (typeof decisionId === "string"
     ? (await db.select({ runId: statusDecisions.runId }).from(statusDecisions).where(and(
@@ -40,7 +44,7 @@ export async function nativeStatusSuccessorState(db: Db, input: {
       ...(typeof context?.conversationReplyBoundaryCommentId === "string" ? [context.conversationReplyBoundaryCommentId] : [])];
   }))].filter(id => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id));
   if (ids.length) {
-    const messages = await db.select({ answered: sql<boolean>`${answeredPersonMessageSql({ id: sql`${issueComments.id}`,
+    const messages = await db.select({ answered: sql<boolean>`${completedPersonMessageAnswerSql({ id: sql`${issueComments.id}`,
       companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}` })
       .from(issueComments).where(and(eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
         eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), inArray(issueComments.id, ids)));
