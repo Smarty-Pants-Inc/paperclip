@@ -230,6 +230,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
         and not ${answeredSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
+          and n.deleted_at is null and n.metadata->>'supersededByCommentId' is null
           and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or exists (select 1 from ${issueComments} n
       join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
@@ -256,6 +257,7 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
         and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
+        and n.deleted_at is null and n.metadata->>'supersededByCommentId' is null
         and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
@@ -362,7 +364,8 @@ export async function settleUnansweredPersonMessage(
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
     const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies);
     if (fenced.kind !== "notice" || fenced.reason !== decision.reason
-      || fenced.upgradeCommentId !== decision.upgradeCommentId) return null;
+      || fenced.upgradeCommentId !== decision.upgradeCommentId
+      || fenced.supersedeCommentId !== decision.supersedeCommentId) return null;
     if (fenced.upgradeCommentId) {
       // The SAME note (same key) becomes the failure text: still one note.
       const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
@@ -376,6 +379,13 @@ export async function settleUnansweredPersonMessage(
       presentation: fenced.notice.presentation,
       metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason },
     }, tx);
+    if (fenced.supersedeCommentId) {
+      await tx.update(issueComments).set({ metadata: sql`jsonb_set(${issueComments.metadata},
+        '{supersededByCommentId}', to_jsonb(${comment.id}::text))` }).where(and(
+        eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+        eq(issueComments.id, fenced.supersedeCommentId), eq(issueComments.authorType, "system"),
+        isNull(issueComments.deletedAt), sql`${issueComments.metadata}->>'supersededByCommentId' is null`));
+    }
     return comment?.id ?? null;
   });
   return commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" };
@@ -388,7 +398,8 @@ type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" 
       recordWait?: { messageId: string; runId: string | null } }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
       /** Set when this replaces the message's standing waiting note. */
-      upgradeCommentId?: string };
+      upgradeCommentId?: string;
+      supersedeCommentId?: string };
 
 /** The run event that records, once and durably, when this step first deferred
  * a person message's notice to the native blocked-request repair (T0). */
@@ -424,15 +435,18 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await q.select({ id: issueComments.id,
+    supersededByCommentId: sql<string | null>`${issueComments.metadata}->>'supersededByCommentId'`,
     waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)`,
     waitingCode: sql<string | null>`(select r->>'value' from jsonb_array_elements(coalesce(${issueComments.metadata}->'sections', '[]'::jsonb)) sec,
       jsonb_array_elements(coalesce(sec->'rows', '[]'::jsonb)) r where r->>'label' = ${WAITING_ROW_LABEL} limit 1)` })
     .from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-    sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+    sql`${reasonOf(issueComments.metadata)} = ${reason}`))
+    .orderBy(desc(sql`${issueComments.metadata}->>'supersededByCommentId' is null`), desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
   // A standing WAITING note is still an open obligation: it must stay true.
-  if (noticed && !noticed.waiting) return { kind: "noticed_before" };
-  const upgrading = noticed?.waiting ? noticed.id : null;
+  if (noticed && !noticed.waiting && !noticed.supersededByCommentId) return { kind: "noticed_before" };
+  const upgrading = noticed?.waiting && !noticed.supersededByCommentId ? noticed.id : null;
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode ?? UNANSWERED_MESSAGE_WAITING_CODE : null;
 
   // The run this message started (the latest run that carries it), if any.
@@ -658,6 +672,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
     sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
+    sql`${issueComments.metadata}->>'supersededByCommentId' is null`,
+    sql`${issueComments.id}::text <> ${noticed?.supersededByCommentId ?? ""}`,
     sql`${issueComments.presentation}->>'tone' in ('danger', 'warning')`,
     sql`coalesce(${issueComments.metadata}->>'recoveryResponsibility', 'user') <> 'system'`,
     sql`not starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), ${UNANSWERED_MESSAGE_REASON_PREFIX})`)).limit(1);
@@ -697,7 +713,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     failureCode: waiting ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
-  return { kind: "notice", reason, code, notice, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
+  return { kind: "notice", reason, code, notice, ...(upgrading ? { upgradeCommentId: upgrading } : {}),
+    ...(noticed?.supersededByCommentId ? { supersedeCommentId: noticed.supersededByCommentId } : {}) };
 }
 
 
