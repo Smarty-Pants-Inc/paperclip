@@ -890,6 +890,31 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect((await current(agent.id)).lifecycleState).toBe("ready");
   });
 
+  it("keeps the original unclassified private detail hidden throughout a continuous transient outage", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const start = new Date("2026-11-17T12:00:00Z").getTime();
+      vi.setSystemTime(start);
+      const work = worker(async agent => { if (agent.lifecycleState === "verifying") throw new Error("private detail"); return "complete"; });
+      const agent = await hire(); await work.process(agent.id);
+      const samples = [...Array.from({ length: 17 }, (_, minute) => minute * 60_000), 599_999, 600_001].sort((a, b) => a - b);
+      const observed: Array<{ elapsed: number; lifecycleError: string | null; transientFailures: number | undefined }> = [];
+      for (const elapsed of samples) {
+        vi.setSystemTime(start + elapsed);
+        await work.sweep();
+        const row = await current(agent.id);
+        const label = `after ${elapsed} ms of unclassified failures`;
+        expect(row.lifecycleState, label).toBe("verifying");
+        expect(row.lifecycleOperation?.transientFailureSince, label).toBe(new Date(start).toISOString());
+        expect(row.lifecycleOperation, label).not.toHaveProperty("retryRequired");
+        expect(row.lifecycleError ?? "", label).not.toContain("private detail");
+        expect(row.lifecycleError, label).toBe(elapsed < 600_000 ? null : "Waiting for its environment; retrying automatically");
+        observed.push({ elapsed, lifecycleError: row.lifecycleError, transientFailures: row.lifecycleOperation?.transientFailures });
+      }
+      console.info("UNCLASSIFIED_PRIVACY_RECEIPT", JSON.stringify(observed));
+    } finally { vi.useRealTimers(); }
+  });
+
   it("fences a late completion when termination replaces preparation", async () => {
     const agent = await hire("paused");
     const store = createLifecycleStore(db);
