@@ -4779,6 +4779,7 @@ export function heartbeatService(
     resumeRemoteStopComments,
     resumeTaskRetry: runControl.resumeTaskRetry,
     resumeQueuedCommentInterrupt,
+    queuedCommentInterruptTargetStopped,
     resumeExecutionWaitComments,
 
     sweepStaleIssueLocks,

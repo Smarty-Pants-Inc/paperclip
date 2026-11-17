@@ -847,6 +847,21 @@ describe("deferred receipt durable dispatch", () => {
     expect(resume).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ companyId: f.companyId, requestId: wake.id }));
     await quiet();
   });
+  // S8q delta: interruptedLegacy's outer columns must bind to the wake, not to
+  // the subquery's run (a bare "id" made the marker match never).
+  it("releases a fresh legacy Interrupt wake at once when its own run's stop is recorded", async () => {
+    const f = await fixture();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agent.id,
+      source: "on_demand", status: "deferred_issue_execution", updatedAt: new Date(),
+      payload: { issueId: f.issue.id, queuedCommentInterrupt: { actorId: f.actorId } } }).returning();
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled", resultJson: { queuedCommentInterruptQueueId: wake.id } })
+      .where(eq(heartbeatRuns.id, f.source.id));
+    const resume = vi.fn(async () => {});
+    await registerDeferredReceiptWork(db, coordinator, { resume, settleTaskChat: vi.fn(), createNativeBatch: () => vi.fn(),
+      schedulingSuppressed: async () => false }, () => !drain).ready;
+    expect(resume).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ companyId: f.companyId, requestId: wake.id }));
+    await quiet();
+  });
   it("keeps a conversation Retry behind agent pause while ignoring retired Chat off values", async () => {
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: false });
     const { f, lifecycle, lifecycleWorker, request, read } = await blockedRetry("paused agent", true);

@@ -803,20 +803,34 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
 
   /** S8q: the native run this Interrupt click stopped has finished teardown.
    * Its end-of-teardown hint may then deliver the saved messages at once
-   * instead of waiting out the 30 s fallback age gate. */
+   * instead of waiting out the 30 s fallback age gate. The proof must be this
+   * press's own: the run it recorded as its target, stopped by its actor for
+   * this queue, no earlier than the press. A later press that stopped nothing
+   * never inherits an earlier press's proof. */
   async function queuedCommentInterruptTargetStopped(companyId: string, queueId: string) {
-    const [wake] = await db.select({ agentId: agentWakeupRequests.agentId }).from(agentWakeupRequests).where(and(
+    const [wake] = await db.select({ agentId: agentWakeupRequests.agentId, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, queueId),
       eq(agentWakeupRequests.status, "deferred_issue_execution"),
       sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
     ));
-    if (!wake) return false;
-    const [target] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    const press = wake?.payload?.queuedCommentInterrupt as
+      { targetRunId?: unknown; actorId?: unknown; requestedAt?: unknown } | undefined;
+    const pressedAt = typeof press?.requestedAt === "string" ? Date.parse(press.requestedAt) : NaN;
+    if (!wake || typeof press?.targetRunId !== "string" || !/^[0-9a-f-]{36}$/i.test(press.targetRunId) ||
+        typeof press.actorId !== "string" ||
+        !Number.isFinite(pressedAt)) return false;
+    const [target] = await db.select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt,
+      resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, wake.agentId),
+      eq(heartbeatRuns.id, press.targetRunId),
       eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "cancelled"),
       sql`${heartbeatRuns.resultJson}->>'queuedCommentInterruptQueueId' = ${queueId}`,
-    )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
-    return Boolean(target) && await nativeStopExecutionProven(companyId, target!.id);
+    )).limit(1);
+    const stoppedByThisPress = Boolean(target?.finishedAt && target.finishedAt.getTime() >= pressedAt) &&
+      target!.resultJson?.interruptionSource === "issue_comment_interrupt" &&
+      target!.resultJson?.interruptedByActorType === "user" && target!.resultJson?.interruptedByActorId === press.actorId;
+    return stoppedByThisPress && await nativeStopExecutionProven(companyId, target!.id);
   }
 
   async function resumeQueuedCommentInterrupt(companyId: string, queueId: string, opts?: { retryCleanup?: boolean }) {
