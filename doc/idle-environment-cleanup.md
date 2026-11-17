@@ -147,44 +147,33 @@ These operations do not copy credentials, resolved configuration, or provider
 payloads into the operation record. A lost provider reply can still leave the
 resource ID unknown.
 
-## Compatible changes on reusable sandboxes
+## Obsolete reusable sandboxes
 
-Reusable sandbox scopes retain the full configuration fingerprint and a separate
-allocation-identity fingerprint. Boot-source keys (`from`, `snapshot`, `image`,
-`rootfs`) are identity fields: a change, including clearing a source, never reuses
-an allocation created from the old source. Obsolete retained/released allocations
-enter the existing durable stop-only cleanup path so their workspace/session
-state stays recoverable while a new allocation uses the current source. This
-also applies to pre-upgrade fingerprints that omitted boot sources from identity.
-Only scalar sizing keys (`cpu`, `memory`, `disk`, `gpu`, `size`, `shape`),
-explicit timing keys (`timeoutMs`, `bridgeRequestTimeoutMs`, `livenessTimeoutMs`,
-`ttlMinutes`, `autoStopInterval`, `autoArchiveInterval`, `autoDeleteInterval`,
-`runnerIdleTimeoutMs`), and scalar `resources.{cpu,memory,disk,gpu}` may drain to
-the next allocation. Objects under these names, unknown fields, provider/plugin
-identity, account, region, endpoints, mounts, environment and credential/secret
-scope changes remain identity changes and keep the existing mismatch behavior.
+Boot-source keys (`from`, `snapshot`, `image`, `rootfs`) are allocation identity:
+a change, including clearing a source, never reuses an allocation created from
+the old source. Any other configuration change is a fingerprint mismatch, as
+upstream. A retained or released reuse candidate that no longer matches is
+obsolete. Acquisition destroys it through upstream's guarded destroy only when
+all of these hold on the re-read row (delete-ours step 6, RFL's custody bar):
 
-A compatible sizing/timing change does not relabel the running allocation.
-Reuse, provider resume, and the stored scope keep its admitted creation settings
-while the owning run is nonterminal or its required checkpoint is unavailable.
-An old valid backup is insufficient when later durable provider events exist.
-Once the owner settles, workspace safety checks pass and native harness backup
-verification covers the latest provider work, acquisition creates and attaches
-the new-config lease with the backup and an explicit
-`compatible_environment_change` replacement receipt **before** retiring the old
-allocation. Failure to create the replacement leaves the source intact.
-Existing cleanup claims/retries own a failed retirement; no new worker or timer
-is introduced. Pre-upgrade full fingerprints are checked against reconstructed
-admitted settings under the current security context, never accepted by a
-compatible-key-only comparison.
+- its agent is not one held out until Paul says (`29b216c4`, `46a1dae4`);
+- no other row of the same provider allocation is `active` or `pending_cleanup`;
+- its run has ended and both the run and the row have been idle for 30 minutes
+  (`PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_IDLE_MS` overrides it for a gate row);
+- no native workspace export is pending for the row or its allocation;
+- unless the row records a known non-native adapter, its native session backup
+  is verified in two copies: the durable object (downloaded and hashed) and the
+  local backup tree (each directory re-hashed against the stamp manifest), and
+  no provider work followed that backup.
 
-The PostgreSQL runtime regression covers retained and released boot-source
-changes, legacy scopes, stale lifecycle support, same-source reuse, and execution
-on the newly acquired source. Compatible sizing coverage includes active and
-released warm leases, old scope migration, absent/stale checkpoints, replacement
-creation failure, eventual sizing adoption with F7 backup propagation, and
-incompatible account/region/mount or object-valued creation-setting changes. This is local lifecycle proof with a controlled provider, not a live
-Boat/Pi conversation acceptance result.
+Anything else is not destroyed, and an activity row
+`environment.lease.obsolete_destroy_refused` names the reason. Destroys run only
+with `PAPERCLIP_OBSOLETE_SANDBOX_DESTROY=destroy`; otherwise each box that would
+be destroyed gets an `environment.lease.obsolete_would_destroy` row (the dry run).
+A destroy writes `environment.lease.obsolete_destroyed` (or `_destroy_pending`
+when the provider did not confirm) with the box, the custody manifest sha, the
+time and the rule. Retained warm boxes are otherwise stopped by upstream's warm
+expiry (`warm-sandbox-expiry.ts`).
 
 ## Legacy deferred orphan buffers
 

@@ -1510,11 +1510,6 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(first.lease.metadata?.reusableSandboxLease).toMatchObject({
       projectlessIssueId: issueId, executionWorkspaceId: null, agentId: seeded.agentId,
     });
-    const receipt = { key: "a".repeat(64), leaseId: first.lease.id, layout: { PATH: "/wrappers" } };
-    const realizationReceipt = { key: "b".repeat(64), leaseId: first.lease.id, cwd: "/workspace",
-      realization: { mode: "copy", authoritativeRoot: "/workspace", leaseId: first.lease.id } };
-    await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata,
-      anonymousGitHubLaunchers: receipt, nativeWorkspaceRealizationPreparation: realizationReceipt });
     await runtimeWithPlugin.releaseRunLeases(seeded.runId, "released", undefined, "stop_and_retain");
     const nextRunId = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -1538,16 +1533,6 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const shouldResume = scenario === "same task";
     expect(next.lease.providerLeaseId).toBe(shouldResume ? "projectless-1" : "projectless-2");
     expect(acquisitions).toBe(shouldResume ? 1 : 2);
-    expect(next.lease.id).not.toBe(first.lease.id);
-    if (shouldResume) {
-      expect(next.lease.metadata?.anonymousGitHubLaunchers).toEqual({ ...receipt, leaseId: next.lease.id });
-      expect(next.lease.metadata?.nativeWorkspaceRealizationPreparation).toEqual({ ...realizationReceipt,
-        leaseId: next.lease.id, realization: { ...realizationReceipt.realization, leaseId: next.lease.id } });
-      expect(next.lease.metadata?.workspaceRealization).toMatchObject({ leaseId: next.lease.id });
-    } else {
-      expect(next.lease.metadata?.anonymousGitHubLaunchers).toBeUndefined();
-      expect(next.lease.metadata?.nativeWorkspaceRealizationPreparation).toBeUndefined();
-    }
     expect(call.mock.calls.filter((entry) => entry[1] === "environmentResumeLease")).toHaveLength(shouldResume ? 1 : 0);
   });
 
@@ -4979,7 +4964,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   // Keep: recorded real catch + provider-state data safety. Exercise the real
   // DB-backed admission path, including pre-upgrade scope fingerprints.
   it.each(["from", "snapshot", "image", "rootfs"].flatMap(key =>
-    ["same", "changed", "legacy changed", "old identity changed", "unset", "released", "stale lifecycle"].map(change => ({ key, change }))))(
+    ["same", "changed", "unset", "released", "stale lifecycle"].map(change => ({ key, change }))))(
     "never reuses a retained allocation across a boot source change: $key / $change", async ({ key, change }) => {
     const pluginId = randomUUID();
     const providerConfig = { provider: "fake-plugin", [key]: "snap-A", reuseLease: true, timeoutMs: 1234 };
@@ -5012,12 +4997,6 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       heartbeatRunId, persistedExecutionWorkspace: null,
     });
     const first = await acquire(environment, runId);
-    if (change.startsWith("legacy") || change.startsWith("old identity")) {
-      const scope = { ...(first.lease.metadata?.reusableSandboxLease as Record<string, unknown>) };
-      if (change.startsWith("legacy")) delete scope.leaseIdentityFingerprint;
-      else scope.leaseIdentityFingerprint = { ...(scope.leaseIdentityFingerprint as object), fingerprint: "0".repeat(64) };
-      await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata, reusableSandboxLease: scope });
-    }
     await db.update(environmentLeases).set({ status: change === "released" ? "released" : "retained" }).where(eq(environmentLeases.id, first.lease.id));
     if (change === "stale lifecycle") vi.spyOn(workerManager, "getWorker").mockReturnValue({ supportedMethods: ["environmentResumeLease", "environmentExecute"] } as never);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
@@ -5035,192 +5014,10 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect(next.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
       expect(acquisitions).toBe(2);
       expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentResumeLease", expect.anything(), expect.anything());
-      await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
-        status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending",
-        metadata: { [key]: "snap-A", sandboxStopAndRetain: {
-          schema: "paperclip.sandbox-stop-and-retain.v1", providerLeaseId: first.lease.providerLeaseId, pluginId,
-        } },
-      });
       expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
     }
     await expect(service.execute({ environment: { ...environment, config }, lease: next.lease, command: "verify source" }))
       .resolves.toMatchObject({ stdout: `served:${config[key]}` });
-  });
-
-  // Compatible sizing changes still preserve a warm conversation until its
-  // checkpoint is verifiable. Keep: provider-state data safety.
-  it.each(["active", "released", "legacy active", "legacy released", "old identity", "stale checkpoint", "source changed during create"])(
-    "drains a compatible sizing change after the owner settles and checkpoints: %s", async state => {
-    const pluginId = randomUUID();
-    const providerConfig = { provider: "fake-plugin", from: "snapshot-a", cpu: 1, region: "eu", reuseLease: true, timeoutMs: 1234 };
-    const { companyId, agentId, environment, runId } = await seedEnvironment({ driver: "sandbox", config: providerConfig });
-    const issueId = randomUUID();
-    await db.insert(issues).values({ id: issueId, companyId, title: "Warm Pi conversation", status: "in_progress", assigneeAgentId: agentId });
-    await insertSandboxProviderPlugin(pluginId, { environmentDrivers: [{
-      driverKey: "fake-plugin", kind: "sandbox_provider", displayName: "Compatible source fixture", supportsReusableLeases: true,
-      configSchema: { type: "object" },
-    }] });
-    let acquisitions = 0;
-    let rejectReplacement = false;
-    let raceSourceLeaseId: string | null = null;
-    const calls: string[] = [];
-    const workerManager = {
-      isRunning: () => true,
-      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
-      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
-        calls.push(method);
-        if (method === "environmentAcquireLease") {
-          if (rejectReplacement) throw new Error("injected create refusal");
-          if (raceSourceLeaseId) {
-            const raced = (await environmentService(db).getLeaseById(raceSourceLeaseId))!;
-            await environmentService(db).updateLeaseMetadata(raced.id, { ...raced.metadata, changedDuringCreate: true });
-            raceSourceLeaseId = null;
-          }
-          return { providerLeaseId: `compatible-${++acquisitions}`, metadata: { ...params.config, remoteCwd: "/workspace" } };
-        }
-        if (method === "environmentResumeLease") return {
-          providerLeaseId: params.providerLeaseId, metadata: { ...params.config, remoteCwd: "/workspace" },
-        };
-        if (method === "environmentReleaseLease" || method === "environmentDestroyLease") return undefined;
-        if (method === "environmentExecute") return { exitCode: 0, stdout: `served:${params.config.cpu}:${params.command}`, stderr: "" };
-        throw new Error(`Unexpected compatible-source method: ${method}`);
-      }),
-    } as unknown as PluginWorkerManager;
-    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
-    const acquire = (selectedEnvironment = environment, selectedRunId = runId) => runtimeWithPlugin.acquireRunLease({
-      companyId, environment: selectedEnvironment, issueId, agentId, adapterType: "paperclip_runner",
-      heartbeatRunId: selectedRunId, persistedExecutionWorkspace: null,
-    });
-    const first = await acquire();
-    // Preparation proofs must follow only the retained physical allocation;
-    // the compatible-config drain must not bless them for its replacement.
-    const launcherPreparation = { key: "a".repeat(64), leaseId: first.lease.id, layout: { PATH: "/wrappers" } };
-    const realizationPreparation = { key: "b".repeat(64), leaseId: first.lease.id, cwd: "/workspace",
-      realization: { mode: "copy", authoritativeRoot: "/workspace", leaseId: first.lease.id } };
-    first.lease = (await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata,
-      anonymousGitHubLaunchers: launcherPreparation, nativeWorkspaceRealizationPreparation: realizationPreparation }))!;
-    const admittedFingerprint = (first.lease.metadata?.reusableSandboxLease as any).leaseFingerprint;
-    if (state.startsWith("legacy") || state === "old identity") {
-      const scope = { ...(first.lease.metadata?.reusableSandboxLease as Record<string, unknown>) };
-      if (state.startsWith("legacy")) delete scope.leaseIdentityFingerprint;
-      else scope.leaseIdentityFingerprint = { ...(scope.leaseIdentityFingerprint as object), fingerprint: "0".repeat(64) };
-      await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata, reusableSandboxLease: scope });
-    }
-    if (state.endsWith("released")) await runtimeWithPlugin.releaseRunLeases(runId);
-    const changed = { ...environment, config: { ...providerConfig, cpu: 2 } };
-    await environmentService(db).update(environment.id, { config: changed.config });
-
-    const duringRun = await acquire(changed);
-    expect(duringRun.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
-    expect(duringRun.lease.metadata?.from).toBe("snapshot-a");
-    expect(duringRun.lease.metadata?.cpu).toBe(1);
-    expect((duringRun.lease.metadata?.reusableSandboxLease as any).leaseFingerprint).toEqual(admittedFingerprint);
-    expect(calls).not.toContain("environmentDestroyLease");
-    await expect(runtimeWithPlugin.execute({ environment: changed, lease: duringRun.lease, command: "next message" }))
-      .resolves.toMatchObject({ exitCode: 0, stdout: "served:1:next message" });
-
-    await runtimeWithPlugin.releaseRunLeases(runId);
-    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
-    const nextRunId = randomUUID();
-    await insertRunningManualRun(nextRunId, companyId, agentId);
-    // Settling alone is insufficient: until F7 is verifiable, keep serving the
-    // admitted allocation rather than losing the next message or its history.
-    const noCheckpoint = await acquire(changed, nextRunId);
-    expect(noCheckpoint.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
-    expect(noCheckpoint.lease.metadata?.anonymousGitHubLaunchers).toEqual({ ...launcherPreparation, leaseId: noCheckpoint.lease.id });
-    expect(noCheckpoint.lease.metadata?.nativeWorkspaceRealizationPreparation).toEqual({ ...realizationPreparation,
-      leaseId: noCheckpoint.lease.id, realization: { ...realizationPreparation.realization, leaseId: noCheckpoint.lease.id } });
-    expect(calls).not.toContain("environmentDestroyLease");
-
-    const backupBase = await mkdtemp(path.join(os.tmpdir(), "compatible-source-backup-"));
-    const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
-    process.env.PAPERCLIP_RUNNER_STATE_DIR = backupBase;
-    try {
-      const normalizedSessionId = randomUUID(), runnerInstanceId = "compatible-pi-runner", sessionScopeId = "compatible-pi-scope";
-      const current = path.join(backupBase, createHash("sha256").update(sessionScopeId).digest("hex"), "failover-backups", "current");
-      await mkdir(path.join(current, "runner"), { recursive: true });
-      await mkdir(path.join(current, "pi-agent"), { recursive: true });
-      // Image B persists Pi's cold-open transcript separately from its agent home.
-      await mkdir(path.join(current, "pi"), { recursive: true });
-      await writeFile(path.join(current, "runner", "runner-state.json"), "settled runner checkpoint");
-      await writeFile(path.join(current, "pi", `${normalizedSessionId}.jsonl`), '{"role":"user","content":"next message"}\n');
-      const manifest = buildNativeHarnessBackupManifest({ backupRoot: current, runnerInstanceId,
-        sourceProviderLeaseId: first.lease.providerLeaseId!, providerSessionIdentity: { providerSessionId: "pi-thread" },
-        execution: { provider: { kind: "pi_rpc" }, binding: { companyId, runId: nextRunId, issueId, agentId, executionWorkspaceId: null },
-          workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
-          session: { normalizedSessionId, driverKind: "pi_rpc", protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300000 } },
-        } as never });
-      const manifestPath = path.join(current, "manifest.json");
-      await writeFile(manifestPath, JSON.stringify(manifest));
-      let stamp = createNativeHarnessBackupStamp({ manifestPath, sessionScopeId, normalizedSessionId, runnerInstanceId,
-        authorizedProviderLeaseId: first.lease.providerLeaseId!, completedAt: manifest.completedAt });
-      let sourceLease = noCheckpoint.lease;
-      await environmentService(db).updateLeaseMetadata(sourceLease.id, { ...sourceLease.metadata, nativeHarnessBackup: stamp });
-      await runtimeWithPlugin.releaseRunLeases(nextRunId);
-      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), nativeSessionId: normalizedSessionId }).where(eq(heartbeatRuns.id, nextRunId));
-      let finalRunId = randomUUID();
-      await insertRunningManualRun(finalRunId, companyId, agentId);
-      if (state === "stale checkpoint") {
-        const laterAt = new Date(Date.parse(stamp.completedAt) + 1000);
-        await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: nextRunId, seq: 1, eventType: "provider.event", createdAt: laterAt });
-        const stale = await acquire(changed, finalRunId);
-        expect(stale.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
-        expect(calls).not.toContain("environmentDestroyLease");
-        await expect(runtimeWithPlugin.execute({ environment: changed, lease: stale.lease, command: "after stale checkpoint" }))
-          .resolves.toMatchObject({ stdout: "served:1:after stale checkpoint" });
-        sourceLease = stale.lease;
-        // F7 finally covers the later provider event before the drain proceeds.
-        await writeFile(path.join(current, "pi", `${normalizedSessionId}.jsonl`), '{"content":"next message"}\n{"content":"after stale checkpoint"}\n');
-        const refreshed = buildNativeHarnessBackupManifest({ backupRoot: current, runnerInstanceId,
-          sourceProviderLeaseId: first.lease.providerLeaseId!, providerSessionIdentity: manifest.providerSessionIdentity,
-          completedAt: new Date(laterAt.getTime() + 1000).toISOString(), execution: { provider: { kind: "pi_rpc" },
-            binding: { companyId, agentId, issueId, executionWorkspaceId: null }, workspace: { cwd: "/workspace" },
-            session: { normalizedSessionId, driverKind: "pi_rpc" } } as never });
-        await writeFile(manifestPath, JSON.stringify(refreshed));
-        stamp = createNativeHarnessBackupStamp({ manifestPath, sessionScopeId, normalizedSessionId, runnerInstanceId,
-          authorizedProviderLeaseId: first.lease.providerLeaseId!, completedAt: refreshed.completedAt });
-        await environmentService(db).updateLeaseMetadata(sourceLease.id, { ...sourceLease.metadata, nativeHarnessBackup: stamp });
-        await runtimeWithPlugin.releaseRunLeases(finalRunId);
-        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), nativeSessionId: normalizedSessionId }).where(eq(heartbeatRuns.id, finalRunId));
-        finalRunId = randomUUID();
-        await insertRunningManualRun(finalRunId, companyId, agentId);
-      }
-      rejectReplacement = true;
-      await expect(acquire(changed, finalRunId)).rejects.toThrow("injected create refusal");
-      expect(calls).not.toContain("environmentDestroyLease");
-      await expect(environmentService(db).getLeaseById(sourceLease.id)).resolves.toMatchObject({ status: "released" });
-      rejectReplacement = false;
-      await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, finalRunId));
-      let retryRunId = randomUUID();
-      await insertRunningManualRun(retryRunId, companyId, agentId);
-      if (state === "source changed during create") {
-        raceSourceLeaseId = sourceLease.id;
-        await expect(acquire(changed, retryRunId)).rejects.toThrow("Reusable sandbox changed during compatible configuration drain");
-        await expect(environmentService(db).getLeaseById(sourceLease.id)).resolves.toMatchObject({ status: "released" });
-        const unused = (await environmentService(db).listLeases(environment.id)).find(lease => lease.heartbeatRunId === retryRunId);
-        expect(unused).toMatchObject({ status: "pending_cleanup", failureReason: "compatible_environment_change_source_changed" });
-        expect(calls).not.toContain("environmentDestroyLease");
-        await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, retryRunId));
-        retryRunId = randomUUID();
-        await insertRunningManualRun(retryRunId, companyId, agentId);
-      }
-      const replacement = await acquire(changed, retryRunId);
-      expect(replacement.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
-      expect(replacement.lease.metadata?.anonymousGitHubLaunchers).toBeUndefined();
-      expect(replacement.lease.metadata?.nativeWorkspaceRealizationPreparation).toBeUndefined();
-      expect(replacement.lease.metadata).toMatchObject({ from: "snapshot-a", cpu: 2, nativeHarnessBackup: stamp,
-        sandboxLeaseAcquisition: { outcome: "replacement", reason: "compatible_environment_change", previousProviderLeaseId: first.lease.providerLeaseId } });
-      // Recording the replacement (with the backup) precedes retirement.
-      const old = await environmentService(db).getLeaseById(sourceLease.id);
-      expect(old).toMatchObject({ status: "pending_cleanup", failureReason: "compatible_environment_change" });
-      expect(calls).not.toContain("environmentDestroyLease");
-      await expect(runtimeWithPlugin.execute({ environment: changed, lease: replacement.lease, command: "after settle" }))
-        .resolves.toMatchObject({ exitCode: 0, stdout: "served:2:after settle" });
-    } finally {
-      if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
-      else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
-      await rm(backupBase, { recursive: true, force: true });
-    }
   });
 
   it.each(["provider config", "workspace migration"])("does not resume released reusable plugin sandbox leases after %s drift", async drift => {
@@ -5365,14 +5162,6 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect.anything(),
       expect.anything(),
     );
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.objectContaining({
-      providerLeaseId: "lease-template-a",
-    }), 31234);
-    await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
-      status: "expired",
-      cleanupStatus: "success",
-      failureReason: "lease_fingerprint_mismatch",
-    });
   });
 
   it("does not resume released reusable plugin sandbox leases after secret version drift", async () => {
@@ -5498,14 +5287,6 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect.anything(),
       expect.anything(),
     );
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.objectContaining({
-      providerLeaseId: "lease-resolved-provider-key",
-    }), 31234);
-    await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
-      status: "expired",
-      cleanupStatus: "success",
-      failureReason: "lease_fingerprint_mismatch",
-    });
     const firstMetadata = JSON.stringify(first.lease.metadata);
     expect(firstMetadata).not.toContain("resolved-provider-key");
     expect(firstMetadata).not.toContain("rotated-provider-key");
