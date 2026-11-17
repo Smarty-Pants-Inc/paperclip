@@ -636,6 +636,20 @@ fn final_agent_message_text(value: &str) -> String {
     bounded
 }
 
+/// The agent-facing reference to the whole text of an answer longer than one
+/// record: only a well-formed {path, sha256, bytes} is carried.
+pub(crate) fn full_text_reference(value: Option<&Value>) -> Option<Value> {
+    let value = value?;
+    let path = value.get("path").and_then(Value::as_str)?;
+    let sha256 = value.get("sha256").and_then(Value::as_str)?;
+    let bytes = value.get("bytes").and_then(Value::as_u64)?;
+    (!path.is_empty()
+        && path.len() <= 4_096
+        && sha256.len() == 64
+        && sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| json!({"path": path, "sha256": sha256, "bytes": bytes}))
+}
+
 fn bounded_text(value: &str, max_chars: usize) -> String {
     let redacted = redact_text(value);
     if redacted.chars().count() <= max_chars {
@@ -1716,6 +1730,12 @@ pub(crate) fn normalize_pi_notification_in(
                         // The durable outbox keeps it whole when it fits a frame.
                         .map(|text| json!(redact_sensitive_text_values(text)))
                         .unwrap_or(Value::Null);
+                    // An answer longer than one record: the person's text is a
+                    // plain line and a labelled excerpt; the path and sha256 of
+                    // the whole text are for the agent, never shown.
+                    if let Some(full) = full_text_reference(params.get("fullText")) {
+                        event.payload["fullText"] = full;
+                    }
                 }
             }
         }
