@@ -9,6 +9,26 @@ export const COMPANY_IMPORTED_ACTION = "company.imported";
 
 type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
 
+/** A live run already owns this pending input. This blocks another promotion
+ * or carry; it is NOT an answer. The caller excludes the run being seeded (or
+ * restored from), whose own input must survive first-turn revalidation. Only
+ * direct input ids count here, never reply boundaries or continuation ancestry. */
+export function carriedInLiveRunSql(m: Pick<PersonMessageSql, "id" | "companyId" | "issueId"> & {
+  agentId: SQL; excludeRunId?: SQL;
+}): SQL {
+  return sql`exists (select 1 from ${heartbeatRuns} pending_run
+    where pending_run.company_id = ${m.companyId} and pending_run.agent_id = ${m.agentId}
+      and (pending_run.issue_id = ${m.issueId} or pending_run.native_issue_id = ${m.issueId}
+        or pending_run.context_snapshot->>'issueId' = ${m.issueId}::text)
+      and pending_run.status in ('queued', 'running', 'scheduled_retry')
+      ${m.excludeRunId ? sql`and pending_run.id <> ${m.excludeRunId}` : sql``}
+      and (pending_run.context_snapshot->>'wakeCommentId' = ${m.id}::text
+        or pending_run.context_snapshot->>'commentId' = ${m.id}::text
+        or coalesce(pending_run.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(pending_run.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(pending_run.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${m.id}::text))`;
+}
+
 // A person input is a typed message (a comment id) or a person's answer to an
 // agent's card (the interaction id): its answer-resume run carries it as
 // context.interactionId (routes/issues.ts wake contexts). Ids never collide.

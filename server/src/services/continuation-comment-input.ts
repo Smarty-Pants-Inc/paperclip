@@ -1,7 +1,8 @@
 import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issueComments, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
-import { answeredPersonMessageSql } from "./person-message-answer.js";
+import { answeredPersonMessageSql, carriedInLiveRunSql } from "./person-message-answer.js";
+import { personStoppedCarrierSql } from "./recovery/person-stopped-message.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -80,10 +81,16 @@ async function pendingPersonCommentInput(db: Pick<Db, "select">, input: {
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     inArray(issueComments.id, candidates), isNull(issueComments.deletedAt),
     or(inArray(issueComments.id, directIds), eq(issueComments.authorType, "user")),
-    // Only still-pending input: a comment with a PUBLISHED agent answer attributed to it (or to a later person
-    // input) is never re-presented, or every continuation re-answers it (the re-wake loop, org 19:48Z).
+    // Keep answer attribution in the shared predicate. A live pending owner is
+    // a separate duplicate-carry fence, not proof the person was answered.
     sql`not ${answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`,
+    sql`not ${carriedInLiveRunSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, agentId: sql`${input.agentId}`,
+      excludeRunId: input.runId && UUID.test(input.runId) ? sql`${input.runId}` : undefined })}`,
+    // Stop means stop: reuse recovery's sender-stop exclusion, never rebuild it.
+    sql`not ${personStoppedCarrierSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, authorUserId: sql`${issueComments.authorUserId}` })}`,
   )).orderBy(asc(issueComments.createdAt), asc(issueComments.id));
   const commentIds = rows.map(row => row.id);
   if (commentIds.length === 0) return {};

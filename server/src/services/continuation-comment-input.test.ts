@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "./continuation-comment-input.js";
 import { claimFirstTurnQueuedInput } from "./native-runtime/first-turn-queued-input.js";
@@ -55,6 +55,92 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
       createdByRunId: f.run.id, body: "COBALT" });
     // RFL ruling (1), 20:06Z: the parent's OWN published reply answers the comment (carrying it would answer it twice).
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
+  });
+
+  // R-ONCE: a live pending owner blocks another carry, but is not an answer.
+  it.each(["queued", "running", "scheduled_retry"].flatMap(status =>
+    ["wakeCommentIds", "wakeCommentId", "commentId", "firstTurnQueuedInput", "steeredCommentIds"].map(field => ({ status, field }))))
+  ("a $status carrier blocks a second wake ($field)", async ({ status, field }) => {
+    const f = await fixture();
+    const pending = field === "firstTurnQueuedInput" ? { commentIds: [f.message.id] }
+      : field.endsWith("Ids") ? [f.message.id] : f.message.id;
+    const [live] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status, contextSnapshot: { [field]: pending } }).returning();
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id }), `${status}/${field}: no duplicate`).toEqual({});
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, live.id));
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id }), `${status}/${field}: pending is not answered`)
+      .toMatchObject({ wakeCommentIds: [f.message.id] });
+  });
+
+  it("only a live carrier on the same company, issue and agent blocks; the restored source itself never blocks", async () => {
+    const f = await fixture(), foreign = await fixture();
+    const [otherAgent] = await db.insert(agents).values({ companyId: f.companyId, name: "Other", adapterType: "process" }).returning();
+    const [otherIssue] = await db.insert(issues).values({ companyId: f.companyId, title: "Other" }).returning();
+    await db.insert(heartbeatRuns).values([
+      { companyId: foreign.companyId, agentId: foreign.agentId, nativeIssueId: f.issueId, status: "running" },
+      { companyId: f.companyId, agentId: otherAgent.id, nativeIssueId: f.issueId, status: "running" },
+      { companyId: f.companyId, agentId: f.agentId, nativeIssueId: otherIssue.id, status: "running" },
+      ...["succeeded", "failed", "cancelled", "timed_out"].map(status => ({ companyId: f.companyId, agentId: f.agentId,
+        nativeIssueId: f.issueId, status })),
+    ].map(run => ({ ...run, contextSnapshot: { wakeCommentIds: [f.message.id] } })));
+    for (const status of ["queued", "running", "scheduled_retry"]) {
+      await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, f.run.id));
+      expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
+    }
+    for (const issueBinding of [{ issueId: f.issueId }, { contextSnapshot: { issueId: f.issueId, wakeCommentIds: [f.message.id] } }]) {
+      const [live] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        status: "running", contextSnapshot: { wakeCommentIds: [f.message.id] }, ...issueBinding }).returning();
+      expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
+      await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, live.id));
+    }
+  });
+
+  it("never re-carries the sender-stopped input while the next message is carried and answered", async () => {
+    const f = await fixture();
+    const [next] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "board", body: "Next message", createdAt: new Date(f.message.createdAt.getTime() + 100) }).returning();
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled",
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } }).where(eq(heartbeatRuns.id, f.run.id));
+    await db.insert(heartbeatRunEvents).values(["userMessage", "agentMessage"].map((kind, i) => ({
+      companyId: f.companyId, agentId: f.agentId, runId: f.run.id, seq: i + 1, eventType: "item.started",
+      sourceEventId: randomUUID(), payload: { prpEvent: { turnId: "first", itemId: `item-${i}`, payload: { kind } } },
+    })));
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "failed", retryOfRunId: f.run.id,
+      contextSnapshot: { issueId: f.issueId, wakeCommentIds: [next.id] } }).returning();
+    const seed = await readContinuationCommentInput(db, { ...f, runId: source.id });
+    expect(seed).toMatchObject({ wakeCommentIds: [next.id] });
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "succeeded", contextSnapshot: { issueId: f.issueId, ...seed } }).returning();
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: successor.id, body: "Answer to the next message",
+      createdAt: new Date(next.createdAt.getTime() + 100) });
+    expect(await readContinuationCommentInput(db, { ...f, runId: source.id })).toEqual({});
+  });
+
+  it("a held list plus Send carries once into its own live first turn, then blocks a second wake", async () => {
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled",
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } }).where(eq(heartbeatRuns.id, f.run.id));
+    const held = await db.insert(issueComments).values(["A", "B", "C"].map((body, i) => ({ companyId: f.companyId,
+      issueId: f.issueId, authorType: "user" as const, authorUserId: "board", body,
+      createdAt: new Date(f.message.createdAt.getTime() + 100 + i * 100),
+    }))).returning();
+    const expected = held.map(message => message.id);
+    const sendContext = { issueId: f.issueId, wakeReason: "queued_comment_interrupt", wakeCommentIds: expected };
+    const seed = await pendingContinuationCommentInput(db, { ...f, runId: f.run.id, contextSnapshot: sendContext });
+    expect(seed).toMatchObject({ wakeCommentIds: expected });
+    const [sent] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, runtimeMode: "native", status: "running", responsibleUserId: "board",
+      contextSnapshot: { ...sendContext, ...seed } }).returning();
+    await db.update(issues).set({ executionRunId: sent.id }).where(eq(issues.id, f.issueId));
+    const binding = { ...f, runId: sent.id };
+    const first = await claimFirstTurnQueuedInput(db, binding);
+    expect(first).toContain("A"); expect(first).toContain("B"); expect(first).toContain("C");
+    const [sealed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, sent.id));
+    expect(sealed.contextSnapshot?.firstTurnQueuedInput).toMatchObject({ commentIds: expected });
+    expect(await claimFirstTurnQueuedInput(db, binding)).toBe(first);
+    expect(await pendingContinuationCommentInput(db, { ...f, runId: f.run.id, contextSnapshot: sendContext })).toEqual({});
   });
 
   it("keeps all live comment authors within the source company and task", async () => {
@@ -168,7 +254,7 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
         contextSnapshot: { wakeCommentId: reset.id, conversationSessionGeneration: 2 } },
     ]).returning();
     const [ancestor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
-      issueId: f.issueId, retryOfRunId: otherAgentRun.id, contextSnapshot: { wakeCommentId: pending.id,
+      issueId: f.issueId, status: "failed", retryOfRunId: otherAgentRun.id, contextSnapshot: { wakeCommentId: pending.id,
         previousRunId: foreign.run.id, retryOfRunId: otherTaskRun.id } }).returning();
     const [source] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
       nativeSessionId: randomUUID(), retryOfRunId: resetRun.id, contextSnapshot: { issueId: f.issueId, wakeCommentId: f.message.id,
