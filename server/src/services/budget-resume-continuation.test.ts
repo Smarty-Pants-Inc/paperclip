@@ -114,6 +114,20 @@ describe.skipIf(!support.supported)("resuming after a budget hard stop", () => {
     expect(await continuations(scope.company.id)).toHaveLength(2);
   });
 
+  it("labels the Retry it files as the budget resume, an automatic attempt, not a person's click", async () => {
+    // The Retry is filed for the board member (requestedByActorType "user"),
+    // but nobody pressed it now: its fresh-thread record must count against the
+    // automatic continuation cap, never as a person's Retry.
+    const scope = await seedScope("automatic-label");
+    const task = await seedTask(scope);
+    await resume(scope);
+    await deliverBudgetResumeContinuations(db);
+    const [wake] = await continuations(scope.company.id);
+    expect(wake?.payload?.issueId).toBe(task.issue.id);
+    expect(wake?.payload?.taskRetry).toMatchObject({ resumedBy: "budget_resume" });
+    expect(wake?.payload?.taskRetry).not.toHaveProperty("initiatedBy");
+  });
+
   it("continues a run whose stop was still being delivered when the board resumed", async () => {
     const scope = await seedScope("in-flight");
     const task = await seedTask(scope, { runStatus: "running" });
