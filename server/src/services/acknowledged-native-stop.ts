@@ -120,18 +120,8 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pic
   ));
   // Provider PIDs are meaningful only on their own host. A recovered sandbox
   // queued for destroy keeps its verified stop; the destroy is only cleanup.
-  if (leases.some(lease => lease.provider !== "local")) {
-    const unreceipted = leases.filter(lease => !hasRemoteTerminationReceipt(lease) && !hasRecoveredCleanupStopReceipt(lease));
-    if (!unreceipted.length) return true;
-    // pl/send-after-stop2: a warm box the Stop handed off never gets a receipt;
-    // it is settled through the SAME predicate as the explicit Send's gate.
-    const [owner] = await db.select().from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).limit(1);
-    if (!owner) return false;
-    const { handedOffWarmLeaseSettled } = await import("./native-runtime/handed-off-warm-lease.js");
-    for (const lease of unreceipted) if (!await handedOffWarmLeaseSettled(owner, lease)) return false;
-    return true;
-  }
+  if (leases.some(lease => lease.provider !== "local"))
+    return leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease));
   if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return false;
   if (!run.processPid && !run.processGroupId) return hasNativeLocalProcessStop(db, run.companyId, run.id);
   const absent = (pid: number) => {
