@@ -410,7 +410,7 @@ describe("TaskChatProtocolCard", () => {
       runLogHref: "/agents/a/runs/r",
     });
     expect(container.querySelector("pre")?.textContent ?? "").toBe(displayed);
-    expect([...container.querySelectorAll("p")].filter(node => node.textContent?.includes("The full text is kept; ask me to show any part."))).toHaveLength(1);
+    expect([...container.querySelectorAll("p")].filter(node => node.textContent?.includes("The full output is kept on the agent's machine while it runs."))).toHaveLength(1);
     expect(container.textContent).not.toMatch(/\[Full output:|\/tmp\/pi-output-42|saved only part|truncated|\bcut\b/i);
     expect(container.querySelector('a[href*="/agents/a/runs/r"]')).not.toBeNull();
   });
@@ -422,7 +422,7 @@ describe("TaskChatProtocolCard", () => {
       details: [], steps: [], links: [], children: [], output: "All the output", outputTruncated: false,
     });
     expect(container.querySelector("pre")?.textContent).toBe("All the output");
-    expect(container.textContent).not.toMatch(/full text is kept|saved only part/);
+    expect(container.textContent).not.toMatch(/full output is kept|saved only part/);
   });
 
   it("renders provider plan steps and status", () => {
