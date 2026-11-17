@@ -177,7 +177,26 @@ type QueuedCommentQueueEntryFacts = {
   updatedAt: Date;
   authorUserId: string | null;
   authorAgentId: string | null;
+  body?: string;
+  metadata?: unknown;
 };
+
+/**
+ * A waiting message's stored mode (`metadata.deliveryIntent`); Steer when none
+ * was chosen, and always Queue for a `/new` reset (it waits for the turn).
+ */
+function queueEntryDeliveryIntent(comment: { body?: string; metadata?: unknown }): "steer" | "queue" {
+  if (comment.body?.trim() === "/new") return "queue";
+  const intent = record(comment.metadata).deliveryIntent;
+  return intent === "queue" ? "queue" : "steer";
+}
+
+/** A metadata object that only carries the mode is not presentation metadata. */
+function queueEntryComment<T extends { metadata?: unknown }>(comment: T): T {
+  const metadata = comment.metadata;
+  if (typeof metadata !== "object" || metadata === null || Array.isArray(record(metadata).sections)) return comment;
+  return { ...comment, metadata: null };
+}
 
 /**
  * Assembles the shared `IssueQueuedCommentQueue` response from the already
@@ -210,11 +229,12 @@ export function buildQueuedCommentQueueSnapshot<TComment extends QueuedCommentQu
     steeringDisposition: facts.steeringDisposition,
     ...(facts.executionWait ? { executionWait: facts.executionWait } : {}),
     entries: facts.comments.map((comment, position) => ({
-      comment: comment as unknown as IssueComment,
+      comment: queueEntryComment(comment) as unknown as IssueComment,
       position,
       canEdit: facts.actorType === "user" && comment.authorUserId === facts.actorId,
       canDiscard: facts.actorType === "user" &&
         (comment.authorUserId === facts.actorId || Boolean(comment.authorAgentId)),
+      deliveryIntent: queueEntryDeliveryIntent(comment),
     })),
   };
 }

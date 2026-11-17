@@ -2550,7 +2550,8 @@ describe("TaskChatComposer", () => {
       });
       typeText("Please outline the launch.");
       await act(async () => sendButton().click());
-      expect(onAdd).toHaveBeenCalledWith("Please outline the launch.", undefined, undefined, undefined, expect.any(String), { model: "gpt-6-astra", effort: "high", fast: false });
+      // While the agent works the message also carries its mode (Paul NOTE 6: Steer by default).
+      expect(onAdd.mock.calls.at(-1)!.slice(0, 6)).toEqual(["Please outline the launch.", undefined, undefined, undefined, expect.any(String), { model: "gpt-6-astra", effort: "high", fast: false }]);
     } finally {
       render(<></>); client.clear(); catalog.mockRestore(); vi.unstubAllGlobals();
     }
@@ -3684,6 +3685,9 @@ describe("composer Stop", () => {
     const onAdd = vi.fn(async () => {});
     render(<TaskChatComposer workMode="standard" onAdd={onAdd} onStop={onStop} stopScope="subtree" />);
     expect(stopButton()?.title).toBe("Stop response");
+    expect(stopButton()?.classList).toContain("max-sm:size-11");
+    expect(stopButton()?.classList).toContain("max-sm:min-h-11");
+    expect(stopButton()?.classList).toContain("max-sm:min-w-11");
     pressKey("Enter", { metaKey: true });
     expect(onStop).not.toHaveBeenCalled();
     expect(onAdd).not.toHaveBeenCalled();
@@ -3692,7 +3696,8 @@ describe("composer Stop", () => {
     expect(sendButton().disabled).toBe(false);
     flushSync(() => sendButton().click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith("Check mobile too.", undefined, undefined, undefined, expect.any(String));
+    // Sent while the agent works: Steer by default (Paul NOTE 6), never an interrupt.
+    expect(onAdd).toHaveBeenCalledWith("Check mobile too.", undefined, undefined, undefined, expect.any(String), undefined, "steer");
     expect(onStop).not.toHaveBeenCalled();
     typeText(" \n ");
     expect(stopButton()?.disabled).toBe(false);

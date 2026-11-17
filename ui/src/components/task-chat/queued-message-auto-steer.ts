@@ -53,5 +53,8 @@ export function queuedMessageAutoSteerEligible(input: {
     && !input.attemptedKeys.has(queuedMessageAutoSteerKey(entry))
     && input.editingCommentId !== entry.comment.id
     && entry.comment.body.trim() !== "/new"
+    // Paul NOTE 6: only a message whose stored mode is Steer; never at or behind a /new.
+    && entry.deliveryIntent !== "queue"
+    && entry.behindReset !== true
     && (!input.headOnly || queue.entries[0]?.comment.id === entry.comment.id);
 }

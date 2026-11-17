@@ -39,7 +39,7 @@ describe("issuesApi.list", () => {
   });
 
   it.each([null, "stopped-run"])("dispatches a stopped queue using its current revision (%s)", async (target) => {
-    mockApi.get.mockResolvedValueOnce({ queueId: "queue-1", targetRunId: null, revision: "revision-2" });
+    mockApi.get.mockResolvedValueOnce({ queueId: "queue-1", targetRunId: null, revision: "revision-2", entries: [{ comment: { id: "waiting" } }] });
     await issuesApi.interruptLatestQueuedComments("issue-1", target);
     expect(mockApi.post).toHaveBeenCalledWith("/issues/issue-1/queued-comments/interrupt", {
       queueId: "queue-1", targetRunId: null, revision: "revision-2",
@@ -47,11 +47,23 @@ describe("issuesApi.list", () => {
   });
 
   it.each([
-    { queueId: null, targetRunId: null, revision: "empty" },
-    { queueId: "queue-1", targetRunId: "new-run", revision: "changed" },
+    { queueId: null, targetRunId: null, revision: "empty", entries: [] },
+    { queueId: "queue-1", targetRunId: "new-run", revision: "changed", entries: [{ comment: { id: "waiting" } }] },
   ])("rejects a changed or empty queue before interruption", async queue => {
     mockApi.get.mockResolvedValueOnce(queue);
-    await expect(issuesApi.interruptLatestQueuedComments("issue-1", "old-run")).rejects.toThrow("queued messages changed");
+    await expect(issuesApi.interruptLatestQueuedComments("issue-1", "old-run")).rejects.toThrow(queue.entries.length ? "The queue changed" : "Nothing is waiting.");
+    expect(mockApi.post).not.toHaveBeenCalled();
+  });
+
+  it("does not POST a second Send when the wake still exists but nothing is waiting (S8q 5)", async () => {
+    mockApi.get.mockResolvedValueOnce({ queueId: "queue-1", targetRunId: null, revision: "empty-wake", entries: [] });
+    await expect(issuesApi.interruptLatestQueuedComments("issue-1", null)).rejects.toThrow("Nothing is waiting.");
+    expect(mockApi.post).not.toHaveBeenCalled();
+  });
+
+  it("does not interrupt a different run when a selected row survives a queue change", async () => {
+    mockApi.get.mockResolvedValueOnce({ queueId: "queue-1", targetRunId: "new-run", revision: "changed", entries: [{ comment: { id: "waiting" } }] });
+    await expect(issuesApi.interruptLatestQueuedComments("issue-1", "old-run", "waiting")).rejects.toThrow("The queue changed");
     expect(mockApi.post).not.toHaveBeenCalled();
   });
 
