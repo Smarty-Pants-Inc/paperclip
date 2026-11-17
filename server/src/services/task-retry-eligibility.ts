@@ -4,7 +4,7 @@ import { executionBlockerPredicate, NEW_TASK_CONTINUE_ACTION, restoreHoldPredica
   withoutUnavailableRetry } from "./execution-blocker.js";
 import { WORKSPACE_RESTORE_PENDING_KEY, workspaceRestoreHoldNextAction } from "./legacy-execution-recovery.js";
 import {
-  AGENT_PAUSED_ACTION, AGENT_PAUSED_RETRY_MESSAGE, AUTOMATIC_RECOVERY_MESSAGE, HELD_PREDECESSOR_NOTICE,
+  AGENT_PAUSED_ACTION, AGENT_PAUSED_RETRY_MESSAGE, AUTOMATIC_RECOVERY_MESSAGE, HELD_CONDITION, HELD_PREDECESSOR_NOTICE,
   HELD_NEW_TASK_MESSAGE, HELD_RECOVERED_NEW_TASK_MESSAGE, HELD_RECOVERED_WORK_MESSAGE, HELD_RETRY_ACTION, NEW_TASK_ACTION, NO_SAVED_WORK_NEW_TASK_MESSAGE, NO_SAVED_WORK_RETRY_ACTION, NO_SAVED_WORK_RETRY_MESSAGE,
   RECOVERED_WORK_CONTINUE_MESSAGE, RECOVERED_WORK_MESSAGE, RECOVERED_WORK_RETRY_ACTION, RECOVERED_WORK_RETRY_MESSAGE,
   RETRY_STOP_UNPROVEN_ACTION, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_WAIT_ACTION, RETRY_STOP_WAIT_MESSAGE, SEND_MESSAGE_ACTION,
@@ -178,8 +178,37 @@ export async function readRestoreHoldEvidence(db: Db, input: { companyId: string
  * cleanup_quarantined, the fence reasons, ...) is answered by upstream #21497's
  * taskRetryRefusal on the Retry route after admission, not here.
  */
-const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["agent_paused"]);
-export async function retryRefusedBeforeAdmission(db: Db, input: { companyId: string; issueId: string }): Promise<RetryAuthority | null> {
-  const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, input), retrySource: true });
+// retry-fold6 (rf-3 FAIL 1/2): the card's other two refusals are refused here too,
+// with the same facts the card reads:
+// - workspace_repair_required: a restore hold the execution blocker withholds
+//   Retry for (the card's own check); its words are restore-card's.
+// - execution_stop_unproven: the Retry's source Stop expired unproven (the
+//   Stop gate); a waiting Stop is not refused (admission defers it visibly).
+const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["agent_paused", "workspace_repair_required", "execution_stop_unproven"]);
+// A repeat of an already accepted Retry (`repeat`) is refused only where the card
+// now refuses for good (an expired Stop, a pause, a restore that failed): a
+// restore still pending is a wait whose own words keep the message and run it
+// when the files are back, and it is often the accepted Retry's own recovery.
+export async function retryRefusedBeforeAdmission(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null;
+  repeat?: boolean }): Promise<RetryAuthority | null> {
+  const [{ getExecutionBlocker }, { readRetryStopGate }] = await Promise.all([import("./execution-blocker.js"), import("./task-retry-stop-gate.js")]);
+  const hold = await readRestoreHoldEvidence(db, input);
+  const restoreHold = hold && !(input.repeat && hold[WORKSPACE_RESTORE_PENDING_KEY] === true)
+    && (await getExecutionBlocker(db, input.companyId, input.issueId))?.canRetry === false ? hold : null;
+  const gate = input.sourceRunId
+    ? (await readRetryStopGate(db, { companyId: input.companyId, issueId: input.issueId, sourceRunId: input.sourceRunId }))?.state : null;
+  const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, input), restoreHold,
+    stopGate: gate === "expired" ? "expired" : null, retrySource: true });
   return !authority.canRetry && REFUSED_BEFORE_ADMISSION.has(authority.reason) ? authority : null;
+}
+
+/** retry-fold6 (rf-3 FAIL 3): a held conversation's note states the held
+ * condition and then the one authority's instruction at post time (Retry's
+ * words, or Resume for a paused agent), never a fixed "Press Retry". */
+export function heldConversationNoticeText(authority: Pick<RetryAuthority, "nextAction">) {
+  return `${HELD_CONDITION} ${authority.nextAction ?? HELD_RETRY_ACTION}`;
+}
+export async function readHeldConversationNoticeText(db: Db, input: { companyId: string; issueId: string }) {
+  return heldConversationNoticeText(decideRetryAuthority({ ...await readRetryAuthorityFacts(db, input),
+    heldConversation: true, retrySource: true }));
 }
