@@ -66637,6 +66637,36 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(f.wakeup).not.toHaveBeenCalled();
   });
 
+  // fam-retry3 ITEM B (fam-retry2 open item 1): a restore_failed hold whose files
+  // Paperclip's workspace recovery owns holds an ACCEPTED Retry, so the card and
+  // the route's held answer say the recovering words, never restore-card's
+  // "could not be put back... Create a new task". A failed restore with no
+  // recovery (an unsafe archive) keeps "Create a new task" and refuses.
+  it.each(["recovery_owned", "failed_no_recovery"] as const)("retry-fold / fam-retry3: card and Retry route words under a %s restore hold", async kind => {
+    const f = await boatRetryRouteFixture();
+    const evidence = kind === "recovery_owned"
+      ? { runId: f.runId, workspaceRestoreFailure: "restore_failed", workspaceRestoreRecovery: { schema: LEGACY_WORKSPACE_RECOVERY_SCHEMA, state: "pending" } }
+      : { runId: f.runId, workspaceRestoreFailure: "restore_unsafe_archive" };
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
+      cause: "native_continuation_requires_reconciliation", fingerprint: `native-workspace:${f.runId}`, attemptCount: 1, status: "resolved",
+      outcome: "blocked", ownerType: "board", resolvedAt: new Date(), nextAction: "The task's saved files could not be put back after the run stopped.",
+      evidence: { ...evidence, continuationDelivery: "invalidated", automaticRecovery: { policy: "preserve_without_replay_v1", runId: f.runId,
+        replay: "blocked", actionOutcome: "unknown", recordedAt: new Date().toISOString() } } });
+    const card = await f.card();
+    expect(card).toMatchObject({ canRetry: false });
+    const response = await request(f.app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: f.runId, idempotencyKey: randomUUID() });
+    if (kind === "recovery_owned") {
+      expect(card?.retryWait?.message).toBe(RECOVERING_SAVED_WORK_NEXT_ACTION);
+      expect(response.status, JSON.stringify(response.body)).toBe(202);
+      expect(response.body).toMatchObject({ accepted: true, held: { message: RECOVERING_SAVED_WORK_NEXT_ACTION } });
+      expect(JSON.stringify(response.body.held)).not.toMatch(/could not be put back|Create a new task/);
+    } else {
+      expect(card?.retryWait?.message ?? "").toMatch(/could not be put back/);
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(JSON.stringify(response.body)).toMatch(/Create a new task/);
+    }
+  });
+
   it("retry-fold6 (rf-3 FAIL 2, finding A): a repeat of a waiting Retry whose Stop has since expired unproven is refused at requestTaskRetry, as the card refuses it", async () => {
     const f = await boatRetryRouteFixture();
     // A requested Stop the Runner has not proven yet: Retry waits (deferred).
