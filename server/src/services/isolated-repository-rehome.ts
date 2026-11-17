@@ -18,7 +18,8 @@ import { applyRestorePoint, captureRestorePoint, currentRestorePointSnapshot, im
   RestorePointRestoreFailure, RestorePointSkip, type RestorePointLimits, type RestorePointSnapshot } from "./git-restore-point.js";
 import { findRegenerableWorkspaceDirs, REGENERABLE_WORKSPACE_DIR_NAMES, WORKSPACE_COMPACTION_TRASH_DIR } from "./workspace-compaction.js";
 import { ensureManagedRepositoriesIgnored } from "./managed-repository-checkout.js";
-import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
+import { currentHostMutationDrain, withHeldLockHostDrain } from "./native-runtime/held-lock-host-drain.js";
+import { hostCleanup, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { canonicalRepositoryRoot, localWorkspaceSourcePaths } from "./execution-workspace-source-roots.js";
 import { withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
 import { loadGitRestorePoint } from "./git-restore-point-storage.js";
@@ -361,18 +362,19 @@ export class WorkspaceMoveLockLostError extends Error {
 export function withWorkspaceMoveLocks<T>(db: Db, workspace: Workspace, work: (tx: Tx, signal?: AbortSignal) => Promise<T>) {
   return withIsolatedRepositorySourceLock(db, workspace.companyId, workspace.sourceIssueId!, () =>
     withWorkspaceSourceLocks(db, { companyId: workspace.companyId, projectIds: workspace.projectId ? [workspace.projectId] : [] }, async () => {
+      // pl/keepalive6: the held source scope's gate, captured before the move's own lock connection opens.
+      const sourceGate = currentHostMutationDrain();
       for (const cwd of localWorkspaceSourcePaths(workspace)) await retainCurrentWorkspaceSource(cwd);
       return withDedicatedDbConnection(db, connection => connection.transaction(async tx => {
         const rows = await tx.execute<{ locked: boolean; idle_timeout_ms: string | number | null }>(sql`select
           pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${workspace.id}`}, 0)) as locked,
           (select setting::bigint from pg_settings where name = 'idle_in_transaction_session_timeout') as idle_timeout_ms`);
         if (!rows[0]?.locked) throw new Error("lifecycle_busy");
-        // pl/keepalive5: a failed ping aborts work's signal; a lost lock is a failure, never a success.
-        const lost = new AbortController();
-        const result = await withWorkspaceLockKeepalive(tx, Number(rows[0]?.idle_timeout_ms), () => work(tx, lost.signal),
-          { onLost: cause => lost.abort(new WorkspaceMoveLockLostError(cause)) });
-        lost.signal.throwIfAborted();
-        return result;
+        // pl/keepalive6: the move's gate is JOINED to the source scope's: losing the move's lifecycle lock OR the
+        // outer source lock stops the move's host writes; in-flight ones drain before the locks are released.
+        return withHeldLockHostDrain({ lock: tx, idleTimeoutMs: Number(rows[0]?.idle_timeout_ms), parent: sourceGate,
+          label: "workspace move lock", lostError: cause => new WorkspaceMoveLockLostError(cause) },
+        (signal) => work(tx, signal));
       }));
     }), true);
 }
@@ -426,7 +428,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
           || interrupted.target !== path.join(await fs.realpath(base), standardWorktreeSuffix(branch))) throw new Error("invalid_rehome_record");
         if (options.dryRun) return { ...result, outcome: "dry_run" as const, reason: "interrupted_rehome_pending", from: row.cwd, to: interrupted.target };
         options.signal?.throwIfAborted();
-        await undoMove(tx, row.id, interrupted);
+        await hostMutation(() => undoMove(tx, row.id, interrupted));
         await writePending(db, row.id, null);
       }
       const target = await targetWorktree(tx, row, base, branch, options.signal);
@@ -442,7 +444,8 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
       if (options.dryRun) return { ...result, outcome: "dry_run" as const };
       const admins = [path.basename(old.admin)];
       options.signal?.throwIfAborted();
-      const locks = await acquireGitExpirationLocks(rehomeLockLocations(clone, admins, branch), lockToken(row.id))
+      // pl/keepalive6: the move's host writes below go through the held locks' (joined) gate: refused after a loss, drained before release.
+      const locks = await hostMutation(() => acquireGitExpirationLocks(rehomeLockLocations(clone, admins, branch), lockToken(row.id)))
         .catch(() => { throw new Error("worktree_git_busy"); });
       const pending: IsolatedRepositoryRehomePending = { base, from: old.cwd, target, branch, head: old.head, previousTip, moves };
       let recorded = false, ownsTarget = false, committed = false;
@@ -452,7 +455,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         if (before.head !== old.head) throw new Error("head_changed");
         const captured = await captureRestorePoint({ cwd: old.cwd, upstreamCommits: await sharedHistoryBoundary(old.cwd, base, old.head, options.signal),
           limits: options.limits ?? ISOLATED_REHOME_RESTORE_POINT_LIMITS, signal: options.signal });
-        const manifest = captured ? await importRestorePoint({ repositoryCwd: base, payload: captured.payload, signal: options.signal }) : null;
+        const manifest = captured ? await hostMutation(() => importRestorePoint({ repositoryCwd: base, payload: captured.payload, signal: options.signal })) : null;
         const reflog = shas(await git(old.cwd, ["reflog", "show", "--format=%H", "HEAD"], { signal: options.signal }).catch(() => ""));
         const original = (await fs.readFile(path.join(old.admin, "ORIG_HEAD"), "utf8").catch(() => "")).trim();
         const history = [old.head, ...reflog, ...(SHA.test(original) ? [original] : [])];
@@ -461,32 +464,32 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         options.signal?.throwIfAborted();
         await writePending(db, row.id, pending);
         recorded = true;
-        if (previousTip) await git(base, ["update-ref", branchRef, old.head, previousTip], { signal: options.signal });
+        if (previousTip) await hostMutation(() => git(base, ["update-ref", branchRef, old.head, previousTip], { signal: options.signal }));
         else {
-          await git(base, ["update-ref", branchRef, old.head, ""], { signal: options.signal });
+          await hostMutation(() => git(base, ["update-ref", branchRef, old.head, ""], { signal: options.signal }));
           for (const key of ["remote", "merge"]) {
             const value = (await git(old.cwd, ["config", "--local", "--get", `branch.${branch}.${key}`]).catch(() => "")).trim();
-            if (value) await git(base, ["config", "--local", `branch.${branch}.${key}`, value], { signal: options.signal });
+            if (value) await hostMutation(() => git(base, ["config", "--local", `branch.${branch}.${key}`, value], { signal: options.signal }));
           }
         }
         options.signal?.throwIfAborted();
-        await fs.mkdir(path.dirname(target), { recursive: true });
+        await hostMutation(() => fs.mkdir(path.dirname(target), { recursive: true }));
         await assertSafeBaseConfig(base, options.signal);
         await options.hooks?.beforeWorktreeAdd?.({ from: old.cwd, to: target });
         if (await exists(target)) throw new Error("target_worktree_exists");
-        await git(base, ["worktree", "add", target, branch], { signal: options.signal, timeout: 15 * 60_000 });
+        await hostMutation(() => git(base, ["worktree", "add", target, branch], { signal: options.signal, timeout: 15 * 60_000 }));
         ownsTarget = true;
-        if (manifest) await applyRestorePoint({ cwd: target, manifest, signal: options.signal });
+        if (manifest) await hostMutation(() => applyRestorePoint({ cwd: target, manifest, signal: options.signal }));
         const newAdmin = (await git(target, ["rev-parse", "--absolute-git-dir"], { signal: options.signal })).trim();
         options.signal?.throwIfAborted();
-        await fs.mkdir(path.join(newAdmin, "logs"), { recursive: true });
-        await fs.copyFile(path.join(old.admin, "logs", "HEAD"), path.join(newAdmin, "logs", "HEAD")).catch(async (error: NodeJS.ErrnoException) => {
+        await hostMutation(() => fs.mkdir(path.join(newAdmin, "logs"), { recursive: true }));
+        await hostMutation(() => fs.copyFile(path.join(old.admin, "logs", "HEAD"), path.join(newAdmin, "logs", "HEAD"))).catch(async (error: NodeJS.ErrnoException) => {
           if (error.code !== "ENOENT") throw error;
-          await fs.rm(path.join(newAdmin, "logs", "HEAD"), { force: true });
+          await hostMutation(() => fs.rm(path.join(newAdmin, "logs", "HEAD"), { force: true }));
         });
-        if (original) await fs.copyFile(path.join(old.admin, "ORIG_HEAD"), path.join(newAdmin, "ORIG_HEAD"));
+        if (original) await hostMutation(() => fs.copyFile(path.join(old.admin, "ORIG_HEAD"), path.join(newAdmin, "ORIG_HEAD")));
         options.signal?.throwIfAborted();
-        await moveTransferItems(old.cwd, target, moves, linkedBases);
+        await hostMutation(() => moveTransferItems(old.cwd, target, moves, linkedBases));
         await options.hooks?.beforeVerify?.({ from: old.cwd, to: target });
         const after = await currentRestorePointSnapshot(old.cwd, options.signal);
         const moved = await currentRestorePointSnapshot(target, options.signal);
@@ -516,10 +519,10 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         try {
           // pl/keepalive5: after a lock loss the pending record stays; the next owner's interrupted-move recovery undoes it.
           if (!committed && recorded && !lost?.aborted) {
-            await undoMove(tx, row.id, pending, ownsTarget);
+            await hostMutation(() => undoMove(tx, row.id, pending, ownsTarget));
             await writePending(db, row.id, null);
           }
-        } finally { await locks.release().catch(() => undefined); }
+        } finally { await hostCleanup(() => locks.release()).catch(() => undefined); }
       }
       result.rehomed = true;
       result.outcome = "rehomed";
@@ -663,12 +666,13 @@ async function cleanupRehomedSource(db: Db, tx: Tx, row: Workspace, result: Isol
       if (!fromStat.isDirectory() || fromStat.isSymbolicLink()) return keep("unsafe_worktree_path", false);
       if (!await worktreeOfClone(from, cloneReal, options.signal)) return keep("source_identity_changed", false);
       result.reclaimedBytes += await allocatedBytes(from, () => true).catch(() => 0);
-      if (await exists(worktreeTrash)) await fs.rm(worktreeTrash, { recursive: true, force: true });
-      await fs.rename(from, worktreeTrash);
+      // pl/keepalive6: the cleanup's removals go through the held locks' gate (refused after a loss, drained before release).
+      if (await exists(worktreeTrash)) await hostMutation(() => fs.rm(worktreeTrash, { recursive: true, force: true }));
+      await hostMutation(() => fs.rename(from, worktreeTrash));
     }
-    await git(clone, ["worktree", "prune"], { signal: options.signal });
+    await hostMutation(() => git(clone, ["worktree", "prune"], { signal: options.signal }));
   }
-  if (await exists(worktreeTrash)) await fs.rm(worktreeTrash, { recursive: true, force: true });
+  if (await exists(worktreeTrash)) await hostMutation(() => fs.rm(worktreeTrash, { recursive: true, force: true }));
   if (cloneReal) {
     const consumer = await cloneConsumers(tx, row.companyId, row.sourceIssueId, row.id, clone);
     if (consumer) return keep(consumer, consumer === "base_has_consumers");
@@ -680,15 +684,15 @@ async function cleanupRehomedSource(db: Db, tx: Tx, row: Workspace, result: Isol
       return keep(disposable.reason, false);
     }
     const bytes = await allocatedBytes(clone, () => true).catch(() => 0);
-    if (await exists(cloneTrash)) await fs.rm(cloneTrash, { recursive: true, force: true });
-    await fs.rename(clone, cloneTrash);
+    if (await exists(cloneTrash)) await hostMutation(() => fs.rm(cloneTrash, { recursive: true, force: true }));
+    await hostMutation(() => fs.rename(clone, cloneTrash));
     result.reclaimedBytes += bytes;
   }
   if (await exists(cloneTrash)) {
-    await fs.rm(cloneTrash, { recursive: true, force: true });
+    await hostMutation(() => fs.rm(cloneTrash, { recursive: true, force: true }));
     result.cloneRemoved = true;
   }
-  await fs.rmdir(parent).catch(() => undefined);
+  await hostMutation(() => fs.rmdir(parent)).catch(() => undefined);
   if (!result.rehomed) result.outcome = "cleaned";
   await markCleaned(db, row.id, options.now);
   return result;
