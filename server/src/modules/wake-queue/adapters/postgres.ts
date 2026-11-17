@@ -767,14 +767,14 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       );
     },
 
-    async pendingContinuationCommentInput({ companyId, issueId, contextSnapshot }) {
-      return pendingContinuationCommentInput(tx, { companyId, issueId, contextSnapshot });
+    async pendingContinuationCommentInput({ companyId, issueId, agentId, contextSnapshot }) {
+      return pendingContinuationCommentInput(tx, { companyId, issueId, agentId, contextSnapshot });
     },
 
     async queueReviewParticipantRecoveryRun({ companyId, issue, finishingRun, recoveryAgent, sessionBefore, now }) {
       await notifyStatusCardIssueChange(tx, companyId);
       const executionState = parseIssueExecutionState(issue.executionState);
-      const commentInput = await pendingContinuationCommentInput(tx, { companyId, issueId: issue.id, contextSnapshot: finishingRun.contextSnapshot });
+      const commentInput = await pendingContinuationCommentInput(tx, { companyId, issueId: issue.id, agentId: finishingRun.agentId, contextSnapshot: finishingRun.contextSnapshot });
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -865,7 +865,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       now,
     }) {
       await notifyChatRunMilestones(tx, { companyId, issueId: issue.id });
-      const commentInput = await pendingContinuationCommentInput(tx, { companyId, issueId: issue.id, contextSnapshot: finishingRun.contextSnapshot });
+      const commentInput = await pendingContinuationCommentInput(tx, { companyId, issueId: issue.id, agentId: finishingRun.agentId, contextSnapshot: finishingRun.contextSnapshot });
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
