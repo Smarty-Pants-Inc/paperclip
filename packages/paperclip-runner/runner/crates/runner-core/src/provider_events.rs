@@ -1692,7 +1692,11 @@ pub(crate) fn normalize_pi_notification_in(
                 },
                 "text": params.get("text").or_else(|| provider_item.get("text"))
                     .and_then(Value::as_str).map(|text| bounded_text(text, MAX_TEXT_CHARS)),
-                "message": bounded_text(string(params.get("message")), MAX_TEXT_CHARS),
+                // Shown in the person's transcript (ui adapters/paperclip-runner
+                // index.ts item.failed): whole and redacted, never cut. The Pi
+                // projector already bounds it to one record. (`text` above is
+                // not rendered for a failed item and keeps its preview.)
+                "message": redact_sensitive_text_values(string(params.get("message"))),
             }),
         }];
     }
@@ -1736,6 +1740,21 @@ pub(crate) fn normalize_pi_notification_in(
                     if let Some(full) = full_text_reference(params.get("fullText")) {
                         event.payload["fullText"] = full;
                     }
+                }
+            }
+        }
+    }
+    // A Pi progress message is shown in the person's task chat. The Pi
+    // projector already bounds it to one record: keep it whole (redacted), not
+    // the 4,000-character "…[truncated]" preview.
+    if method == "item/completed"
+        && string(params.get("channel")) == "progress"
+        && string(item(params).get("type")) == "agentMessage"
+    {
+        for event in &mut events {
+            if event.payload.get("kind").and_then(Value::as_str) == Some("agentMessage") {
+                if let Some(text) = item(params).get("text").and_then(Value::as_str) {
+                    event.payload["text"] = json!(redact_sensitive_text_values(text));
                 }
             }
         }
