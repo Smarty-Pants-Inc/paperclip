@@ -41,7 +41,7 @@ import { readSystemRecovery } from "./system-recovery-state.js";
 import { isReattachPhaseActive } from "./heartbeat/run-admission.js";
 import { provenGoneLegacyControllerBootId } from "./legacy-controller-lease.js";
 import { continueFreshInTransaction, continueHeldExecutions, freshContinuationCheckDue, recordFreshContinuationCheck,
-  settleCoalescedFreshContinuationHolds, freshContinuationChain, FRESH_CONTINUATIONS_PER_CHAIN } from "./fresh-continuation-fallback.js";
+  settleCoalescedFreshContinuationHolds, freshContinuationChain, resolveFreshContinuationsPerChain } from "./fresh-continuation-fallback.js";
 import { nativeStartupNeverConnectedExhausted } from "./continuation-cause.js";
 import { alias } from "drizzle-orm/pg-core";
 import { RECOVERY_BACKLOG_AGE_MS, RECOVERY_WAKE_REASONS } from "./heartbeat/queued-run-dispatch-order.js";
@@ -529,9 +529,9 @@ export async function deliverReconciledExecutions(
         if (fresh && typeof fresh.recordedAt === "string") {
           // Pending records from an older release must not get one last doomed
           // wake past the chain limit. This action already counts as an
-          // attempt, so the second one is still deliverable.
+          // attempt, so the last configured attempt is still deliverable.
           const chain = await freshContinuationChain(db, { companyId: action.companyId, issueId: task.id, runId: decision.runId });
-          const stopReason = chain.attempts > FRESH_CONTINUATIONS_PER_CHAIN ? "fresh_continuation_chain_exhausted" : null;
+          const stopReason = chain.attempts > resolveFreshContinuationsPerChain() ? "fresh_continuation_chain_exhausted" : null;
           if (stopReason) {
             await db.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify(
               { continuationDelivery: "invalidated", continuationStopReason: stopReason })}::jsonb` }).where(pendingDecision);

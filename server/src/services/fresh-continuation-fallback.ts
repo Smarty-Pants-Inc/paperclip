@@ -79,6 +79,15 @@ export const FRESH_CONTINUATION_CHECK_KEY = "freshContinuationCheck" as const;
 // import cycle); a test pins them to SERVER_RESTART_RETRY_MAX_ATTEMPTS/_WINDOW_MS.
 export const FRESH_CONTINUATIONS_PER_HOUR = 6;
 export const FRESH_CONTINUATIONS_PER_CHAIN = 2;
+export const FRESH_CONTINUATIONS_PER_CHAIN_ENV = "PAPERCLIP_FRESH_CONTINUATIONS_PER_CHAIN";
+
+/** Missing or invalid settings preserve the existing durable chain limit. */
+export function resolveFreshContinuationsPerChain(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[FRESH_CONTINUATIONS_PER_CHAIN_ENV]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return FRESH_CONTINUATIONS_PER_CHAIN;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : FRESH_CONTINUATIONS_PER_CHAIN;
+}
 export const FRESH_CONTINUATION_WINDOW_MS = 60 * 60_000;
 const PERSON_RECHECK_MS = 60 * 60_000;
 /** Consecutive pending checks (about 12 minutes) before the fallback stops waiting. */
@@ -613,7 +622,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
   const chain = await freshContinuationChain(tx, { companyId, issueId: issue.id, runId: run.id });
-  if (chain.attempts >= FRESH_CONTINUATIONS_PER_CHAIN)
+  if (chain.attempts >= resolveFreshContinuationsPerChain())
     return { kind: "not_applicable", reason: "fresh_continuation_chain_exhausted" };
 
   // The holds this decision owns: reconciliation holds that still block the
