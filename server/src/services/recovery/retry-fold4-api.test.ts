@@ -7,6 +7,7 @@ import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embed
 import { getExecutionBlocker } from "../execution-blocker.js";
 import { UNRESTORED_FILES_NEXT_ACTION } from "../legacy-execution-recovery.js";
 import { requestTaskRetry } from "../task-retry.js";
+import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { taskInterruptionPresentation } from "../task-interruption-presentation.js";
 
 // retry-fold4 (rf-3 finding A, judge R8 general): the Retry API reads the ONE
@@ -14,7 +15,7 @@ import { taskInterruptionPresentation } from "../task-interruption-presentation.
 // an idempotent repeat, is refused with the card's one instruction; nothing
 // is accepted that no run will follow. requestTaskRetry is what
 // POST /api/issues/:id/retry calls (routes/issues.ts requestTaskRetry).
-const HELD_NOTICE = "Your message and saved work are kept, but this conversation cannot continue. Assign this agent a new task to continue.";
+const HELD_NOTICE = HELD_PREDECESSOR_NOTICE;
 const PAUSED = "This agent is paused. Resume this agent to continue. Your message and saved work are kept.";
 
 describe("retry fold 4: the Retry API refuses every Retry the card does not offer", () => {
@@ -61,7 +62,9 @@ describe("retry fold 4: the Retry API refuses every Retry the card does not offe
     expect(presentation).toMatchObject({ canRetry: false, userAction: "resume" });
   });
 
-  it("R8/A: an idempotent REPEAT of an unrun Retry, after the conversation became held, is refused (no replayed 'accepted')", async () => {
+  // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z; follow-Paperclip Cut B R8): a held
+  // conversation never withholds Retry, so its repeat is accepted like the card's Retry.
+  it("supersedes: R8/A: an idempotent REPEAT of an unrun Retry, after the conversation became held, is refused (no replayed 'accepted')", async () => {
     const f = await seed();
     const key = randomUUID();
     const first = await retry(f, key);
@@ -73,10 +76,8 @@ describe("retry fold 4: the Retry API refuses every Retry the card does not offe
       metadata: { version: 1, authorizationReason: `native_prior_owner_held:${randomUUID()}`,
         sections: [{ rows: [{ type: "run_link", runId: f.runId, agentId: f.agentId }] }] } });
     const card = await getExecutionBlocker(db, f.companyId, f.issueId);
-    expect(card?.canRetry).toBe(false);
-    await expect(retry(f, key)).rejects.toMatchObject({ status: 409,
-      details: { code: "retry_not_available", reason: "conversation_held", userAction: "new_task",
-        nextAction: "Assign this agent a new task to continue." } });
+    expect(card?.canRetry).toBe(true);
+    expect(await retry(f, key)).toMatchObject({ accepted: true });
   });
 
   it("R8: an idempotent repeat of a Retry that already got its run still answers accepted (truthful replay)", async () => {
