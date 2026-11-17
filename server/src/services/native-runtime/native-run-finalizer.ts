@@ -31,6 +31,7 @@ import { hasPendingNativeChildCompletion } from "./native-child-completion-deliv
 import { settleExternalConversation } from "../slack-conversation-lifecycle.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { isFailedTurnContinuationRun } from "./native-failed-turn-continuation.js";
+import { isNativeMidStreamCutRecoveryRun, readNativeMidStreamCut } from "./native-mid-stream-cut.js";
 import { readPersistedNativeFailureEvidence } from "./native-provider-failure-evidence.js";
 // Fork: upstream reads nativeRunHasStopRequest from native-tool-receipt-limit.ts (#21913, not carried).
 import { nativeRunHasStopRequest } from "./native-run-stop-request.js";
@@ -1887,8 +1888,11 @@ async function finalizeNativeRunAndProject(input: {
       failureRetryCount: executionFailureRetryCount(run),
       // Only the task's current owner may turn its own failed continuation
       // into a blocker; the committer rechecks that under the issue lock.
+      // The recovery successor of a mid-stream cut is that one continuation too.
       failedTurnContinuationUsed: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext
-        && await isFailedTurnContinuationRun(input.db, run, authoritativeIssue.id),
+        && (isNativeMidStreamCutRecoveryRun(run) || await isFailedTurnContinuationRun(input.db, run, authoritativeIssue.id)),
+      midStreamCut: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext
+        ? await readNativeMidStreamCut(input.db, { companyId: run.companyId, runId: run.id }) : null,
       ...(addressedOutcome ? { nativeAddressedInteractionOutcome: addressedOutcome } : {}),
       ...(reviewContext ? { nativeReviewOutcome: nativeReview
         ? nativeReview.interaction.status === "pending" ? "pending" as const : "resolved" as const

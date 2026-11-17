@@ -323,6 +323,7 @@ import {
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import { resolveRunAssigneeAdapterOverrides } from "./thinking-cap-stop.js";
+import { NATIVE_MID_STREAM_CUT_CODE, applyNativeMidStreamCutOpening } from "./native-runtime/native-mid-stream-cut.js";
 import {
   getExecutionBlocker,
 } from "./execution-blocker.js";
@@ -2478,6 +2479,10 @@ export function heartbeatService(
       // dl-n5-cont3: the task's assignee overrides; the ONE automatic recovery
       // run after a thinking-only output-cap stop also runs at 'high' in its
       // fresh session (a run-level override; the agent's stored level is unchanged).
+      // dl famlong-u1: the ONE recovery successor of a mid-stream cut opens
+      // with the cut's own instruction (cont3's ask for the fresh session after
+      // a cap stop with no text; cont4's "continue from exactly this point").
+      await applyNativeMidStreamCutOpening(db, { run, issueId: issueId ?? null, context });
       let issueAssigneeOverrides = await resolveRunAssigneeAdapterOverrides(db, {
         companyId: agent.companyId, runId: run.id, agent, issueContext });
       const experimentalInstanceSettings =
@@ -3128,7 +3133,7 @@ export function heartbeatService(
         }
         const enforceContinuationOwnership = Boolean(issueId && (isFailedChatRunRetry || isResolvedInteractionContinuationWakeContext(context) ||
           typeof context.workspaceReconstructionActionId === "string" ||
-          ["native_safe_replacement", "native_provider_overloaded", "native_environment_blocker"].includes(run.scheduledRetryReason ?? "")));
+          ["native_safe_replacement", "native_provider_overloaded", "native_environment_blocker", NATIVE_MID_STREAM_CUT_CODE].includes(run.scheduledRetryReason ?? "")));
         if (issueId && enforceContinuationOwnership) {
           await options.beforeResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
           await options.afterResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });

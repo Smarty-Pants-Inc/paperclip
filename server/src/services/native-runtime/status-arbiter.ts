@@ -3,6 +3,7 @@ import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
 import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE } from "./native-provider-failure.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_ACTION, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE,
   NATIVE_ENVIRONMENT_BLOCKER_MAX_RETRIES } from "./native-environment-blocker.js";
+import { NATIVE_MID_STREAM_CUT_CODE, NATIVE_PROVIDER_REFUSAL_TERMINAL_REASON, type NativeMidStreamCut } from "./native-mid-stream-cut-cause.js";
 
 export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v14";
 
@@ -268,6 +269,12 @@ export function arbitrateNativeStatus(input: {
    * Another failure needs a person's Retry, never another automatic wake.
    */
   failedTurnContinuationUsed?: boolean;
+  /**
+   * How the provider cut this failed turn mid-stream (an output-cap stop, an
+   * EOF or other provider error, a refusal), re-derived from the run's own
+   * persisted turn events. Null for every other failure.
+   */
+  midStreamCut?: NativeMidStreamCut | null;
   agentId: string;
   priorIssueStatus: NativeAuthoritativeIssueStatus;
 }): NativeStatusDecision {
@@ -415,6 +422,18 @@ export function arbitrateNativeStatus(input: {
         effects: [{ kind: "release_run_resources" }],
       };
     }
+    if (input.midStreamCut === "provider_refusal") {
+      // The provider refused the turn. Resuming or re-sending it would only
+      // be refused again: this path starts no successor of any kind.
+      return {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "preserve",
+        toStatus: input.priorIssueStatus,
+        reasonCode: NATIVE_PROVIDER_REFUSAL_TERMINAL_REASON,
+        unblockDescriptor: null,
+        effects: [{ kind: "release_checkout" }],
+      };
+    }
     if (input.failedTurnContinuationUsed) {
       // The automatic continuation already ran and failed too. Keep the work
       // and hand the next attempt to a person instead of waking again.
@@ -425,6 +444,26 @@ export function arbitrateNativeStatus(input: {
         reasonCode: "native_run_failed_continuation_exhausted",
         unblockDescriptor: { owner: "board", action: NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION },
         effects: [{ kind: "bind_blocker", owner: "board", action: NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION }],
+      };
+    }
+    if (input.midStreamCut) {
+      // A mid-stream cut has ONE automatic successor, and it is the recovery
+      // run (fresh at 'high' after a cap stop with no text), never the
+      // generic same-session wake below.
+      return {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "preserve",
+        toStatus: input.priorIssueStatus,
+        reasonCode: "run_failed_partial_evidence_preserved",
+        unblockDescriptor: null,
+        effects: [{
+          kind: "schedule_retry",
+          cause: NATIVE_MID_STREAM_CUT_CODE,
+          summary: input.midStreamCut === "output_cap_no_text"
+            ? "Recover the output-cap stop once, in a fresh provider session."
+            : "Recover the cut turn once.",
+          agentId: input.agentId,
+        }],
       };
     }
     return {

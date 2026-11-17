@@ -8,6 +8,7 @@ import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed, isReattachPhaseActive as isProcessReattachPhaseActive } from "./run-admission.js";
+import { NATIVE_MID_STREAM_CUT_CODE, isNativeFailedTurnRetryReason } from "../native-runtime/native-mid-stream-cut.js";
 import { continueFreshInTransaction, hasPendingFreshContinuation, isFreshIsolatedContinuationWake, settleCoalescedFreshContinuationHolds } from "../fresh-continuation-fallback.js";
 import { deliverContinuationAsRun, foldWaitingRetriesIntoContinuation, foldWaitingRetriesIntoRecordedContinuation, undeliveredContinuation,
   undeliveredContinuationContext } from "../fresh-continuation-retry-fold.js";
@@ -1396,18 +1397,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             !ownsIssue || (!run.startedAt && current.appliedIssueStatusVersion !== owner?.statusVersion))
           return declined("case_handoff_superseded");
       }
-      if (ownsIssue && ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? "") &&
+      if (ownsIssue && ["native_safe_replacement", "native_provider_overloaded", NATIVE_MID_STREAM_CUT_CODE].includes(run.scheduledRetryReason ?? "") &&
           owner.checkoutRunId && owner.checkoutRunId !== run.id) {
         return declined("issue_checked_out_by_another_run", owner.checkoutRunId);
       }
-      if (run.scheduledRetryReason === "native_provider_overloaded" && owner?.executionRunId &&
+      if (isNativeFailedTurnRetryReason(run.scheduledRetryReason) && owner?.executionRunId &&
           owner.executionRunId !== run.id && owner.executionRunId !== run.retryOfRunId) {
         return declined("issue_execution_owned_by_another_run", owner.executionRunId);
       }
       if (ownsIssue && issueId && await taskChatRetrySourceCleanupPending(tx, run, issueId)) {
         return declined("task_chat_retry_source_cleanup_pending");
       }
-      const executionOwnerId = run.scheduledRetryReason === "native_provider_overloaded"
+      const executionOwnerId = isNativeFailedTurnRetryReason(run.scheduledRetryReason)
         ? run.retryOfRunId : ownsIssue ? owner?.executionRunId : null;
       for (const previousRunId of new Set([executionOwnerId, ownsIssue ? run.retryOfRunId : null])) {
         if (!previousRunId || previousRunId === run.id) continue;
@@ -1815,7 +1816,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             updatedAt: claimedAt,
           };
           if (nativeReviewContext) {
-            if (run.scheduledRetryReason === "native_provider_overloaded") {
+            if (isNativeFailedTurnRetryReason(run.scheduledRetryReason)) {
               const predecessor = await lockIssueExecutionClaim(tx);
               if (predecessor.blocked) return null;
             }
@@ -1911,7 +1912,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             // Mention/context runs can touch an issue, but only the current assignee
             // owns the issue execution lock shown as the active run.
             eq(issues.assigneeAgentId, claimed.agentId),
-            ["native_safe_replacement", "native_provider_overloaded"].includes(claimed.scheduledRetryReason ?? "")
+            ["native_safe_replacement", "native_provider_overloaded", NATIVE_MID_STREAM_CUT_CODE].includes(claimed.scheduledRetryReason ?? "")
               ? or(
                   isNull(issues.checkoutRunId),
                   eq(issues.checkoutRunId, claimed.id),
