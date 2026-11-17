@@ -1661,10 +1661,10 @@ A person's task Retry on a connected task first asks the chat retry owner to rep
 > **Superseded by follow-Paperclip Cut B.** The proven-gone admission gate below is
 > removed. This typed family now takes upstream's fresh-continuation fallback: a bounded
 > wait, then a fenced epoch or a new isolated workspace. The typed diagnostic channel
-> (`nativeFreshContinuationRefusal`) and the K=2 chain cap stay. When the cap is reached,
-> the unanswered-message sweep writes the one note ("Paperclip tried to continue this
-> task twice from its saved work, and both attempts failed. Your message and the saved
-> work are kept. Send a new message to try again."). The text below is historical.
+> (`nativeFreshContinuationRefusal`) stays. The fork's K=2 chain cap is removed;
+> upstream's six-per-task rolling-hour brake schedules another automatic check,
+> without a manual Retry or a request to send the message again. The text below
+> is historical.
 
 The typed refusal codes `native_controller_recovery_missing_evidence:snapshot_binding`, `native_controller_recovery_unsupported:metadata_format`, `runner_remote_state_unavailable`, `native_runner_launch_profile_mismatch`, and `native_runner_refresh_required` use the existing fresh-continuation owner, not a provider-text match, bounded same-run retry, or a bare failed-run reply. Runner prepare/attach carries an authenticated refusal code; a prepare result requiring refresh is consumed **before** the controller queues `session.open`. The refusing contender may not restore, poll, rewrite, or stop its predecessor's provider state. The additive refusal channel preserves distinct `provider_active_turn`, `provider_live_descendants`, `provider_active_goal`, `provider_config_changed`, `provider_contract_changed_same_run`, `provider_contract_changed`, and `provider_launch_profile_mismatch` codes through PRP and server completion. Old no-code and unknown receipts become only `provider_prepare_refused`; English diagnostics and serialized prose never promote them to launch-profile mismatch. The legacy recovery classifier remains unchanged; the fresh-history policy explicitly opts into the new channel. A structured `runner_remote_state_unavailable` code also survives the Codex recovery driver, backend adapter and native runtime boundary as `recoveryRefusalCode`; runtime recovery must not turn it into diagnostic-only text or bootstrap a replacement under a legacy policy. Only the exact structured code or its bounded error cause is accepted; old diagnostic-only errors and unknown codes are not promoted. Older controller rows that saved a whole reserved D10 code in `error` under the generic reconciliation envelope use the same strict stop gate. This accepts only the exact named code, never a code quoted inside prose or a provider-message field; removing it from permanent refusal must not accidentally send it through the generic isolation-only fallback.
 
@@ -1694,28 +1694,25 @@ The exact replay can also be refused after the click is accepted. This happens w
 
 A native conversation refusal (typed or not) takes the same fresh-continuation
 fallback as any other system-owned failure, under the bound below; a refusal's
-text never decides admission (follow-Paperclip Cut B, R4). Transient failures may create at most two fresh continuations per task and
-source-run chain. The task lock serializes recording, and the existing recovery
-actions retain `freshContinuation.chainRootRunId` and `chainAttempt`. The bound
-counts durable records along `retryOfRunId` / previous-run context, including
-records from before these markers existed, with company and task scope on every
-hop. It does not reset on restart or when the separate six-per-hour rolling
-budget expires. A genuinely admitted new person turn starts a new chain even
-when it retains `previousRunId` or `retryOfRunId` as execution provenance. The
-lineage stops at the admission owner's explicit-user authorization or a
-user-owned wake carrying that person's comment, not an arbitrary wake reason
-or a copied continuation marker. Automatic retries of that turn remain in its
-chain. Pending fallback records from older releases are invalidated before
-delivery if their source is permanently refused or they exceed the chain bound;
-invalidation starts no run
-and posts no additional note. If a fresh continuation fails in preparation with
-a permanent refusal before carrying the message, the existing unanswered-message
-notice owner follows its automatic lineage and uses that terminal run's
-classification and Run evidence. It produces the existing new-task guidance,
-not the earlier source's resend guidance, under the same per-message dedupe and
-issue fence; there is no second notice writer. Unrelated runs and later person
-turns do not supply another message's failure. A successful continuation is
-unchanged. No schema migration or plugin setting is needed.
+text never decides admission (follow-Paperclip Cut B, R4). The task lock
+serializes recording. The shared continuation ledger counts fresh continuations,
+assigned-work continuations and automatic retry runs against the existing six
+attempts per task in a rolling hour. Watchdog disposition, permanently lost
+saved-work recovery and sandbox-client-timeout recovery all reach this same
+fallback; changing the failure code or creating another hold does not reset it.
+The fork has no separate lifetime/source-chain cap.
+
+At the bound the existing recovery action records `freshContinuationCheck` as
+`backoff`, with its next check at the oldest attempt's expiry. The task card and
+transcript show `retry_scheduled`, with `canRetry: false`, until that deadline.
+The unanswered-message sweep reads this same task presentation, even when the
+latest fallback failed before carrying the original message. Its two-minute
+unowned-wait bound cannot override the scheduled retry. It adds no competing
+notice or resend instruction, and retires an older unanswered-message notice
+under the issue fence while preserving its row. If automatic recovery later
+ends with a real unowned failure, the same message key may explain it once;
+answers, human gates and unrelated messages retain their existing semantics.
+No new timer, schema migration, plugin setting or notice writer is needed.
 
 ### Saved chat Retry preparation
 
