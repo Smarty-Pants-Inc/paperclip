@@ -19,6 +19,7 @@ import { preserveRemoteWorkspacePreparationFailure } from "./native-workspace-fi
 import { pinFailedObservedWorkspace } from "./native-observed-workspace-preservation.js";
 import { hasConfirmedSandboxStopAndRetain } from "../sandbox-stop-and-retain.js";
 import { preparedRemoteWorkspaceSource } from "../remote-workspace-lifecycle.js";
+import { stoppedReusableSourceProof } from "./native-sync-stopped-source.js";
 import { releaseUnchangedRemoteWorkspaceWriterById } from "../remote-workspaces.js";
 import { isSupersededWorkspaceExport, markSupersededWorkspaceExportHold } from "./native-superseded-workspace-export.js";
 
@@ -66,8 +67,8 @@ function cancelledNativeRunWorkspaceOutcome(run: Pick<typeof heartbeatRuns.$infe
 }
 
 /** The exact source the restore recorder can retain. A released reusable lease
- * qualifies only with a confirmed stop-and-retain receipt and the remote
- * workspace binding proof. Native-sync descriptors have no such proof here. */
+ * qualifies only with a confirmed stop-and-retain receipt and the binding proof
+ * of its run's prepared source (remote workspace or v3 native-sync). */
 async function cancelledWorkspaceSource(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "status" | "nativeIssueId" | "resultJson" | "runnerProfileJson">) {
   const leases = await db.select().from(environmentLeases).where(and(
@@ -78,8 +79,7 @@ async function cancelledWorkspaceSource(db: Db, run: Pick<typeof heartbeatRuns.$
     // A still-running warm box after an ordinary Stop is a handoff, not a source.
     if (cancelledNativeRunWorkspaceOutcome(run, lease) === "handoff") continue;
     if (lease.status !== "released" || lease.leasePolicy === "ephemeral") return lease;
-    if (run.runnerProfileJson?.nativeWorkspaceSync == null && hasConfirmedSandboxStopAndRetain(lease)
-      && await preparedRemoteWorkspaceSource(db, lease)) return lease;
+    if (await stoppedReusableSourceProof(db, run.runnerProfileJson, lease)) return lease;
   }
   return null;
 }
@@ -196,8 +196,8 @@ export async function preserveNativeFailedWorkspace(db: Db, selected: Pick<typeo
         workspaceId: currentReference.workspaceId, runId: run.id })) return;
     // A stopped reusable sandbox is retained only with its exact stop receipt
     // while the workspace is still bound to this writer. Otherwise record nothing.
-    if (!exhaustedAcceptedCopyback && source.status !== "active" && reusableLeasePolicies.includes(source.leasePolicy) && (!hasConfirmedSandboxStopAndRetain(source)
-      || !await preparedRemoteWorkspaceSource(tx as unknown as Db, source))) return;
+    if (!exhaustedAcceptedCopyback && source.status !== "active" && reusableLeasePolicies.includes(source.leasePolicy)
+      && !await stoppedReusableSourceProof(tx as unknown as Db, run.runnerProfileJson, source)) return;
     // Ownership settlement still applies to workspace-less external sessions.
     // Their Runner descriptor is not evidence that user files need exporting.
     const retainFiles = !nativeRunHasNoWorkspaceAccess(run);
