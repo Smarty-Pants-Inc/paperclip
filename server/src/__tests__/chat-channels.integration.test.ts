@@ -65471,6 +65471,58 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       }
     });
 
+    // fam-retry3 ITEM A (RFL 20:33Z, R-ONCE; testing-lead's live shape a58a6a19):
+    // the chat Retry of failed run A after successor B posted the final answer
+    // to the same person message is a no-op with the one authority's line and no
+    // wake (person-message-answer.ts answeredPersonMessageSql decides "answered").
+    it("retry-fold / fam-retry3: a chat Retry of a failed run whose person message a later run already answered starts no run and says 'Already answered above.'", async () => {
+      const context = await fixture(true);
+      try {
+        await context.resolve().expect(200);
+        const [retry] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, context.endpoint.id),
+          eq(chatActions.kind, "failed_run_retry")));
+        expect(retry).toMatchObject({ status: "issued" });
+        const [runA] = await readHeartbeatRunsById(context.runId);
+        const carried = runA!.contextSnapshot as Record<string, unknown>;
+        expect(carried.wakeCommentId).toEqual(expect.any(String));
+        const runB = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: runB, companyId: context.fixture.companyId, agentId: context.fixture.assignedAgentId,
+          issueId: context.issue.id, status: "succeeded", startedAt: new Date(), finishedAt: new Date(),
+          contextSnapshot: { issueId: context.issue.id, wakeCommentId: carried.wakeCommentId,
+            wakeCommentIds: carried.wakeCommentIds ?? [carried.wakeCommentId], retryOfRunId: context.runId } });
+        await db.insert(issueComments).values({ companyId: context.fixture.companyId, issueId: context.issue.id, authorType: "agent",
+          authorAgentId: context.fixture.assignedAgentId, createdByRunId: runB, body: "Here is the final answer." });
+        await context.service.processFailedChatRunRetry(retry!.id).catch(() => undefined);
+        expect(context.wakeup).not.toHaveBeenCalled();
+        expect(await readAgentWakeupRequestsById(retry!.id)).toEqual([]);
+        const [settled] = await db.select().from(chatActions).where(eq(chatActions.id, retry!.id));
+        expect(settled?.result).toMatchObject({ message: "Already answered above." });
+        expect(JSON.stringify(settled?.result)).not.toContain("Retry continues the task");
+      } finally {
+        await context.cleanup();
+      }
+    });
+
+    // fam-retry3 negative: the same chat Retry while the message is unanswered
+    // (B cancelled having posted nothing) still wakes once.
+    it("retry-fold / fam-retry3: a chat Retry whose person message only a cancelled run carried (no answer posted) still wakes", async () => {
+      const context = await fixture(true);
+      try {
+        await context.resolve().expect(200);
+        const [retry] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, context.endpoint.id),
+          eq(chatActions.kind, "failed_run_retry")));
+        const [runA] = await readHeartbeatRunsById(context.runId);
+        const carried = runA!.contextSnapshot as Record<string, unknown>;
+        await db.insert(heartbeatRuns).values({ companyId: context.fixture.companyId, agentId: context.fixture.assignedAgentId,
+          issueId: context.issue.id, status: "cancelled", startedAt: new Date(), finishedAt: new Date(),
+          contextSnapshot: { issueId: context.issue.id, wakeCommentId: carried.wakeCommentId, retryOfRunId: context.runId } });
+        await context.service.processFailedChatRunRetry(retry!.id);
+        expect(context.wakeup).toHaveBeenCalledTimes(1);
+      } finally {
+        await context.cleanup();
+      }
+    });
+
     it.each([
       "revoked_principal",
       "closed_conversation",
