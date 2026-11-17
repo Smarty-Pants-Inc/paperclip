@@ -2773,11 +2773,15 @@ function createSandboxEnvironmentDriver(
 
       let cleanupStatus: "success" | "failed" = "success";
       try {
-        await releaseSandboxProviderLease({
+        const release = () => releaseSandboxProviderLease({
           config: parsed.config,
           providerLeaseId: input.lease.providerLeaseId,
           status: input.status,
         });
+        // A non-reusable release erases the box: it takes the destroy claim
+        // (refused, so the cleanup fails closed, while the allocation is held).
+        if (releaseErasesSandbox(input.lease)) await withLeaseDestroyClaim(db, input.lease, release);
+        else await release();
       } catch {
         cleanupStatus = "failed";
       }
@@ -3518,6 +3522,10 @@ function createSandboxEnvironmentDriver(
     return advertised.includes(method);
   }
 
+  function releaseErasesSandbox(lease: EnvironmentLease): boolean {
+    return lease.leasePolicy !== "reuse_by_environment";
+  }
+
   async function releasePluginBackedSandboxLease(
     input: EnvironmentDriverReleaseInput,
   ): Promise<EnvironmentLease | null> {
@@ -3542,7 +3550,7 @@ function createSandboxEnvironmentDriver(
           lease: input.lease,
           provider: providerKey,
         });
-        const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () =>
+        const releaseCall = () => runLeaseReleaseWithRunParent(input.lease.id, () =>
           pluginWorkerManager.call(pluginId, "environmentReleaseLease", {
             driverKey: providerKey,
             companyId: input.lease.companyId,
@@ -3554,6 +3562,11 @@ function createSandboxEnvironmentDriver(
             ...(input.cancelActiveWork ? { cancelActiveWork: true } : {}),
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig))),
         );
+        // A non-reusable release erases the box: it takes the destroy claim
+        // (refused, so the cleanup fails closed, while the allocation is held).
+        const receipt = releaseErasesSandbox(input.lease)
+          ? await withLeaseDestroyClaim(db, input.lease, releaseCall)
+          : await releaseCall();
         termination = remoteTerminationReceipt(input.lease, receipt);
         if (input.cancelActiveWork && !termination) cleanupStatus = "failed";
       } catch {

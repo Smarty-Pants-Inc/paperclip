@@ -946,6 +946,28 @@ describe("persistent agent directories", () => {
     expect((await fx.lease()).metadata?.agentFileDestroyClaim).toBe(claim);
   }, 60_000);
 
+  // F2c: a fifth route found while porting (red at d734a5e5): a non-reusable release erases the box.
+  it("JUDGE ordinary release: provider release cannot erase held agent directory", async () => {
+    const fx = await boundLeaseFixture();
+    const source = await fx.lease();
+    await db.update(environmentLeases).set({ status: "active", leasePolicy: "ephemeral" }).where(eq(environmentLeases.id, source.id));
+    const held = await copies.collectStopped({ companyId, runId: fx.copy.runId });
+    expect(held?.receipt?.savePending).toBeTruthy();
+    const call = vi.fn(async (_plugin: string, method: string, input: any) => {
+      if (method !== "environmentReleaseLease") throw new Error(`Unexpected ${method}`);
+      await fs.rm(String(source.metadata?.remoteCwd), { recursive: true, force: true });
+      return { providerLeaseId: input.providerLeaseId, state: "destroyed" };
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: { isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentReleaseLease", "environmentDestroyLease"] }) } as any });
+    await runtime.releaseRunLeases(fx.copy.runId, "released");
+    const proof = { held: true, providerCalls: call.mock.calls.map(c => c[1]), surviving: await fx.surviving(), expected: fx.note };
+    console.log("JUDGE_ORDINARY_RELEASE", JSON.stringify(proof));
+    await writeJudgeEvidence("ordinary-release-evidence.json", proof);
+    expect.soft(call).not.toHaveBeenCalled();
+    expect.soft(await fx.surviving()).toBe(fx.note);
+  }, 60_000);
+
   it("round trips nested text, empty directories and binary bytes independently of task files", async () => {
     const first = await run();
     expect(first.localRoot.startsWith(path.join(home, ".paperclip-runtime"))).toBe(false);
