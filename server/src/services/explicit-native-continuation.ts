@@ -2,7 +2,7 @@ import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-n
 import { agentDirectoryPreparationWaitPredicate, isAgentDirectoryPreparationWait } from "./pre-dispatch-execution-evidence.js";
 import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
-import { canSelectFreshWorkspace, freshReadinessSchema, retainedIssueWorkspaceForRetry, type ContinuationReadiness } from "./fresh-workspace-continuation.js";
+import { canSelectFreshWorkspace, decideTaskRetryWorkspace, freshReadinessSchema, retainedIssueWorkspaceForRetry, type ContinuationReadiness } from "./fresh-workspace-continuation.js";
 import { verifiedWorkspaceSnapshotReceipt } from "./workspace-recovery-snapshot.js";
 import { readTaskRetryIntent, retireTaskRetriesContinuedBy } from "./task-retry.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
@@ -675,6 +675,22 @@ export async function admitExplicitNativeContinuation(input: {
       : { mode: "fresh_isolated_workspace", retryIntentId: last.intent, sourceRunId: last.run.id,
         retainedSourceIds: [...new Set(freshCandidates.flatMap(candidate => candidate.leaseIds))] };
   }
+  // A Retry of a native source with no recovery generation (for example a
+  // failed answer run) used to reach its new box only in preparation, after
+  // native selection had kept the old provider thread. Take the same decision
+  // here, so a fresh box gets its fresh-thread record and successor-bound
+  // readiness below. A source whose stopped provider session is verified here
+  // (stoppedSessions) keeps preparation's resume of that verified workspace.
+  if (!readiness && taskRetry && !stoppedSessions.length && !taskRetry.canonicalIntentId && !taskRetry.chatActionId
+      && !taskRetry.queuedChatRequestId && ["evaluate", "continue"].includes(taskRetry.strategy)
+      && sources.some(run => run.id === taskRetry.sourceRunId && run.runtimeMode === "native")) {
+    const [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.id, taskRetry.sourceRunId)));
+    const decided = source ? await decideTaskRetryWorkspace(db, { run: { id: input.successorRunId, companyId, agentId,
+      contextSnapshot: { issueId, previousRunId: source.id } }, issueId, retryIntentId: input.taskRetryRequestId!,
+      strategy: taskRetry.strategy, source }) : null;
+    if (decided?.mode === "fresh_isolated_workspace") readiness = decided;
+  }
   const nativeSources = sources.filter(run => run.runtimeMode === "native");
   const executedSources = sources.filter(run => run.runtimeMode === "native" || run.errorCode !== "execution_reconciliation_required" || run.startedAt);
   if (!executedSources.length || (retry && !sources.some(run => run.id === input.failedRunId)) ||
@@ -777,7 +793,7 @@ export async function admitExplicitNativeContinuation(input: {
   if (taskRetry && readiness?.mode === "fresh_isolated_workspace") {
     const { recordRetryFreshProviderThread, retryFreshThreadTrigger } = await import("./fresh-continuation-fallback.js");
     await recordRetryFreshProviderThread(db, { companyId, issueId, agentId, sourceRunId: readiness.sourceRunId,
-      successorRunId: input.successorRunId, trigger: retryFreshThreadTrigger(taskRetry) });
+      successorRunId: input.successorRunId, trigger: retryFreshThreadTrigger(taskRetry), retryIntentId: input.taskRetryRequestId! });
   }
   if (input.taskRetryRequestId) {
     const payload = sql`jsonb_set(${agentWakeupRequests.payload} #- '{taskRetry,continuation}', '{taskRetry,strategy}',

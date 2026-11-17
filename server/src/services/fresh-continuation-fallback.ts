@@ -435,10 +435,16 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
  * to exactly the successor run whose admitted readiness chose the new box. */
 function isRetryFreshProviderThread(action: typeof issueRecoveryActions.$inferSelect, sourceRunId: string,
   run: typeof heartbeatRuns.$inferSelect) {
-  const readiness = object(object(object(run.contextSnapshot).explicitUserContinuation).readiness);
-  return RETRY_FRESH_THREAD_TRIGGERS.includes(object(action.evidence.freshContinuation).trigger as RetryFreshThreadTrigger)
+  const context = object(run.contextSnapshot);
+  const readiness = object(object(context.explicitUserContinuation).readiness);
+  const fresh = object(action.evidence.freshContinuation);
+  // Bound to THIS Retry: its run, its source, and its own Retry request. A
+  // record another Retry wrote never rotates this run's thread.
+  return RETRY_FRESH_THREAD_TRIGGERS.includes(fresh.trigger as RetryFreshThreadTrigger)
     && action.evidence.continuationRunId === run.id && action.evidence.continuationDelivery === "delivered"
-    && readiness.mode === "fresh_isolated_workspace" && readiness.sourceRunId === sourceRunId;
+    && readiness.mode === "fresh_isolated_workspace" && readiness.sourceRunId === sourceRunId
+    && typeof fresh.retryIntentId === "string" && fresh.retryIntentId === context.taskRetryRequestId
+    && fresh.retryIntentId === readiness.retryIntentId;
 }
 
 export const RETRY_FRESH_THREAD_TRIGGER = "person_retry" as const;
@@ -473,7 +479,7 @@ export function retryFreshThreadTrigger(intent: { initiatedBy?: "restart_recover
  */
 export async function recordRetryFreshProviderThread(db: Db, input: {
   companyId: string; issueId: string; agentId: string; sourceRunId: string; successorRunId: string;
-  trigger: RetryFreshThreadTrigger;
+  trigger: RetryFreshThreadTrigger; retryIntentId: string;
 }): Promise<string | null> {
   const [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.agentId, input.agentId))).for("update");
@@ -484,7 +490,8 @@ export async function recordRetryFreshProviderThread(db: Db, input: {
   const recordedAt = new Date(Number(clock!.ms)).toISOString();
   const isolation: FreshContinuationIsolation = "fresh_isolated_workspace";
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: source.id, trigger: input.trigger,
-    failureCode: source.errorCode ?? null, delivery: "caller_owns", recordedAt, isolation, stopProof: "unproven_isolated" };
+    failureCode: source.errorCode ?? null, delivery: "caller_owns", recordedAt, isolation, stopProof: "unproven_isolated",
+    retryIntentId: input.retryIntentId };
   const reconciliation = { runId: source.id, providerStopped: true, providerStopProof: "isolated",
     workspaceRepairEvidence: `The Retry of run ${source.id} starts in a new isolated workspace; no unverified files are applied.`,
     actorId: FRESH_CONTINUATION_ACTOR, recordedAt };
