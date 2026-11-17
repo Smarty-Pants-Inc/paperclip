@@ -86,9 +86,8 @@ describe("heartbeat warm sandbox failure settlement", () => {
     { status: "succeeded", errorCode: null },
   ] as const)("hands off a warm sandbox after $status/$errorCode without stopping or physically resuming it", async ({ status, errorCode }) => {
     const f = await seed();
-    await db.update(heartbeatRuns).set({ status, errorCode, finishedAt: new Date(),
-      ...(status === "cancelled" ? { resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-operator" } } : {}),
-    }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ status, errorCode, finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, f.runId));
     await f.heartbeat.releaseEnvironmentLeasesForRun({ runId: f.runId, companyId: f.companyId,
       agentId: f.agentId, status, providerResourceDisposition: "keep_running" });
     expect(await environmentService(db).getLeaseById(f.acquired.lease.id)).toMatchObject({ status: "retained", cleanupStatus: "success" });
