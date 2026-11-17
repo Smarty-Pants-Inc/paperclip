@@ -736,6 +736,21 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       else skippedRunIds.push(candidate.runId);
     };
 
+    // Native restart recovery claims from durable DB state (finalization row,
+    // checkpoint, custody), not from the shutdown snapshot. A missing snapshot
+    // is missing handoff inventory for such a run, not a lost run.
+    const missingSnapshotNativeIds = missingSnapshotRunIds.filter((runId) => {
+      const current = currentByRunId.get(runId);
+      return current?.run.status === "running" && current.run.runtimeMode === "native"
+        && current.adapterType === "paperclip_runner";
+    });
+    const durableNativeRunIds = new Set(
+      missingSnapshotNativeIds.length > 0
+        ? (await db.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
+          .where(inArray(nativeRunFinalizations.runId, missingSnapshotNativeIds))).map((row) => row.runId)
+        : [],
+    );
+
     for (const runId of missingSnapshotRunIds) {
       const current = currentByRunId.get(runId);
       if (!current) {
@@ -750,6 +765,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           "finalized_while_down",
           `run_status_${current.run.status}`,
         );
+      } else if (durableNativeRunIds.has(runId)) {
+        classify(candidate, "skipped", "native_restart_recovery_pending_missing_snapshot");
       } else {
         classify(candidate, "lost", "missing_shutdown_snapshot");
       }
@@ -759,6 +776,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       logger.error(
         { previousServerPid: intent.previousServerPid, lostRunIds },
         "hot-restart shutdown snapshot omitted live preflight runs; reporting them as lost",
+      );
+    }
+    if (durableNativeRunIds.size > 0) {
+      logger.warn(
+        { previousServerPid: intent.previousServerPid, nativeRecoveryPendingRunIds: [...durableNativeRunIds] },
+        "hot-restart shutdown snapshot omitted native runs with durable native state; native restart recovery owns them",
       );
     }
 
