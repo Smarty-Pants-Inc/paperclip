@@ -74,9 +74,29 @@ function runResult(summary: string): Record<string, unknown> {
 }
 
 describe("cut native text snapshots", () => {
-  it.each(["reasoning", "agentMessage"] as const)("preserves literal terminal markers outside the runner byte window for %s, including reload", kind => {
+  it.each((["reasoning", "agentMessage"] as const).flatMap(kind => [
+    { kind, shape: "ASCII", whole: "r".repeat(4354) },
+    { kind, shape: "multibyte", whole: "😀é" + "r".repeat(4348) },
+  ]))("keeps all 4,354 streamed bytes for bounded_text $shape $kind snapshots", ({ kind, whole }) => {
+    const body = Array.from(whole).slice(0, 3988).join("");
     const payload = { kind, channel: kind === "reasoning" ? "detail" : "final" };
-    for (const body of ["The literal marker is ", "r".repeat(4092), "r".repeat(4097), "é".repeat(4093)]) {
+    const completion = itemEvent(3, "item.completed", "bounded-1", { ...payload, text: body + "…[truncated]" });
+    const entries = nativeRunEventsToTranscript([
+      itemEvent(1, "item.delta", "bounded-1", { ...payload, text: whole.slice(0, 2000) }),
+      itemEvent(2, "item.delta", "bounded-1", { ...payload, text: whole.slice(2000) }), completion,
+    ]);
+    const items = transcriptToTaskChatItems(entries, { runId: RUN_ID, running: false });
+    const rendered = items.map(item => item.kind === "thinking" ? item.lines.join("\n") : item.kind === "message" ? item.text : "").join("");
+    expect(Buffer.byteLength(rendered)).toBe(4354);
+    expect(rendered).toBe(whole);
+    expect(JSON.stringify(entries)).not.toContain("[truncated]");
+    expect(nativeRunEventsToTranscript([completion])[0]).toMatchObject({ text: body +
+      `\n\nThe full ${kind === "reasoning" ? "thinking" : "response"} is kept in the run log.` });
+  });
+
+  it.each(["reasoning", "agentMessage"] as const)("preserves literal terminal markers outside both runner cut windows for %s, including reload", kind => {
+    const payload = { kind, channel: kind === "reasoning" ? "detail" : "final" };
+    for (const body of ["The literal marker is ", "r".repeat(3987), "r".repeat(3989), "é".repeat(3987), "é".repeat(3989), "😀".repeat(1994), "r".repeat(4092), "r".repeat(4097), "é".repeat(4093)]) {
       const value = body + "…[truncated]";
       const completion = itemEvent(2, "item.completed", "literal-1", { ...payload, text: value });
       for (const deltas of [[], [itemEvent(1, "item.delta", "literal-1", { ...payload, text: "An earlier draft" })]]) {
