@@ -11,6 +11,11 @@ import { ApiError } from "@/api/client";
 import { queryKeys } from "@/lib/queryKeys";
 import { CompanySettings } from "./CompanySettings";
 
+const costPolicy = vi.hoisted(() => ({ hidden: false }));
+vi.mock("../lib/cost-visibility", () => ({
+  get COST_BUDGET_UI_HIDDEN() { return costPolicy.hidden; },
+}));
+
 const mockCompaniesApi = vi.hoisted(() => ({
   update: vi.fn(),
   archive: vi.fn(),
@@ -140,6 +145,7 @@ describe("CompanySettings Decisions section", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     companyStore.set({ ...companyStore.initial });
+    costPolicy.hidden = false;
     mockAccessApi.listMembers.mockResolvedValue(MEMBERS);
     // Mirrors the server: the PATCH answers with the updated company, and the
     // refetch then carries it to the page.
@@ -181,7 +187,7 @@ describe("CompanySettings Decisions section", () => {
     });
     // Members fill the pickers before anyone can choose.
     await waitForAssertion(() => {
-      expect(getByLabelText("Budget owner").querySelectorAll("option")).toHaveLength(3);
+      expect(getByLabelText("Default decision owner").querySelectorAll("option")).toHaveLength(3);
     });
   }
 
@@ -225,6 +231,13 @@ describe("CompanySettings Decisions section", () => {
       (button) => button.textContent?.trim() === "Save changes",
     );
   }
+
+  it("hides the budget owner setting without hiding decision ownership", async () => {
+    costPolicy.hidden = true;
+    await render();
+    expect(container.textContent).not.toMatch(/budget/i);
+    expect(getByLabelText("Default decision owner")).toBeTruthy();
+  });
 
   it("names both owner selects with an associated label", async () => {
     await render();

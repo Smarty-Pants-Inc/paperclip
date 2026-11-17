@@ -930,8 +930,9 @@ describe("SidebarAgents", () => {
     const budgetPausedItem = Array.from(
       document.body.querySelectorAll('[data-slot="dropdown-menu-item"]'),
     )
-      .find((element) => element.textContent?.includes("Budget paused"));
+      .find((element) => element.textContent?.includes("Paused"));
     expect(budgetPausedItem).toBeTruthy();
+    expect(document.body.textContent).not.toContain("Budget");
 
     await act(async () => {
       budgetPausedItem?.dispatchEvent(new MouseEvent("click", { bubbles: true }));

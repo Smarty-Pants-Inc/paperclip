@@ -70,12 +70,16 @@ describe("AgentOverview", () => {
       </DialogProvider></QueryClientProvider>,
     );
 
-    for (const label of ["Activity", "Runs", "Costs", "Budget used", "Profile", "Skills", "Recent tasks"]) {
+    for (const label of ["Activity", "Runs", "Profile", "Skills", "Recent tasks"]) {
       expect(markup).toContain(label);
     }
-    for (const page of ["activity", "runs", "costs", "budgets"]) {
+    for (const page of ["activity", "runs"]) {
       expect(markup).toContain(`href="/agents/codexcoder/${page}"`);
     }
+    expect(markup).not.toContain("Costs");
+    expect(markup).not.toContain("Budget used");
+    expect(markup).not.toContain('/costs"');
+    expect(markup).not.toContain('/budgets"');
     expect(markup).toContain("2 enabled");
     expect(markup).toContain("Explore skills");
     expect(markup).toContain('href="/agents/codexcoder/skills"');

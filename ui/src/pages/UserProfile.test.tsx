@@ -144,6 +144,14 @@ describe("UserProfile", () => {
     return root;
   }
 
+  it("keeps tokens but hides all spend columns and hints", async () => {
+    const root = await render(profileFor("user-1"));
+    try {
+      expect(container.textContent).toContain("All-time tokens");
+      expect(container.textContent).not.toMatch(/Spend|spent|\$/);
+    } finally { await act(async () => root.unmount()); }
+  });
+
   it("offers an edit link on the viewer's own profile", async () => {
     const root = await render(profileFor("user-1"));
 

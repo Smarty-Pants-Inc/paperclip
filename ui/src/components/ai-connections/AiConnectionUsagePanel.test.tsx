@@ -35,7 +35,7 @@ it("checks only on demand and replaces a successful observation with a failed pr
   await vi.waitFor(() => expect(host.textContent).toContain("100% used"));
   expect(api.probeUsage).toHaveBeenCalledWith("company", "connection", "grant");
   expect(host.textContent).toContain("Limit reached");
-  expect(host.textContent).toContain("OverageOff");
+  expect(host.textContent).not.toContain("Overage");
   expect(host.textContent).not.toContain("remaining");
   expect(host.textContent).not.toContain("hour window");
   api.probeUsage.mockResolvedValue({ ...observation, status: "error", limits: [], overage: null, message: "The provider rate limited the usage check. Try again later." });
@@ -55,14 +55,23 @@ it("clears the prior account's snapshot when changing accounts", async () => {
 it("does not round almost-exhausted usage up to an exhausted allowance", async () => {
   api.probeUsage.mockResolvedValue({ status: "ok", checkedAt: "2026-10-02T12:00:00Z", overage: { balance: 0.00001, unit: "USD" },
     limits: [{ id: "five_hour", label: "5 hour limit", usedPercent: 99.99999, remainingPercent: 0.00001,
-      limitReached: false, allowed: null, windowDurationSeconds: 18000, resetsAt: null, limit: 1, remaining: 0.0000001, unit: "USD" }],
+      limitReached: false, allowed: null, windowDurationSeconds: 18000, resetsAt: null, limit: null, remaining: null, unit: "percent" }],
   });
   render(); click();
   await vi.waitFor(() => expect(host.textContent).toContain("99.99999% used"));
   expect(host.textContent).not.toContain("0.00001% remaining");
-  expect(host.textContent).toContain("— left");
-  expect(host.textContent).toContain("— cap");
+  expect(host.textContent).not.toMatch(/Overage|— left|— cap/);
   expect(host.textContent).not.toContain("Limit reached");
+});
+it("hides monetary usage windows and overage while preserving token quotas", () => {
+  const observation = { status: "ok", checkedAt: "2026-10-02T12:00:00Z", limits: [
+    { id: "money", label: "Spend limit", unit: "USD", used: 5, limit: 10, usedPercent: 50 },
+    { id: "cents", label: "Cents limit", unit: "cents", used: 500, limit: 1000, usedPercent: 50 },
+    { id: "tokens", label: "Token quota", unit: "tokens", used: 120, limit: 1000, usedPercent: 12 },
+  ], overage: { balance: 5, unit: "USD" } } as AiConnectionUsage;
+  flushSync(() => root.render(<QueryClientProvider client={client}><AiConnectionUsagePanel account={account} observation={observation} cachedOnly /></QueryClientProvider>));
+  expect(host.textContent).not.toMatch(/Spend limit|Cents limit|Overage|\$|—/);
+  expect(host.textContent).toContain("120 tokens / 1,000 tokens used");
 });
 it("explains unsupported methods and disables checks for a revoked grant", () => {
   render({ ...account, method: "api_key" });
@@ -81,7 +90,7 @@ it("keeps provider admission and unknown overage availability distinct from exha
   render(); click();
   await vi.waitFor(() => expect(host.textContent).toContain("Limit reached · Usage allowed"));
   expect(host.textContent).toContain("Plan usage · Primary · 5h");
-  expect(host.textContent).toContain("On · Availability unknown");
+  expect(host.textContent).not.toContain("Overage");
   expect(host.textContent).not.toContain("Provider denies");
 });
 it("shows explicit denial and distinguishes equal-duration provider windows", async () => {

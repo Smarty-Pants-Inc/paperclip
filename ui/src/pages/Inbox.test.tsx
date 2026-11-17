@@ -447,6 +447,19 @@ describe("Inbox toolbar", () => {
     container.remove();
   });
 
+  it("hides the aggregate budget alert while retaining non-money alerts", async () => {
+    routerMock.location.pathname = "/inbox/all";
+    apiMocks.dashboardSummary.mockResolvedValue({ agents: { error: 2 }, costs: { monthBudgetCents: 10000, monthUtilizationPercent: 95 } });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    const root = createRoot(container);
+    try {
+      await act(async () => root.render(<QueryClientProvider client={client}><Inbox /></QueryClientProvider>));
+      await vi.waitFor(() => expect(container.textContent).toContain("agents have"));
+      expect(container.textContent).not.toContain("Budget at");
+      expect(container.querySelector('a[href="/costs"]')).toBeNull();
+    } finally { act(() => root.unmount()); client.clear(); }
+  });
+
   it.each([
     { tab: "mine", userId: "user-1", visible: ["own-failure"], hidden: ["other-failure", "unowned-failure"] },
     { tab: "mine", userId: "user-2", visible: ["other-failure"], hidden: ["own-failure", "unowned-failure"] },

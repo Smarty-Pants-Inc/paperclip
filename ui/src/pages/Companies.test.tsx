@@ -123,6 +123,14 @@ describe("Companies page", () => {
     }
   });
 
+  it("shows no organization spend or budget summary", async () => {
+    const root = await renderPage();
+    try {
+      expect(container.textContent).toContain("Acme Labs");
+      expect(container.textContent).not.toMatch(/spend|spent|budget/i);
+    } finally { act(() => root.unmount()); }
+  });
+
   it("offers the company wizard when self-hosted", async () => {
     const root = await renderPage();
 
