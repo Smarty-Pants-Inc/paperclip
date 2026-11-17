@@ -10,12 +10,14 @@ import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { heldRetryOffersRetry, heldTaskRetryRefusals } from "./task-retry-eligibility.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
-import { EXECUTION_RECONCILIATION_CAUSES, readRunFailureCause, withoutSqlStatementText, type ExecutionBlocker } from "@paperclipai/shared";
+import { EXECUTION_RECONCILIATION_CAUSES, readRunFailureCause, WORKSPACE_RESTORE_DELAYED_TEXT, withoutSqlStatementText,
+  type ExecutionBlocker } from "@paperclipai/shared";
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA, nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { unreconciledNativeExportPredicate } from "./native-runtime/native-workspace-reconstruction.js";
 import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
-import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, recoveredWorkMessage, savedWorkOffersRetry, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
+import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, recoveredWorkMessage, savedWorkOffersRetry, workspaceRecoveryDisplay,
+  workspaceRestoreDelayed } from "./workspace-recovery-receipt.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
@@ -444,7 +446,10 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   // hold to protect its files. Offer the same Retry that admission accepts, so
   // an infrastructure failure (such as a restart) is not left to a new message.
   // An intentional Stop keeps "send a new message" as its only continuation.
-  const recoveredFailure = Boolean(restoreHold && savedWorkOffersRetry(workspaceRecoveryState, run?.status, workspaceRepairRequired, action.evidence));
+  const recoveredFailure = Boolean(restoreHold && savedWorkOffersRetry(workspaceRecoveryState, run?.status, workspaceRepairRequired,
+    action.evidence, action.createdAt));
+  // The person bound: the same delayed state the run projection reports.
+  const restoreDelayed = Boolean(restoreHold && workspaceRestoreDelayed(workspaceRecoveryState, action.evidence, action.createdAt));
   const canRetry = Boolean((!restoreHold || recoveredFailure) && run && conversation?.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(conversation.status) && await canRetryStoppedRun(db, run));
   const runError = run && canRetry && isPreDispatchReviewWait(run)
@@ -471,6 +476,8 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   const retryOffered = canRetry && (!chatBinding || recoveredFailure) && heldRetryOffersRetry(heldRefusal);
   const workspaceRecovery = workspaceRecoveryState?.status === "recovered"
     ? { ...workspaceRecoveryState, message: recoveredWorkMessage(run?.status, retryOffered) }
+    : restoreDelayed && workspaceRecoveryState ? { ...workspaceRecoveryState, canRetry: retryOffered,
+      message: retryOffered ? WORKSPACE_RESTORE_DELAYED_TEXT : workspaceRecoveryState.message }
     : workspaceRecoveryState && { ...workspaceRecoveryState, canRetry: workspaceRecoveryState.canRetry && retryOffered };
   let nextAction = action.status === "active" && action.cause === EXECUTION_FINALIZATION_DEADLINE_EXCEEDED
     ? EXECUTION_FINALIZATION_DEADLINE_MESSAGE : action.nextAction;

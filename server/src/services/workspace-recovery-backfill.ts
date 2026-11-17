@@ -1,6 +1,29 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, heartbeatRuns, issues, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { adoptSystemRecovery, unadoptedWorkspaceRecoveryCondition } from "./system-recovery.js";
+import { createSystemRecovery, exhaustedSystemRecoveryAction } from "./system-recovery-state.js";
+
+/** An adoption that throws this many times is exhausted with a recorded cause,
+ * so the card reads failed + Retry and the due-now loop stops (restore-card6). */
+export const SYSTEM_RECOVERY_ADOPTION_MAX_FAILURES = 5;
+
+async function recordAdoptionFailure(db: Db, action: typeof issueRecoveryActions.$inferSelect) {
+  const failures = (typeof action.evidence.systemRecoveryAdoptionFailures === "number"
+    ? action.evidence.systemRecoveryAdoptionFailures : 0) + 1;
+  const runId = String(action.evidence.runId);
+  const exhausted = failures >= SYSTEM_RECOVERY_ADOPTION_MAX_FAILURES ? { ...createSystemRecovery(runId), state: "exhausted" as const,
+    failure: { code: "effect_unresolved" as const, retryClass: "service_required" as const, evidenceFingerprint: "adoption_failed",
+      cause: { label: "adoption_failed", code: null, status: null } } } : null;
+  const handoff = exhausted ? exhaustedSystemRecoveryAction(exhausted, action.evidence) : null;
+  await db.update(issueRecoveryActions).set({
+    ...(exhausted ? { ownerType: "board", ownerAgentId: null, ownerUserId: null, nextAction: handoff! } : {}),
+    evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({ systemRecoveryAdoptionFailures: failures,
+      ...(exhausted ? { systemRecovery: exhausted, workspaceRecovery: { schema: "paperclip.workspace-recovery.v1", runId,
+        status: "blocked", stage: "verifying_stop", attempt: 0, attemptLimit: 6, requestIds: [], retryable: true, message: handoff } } : {}) })}::jsonb`,
+    updatedAt: new Date(),
+  }).where(and(eq(issueRecoveryActions.companyId, action.companyId), eq(issueRecoveryActions.id, action.id),
+    sql`not (${issueRecoveryActions.evidence} ? 'systemRecovery')`));
+}
 import { terminalWorkspaceRunStates, workspaceExportCauses } from "./workspace-recovery-source.js";
 
 /** Progress lives on each source, so restarts and additional servers neither
@@ -8,9 +31,17 @@ import { terminalWorkspaceRunStates, workspaceExportCauses } from "./workspace-r
 export async function adoptHistoricalWorkspaceRecoveries(db: Db) {
   const rows = await db.select().from(issueRecoveryActions).where(unadoptedWorkspaceRecoveryCondition())
     .orderBy(asc(issueRecoveryActions.id)).limit(50);
-  for (const action of rows) await adoptSystemRecovery(db, {
-    companyId: action.companyId, issueId: action.sourceIssueId, actionId: action.id, runId: String(action.evidence.runId),
-  });
+  for (const action of rows) {
+    try {
+      await adoptSystemRecovery(db, {
+        companyId: action.companyId, issueId: action.sourceIssueId, actionId: action.id, runId: String(action.evidence.runId),
+      });
+    } catch {
+      // Counted on the action; one row that always throws no longer stops the
+      // other rows or keeps the worker due now forever.
+      await recordAdoptionFailure(db, action);
+    }
+  }
   const remaining = 50 - rows.length;
   if (remaining === 0) return rows.length;
   // Both branches use durable indexed candidate identities. The lease branch

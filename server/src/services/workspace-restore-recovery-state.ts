@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm";
 import { heartbeatRuns } from "@paperclipai/db";
-import { hasWorkspaceRestoreFailure, WORKSPACE_RESTORE_PENDING_KEY } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, WORKSPACE_RESTORE_PENDING_KEY, WORKSPACE_RESTORE_PERSON_BOUND_MS } from "@paperclipai/shared";
 
 export const LEGACY_WORKSPACE_RECOVERY_KEY = "workspaceRestoreRecovery";
 export const LEGACY_WORKSPACE_RECOVERY_SCHEMA = "paperclip.workspace-restore-recovery.v1";
@@ -51,9 +51,20 @@ const runRestoreHoldStatusSql = sql`(select hold.evidence #>> '{workspaceRecover
   order by (hold.evidence #>> '{workspaceRecovery,status}' = 'recovered') desc, hold.updated_at desc
   limit 1)`;
 const runOwesRestoreSql = sql`${heartbeatRuns.resultJson} -> '${sql.raw(WORKSPACE_RESTORE_PENDING_KEY)}' = 'true'::jsonb`;
-/** Projection of the run's owed fact: still in progress (no terminal hold state). */
-export const workspaceRestorePendingProjectionSql = sql`case when ${runOwesRestoreSql}
-  and coalesce(${runRestoreHoldStatusSql}, 'queued') in ('queued', 'recovering') then to_jsonb(true) end`;
+/** When the run's hold was written (the earliest action for this run). */
+const runRestoreHoldWrittenSql = sql`(select min(hold.created_at) from issue_recovery_actions hold
+  where hold.company_id = ${heartbeatRuns.companyId} and hold.evidence ->> 'runId' = ${heartbeatRuns.id}::text)`;
+const runRestoreInProgressSql = sql`${runOwesRestoreSql}
+  and coalesce(${runRestoreHoldStatusSql}, 'queued') in ('queued', 'recovering')`;
+/** Past the person bound (WORKSPACE_RESTORE_PERSON_BOUND_MS after the hold was written). */
+const runRestorePastBoundSql = sql`coalesce(${runRestoreHoldWrittenSql}, ${heartbeatRuns.updatedAt})
+  < now() - make_interval(secs => ${WORKSPACE_RESTORE_PERSON_BOUND_MS / 1000})`;
+/** Projection of the run's owed fact: still in progress (no terminal hold state), within the person bound. */
+export const workspaceRestorePendingProjectionSql = sql`case when ${runRestoreInProgressSql}
+  and not (${runRestorePastBoundSql}) then to_jsonb(true) end`;
+/** Projection: still in progress past the person bound; the person may Retry. */
+export const workspaceRestoreDelayedProjectionSql = sql`case when ${runRestoreInProgressSql}
+  and ${runRestorePastBoundSql} then to_jsonb(true) end`;
 /** Projection of the run's owed fact once the worker recovered the files. */
 export const workspaceRestoreRecoveredProjectionSql = sql`case when ${runOwesRestoreSql}
   and ${runRestoreHoldStatusSql} = 'recovered' then to_jsonb(true) end`;
