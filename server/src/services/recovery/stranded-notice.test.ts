@@ -387,6 +387,25 @@ it("names a remote Runner that was still not updated after its retries", () => {
   expect(JSON.stringify(notice.metadata)).toContain("remote Runner received the update");
 });
 
+// B fix (i): a chat whose saved backup failed the real verifier gets ONE
+// true instruction; the card body and its next action say the same thing.
+it("tells the person the one true thing when a chat's saved box could not be restored", () => {
+  const instruction = "This chat's saved box couldn't be restored. Nothing was deleted; the old box is kept. Press Retry.";
+  const notice = buildStrandedRecoveryEscalationNotice({
+    seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
+    recoveryActionId: "backup-recovery",
+    recoveryOwner: null,
+    sourceRun: { id: "failed-run", status: "failed", errorCode: "reusable_sandbox_backup_unrestorable" },
+  });
+  expect(notice.body).toBe(instruction);
+  expect(notice.presentation.title).toBe("Saved chat could not be restored");
+  const nextAction = allRows(notice.metadata).find(row => row.label === "Next action");
+  expect(nextAction?.value).toBe(instruction);
+  const text = JSON.stringify(notice);
+  expect(text).not.toContain("did not start the saved sandbox in time");
+  expect(text).not.toContain("tries again automatically");
+});
+
 it("names the managed AI connection a plugin Runner-task environment requires", () => {
   const notice = buildConfigurationIncompleteRecoveryNoticeSeed({ reason: "ai_connection_required" });
   expect(notice.title).toBe("AI connection required");

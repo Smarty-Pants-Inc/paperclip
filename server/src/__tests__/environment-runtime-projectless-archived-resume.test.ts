@@ -428,6 +428,21 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
     const namesKeptBox = (params: unknown) => JSON.stringify(params ?? null).includes(`"providerLeaseId":"${BOX}"`);
     expect(next.call.mock.calls.filter(([, , params]) => namesKeptBox(params))).toEqual([]);
     expect(next.call.mock.calls.filter(([, method]) => method === "environmentAcquireLease")).toHaveLength(0);
+
+    // Even when the new box is gone too, the kept box is not a candidate: the
+    // next run gets a new box and still never names the kept one.
+    await db.update(environmentLeases).set({ status: "expired" }).where(eq(environmentLeases.providerLeaseId, "bx_new"));
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, nextRunId));
+    const thirdRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: thirdRunId, companyId: seeded.companyId, agentId: seeded.agentId,
+      invocationSource: "assignment", status: "running" });
+    const third = worker(seeded, async () => ({ providerLeaseId: BOX, metadata: { remoteCwd: "/home/boat/paperclip-workspace" } }));
+    const fresh = await third.runtime.acquireRunLease({ companyId: seeded.companyId, environment: seeded.environment,
+      issueId: seeded.issueId, agentId: seeded.agentId, adapterType: "paperclip_runner", heartbeatRunId: thirdRunId,
+      persistedExecutionWorkspace: null });
+    expect(fresh.lease.providerLeaseId).toBe("bx_new");
+    expect(third.call.mock.calls.filter(([, , params]) => namesKeptBox(params))).toEqual([]);
+    expect(third.call.mock.calls.filter(([, method]) => method === "environmentResumeLease")).toHaveLength(0);
     const kept = await environmentService(db).getLeaseById(seeded.lease.id);
     expect(kept).toMatchObject({ status: "retained", providerLeaseId: BOX, cleanupStatus: null, heartbeatRunId: seeded.previousRunId });
   });
