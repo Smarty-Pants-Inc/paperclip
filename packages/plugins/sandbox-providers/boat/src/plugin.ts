@@ -409,12 +409,13 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
   let httpStatus: number | null = null;
   let signal: AbortSignal | undefined;
   let boat409: Boat409Fields | undefined;
+  let archivingCommandConflict = false;
   // F-04 (boat-commands-table.md lines 12-18; boat-command-history.md line 18):
   // a POST /commands whose send was under way when it failed, or that Boat
   // answered with a 5xx other than 'did not run', possibly ran. It is never sent
   // again; it surfaces as boat_command_possibly_ran with history evidence.
-  const commandSend = (init.method ?? "GET").toUpperCase() === "POST" && /^\/sandboxes\/[^/?]+\/commands$/.test(path)
-    && responseOptions.intent !== "idempotent_probe";
+  const commandCall = (init.method ?? "GET").toUpperCase() === "POST" && /^\/sandboxes\/[^/?]+\/commands$/.test(path);
+  const commandSend = commandCall && responseOptions.intent !== "idempotent_probe";
   let commandInFlight = false;
   let possiblyRan: PossiblyRanReason | undefined;
   let attemptCommand: string | undefined;
@@ -500,6 +501,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       category = "network_error";
       httpStatus = null;
       boat409 = undefined;
+      archivingCommandConflict = false;
       direct = undefined;
       // F-04: this send's own nonce, a shell no-op at the START of the command text
       // (Boat's history keeps the first 64 KiB of it: boat-command-history.md line 41).
@@ -537,9 +539,18 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       if (response.status === 409) {
         category = "http_error";
         boat409 = boat409Fields(await response.clone().json().catch(() => null));
+        // F-04C: readiness.md:21-22 refuses archiving/archived commands, but
+        // neither it nor commands-table.md:13-16 names an archiving-specific
+        // code/body. The observed 409 has no known code. An unreadable state
+        // is NOT permission to resend; only an explicit probe may observe it.
+        archivingCommandConflict = commandCall && boat409.boatCode !== "snapshot_data_expired" && (
+          ["archiving", "archived", "stopping", "stopped"].includes(boat409.boatState ?? "") ||
+          (boat409.boatState === undefined && !["sandbox_starting", "sandbox_stopping"].includes(boat409.boatCode ?? ""))
+        );
         const resend = await boat409Resend(config, path, method, allocation ? decodeURIComponent(allocation) : undefined, boat409, {
           attempt, maxSends, deadline, callSignal, retryAfter: response.headers.get("Retry-After"),
           commandOrFilesCall: commandOrFilesCall && !isStreamBody, resumeCall, sendGuard,
+          archivingCommand: archivingCommandConflict, idempotentProbe: responseOptions.intent === "idempotent_probe" && !isStreamBody,
           resumeRecoveryUsed, useResumeRecovery: () => { resumeRecoveryUsed = true; },
         });
         if (resend === false) break;
@@ -646,7 +657,16 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     // failure; our own call deadline is ETIMEDOUT. The failure itself is dropped.
     const code = httpStatus !== null && httpStatus >= 400 ? undefined
       : isOwnDeadline(error, signal) ? "ETIMEDOUT" : closedTransportCode(error);
-    throw requestError(config, init.method ?? "GET", path, httpStatus, category, code, boat409, direct);
+    const failure = requestError(config, init.method ?? "GET", path, httpStatus, category, code, boat409, direct);
+    if (archivingCommandConflict) {
+      // A definite 409 refusal is not possibly-ran. Do not repeat arbitrary
+      // commands here. Preserve a named, closed transient across RPC via the
+      // REAL server resume predicate's 'state change in progress' phrase.
+      failure.message += " (state change in progress)";
+      if (failure.stack) failure.stack = failure.stack.replace("\n", " (state change in progress)\n");
+      Object.assign(failure, { code: "boat_sandbox_state_transition" });
+    }
+    throw failure;
   }
 }
 /**
@@ -663,6 +683,11 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
  *   once per resume; then the call is retried once.
  * - sandbox_stopping (troubleshooting: the resume answer carries Retry-After;
  *   'Wait that many seconds ... Then run the same resume again'): resume only.
+ * - F-04C archiving/archived command refusal (including a missing/unknown code
+ *   or unreadable state): ONLY an explicit idempotent_probe may observe the
+ *   stop, wait until archived, resume, wait ready, then resend. Arbitrary
+ *   commands surface a named transient instead. readiness.md:93 and
+ *   troubleshooting-409.md:57 say wait for stopped before retrying a resume.
  * - Anything else is surfaced as is: snapshot_data_expired
  *   (https://docs.boat.dev/troubleshooting.md, section '409 snapshot_data_expired':
  *   'Resume, fork and a saved snapshot save of this sandbox fail. You cannot get
@@ -671,8 +696,42 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
 async function boat409Resend(config: Config, path: string, method: string, id: string | undefined, fields: Boat409Fields, call: {
   attempt: number; maxSends: number; deadline: number; callSignal: AbortSignal; retryAfter: string | null;
   commandOrFilesCall: boolean; resumeCall: boolean; sendGuard: () => void; resumeRecoveryUsed: boolean; useResumeRecovery: () => void;
+  archivingCommand: boolean; idempotentProbe: boolean;
 }): Promise<number | false> {
   if (call.callSignal.aborted || call.attempt >= call.maxSends || !id) return false;
+  const resume = async (signal = call.callSignal): Promise<boolean> => {
+    // Shared with the existing not-ready recovery: one resume send, followed
+    // by ready observations, all bound to the ORIGINAL admission/deadline.
+    try {
+      await request(config, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", signal,
+        body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(config), ...(config.boatEnvironment === undefined ? { noEnv: true } : {}) }) },
+      false, { maxSends: 1, deadline: call.deadline, sendGuard: call.sendGuard });
+      await waitReady(config, id, true, { signal, deadline: call.deadline, sendGuard: call.sendGuard });
+      return true;
+    } catch { return false; }
+  };
+  if (call.archivingCommand) {
+    // Boat never retries commands automatically (command-history.md:18).
+    // This opt-in is intent, NOT shell-text inference, and does not promote a
+    // server-owned supervision command to a probe. No new worker idle poller:
+    // only a refused call's bounded transition observation (readiness.md:89-93).
+    if (!call.idempotentProbe || call.resumeRecoveryUsed || call.attempt + 2 > call.maxSends) return false;
+    call.useResumeRecovery();
+    // The command's signal can outlast its 30 s request budget. Bound actual
+    // fetches too, not just the observation cadence and next-send guard.
+    const signal = AbortSignal.any([call.callSignal, AbortSignal.timeout(Math.max(1, call.deadline - Date.now()))]);
+    while (Date.now() < call.deadline) {
+      const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, { signal }, false,
+        { maxSends: 1, deadline: call.deadline, sendGuard: call.sendGuard, requireJson: true });
+      call.sendGuard(); // a late response cannot authorize a resume
+      const sandbox = result?.sandbox ?? result;
+      assertSandboxId(sandbox, id);
+      if (["archived", "stopped"].includes(sandbox.state)) return await resume(signal) ? 1 : false;
+      if (!["archiving", "stopping"].includes(sandbox.state)) return false;
+      await delay(Math.min(500, Math.max(0, call.deadline - Date.now())), undefined, { signal });
+    }
+    return false;
+  }
   const route = path.replace(/^\/sandboxes\/[^/?]+/, "/sandboxes/{sandboxId}").replace(/\?.*$/, "");
   const log = (action: string) => duplexLogger?.warn("Boat API 409", { method, route, attempt: `${call.attempt}/${call.maxSends}`, action, ...fields });
   if (fields.boatCode === "sandbox_starting" && call.commandOrFilesCall) {
@@ -692,17 +751,7 @@ async function boat409Resend(config: Config, path: string, method: string, id: s
       log("resume_again");
       // F-01: every send of the recovery (the resume and each ready poll) runs
       // this call's admission and box lifecycle check first.
-      const guard = call.sendGuard;
-      ours.recovery = (async () => {
-        try {
-          await request(config, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", signal: call.callSignal,
-            body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(config), ...(config.boatEnvironment === undefined ? { noEnv: true } : {}) }) },
-          false, { maxSends: 1, deadline: call.deadline, sendGuard: guard });
-          await waitReady(config, id, true, { signal: call.callSignal, deadline: call.deadline, sendGuard: guard });
-          return true;
-        } catch { return false; }
-        finally { ours.settled = true; }
-      })();
+      ours.recovery = resume().finally(() => { ours.settled = true; });
     }
     return await ours.recovery ? 1 : false;
   }

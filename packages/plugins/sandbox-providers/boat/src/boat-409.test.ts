@@ -51,6 +51,9 @@ function fakeBoat(script: { commands?: Reply[]; files?: Reply[]; resume?: Reply[
 }
 const resume = () => plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: id });
 const execute = (extra: Record<string, unknown> = {}) => plugin.definition.onEnvironmentExecute!({ ...scope, lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000, ...extra } as any);
+// F-04C: only explicit repeatable probes retain archive resume/resend; arbitrary
+// execute is covered by boat-archiving R2 and must surface a transient instead.
+const probe = () => plugin.definition.onEnvironmentRealizeWorkspace!({ ...scope, lease: { providerLeaseId: id }, workspace: { remotePath: "/home/user/409" } } as any);
 function assertClosed(error: Error) {
   expect(Object.hasOwn(error, "cause")).toBe(false);
   for (const value of [String(error), error.message, error.stack, JSON.stringify(Object.getOwnPropertyDescriptors(error))]) {
@@ -84,7 +87,7 @@ describe("#20974 (a) a Boat 409 keeps only its closed code, state and retryable"
     expect(odd).toMatchObject({ status: 409, boatCode: "other" });
     expect(odd.boatState).toBeUndefined();
     expect(odd.boatRetryable).toBeUndefined();
-    expect(odd.message).toBe(`Boat POST /sandboxes/${id}/commands failed (409): http_error [boat 409 code=other]`);
+    expect(odd.message).toBe(`Boat POST /sandboxes/${id}/commands failed (409): http_error [boat 409 code=other] (state change in progress)`);
     assertClosed(odd);
   });
 });
@@ -116,7 +119,7 @@ describe("#20974 (b) documented 409 handling inside the call's bounded budget", 
     await expect(resume()).resolves.toMatchObject({ providerLeaseId: id });
     expect(boat.count("POST", "/resume")).toBe(1);
     boat.setState("archived");
-    await expect(execute()).resolves.toMatchObject({ exitCode: 0, stdout: "ran" });
+    await expect(probe()).resolves.toMatchObject({ cwd: "/home/user/409" });
     expect(boat.count("POST", "/resume")).toBe(2);
     expect(boat.count("POST", "/commands")).toBe(2);
     // The second resume comes before the retried command, and readiness is observed between them.
@@ -136,11 +139,12 @@ describe("#20974 (b) documented 409 handling inside the call's bounded budget", 
     const notRunning = conflict("machine_not_running", { state: "archived", retryable: false });
     const boat = fakeBoat({ commands: [notRunning, notRunning, notRunning] });
     await resume();
-    const first = await execute().catch(e => e);
+    boat.setState("archived");
+    const first = await probe().catch(e => e);
     expect(first).toMatchObject({ status: 409, boatCode: "machine_not_running", boatState: "archived", boatRetryable: false });
     expect(boat.count("POST", "/resume")).toBe(2);
     expect(boat.count("POST", "/commands")).toBe(2);
-    const later = await execute().catch(e => e);
+    const later = await probe().catch(e => e);
     expect(later).toMatchObject({ status: 409, boatCode: "machine_not_running" });
     expect(boat.count("POST", "/resume")).toBe(2);
     expect(boat.count("POST", "/commands")).toBe(3);
