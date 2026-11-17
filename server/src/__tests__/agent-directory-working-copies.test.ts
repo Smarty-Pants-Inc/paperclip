@@ -87,6 +87,9 @@ describe("persistent agent directories", () => {
     }
   });
   beforeEach(async () => {
+    // Fixture isolation: a test that swapped in a service with a mocked
+    // environment runtime must not hand it (or its transports) to the next.
+    copies = agentInstructionWorkingCopyService(db);
     companyId = randomUUID(); agentId = randomUUID(); userId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Instruction tests", issuePrefix: randomUUID().slice(0, 8) });
     await db.insert(authUsers).values({ id: userId, name: "Editor", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
@@ -99,6 +102,17 @@ describe("persistent agent directories", () => {
     await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: userId, permissionKey: "agents:configure", scope: { agentIds: [agentId] } });
     await fs.mkdir(path.dirname(path.join(root, entryFile)), { recursive: true });
     await fs.writeFile(path.join(root, entryFile), initial);
+  });
+  // Fixture isolation: every test owns a fresh company. When it ends, retire
+  // that company's working copies and leases, so a later test's UNSCOPED
+  // recovery/cleanup sweep (with its own runtime mock) never acts on them,
+  // e.g. a remote rm -rf of an earlier test's Boat sandbox once its 30 s
+  // retry comes due. Order and suite load no longer decide a result.
+  afterEach(async () => {
+    const owner = companyId;
+    await db.update(agentInstructionWorkingCopies).set({ state: "saved", processStoppedAt: new Date(), nextAttemptAt: null,
+      receipt: { schema: "paperclip.agent-files.v1", cleanupPending: false } }).where(eq(agentInstructionWorkingCopies.companyId, owner));
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() }).where(eq(environmentLeases.companyId, owner));
   });
 
   gitExclusionRetryContract(async (runId, executionTarget) => {
@@ -622,15 +636,6 @@ describe("persistent agent directories", () => {
         let waiting: ((pid: number) => void) | null = null;
         runnerd.stdout!.setEncoding("utf8").on("data", (chunk: string) => { for (const line of chunk.split("\n").filter(Boolean)) { childPids.push(Number(line)); waiting?.(Number(line)); } });
         onTestFinished(() => { runnerd.kill("SIGTERM"); });
-        // Fixture isolation: retire THIS fixture's remote owners when the test
-        // ends, so a later test's unscoped recovery/cleanup sweep (with its own
-        // runtime mock) never reaches into this Boat sandbox and runs rm -rf.
-        const fixtureCompanyId = companyId;
-        onTestFinished(async () => {
-          await db.update(agentInstructionWorkingCopies).set({ state: "saved", processStoppedAt: new Date(), nextAttemptAt: null,
-            receipt: { schema: "paperclip.agent-files.v1", cleanupPending: false } }).where(eq(agentInstructionWorkingCopies.companyId, fixtureCompanyId));
-          await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() }).where(eq(environmentLeases.companyId, fixtureCompanyId));
-        });
         const nextChild = () => new Promise<number>(resolve => { waiting = pid => { waiting = null; resolve(pid); }; });
         const providerPid = childPids[0] ?? await nextChild();
         void providerPid;
