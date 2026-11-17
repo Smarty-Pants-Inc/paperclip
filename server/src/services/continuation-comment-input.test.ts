@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "./continuation-comment-input.js";
 import { claimFirstTurnQueuedInput } from "./native-runtime/first-turn-queued-input.js";
+import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
+import { requestTaskRetry } from "./task-retry.js";
+import { heartbeatService } from "./heartbeat.js";
 
 // DREA-31 / data safety: exercise persisted input and answer attribution, not SQL text.
 const support = await getEmbeddedPostgresTestSupport();
@@ -81,5 +84,105 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     expect(await pendingContinuationCommentInput(db, { ...f, contextSnapshot: { issueId: f.issueId, wakeReason: "issue_assigned" } })).toEqual({});
     // No source run is an initial assignment, not a comment continuation.
     expect(await readContinuationCommentInput(db, { ...f, runId: null })).toEqual({});
+  });
+  // H3 (A), RFL verdict: the ONE shared seam carries a person's answer for every caller.
+  async function answeredFixture() {
+    const [c] = await db.insert(companies).values({ name: "SRA", issuePrefix: "SRA" + randomUUID().slice(0, 5) }).returning();
+    const [a] = await db.insert(agents).values({ companyId: c.id, name: "Question owner", adapterType: "process" }).returning();
+    const [b] = await db.insert(agents).values({ companyId: c.id, name: "Foreign agent", adapterType: "process" }).returning();
+    const [i, j] = await db.insert(issues).values([{ companyId: c.id, title: "This task", status: "in_progress", assigneeAgentId: a.id },
+      { companyId: c.id, title: "Other task", assigneeAgentId: a.id }]).returning();
+    const [m] = await db.insert(issueComments).values({ companyId: c.id, issueId: i.id, authorType: "user", authorUserId: "board", body: "Old asking turn" }).returning();
+    const base = { companyId: c.id, issueId: i.id, kind: "ask_user_questions", status: "answered", createdByAgentId: a.id, resolvedByUserId: "board",
+      resolvedAt: new Date(), title: "Continue?", payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", required: true, selectionMode: "single",
+        options: [{ id: "yes", label: "YES" }] }] }, result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }], summaryMarkdown: "YES" } };
+    const [good, foreign, other, pending, stale, agentResolved] = await db.insert(issueThreadInteractions).values([
+      { ...base, idempotencyKey: randomUUID() }, { ...base, idempotencyKey: randomUUID(), createdByAgentId: b.id },
+      { ...base, idempotencyKey: randomUUID(), issueId: j.id },
+      { ...base, idempotencyKey: randomUUID(), status: "pending", resolvedByUserId: null, resolvedAt: null, result: null },
+      { ...base, idempotencyKey: randomUUID(), status: "expired", result: { outcome: "stale_target" } },
+      { ...base, idempotencyKey: randomUUID(), resolvedByUserId: null, resolvedByAgentId: b.id },
+    ] as never).returning();
+    const context = { issueId: i.id, interactionId: good.id, interactionIds: [good.id, foreign.id, other.id, pending.id, stale.id, agentResolved.id, "bad-id"],
+      wakeCommentId: m.id, wakeCommentIds: [m.id] };
+    const [r] = await db.insert(heartbeatRuns).values({ companyId: c.id, agentId: a.id, nativeIssueId: i.id, status: "failed", runtimeMode: "native",
+      responsibleUserId: "board", contextSnapshot: context, finishedAt: new Date() }).returning();
+    return { companyId: c.id, issueId: i.id, agentId: a.id, runId: r.id, contextSnapshot: context, good, m, r };
+  }
+  /** The successor's built input holds the answer and does not re-request the old turn. */
+  function expectAnswerSeed(context: unknown, f: Awaited<ReturnType<typeof answeredFixture>>) {
+    expect(context).toMatchObject({ interactionIds: [f.good.id], interactionId: f.good.id });
+    const seed = context as Record<string, unknown>;
+    expect([seed.wakeCommentId, seed.commentId, ...((seed.wakeCommentIds as unknown[] | undefined) ?? [])]).not.toContain(f.m.id);
+  }
+
+  // The judge's third test (rfl-sra judge-carry.test.ts), name kept.
+  it("direct pendingContinuationCommentInput path must carry the answer, not just the asking comment", async () => {
+    const f = await answeredFixture(); const actual = await pendingContinuationCommentInput(db, f);
+    console.log("SRA_DIRECT_PENDING_ACTUAL", JSON.stringify(actual));
+    expect(actual).toMatchObject({ interactionIds: [f.good.id] });
+    expect(actual.wakeCommentIds).toBeUndefined();
+  });
+
+  // (i) immediate recovery by execution reconciliation: production entry is
+  // execution-recovery-resolution.ts (fresh successor seed from readContinuationCommentInput
+  // with the reconciled source run id), which now only delegates to the shared seam.
+  it("an execution-reconciliation successor seeds from the person's answer, not the asking turn", async () => {
+    const f = await answeredFixture();
+    expectAnswerSeed(await readContinuationCommentInput(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId }), f);
+  });
+
+  // (ii) review / watchdog recovery: production entry is the wake-queue Postgres port
+  // (adapters/postgres.ts pendingContinuationCommentInput, which use-cases.ts seeds the
+  // fresh continuation recovery from; queueReviewParticipantRecoveryRun; queueImmediateRecoveryRun).
+  it("review and watchdog recovery successors seed from the person's answer, not the asking turn", async () => {
+    const f = await answeredFixture();
+    // The finishing run (e.g. a reviewer's) ended while the task still needs it; the
+    // wake-queue port is entered under the task lock as run finalization does.
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    const adapter = createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: async () => "board", getRoutineEnv: async () => ({}),
+      resolveSessionBeforeForWakeup: async () => null } as never);
+    const recoveryAgent = { id: f.agentId, name: "Question owner" } as never;
+    const seeds: Record<string, unknown> = {};
+    const released = await adapter.withIssueExecutionLock({ companyId: f.companyId, runId: f.runId, now: new Date() }, async (locked, { transaction }) => {
+      // The adapter's own trusted snapshots of the finishing run and its task (as use-cases.ts receives them).
+      const issue = locked.primaryIssue!, finishingRun = locked.run;
+      seeds.continuation = await transaction.pendingContinuationCommentInput({ companyId: finishingRun.companyId, issueId: issue.id,
+        agentId: finishingRun.agentId, contextSnapshot: finishingRun.contextSnapshot });
+      const review = await transaction.queueReviewParticipantRecoveryRun({ companyId: f.companyId, issue, finishingRun,
+        recoveryAgent, sessionBefore: null, now: new Date() });
+      seeds.reviewId = review.id;
+      const watchdog = await transaction.queueImmediateRecoveryRun({ companyId: f.companyId, issue, finishingRun, recoveryAgent,
+        reason: "issue_continuation_needed", contextSnapshot: { issueId: f.issueId, ...(seeds.continuation as object) },
+        responsibleUserId: "board", sessionBefore: null, now: new Date() } as never);
+      seeds.watchdogId = watchdog.id;
+      return { outcome: { kind: "released" }, postCommitEffects: [] } as never;
+    });
+    expect(seeds.continuation, JSON.stringify({ seeds, outcome: released.outcome })).toBeDefined();
+    expectAnswerSeed(seeds.continuation, f);
+    for (const id of [seeds.reviewId, seeds.watchdogId] as string[]) {
+      const [successor] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, id), eq(heartbeatRuns.companyId, f.companyId)));
+      expectAnswerSeed(successor.contextSnapshot, f);
+    }
+  });
+
+  // (iii) person Retry: production entry is requestTaskRetry (POST /issues/:id/retry) then
+  // heartbeat resumeTaskRetry -> enqueueWakeup (heartbeat/queue.ts task-retry admission).
+  it("a person's Retry successor seeds from the person's answer, not the asking turn", async () => {
+    const f = await answeredFixture();
+    await db.update(agents).set({ adapterType: "paperclip_runner", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+    // Hold dispatch: the built seed is the assertion, not a live turn.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "local-board",
+      actorSource: "local_implicit", observedRunId: f.runId, idempotencyKey: randomUUID() });
+    await heartbeatService(db).resumeTaskRetry(f.companyId, receipt.requestId!);
+    const queued = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+    const [wake] = receipt.requestId ? await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId)) : [];
+    expect(queued, JSON.stringify({ receipt, wake: wake && { status: wake.status, payload: wake.payload, error: wake.error } })).toHaveLength(1);
+    expect(queued[0].contextSnapshot).toMatchObject({ taskRetryRequestId: receipt.requestId, previousRunId: f.runId });
+    expectAnswerSeed(queued[0].contextSnapshot, f);
   });
 });
