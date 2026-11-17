@@ -1,5 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
-import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY, agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
+import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY, agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, holdUncollectedAgentFileCopy, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -425,6 +425,35 @@ export function buildEnvironmentLeaseContext(input: {
  */
 export type AgentFileRetirementCollector = (input: { environment: Environment; lease: EnvironmentLease; runId: string }) =>
   Promise<{ state: string; receipt?: Record<string, unknown> | null; processStoppedAt?: Date | null } | null>;
+
+/**
+ * rf-4 A2: ONE aggregate deadline over all collect-before-retire work (the
+ * collection inspections and every Stop-collector call) in one obsolete-lease
+ * cleanup, i.e. in one acquisition. The collector's own retries bound calls,
+ * not time, and its remote checkpoint shell allows 120 s per attempt; this
+ * deadline is what keeps the person's next acquisition bounded. 60 s is below
+ * the 90 s reusable resume budget (REUSABLE_SANDBOX_RESUME_BUDGET_MS). On expiry
+ * the box is stopped and kept WITHOUT collection, its copies keep (or get) a
+ * durable savePending hold, and the acquisition proceeds.
+ */
+export const AGENT_FILE_RETIREMENT_COLLECTION_DEADLINE_MS = 60_000;
+const RETIREMENT_COLLECTION_TIMED_OUT = Symbol("agent-file retirement collection deadline");
+/** Waits for `work` until the monotonic `deadlineAt` (performance.now()); the
+ * late work keeps running, with its rejection owned here. Same race-and-clear
+ * pattern as controller-instance-lease.ts withTimeout (module-private there). */
+async function settleBeforeDeadline<T>(work: Promise<T>, deadlineAt: number): Promise<T | typeof RETIREMENT_COLLECTION_TIMED_OUT> {
+  work.catch(() => undefined);
+  const remaining = deadlineAt - performance.now();
+  if (remaining <= 0) return RETIREMENT_COLLECTION_TIMED_OUT;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<typeof RETIREMENT_COLLECTION_TIMED_OUT>(resolve => {
+      timer = setTimeout(() => resolve(RETIREMENT_COLLECTION_TIMED_OUT), remaining);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export interface ResolvedSandboxDuplexBridgeInput {
   /** True only when the instance opts in to the sandbox duplex command stream. */
@@ -1407,8 +1436,12 @@ function createSandboxEnvironmentDriver(
     orphanCleanupSpool?: SandboxOrphanCleanupSpool;
     orphanCleanupSpoolDir?: string;
     agentFileCollector?: { current: AgentFileRetirementCollector | null };
+    agentFileRetirementCollectionDeadlineMs?: number;
   } = {},
 ): EnvironmentRuntimeDriver {
+  const agentFileRetirementCollectionDeadlineMs = Number.isFinite(options.agentFileRetirementCollectionDeadlineMs)
+    && options.agentFileRetirementCollectionDeadlineMs! > 0
+    ? options.agentFileRetirementCollectionDeadlineMs! : AGENT_FILE_RETIREMENT_COLLECTION_DEADLINE_MS;
   const pluginWorkerManager = options.pluginWorkerManager;
   const pluginWorkerReadyTimeoutMs = options.pluginWorkerReadyTimeoutMs ?? DEFAULT_PLUGIN_SANDBOX_WORKER_READY_TIMEOUT_MS;
   const pluginWorkerReadyPollMs = options.pluginWorkerReadyPollMs ?? DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS;
@@ -1871,6 +1904,10 @@ function createSandboxEnvironmentDriver(
   }) {
     const reusableIds = new Set(input.reusableLeases.map((lease) => lease.id));
     const closedActiveTipIds = new Set(input.closedActiveTips?.leases.map(lease => lease.id) ?? []);
+    // rf-4 A2: one aggregate deadline, started by the first collection work.
+    let collectionDeadlineAt: number | null = null;
+    let collectionTimedOut = false;
+    const collectionDeadline = () => collectionDeadlineAt ??= performance.now() + agentFileRetirementCollectionDeadlineMs;
     // Re-read and re-prove right before acting: the tip may have changed since it was admitted.
     const closedActiveTipStill = async (id: string) => {
       if (!input.closedActiveTips || !closedActiveTipIds.has(id)) return null;
@@ -1887,22 +1924,51 @@ function createSandboxEnvironmentDriver(
       let agentFilesSettled = true;
       let inspectedForCollection = false;
       let collectionObservation: PluginEnvironmentLeaseObservation | undefined;
+      // Copies left uncollected because the aggregate deadline expired.
+      const uncollected: string[] = [];
       if (copiesToCollect.length && ["released", "expired"].includes(lease.status)) {
         // G7: never resume an idled-out box to collect. Turn-end saves remain
         // on the server; any later box-only files stay on the kept disk.
         if (hasBoundRemoteStopReceipt(lease) || hasStopOnlyCleanup(lease)
           || lease.metadata?.pendingCleanupInFlight === true) continue;
-        inspectedForCollection = true;
-        collectionObservation = await sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(lease) })
-          .catch(() => undefined);
+        if (!collectionTimedOut) {
+          inspectedForCollection = true;
+          const observed = await settleBeforeDeadline((sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(lease) })
+            ?? Promise.resolve(undefined)).catch(() => undefined), collectionDeadline());
+          if (observed === RETIREMENT_COLLECTION_TIMED_OUT) {
+            collectionTimedOut = true;
+            // The stop path inspects for itself, as before collection existed.
+            inspectedForCollection = false;
+          } else collectionObservation = observed;
+        }
+        if (collectionTimedOut) uncollected.push(...copiesToCollect);
       }
-      const canCollect = !inspectedForCollection || collectionObservation?.providerLeaseId === lease.providerLeaseId
-        && ["active", "running"].includes(String(collectionObservation?.state));
-      if (!canCollect) agentFilesSettled = false;
+      const canCollect = !collectionTimedOut && (!inspectedForCollection || collectionObservation?.providerLeaseId === lease.providerLeaseId
+        && ["active", "running"].includes(String(collectionObservation?.state)));
+      if (!canCollect && copiesToCollect.length) agentFilesSettled = false;
+      if (collectionTimedOut && !uncollected.length) uncollected.push(...copiesToCollect);
       for (const runId of canCollect ? copiesToCollect : []) {
-        const collected = await options.agentFileCollector?.current?.({ environment: input.environment, lease, runId })
-          .catch((error: unknown) => { logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file collection before source-change retirement failed"); return null; });
+        const collected = collectionTimedOut ? RETIREMENT_COLLECTION_TIMED_OUT : await settleBeforeDeadline(
+          options.agentFileCollector?.current?.({ environment: input.environment, lease, runId })
+            .catch((error: unknown) => { logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file collection before source-change retirement failed"); return null; })
+          ?? Promise.resolve(null), collectionDeadline());
+        if (collected === RETIREMENT_COLLECTION_TIMED_OUT) {
+          collectionTimedOut = true;
+          agentFilesSettled = false;
+          uncollected.push(runId);
+          continue;
+        }
         if (!collected || !agentFileCopyRetirementSettled(collected)) agentFilesSettled = false;
+      }
+      // Deadline expired: stop and keep WITHOUT collection. The files are on the
+      // kept disk; a durable savePending hold keeps any destroy/expiry off it.
+      // A late collector result still writes its own outcome afterwards.
+      for (const runId of uncollected) {
+        logger.warn({ leaseId: lease.id, runId, deadlineMs: agentFileRetirementCollectionDeadlineMs },
+          "agent-file collection before source-change retirement exceeded its deadline; stopping and keeping the box without collection");
+        await holdUncollectedAgentFileCopy(db, { companyId: lease.companyId, runId,
+          reason: `Collection before retirement exceeded ${agentFileRetirementCollectionDeadlineMs} ms; the box is stopped and kept.` })
+          .catch((error: unknown) => logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file retirement hold write failed; the box is still stopped and kept"));
       }
       // Destroying an obsolete source deletes its box. A native session there
       // needs verified custody first: upstream's own resume-replacement guard
@@ -4373,6 +4439,8 @@ export function environmentRuntimeService(
     deferredOrphanCleanupBufferLimit?: number;
     orphanCleanupSpool?: SandboxOrphanCleanupSpool;
     orphanCleanupSpoolDir?: string;
+    /** Aggregate collect-before-retire deadline; default AGENT_FILE_RETIREMENT_COLLECTION_DEADLINE_MS. */
+    agentFileRetirementCollectionDeadlineMs?: number;
   } = {},
 ) {
   // One dispatch fence shared by sandbox/plugin drivers AND the task runtime.
@@ -4414,6 +4482,7 @@ export function environmentRuntimeService(
       orphanCleanupSpool: options.orphanCleanupSpool,
       orphanCleanupSpoolDir: options.orphanCleanupSpoolDir,
       agentFileCollector,
+      agentFileRetirementCollectionDeadlineMs: options.agentFileRetirementCollectionDeadlineMs,
     }),
     ...(options.pluginWorkerManager
       ? [createPluginEnvironmentDriver(db, options.pluginWorkerManager)]

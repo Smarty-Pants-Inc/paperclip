@@ -3,7 +3,7 @@ import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
 import { notifyDirectoryCleanup } from "./directory-cleanup-notifications.js";
 import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
-import { agentFileHoldWriteCondition, pinLeaseForCollection, unpinLeaseForCollection } from "./agent-file-save-hold.js";
+import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, agentFileHoldWriteCondition, pinLeaseForCollection, unpinLeaseForCollection } from "./agent-file-save-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -40,7 +40,7 @@ export class AgentDirectoryOperationBusyError extends HttpError {
 }
 const completed = new Set(["saved", "unchanged", "resolved"]);
 /** The one instruction shown while a stopped agent-file save is unverified. */
-export const AGENT_FILES_SAVE_PENDING_INSTRUCTION = "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.";
+export { AGENT_FILES_SAVE_PENDING_INSTRUCTION };
 /** A stopped save that failed or could not be verified holds its exact source,
  * mirror, baseline, owner and lease. It is never completion: only a verified
  * save/unchanged receipt (or proven prior destruction) ends the hold. */

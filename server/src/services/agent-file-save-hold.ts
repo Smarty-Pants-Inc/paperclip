@@ -4,6 +4,10 @@ import type { Db } from "@paperclipai/db";
 import { conflict, notFound } from "../errors.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
+import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
+
+export const AGENT_FILES_SAVE_PENDING_INSTRUCTION = "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.";
+export const AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT = "AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT";
 
 type HoldLease = { id: string; companyId: string; providerLeaseId?: string | null };
 
@@ -216,4 +220,36 @@ export async function agentFileCopiesToCollectOnLease(db: Pick<Db, "execute">, l
         or (not (receipt ? 'savePending') and (state = 'superseded' or coalesce(receipt->>'retainedByRunId', '') <> ''
           or (state = 'unavailable' and process_stopped_at is not null))))`);
   return Array.isArray(rows) ? rows.map(row => String((row as { run_id: unknown }).run_id)) : [];
+}
+
+/**
+ * rf-4 A2: the retirement collection ran out of its aggregate deadline, so the
+ * box is stopped and kept WITHOUT collection. Its unsaved agent files are on
+ * the kept disk: write the same durable hold a failed stopped save writes
+ * (receipt.savePending), so no destroy or expiry claims that disk until a
+ * verified save or an explicit discard. An existing hold stays as it is; a
+ * copy the still-running collector already settled is not touched. SQL only
+ * (no provider call in this transaction), with bounded lock/statement waits.
+ */
+export async function holdUncollectedAgentFileCopy(db: Db, input: { companyId: string; runId: string; reason: string }): Promise<boolean> {
+  const since = new Date();
+  const savePending = { since: since.toISOString(), code: AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT, reason: input.reason.slice(0, 500), failures: 1 };
+  return db.transaction(async tx => {
+    await tx.execute(sql`set local lock_timeout = '5s'`);
+    await tx.execute(sql`set local statement_timeout = '10s'`);
+    const rows = await tx.execute(sql`update agent_instruction_working_copies
+      set state = 'unavailable', process_stopped_at = coalesce(process_stopped_at, now()),
+        error_code = ${AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT}, error_message = ${AGENT_FILES_SAVE_PENDING_INSTRUCTION},
+        next_attempt_at = ${instructionCopyRetryAt(since).toISOString()}::timestamptz,
+        receipt = coalesce(receipt, '{}'::jsonb) || jsonb_build_object('savePending', ${JSON.stringify(savePending)}::jsonb),
+        updated_at = now()
+      where company_id = ${input.companyId} and run_id::text = ${input.runId}::text
+        and receipt->>'schema' = 'paperclip.agent-files.v1'
+        and not (receipt ? 'savePending')
+        and state not in ('saved', 'unchanged', 'resolved', 'superseded')
+        and coalesce(receipt->>'retainedByRunId', '') = ''
+        and ${agentFileHoldWriteCondition}
+      returning run_id`);
+    return Array.isArray(rows) && rows.length > 0;
+  });
 }
