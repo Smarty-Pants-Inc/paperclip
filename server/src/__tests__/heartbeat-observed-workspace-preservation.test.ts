@@ -30,6 +30,7 @@ import { hasConfirmedSandboxStopAndRetain } from "../services/sandbox-stop-and-r
 import { createOwnershipReportState, runOwnershipReconciliationPass, settleOwnableKind } from "../services/recovery/ownership-invariant-report.js";
 import { OWNABLE_KINDS } from "../services/recovery/ownership-registry.js";
 import { describeEmbeddedPostgres, nativeRestartFixture } from "./helpers/native-restart.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 
 const execute = promisify(execFile);
 function barrier() { let resolve!: () => void; const promise = new Promise<void>(ready => { resolve = ready; }); return { promise, resolve }; }
@@ -281,6 +282,33 @@ describeEmbeddedPostgres("stopped observed native workspace preservation", () =>
         expect(destroyed.mock.calls.filter(([input]) => input.providerLeaseId === f.providerLeaseId)).toHaveLength(0); expect(backend).not.toHaveBeenCalled();
       } finally { await heartbeat.drainActiveRunExecutions(); stopped.mockRestore(); destroyed.mockRestore(); }
     });
+
+  // restore-card2 (1): the pin runs on an active ephemeral lease before any
+  // stop or restore, so the files are only owed: the card says recovering. The
+  // hold, its predicates and the run marker are exactly as before.
+  it("(1) pins owed files with the recovering words and the unchanged hold", async () => {
+    const f = await seedSource("OWED-CARD");
+    expect(await pinFailedObservedWorkspace(f.db, companyId, f.runId)).toBe(true);
+    const [run] = await f.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(run.resultJson).toMatchObject({ workspaceRestoreFailure: "restore_failed",
+      workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [f.leaseId] } });
+    expect(run.resultJson).not.toHaveProperty("workspaceRestorePending");
+    const [action] = await f.db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, f.issueId),
+      eq(issueRecoveryActions.fingerprint, `native-workspace:${f.runId}`)));
+    expect(action).toMatchObject({ status: "resolved", outcome: "blocked", cause: "native_continuation_requires_reconciliation",
+      evidence: { runId: f.runId, workspaceRestoreFailure: "restore_failed", automaticRecovery: { replay: "blocked" } } });
+    expect(Object.keys(action.evidence).filter(key => action.evidence[key] !== undefined && key !== "workspaceRestorePending").sort())
+      .toEqual(["automaticRecovery", "continuationDelivery", "observedWorkspacePreservation", "originalFailureCode", "runId",
+        "workspaceRestoreFailure", "workspaceRestoreRecovery"]);
+    expect(action.evidence.workspaceRestorePending).toBe(true);
+    expect(action.nextAction).toBe("Recovering your saved work; your message is kept and runs when it's back.");
+    const blocker = await getExecutionBlocker(f.db, companyId, f.issueId);
+    expect(blocker!.nextAction).not.toContain("could not be put back");
+    expect({ cause: blocker?.cause, canRetry: blocker?.canRetry, canContinue: blocker?.canContinue,
+      workspaceRepairRequired: blocker?.workspaceRepairRequired, canRecordWorkspaceRepair: blocker?.canRecordWorkspaceRepair })
+      .toEqual({ cause: "native_continuation_requires_reconciliation", canRetry: false, canContinue: false,
+        workspaceRepairRequired: true, canRecordWorkspaceRepair: true });
+  });
 
   it("holds malformed workspace authority without throwing or recording a new pin", async () => {
     const f = await seedSource("MALFORMED-WORKSPACE");
