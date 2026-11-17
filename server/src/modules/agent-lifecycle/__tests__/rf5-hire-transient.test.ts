@@ -30,7 +30,7 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
   ? new HttpError(422, PRIVATE_DETAIL, { code })
   : Object.assign(new Error(PRIVATE_DETAIL), { code });
 
-(support.supported ? describe : describe.skip)("rf5 hire transient RED at rc3-c1", () => {
+(support.supported ? describe : describe.skip)("rf5 hire transient RED v2 (rf5 18:23Z + RFL 18:17Z)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: Db;
   let companyId: string;
@@ -85,21 +85,27 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
     return { agent, work, store, runHost, onReady, reportFailure };
   }
 
-  function assertAutomaticDeadline(row: Awaited<ReturnType<typeof current>>, now: number, label: string) {
+  function assertAutomaticDeadline(row: Awaited<ReturnType<typeof current>>, now: number, delay: number, label: string) {
     expect.soft(row.lifecycleOperation?.retryRequired ?? false, `${label}: must not park`).toBe(false);
     expect.soft(row.lifecycleOperation?.verificationFailures ?? 0, `${label}: transient must not spend verificationFailures`).toBe(0);
     const retryAt = row.lifecycleOperation?.retryAt;
     expect.soft(retryAt, `${label}: must save retryAt`).toBeDefined();
-    expect.soft(Date.parse(retryAt ?? ""), `${label}: ordinary-error retryAt is now + 60s`).toBe(now + MINUTE);
+    expect.soft(Date.parse(retryAt ?? "") - now, `${label}: retryAt delta must be ${delay / 1000}s`).toBe(delay);
     expect.soft(row.lifecycleError ?? "", `${label}: diagnostic is secret-safe`).not.toContain(PRIVATE_DETAIL);
   }
 
-  it("R1: three consecutive HOST transients retry at 60s without spending budget; fourth reaches ready without touch in five minutes", async () => {
-    const errors = [
-      hostError("test_environment_unavailable"),
-      hostError("native_probe_cleanup_pending"),
-      hostError("native_probe_cleanup_pending"),
-    ];
+  it.each([
+    {
+      title: "supersedes(rf5-hire-transient R1; SUPERSEDE-RF5-HIRE-TRANSIENT-1117.md): three HOST transients back off 60/120/240s; fourth reaches ready without touch by minute eight",
+      errors: [hostError("test_environment_unavailable"), hostError("native_probe_cleanup_pending"), hostError("native_probe_cleanup_pending")],
+    },
+    {
+      title: "R1u: three UNCLASSIFIED HOST failures back off 60/120/240s; fourth reaches ready without touch by minute eight",
+      // A plain Error deliberately has no recognized code. This reproduces the
+      // recorded unclassified host class, without inventing a recognized code.
+      errors: [new Error(PRIVATE_DETAIL), new Error(PRIVATE_DETAIL), new Error(PRIVATE_DETAIL)],
+    },
+  ])("$title", async ({ errors }) => {
     let attempts = 0;
     const fixture = await hire(async () => {
       const error = errors[attempts++];
@@ -114,10 +120,9 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
       operationId ??= row.lifecycleOperation!.id;
       expect.soft(row.lifecycleOperation!.id, "same hire operation; no config save/Retry").toBe(operationId);
       expect.soft(attempts, `failure ${failure + 1} actually reached HOST`).toBe(failure + 1);
-      assertAutomaticDeadline(row, now, `failure ${failure + 1}`);
-      // Honor the actual saved deadline even on RED (base backs off to 120s).
-      // A parked base has no deadline: one more ordinary clock tick proves
-      // process() cannot wake it; never remove retryRequired to force progress.
+      assertAutomaticDeadline(row, now, MINUTE * 2 ** failure, `failure ${failure + 1}`);
+      // Honor only persisted deadlines, even on RED. A parked row gets one
+      // ordinary clock tick, never a row edit or explicit Retry to wake it.
       const retryAt = Date.parse(row.lifecycleOperation?.retryAt ?? "");
       vi.setSystemTime(Number.isFinite(retryAt) ? retryAt : now + MINUTE);
     }
@@ -127,7 +132,8 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
       lifecycleState: "ready", lifecycleError: null,
     });
     expect.soft(fixture.onReady, "normal ready handoff exactly once").toHaveBeenCalledOnce();
-    expect.soft(Date.now() - startedAt, "unattended recovery within five simulated minutes").toBeLessThanOrEqual(5 * MINUTE);
+    expect.soft(Date.now() - startedAt, "60 + 120 + 240s gives recovery at minute seven").toBe(7 * MINUTE);
+    expect.soft(Date.now() - startedAt, "unattended recovery by simulated minute eight").toBeLessThanOrEqual(8 * MINUTE);
   });
 
   // R2 acquisition site: server/src/services/agent-environment-test.ts:306
@@ -135,24 +141,28 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
   // agent-harness-verification.ts:163 BEFORE withManagedAiProbe at :171 and
   // retained cleanup reconciliation in ai-connection-runtime.ts:306.
   // Do not count this injected driver's runHost calls as real box acquisitions.
-  it.todo("R2: zero acquisitions while cleanup is pending, then exactly one per cleanup-admitted attempt — lifecycle driver exposes no probe acquisition/cleanup-proof seam; requires real probe integration, not a synthetic acquisition counter");
+  // The builder's verification-retry.test.ts acquisition-seam test covers this;
+  // this judge's injected runHost seam must not pretend to measure acquisitions.
+  it.todo("R2: zero acquisitions while cleanup is pending, then exactly one per cleanup-admitted attempt — acquisition-seam coverage is in the builder's verification-retry.test.ts, not this injected lifecycle driver");
 
   it.each([
-    { last: "harness_test_failed", reason: "The execution test did not pass" },
-    { last: "harness_auth_failed", reason: "Authentication failed" },
-    { last: "ai_connection_default_missing", reason: "personal default" },
-  ])("R3: two genuine harness failures then $last still park at three with the true reason and no retryAt", async ({ last, reason }) => {
+    { row: "R3a", code: "harness_test_failed", failures: 3, budgeted: true, reason: "The execution test did not pass" },
+    { row: "R3b", code: "harness_auth_failed", failures: 1, budgeted: false, reason: "Authentication failed" },
+    { row: "R3c", code: "ai_connection_default_missing", failures: 1, budgeted: false, reason: "personal default" },
+  ])("supersedes(rf5-hire-transient R3; SUPERSEDE-RF5-HIRE-TRANSIENT-1117.md): $row $code parks after $failures failure(s), with the true reason and no retryAt", async ({ code, failures, budgeted, reason }) => {
     const accountFailure = new HttpError(422, PRIVATE_DETAIL);
     recordAiConnectionConfigurationFailure(accountFailure, "ai_connection_default_missing");
-    const errors = [hostError("harness_test_failed"), hostError("harness_test_failed"),
-      last === "ai_connection_default_missing" ? accountFailure : hostError(last)];
     let attempts = 0;
-    const fixture = await hire(async () => { throw errors[attempts++]; });
-    for (let index = 0; index < 3; index++) {
+    const fixture = await hire(async () => {
+      attempts++;
+      throw code === "ai_connection_default_missing" ? accountFailure : hostError(code);
+    });
+    for (let index = 0; index < failures; index++) {
       await fixture.work.process(fixture.agent.id);
       const row = await current(fixture.agent.id);
-      expect(row.lifecycleOperation?.verificationFailures).toBe(index + 1);
-      if (index < 2) {
+      expect.soft(row.lifecycleOperation?.verificationFailures ?? 0,
+        `${code}: only harness_test_failed spends verificationFailures`).toBe(budgeted ? index + 1 : 0);
+      if (index < failures - 1) {
         expect(row.lifecycleOperation?.retryRequired).not.toBe(true);
         const due = Date.parse(row.lifecycleOperation!.retryAt!);
         expect(due).toBeGreaterThan(Date.now());
@@ -160,31 +170,45 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
       }
     }
     const parked = await current(fixture.agent.id);
-    expect(parked.lifecycleOperation).toMatchObject({ verificationFailures: 3, retryRequired: true });
-    expect(parked.lifecycleOperation).not.toHaveProperty("retryAt");
-    expect(parked.lifecycleError).toContain(reason);
-    expect(parked.lifecycleError).toContain("Automatic verification is paused");
-    expect(parked.lifecycleError).not.toContain(PRIVATE_DETAIL);
+    expect.soft(attempts, "parking at exactly the required failure").toBe(failures);
+    expect.soft(parked.lifecycleOperation?.retryRequired, "required manual repair parks immediately").toBe(true);
+    expect.soft(parked.lifecycleOperation, "parked operations have no automatic deadline").not.toHaveProperty("retryAt");
+    expect.soft(parked.lifecycleError, "park with the true failure reason").toContain(reason);
+    expect.soft(parked.lifecycleError).toContain("Automatic verification is paused");
+    expect.soft(parked.lifecycleError).not.toContain(PRIVATE_DETAIL);
     vi.setSystemTime(Date.now() + 10 * MINUTE);
     await fixture.work.process(fixture.agent.id);
-    expect(attempts).toBe(3);
-    expect(fixture.onReady).not.toHaveBeenCalled();
+    expect.soft(attempts, "clock alone cannot unpark a manual repair").toBe(failures);
+    expect.soft(fixture.onReady).not.toHaveBeenCalled();
   });
 
   // R4 is RFL bar b's TEXT CONTRACT, not merely a retry-classification check:
   // no visible lifecycleError line before 10 min; at/after 10 min exactly one
   // line containing /retrying automatically/i; keep retrying; clear on success.
-  it("R4: persistent outage stays quiet before ten minutes, then has one retrying automatically line, continues retrying and clears on success", async () => {
+  it("supersedes(rf5-hire-transient R4; SUPERSEDE-RF5-HIRE-TRANSIENT-1117.md): continuous outage backs off for 60/120 minutes (8/12 attempts), has one line from minute ten, and clears on success", async () => {
+    // Derive the schedule independently from the rule, not production policy:
+    // 60, 120, 240, 480 seconds, then 900 seconds capped, from failure one.
+    const expectedMinutes: number[] = [];
+    let nextMinute = 0;
+    for (let failure = 0; nextMinute <= 120; failure++) {
+      expectedMinutes.push(nextMinute);
+      nextMinute += Math.min(2 ** failure, 15);
+    }
+    expect(expectedMinutes.filter(minute => minute <= 60)).toEqual([0, 1, 3, 7, 15, 30, 45, 60]);
+    expect(expectedMinutes).toEqual([0, 1, 3, 7, 15, 30, 45, 60, 75, 90, 105, 120]);
     let healthy = false;
-    let attempts = 0;
+    const attemptMinutes: number[] = [];
+    const startedAt = Date.now();
     const fixture = await hire(async () => {
-      attempts++;
+      attemptMinutes.push((Date.now() - startedAt) / MINUTE);
       if (!healthy) throw hostError("native_probe_cleanup_pending");
     });
-    const startedAt = Date.now();
-    for (let minute = 0; minute <= 11; minute++) {
+    // Evaluate every minute, including minute ten BETWEEN the minute-seven and
+    // minute-fifteen probes. Visibility must not be delayed to the next probe;
+    // evaluating a row must also not bypass its persisted retryAt admission.
+    for (let minute = 0; minute <= 120; minute++) {
       vi.setSystemTime(startedAt + minute * MINUTE);
-      const now = Date.now();
+      const previousAttempts = attemptMinutes.length;
       await fixture.work.process(fixture.agent.id);
       const row = await current(fixture.agent.id);
       const lines = (row.lifecycleError ?? "").split(/\r?\n/).filter(line => line.trim());
@@ -192,16 +216,28 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
         expect.soft(lines, `minute ${minute}: no lifecycleError line before ten minutes`).toHaveLength(0);
       } else {
         expect.soft(lines, `minute ${minute}: exactly ONE persistent-outage line`).toHaveLength(1);
-        expect.soft(lines.filter(line => /retrying automatically/i.test(line)),
+        expect.soft(lines.filter(line => line.includes("retrying automatically")),
           `minute ${minute}: missing 'retrying automatically' line`).toHaveLength(1);
       }
-      assertAutomaticDeadline(row, now, `outage minute ${minute}`);
-      expect.soft(attempts, `minute ${minute}: retries continue every minute`).toBe(minute + 1);
+      expect.soft(row.lifecycleOperation?.retryRequired ?? false, `minute ${minute}: must not park`).toBe(false);
+      expect.soft(row.lifecycleOperation?.verificationFailures ?? 0, `minute ${minute}: transient must not spend verificationFailures`).toBe(0);
+      expect.soft(row.lifecycleError ?? "", `minute ${minute}: diagnostic is secret-safe`).not.toContain(PRIVATE_DETAIL);
+      expect.soft(attemptMinutes, `minute ${minute}: exact backoff admission, no early or missing attempts`)
+        .toEqual(expectedMinutes.filter(time => time <= minute));
+      if (attemptMinutes.length > previousAttempts) {
+        assertAutomaticDeadline(row, Date.now(), Math.min(2 ** (attemptMinutes.length - 1), 15) * MINUTE, `outage minute ${minute}`);
+      }
+      if (minute === 60) {
+        expect.soft(attemptMinutes, "first hour inclusive (0 through 60): exactly eight attempts").toHaveLength(8);
+        expect.soft(attemptMinutes.length, "first hour attempts <= 10").toBeLessThanOrEqual(10);
+      }
     }
+    expect.soft(attemptMinutes, "two hours inclusive (0 through 120): exactly twelve attempts").toHaveLength(12);
     healthy = true;
-    vi.setSystemTime(startedAt + 12 * MINUTE);
+    // The next capped deadline is minute 135. No Retry, config save or row edit.
+    vi.setSystemTime(startedAt + nextMinute * MINUTE);
     await fixture.work.process(fixture.agent.id);
-    expect.soft(attempts, "post-outage automatic attempt reaches host").toBe(13);
+    expect.soft(attemptMinutes, "one automatic success after the two-hour outage").toEqual([...expectedMinutes, 135]);
     expect.soft(await current(fixture.agent.id), "successful recovery clears persistent-outage line").toMatchObject({
       lifecycleState: "ready", lifecycleError: null,
     });
