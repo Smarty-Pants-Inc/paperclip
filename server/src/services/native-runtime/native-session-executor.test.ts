@@ -15566,6 +15566,65 @@ describe("native warm session supervision", () => {
       }
     });
 
+    // S8 live RED 186f55fc (2026-11-17 18:47:31Z): the successor of 4d6135ad
+    // failed native_predecessor_retirement_unproven "(Boat sandbox lease is
+    // no longer active.)" and the answer came 179.5 s later from a fallback
+    // run. RFL: a lease Boat reports terminal (its typed stop/destroy receipt
+    // on the lease row) proves the old session cannot run: retirement is
+    // proven at once, no wait, no failed run. A non-terminal close failure, or
+    // the same free text without a terminal receipt, stays unproven.
+    it.each([
+      { name: "terminal-destroyed", closeError: "Boat sandbox lease is no longer active.", receipt: "destroyed", proven: true },
+      { name: "terminal-own-stop", closeError: "Boat sandbox lease is no longer active.", receipt: "stopped", proven: true },
+      { name: "same-text-no-receipt", closeError: "Boat sandbox lease is no longer active.", receipt: null, proven: false },
+      { name: "download-url-unavailable", closeError: "Boat sandbox download URL is unavailable (503).", receipt: null, proven: false },
+    ] as const)("S8 186f55fc: a superseded owner on a terminal Boat lease is retired at once ($name)", async ({ name, closeError, receipt, proven }) => {
+      const predecessorRunId = "4d6135ad-9fd6-44ce-a7cf-d13317133fda", successorRunId = "186f55fc-1e15-4dcb-ab94-f689095fef00";
+      const { base: shape } = fixture(`s8-186f55fc-${name}`);
+      const base = { ...shape, binding: { ...shape.binding, runId: predecessorRunId } };
+      const next = { ...base, binding: { ...base.binding, runId: successorRunId } };
+      const environmentId = `s8-environment-${name}`, providerLeaseId = `bx_s8${name.replace(/-/g, "")}`;
+      const close = vi.fn().mockRejectedValue(new Error(closeError));
+      const release = vi.spyOn(nativeLeaseRenewal, "releaseUnstartedNativeExecutionClaim").mockResolvedValue(true);
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        options.onSession?.({ close }); return result;
+      }).mockResolvedValue(result);
+      const leaseRows: Array<Record<string, unknown>> = [];
+      const target = (leaseId: string) => ({ kind: "remote" as const, transport: "sandbox" as const,
+        environmentId, leaseId, remoteCwd: `/tmp/${environmentId}`,
+        sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId } });
+      const ownerDb = leaseDb(base, {}, {}, [], {}, "running", [], leaseRows);
+      try {
+        await executePaperclipNativeSession({ db: ownerDb, execution: base, runnerInstanceId: "runner", useRunnerd: false,
+          backend: {} as never, runnerExecutionTarget: target("previous-lease") });
+        // Boat's typed teardown answer, bound to the predecessor's own lease.
+        leaseRows.push({ id: "previous-lease", companyId: base.binding.companyId, environmentId, heartbeatRunId: predecessorRunId,
+          provider: "boat", providerLeaseId, status: receipt ? "released" : "active", releasedAt: receipt ? new Date() : null,
+          cleanupStatus: receipt ? "success" : null, leasePolicy: "reuse_by_environment",
+          metadata: receipt ? { remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
+            companyId: base.binding.companyId, runId: predecessorRunId, leaseId: "previous-lease", provider: "boat",
+            providerLeaseId, state: receipt, confirmedAt: new Date().toISOString() } } : {} });
+        release.mockClear();
+        const successor = executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner",
+          useRunnerd: false, backend: {} as never, refreshTools: true, runnerExecutionTarget: target("new-lease") });
+        if (proven) {
+          await expect(successor).resolves.toBeDefined();
+          // The successor ran its own provider turn; no failed run, no fallback.
+          expect(state.execute).toHaveBeenCalledTimes(2);
+          expect(release).not.toHaveBeenCalled();
+        } else {
+          await expect(successor).rejects.toMatchObject({ code: "native_predecessor_retirement_unproven",
+            predecessorRunId, providerLeaseId, cause: { message: closeError } });
+          expect(state.execute).toHaveBeenCalledOnce();
+        }
+        expect(close).toHaveBeenCalledOnce();
+      } finally {
+        close.mockResolvedValue(undefined);
+        await closeIdleWarmNativeSessionsForRestart();
+        release.mockRestore();
+      }
+    });
+
     it.each([true, false])("TL08 retains preparation ownership until startup cleanup drains (%s)", async drained => {
       const { NativePredecessorRetirementUnprovenError } = await import("./predecessor-retirement.js");
       const { base } = fixture(`tl08-preparation-cleanup-${drained}`);
