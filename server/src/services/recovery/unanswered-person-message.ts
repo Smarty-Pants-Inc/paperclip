@@ -1,4 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
+import { decideRetryAuthority } from "../task-retry-eligibility.js";
 import { answeredPersonMessageSql } from "../person-message-answer.js";
 import {
   activityLog,
@@ -769,7 +770,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       nextAction: settingUp ? "No action is needed; your message is saved."
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
-        : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
+        // Retry fold: a HELD body names only a new task; its Next action is the same one instruction.
+        : boundReached ? "Send a new message to try again."
+        : held ? decideRetryAuthority({ heldConversation: true }).nextAction!
+        : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,

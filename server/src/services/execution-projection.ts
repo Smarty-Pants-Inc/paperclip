@@ -312,6 +312,10 @@ export async function executionProjectionsForRuns(
     .map(row => row.issueId))];
   const heldConversations = await read(() => readUnsupersededHeldConversationNotices(db,
     { companyId, issueIds: recoveredIssueIds }));
+  // Retry fold: a paused assignee's receipt names Resume, as the card does.
+  const pausedIssues = new Set(recoveredIssueIds.length ? (await read(() => db.select({ id: issues.id }).from(issues)
+    .innerJoin(agents, and(eq(agents.companyId, issues.companyId), eq(agents.id, issues.assigneeAgentId)))
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, recoveredIssueIds), eq(agents.status, "paused"))))).map(row => row.id) : []);
   // The exceptional pre-provider receipt must name the same available action
   // as the card. Reuse its admission-backed Retry decision, once per task;
   // ordinary list projections keep their existing batched diagnostic reads.
@@ -350,6 +354,7 @@ export async function executionProjectionsForRuns(
         cleanupHeldRuns.has(run.id),
         Boolean(issueId && heldConversations.has(issueId)),
         recoveredInstruction,
+        Boolean(issueId && pausedIssues.has(issueId)),
       ),
     );
   }
@@ -386,6 +391,8 @@ export function projectExecution(
   heldConversation = false,
   /** The card's admission-backed instruction for a pre-provider failure. */
   recoveredInstruction?: string,
+  /** The task's assignee is paused (Retry fold: the receipt names Resume). */
+  agentPaused = false,
 ): ExecutionProjection {
   const detail = coordinator?.failureDetail ?? {};
   const successorRunId = text(detail.successorRunId);
@@ -423,9 +430,9 @@ export function projectExecution(
     projection.nextAction = recoveredInstruction ?? (run.runtimeMode === "native"
       && readWorkspaceRecovery(recoveryAction.evidence)?.status === "recovered"
       && stoppedBeforeWorkWasSaved(run.status, detail)
-      ? recoveredWorkMessage(run.status, false, heldConversation, true)
+      ? recoveredWorkMessage(run.status, false, heldConversation, true, agentPaused)
       : workspaceRecoveryDisplay(recoveryAction.evidence, run.id,
-        { status: run.status, retryOffered: false, heldConversation })?.message)
+        { status: run.status, retryOffered: false, heldConversation, agentPaused })?.message)
       ?? recoveryAction.nextAction;
     const continuation = recoveryAction.evidence.explicitUserContinuation as
       { previousRunId?: unknown; runId?: unknown } | undefined;

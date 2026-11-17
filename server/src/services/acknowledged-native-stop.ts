@@ -38,7 +38,8 @@ export function hasAuthorizedManagementStopRecord(run: {
   id: string; companyId: string; agentId?: string; resultJson: Record<string, unknown> | null;
 }): boolean {
   const result = run.resultJson;
-  if (result?.cancelledByActorType !== "agent" || result.cancelledByUserId !== undefined) return false;
+  // A stored JSON null is no user (projections write absent fields as null).
+  if (result?.cancelledByActorType !== "agent" || (result.cancelledByUserId !== undefined && result.cancelledByUserId !== null)) return false;
   const record = parseObject(result.managementStop);
   const actorAgentId = record.actorAgentId;
   if (record.schema !== MANAGEMENT_STOP_SCHEMA || record.runId !== run.id || record.companyId !== run.companyId ||
