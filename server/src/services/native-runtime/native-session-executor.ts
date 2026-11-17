@@ -15085,8 +15085,9 @@ export function buildRemoteCodexLauncherCommand(
 
 export function mayUsePreinstalledRunnerArtifact(
   configuredRemoteBinaryPath: string | null | undefined,
+  configuredArtifactAvailable = false,
 ): boolean {
-  return !configuredRemoteBinaryPath?.trim();
+  return !configuredRemoteBinaryPath?.trim() || configuredArtifactAvailable;
 }
 
 const RUNNERD_BUILD_METADATA_SCHEMA =
@@ -21169,11 +21170,15 @@ export function createRemoteNativeArtifactPreparation(input: {
         );
       }
       const explicitRemoteBinary = input.runnerRemoteBinaryPath?.trim() || null;
-      if (!runnerArtifactPrepared && mayUsePreinstalledRunnerArtifact(explicitRemoteBinary)) {
+      const controllerArtifactAvailable = existsSync(controllerRunnerBinary);
+      if (!runnerArtifactPrepared &&
+          mayUsePreinstalledRunnerArtifact(explicitRemoteBinary, controllerArtifactAvailable)) {
         const preinstalledRunner = await measureNativeRunnerSpan(
           input.trace,
           "runner.artifact.discover",
-          () => discoverPreinstalledExecutable("paperclip-runnerd"),
+          () => explicitRemoteBinary
+            ? discoverPreinstalledExecutable("paperclip-runnerd").catch(() => null)
+            : discoverPreinstalledExecutable("paperclip-runnerd"),
         );
         if (preinstalledRunner) {
           try {
@@ -21182,7 +21187,7 @@ export function createRemoteNativeArtifactPreparation(input: {
               "runner.artifact.verify_preinstalled",
               () => verifyRemoteRunner(requiredMode, preinstalledRunner),
             );
-            if (existsSync(controllerRunnerBinary) &&
+            if (controllerArtifactAvailable &&
                 !await matchesControllerRunnerArtifact(preinstalledRunner)) {
               throw new Error("runner_remote_preinstalled_artifact_mismatch");
             }

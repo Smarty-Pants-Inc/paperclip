@@ -6,7 +6,7 @@ import { expect, it, vi } from "vitest";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { coordinatorAttentionSummaryQueryKey } from "@/lib/coordinator-attention";
 
-vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({ useCoordinatorWorkspaceEnabled: () => ({ enabled: true }) }));
+vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({ useCoordinatorWorkspaceEnabled: () => ({ enabled: true, userId: "reviewer" }) }));
 vi.mock("@/hooks/useAgentChatEnabled", () => ({ useAgentChatEnabled: () => ({ enabled: true }) }));
 vi.mock("@/hooks/useCombinedInboxTasksEnabled", () => ({ useCombinedInboxTasksEnabled: () => ({ enabled: false }) }));
 vi.mock("@/hooks/useInboxBadge", () => ({ useInboxBadge: () => ({ inbox: 0 }) }));
@@ -15,17 +15,16 @@ vi.mock("@/context/DialogContext", () => ({ useDialogActions: () => ({ openNewIs
 vi.mock("@/lib/router", () => ({ useLocation: () => ({ pathname: "/chats" }), NavLink: ({ to, children }: { to: string; children: (state: { isActive: boolean }) => ReactNode }) => <a href={to}>{children({ isActive: false })}</a> }));
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 // Superseded by replacement, RFL 07:30Z 11-16 (#20846): the old assertion ({3,0} -> 3) asserted the bug; the badge is the For you count.
-// #20846: the phone badge is the For you count (deskBadgeCount), the same
-// number the default Inbox list shows; other people's cards are not in it.
-it("uses the For you count on the phone as well as the desktop", async () => {
+// Upstream #21953 also scopes the cached For you count to the signed-in user.
+it("counts only decisions for the signed-in user on the phone as well as the desktop", async () => {
   const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
-  const key = coordinatorAttentionSummaryQueryKey("company");
-  client.setQueryData(key, { totalCount: 5, deskBadgeCount: 3 });
+  const key = coordinatorAttentionSummaryQueryKey("company", "reviewer");
+  client.setQueryData(key, { totalCount: 8, deskBadgeCount: 3 });
   const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
   try {
     await act(() => root.render(<QueryClientProvider client={client}><MobileBottomNav visible /></QueryClientProvider>));
     expect(host.querySelector('a[href="/decisions"]')?.textContent).toBe("3Inbox");
-    await act(async () => { client.setQueryData(key, { totalCount: 3, deskBadgeCount: 0 }); await new Promise(resolve => setTimeout(resolve, 1)); });
+    await act(async () => { client.setQueryData(key, { totalCount: 5, deskBadgeCount: 0 }); await new Promise(resolve => setTimeout(resolve, 1)); });
     expect(host.querySelector('a[href="/decisions"]')?.textContent).toBe("Inbox");
   } finally { await act(() => root.unmount()); host.remove(); client.clear(); }
 });
