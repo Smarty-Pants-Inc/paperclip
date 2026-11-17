@@ -57,7 +57,8 @@ it.each(["sandbox_not_ready", "machine_not_running", "sandbox_starting"])("docum
   });
   const work = execute().catch(e => e); await vi.advanceTimersByTimeAsync(1500);
   expect(await work).toMatchObject({ exitCode: 0, stdout: "observed" });
-  expect(count("/commands")).toBe(2); expect(count("/resume")).toBe(1);
+  // readiness.md:29 says resend sandbox_starting; :31 says resume not-ready.
+  expect(count("/commands")).toBe(2); expect(count("/resume")).toBe(code === "sandbox_starting" ? 0 : 1);
 });
 
 it.each([{}, { code: "sandbox_not_ready" }, { code: "sandbox_starting" }, { code: "machine_not_running" }])("second 409 %j after resume is one true named transient, never a loop", async second => {
