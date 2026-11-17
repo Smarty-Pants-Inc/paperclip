@@ -18136,9 +18136,44 @@ export function issueRoutes(
         }
         // The click is durable fresh user intent, including when the message
         // predates a failed run's stop. Keep its content and original attribution.
+        // S8 order (Paul note 6): in a chat the press sends everything waiting,
+        // in the order written. The person's plain messages from the oldest on
+        // join this wake, as after a person's Stop (gatherPersonStoppedChatMessages).
+        let pressedPayload = readObject(locked.wake.payload);
+        if (issue.conversationAgentId) {
+          const waiting = await tx.select().from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, locked.wake.agentId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.requestedByActorType, "user"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+            sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
+          )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).for("update");
+          const ids = waiting.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload));
+          const byId = new Map((ids.length ? await tx.select().from(issueComments).where(and(eq(issueComments.companyId,
+            issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids))) : []).map((c) => [c.id, c]));
+          const joined: typeof waiting = [];
+          for (const wake of waiting) {
+            const payload = readObject(wake.payload), wakeIds = queuedCommentIdsFromWakePayload(wake.payload);
+            if (wake.id !== locked.wake.id && (payload.queuedCommentInterrupt || queuedInteractionId(wake.payload) ||
+                readObject(payload._paperclipWakeContext).forceFreshSession === true || !wakeIds.length ||
+                !wakeIds.every((id) => { const c = byId.get(id);
+                  return c && !c.deletedAt && c.authorUserId && !c.authorAgentId && !isConversationReset(c.body); }))) break;
+            joined.push(wake);
+          }
+          if (joined.length > 1 && joined.some((wake) => wake.id === locked.wake.id)) {
+            const rest = joined.filter((wake) => wake.id !== locked.wake.id);
+            pressedPayload = withQueuedCommentIdsInWakePayload(pressedPayload,
+              [...new Set(joined.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))]);
+            await tx.update(agentWakeupRequests).set({ coalescedCount: (locked.wake.coalescedCount ?? 0) + rest.length })
+              .where(eq(agentWakeupRequests.id, locked.wake.id));
+            await tx.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: new Date(), updatedAt: new Date(),
+              error: "Sent with the chat's other queued messages by an Interrupt" }).where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId), inArray(agentWakeupRequests.id, rest.map((wake) => wake.id)),
+              eq(agentWakeupRequests.status, "deferred_issue_execution")));
+          }
+        }
         await notifyDeferredExecutionWork(tx, { companyId: issue.companyId, requestId: locked.wake.id });
         await tx.update(agentWakeupRequests).set({
-          payload: { ...readObject(locked.wake.payload), queuedCommentInterrupt: {
+          payload: { ...pressedPayload, queuedCommentInterrupt: {
             actorId: actor.actorId, requestedAt: new Date().toISOString(),
             ...(locked.queue.protocol === "paperclip_runner_v1" && locked.activeRun?.status === "running"
               ? { targetRunId: locked.activeRun.id } : {}),
