@@ -13195,6 +13195,136 @@ describe("native warm session supervision", () => {
     }
   });
 
+  // settle-sites S072 (RFL STOP-PATH-SITES row S072): a person's Stop, then the
+  // next message on the same Boat pi_rpc chat with agent_files. Heartbeat
+  // preparation (instruction-working-copy.ts:157-158) reserves the stopped
+  // run's warm directory (reserveWarmNativeInstructionDirectory) and joins that
+  // own predecessor's release. That join and every later own-predecessor wait of
+  // the same successor (the s6409 Stop-command wait, the supbusy superseded-owner
+  // wait) share ONE settle deadline (warmSessionReleaseWait), never a fresh 30 s each.
+  describe("settle-sites S072: the instruction-directory reservation joins its own predecessor within the successor's one settle budget", () => {
+    async function stopFollowUpFixture(name: string) {
+      const { createHeartbeatInstructionWorkingCopy } = await import("../heartbeat/instruction-working-copy.js");
+      const stopped = { ...execution,
+        binding: { ...execution.binding, runId: `${name}-stopped`, executionWorkspaceId: name },
+        session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+      } as NativeExecutionInputV1;
+      const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "boat", environmentId: name,
+        remoteCwd: `/tmp/${name}`, sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: `bx_${name}` } };
+      let releaseGate!: () => void;
+      const releasing = new Promise<void>(resolve => { releaseGate = resolve; });
+      const release = vi.fn(async () => { await releasing; });
+      const copy = { runId: stopped.binding.runId, root: `/tmp/${name}/home`, collectStopped: vi.fn(async () => undefined),
+        checkpointWarm: vi.fn(async () => true), hasChanges: vi.fn(async () => false) };
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        await options.onSession?.({ close: vi.fn(async () => undefined), release });
+        return { result: { summary: "stopped" }, terminal: { runTerminalState: "succeeded" }, turnId: name,
+          normalizedSessionId: name, providerSessionId: name, driverKind: "test", driverVersion: "1",
+          nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+      });
+      const first = executePaperclipNativeSession({ db: leaseDb(stopped), execution: stopped,
+        runnerInstanceId: name, runnerExecutionTarget: target as never, instructionWorkingCopy: copy });
+      await vi.waitFor(() => expect(release).toHaveBeenCalledOnce());
+      /** The successor's heartbeat preparation: the production entry of this site. */
+      const controllers: Array<{ nativeInstructionReservation: { release: () => Promise<void> } | null }> = [];
+      const successor = (runId: string) => {
+        const run = { id: runId, companyId: stopped.binding.companyId, agentId: stopped.binding.agentId, runnerProfileJson: {} };
+        const prepared = { runId, companyId: run.companyId, agentId: run.agentId, localRoot: `/tmp/${name}/copy`,
+          executionRoot: `/tmp/${name}/copy`, entryFile: "AGENTS.md", state: "prepared", receipt: { schema: "agent_files", warm: true },
+          errorCode: null, errorMessage: null };
+        const copies = { prepare: vi.fn(async () => prepared), canReuseWarm: vi.fn(async () => true),
+          collectStopped: vi.fn(async () => null), checkpointWarm: vi.fn(async () => null), hasChanges: vi.fn(async () => false),
+          reportRetirementUnconfirmed: vi.fn(async () => null), claimConflictNotice: vi.fn(async () => null) };
+        const controller = createHeartbeatInstructionWorkingCopy({ db: {} as never, instructionCopies: copies as never,
+          readRun: () => run as never,
+          agent: { id: run.agentId, companyId: run.companyId, adapterType: "paperclip_runner",
+            adapterConfig: { lifecycleMode: "warm" }, runtimeConfig: {} } as never,
+          context: {}, session: { taskSession: null, taskSessionForRun: { lastRunId: stopped.binding.runId }, sessionConfigMetadata: {} as never },
+          workspace: { executionTarget: target as never, executionWorkspace: { cwd: `/tmp/${name}` } as never, persistedExecutionWorkspace: null },
+          appendRunEvent: vi.fn(async () => undefined) } as never);
+        controllers.push(controller);
+        return controller.prepare({ runtimeConfig: {}, hasInstructionFilesystem: true,
+          nativeRuntimeResolution: { kind: "native", profile: { backend: "pi_rpc" } } as never,
+          nativeLifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } as never });
+      };
+      const cleanup = async () => {
+        releaseGate();
+        await first.catch(() => undefined);
+        // The successor's reservation ends with its run (heartbeat's final release).
+        for (const controller of controllers) await controller.nativeInstructionReservation?.release().catch(() => undefined);
+        await closeWarmNativeSessionsForEnvironment({ environmentId: name, reason: "test cleanup" });
+      };
+      return { stopped, first, releaseGate, successor, cleanup };
+    }
+    const sharedDeadline = async (runId: string): Promise<number | undefined> => {
+      const executor = await import("./native-session-executor.js") as Record<string, unknown>;
+      const derive = executor.ownPredecessorSettleDeadline as ((id: string) => number) | undefined;
+      return derive?.(runId);
+    };
+
+    it("RED (budget): the join derives the successor's one deadline, so a later own-predecessor wait gets only what is left", async () => {
+      const f = await stopFollowUpFixture("s072-budget-first");
+      const bound = warmSessionReleaseWait.timeoutMs;
+      warmSessionReleaseWait.timeoutMs = 1_000;
+      try {
+        const successorRunId = "s072-budget-first-next";
+        const started = Date.now();
+        const preparing = f.successor(successorRunId);
+        await new Promise(resolve => setTimeout(resolve, 300));
+        f.releaseGate();
+        await preparing;
+        await expect(f.first).resolves.toMatchObject({ exitCode: 0 });
+        // The same successor's next site (createRunnerdBackend's Stop-command
+        // wait) reads the deadline this join derived, not a fresh bound.
+        const deadline = await sharedDeadline(successorRunId);
+        expect(deadline).toBeDefined();
+        expect(deadline!).toBeGreaterThanOrEqual(started + 1_000 - 50);
+        expect(deadline!).toBeLessThanOrEqual(started + 1_000 + 250);
+      } finally {
+        warmSessionReleaseWait.timeoutMs = bound;
+        await f.cleanup();
+      }
+    });
+
+    it("RED (budget): a join after an earlier own-predecessor wait of the same successor stops at the one shared deadline", async () => {
+      const f = await stopFollowUpFixture("s072-budget-second");
+      const bound = warmSessionReleaseWait.timeoutMs;
+      warmSessionReleaseWait.timeoutMs = 1_000;
+      try {
+        const successorRunId = "s072-budget-second-next";
+        const started = Date.now();
+        // An earlier site of this successor already derived and spent 700 ms.
+        await sharedDeadline(successorRunId);
+        await new Promise(resolve => setTimeout(resolve, 700));
+        // The stopped run's release never finishes inside the budget.
+        await expect(f.successor(successorRunId)).rejects.toThrow("native_session_supervisor_busy");
+        expect(Date.now() - started).toBeLessThan(1_000 + 400);
+      } finally {
+        warmSessionReleaseWait.timeoutMs = bound;
+        await f.cleanup();
+      }
+    });
+
+    it("negative: another run's reservation (preparingRunId) of the same directory stays refused at once", async () => {
+      const f = await stopFollowUpFixture("s072-foreign");
+      try {
+        f.releaseGate();
+        await expect(f.first).resolves.toMatchObject({ exitCode: 0 });
+        const foreign = await reserveWarmNativeInstructionDirectory({ companyId: f.stopped.binding.companyId,
+          agentId: f.stopped.binding.agentId, previousRunId: f.stopped.binding.runId, runId: "s072-foreign-other",
+          target: { kind: "remote", transport: "sandbox", providerKey: "boat", environmentId: "s072-foreign", remoteCwd: "/tmp/s072-foreign",
+            sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "bx_s072-foreign" } } as never, canReuse: async () => true });
+        expect(foreign).not.toBeNull();
+        const started = Date.now();
+        await expect(f.successor("s072-foreign-next")).rejects.toThrow("native_session_supervisor_busy");
+        expect(Date.now() - started).toBeLessThan(500);
+        await foreign!.release();
+      } finally {
+        await f.cleanup();
+      }
+    });
+  });
+
   it.each([
     { runTerminalState: "failed", managedFiles: true },
     { runTerminalState: "cancelled", managedFiles: true },
