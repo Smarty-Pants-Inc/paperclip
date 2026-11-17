@@ -2867,7 +2867,7 @@ async function retireSupersededWarmNativeSessions(
     const releasing = !foreignPreparation
       && (settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope));
     if (releasing && !releaseWaited) {
-      await waitForWarmNativeSessionRelease(scope, entry);
+      await waitForWarmNativeSessionRelease(scope, entry, ownPredecessorSettleDeadline(runId));
       return retireSupersededWarmNativeSessions(ownerScope, nextSessionScope, nextSessionId, runId, ingress, target, true);
     }
     if (entry.busy || foreignPreparation || executingRunnerdSessionScopes.has(scope)) {
@@ -6815,9 +6815,11 @@ async function retireAfterStopIssuedLifecycleCommands(input: Parameters<typeof i
     || !await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
     return { retired: false, refused };
   }
-  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+  // settle-sites: the successor's one own-predecessor settle deadline, shared
+  // with its earlier instruction-directory join (S072), not a fresh bound.
+  const deadline = ownPredecessorSettleDeadline(input.execution.binding.runId);
   await input.onLog?.("stderr", `[paperclip-runner] waiting for the Stop's runner lifecycle command of run ${String(input.identity.runId)}\n`);
-  await waitForWarmNativeSessionSettled(nativeSessionScopeKey(input.execution));
+  await waitForWarmNativeSessionSettled(nativeSessionScopeKey(input.execution), deadline);
   while (Date.now() < deadline
     && await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
     await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
