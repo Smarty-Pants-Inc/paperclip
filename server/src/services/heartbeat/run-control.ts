@@ -762,7 +762,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         ));
         if (!comment?.body.trim()) continue;
       } else {
-        let wait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+        // pl/no-default-wait: no default wait. Only a gate that names one, or a
+        // real execution blocker, owns a saved wait; otherwise the held wake
+        // stays plain deferred and the person's Stop line with Send stays.
+        let wait: { reason: string; message: string } | null = null;
         const admitted = await admitExplicitNativeContinuation({ db, companyId: run.companyId, issueId,
           agentId: run.agentId, actorType: wake.requestedByActorType, actorId: requestedByActorId,
           reason, commentId, successorRunId: randomUUID(), dryRun: true,
@@ -770,7 +773,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           onBlocked: (reason, message) => { wait = { reason, message }; },
         });
         if (!admitted) {
-          await writeDeferredExecutionWait(db, { companyId: run.companyId, requestId: wake.id }, wait);
+          if (wait || await getExecutionBlocker(db, run.companyId, issueId)) {
+            await writeDeferredExecutionWait(db, { companyId: run.companyId, requestId: wake.id },
+              wait ?? { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." });
+          }
           continue;
         }
       }
