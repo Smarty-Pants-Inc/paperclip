@@ -67,6 +67,10 @@ export type NativeWorkspaceFinalizationOwnership = {
   token: string;
   /** Recheck both the physical lock connection and the durable owner before publishing. */
   assertHeld(): Promise<void>;
+  /** pl/lockloss: aborts (reason NativeWorkspaceFinalizationOwnershipLostError)
+   * as soon as the lock session is known dead (a failed keepalive ping or a failed
+   * assertHeld). Work that may write after losing the lock passes it as its signal. */
+  lost: AbortSignal;
 };
 export class NativeWorkspaceFinalizationBusyError extends Error {
   constructor() { super("native_workspace_finalization_busy"); }
@@ -135,6 +139,10 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
         acquired: false,
         reason: !input.retainedRepairActionId && activeRunOwners.get(runKey)?.db === input.db ? "owner_active" : "busy",
       } as const;
+      const lost = new AbortController();
+      const markLost = (cause: unknown) => {
+        if (!lost.signal.aborted) lost.abort(new NativeWorkspaceFinalizationOwnershipLostError({ cause }));
+      };
       return withWorkspaceLockKeepalive(lock as unknown as Db, Number(rows[0].idle_timeout_ms), async () => {
         // Reads and durable progress use the ordinary pool, not the lock transaction.
         const [run] = await input.db.select({ profile: heartbeatRuns.runnerProfileJson,
@@ -307,7 +315,9 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
         if (prior) joinedOwnerTokens.delete(prior.token);
         const ownership: NativeWorkspaceFinalizationOwnership = {
           token: owner.token,
+          lost: lost.signal,
           assertHeld: async () => {
+            if (lost.signal.aborted) throw lost.signal.reason;
             try {
               // A failed transaction is never transparently reconnected by the DB client.
               await lock.execute(sql`select 1`);
@@ -318,7 +328,8 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
                 if (result?.id !== automaticResultId) throw new Error("task_replaced");
               }
             } catch (cause) {
-              throw new NativeWorkspaceFinalizationOwnershipLostError({ cause });
+              markLost(cause);
+              throw lost.signal.reason;
             }
           },
         };
@@ -337,7 +348,7 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
         const value = await actionPromise;
         await ownership.assertHeld();
         return { acquired: true, value } as const;
-      });
+      }, { onLost: markLost });
     }));
   } catch (error) {
     finishAcquisition(true);
