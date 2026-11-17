@@ -66667,6 +66667,41 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   });
 
+  // fam-retry-r2 (3-way semantic check): the person message Retry's source run
+  // carried is already answered while a restore hold Paperclip can still release
+  // stands. The ONE authority says person_message_already_answered (it sits
+  // before the hold), so the API refuses with "Already answered above." and the
+  // card must say that line too: not the hold's "your message is kept and runs
+  // when it's back", and not the accept-held state (no Retry is held).
+  it.each(["pending", "recovery_owned"] as const)("retry-fold / fam-retry3 / fam-retry-r2: an answered message under a %s restore hold: card and Retry route say the one line", async kind => {
+    const f = await boatRetryRouteFixture();
+    if (kind === "pending") await insertPendingRestoreHold(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId });
+    else await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
+      cause: "native_continuation_requires_reconciliation", fingerprint: `native-workspace:${f.runId}`, attemptCount: 1, status: "resolved",
+      outcome: "blocked", ownerType: "board", resolvedAt: new Date(), nextAction: "The task's saved files could not be put back after the run stopped.",
+      evidence: { runId: f.runId, workspaceRestoreFailure: "restore_failed", workspaceRestoreRecovery: { schema: LEGACY_WORKSPACE_RECOVERY_SCHEMA, state: "pending" },
+        continuationDelivery: "invalidated", automaticRecovery: { policy: "preserve_without_replay_v1", runId: f.runId,
+          replay: "blocked", actionOutcome: "unknown", recordedAt: new Date().toISOString() } } });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: "board", body: "Please summarise the report.", createdAt: new Date(Date.now() - 5 * 60_000) }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...(run!.contextSnapshot as Record<string, unknown> ?? {}),
+      wakeCommentId: message!.id, wakeCommentIds: [message!.id] } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.fixture.assignedAgentId, createdByRunId: f.runId, body: "Here is the summary of the report.",
+      createdAt: new Date(Date.now() - 4 * 60_000) });
+    const before = await f.counts();
+    const response = await request(f.app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: f.runId, idempotencyKey: randomUUID() });
+    expect(response.body, JSON.stringify(response.body)).toMatchObject({ accepted: false,
+      refused: { reason: "person_message_already_answered", message: "Already answered above." } });
+    expect(await f.counts()).toEqual(before);
+    const card = await f.card();
+    expect(card).toMatchObject({ canRetry: false,
+      retryWait: { reason: "person_message_already_answered", message: "Already answered above." } });
+    expect(card?.retryAdmission).toBeUndefined();
+    expect(f.wakeup).not.toHaveBeenCalled();
+  });
+
   it("retry-fold6 (rf-3 FAIL 2, finding A): a repeat of a waiting Retry whose Stop has since expired unproven is refused at requestTaskRetry, as the card refuses it", async () => {
     const f = await boatRetryRouteFixture();
     // A requested Stop the Runner has not proven yet: Retry waits (deferred).
