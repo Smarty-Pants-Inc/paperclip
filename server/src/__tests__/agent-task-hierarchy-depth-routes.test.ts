@@ -7,6 +7,7 @@ import { activityLog, agents, companies, createDb, heartbeatRuns, issues } from 
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
+import { loadConfig } from "../config.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describePostgres = support.supported ? describe : describe.skip;
@@ -73,8 +74,12 @@ describePostgres("agent task hierarchy depth through the issue routes", () => {
     effectiveParent: { id: rootId, identifier: "DEP-1" },
   };
 
-  it.each([undefined, "invalid", "5"])("makes re-parenting visible in the response and its own activity entry (depth %s)", async raw => {
+  it.each([undefined, "invalid", "5"])("refuses malformed depth or makes re-parenting visible in response and activity (depth %s)", async raw => {
     vi.stubEnv("PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH", raw);
+    if (raw === "invalid") {
+      expect(() => loadConfig(null)).toThrow("Invalid PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH: expected a positive safe integer.");
+      return;
+    }
     for (const route of [`/api/companies/${companyId}/issues`, `/api/issues/${childId}/children`]) {
       const created = await request(app(agentActor(runOnChild))).post(route)
         .send({ title: `Visible placement ${raw} ${route}`, parentId: childId });
