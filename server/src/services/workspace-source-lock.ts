@@ -9,11 +9,22 @@ import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lo
 
 type SourceTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type SourceLockScope = { db: Db; companyId: string; keys: Set<string>; transaction: SourceTransaction; active: boolean;
-  wait?: WorkspaceSourceLockWait };
+  wait?: WorkspaceSourceLockWait; lost?: AbortSignal };
 const sourceLocks = new AsyncLocalStorage<SourceLockScope>();
 export class IsolatedRepositorySourceBusy extends Error {
   sqlstate?: string;
 }
+/** pl/keepalive5: the source-lock session died (failed keepalive ping); the locks may now have another owner. */
+export class WorkspaceSourceLockLostError extends Error {
+  override name = "WorkspaceSourceLockLostError";
+  constructor(cause?: unknown) { super("workspace_source_lock_lost", { cause }); }
+}
+
+/** The held source scope's lock-loss signal, for host writes deep in a guarded action. */
+export function workspaceSourceLockSignal(): AbortSignal | undefined {
+  return heldScope()?.lost;
+}
+
 export type WorkspaceSourceLockWait = { waitMs: number; signal?: AbortSignal };
 
 async function acquireQueuedSourceLocks(db: Db, transaction: SourceTransaction, keys: string[], wait: WorkspaceSourceLockWait) {
@@ -83,7 +94,7 @@ function heldScope(): SourceLockScope | undefined {
  * Joining that scope would tie these locks to the other transaction. */
 export function withIndependentWorkspaceSourceLocks<T>(db: Db,
   input: { companyId: string; issueIds?: readonly string[]; projectIds?: readonly string[] },
-  action: (transaction: SourceTransaction) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
+  action: (transaction: SourceTransaction, signal?: AbortSignal) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
   return sourceLocks.exit(() => withWorkspaceSourceLocks(db, input, action, tryOnly, wait));
 }
 
@@ -94,7 +105,7 @@ export function withIsolatedRepositorySourceLock<T>(db: Db, companyId: string, i
 
 export async function withWorkspaceSourceLocks<T>(db: Db,
   input: { companyId: string; issueIds?: readonly string[]; projectIds?: readonly string[] },
-  action: (transaction: SourceTransaction) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
+  action: (transaction: SourceTransaction, signal?: AbortSignal) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
   if (wait && (!Number.isSafeInteger(wait.waitMs) || wait.waitMs < 1 || wait.waitMs > 2_147_483_647))
     throw new Error("workspace_source_wait_invalid");
   const keys = [...new Set([
@@ -125,18 +136,30 @@ export async function withWorkspaceSourceLocks<T>(db: Db,
     const onlyProjectKeys = keys.filter(key => !held.keys.has(key)).every(key => key.startsWith("managed_project_source:"));
     const alreadyHasProject = [...held.keys].some(key => key.startsWith("managed_project_source:"));
     await acquire(held, !onlyProjectKeys || alreadyHasProject);
-    return action(held.transaction);
+    // pl/keepalive5: re-check after the lock wait, and never report success once the scope's session died.
+    held.lost?.throwIfAborted();
+    const joined = await action(held.transaction, held.lost);
+    held.lost?.throwIfAborted();
+    return joined;
   }
   return withDedicatedDbConnection(db, connection => connection.transaction(async transaction => {
-    const scope: SourceLockScope = { db, companyId: input.companyId, transaction, keys: new Set<string>(), active: true, wait };
+    const lost = new AbortController();
+    const scope: SourceLockScope = { db, companyId: input.companyId, transaction, keys: new Set<string>(), active: true, wait,
+      lost: lost.signal };
     try {
       if (wait) {
         await acquireQueuedSourceLocks(db, transaction, keys, wait);
         for (const key of keys) scope.keys.add(key);
       } else await acquire(scope, tryOnly);
       const rows = await transaction.execute(sql`select setting::bigint as idle_timeout_ms from pg_settings where name = 'idle_in_transaction_session_timeout'`);
-      return await withWorkspaceLockKeepalive(transaction, Number(rows[0]?.idle_timeout_ms),
-        () => sourceLocks.run(scope, () => action(transaction)));
+      // pl/keepalive5: a failed ping aborts the action's signal; a lost scope is a failure, never a success.
+      const result = await withWorkspaceLockKeepalive(transaction, Number(rows[0]?.idle_timeout_ms),
+        () => sourceLocks.run(scope, async () => {
+          lost.signal.throwIfAborted();
+          return action(transaction, lost.signal);
+        }), { onLost: cause => lost.abort(new WorkspaceSourceLockLostError(cause)) });
+      lost.signal.throwIfAborted();
+      return result;
     } finally {
       scope.active = false;
     }
