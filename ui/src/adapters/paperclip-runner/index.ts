@@ -1,5 +1,5 @@
-import type { PaperclipQuestion, PaperclipQuestionResponse, PaperclipQuestionSet, TranscriptEntry } from "@paperclipai/adapter-utils";
-import type { UIAdapterModule } from "../types";
+import type { PaperclipQuestion, PaperclipQuestionResponse, PaperclipQuestionSet } from "@paperclipai/adapter-utils";
+import type { TranscriptEntry, UIAdapterModule } from "../types";
 import { parseCodexStdoutLine, buildPaperclipRunnerConfig } from "@paperclipai/adapter-codex-local/ui";
 import { CodexLocalConfigFields } from "../codex-local/config-fields";
 import { isRunLogOnlyProviderEvent } from "@/components/transcript/run-log-only-events";
@@ -12,7 +12,7 @@ interface PaperclipRunnerParserState {
   usageReceiptItemIds: Set<string>;
   completedTextItemIds: Set<string>;
   resultSummaries: Set<string>;
-  toolOutputItemIds: Set<string>;
+  commandOutputById: Map<string, string>;
   itemChannels: Map<string, "progress" | "final" | "summary" | "detail" | "unknown">;
   structuredFinalItemIds: Set<string>;
   runtimeRequests: Map<string, Extract<TranscriptEntry, { kind: "runtime_request" }>>;
@@ -90,11 +90,31 @@ function toolFailure(item: JsonRecord): boolean {
     || ["failed", "error", "errored", "cancelled"].includes(status);
 }
 
+/** Completed aliases describe one snapshot, not extra chunks. Prefer the
+ * Codex aggregate (camel, then legacy snake), provider item output, Pi envelope
+ * output, then proxy item/envelope text. Empty placeholders must not mask bytes.
+ */
+function commandOutput(item: JsonRecord, payload: JsonRecord): string {
+  return [item.aggregatedOutput, item.aggregated_output, item.output, payload.output, item.text, payload.text]
+    .find((value): value is string => typeof value === "string" && value.length > 0) ?? "";
+}
+
+/** A snapshot may fill a missed delta or lag the stream. Keep the longer
+ * prefix; if it is a distinct tail, retain both without trimming or separators.
+ */
+function reconcileCommandOutput(previous: string, snapshot: string): string {
+  if (snapshot.startsWith(previous)) return snapshot;
+  if (previous.startsWith(snapshot)) return previous;
+  return previous + snapshot;
+}
+
 function commandEntries(
   event: JsonRecord,
   item: JsonRecord,
+  payload: JsonRecord,
   phase: "started" | "completed",
   ts: string,
+  state: PaperclipRunnerParserState,
 ): TranscriptEntry[] {
   const id = itemId(event, item);
   const commandActions = Array.isArray(item.commandActions) ? item.commandActions : [];
@@ -102,7 +122,8 @@ function commandEntries(
   if (phase === "started") {
     return [{ kind: "tool_call", ts, name: "command", toolUseId: id, input: { command } }];
   }
-  const output = text(item.aggregatedOutput, text(item.aggregated_output));
+  const output = reconcileCommandOutput(state.commandOutputById.get(id) ?? "", commandOutput(item, payload));
+  state.commandOutputById.delete(id);
   const exitCode = item.exitCode ?? item.exit_code;
   const detail = [
     typeof exitCode === "number" ? `exit_code: ${exitCode}` : "",
@@ -115,6 +136,7 @@ function commandEntries(
     toolName: "command",
     content: detail || text(item.status, "command completed"),
     isError: toolFailure(item),
+    ...(item.outputTruncated === true || payload.outputTruncated === true ? { outputTruncated: true } : {}),
   }];
 }
 
@@ -206,6 +228,7 @@ function genericToolEntries(
     toolName: name,
     content: stringify(item.content ?? item.result ?? item.output ?? item.error) || `${name} completed`,
     isError: toolFailure(item),
+    ...(item.outputTruncated === true ? { outputTruncated: true } : {}),
   }];
 }
 
@@ -256,18 +279,19 @@ function parseItemEvent(
       itemId: id,
     }];
   }
-  if (type === "commandexecution") {
-    const entries = commandEntries(event, item, phase, ts);
-    if (phase === "completed" && state.toolOutputItemIds.has(id)) {
-      const result = entries[0];
-      if (result?.kind === "tool_result") result.content = "";
-    }
-    return entries;
+  if (type === "commandexecution" || (phase === "completed" && !type && state.commandOutputById.has(id))) {
+    return commandEntries(event, item, payload, phase, ts, state);
   }
   if (type === "filechange") return fileChangeEntries(event, item, phase, ts);
   if (type === "dynamictoolcall") return dynamicToolEntries(event, item, phase, ts);
   if (type === "tooluse" || type === "toolresult" || type === "mcptoolcall") {
-    const normalized = { ...item, output: payload.output ?? item.output, isError: payload.isError === true || item.isError === true };
+    const isCommand = text(payload.kind).replaceAll("_", "").toLowerCase() === "commandexecution";
+    const output = isCommand && phase === "completed"
+      ? reconcileCommandOutput(state.commandOutputById.get(id) ?? "", commandOutput(item, payload))
+      : payload.output ?? item.output;
+    if (isCommand && phase === "completed") state.commandOutputById.delete(id);
+    const normalized = { ...item, output, isError: payload.isError === true || item.isError === true,
+      outputTruncated: payload.outputTruncated === true || item.outputTruncated === true };
     // Some providers learn structured arguments only at completion. Re-emit
     // the same call identity as an update before its correlated result.
     return phase === "completed" && (item.input !== undefined || item.arguments !== undefined)
@@ -287,8 +311,8 @@ function parseDeltaEvent(
   state: PaperclipRunnerParserState,
 ): TranscriptEntry[] {
   const kind = text(payload.kind).replaceAll("_", "").toLowerCase();
-  const value = text(payload.text);
-  const id = text(event.itemId, `${kind || "item"}-delta`);
+  const value = kind === "commandexecution" ? text(payload.text) || text(payload.output) : text(payload.text);
+  const id = text(event.itemId, text(record(payload.item).id, `${kind || "item"}-delta`));
   const explicitChannel = itemChannel(payload);
   const channel = explicitChannel === "unknown" ? state.itemChannels.get(id) ?? "unknown" : explicitChannel;
   if (!value) return [];
@@ -305,15 +329,24 @@ function parseDeltaEvent(
     return [{ kind: "thinking", ts, text: value, delta: true, channel: channel === "detail" ? "detail" : channel === "summary" ? "summary" : "unknown", itemId: id }];
   }
   if (kind === "commandexecution") {
-    state.toolOutputItemIds.add(id);
+    const previous = state.commandOutputById.get(id) ?? "";
+    // Codex payload.text is an ordered chunk; Pi payload.output is a cumulative
+    // partialResult snapshot. Emit only the new suffix, preserving live status.
+    const output = text(payload.text)
+      ? previous + value
+      : reconcileCommandOutput(previous, value);
+    state.commandOutputById.set(id, output);
+    const suffix = output.slice(previous.length);
+    if (!suffix) return [];
     return [{
       kind: "tool_result",
       ts,
       toolUseId: id,
       toolName: "command",
-      content: value,
+      content: suffix,
       isError: false,
       delta: true,
+      ...(payload.outputTruncated === true || record(payload.item).outputTruncated === true ? { outputTruncated: true } : {}),
     }];
   }
   if (kind === "filechange" || kind === "diff") {
@@ -821,7 +854,7 @@ function createParserState(): PaperclipRunnerParserState {
     usageReceiptItemIds: new Set(),
     completedTextItemIds: new Set(),
     resultSummaries: new Set(),
-    toolOutputItemIds: new Set(),
+    commandOutputById: new Map(),
     itemChannels: new Map(),
     structuredFinalItemIds: new Set(),
     runtimeRequests: new Map(),
