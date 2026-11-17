@@ -475,7 +475,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(codeOf(notices[0]!)).toBe("runner_state_identity_mismatch");
   });
 
-  it("retry fold R12 F3: the sweep's HELD notice gives ONE instruction: its Next action is the body's own new-task action", async () => {
+  // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z): the HELD body names Retry; its Next action is that same one instruction.
+  it("supersedes: retry fold R12 F3: the sweep's HELD notice gives ONE instruction: its Next action is the body's own new-task action", async () => {
     const f = await fixture();
     await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
       error: "runner_state_identity_mismatch: prior_owner_scope_mismatch" });
@@ -485,7 +486,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notices[0]!.body).toBe(HELD);
     const rows = notices[0]!.metadata!.sections!.flatMap(section => section.rows);
     const nextAction = rows.find(row => row.type === "key_value" && row.label === "Next action");
-    expect(nextAction).toEqual({ type: "key_value", label: "Next action", value: "Assign this agent a new task to continue." });
+    expect(nextAction).toEqual({ type: "key_value", label: "Next action", value: "Press Retry to continue in a fresh run with this conversation's history." });
     expect(notices[0]!.body).toContain((nextAction as { value: string }).value);
     expect(JSON.stringify(rows)).not.toMatch(/Send a new message/);
   });

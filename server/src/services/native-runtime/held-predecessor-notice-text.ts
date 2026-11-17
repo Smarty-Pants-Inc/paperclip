@@ -7,6 +7,11 @@
 export const HELD_RETRY_ACTION = "Press Retry to continue in a fresh run with this conversation's history.";
 export const HELD_PREDECESSOR_NOTICE = `Your message and saved work are kept, but the previous run of this conversation did not finish. ${HELD_RETRY_ACTION}`;
 export const HELD_RECOVERED_WORK_MESSAGE = `Saved work recovered, but the previous run of this conversation did not finish. ${HELD_RETRY_ACTION}`;
+// Only where Retry is NOT offered for another reason (Retry's own source check
+// refuses, e.g. a managing agent's Stop): the held thread meets the same fence
+// on a new message too, so the one action is a new task.
+export const HELD_NEW_TASK_MESSAGE = "Your message and saved work are kept, but this conversation cannot continue. Assign this agent a new task to continue.";
+export const HELD_RECOVERED_NEW_TASK_MESSAGE = "Saved work recovered, but this conversation cannot continue. Assign this agent a new task to continue.";
 export const STOPPED_TASK_RETRY_MESSAGE = "This task was stopped and its saved work is kept. Press Retry to run it again, or assign this agent a new task.";
 // Also used when task Retry's target is closed, unassigned or superseded.
 export const STOPPED_TASK_NEW_TASK_MESSAGE = "This task was stopped and its saved work is kept. Assign this agent a new task to continue.";
