@@ -172,6 +172,7 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
           target: executionTarget, cwd: executionWorkspace.cwd,
           legacy: Object.keys(priorFileInput).length > 0 && priorWorkingCopy.kind !== "agent_files",
           warm: warmFiles, reuseRunId,
+          runnerStateDirectory: reuseRunId ? nativeInstructionReservation?.runnerStateDirectory : undefined,
           onWarmHandoff: copy => {
             instructionCopy = copy;
             nativeInstructionReservation?.adopt(copy.executionRoot, collectStoppedInstructions);

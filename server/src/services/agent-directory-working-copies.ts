@@ -88,18 +88,68 @@ export function declaredInstructionDigest(snapshot: DirectorySnapshot, entryFile
     .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
   return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
 }
-/** Runs on the remote target. Moves uploaded note files (already inside the
- * root's excluded .paperclip-runtime scratch, same filesystem) into place by
- * atomic rename, so a failure never leaves a partial note in the tree. Every
- * ancestor below the root must be a real directory, never a link. */
-export const applyWarmNotesProgram = `const fs=require("node:fs"),path=require("node:path");const plan=JSON.parse(process.argv[1]);
+/** Runs on the remote target with the parked runner's state directory. The
+ * runner's own process-lineage journal (runner-core process_lineage/journal.rs:
+ * writer-<pid>.json marks the live runnerd, lineage-<pid>-<n>.json records each
+ * supervised root with its members, groups and sessions) plus the box's /proc
+ * table must show no live process of this chat except runnerd and ONE parked
+ * provider root. Any other member, group or session process, any other
+ * descendant of runnerd, an unreadable table or a missing journal is not
+ * quiescent. Callers then take the existing retirement + fresh restore. */
+const warmRunnerQuiescence = String.raw`const quiet=dir=>{const fs=require("node:fs"),path=require("node:path");
+if(process.platform!=="linux"||typeof dir!=="string"||!path.isAbsolute(dir))throw new Error("runner process table unavailable");
+const stat=pid=>{let t;try{t=fs.readFileSync("/proc/"+pid+"/stat","utf8");}catch(e){if(e.code==="ENOENT"||e.code==="ESRCH")return null;throw e;}const f=t.slice(t.lastIndexOf(")")+1).trim().split(/\s+/);return{pid,ppid:+f[1],pgid:+f[2],sid:+f[3],started:+f[19],zombie:f[0]==="Z"||f[0]==="X"};};
+const lineage=path.join(dir,"process-lineage"),ls=fs.lstatSync(lineage);if(!ls.isDirectory()||ls.isSymbolicLink())throw new Error("unsafe runner lineage");
+const rows=fs.readdirSync("/proc").filter(n=>/^[0-9]+$/.test(n)).map(n=>stat(+n)).filter(r=>r&&!r.zombie),by=new Map(rows.map(r=>[r.pid,r]));
+const alive=id=>Array.isArray(id)&&by.get(id[0])?.started===id[1];
+const names=fs.readdirSync(lineage).filter(n=>!n.endsWith(".tmp"));if(names.some(n=>!/^(writer-[1-9][0-9]*|lineage-[1-9][0-9]*-[0-9]+)\.json$/.test(n)))throw new Error("unknown runner lineage");
+const read=n=>JSON.parse(fs.readFileSync(path.join(lineage,n),"utf8"));
+const writers=names.filter(n=>n.startsWith("writer-")).map(read).filter(m=>m.schema==="paperclip.runner.process-lineage-writer.v1"&&alive([m.writer?.pid,m.writer?.started]));
+if(writers.length!==1)throw new Error("no single live runner");const w=writers[0].writer;
+const records=names.filter(n=>n.startsWith("lineage-")).map(read);if(records.some(r=>r.schema!=="paperclip.runner.process-lineage.v1"))throw new Error("invalid runner lineage");
+const roots=records.filter(r=>r.writer?.pid===w.pid&&r.writer?.started===w.started&&alive(r.root)).map(r=>r.root);
+if(roots.length!==1)throw new Error("runner has no single parked provider");const root=roots[0];
+const own=new Set();for(let r=by.get(process.pid);r&&!own.has(r.pid);r=by.get(r.ppid))own.add(r.pid);
+const members=new Set(),groups=new Set(),sessions=new Set();for(const r of records){for(const m of r.members||[])if(alive(m))members.add(m[0]);for(const g of r.groups||[])groups.add(g[0]);for(const x of r.sessions||[])sessions.add(x[0]);}
+const descends=r=>{for(let seen=0,p=r;p&&seen<4096;p=by.get(p.ppid),seen++)if(p.pid===w.pid)return true;return false;};
+const live=rows.filter(r=>!own.has(r.pid)&&r.pid!==w.pid&&!(r.pid===root[0]&&r.started===root[1])&&(members.has(r.pid)||groups.has(r.pgid)||sessions.has(r.sid)||descends(r)));
+if(live.length)throw new Error("live chat process "+live.map(r=>r.pid).join(","));return true;};`;
+const warmRunnerQuiescenceProgram = `${warmRunnerQuiescence}quiet(process.argv[1]);`;
+/** Runs on the remote target. Places uploaded note files (already inside the
+ * root's excluded .paperclip-runtime scratch, same filesystem) WITHOUT erasing:
+ * each destination (file or removed path) is first renamed aside into that
+ * scratch, the moved-aside bytes must equal the captured baseline ('absent'
+ * for a new path), the new file is placed with link(2), which fails EEXIST if
+ * anything recreated the path, and every moved-aside copy is re-hashed after
+ * placement (a write through an fd held open lands there). Quiescence is read
+ * before and after placement. Any mismatch, EEXIST or live chat process puts
+ * the agent's bytes back (the new note aside) and fails. Nothing moved aside
+ * is deleted here: the caller removes the scratch only after its post-check.
+ * Every ancestor below the root must be a real directory, never a link. */
+export const applyWarmNotesProgram = `const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");const plan=JSON.parse(process.argv[1]);${warmRunnerQuiescence}
 const at=(base,name)=>{if(typeof name!=="string"||!name||name.length>512||name.startsWith("/")||name.includes("\\\\")||name.includes("\\0")||name.split("/").some(p=>!p||p==="."||p===".."||p===".paperclip-runtime"))throw new Error("unsafe note path");return path.join(base,...name.split("/"));};
 const real=target=>{let current=plan.root;for(const segment of path.relative(plan.root,path.dirname(target)).split(path.sep).filter(Boolean)){current=path.join(current,segment);const s=fs.lstatSync(current);if(!s.isDirectory()||s.isSymbolicLink())throw new Error("unsafe note parent");}};
-if(!path.isAbsolute(plan.root)||!plan.source.startsWith(plan.root+"/.paperclip-runtime/"))throw new Error("unsafe note plan");
-for(const name of plan.remove){const t=at(plan.root,name);real(t);fs.rmSync(t,{recursive:true,force:true});}
+if(!path.isAbsolute(plan.root)||!plan.source.startsWith(plan.root+"/.paperclip-runtime/")||!plan.aside.startsWith(plan.root+"/.paperclip-runtime/"))throw new Error("unsafe note plan");
+const sha=f=>crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
+const tree=(p,rel,out)=>{const s=fs.lstatSync(p,{throwIfNoEntry:false});if(!s)return out;if(s.isSymbolicLink())out[rel]="link";else if(s.isDirectory()){out[rel]="dir";for(const n of fs.readdirSync(p))tree(path.join(p,n),rel?rel+"/"+n:n,out);}else out[rel]=s.isFile()?sha(p):"other";return out;};
+const same=(p,expect)=>{const got=tree(p,"",{});return JSON.stringify(Object.keys(got).sort().map(k=>[k,got[k]]))===JSON.stringify(Object.keys(expect).filter(k=>expect[k]!=="absent").sort().map(k=>[k,expect[k]]));};
+const C=new Error("warm note changed during delivery");let n=0;const moved=[],kept=[];
+fs.mkdirSync(plan.aside,{recursive:true,mode:0o700});
+const aside=(t,expect)=>{const a=path.join(plan.aside,String(n++));const d=fs.lstatSync(path.dirname(t),{throwIfNoEntry:false});if(d&&d.dev!==fs.lstatSync(plan.aside).dev)throw new Error("note aside crosses filesystems");
+let present=true;try{fs.renameSync(t,a);}catch(e){if(e.code!=="ENOENT")throw e;present=false;}const m={t,a,present,expect,placed:null};moved.push(m);
+if(present?!same(a,expect):expect[""]!=="absent")throw C;return m;};
+const putBack=m=>{if(m.placed){const now=fs.lstatSync(m.t,{throwIfNoEntry:false});if(now&&now.isFile()&&sha(m.t)===m.placed){fs.renameSync(m.t,path.join(plan.aside,"new-"+String(n++)));}else if(now){if(m.present)kept.push(m.a);return;}}
+if(!m.present)return;const s=fs.lstatSync(m.a);if(s.isDirectory()){if(fs.lstatSync(m.t,{throwIfNoEntry:false})){kept.push(m.a);return;}fs.renameSync(m.a,m.t);return;}
+try{fs.linkSync(m.a,m.t);fs.unlinkSync(m.a);}catch(e){if(e.code!=="EEXIST")throw e;kept.push(m.a);}};
+try{quiet(plan.runner);
+for(const [name,expect] of plan.remove){const t=at(plan.root,name);real(t);aside(t,expect);}
 for(const name of plan.dirs){const t=at(plan.root,name);fs.mkdirSync(t,{recursive:true,mode:0o700});real(path.join(t,"x"));}
-for(const [name,mode] of plan.files){const t=at(plan.root,name),s=at(plan.source,name);fs.mkdirSync(path.dirname(t),{recursive:true,mode:0o700});real(t);
-const e=fs.lstatSync(t,{throwIfNoEntry:false});if(e&&!e.isFile())fs.rmSync(t,{recursive:true,force:true});fs.chmodSync(s,mode);fs.renameSync(s,t);}`;
+for(const [name,mode,expect,hash] of plan.files){const t=at(plan.root,name),s=at(plan.source,name);fs.mkdirSync(path.dirname(t),{recursive:true,mode:0o700});real(t);
+const m=aside(t,expect);fs.chmodSync(s,mode);if(sha(s)!==hash)throw new Error("staged note changed");fs.linkSync(s,t);m.placed=hash;fs.unlinkSync(s);}
+for(const m of moved)if(m.present?!same(m.a,m.expect):fs.existsSync(m.a))throw C;
+quiet(plan.runner);
+}catch(error){for(const m of moved.reverse()){try{putBack(m);}catch(e){kept.push(m.a);}}
+if(kept.length)process.stderr.write("agent bytes kept aside: "+JSON.stringify(kept)+"\\n");throw error;}`;
 function actor(row: Copy): AuthorizationActor {
   return { type: "agent", companyId: row.companyId, agentId: row.agentId, runId: row.runId, onBehalfOfUserId: row.responsibleUserId };
 }
@@ -142,14 +192,14 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
    * idle warm tree that still equals its last checkpoint, under the caller's
    * canonical lock. Returns the rebased baseline. A remote tree keeps its
    * root, so AGENT_HOME in the runner's instruction text does not move. */
-  async function refreshWarmNotes(row: Copy, canonicalRoot: string, canonical: DirectorySnapshot, executionTarget?: AdapterExecutionTarget | null) {
+  async function refreshWarmNotes(row: Copy, canonicalRoot: string, canonical: DirectorySnapshot, executionTarget?: AdapterExecutionTarget | null, runnerStateDirectory?: string) {
     const before = baseline(row);
     const names = [...new Set([...[...before.entries].map(([name]) => name), ...[...canonical.entries].map(([name]) => name)])]
       .filter(name => !isDeepStrictEqual(before.entries.get(name), canonical.entries.get(name)));
     if (names.some(name => isDeclaredInstructionPath(name, row.entryFile) && (before.entries.get(name)?.kind ?? canonical.entries.get(name)?.kind) !== "dir")) {
       throw new AgentDirectoryReuseInvalidatedError("Managed agent instructions changed before warm directory handoff");
     }
-    if (row.location !== "local") return refreshRemoteWarmNotes(row, canonicalRoot, canonical, names, executionTarget);
+    if (row.location !== "local") return refreshRemoteWarmNotes(row, canonicalRoot, canonical, names, executionTarget, runnerStateDirectory);
     const observed = await observeLocalAgentDirectory(row.localRoot).catch(() => null);
     if (observed?.digest !== agentDirectoryBaselineDigest(before)) throw new AgentDirectoryReuseInvalidatedError("Warm agent directory changed after its checkpoint");
     const target = (name: string) => path.join(row.localRoot, ...name.split("/"));
@@ -180,11 +230,21 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
    * saves that write first), the managed-runtime asset upload stages the changed
    * notes inside the excluded .paperclip-runtime area, a bounded program renames
    * them into place, and a second capture proves the tree equals canonical. */
-  async function refreshRemoteWarmNotes(row: Copy, canonicalRoot: string, canonical: DirectorySnapshot, names: string[], target?: AdapterExecutionTarget | null) {
+  async function refreshRemoteWarmNotes(row: Copy, canonicalRoot: string, canonical: DirectorySnapshot, names: string[], target?: AdapterExecutionTarget | null, runnerStateDirectory?: string) {
     if (target?.kind !== "remote" || row.location !== `remote:${target.environmentId ?? ""}`) {
       throw new AgentDirectoryReuseInvalidatedError("Remote warm agent directory collector is unavailable");
     }
     const before = baseline(row);
+    const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+    // (a) Quiescence: without the parked runner's state directory, or with any
+    // live chat process other than the idle provider, nothing is delivered.
+    if (!runnerStateDirectory) throw new AgentDirectoryReuseInvalidatedError("Warm runner quiescence is unproven");
+    const quiet = await runAdapterExecutionTargetShellCommand(row.runId, target,
+      `node -e ${quote(warmRunnerQuiescenceProgram)} ${quote(runnerStateDirectory)}`, { cwd: target.remoteCwd, env: {}, timeoutSec: 15 }).catch(() => null);
+    if (!quiet || quiet.exitCode !== 0 || quiet.timedOut) {
+      logger.info({ runId: row.runId, stderr: quiet?.stderr?.trim().slice(0, 500) }, "Warm runner is not quiescent; retiring the warm session instead of delivering notes");
+      throw new AgentDirectoryReuseInvalidatedError("Warm runner quiescence is unproven");
+    }
     const capture = async (previous: AgentFileManifest) => {
       const captured = await captureAgentFileCheckpoint({ runId: row.runId, localRoot: row.localRoot, executionRoot: row.executionRoot, previous, target });
       await captured.cleanup().catch(error => logger.warn({ err: error, runId: row.runId }, "Agent note refresh scratch cleanup deferred to session retirement"));
@@ -197,20 +257,33 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const id = randomUUID();
     const staging = path.join(path.dirname(row.localRoot), `notes-${id}`), files = path.join(staging, "files");
     const remoteStaging = path.posix.join(row.executionRoot, ".paperclip-runtime", `notes-${id}`);
-    const plan = { root: row.executionRoot, source: "", remove: [] as string[], dirs: [] as string[], files: [] as Array<[string, number]> };
+    // (b) Each removed or replaced path carries its captured baseline: the
+    // file hash, 'dir' plus every baseline entry below it, or 'absent'.
+    type Expect = Record<string, string>;
+    const expectOf = (name: string): Expect => {
+      const entry = before.entries.get(name);
+      if (!entry) return { "": "absent" };
+      if (entry.kind === "file") return { "": entry.hash };
+      const below: Expect = { "": entry.kind };
+      for (const [other, value] of before.entries) if (other.startsWith(`${name}/`)) below[other.slice(name.length + 1)] = value.kind === "file" ? value.hash : value.kind;
+      return below;
+    };
+    const plan = { root: row.executionRoot, source: "", aside: path.posix.join(remoteStaging, "aside"), runner: runnerStateDirectory,
+      remove: [] as Array<[string, Expect]>, dirs: [] as string[], files: [] as Array<[string, number, Expect, string]> };
     for (const name of [...names].sort()) {
       const previous = before.entries.get(name), next = canonical.entries.get(name);
-      if (previous && previous.kind !== next?.kind) plan.remove.push(name);
+      if (previous && previous.kind !== next?.kind) plan.remove.push([name, expectOf(name)]);
       if (next?.kind === "dir") plan.dirs.push(name);
       else if (next?.kind === "file") {
         await fs.mkdir(path.dirname(path.join(files, ...name.split("/"))), { recursive: true, mode: 0o700 });
         await fs.copyFile(path.join(canonicalRoot, ...name.split("/")), path.join(files, ...name.split("/")));
-        plan.files.push([name, next.mode & 0o777]);
+        plan.files.push([name, next.mode & 0o777, previous?.kind === "file" ? expectOf(name) : { "": "absent" }, next.hash]);
       }
     }
-    plan.remove.sort((a, b) => b.length - a.length);
+    // A removed parent holds every removed child; nested removes are already aside with it.
+    plan.remove = plan.remove.filter(([name]) => !plan.remove.some(([other]) => name.startsWith(`${other}/`)));
+    plan.remove.sort(([a], [b]) => b.length - a.length);
     await fs.mkdir(files, { recursive: true, mode: 0o700 });
-    const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
     let upload: PreparedAdapterExecutionTargetRuntime | undefined;
     try {
       upload = await prepareAdapterExecutionTargetRuntime({ target, runId: row.runId, adapterKey: `agent-notes-${id}`, workspaceLocalDir: staging,
@@ -226,14 +299,16 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     } finally {
       await upload?.cleanupWorkspaceSnapshot?.().catch(() => undefined);
       await fs.rm(staging, { recursive: true, force: true });
-      await runAdapterExecutionTargetShellCommand(row.runId, target, `rm -rf -- ${quote(remoteStaging)}`, { cwd: target.remoteCwd, env: {}, timeoutSec: 15 })
-        .catch(() => undefined);
     }
     const refreshed = new Set(names);
     const verified = await capture({ ...observed, entries: observed.entries.filter(([name]) => !refreshed.has(name)) }).catch(() => null);
     if (!verified || directorySnapshotSha256(checkpointSnapshot(verified)) !== directorySnapshotSha256(canonical)) {
+      // The moved-aside copies stay in the excluded scratch: nothing is deleted
+      // before a green post-check. Retirement collects the tree itself.
       throw new AgentDirectoryReuseInvalidatedError("Warm agent directory note refresh could not be verified");
     }
+    await runAdapterExecutionTargetShellCommand(row.runId, target, `rm -rf -- ${quote(remoteStaging)}`, { cwd: target.remoteCwd, env: {}, timeoutSec: 15 })
+      .catch(() => undefined);
     return { baseHash: directorySnapshotSha256(canonical), baseline: serializeDirectorySnapshot(canonical), checkpointManifest: verified };
   }
   async function transport(row: Copy, target: AdapterExecutionTarget, recovering: boolean) {
@@ -273,7 +348,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (!value || typeof value.digest !== "string" || !/^[a-f0-9]{64}$/.test(value.digest) || typeof value.identity !== "string") throw new Error("Invalid agent directory observation");
     return value as { digest: string; identity: string };
   }
-  async function prepareCopy(input: { companyId: string; agentId: string; runId: string; target?: AdapterExecutionTarget | null; cwd: string; warm?: boolean; reuseRunId?: string; onWarmHandoff?: (copy: Copy) => void }, serialHeld = false): Promise<Copy | null> {
+  async function prepareCopy(input: { companyId: string; agentId: string; runId: string; target?: AdapterExecutionTarget | null; cwd: string; warm?: boolean; reuseRunId?: string; runnerStateDirectory?: string; onWarmHandoff?: (copy: Copy) => void }, serialHeld = false): Promise<Copy | null> {
     const [agent] = await db.select().from(agents).where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)));
     if (!agent) throw notFound("Agent not found");
     if (agentInstructionsBundleMode(agent) !== "managed") return null;
@@ -303,7 +378,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
             if (declaredInstructionDigest(canonicalSnapshot, current.entryFile) !== declaredInstructionDigest(baseline(current), current.entryFile)) {
               throw new AgentDirectoryReuseInvalidatedError("Managed agent files changed before warm directory handoff");
             }
-            const refreshed = await refreshWarmNotes(current, canonical, canonicalSnapshot, input.target);
+            const refreshed = await refreshWarmNotes(current, canonical, canonicalSnapshot, input.target, input.runnerStateDirectory);
             Object.assign(successor!, await patch(successor!, { baseHash: refreshed.baseHash,
               receipt: { ...successor!.receipt, baseline: refreshed.baseline, checkpointManifest: refreshed.checkpointManifest } }));
           }
