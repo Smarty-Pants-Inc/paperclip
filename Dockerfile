@@ -337,6 +337,8 @@ RUN --mount=type=bind,from=runner-artifacts,target=/runner-artifacts \
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
+# Match the external database major (docker/docker-compose.yml uses PostgreSQL 17).
+ARG POSTGRES_MAJOR=17
 # Refreshes the tool layer below when it changes (CI stamps an ISO week, so
 # the @latest CLI tools advance weekly). Without it the cached layer would
 # freeze the tools until an unrelated cache bust.
@@ -349,7 +351,7 @@ WORKDIR /app
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest \
   && apt-get update \
-  && apt-get install -y --no-install-recommends openssh-client jq \
+  && apt-get install -y --no-install-recommends openssh-client jq postgresql-client-${POSTGRES_MAJOR} \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
