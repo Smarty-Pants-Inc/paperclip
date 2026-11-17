@@ -1400,6 +1400,28 @@ fresh provider session. Other local `session.open` rejections keep the bounded
 startup retry and end with Retry when it is spent. An
 indeterminate `session.open` outcome stays unclassified.
 
+### Native provider policy refusals
+
+A bound Pi provider terminal refusal is `provider_policy_refusal`, a permanent
+failure, not a capacity error or an interrupted session. The Pi driver preserves
+Anthropic's `rawStopReason: "refusal"` as that code even when the provider's
+explanation does not mention policy. Older pinned packs forward
+`pi_provider_error` with Pi's default refusal message or an explicit usage-policy
+rejection; the server classifies those at the same committed-event boundary.
+Assistant prose, tool output and events from another run, source or turn cannot
+authorize this classification. Finalization after restart re-derives it from the
+hash-checked persisted runner event, not a display diagnostic.
+
+Neither the native status decision nor generic recovery/fresh continuation
+retries that request automatically. The unanswered-person-message sweep writes
+one idempotent note: “The model provider refused this request under its usage
+policy; it won't be retried automatically.” It never recommends resending that
+request. A provider refusal does not itself request Stop or prove execution
+cleanup: no Stop-pending card is created for it without a recorded Stop request,
+and the existing execution claims and cleanup gates remain intact. A genuinely
+requested Stop keeps its existing proof and escalation requirements. Ordinary
+provider overloads retain their existing retry policy.
+
 ### Workspace scan failures before provider startup
 
 Workspace source preparation keeps its dedicated advisory-lock connection active

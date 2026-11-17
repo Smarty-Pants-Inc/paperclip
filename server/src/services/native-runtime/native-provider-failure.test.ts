@@ -19,6 +19,42 @@ const terminal: PrpTerminalState = {
 const observation = () => createNativeProviderFailureObservation({ kind: "codex", model });
 
 describe("native provider failure observation", () => {
+  // KEEP: never-OK account-risk guard. Neither assistant/tool prose nor a
+  // different turn, provider, source or successful terminal may stop retries.
+  const policyEvent: PrpEvent = { ...event, payload: { status: "failed", error: {
+    code: "pi_provider_error", message: '400 {"type":"error","error":{"type":"invalid_request_error","message":"Your request was flagged by our usage policy."}}',
+  } } };
+  it("classifies only the bound Pi provider refusal, with closed diagnostics", () => {
+    const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
+    observed.observe(policyEvent);
+    expect(observed.forTerminal("turn", terminal)).toEqual({ errorCode: "provider_policy_refusal",
+      errorMessage: "The model provider refused this request under its usage policy; it won't be retried automatically.",
+      diagnostic: { provider: "pi_rpc", category: "policy_refusal" } });
+    expect(observed.unclassifiedTurnFailure("turn", terminal)).toBeNull();
+    expect(observed.forTerminal("other-turn", terminal)).toBeNull();
+    expect(observed.forTerminal("turn", { ...terminal, runTerminalState: "succeeded" })).toBeNull();
+    expect(observed.forTerminal("turn", { ...terminal, turnTerminalState: "cancelled" })).toBeNull();
+  });
+  it.each([
+    { ...policyEvent, sourceKind: "control_plane" as const },
+    { ...policyEvent, eventType: "item.failed" as const },
+    { ...policyEvent, eventType: "harness.diagnostic" as const },
+    { ...policyEvent, turnId: undefined },
+    { ...policyEvent, payload: { ...policyEvent.payload, status: "completed" } },
+    { ...policyEvent, payload: { status: "failed", error: { code: "pi_rpc_transport_failed", message: "Request blocked by usage policy" } } },
+    { ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", message: "400 invalid_request_error: blocked tool schema; field content_policy is unknown" } } },
+    { ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", message: "400 invalid_request_error: usage policy parameter is missing" } } },
+    { ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", message: "529 overloaded_error: Overloaded" } } },
+  ])("does not mistake non-refusal evidence for policy refusal %#", candidate => {
+    const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
+    observed.observe(candidate);
+    expect(observed.forTerminal("turn", terminal)).toBeNull();
+  });
+  it.each(["codex", "opencode", "acpx"])("does not infer Pi policy evidence for %s", kind => {
+    const observed = createNativeProviderFailureObservation({ kind });
+    observed.observe(policyEvent);
+    expect(observed.forTerminal("turn", terminal)).toBeNull();
+  });
   it.each(["acpx", "codex", "opencode"])("retains a typed explanation for %s without granting recovery authority", kind => {
     const observed = createNativeProviderFailureObservation({ kind });
     const providerFailure = { schema: "paperclip.provider-failure.v1", provider: "new-provider", phase: "turn",
