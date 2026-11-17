@@ -11,6 +11,7 @@ import { providerResourceDispositionForTerminalRun } from "./runner-environment-
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { agentExecutionStopBlocker } from "./agent-execution-stop.js";
 import { recoveryService } from "./recovery/service.js";
+import { personStopExportPendingHoldsAdmission } from "./heartbeat/person-stop-release-export.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
 import { personFacingText, STOP_ABSENT_LINES } from "../__tests__/helpers/person-facing-lines.js";
@@ -215,6 +216,7 @@ const support = await getEmbeddedPostgresTestSupport();
       .where(eq(environmentLeases.id, lease.id));
   };
   const STOP_LINE = "Stopped. These messages are waiting: Send them, or delete any first.";
+  const PERSON_CARD_LINE = "Stop pending: Paperclip cannot confirm that the previous execution stopped. New messages you send start now on a fresh machine; messages waiting from before the Stop still need Send.";
 
   it("U9 late receipt: held with the Stop/Send line (no wait saved); the 30 s re-poll does not admit it; the receipt writer's resume admits it once", async () => {
     const f = await seed({ receipt: false });
@@ -294,7 +296,7 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(atBound.cards).toEqual([CARD]);
       const [card] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
       trail.push({ cardLine: card!.nextAction });
-      expect(card!.nextAction).toBe("Stop pending: Paperclip cannot confirm that the previous execution stopped. New messages you send now are saved and will start once the stop is confirmed. Messages waiting from before Stop still need Send.");
+      expect(card!.nextAction).toBe("Stop pending: Paperclip cannot confirm that the previous execution stopped. New messages you send start now on a fresh machine; messages waiting from before the Stop still need Send.");
       const feed = await import("./attention.js").then(({ attentionService }) => attentionService(db).list(f.companyId, { userId: "board" }));
       const projected = feed.items.find(item => item.sourceKind === "recovery_action" && item.subject.id === card!.id);
       expect(projected?.subject.metadata?.personStop).toBe(true);
@@ -387,7 +389,39 @@ const support = await getEmbeddedPostgresTestSupport();
     } finally { vi.useRealTimers(); }
   }, 60_000);
 
-  it("U9 card3: input sent AFTER the card is admitted once on receipt; pre-Stop input waits for Send, then is admitted once", async () => {
+  // adopt-stopu-card5 (RFL ruling (a)): the card's line is TRUE IN EVERY PHASE, by line.
+  // - Executor ALIVE (pre-card only): queue.ts:1200-1222 (predecessor_settling_in_process)
+  //   declines the claim until heartbeat.ts:4375 removes the executor, after the release
+  //   at heartbeat.ts:4230 (export first: run-control.ts xpaths guard, 30 s bound). No card
+  //   is shown then; the pre-Stop messages carry STOP_LINE, the new message has no line.
+  // - Executor GONE (restart, or after its exit): nothing durable holds an ordinary message
+  //   once the export finalized (explicit-native-continuation.ts:363 returns null on this
+  //   path; queue.ts:1224-1233 person_stop_export_pending holds only while the export is
+  //   pending), so it starts at once on a fresh machine: the same as post-card.
+  // - The successor never reuses the old box: its lease is pending_cleanup, which the reuse
+  //   filter (environment-runtime.ts:2085-2088, 2115) excludes.
+  const postNew = async (f: { companyId: string; issueId: string }, body: string) => {
+    const posted = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/comments`)
+      .send({ body, clientRequestId: randomUUID() });
+    expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+    const commentId = posted.body.id as string;
+    let wakeId = "";
+    await vi.waitFor(async () => {
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      wakeId = wakes.find(wake => wake.payload?.commentId === commentId)?.id ?? "";
+      expect(wakeId).not.toBe("");
+    }, { timeout: 15_000, interval: 100 });
+    return { commentId, wakeId };
+  };
+  const boxesOf = async (f: { companyId: string; providerLeaseId: string }) =>
+    (await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, f.companyId)))
+      .filter(lease => lease.providerLeaseId === f.providerLeaseId)
+      .map(lease => ({ id: lease.id, heartbeatRunId: lease.heartbeatRunId, status: lease.status }));
+  const admittedOrigins = async (f: Awaited<ReturnType<typeof seed>>, run: typeof heartbeatRuns.$inferSelect) =>
+    (await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, runId: run.id,
+      context: run.contextSnapshot!, summary: null, exposeLowTrustRaw: false })).originCommentIds;
+
+  it("U9 card3 (iii) post-card: the real comment POST starts now, ONE successor, never on the old box; the late receipt adds no duplicate", async () => {
     const f = await seed({ receipt: false });
     const calls = { n: 0, runId: f.sourceRunId };
     const cleanup = heartbeatService(db, { environmentRuntime: stuckRuntime(calls, 2) });
@@ -396,58 +430,84 @@ const support = await getEmbeddedPostgresTestSupport();
     try {
       vi.setSystemTime(t0 + RETRY_MS);
       await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });
-      expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(c => c.status)).toEqual(["escalated"]);
-      const posted = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/comments`)
-        .send({ body: "New input after the Stop-pending card", clientRequestId: randomUUID() });
-      expect(posted.status, JSON.stringify(posted.body)).toBe(201);
-      const nextCommentId = posted.body.id as string;
-      let nextId = "";
-      await vi.waitFor(async () => {
-        const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
-        nextId = wakes.find(wake => wake.payload?.commentId === nextCommentId)?.id ?? "";
-        expect(nextId).not.toBe("");
-      }, { timeout: 15_000, interval: 100 });
-      await evidence(`card3BeforeReceipt ${JSON.stringify({ preStopWake: await wakeOf(f.queueId),
-        postCardWake: await wakeOf(nextId), lease: await leaseOf(f),
-        successors: (await successors(f)).map(run => ({ id: run.id, status: run.status, runtimeMode: run.runtimeMode,
-          context: run.contextSnapshot, result: run.resultJson, errorCode: run.errorCode })) })}`);
-      expect(await successors(f)).toHaveLength(0);
+      const [card] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      expect(card.status).toBe("escalated");
+      expect(card.nextAction).toBe(PERSON_CARD_LINE);
+      // The export finalized before the release (xpaths guard): no durable export hold.
+      expect(await personStopExportPendingHoldsAdmission(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId })).toBeNull();
+      const next = await postNew(f, "New input after the Stop-pending card");
+      await vi.waitFor(async () => expect(await successors(f)).toHaveLength(1), { timeout: 15_000, interval: 100 });
+      const [first] = await successors(f);
+      // Started before the receipt: the old lease is still unproved.
+      const old = await leaseOf(f);
+      expect(old).toMatchObject({ status: "pending_cleanup", heartbeatRunId: f.sourceRunId });
+      expect((old.metadata as Record<string, unknown>).remoteExecutionTermination).toBeUndefined();
+      // Never the old box: the only lease on bx_warm is the stopped run's own.
+      expect(await boxesOf(f)).toEqual([{ id: old.id, heartbeatRunId: f.sourceRunId, status: "pending_cleanup" }]);
+      expect((await wakeOf(next.wakeId)).runId).toBe(first.id);
+      expect((await admittedOrigins(f, first)).filter(id => id === next.commentId)).toHaveLength(1);
+      expect((await admittedOrigins(f, first)).filter(id => f.commentIds.includes(id))).toEqual([]);
+      // Pre-Stop messages still need Send.
+      expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect((await readQueue(f)).executionWait).toEqual({ reason: "stopped_by_person", message: STOP_LINE });
+      const beforeReceipt = { successorRunId: first.id, successorStatus: first.status, oldLease: await boxesOf(f),
+        postCardWake: await wakeOf(next.wakeId), preStopWake: await wakeOf(f.queueId) };
+      // The late receipt: the card retires; no duplicate successor, from either writer.
       vi.setSystemTime(t0 + 2 * RETRY_MS + 1_000);
       await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });
       vi.useRealTimers();
-      await vi.waitFor(async () => expect(await successors(f)).toHaveLength(1), { timeout: 15_000, interval: 200 });
-      const [first] = await successors(f);
-      const delivered = async (run: typeof first) => (await buildExecutionContinuation({ db,
-        companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, runId: run.id,
-        context: run.contextSnapshot!, summary: null, exposeLowTrustRaw: false }));
-      const admitted = async (run: typeof first) => (await delivered(run)).originCommentIds;
-      expect((await wakeOf(nextId)).runId).toBe(first.id);
-      expect((await admitted(first)).filter(id => id === nextCommentId)).toHaveLength(1);
-      expect((await admitted(first)).filter(id => f.commentIds.includes(id))).toEqual([]);
-      expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
-      expect((await readQueue(f)).executionWait).toEqual({ reason: "stopped_by_person", message: STOP_LINE });
+      expect(calls.n).toBe(2);
       const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
       await heartbeatService(db).resumeRemoteStopComments(source);
-      expect(await successors(f)).toHaveLength(1); // Repeated receipt delivery is idempotent.
-      expect((await wakeOf(f.queueId)).runId).toBeNull();
-      const queue = await readQueue(f);
-      const sent = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
-        .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
-      expect(sent.status).toBeLessThan(300);
-      await vi.waitFor(async () => expect(await successors(f)).toHaveLength(2), { timeout: 15_000, interval: 200 });
-      const second = (await successors(f)).find(run => run.id !== first.id)!;
-      expect((await admitted(second)).filter(id => f.commentIds.includes(id)).sort()).toEqual([...f.commentIds].sort());
-      expect((await admitted(second)).filter(id => id === nextCommentId)).toEqual([]);
-      await heartbeatService(db).resumeRemoteStopComments(source);
-      expect(await successors(f)).toHaveLength(2);
-      // messages is full task history (execution-continuation.ts:352), NOT admission.
-      // Keep this visible in evidence: held pre-Stop input still appears in that history.
-      await evidence(`card3 ${JSON.stringify({ firstRunId: first.id, firstOrigins: await admitted(first),
-        firstHistory: (await delivered(first)).messages.map(m => m.id), secondRunId: second.id,
-        secondOrigins: await admitted(second), secondHistory: (await delivered(second)).messages.map(m => m.id),
-        preStopIds: f.commentIds, postCardId: nextCommentId,
-        preStopWake: await wakeOf(f.queueId), postCardWake: await wakeOf(nextId) })}`);
+      await new Promise(resolve => setTimeout(resolve, 1_500));
+      expect((await successors(f)).map(run => run.id)).toEqual([first.id]);
+      expect((await wakeOf(next.wakeId)).runId).toBe(first.id);
+      expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(c => c.status))
+        .not.toContain("escalated");
+      await evidence(`card5PostCard ${JSON.stringify({ card: card.nextAction, beforeReceipt, afterReceipt: {
+        successors: (await successors(f)).map(run => run.id), lease: await boxesOf(f), receiptAttempts: calls.n } })}`);
     } finally { vi.useRealTimers(); }
+  }, 60_000);
+
+  it("U9 card3 (iii-b) export UNPROVEN: the durable hold keeps the real POST queued; no fresh box without the files", async () => {
+    const f = await seed({ receipt: false });
+    const lease = await leaseOf(f);
+    // The release-site guard could not prove the export: no stop, box kept (lease still
+    // active), descriptor still `prepared` on that box.
+    await db.update(environmentLeases).set({ status: "active", cleanupStatus: null }).where(eq(environmentLeases.id, lease.id));
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...(source.runnerProfileJson ?? {}),
+      nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v3", state: "prepared", descriptorSha256: "a".repeat(64),
+        baselineSha256: "b".repeat(64), finalHostSha256: null, workspaceId: randomUUID(), leaseId: lease.id,
+        providerLeaseId: f.providerLeaseId, remoteCwd: "/workspace", resourceDisposition: "keep_running" } } })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(await personStopExportPendingHoldsAdmission(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId }))
+      .toBe(f.sourceRunId);
+    const next = await postNew(f, "New input while the export is unproven");
+    await new Promise(resolve => setTimeout(resolve, 3_000));
+    expect(await successors(f)).toHaveLength(0);
+    expect((await wakeOf(next.wakeId)).runId).toBeNull();
+    expect(await boxesOf(f)).toEqual([{ id: lease.id, heartbeatRunId: f.sourceRunId, status: "active" }]);
+    await evidence(`card5ExportUnproven ${JSON.stringify({ hold: f.sourceRunId, postWake: await wakeOf(next.wakeId),
+      successors: (await successors(f)).length, lease: await boxesOf(f) })}`);
+  }, 60_000);
+
+  it("U9 card3 (ii) pre-card, executor GONE (restart): the real POST starts at once on a fresh machine, the same as post-card", async () => {
+    const f = await seed({ receipt: false });
+    // A fresh service in a process that never ran the stopped executor: the in-memory
+    // gate (queue.ts:1200-1222, activeRunExecutions) is empty, exactly as after a restart.
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toHaveLength(0);
+    expect(await personStopExportPendingHoldsAdmission(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId })).toBeNull();
+    const next = await postNew(f, "New input before the card, after a restart");
+    await vi.waitFor(async () => expect(await successors(f)).toHaveLength(1), { timeout: 15_000, interval: 100 });
+    const [first] = await successors(f);
+    expect((await wakeOf(next.wakeId)).runId).toBe(first.id);
+    expect((await admittedOrigins(f, first)).filter(id => f.commentIds.includes(id))).toEqual([]);
+    expect(await boxesOf(f)).toEqual([{ id: (await leaseOf(f)).id, heartbeatRunId: f.sourceRunId, status: "pending_cleanup" }]);
+    expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect((await readQueue(f)).executionWait).toEqual({ reason: "stopped_by_person", message: STOP_LINE });
+    await evidence(`card5PreCardRestart ${JSON.stringify({ successorRunId: first.id, postWake: await wakeOf(next.wakeId), lease: await boxesOf(f) })}`);
   }, 60_000);
 
   it("U9 control: a non-person stop's cleanup escalation is unchanged (no card; capped at 5 attempts, then 30 min)", async () => {
