@@ -5,6 +5,7 @@ import { onRetainedNativeSessionCleanupRelease } from "../retained-native-sessio
 import { readIdleLocalWork, markIdleStartupComplete, markIdleIngressTracked } from "../idle-local-work.js";
 import * as runnerCheckpoint from "./native-runner-checkpoint.js";
 import * as harnessStorage from "./native-harness-backup-storage.js";
+import * as sandboxRunnerPortHolders from "./sandbox-runner-port-holders.js";
 import * as stagedAttachmentRecovery from "./native-staged-attachment-recovery.js";
 import * as controllerRecovery from "./native-controller-recovery.js";
 import * as ownerProof from "../owner-proof.js";
@@ -14720,6 +14721,10 @@ describe("native warm session supervision", () => {
         { holder: "exit-unproven", delaySeconds: 0, answered: false, control: "stop" },
         { holder: "probe-throws", delaySeconds: 0, answered: false, control: "stop" },
         { holder: "no-sandbox-runner", delaySeconds: 0, answered: false, control: "stop" },
+        // Never-OK: stopping this owner must leave an unrelated same-agent Runner alive and listed.
+        { holder: "unrelated-runner", delaySeconds: 0, answered: true, control: "stop" },
+        // The final exit proof throws OUTSIDE stopSessionRunnerAndProveExit's stop catch.
+        { holder: "exit-proof-throws", delaySeconds: 0, answered: false, control: "stop" },
         // Stop with queued messages, then Send: the queued-message Interrupt
         // cancels the turn through the same native Stop (routes/issues.ts
         // heartbeat.cancelRun) and its successor meets the same retirement.
@@ -14731,6 +14736,14 @@ describe("native warm session supervision", () => {
           const { companies, agents } = await import("@paperclipai/db");
           const fixed = fixture(`s3f-${control}-${holder}-${delaySeconds}`);
           const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+          const otherRunId = randomUUID();
+          const otherSignals: string[] = [];
+          let otherAlive = true;
+          const exitsOnStop = holder === "exits-on-stop" || holder === "unrelated-runner";
+          const exitProof = holder === "exit-proof-throws"
+            ? vi.spyOn(sandboxRunnerPortHolders, "sandboxSessionRunnerExited").mockRejectedValue(new Error("exit proof unavailable"))
+            : undefined;
+          onTestFinished(() => exitProof?.mockRestore());
           const base = { ...fixed.base, binding: { ...fixed.base.binding, companyId, agentId, issueId, runId: randomUUID() } };
           const next = { ...fixed.next, binding: { ...fixed.next.binding, companyId, agentId, issueId, runId: randomUUID() } };
           await proofDb.insert(companies).values({ id: companyId, name: "s3 fence", issuePrefix: `S${companyId.slice(0, 7).toUpperCase()}` });
@@ -14740,6 +14753,8 @@ describe("native warm session supervision", () => {
           await proofDb.insert(heartbeatRuns).values({ id: base.binding.runId, companyId, agentId, issueId,
             status: holder === "owner-running" ? "running" : "cancelled",
             runtimeMode: "native", finishedAt: new Date() });
+          await proofDb.insert(heartbeatRuns).values({ id: otherRunId, companyId, agentId, issueId,
+            status: "cancelled", runtimeMode: "native", finishedAt: new Date() });
           const coordinator = { phase: "observed", resultId: null as string | null, leaseOwner: "remote-owner" as string | null,
             leaseExpiresAt: new Date(Date.now() + 300_000), controllerGeneration: 1, controllerBootId: "s3f-boot" };
           let taskRunId = base.binding.runId;
@@ -14767,9 +14782,12 @@ describe("native warm session supervision", () => {
           const identityPath = `${remoteCwd}/.paperclip-runtime/paperclip-runner/sessions/${sessionDirectory}/runner/runner-process.identity`;
           const runnerInstanceId = `runner-${randomUUID()}`;
           const identity = ["nonce1", "4242", new Date().toISOString(), runnerInstanceId].join("\n");
+          const otherIdentityPath = `${remoteCwd}/.paperclip-runtime/paperclip-runner/sessions/${"f".repeat(64)}/runner/runner-process.identity`;
+          const otherIdentity = ["nonce2", "4343", new Date().toISOString(), "other-runner"].join("\n");
+          const otherState = { runId: otherRunId, runnerInstanceId: "other-runner", lifecycle: "running", outbox: [], pendingTerminalDelivery: null };
           const runnerState = { runId: base.binding.runId, runnerInstanceId, lifecycle: "running",
             outbox: holder === "busy" ? [{ seq: 7, kind: "provider_delta" }] : [], pendingTerminalDelivery: null };
-          let runnerAlive = holder !== "already-exited";
+          let runnerAlive = holder !== "already-exited" && holder !== "exit-proof-throws";
           const signals: string[] = [];
           const remoteCommands: string[] = [];
           const remoteExecute = vi.fn(async (command: { command?: string; args?: string[] }) => {
@@ -14779,11 +14797,16 @@ describe("native warm session supervision", () => {
               if (holder === "probe-throws") throw new Error("sandbox command channel closed");
               const b64 = (text: string) => Buffer.from(text).toString("base64");
               return { exitCode: 0, timedOut: false, stderr: "",
-                stdout: `${identityPath}\t${b64(identity)}\t${b64(JSON.stringify(runnerState))}\n` };
+                stdout: `${identityPath}\t${b64(identity)}\t${b64(JSON.stringify(runnerState))}\n`
+                  + (otherAlive ? `${otherIdentityPath}\t${b64(otherIdentity)}\t${b64(JSON.stringify(otherState))}\n` : "") };
             }
             if (label === "paperclip-runner-port-holder-check" || label === "paperclip-runner-exit-check") {
               const signal = command.args?.[8];
-              if (signal) { signals.push(signal); if (holder === "exits-on-stop" || holder === "exit-unproven") runnerAlive = false; }
+              if (command.args?.[3] === otherIdentityPath) {
+                if (signal) { otherSignals.push(signal); otherAlive = false; }
+                return { exitCode: otherAlive ? 0 : 45, timedOut: false, stderr: "", stdout: "" };
+              }
+              if (signal) { signals.push(signal); if (exitsOnStop || holder === "exit-unproven") runnerAlive = false; }
               return { exitCode: runnerAlive ? 0 : holder === "exit-unproven" ? 47 : 45, timedOut: false, stderr: "", stdout: "" };
             }
             return { exitCode: command.args?.[1]?.includes("base64") ? 1 : 0, timedOut: false, stderr: "", stdout:
@@ -14846,7 +14869,7 @@ describe("native warm session supervision", () => {
             // The retained owner's sandbox lease database reads real rows from here on.
             Object.assign(runDb, { select: proofDb.select.bind(proofDb), insert: proofDb.insert.bind(proofDb),
               update: proofDb.update.bind(proofDb), execute: proofDb.execute.bind(proofDb), transaction: proofDb.transaction.bind(proofDb) });
-            collectStopped.mockClear(); signals.length = 0;
+            collectStopped.mockClear(); sandboxRunner.syncIn.mockClear(); signals.length = 0;
             if (delaySeconds > 0) { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(Date.now() + delaySeconds * 1_000); }
             const followUp = { ...next, session: base.session };
             const attempt = executePaperclipNativeSession({ db: leaseDb(followUp), execution: followUp, runnerInstanceId: "runner",
@@ -14860,12 +14883,12 @@ describe("native warm session supervision", () => {
               // ONE run answers on its first wake; the predecessor ran once.
               expect(Object.fromEntries(turns)).toEqual({ [base.binding.runId]: 1, [next.binding.runId]: 1 });
               expect(collectStopped).toHaveBeenCalled();
-              expect(signals).toEqual(holder === "exits-on-stop" ? ["TERM"] : []);
+              expect(signals).toEqual(exitsOnStop ? ["TERM"] : []);
               // A live holder is stopped only after its run's terminal status
               // was read from PostgreSQL (`owner-running` below is refused).
               expect((state.persistActivity.mock.calls as unknown as Array<[unknown, { action?: string; details?: Record<string, unknown> }]>)
                 .filter(([, receipt]) => receipt?.details?.holderRunId === base.binding.runId).map(([, receipt]) => receipt.action))
-                .toEqual(holder === "exits-on-stop" ? ["native.runner_port_holder_retired"] : []);
+                .toEqual(exitsOnStop ? ["native.runner_port_holder_retired"] : []);
             } else {
               await expect(attempt).rejects.toMatchObject({ code: "native_predecessor_retirement_unproven" });
               expect(turns.get(next.binding.runId) ?? 0).toBe(0);
@@ -14880,6 +14903,18 @@ describe("native warm session supervision", () => {
             expect(await sha()).toBe(unsyncedSha);
             expect(remoteCommands.filter(command => /\brm\b|rmdir|unlink/.test(command))).toEqual([]);
             expect(signals).not.toContain("KILL");
+            expect(otherSignals).toEqual([]);
+            expect(otherAlive).toBe(true);
+            if (holder !== "probe-throws") {
+              const inventory = await remoteExecute({ args: ["", "", "paperclip-runner-port-holders"] });
+              expect(sandboxRunnerPortHolders.parseSandboxRunnerHolders(inventory.stdout))
+                .toContainEqual(expect.objectContaining({ runId: otherRunId, runnerInstanceId: "other-runner", identityPath: otherIdentityPath }));
+            }
+            if (exitProof) {
+              expect(exitProof).toHaveBeenCalled();
+              expect(String(checkpointError)).toContain("native_harness_storage_owner_superseded");
+              expect(sandboxRunner.syncIn).not.toHaveBeenCalled();
+            }
           } finally {
             vi.useRealTimers();
             close.mockResolvedValue(undefined); await closeIdleWarmNativeSessionsForRestart();
