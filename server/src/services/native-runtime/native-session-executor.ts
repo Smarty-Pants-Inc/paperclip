@@ -6720,6 +6720,71 @@ async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof insp
   return changed ? null : identity as unknown as DurableRecoveryIdentity;
 }
 
+/** The earliest recorded moment of the person's acknowledged Stop of this
+ * exact run, or null when the run carries no such Stop. */
+function acknowledgedUserStopRequestedAt(run: typeof heartbeatRuns.$inferSelect): number | null {
+  if (run.status !== "cancelled" || !hasAcknowledgedNativeStopIntent(run)) return null;
+  const result = record(run.resultJson);
+  const times = [record(result.executionCancellation).requestedAt, record(result.startupCancellation).requestedAt,
+    record(result.cancellation).recordedAt, record(result.nativeCancellation).recordedAt]
+    .map(value => typeof value === "string" ? Date.parse(value) : Number.NaN).filter(Number.isFinite);
+  return times.length > 0 ? Math.min(...times) : null;
+}
+
+/** The finished owner's journal is unsettled only by Runner lifecycle commands
+ * (suspend, drain, shutdown) that its person's acknowledged Stop issued: each
+ * is still pending and was journaled at or after that Stop. Any other
+ * unsettled command, or one that predates the Stop, is not the Stop's own. */
+async function pendingLifecycleCommandsIssuedByStop(db: Db, root: string, identity: { runId?: unknown },
+  companyId: string): Promise<boolean> {
+  if (typeof identity.runId !== "string") return false;
+  const [run] = await db.select().from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id, identity.runId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+  const stopAt = run ? acknowledgedUserStopRequestedAt(run) : null;
+  if (stopAt === null) return false;
+  try {
+    const control = record(JSON.parse(readBoundedNativeFile(resolve(root, "control-plane", "control-plane-state.json"),
+      NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8")));
+    if (record(control.identity).runId !== identity.runId) return false;
+    const unsettled = unsettledControllerCommands((Array.isArray(control.commands) ? control.commands : []).map(record));
+    return unsettled.length > 0 && unsettled.every(command => command.status === "pending"
+      && LOCAL_RUNNER_LIFECYCLE_COMMANDS.has(String(command.type))
+      && typeof command.issuedAt === "string" && Date.parse(command.issuedAt) >= stopAt);
+  } catch {
+    return false;
+  }
+}
+
+/** A Runner lifecycle command that the person's acknowledged Stop issued is
+ * still settling, not an unprovable owner. Wait for it through the same
+ * predecessor-settle helper and bound as warm admission
+ * (waitForWarmNativeSessionSettled, warmSessionReleaseWait), outside any
+ * database transaction, then re-read and recompute the same retirement proof.
+ * At the bound, while the Stop's own command is still pending, defer this run
+ * through the typed recovery wait (never a failed run). Commands the Stop did
+ * not issue keep the ordinary refusal. */
+async function retireAfterStopIssuedLifecycleCommands(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0],
+  refused: string): Promise<{ retired: true } | { retired: false; refused: string }> {
+  const companyId = input.execution.binding.companyId;
+  if (!refused.startsWith("journal_commands_unsettled(")
+    || !await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
+    return { retired: false, refused };
+  }
+  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+  await input.onLog?.("stderr", `[paperclip-runner] waiting for the Stop's runner lifecycle command of run ${String(input.identity.runId)}\n`);
+  await waitForWarmNativeSessionSettled(nativeSessionScopeKey(input.execution));
+  while (Date.now() < deadline
+    && await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
+    await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
+  }
+  const retirement = await retireFinishedPerTurnRunnerdOwner(input);
+  if (!retirement.retired && retirement.refused.startsWith("journal_commands_unsettled(")
+    && await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
+    throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs));
+  }
+  return retirement;
+}
+
 async function retireFinishedPerTurnRunnerdOwner(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0])
   : Promise<{ retired: true } | { retired: false; refused: string }> {
   const proof = await inspectFinishedPerTurnRunnerdOwner(input);
@@ -7064,7 +7129,10 @@ async function migrateRunnerdStateRootForExecution(input: {
           if (await provenLostResumedSandboxRunner({ ...input, root: scoped })) return;
           retirementRefusal = "; retirement_refused=restarted_sandbox_owner_unproven";
         } else {
-          const retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
+          let retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
+          if (!retirement.retired) {
+            retirement = await retireAfterStopIssuedLifecycleCommands({ ...input, root: scoped, identity }, retirement.refused);
+          }
           if (retirement.retired) return;
           if (retirement.refused !== "lifecycle_not_per_turn") retirementRefusal = `; retirement_refused=${retirement.refused}`;
         }
