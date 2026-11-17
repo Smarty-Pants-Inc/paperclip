@@ -15,6 +15,9 @@ import {
   completionContracts,
   nativeRunFinalizations,
   nativeRunResults,
+  workAssessments,
+  statusDecisions,
+  statusDecisionEffects,
   environmentLeases,
 } from "@paperclipai/db";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
@@ -23,6 +26,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { heartbeatService } from "../heartbeat.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
+import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "../continuation-comment-input.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
@@ -100,7 +104,35 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const visible = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
       .filter(comment => (comment.metadata as Record<string, unknown> | null)?.recoveryResponsibility !== "system");
-    return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, at };
+    const nativeSuccessor = async (sourceRunId: string, status = "succeeded") => {
+      // Real status-decision outbox provenance: unlike a fresh fallback, this
+      // producer saves a wake-intent id, not retryOfRunId/previousRunId.
+      const [contract] = await db.insert(completionContracts).values({ companyId, issueId, revision: 1,
+        schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block",
+        contractJson: {}, canonicalSha256: "47".repeat(32), createdByActorType: "system", createdByActorId: "fixture" }).returning();
+      await db.update(heartbeatRuns).set({ completionContractId: contract!.id }).where(eq(heartbeatRuns.id, sourceRunId));
+      const [result] = await db.insert(nativeRunResults).values({ companyId, issueId, runId: sourceRunId,
+        completionContractId: contract!.id, serverFingerprint: "fixture", schemaStatus: "accepted",
+        canonicalSha256: "fixture", resultJson: {} }).returning();
+      const [assessment] = await db.insert(workAssessments).values({ companyId, issueId, runId: sourceRunId,
+        contractId: contract!.id, resultId: result!.id, triggerKind: "run_terminal", triggerActorCompanyId: companyId,
+        priorIssueStatus: "in_review", priorStatusVersion: 1, policyVersion: "v1", assessmentJson: {}, inputDigest: "fixture" }).returning();
+      const [decision] = await db.insert(statusDecisions).values({ companyId, issueId, runId: sourceRunId,
+        assessmentId: assessment!.id, decisionVersion: 1, policyVersion: "v1", fromStatus: "in_review", toStatus: "in_progress",
+        reasonCode: "native_run_failed_continuation", decisionJson: {}, decisionDigest: "fixture", applicationState: "applied" }).returning();
+      const target = await run({ status, wakeReason: "issue_status_changed" });
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+        reason: "issue_status_changed", status: "coalesced", runId: target, requestedByActorType: "system",
+        requestedByActorId: "native-status-committer", payload: { issueId, nativeDecisionId: decision!.id } }).returning();
+      await db.insert(statusDecisionEffects).values({ companyId, issueId, decisionId: decision!.id, ordinal: 0,
+        effectKind: "schedule_retry", targetType: "agent_wakeup_request", targetId: wake!.id,
+        idempotencyKey: `native-status:${decision!.id}:retry`, payload: {} });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_status_changed",
+        source: "native_status_decision", statusDecisionSource: "native_status_decision", nativeStatusWakeIntentId: wake!.id } })
+        .where(eq(heartbeatRuns.id, target));
+      return target;
+    };
+    return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, at, nativeSuccessor };
   }
 
   const codeOf = (comment: { metadata: unknown }) => {
@@ -558,7 +590,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
-  it("D10 row 12: a comment-less successful continuation and its old reply do not answer the pending follow-up", async () => {
+  it.each(["retry", "native-status"])("PV2b chain: a comment-less %s continuation supersedes its ancestor's notice", async kind => {
     const f = await fixture();
     const commentId = await f.message("What about my follow-up?");
     const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_workspace_required" });
@@ -566,19 +598,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const before = await f.visible();
     expect(before).toHaveLength(1);
     expect(before[0]!.body).toBe(NOT_ANSWERED);
-    const continuation = await f.run({ commentId: null, status: "succeeded", retryOfRunId: failed,
-      wakeReason: "issue_continuation_needed" });
-    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId,
-      wakeReason: "issue_continuation_needed", wakeCommentId: null, wakeCommentIds: [],
-      firstTurnQueuedInput: { commentIds: [] } } }).where(eq(heartbeatRuns.id, continuation));
+    const continuation = kind === "native-status" ? await f.nativeSuccessor(failed)
+      : await f.run({ commentId: null, status: "succeeded", retryOfRunId: failed, wakeReason: "issue_continuation_needed" });
     await f.reply(continuation);
     const outcome = await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
-    expect(outcome.kind).not.toBe("answered");
-    const after = await f.visible();
-    expect(after).toHaveLength(1);
-    expect(after[0]!.id).toBe(before[0]!.id);
-    expect(after[0]!.body).toBe(NOT_ANSWERED);
-    expect(after[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    expect(outcome).toEqual({ kind: "answered" });
+    expect(await f.visible()).toHaveLength(0);
+    const [superseded] = await db.select().from(issueComments).where(eq(issueComments.id, before[0]!.id));
+    expect(superseded!.deletedAt).not.toBeNull();
   });
 
   it("RFL F4: an unrelated timer run's success is not evidence; the message's own path gives exactly one notice", async () => {
@@ -1099,6 +1126,136 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
         options: [{ id: "eu", label: "EU" }, { id: "us", label: "US" }] }] } as never, createdAt: f.at() });
     await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+  });
+
+  // Keep: PV2b gate-4: a final from a later chain run answers the original
+  // input even when only the failed predecessor still carries its comment id.
+  it.each([
+    ["carrying", "context"], ["continuation", "context"], ["carrying", "delivery"], ["continuation", "delivery"],
+  ] as const)(
+    "PV2b chain: message -> %s card -> answer-resume (%s) fails -> successor final never gets a resend notice", async (cardSource, answerLink) => {
+      const f = await fixture({ status: "in_review" });
+      const messageId = await f.message("Build Sol; ask me for the name first.");
+      const carryingRunId = await f.run({ commentId: messageId, status: "succeeded" });
+      const sourceRunId = cardSource === "carrying" ? carryingRunId
+        : await f.run({ status: "succeeded", retryOfRunId: carryingRunId });
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+        kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId,
+        addresseeUserId: f.userId, continuationPolicy: "wake_assignee", createdAt: f.at(),
+        payload: { version: 1, questions: [{ id: "name", prompt: "What is the product called?", required: true,
+          selectionMode: "single", options: [{ id: "sol", label: "Sol" }] }] } }).returning();
+      const noticesEver = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+        sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+      expect(await noticesEver()).toHaveLength(0);
+      await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId }, card!.id,
+        { answers: [{ questionId: "name", optionIds: ["sol"] }] }, { userId: f.userId });
+      const resume = await f.run({ status: "failed", errorCode: "native_run_failed" });
+      if (answerLink === "context") {
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, interactionId: card!.id,
+          interactionStatus: "answered", source: "issue.interaction.respond" } }).where(eq(heartbeatRuns.id, resume));
+      } else {
+        await db.update(issueQuestionResponseDeliveries).set({ targetRunId: resume, status: "fallback_queued",
+          deliveryMode: "wake_fallback" }).where(eq(issueQuestionResponseDeliveries.interactionId, card!.id));
+      }
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+      const successor = await f.nativeSuccessor(resume);
+      await f.reply(successor);
+      expect(await freshContinuationDescendsFrom(db, { companyId: f.companyId, issueId: f.issueId,
+        runId: successor, ancestorRunId: carryingRunId, includeAnswerLineage: true })).toBe(true);
+      await f.sweep();
+      expect(await noticesEver()).toHaveLength(0);
+      expect(await readContinuationCommentInput(db, { ...f, runId: carryingRunId })).toEqual({});
+      // A previously published notice is superseded too, not merely hidden
+      // by the decision to avoid writing another one.
+      const [stale] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "system", body: NOT_ANSWERED, createdAt: f.at(), metadata: { version: 1,
+          authorizationReason: `unanswered_message:${messageId}`, sourceRunId: resume, sections: [] } }).returning();
+      await settleUnansweredPersonMessage(db, f);
+      expect(await f.visible()).toHaveLength(0);
+      expect((await db.select().from(issueComments).where(eq(issueComments.id, stale!.id)))[0]!.deletedAt).not.toBeNull();
+    });
+
+  it("PV2b chain: a final after multiple failed ancestors answers without copied input ids or a card", async () => {
+    const f = await fixture();
+    const messageId = await f.message();
+    const root = await f.run({ commentId: messageId, status: "failed", errorCode: "native_run_failed" });
+    const resume = await f.run({ status: "failed", retryOfRunId: root, errorCode: "native_run_failed" });
+    const final = await f.run({ status: "succeeded" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, previousRunId: resume,
+      wakeReason: "native_status_decision" } }).where(eq(heartbeatRuns.id, final));
+    await f.reply(final);
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    expect(await readContinuationCommentInput(db, { ...f, runId: root })).toEqual({});
+    expect(await db.select().from(issueComments).where(and(eq(issueComments.id, messageId),
+      unansweredPersonMessageCommentCondition()))).toHaveLength(0);
+  });
+
+  it("PV2b chain guard: all runs fail without a reply or card -> one notice; an unrelated final cannot hide it", async () => {
+    const f = await fixture();
+    const messageId = await f.message();
+    const root = await f.run({ commentId: messageId, status: "failed", errorCode: "native_run_failed" });
+    await f.run({ status: "failed", retryOfRunId: root, errorCode: "native_run_failed" });
+    const unrelated = await f.run({ status: "succeeded", wakeReason: "heartbeat_timer" });
+    const sessionId = randomUUID();
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId })
+      .where(sql`${heartbeatRuns.id} in (${root}, ${unrelated})`);
+    await f.reply(unrelated);
+    for (let pass = 0; pass < 2; pass++) {
+      await settleUnansweredPersonMessage(db, f);
+      expect(await f.visible()).toHaveLength(1);
+      expect((await f.visible())[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
+    }
+    expect(await readContinuationCommentInput(db, { ...f, runId: root })).toMatchObject({ wakeCommentIds: [messageId] });
+  });
+
+  it.each(["proposed-decision", "unrelated-effect", "unbound-wake"])(
+    "PV2b chain guard: %s is not native continuation provenance", async variant => {
+      const f = await fixture();
+      const messageId = await f.message();
+      const root = await f.run({ commentId: messageId, status: "failed", errorCode: "native_run_failed" });
+      const successor = await f.nativeSuccessor(root);
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.runId, successor));
+      const decisionId = String(wake!.payload!.nativeDecisionId);
+      if (variant === "proposed-decision") {
+        await db.update(statusDecisions).set({ applicationState: "proposed" }).where(eq(statusDecisions.id, decisionId));
+      } else if (variant === "unrelated-effect") {
+        await db.update(statusDecisionEffects).set({ effectKind: "bind_blocker" }).where(eq(statusDecisionEffects.decisionId, decisionId));
+      } else {
+        await db.update(agentWakeupRequests).set({ runId: null }).where(eq(agentWakeupRequests.id, wake!.id));
+      }
+      await f.reply(successor);
+      expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed" });
+      expect((await f.visible())[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
+    });
+
+  it("PV2b chain: a pending output-cap continuation never asks for a resend; its final answers the chain", async () => {
+    const f = await fixture();
+    const root = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_run_failed" });
+    // The sweep observes the durable continuation, not a provider-specific
+    // output-cap string. No input ids need to be copied into its context.
+    const successor = await f.nativeSuccessor(root, "queued");
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "pending" });
+    expect(await f.visible()).toHaveLength(0);
+    expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + 180_000) }))
+      .toMatchObject({ kind: "noticed", code: "waiting_to_start" });
+    expect((await f.visible()).map(note => note.body)).toEqual([WAITING]);
+    // A real output-cap successor still queued beyond the ordinary start
+    // bound is waiting work, not permission to send duplicate input.
+    expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + 20 * 60_000) }))
+      .toMatchObject({ kind: "pending" });
+    expect((await f.visible()).map(note => note.body)).toEqual([WAITING]);
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successor));
+    expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + 240_000) }))
+      .toMatchObject({ kind: "pending" });
+    expect((await f.visible()).every(note => !note.body.includes("Sending it again"))).toBe(true);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, successor));
+    await f.reply(successor);
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     expect(await f.visible()).toHaveLength(0);
   });
 
