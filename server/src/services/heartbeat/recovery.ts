@@ -1681,19 +1681,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     if (run.status !== "cancelled" || !hasAcknowledgedNativeRunStopRequest(run)
       || !["reuse_by_environment", "reuse_by_execution_workspace"].includes(lease.leasePolicy)
       || admittedNativeResourceDisposition(run.runnerProfileJson) !== "keep_running") return "destroy";
-    const [environment] = lease.environmentId ? await db.select().from(environments)
-      .where(eq(environments.id, lease.environmentId)).limit(1) : [];
-    const reference = { state: readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync)?.state ?? "none" };
-    if (environment) await finishCancelledWarmWorkspaceExport({ db, runId: run.id, companyId: run.companyId,
-      nativeWorkspaceSync: { reference, restoreWorkspace: async (assertOwnership, options) => {
-        const target = await resolveEnvironmentExecutionTarget({ db, companyId: run.companyId, adapterType: "paperclip_runner",
-          environment, leaseId: lease.id, leaseMetadata: lease.metadata, lease: lease as never, environmentRuntime, signal: options?.signal });
-        if (!target || !await resumeNativeWorkspaceSync({ db, runId: run.id, target, assertOwnership, signal: options?.signal }))
-          throw new Error("crashed_stop_export_target_unavailable");
-        const [after] = await db.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, run.id));
-        reference.state = readNativeWorkspaceSyncReference(after?.profile?.nativeWorkspaceSync)?.state ?? "none";
-      } } });
+    // adopt-stopu-xpaths: the export now runs at the ONE release-site guard
+    // (run-control releaseEnvironmentLeasesForRun -> person-stop-release-export.ts).
     return "stop_and_retain";
   }
 

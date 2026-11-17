@@ -200,6 +200,9 @@ export interface HeartbeatRunControlDependencies extends Pick<ReturnType<typeof 
     "mergeRunStopMetadataForAgent" | "setRunStatusFromLive" | "setRunStatus" | "setWakeupStatus" | "appendRunEvent">,
   Pick<HeartbeatRetryDependencies, "finalizeAgentStatus"> {
   verifyStartupCleanup?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+  /** adopt-stopu-xpaths: the release-site export of a person-stopped warm turn
+   * (person-stop-release-export.ts). Wired by heartbeat.ts. */
+  exportPersonStoppedWarmWorkspace?: (run: typeof heartbeatRuns.$inferSelect) => Promise<{ outcome: string }>;
   options: {
     closeWarmNativeSessionsForRun?: (input: {
       runId: string;
@@ -374,6 +377,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     timerClaimWasFirstHeartbeat,
     startNextQueuedRunForAgent,
     setRunStatus,
+    exportPersonStoppedWarmWorkspace,
   } = dependencies;
 
   async function releaseEnvironmentLeasesForRun(input: {
@@ -394,7 +398,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   }) {
     let leaseOwnerRun = await getRunCleanupState(input.runId);
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
-    const cancelledRun = leaseOwnerRun?.runtimeMode === "native" && leaseOwnerRun.status === "cancelled"
+    let cancelledRun = leaseOwnerRun?.runtimeMode === "native" && leaseOwnerRun.status === "cancelled"
       ? await getRun(input.runId) : null;
     if (cancelledRun) leaseOwnerRun = cancelledRun;
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
@@ -411,6 +415,27 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const runnerNeverLaunched = async () => neverLaunched ??= leaseOwnerRun?.runtimeMode === "native"
       && isHeartbeatRunTerminalStatus(status) && await nativeRunNeverLaunchedRunner(db, input.runId, input.companyId);
     const defer = (reason: string) => deferEnvironmentLeaseRelease(input, reason, providerResourceDisposition);
+    // adopt-stopu-xpaths: the ONE choke point for a person's Stop. Whatever path
+    // ended the turn (the in-run cancel-finalize, another error class, a Stop
+    // during finalization, a crash), a box that still holds the only copy of the
+    // turn's edit (descriptor `prepared`) is exported BEFORE it is stopped, here,
+    // outside any DB transaction, under finishCancelledWarmWorkspaceExport's one
+    // aggregate bound. If the export is not proven, the box is KEPT running (no
+    // stop, no stop_and_retain release); the run already carries the true line
+    // and the bounded deferral sweep retries this same release (and export).
+    let personStopExported = false;
+    if (cancelledRun && providerResourceDisposition !== "keep_running" && providerResourceDisposition !== "destroy"
+      && exportPersonStoppedWarmWorkspace && !await runnerNeverLaunched()) {
+      const exported = await exportPersonStoppedWarmWorkspace(cancelledRun)
+        .catch(() => ({ outcome: "unproven" as const }));
+      if (exported.outcome === "unproven" || exported.outcome === "not_settled") {
+        logger.warn({ runId: input.runId, outcome: exported.outcome },
+          "Kept the person-stopped box running: its workspace export is not proven");
+        return await defer("person_stop_export_unproven");
+      }
+      if (exported.outcome === "finalized") cancelledRun = await getRun(input.runId) ?? cancelledRun;
+      personStopExported = exported.outcome === "finalized";
+    }
     // A warm (keep_running) sandbox keeps a cancelled turn's prepared files in
     // place for the next turn, exactly like a succeeded turn; only a sandbox
     // that is about to stop or be destroyed needs its prepared files preserved.
@@ -541,6 +566,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       logger.warn({ runId: input.runId }, "could not wake the agent's stop after its run leases settled");
     });
     await acknowledgeRemoteStop(input.runId, input.companyId);
+    // adopt-stopu-xpaths: the queued message held by personStopExportPendingHoldsAdmission
+    // starts once the export is finalized and the box released (same box or host copy).
+    if (personStopExported && releaseResult?.released.length) await startNextQueuedRunForAgent(input.agentId).catch(() => undefined);
   }
 
   async function wakeAgentAfterRunLeasesSettled(input: { runId: string; companyId: string; agentId: string }) {

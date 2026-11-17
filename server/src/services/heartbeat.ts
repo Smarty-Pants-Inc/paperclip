@@ -82,6 +82,7 @@ import {
 } from "./heartbeat/scheduling.js";
 import { canApplyTaskWorkspaceSelectionAtAdmission, taskWorkspaceRuntimeSelectionEnabled } from "./execution-workspace-policy.js";
 import { agentExecutionStopBlocker } from "./agent-execution-stop.js";
+import { exportPersonStoppedWarmWorkspaceBeforeRelease } from "./heartbeat/person-stop-release-export.js";
 import {
   cancelHeartbeatNativeRun,
   terminateHeartbeatRunProcess,
@@ -1516,6 +1517,7 @@ export function heartbeatService(
 
   const runControl = createHeartbeatRunControl(db, {
     scheduleBoundedRetry,
+    exportPersonStoppedWarmWorkspace: run => exportPersonStoppedWarmWorkspaceBeforeRelease({ db, environmentRuntime, run }),
     verifyStartupCleanup: async run => {
       await verifyNativeStartupCleanup(db, run, () => envOrchestrator.releaseForRun({
         heartbeatRunId: run.id, companyId: run.companyId, agentId: run.agentId, status: "expired",
