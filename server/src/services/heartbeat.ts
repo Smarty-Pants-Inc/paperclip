@@ -3880,9 +3880,12 @@ export function heartbeatService(
           // a handoff and writes no hold; only a stopping box needs one.
           if (nativeStopWorkspaceOutcome({ admittedDisposition: providerResourceDispositionForRun, stopped: true })
             !== "handoff") await preserveNativeWorkspaceOnFailure();
+          // Finish the Stop already recorded on the run, with its requested
+          // code and initiator (a person or an authorized managing agent).
           await cancelRunInternal(
             run.id,
             "Recovered durable native run cancellation",
+            { recoverRecordedCancellation: true },
           );
           return;
         }
