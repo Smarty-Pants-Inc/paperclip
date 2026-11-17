@@ -25,7 +25,7 @@ import { sql } from "drizzle-orm";
 
 // KEEP: never-OK guard against automatically repeating a provider policy refusal.
 // Inject at the real bound runner event port, not at a mocked classifier.
-const POLICY_NOTE = "The model provider refused this request under its usage policy; it won't be retried automatically.";
+const POLICY_NOTE = "The model provider refused this request under its policies; it won't be retried automatically.";
 const usagePolicyError = '400 {"type":"error","error":{"type":"invalid_request_error","message":"Your request was blocked by our usage policy."},"request_id":"fixture-request"}';
 
 describe("Pi policy refusal: persistence, retry, unanswered message and Stop intent", () => {

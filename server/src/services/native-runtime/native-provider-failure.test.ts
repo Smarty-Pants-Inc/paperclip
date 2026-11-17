@@ -28,7 +28,7 @@ describe("native provider failure observation", () => {
     const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
     observed.observe(policyEvent);
     expect(observed.forTerminal("turn", terminal)).toEqual({ errorCode: "provider_policy_refusal",
-      errorMessage: "The model provider refused this request under its usage policy; it won't be retried automatically.",
+      errorMessage: "The model provider refused this request under its policies; it won't be retried automatically.",
       diagnostic: { provider: "pi_rpc", category: "policy_refusal" } });
     expect(observed.unclassifiedTurnFailure("turn", terminal)).toBeNull();
     expect(observed.forTerminal("other-turn", terminal)).toBeNull();
@@ -55,6 +55,8 @@ describe("native provider failure observation", () => {
     const observed = createNativeProviderFailureObservation({ kind: "pi_rpc" });
     observed.observe({ ...policyEvent, payload: { status: "failed", error: { code: "pi_provider_error", ...error } } });
     expect(observed.forTerminal("turn", terminal)?.errorCode).toBe("provider_policy_refusal");
+    expect.soft(observed.forTerminal("turn", terminal)?.errorMessage).not.toContain("usage policy");
+    expect(observed.forTerminal("turn", terminal)?.errorMessage).toBe("The model provider refused this request under its policies; it won't be retried automatically.");
   });
   it.each([
     { ...policyEvent, sourceKind: "control_plane" as const },

@@ -11,7 +11,7 @@ export const NATIVE_PROVIDER_OVERLOADED_CODE = "native_provider_overloaded";
 export const NATIVE_PROVIDER_CAPACITY_MAX_RETRIES = 2;
 export const PROVIDER_POLICY_REFUSAL_CODE = "provider_policy_refusal";
 export const PROVIDER_POLICY_REFUSAL_MESSAGE =
-  "The model provider refused this request under its usage policy; it won't be retried automatically.";
+  "The model provider refused this request under its policies; it won't be retried automatically.";
 
 // Anthropic's documented stop_details.category vocabulary. A refusal can also
 // have a null or future category; stop_reason / stop_details.type takes priority.
