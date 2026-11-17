@@ -18,7 +18,7 @@ import { buildNativeCompletionContract } from "./completion-contracts.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { finalizeNativeRun } from "./native-run-finalizer.js";
 import { projectPaperclipRunnerTaskConfig, resolvePaperclipRunnerNativeProviderInput } from "./provider-profile.js";
-import { applyNativeMidStreamCutOpening } from "./native-mid-stream-cut.js";
+import { applyNativeMidStreamCutOpening, classifyNativeMidStreamCut, readExhaustedNativeMidStreamCutCandidate } from "./native-mid-stream-cut.js";
 import { NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION } from "./status-arbiter.js";
 import { heartbeatService } from "../heartbeat.js";
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
@@ -43,9 +43,10 @@ import { settleUnansweredPersonMessagesForTask, unansweredPersonMessageCondition
 //   mid-thinking) -> 3a301e73 resumed.
 // These run the REAL scheduling path: runner terminal -> finalizeNativeRun ->
 // arbiter -> status-decision committer -> the wake / retry dispatchers.
-type CutShape = "cap_no_text" | "cap_mid_answer" | "eof_mid_thinking" | "provider_error_mid_answer" | "transport_mid_answer" | "refusal";
+type CutShape = "cap_no_text" | "cap_mid_answer" | "eof_mid_thinking" | "provider_error_mid_answer" | "transport_mid_answer" | "other_provider_error_mid_answer" | "refusal";
 const CAP_EXHAUSTED_NOTE = "The model ran out of output budget before answering. Press Retry to try once more.";
-const CONNECTION_EXHAUSTED_NOTE = "The connection to the model dropped before the answer finished, twice. Press Retry to try once more.";
+const CONNECTION_EXHAUSTED_NOTE = "The connection to the model dropped before the answer finished. Press Retry to try once more.";
+const PROVIDER_EXHAUSTED_NOTE = "The model provider returned an error before the answer finished. Press Retry to try once more.";
 const PARTIAL_ANSWER = "Step 1: snapshot the invoices table. Step 2: ";
 const ASK = "Write the full migration plan for the billing tables, every step, nothing left out.";
 const STORED = { provider: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "xhigh" };
@@ -93,6 +94,8 @@ describe("native mid-stream cut: one successor, through recovery", () => {
       failed(2, { code: "pi_provider_error", message: "unexpected EOF" })];
     if (shape === "cap_mid_answer") return [item(1, "agentMessage", PARTIAL_ANSWER),
       failed(2, { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit." })];
+    if (shape === "other_provider_error_mid_answer") return [item(1, "agentMessage", PARTIAL_ANSWER),
+      failed(2, { code: "pi_provider_error", message: "The provider encountered an internal error." })];
     if (shape === "provider_error_mid_answer" || shape === "transport_mid_answer") return [item(1, "agentMessage", PARTIAL_ANSWER),
       failed(2, { code: shape === "transport_mid_answer" ? "pi_rpc_transport_failed" : "pi_provider_error", message: "upstream connect error: stream reset" })];
     return [failed(1, { code: "pi_provider_error", stopCategory: "reasoning_extraction",
@@ -317,7 +320,7 @@ describe("native mid-stream cut: one successor, through recovery", () => {
 
   // Real executor -> finalizer -> dispatch -> completion/replay -> sweep, for
   // every cut mix. No provider execution or additional automatic send is allowed.
-  const cuts = ["cap_no_text", "cap_mid_answer", "eof_mid_thinking", "provider_error_mid_answer", "transport_mid_answer"] as const;
+  const cuts = ["cap_no_text", "cap_mid_answer", "eof_mid_thinking", "provider_error_mid_answer", "transport_mid_answer", "other_provider_error_mid_answer"] as const;
   it.each(cuts.flatMap(first => cuts.map(last => [first, last] as const)))(
     "exhausted cut %s -> %s publishes the LAST failure once, never a generic resend",
     async (firstShape, lastShape) => {
@@ -330,12 +333,40 @@ describe("native mid-stream cut: one successor, through recovery", () => {
       const after = await dispatchEverything(issueId, first.runId);
       expect(after.successors.map(run => run.id)).toEqual([second.runId]);
       expect(await genericWakes(issueId)).toEqual([]);
-      const note = lastShape.startsWith("cap_") ? CAP_EXHAUSTED_NOTE : CONNECTION_EXHAUSTED_NOTE;
+      const note = lastShape.startsWith("cap_") ? CAP_EXHAUSTED_NOTE
+        : lastShape === "other_provider_error_mid_answer" ? PROVIDER_EXHAUSTED_NOTE : CONNECTION_EXHAUSTED_NOTE;
       const prefix = lastShape.endsWith("mid_answer") ? `${PARTIAL_ANSWER}\n\n— ` : "";
       await assertOnePublishedNoteAfterSweep(issueId, second.runId, prefix + note);
       await heartbeat.drainActiveRunExecutions();
     }, 180_000,
   );
+
+  // A small pure classifier guard is needed: a generic provider-error note alone
+  // could hide an account rejection incorrectly admitted to the automatic cut lane.
+  it.each([
+    { message: "insufficient_quota: billing hard limit reached" },
+    { message: "Provider quota exceeded for this model." },
+    { message: "Account billing requires attention." },
+    { message: "401 Unauthorized" },
+    { message: "403 Forbidden" },
+    { message: "authentication_error: invalid credentials" },
+    { message: "invalid_api_key" },
+    { httpStatus: 401 },
+    { statusCode: 403 },
+    { status: 402 },
+    { code: "pi_auth_required" },
+    { providerCode: "pi_auth_required" },
+    ...["quota_exhausted", "authentication", "permission"].map(category => ({
+      providerFailure: { schema: "paperclip.provider-failure.v1", provider: "pi", phase: "turn", category,
+        message: "Account action required", retryability: "requires_action" },
+    })),
+  ])("account rejection never enters the cut lane: %j", async detail => {
+    const rows = [{ seq: 1, payload: { prpEvent: { eventType: "turn.failed", payload: {
+      status: "failed", error: { code: "pi_provider_error", ...detail },
+    } } } }];
+    expect(classifyNativeMidStreamCut(rows)).toBeNull();
+    expect(await readExhaustedNativeMidStreamCutCandidate(db, { companyId, runId: randomUUID() }, rows)).toBeNull();
+  });
 
   it("RED gate 5 (6490dd70 -> 3a301e73): an EOF mid-thinking has ONE successor through recovery, resuming the session, and no generic wake", async () => {
     const issueId = await task();

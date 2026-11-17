@@ -2,7 +2,7 @@ import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { writeRuntimeRunPointer } from "./runtime-run-pointer.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { readRunAnswerEvents, readThinkingCapStop, thinkingCapStopCandidate } from "../thinking-cap-stop.js";
-import { readExhaustedNativeMidStreamCutCandidate } from "../native-runtime/native-mid-stream-cut.js";
+import { readExhaustedNativeMidStreamCutCandidate, readNativeProviderAccountFailureCandidate } from "../native-runtime/native-mid-stream-cut.js";
 import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
 import { isContextCompactionRun } from "../context-compaction.js";
@@ -2557,6 +2557,11 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     const exhaustedCut = await readExhaustedNativeMidStreamCutCandidate(db, { companyId, runId }, streamedRows);
     if (exhaustedCut) return exhaustedCut;
     const cut = readFailedTurnStreamedAnswer(streamedRows);
+    // Account rejections never enter the cut lane. Keep the provider's own
+    // failure text on the normal attributed reply, rather than leaving its
+    // message unanswered or promising to continue a rejected request.
+    const accountFailure = readNativeProviderAccountFailureCandidate(streamedRows);
+    if (accountFailure && (!selected || (cut && selected.seq >= cut.startSeq))) return accountFailure;
     if (cut && (!selected || selected.seq >= cut.startSeq)) return cut.candidate;
     if (selected) return selected;
     // dl-n5-cont2 item 3: the turn stopped at the output cap having streamed
