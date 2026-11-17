@@ -17513,6 +17513,18 @@ export function remoteCheckpointIncompleteFailure(
 }
 
 /** Production runnerd backend seam, exported so provider wiring can be regression tested. */
+/** Chat P0 (11-17): how long a runner refresh refusal waits, in the run, for
+ * a turn still showing on the warm session (after a Stop) to settle before it
+ * keeps the refusal. Never rotates over a live turn. */
+let nativeRefreshRotationWaitBoundMs = 60_000;
+const NATIVE_REFRESH_ROTATION_POLL_MS = 1_000;
+/** Test seam: sets the bound, returns the previous one. */
+export function setNativeRefreshRotationWaitBoundMsForTests(ms: number): number {
+  const previous = nativeRefreshRotationWaitBoundMs;
+  nativeRefreshRotationWaitBoundMs = ms;
+  return previous;
+}
+
 export async function createRunnerdBackend(input: {
   executionContext?: NativeExecutionContext;
   casesEnabled?: boolean;
@@ -20062,6 +20074,92 @@ async function createRunnerdBackendWithinSessionClaim(
     });
     return true;
   };
+  // Chat P0 (fresh 11-17, S1 17b3cb35 / S2 ed94e6f6). The runner refused to
+  // refresh the warm session: its run.prepare saw a next-run config that
+  // differs ONLY in 'instructions' (for example another run of the same agent
+  // saved a file under the agent instruction root) and answered
+  // provider_refresh_required (refresh_wait: a turn still shows on the warm
+  // session; refresh_fresh: the old session's close could not be confirmed).
+  // The driver returns that as a not-recovered result with failureClass
+  // provider_refresh_required and NSR throws NativeRunnerRefreshRequiredError:
+  // the run failed and only the NEXT message was answered, on a fresh thread.
+  // Take that fresh thread in THIS run through NSR's own in-run replacement
+  // (the F20 note: on the recover path NSR's replacement owns it): drop the
+  // failure class, so NSR reports the continuity break, openReplacementSession
+  // sets the old warm state aside (never deleted) BEFORE it opens the fresh
+  // session, and the fresh session's first turn carries the saved-history
+  // handoff. Only when nothing of the old thread can be lost or run twice: the
+  // checkpoint is idle in the rebound shape and NSR itself may replace it;
+  // the box shows no goal, descendant thread, pending tool call or unreadable
+  // state; a turn still showing (after a Stop) is waited for, bounded, and
+  // never rotated over. Anything else keeps today's named refusal.
+  const refreshRefusalFreshThread = async <T extends { recovered: boolean; reason?: string }>(result: T,
+    previous: PersistedNativeSession, signal?: AbortSignal): Promise<T | null> => {
+    const refusal = result as T & { failureClass?: unknown; prepareRefusalCode?: unknown; refreshWaitForTurn?: unknown };
+    if (result.recovered || refusal.failureClass !== "provider_refresh_required") return null;
+    const code = typeof refusal.prepareRefusalCode === "string" ? refusal.prepareRefusalCode : "provider_prepare_refused";
+    const waitForTurn = refusal.refreshWaitForTurn === true;
+    logger.warn({ runId: input.execution.binding.runId, prepareRefusalCode: code, refreshWaitForTurn: waitForTurn },
+      "native runner refused to refresh the warm session (native_runner_refresh_required)");
+    await input.onLog?.("stderr", "[paperclip-runner] the runner refused to refresh the warm session "
+      + `(native_runner_refresh_required): prepareRefusalCode=${code} refreshWaitForTurn=${waitForTurn}\n`);
+    const keep = async (why: string) => {
+      await input.onLog?.("stderr", `[paperclip-runner] keeping the refresh refusal: ${why}\n`);
+      return null;
+    };
+    if (code === "provider_live_descendants" || code === "provider_active_goal") return keep(code);
+    if (!["codex", "pi_rpc"].includes(input.execution.provider.kind) || remoteTarget?.transport !== "sandbox"
+      || !remoteCommandRunner || !remoteStateDirectory || input.remoteWarmRecovery || input.restartRecovery
+      || restoreUnavailableFreshThread || hasRetainedWarmTransitionEvidence(root)) return keep("not a fresh sandbox run");
+    // NSR must take its own replacement for a plain not-recovered result.
+    if (previous.providerRecoveryPolicy !== "allow_replacement_after_resume_failure"
+      || ("homeMode" in input.execution && input.execution.homeMode === "preconfigured")) return keep("checkpoint is not replaceable");
+    if (previous.activeTurnId != null || (previous.pendingRuntimeRequests?.length ?? 0) > 0
+      || previous.semanticResult != null || previous.terminal != null || (previous.terminalTurns?.length ?? 0) > 0
+      || previous.governedWait != null || previous.dispositionOnlyRecoveryConsumed === true
+      || previous.dispositionOnlyRecoveryTurnId != null || (previous as { goal?: unknown }).goal != null) {
+      return keep("the checkpoint carries run authority of the old thread");
+    }
+    const deadline = Date.now() + nativeRefreshRotationWaitBoundMs;
+    for (;;) {
+      let box: Record<string, unknown>;
+      try {
+        box = await readRemoteRunnerProviderState({ runner: remoteCommandRunner, stateDirectory: remoteStateDirectory,
+          execution: input.execution });
+      } catch { return keep("the warm session's state is unreadable"); }
+      const goal = box.goal && typeof box.goal === "object" ? box.goal as Record<string, unknown> : null;
+      const bridge = box.toolBridge && typeof box.toolBridge === "object" ? box.toolBridge as Record<string, unknown> : {};
+      const pendingCalls = bridge.pending && typeof bridge.pending === "object" ? Object.keys(bridge.pending).length : 0;
+      const descendants = Array.isArray(box.descendantThreadIds) ? box.descendantThreadIds.length : 0;
+      if (goal?.status === "active" || goal?.workingNow === true || descendants > 0 || pendingCalls > 0) {
+        return keep("the warm session holds a goal, a descendant thread or a pending tool call");
+      }
+      const turnShowing = (box.activeProviderTurnId ?? null) !== null || (box.piDeferredTerminal ?? null) !== null
+        || box.ambiguousTurnStartPending === true || (box.startupAttempt ?? null) !== null;
+      if (!turnShowing) break;
+      // Only a refresh_wait (the runner saw the turn) is waited for; a turn
+      // showing beside any other refusal keeps it.
+      if (!waitForTurn && code !== "provider_active_turn") return keep("a turn shows on the warm session");
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || signal?.aborted) {
+        return keep(`a turn still shows on the warm session after ${nativeRefreshRotationWaitBoundMs}ms`);
+      }
+      await new Promise<void>(resolveWait => {
+        const timer = setTimeout(done, Math.min(NATIVE_REFRESH_ROTATION_POLL_MS, remaining));
+        function done() { clearTimeout(timer); signal?.removeEventListener("abort", done); resolveWait(); }
+        signal?.addEventListener("abort", done, { once: true });
+      });
+    }
+    const atMs = Date.now();
+    await input.trace?.record({ name: "provider.session.refresh_refusal_fresh_thread", startedAtMs: atMs, endedAtMs: atMs,
+      attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
+        prepareRefusalCode: code, refreshWaitForTurn: waitForTurn } });
+    await input.onLog?.("stdout", "[paperclip-runner] continuing in a fresh provider thread: the runner refused to refresh "
+      + `the warm session (${code}); this run continues the conversation in a fresh provider thread with its saved history.\n`);
+    const { failureClass: _failureClass, prepareRefusalCode: _code, refreshWaitForTurn: _wait, ...rest } = refusal;
+    return { ...rest, recovered: false, reason: `the runner refused to refresh the warm session (${code}); `
+      + "the conversation continues in a fresh provider session with its saved history" } as unknown as T;
+  };
   /** The fresh session opened: append the old thread -> the box's new thread. */
   const recordRestoreUnavailableFreshThread = async () => {
     const taken = restoreUnavailableFreshThread;
@@ -20766,6 +20864,8 @@ async function createRunnerdBackendWithinSessionClaim(
           ? { recovered: true, session: await backend.openSession({ identity: snapshot.identity,
               workingDirectory: input.execution.workspace.cwd ?? undefined, signal: options.signal }) }
           : backend.recoverSession ? await backend.recoverSession(snapshot, options) : { recovered: false, reason: "driver does not support recovery" };
+        const rotated = reopenPi ? null : await refreshRefusalFreshThread(result, snapshot, options.signal);
+        if (rotated) { cursorCloudRuntime?.unregister(); return rotated; }
         const session = result.session ? wrapManagedSession(result.session) : undefined;
         if (result.recovered && session) await recordAdmittedProviderPack(session, snapshot.identity, Boolean(adoptedProcess));
         if (!result.recovered || !session) cursorCloudRuntime?.unregister();
