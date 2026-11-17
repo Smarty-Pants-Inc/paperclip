@@ -1,4 +1,4 @@
-import { PersistedExecutionWaitRefusal } from "../deferred-execution-wait.js";
+import { isWellFormedExecutionWait, PersistedExecutionWaitRefusal, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
@@ -49,7 +49,7 @@ export function registerDeferredReceiptWork(
   // native run finishes after its Stop request (run-cancellation.ts). check()
   // requires the full stop proof, the exact source and a post-Stop request.
   const stoppedNativeSource = sql<boolean>`(agent_wakeup_requests.requested_by_actor_type = 'user'
-    and agent_wakeup_requests.payload->'executionWait' is not null
+    and ${wellFormedExecutionWaitSql(sql.raw("agent_wakeup_requests.payload"))}
     and agent_wakeup_requests.payload->'queuedCommentInterrupt' is null
     and exists (select 1 from heartbeat_runs r
       join native_run_finalizations f on f.company_id = r.company_id and f.run_id = r.id
@@ -185,7 +185,7 @@ export function registerDeferredReceiptWork(
             Boolean(current.payload?.queuedCommentInterrupt) && owner.interruptTargetStopped &&
             await owner.interruptTargetStopped({ companyId: entry.companyId, requestId: entry.id });
           const stoppedSource = kind === "deferred" && due !== null && due > Date.now() && !stoppedInterrupt &&
-            Boolean(current.payload?.executionWait) && !current.payload?.queuedCommentInterrupt &&
+            isWellFormedExecutionWait(current.payload?.executionWait) && !current.payload?.queuedCommentInterrupt &&
             owner.executionWaitSourceStopped &&
             await owner.executionWaitSourceStopped({ companyId: entry.companyId, requestId: entry.id });
           if (due !== null && due > Date.now() && !stoppedInterrupt && !stoppedSource) return { ...entry, dueAt: due, immediate: false };
