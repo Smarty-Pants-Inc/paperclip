@@ -7139,6 +7139,12 @@ export function recoveryService(
         // Terminal status alone does not prove that execution stopped. Match
         // checkout's task-before-run order and escalation's task-scoped Stop
         // gate before releasing either claim or publishing hold-release work.
+        // A proven warm handoff (provedWarmTurnHandoff) passes this gate, so
+        // both claims are released and lock_released promotes the next message,
+        // as the Stop path's own releaseIssueExecution does. The warm lease is
+        // not a claim and is never written here (adopt-h6-claims; test: "a
+        // proven warm handoff releases the claims, promotes the saved message
+        // and the next message keeps box and thread").
         const ownerRunIds = [...new Set([locked.checkoutRunId, locked.executionRunId]
           .filter((id): id is string => id !== null))];
         if (ownerRunIds.length) {
