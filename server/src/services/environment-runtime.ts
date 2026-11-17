@@ -28,7 +28,7 @@ import { dueRunLeaseReleaseCondition, pendingRunLeaseReleaseCondition } from "./
 import { flushDeferredEnvironmentCleanup, registerDeferredEnvironmentCleanup, writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatchedEnvironmentTask } from "./environment-task-runtime.js";
 import { allowLegacyShutdownWorkspaceCleanup, legacyShutdownWorkspaceResourceProtected } from "./legacy-shutdown-workspace-settlement.js";
-import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
+import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource, obsoleteWorkspaceCustodyRefusal } from "./native-runtime/native-workspace-finalization-state.js";
 import { abandonedWorkspaceFilesHeldOnLease, abandonedWorkspaceFilesParked, parkAbandonedWorkspaceFilesLease } from "./remote-workspace-abandoned-files-hold.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
@@ -37,7 +37,7 @@ import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/nati
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
-import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -56,7 +56,7 @@ import type {
   SandboxEnvironmentConfig,
   SandboxProviderCapabilities,
 } from "@paperclipai/shared";
-import { AGENT_ADAPTER_TYPES, resolveDeclaredSandboxCapabilities } from "@paperclipai/shared";
+import { resolveDeclaredSandboxCapabilities } from "@paperclipai/shared";
 import type { EffectiveExecutionCapabilities } from "@paperclipai/adapter-utils/execution-target";
 import { MAX_SANDBOX_SYNC_TIMEOUT_MS } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
@@ -1167,9 +1167,21 @@ function reusableLeaseCanBeResumed(input: {
 }
 
 const OBSOLETE_SOURCE_ENDED_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
-/** Paul's and Kate's Smarties (agent id prefixes): their obsolete boxes are
- * never destroyed until Paul says (RFL's step-6 custody bar, item 5). */
+/** Paul/Kate hold-outs use configured full IDs. Prefixes are a fail-closed
+ * fallback until both full identities are configured (RFL step-6 bar, item 5). */
 const OBSOLETE_SOURCE_DESTROY_EXCLUDED_AGENT_ID_PREFIXES = ["29b216c4", "46a1dae4"] as const;
+
+function obsoleteSourceAgentIsExcluded(agentId: string): boolean {
+  // Full production identities are deployment config, not prefix identities.
+  // An absent, partial or malformed list must never release either hold-out.
+  const ids = (process.env.PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS ?? "")
+    .split(",").map(id => id.trim().toLowerCase()).filter(Boolean);
+  const configured = ids.every(id => /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(id))
+    && OBSOLETE_SOURCE_DESTROY_EXCLUDED_AGENT_ID_PREFIXES.every(prefix => ids.some(id => id.startsWith(`${prefix}-`)));
+  const normalized = agentId.toLowerCase();
+  return configured ? ids.includes(normalized)
+    : OBSOLETE_SOURCE_DESTROY_EXCLUDED_AGENT_ID_PREFIXES.some(prefix => normalized.startsWith(prefix));
+}
 /** The named idle time: an obsolete box's row and run must be idle this long. */
 const OBSOLETE_SOURCE_DESTROY_IDLE_MS = 30 * 60_000;
 
@@ -1700,17 +1712,19 @@ function createSandboxEnvironmentDriver(
    * - Nothing still uses the box: no other lease row of the allocation is open,
    *   the row's own run has ended, and the row has been idle for the named time.
    * - No native workspace export is pending for the row or its allocation.
-   * - Cut A's custody guard, fail-closed: unless the row records a KNOWN
-   *   non-native adapter, its native session must be in TWO sha-verified copies
+   * - Cut A's custody guard, fail-closed for EVERY adapter: its conversation
+   *   history must be in TWO sha-verified copies
    *   at the destroy: the durable object (downloaded and hashed) and the local
    *   backup tree (every directory re-hashed against the stamp's manifest),
    *   and no provider work may have followed that backup.
+   * - Workspace content also needs a read-back receipt newer than its last
+   *   write. No allocation-bound restic receipt is integrated yet: keep it.
    */
   async function obsoleteSourceDestroyRefusal(lease: EnvironmentLease, input: {
     adapterType: string | null; heartbeatRunId: string | null;
   }): Promise<{ reason: string } | { reason: null; manifestSha256: string | null; rule: string }> {
     const agentId = typeof lease.metadata?.agentId === "string" ? lease.metadata.agentId : "";
-    if (OBSOLETE_SOURCE_DESTROY_EXCLUDED_AGENT_ID_PREFIXES.some(prefix => agentId.startsWith(prefix))) {
+    if (obsoleteSourceAgentIsExcluded(agentId)) {
       return { reason: "agent_excluded_until_paul_says" };
     }
     if (!reusableLeaseCanBeCleanedUp(lease) || reusableSandboxKeptAfterReplacement(lease)) return { reason: "lease_not_obsolete_source" };
@@ -1729,10 +1743,6 @@ function createSandboxEnvironmentDriver(
     if (Date.now() - lastUsed < obsoleteSourceDestroyIdleMs()) return { reason: "lease_used_within_idle_time" };
     if (await nativeWorkspaceExportPendingForLease(db, lease)
       || await nativeWorkspaceExportPendingForResource(db, lease, input.heartbeatRunId)) return { reason: "native_workspace_export_pending" };
-    const scope = lease.metadata?.reusableSandboxLease as { adapterType?: unknown } | undefined;
-    const knownNonNative = input.adapterType !== "paperclip_runner" && typeof scope?.adapterType === "string"
-      && scope.adapterType !== "paperclip_runner" && (AGENT_ADAPTER_TYPES as readonly string[]).includes(scope.adapterType);
-    if (knownNonNative) return { reason: null, manifestSha256: null, rule: "known_non_native_adapter" };
     const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId);
     if (!stamp) return { reason: "no_custody_stamp" };
     const storage = durableNativeHarnessStorage();
@@ -1745,7 +1755,9 @@ function createSandboxEnvironmentDriver(
       .catch(() => false)) return { reason: "local_custody_copy_unverified" };
     if (await nativeHarnessBackupHasLaterProviderWork(db, { companyId: lease.companyId,
       normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt })) return { reason: "provider_work_after_custody" };
-    return { reason: null, manifestSha256: stamp.manifestSha256, rule: "two_verified_custody_copies" };
+    const workspaceRefusal = await obsoleteWorkspaceCustodyRefusal(db, lease);
+    if (workspaceRefusal) return { reason: workspaceRefusal };
+    return { reason: null, manifestSha256: stamp.manifestSha256, rule: "two_verified_custody_copies_and_workspace_readback" };
   }
 
   /** One activity row per destroy, would-destroy (dry run) or refusal. */
@@ -1792,7 +1804,11 @@ function createSandboxEnvironmentDriver(
         lease,
         failureReason: "lease_fingerprint_mismatch",
       });
-      if (destroyed) await recordObsoleteSourceDecision(lease, destroyed.status === "expired" ? "destroyed" : "destroy_pending", verdict);
+      if (destroyed) {
+        const receipt = destroyed.metadata?.remoteExecutionTermination as { state?: unknown } | undefined;
+        const confirmed = hasRemoteTerminationReceipt(destroyed) && receipt?.state === "destroyed";
+        await recordObsoleteSourceDecision(lease, confirmed ? "destroyed" : "destroy_pending", verdict);
+      }
     }
   }
 

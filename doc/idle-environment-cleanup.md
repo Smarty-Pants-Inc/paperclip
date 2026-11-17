@@ -156,24 +156,35 @@ upstream. A retained or released reuse candidate that no longer matches is
 obsolete. Acquisition destroys it through upstream's guarded destroy only when
 all of these hold on the re-read row (delete-ours step 6, RFL's custody bar):
 
-- its agent is not one held out until Paul says (`29b216c4`, `46a1dae4`);
+- its agent is not one held out until Paul says. Configure the full Paul and
+  Kate UUIDs in `PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS` (comma
+  separated). Until a valid list covering both identities is configured, all
+  IDs starting with `29b216c4` or `46a1dae4` remain held out; with a complete
+  list only exact full-ID matches are held out;
 - no other row of the same provider allocation is `active` or `pending_cleanup`;
 - its run has ended and both the run and the row have been idle for 30 minutes
   (`PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_IDLE_MS` overrides it for a gate row);
 - no native workspace export is pending for the row or its allocation;
-- unless the row records a known non-native adapter, its native session backup
-  is verified in two copies: the durable object (downloaded and hashed) and the
-  local backup tree (each directory re-hashed against the stamp manifest), and
-  no provider work followed that backup.
+- for every adapter, its conversation backup is verified in two copies: the
+  durable object (downloaded and hashed) and the local backup tree (each
+  directory re-hashed against the v2 stamp manifest), and no provider work
+  followed that backup;
+- its entire workspace has a custody read-back receipt newer than its last
+  write. **No machine-verifiable, allocation-bound restic receipt is integrated
+  yet.** Even with both harness copies verified and no export pending, cleanup
+  refuses with `workspace_custody_unverified`. There is no config or lease
+  metadata bypass. No obsolete box currently reaches destroy or would-destroy
+  through this guard until that receipt integration is implemented.
 
 Anything else is not destroyed, and an activity row
 `environment.lease.obsolete_destroy_refused` names the reason. Destroys run only
 with `PAPERCLIP_OBSOLETE_SANDBOX_DESTROY=destroy`; otherwise each box that would
 be destroyed gets an `environment.lease.obsolete_would_destroy` row (the dry run).
-A destroy writes `environment.lease.obsolete_destroyed` (or `_destroy_pending`
-when the provider did not confirm) with the box, the custody manifest sha, the
-time and the rule. Retained warm boxes are otherwise stopped by upstream's warm
-expiry (`warm-sandbox-expiry.ts`).
+A confirmed, lease-bound destroyed receipt writes
+`environment.lease.obsolete_destroyed` (or `_destroy_pending` when the provider
+throws or returns void, even if the lease row is marked expired) with the box,
+the custody manifest sha, the time and the rule. Retained warm boxes are otherwise
+stopped by upstream's warm expiry (`warm-sandbox-expiry.ts`).
 
 ## Legacy deferred orphan buffers
 

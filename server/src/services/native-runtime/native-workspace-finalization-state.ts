@@ -102,6 +102,15 @@ export async function nativeWorkspaceExportPendingForLease(db: Db, lease: Worksp
   return await held();
 }
 
+/** No integrated receipt currently proves that the box's entire workspace was
+ * read back from custody AFTER its last write. Export-pending=false and a
+ * harness stamp do not prove that. Until the hosts' restic pass exposes a
+ * machine-verifiable, allocation-bound receipt and write fence, keep the box.
+ * Deliberately no metadata or environment-variable bypass. */
+export async function obsoleteWorkspaceCustodyRefusal(_db: Db, _lease: WorkspaceSourceLease): Promise<"workspace_custody_unverified" | null> {
+  return "workspace_custody_unverified";
+}
+
 export async function nativeWorkspaceExportPendingForResource(db: Db, lease: WorkspaceSourceLease, resumingRunId: string | null) {
   if (!lease.provider || !lease.providerLeaseId || lease.provider === "local") return false;
   const sources = await db.select({ lease: { id: environmentLeases.id, companyId: environmentLeases.companyId,
