@@ -318,6 +318,71 @@ export function boundedCodexPayload(
   return record(boundedCodexValue(value));
 }
 
+/**
+ * Inline line for a completed agent message's text on the PRP record. It sits
+ * above every upstream line (the Pi projector's 250 KiB answer line and
+ * runner-core's half-frame budget), so text an upstream stage admitted whole
+ * is never cut again here. The record stays far below the 1 MiB frame guard.
+ */
+export const MAX_COMPLETED_AGENT_MESSAGE_TEXT_BYTES = 512 * 1024;
+const AGENT_MESSAGE_EXCERPT_BYTES = 16 * 1024;
+
+function fullTextReference(value: unknown): Record<string, unknown> | undefined {
+  const reference = record(value);
+  return typeof reference.path === "string" && reference.path.length > 0 && reference.path.length <= 4096
+    && typeof reference.sha256 === "string" && /^[a-f0-9]{64}$/iu.test(reference.sha256)
+    && Number.isSafeInteger(reference.bytes) && Number(reference.bytes) >= 0
+    ? { path: reference.path, sha256: reference.sha256, bytes: reference.bytes }
+    : undefined;
+}
+
+/**
+ * A completed agent message (the person's answer, or a progress message) is
+ * not a diagnostic preview: the 64 KiB / 32,768-character retention bound
+ * above would replace it with `{truncated, byteSize}` and lose its text. Keep
+ * the (already redacted) text whole, once, beside bounded item metadata.
+ * Above the inline line the person gets the plain line and a labelled excerpt
+ * (never a cut marker); an upstream full-text reference is carried through.
+ */
+export function completedAgentMessagePayload(input: {
+  kind: string;
+  channel: string;
+  providerPhase?: string;
+  text: string;
+  item: Record<string, unknown>;
+  fullText?: unknown;
+}): Record<string, unknown> {
+  const { text: _itemText, fullText: _itemFullText, ...itemMetadata } = input.item;
+  const metadata = boundedCodexPayload({
+    kind: input.kind,
+    channel: input.channel,
+    providerPhase: input.providerPhase,
+    item: itemMetadata,
+  });
+  const payload: Record<string, unknown> = metadata.truncated === true
+    ? { kind: input.kind, channel: input.channel, providerPhase: input.providerPhase }
+    : metadata;
+  const fullText = fullTextReference(input.fullText) ?? fullTextReference(input.item.fullText);
+  const bytes = Buffer.byteLength(JSON.stringify(input.text));
+  if (bytes <= MAX_COMPLETED_AGENT_MESSAGE_TEXT_BYTES) {
+    payload.text = input.text;
+  } else {
+    const kilobytes = Math.ceil(Buffer.byteLength(input.text) / 1000);
+    let low = 0, high = Math.min(input.text.length, AGENT_MESSAGE_EXCERPT_BYTES);
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (Buffer.byteLength(JSON.stringify(input.text.slice(0, middle))) <= AGENT_MESSAGE_EXCERPT_BYTES) low = middle;
+      else high = middle - 1;
+    }
+    if (low > 0 && /[\uD800-\uDBFF]/u.test(input.text[low - 1]!)) low--;
+    const excerpt = input.text.slice(0, low);
+    payload.text = `This answer is longer than one message (${kilobytes} KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n${excerpt}`;
+    payload.textBytes = Buffer.byteLength(input.text);
+  }
+  if (fullText) payload.fullText = fullText;
+  return payload;
+}
+
 export function isRetainableCodexPayload(value: unknown): boolean {
   try {
     return (

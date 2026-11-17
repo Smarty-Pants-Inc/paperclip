@@ -8,7 +8,7 @@ import { isNativeRestartInterruption, NativeSessionProtocolIntegrityError } from
 import { isPrpAuthCredentialsUpdated, validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import type { CodexRpcNotification, CodexTraceInterpretation } from "./app-server-transport.js";
 import { redactCodexDiagnostic } from "./app-server-transport.js";
-import { boundedCodexPayload as boundedPayload, boundedCodexValue, isRetainableCodexPayload } from "./codex-boundaries.js";
+import { boundedCodexPayload as boundedPayload, boundedCodexValue, completedAgentMessagePayload, isRetainableCodexPayload } from "./codex-boundaries.js";
 import { runtimeRequestProtocolPayload, runtimeRequestResponse } from "./codex-question-adapter.js";
 import {
   isSupportedCodexNotificationMethod,
@@ -643,13 +643,24 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
           : channelForStartedItem(state, item);
       state.emit(
         "item.completed",
-        boundedPayload({
-          kind: text(item.type, "unknown"),
-          channel,
-          providerPhase: text(item.phase) || undefined,
-          text: itemText(item),
-          item,
-        }),
+        // A completed agent message keeps its text whole (dl-n5-66k): the
+        // generic 64 KiB retention bound would store only {truncated, byteSize}.
+        text(item.type) === "agentMessage"
+          ? completedAgentMessagePayload({
+              kind: "agentMessage",
+              channel,
+              providerPhase: text(item.phase) || undefined,
+              text: itemText(item),
+              item,
+              fullText: params.fullText,
+            })
+          : boundedPayload({
+              kind: text(item.type, "unknown"),
+              channel,
+              providerPhase: text(item.phase) || undefined,
+              text: itemText(item),
+              item,
+            }),
         { turnId, itemId },
       );
       if (text(item.type) === "agentMessage") {
