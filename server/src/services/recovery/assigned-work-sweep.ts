@@ -37,6 +37,7 @@ import { ASSIGNED_WORK_CONTINUED_ACTION, taskAutomaticAttempts } from "./task-au
 import { isReattachPhaseActive, reattachPhaseRecheckAt } from "../heartbeat/run-admission.js";
 import { ensureFreshContinuation, type FreshContinuationResult } from "../fresh-continuation-fallback.js";
 import { canContinueRecoveryRunAutomatically } from "../continuation-cause.js";
+import { wakeBecameFreshContinuation } from "./wake-became-fresh-continuation.js";
 import { STRANDED_CONTINUATION_MAX_AGE_MS, STRANDED_KIND, strandedHoldContinuesAutomatically, type StrandedHoldRun } from "./stranded-hold-continuation.js";
 import {
   continuationActivityMessage,
@@ -614,6 +615,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       await settleContinuationActivity(claimed, claimed.reason, "not_started", { waitingUntil: fresh.retryAt.toISOString() });
       return { verdict: claimed.verdict, outcome: fresh.kind === "backoff" ? "deferred_cap" : "waiting_on_recovery", retryAt: fresh.retryAt };
     }
+    const continuedBefore = await wakeBecameFreshContinuation(db, issue.companyId, issue.id);
     const run = await deps.enqueueWakeup(issue.assigneeAgentId!, {
       source: facts.latestRun ? "automation" : "assignment", triggerDetail: "system",
       reason: facts.latestRun ? "issue_continuation_needed" : "issue_assigned",
@@ -627,13 +629,14 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       logger.warn({ err: error, companyId: issue.companyId, issueId: issue.id }, "assigned-work continuation was not admitted");
       return null;
     });
-    // A refused continuation stays a violation; the claim spaces the next try.
-    // A block lifted for it is put back, so the task never sits unblocked
-    // with nothing pending.
-    if (!run && claimed.restoredTo) await revertRestoredBlock(issue, claimed);
-    await settleContinuationActivity(claimed, claimed.reason, run ? "queued" : "not_started",
-      fresh?.kind === "person_owned" ? { waitingFor: fresh.reason } : {});
-    return { verdict: claimed.verdict, outcome: run ? "repaired" : "enqueue_refused", retryAt: claimed.nextCheckAt };
+    // Admission may coalesce this wake into a new fresh continuation from saved work (not a refusal). An older
+    // stuck one, or a refused wake, stays a violation spaced by the claim; a block lifted for it is put back.
+    const continued = !run && !continuedBefore && await wakeBecameFreshContinuation(db, issue.companyId, issue.id);
+    if (!run && !continued && claimed.restoredTo) await revertRestoredBlock(issue, claimed);
+    await settleContinuationActivity(claimed, claimed.reason, run || continued ? "queued" : "not_started", continued
+      ? { continuedFromSavedWork: "true" }
+      : fresh?.kind === "person_owned" ? { waitingFor: fresh.reason } : {});
+    return { verdict: claimed.verdict, outcome: run || continued ? "repaired" : "enqueue_refused", retryAt: claimed.nextCheckAt };
   }
 
   async function continueFromSavedWork(issue: IssueRow, facts: AssignedWorkFacts, at: Date): Promise<FreshContinuationResult | null> {

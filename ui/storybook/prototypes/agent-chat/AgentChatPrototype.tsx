@@ -216,6 +216,7 @@ export interface AgentChatPrototypeProps {
   entryScenario?: EntryScenario;
   sidebarScenario?: SidebarScenario;
   coordinator?: boolean;
+  primaryView?: "own" | "other" | "other-empty";
   unreadMessageCounts?: Record<string, number>;
 }
 
@@ -227,6 +228,7 @@ export function AgentChatPrototype({
   entryScenario,
   sidebarScenario,
   coordinator = false,
+  primaryView,
   unreadMessageCounts,
 }: AgentChatPrototypeProps) {
   const [ready, setReady] = useState(false);
@@ -286,7 +288,7 @@ export function AgentChatPrototype({
         assigneeAgentId: a.id,
         title: `Chat with ${a.name}`,
         conversationAgentId: taskComparison ? null : a.id,
-        conversationUserId: taskComparison ? null : "user-board",
+        conversationUserId: taskComparison ? null : primaryView?.startsWith("other") && a.id === agent.id ? "user-paul" : "user-board",
         conversationState: "waiting" as const,
         isUnreadForMe: (unreadMessageCounts?.[a.id] ?? 0) > 0,
         unreadMessageCount: unreadMessageCounts?.[a.id] ?? 0,
@@ -294,7 +296,7 @@ export function AgentChatPrototype({
       const hasExistingChat = sidebarScenario
         ? (sidebarScenario === "large-team" || sidebarAgents.some(initial => initial.id === a.id)) && (scenario !== "empty" || a.id !== agent.id)
         : entryScenario ? entryScenario !== "first-use" && a.id === agent.id : scenario !== "empty" || a.id !== agent.id;
-      if (hasExistingChat) chats.set(a.id, task);
+      if (hasExistingChat && !(primaryView === "other-empty" && a.id === agent.id)) chats.set(a.id, task);
       let history =
         a.id === agent.id && scenario !== "empty"
           ? scenario === "working"
@@ -335,6 +337,9 @@ export function AgentChatPrototype({
           ? "I copied the relevant plan to [PAP-248](/PAP/issues/PAP-248) in the existing Launch project and assigned CodexCoder. The original plan remains here."
           : "I saved the plan here and copied it to [PAP-248](/PAP/issues/PAP-248) in the new project. The assigned task can now begin; we can continue the discussion here.",
       };
+      if (primaryView?.startsWith("other") && a.id === agent.id) {
+        history = history.map(item => item.authorUserId === "user-board" ? { ...item, authorUserId: "user-paul" } : item);
+      }
       messages.set(task.id, history);
       writeTaskSidePanelState("user-board", task.companyId, task.id, {
         state: {
@@ -373,7 +378,26 @@ export function AgentChatPrototype({
         init?.body && typeof init.body === "string"
           ? JSON.parse(init.body)
           : {};
-      if (/\/companies\/[^/]+\/chats$/.test(path)) return Response.json([...chats.values()]);
+      if (primaryView && path === "/api/auth/get-session") {
+        return Response.json({ ...storybookAuthSession, user: { ...storybookAuthSession.user, name: "Kate" } });
+      }
+      if (primaryView && path.endsWith("/user-directory")) {
+        return Response.json({ users: [
+          { principalId: "user-board", status: "active", user: { id: "user-board", name: "Kate", image: null } },
+          { principalId: "user-paul", status: "active", user: { id: "user-paul", name: "Paul", image: null } },
+        ] });
+      }
+      if (path.endsWith("/primary-agents")) return Response.json(primaryView
+        ? [{ userId: primaryView === "own" ? "user-board" : "user-paul", agentId: agent.id }] : []);
+      if (path.endsWith("/primary-agent/me")) return Response.json({ companyId: issue.companyId, userId: "user-board",
+        primaryAgentId: primaryView === "own" ? agent.id : null, initialized: true });
+      if (/\/companies\/[^/]+\/chats$/.test(path)) {
+        const shared = url.searchParams.get("members") === "all";
+        const matching = [...chats.values()].filter(chat => shared
+          ? chat.conversationAgentId === url.searchParams.get("agentId") : chat.conversationUserId === "user-board");
+        const offset = Number(url.searchParams.get("offset") ?? 0);
+        return Response.json(shared ? matching.slice(offset, offset + Number(url.searchParams.get("limit") ?? 50)) : matching);
+      }
       const chatRef = path.match(/\/chats\/([^/]+)$/)?.[1];
       if (chatRef) {
         const a = fixtureAgents.find(
@@ -623,7 +647,7 @@ export function AgentChatPrototype({
       }
       queryClient.clear();
     };
-  }, [scenario, taskComparison, entryScenario, sidebarScenario, coordinator, unreadMessageCounts, contextInitiallyOpen, queryClient]);
+  }, [scenario, taskComparison, entryScenario, sidebarScenario, coordinator, primaryView, unreadMessageCounts, contextInitiallyOpen, queryClient]);
   useLayoutEffect(() => {
     if (ready && !initialRouteSet.current) {
       initialRouteSet.current = true;

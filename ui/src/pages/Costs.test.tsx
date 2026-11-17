@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Costs } from "./Costs";
 import { CostByUserTable } from "../components/CostByUserTable";
+import { BudgetPolicyCard } from "../components/BudgetPolicyCard";
 import { MemoryRouter } from "react-router-dom";
 
 const scopedAgentMock = vi.hoisted(() => vi.fn());
@@ -220,6 +221,25 @@ describe("Shared Costs surfaces", () => {
     queryClient.clear();
   });
 
+  it.each(["card", "plain"] as const)("shows the configured policy limit but masks observed and remaining spend in the %s variant", async (variant) => {
+    root = createRoot(container);
+    await act(async () => root.render(<BudgetPolicyCard variant={variant} onSave={vi.fn()} summary={{
+      policyId: "policy", companyId: "company-1", scopeType: "agent", scopeId: "agent", scopeName: "Worker",
+      metric: "billed_cents", windowKind: "calendar_month_utc", amount: 5000, warnPercent: 80,
+      windowStart: new Date("2026-11-01T00:00:00Z"), windowEnd: new Date("2026-12-01T00:00:00Z"),
+      hardStopEnabled: true, notifyEnabled: true, isActive: true, unpricedUsagePolicy: "block", reservationCents: "0",
+      observedAmount: 800, remainingAmount: 4200, utilizationPercent: 16, unpricedEventCount: 0, pendingRunCount: 0,
+      status: "ok", paused: false, pauseReason: null,
+    }} />));
+    const valueAfter = (label: string) => [...container.querySelectorAll("div, span")]
+      .find(node => node.textContent === label)?.nextElementSibling?.textContent;
+    expect(valueAfter("Budget")).toBe("$50.00");
+    expect(valueAfter("Observed")).toBe("—");
+    expect(valueAfter("Remaining")).toBe("—");
+    expect(container.querySelector("input")?.value).toBe("50.00");
+    expect(container.textContent).toContain("Update budget");
+  });
+
   it.each([
     ["reservation", 500, "agent"], ["unknown price", 500, "agent"], ["amount", 500, "agent"],
     ["amount", 0, "company"], ["amount", 0, "agent"], ["amount", 0, "project"],
@@ -312,13 +332,13 @@ describe("Shared Costs surfaces", () => {
     await act(async () => root.render(<MemoryRouter><QueryClientProvider client={queryClient}><Costs /></QueryClientProvider></MemoryRouter>));
     const retry = () => [...container.querySelectorAll("button")].find(button => button.textContent === "Retry account check");
     await act(async () => { await vi.waitFor(() => expect(retry()).toBeDefined()); });
-    expect(container.textContent).toContain("—/month");
+    expect(container.textContent).toContain("$20.00/month");
     expect(container.textContent).not.toContain("private connection error");
     await act(async () => retry()!.click());
     await act(async () => { await vi.waitFor(() => expect(retry()).toBeUndefined()); });
     expect(subscriptionsMocks.refresh).toHaveBeenCalledTimes(2);
     expect(subscriptionsMocks.refresh).toHaveBeenLastCalledWith("company-1");
-    expect(container.textContent).toContain("—/month");
+    expect(container.textContent).toContain("$20.00/month");
     queryClient.clear();
   });
 
@@ -333,18 +353,18 @@ describe("Shared Costs surfaces", () => {
     root = createRoot(container);
     await act(async () => root.render(<MemoryRouter><QueryClientProvider client={queryClient}><Costs /></QueryClientProvider></MemoryRouter>));
     const card = (label: string) => [...container.querySelectorAll("div")].find(node => node.textContent === label)?.closest('[data-slot="card"]');
-    await act(async () => { await vi.waitFor(() => expect(card("Subscriptions")?.textContent).toContain("—/month")); });
+    await act(async () => { await vi.waitFor(() => expect(card("Subscriptions")?.textContent).toContain("$20.00/month")); });
     expect(card("API spend")?.textContent).toContain("—");
     subscriptionsMocks.report.mockResolvedValue({ ...report, activeCount: 1, monthlyTotals: [{ currency: "USD", amountCents: "2000", estimatedCount: 1 }], api: { ...report.api, costCents: "300" } });
     await act(async () => [...container.querySelectorAll("button")].find(button => button.textContent === "All Time")!.click());
     await act(async () => { await vi.waitFor(() => expect(card("API spend")?.textContent).toContain("—")); });
-    expect(card("Subscriptions")?.textContent).toContain("—/month");
+    expect(card("Subscriptions")?.textContent).toContain("$20.00/month");
     expect(subscriptionsMocks.report).toHaveBeenLastCalledWith("company-1", undefined, undefined);
     subscriptionsMocks.report.mockRejectedValue(new Error("private provider failure"));
     await act(async () => { await queryClient.invalidateQueries({ queryKey: ["cost-subscriptions"] }); });
     await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("Showing the last loaded API and subscription usage")); });
     expect(card("API spend")?.textContent).toContain("—");
-    expect(card("Subscriptions")?.textContent).toContain("—/month");
+    expect(card("Subscriptions")?.textContent).toContain("$20.00/month");
     expect(container.textContent).not.toContain("private provider failure");
     queryClient.clear();
   });
@@ -359,13 +379,14 @@ describe("Shared Costs surfaces", () => {
     await act(async () => root.render(<MemoryRouter><QueryClientProvider client={queryClient}><Costs /></QueryClientProvider></MemoryRouter>));
     const budgetCard = () => [...container.querySelectorAll("div")].find(node => node.textContent === "Budget")?.closest('[data-slot="card"]');
     await act(async () => { await vi.waitFor(() => expect(budgetCard()?.textContent).toContain("20%")); });
-    expect(budgetCard()?.textContent).toContain("— of — this month");
+    expect(budgetCard()?.textContent).toContain("— of $10.00 this month");
     costsApiMocks.summary.mockResolvedValue({ spendCents: 12000, budgetCents: 1000, utilizationPercent: 1200, pricingComplete: true });
     const subscriptionReport = await subscriptionsMocks.report();
     subscriptionsMocks.report.mockResolvedValue({ ...subscriptionReport, api: { ...subscriptionReport.api, costCents: "12000" } });
     await act(async () => [...container.querySelectorAll("button")].find(b => b.textContent === "All Time")!.click());
     await act(async () => { await vi.waitFor(() => expect(budgetCard()?.textContent).toContain("Monthly limit")); });
-    expect(budgetCard()?.textContent).toContain("—");
+    expect(budgetCard()?.textContent).toContain("$10.00");
+    expect(budgetCard()?.textContent).not.toContain("—");
     expect(budgetCard()?.textContent).toContain("Monthly limit");
     expect(container.textContent).not.toContain("1200%");
     expect(container.textContent).not.toContain("of monthly budget consumed");

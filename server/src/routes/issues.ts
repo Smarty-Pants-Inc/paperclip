@@ -450,6 +450,8 @@ function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comme
     + `Tell the author to discard it there.`;
 }
 
+const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
+const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting: Send them, or delete any first.";
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -7678,6 +7680,8 @@ export function issueRoutes(
     response?: QueuedInteractionResponse | null;
   };
 
+  const QUEUED_INTERRUPT_HANDOFF_WAIT = { reason: "interrupt_handoff", message: "Sending your messages." } as const;
+
   async function findQueuedCommentWake(
     executor: IssueQueueDb,
     issue: { id: string; companyId: string; assigneeAgentId: string | null },
@@ -7860,10 +7864,15 @@ export function issueRoutes(
             .then((state) => state.disposition)
             .catch(() => "temporarily_unavailable" as const));
     const wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    // The user's Interrupt click is delivering these messages. Its stopped run
+    // settling is not something to read about under the composer; the task
+    // notice owns any wait that needs the user.
+    const interruptHandoff = queueState?.state === "deferred" && readObject(wake?.payload).queuedCommentInterrupt != null;
     const queue = buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
-      executionWait: typeof wait.reason === "string" && typeof wait.message === "string"
-        ? { reason: wait.reason, message: wait.message } : null,
+      executionWait: interruptHandoff ? QUEUED_INTERRUPT_HANDOFF_WAIT
+        : typeof wait.reason === "string" && typeof wait.message === "string"
+          ? { reason: wait.reason, message: wait.message } : null,
       queueId: wake?.id ?? null,
       state: queueState?.state ?? null,
       activeRunId: input.activeRun?.id ?? null,
@@ -7873,6 +7882,21 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
+    if (wake && queueState?.state === "deferred" && !input.activeRun && !queue.executionWait && comments.length > 0 &&
+        input.issue.conversationAgentId && input.issue.conversationAgentId === input.issue.assigneeAgentId &&
+        !queuedInteractionId(wake.payload)) {
+      // Stop means stop (org 11-17): after a person's Stop the chat's waiting
+      // messages are not sent. The person sends them, or deletes some first.
+      const [lastTurn] = await input.executor.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.issue.companyId),
+          eq(heartbeatRuns.agentId, input.issue.conversationAgentId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issue.id}`))
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      const stop = readObject(lastTurn?.resultJson);
+      if (lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId) {
+        queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+      }
+    }
     if (wake && queuedInteractionId(wake.payload)) {
       if (response?.source.requiresFreshSession) queue.steeringDisposition = "unsupported";
       queue.entries = response ? [{ comment: response.comment, source: response.source, position: 0, canEdit: false, canDiscard: false }] : [];
@@ -18004,6 +18028,15 @@ export function issueRoutes(
         if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
         if (req.actor.userId !== issue.conversationUserId) {
           throw forbidden("Only the conversation owner can interrupt a chat to send queued messages");
+        }
+        // A paused chat runs nothing: Send says why and keeps the messages.
+        const [chatAgent] = await db.select({ status: agents.status }).from(agents).where(and(
+          eq(agents.companyId, issue.companyId), eq(agents.id, issue.conversationAgentId)));
+        if (chatAgent?.status === "paused") {
+          throw conflict("This agent is paused. Resume it to send these messages.", { code: "queued_comment_chat_paused" });
+        }
+        if (await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id)) {
+          throw conflict("This chat is paused. Resume it to send these messages.", { code: "queued_comment_chat_paused" });
         }
       }
       const actor = getActorInfo(req);

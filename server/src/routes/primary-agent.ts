@@ -12,6 +12,24 @@ export function primaryAgentRoutes(db: Db) {
   const router = Router();
   const svc = primaryAgentService(db);
   const access = accessService(db);
+  router.get("/companies/:companyId/primary-agents", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    if (!hasCompanyAccess(req, companyId)) throw forbidden("User does not have access to this company");
+    if (!req.actor.userId) throw forbidden("Board user access required");
+    if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin
+      && !req.actor.memberships?.some(member => member.companyId === companyId && member.status === "active")) {
+      throw forbidden("User does not have active company access");
+    }
+    if (!await db.query.companies.findFirst({ where: eq(companies.id, companyId) })) throw notFound("Company not found");
+    const primaries = await svc.list(companyId);
+    const visible = await Promise.all(primaries.map(async primary => {
+      const decision = await access.decide({ actor: req.actor, action: "agent:read",
+        resource: { type: "agent", companyId, agentId: primary.agentId } });
+      return decision.allowed ? primary : null;
+    }));
+    res.json(visible.filter(primary => primary !== null));
+  });
   router.use("/companies/:companyId/primary-agent/me", async (req, _res, next) => {
     assertBoard(req);
     const companyId = req.params.companyId as string;

@@ -9,16 +9,22 @@ import { ApiError } from "@/api/client";
 import { queryKeys } from "@/lib/queryKeys";
 import { AgentChat } from "./AgentChat";
 
-const api = vi.hoisted(() => ({ enabled: true, list: vi.fn(), get: vi.fn(), getChat: vi.fn(), listChats: vi.fn(), directory: vi.fn(), ensure: vi.fn(), session: vi.fn() }));
+const api = vi.hoisted(() => ({ enabled: true, list: vi.fn(), get: vi.fn(), getChat: vi.fn(), listChats: vi.fn(), directory: vi.fn(), primaries: vi.fn(), ensure: vi.fn(), session: vi.fn() }));
 const agentId = "18c5ad50-9d70-4e24-bd82-337e1d45a414";
 vi.mock("@/api/agents", () => ({ agentsApi: { list: api.list, get: api.get } }));
 vi.mock("@/api/agentChats", () => ({ agentChatsApi: { get: api.getChat, list: api.listChats, ensure: api.ensure } }));
 vi.mock("@/api/access", () => ({ accessApi: { listUserDirectory: api.directory } }));
 vi.mock("@/api/auth", () => ({ authApi: { getSession: api.session } }));
+vi.mock("@/api/primaryAgent", () => ({ primaryAgentApi: { list: api.primaries } }));
 vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "company-a" }) }));
 vi.mock("@/hooks/useAgentChatEnabled", () => ({ useAgentChatEnabled: () => ({ enabled: api.enabled, loaded: true }) }));
 vi.mock("@/lib/router", () => ({ useParams: () => ({ agentRef: "18c5ad50-9d70-4e24-bd82-337e1d45a414" }), Link: ({ to, children }: { to: string; children: React.ReactNode }) => <a href={to}>{children}</a> }));
-vi.mock("./IssueDetail", () => ({ TaskDetailSurface: ({ conversation }: { conversation: { agent: Agent } }) => <div>History for {conversation.agent.name}</div> }));
+// Keep reason: data safety at the page→task surface boundary. Browser captures
+// exercise the real TaskDetailSurface and its owner-only composer separately.
+vi.mock("./IssueDetail", () => ({ TaskDetailSurface: ({ conversation }: { conversation: { agent: Agent; issue: Issue | null } }) => <div data-issue-id={conversation.issue?.id}>
+  History for {conversation.agent.name}
+  {(!conversation.issue?.conversationUserId || conversation.issue.conversationUserId === "viewer-a") && <textarea aria-label="Message" />}
+</div> }));
 
 let root: Root;
 let container: HTMLDivElement;
@@ -44,9 +50,11 @@ async function failRoster(status: number, cached = true) {
 beforeEach(() => {
   vi.clearAllMocks();
   api.enabled = true;
+  api.primaries.mockResolvedValue([]);
   api.listChats.mockResolvedValue([{ id: "member-chat", companyId: "company-a", conversationAgentId: agentId, conversationUserId: "member-b", title: "Launch plan", updatedAt: "2026-11-15T12:00:00Z" }]);
   api.directory.mockResolvedValue({ users: [{ principalId: "member-b", status: "active", user: { id: "member-b", name: "Member B" } }] });
   client = new QueryClient({ defaultOptions: { queries: { retry: false, retryOnMount: false, staleTime: Infinity, gcTime: Infinity } } });
+  client.setQueryData(["primary-agent", "company-a", "members", "viewer-a"], []);
   client.setQueryData(queryKeys.auth.session, { user: { id: "viewer-a" } });
   api.session.mockResolvedValue({ user: { id: "viewer-a" } });
   api.get.mockResolvedValue({ id: agentId, companyId: "company-a", name: "Retired helper", status: "terminated" });
@@ -122,18 +130,75 @@ it("opens a stale navigation conversation immediately while revalidating in the 
   expect(api.ensure).not.toHaveBeenCalled();
 });
 
-it("lists all members' conversations with owner names and task links without creating a chat", async () => {
-  api.list.mockResolvedValue([{ id: agentId, companyId: "company-a", name: "Helper" }]);
+function paulSmarty() {
+  api.list.mockResolvedValue([{ id: agentId, companyId: "company-a", name: "Paul's Smarty" }]);
+  client.setQueryData(["primary-agent", "company-a", "members", "viewer-a"], [{ userId: "paul", agentId }]);
+  api.directory.mockResolvedValue({ users: [{ principalId: "paul", status: "active", user: { id: "paul", name: "Paul" } }] });
+  api.listChats.mockResolvedValue([
+    { id: "unrelated", conversationUserId: "another-member", conversationAgentId: agentId },
+    { id: "paul-chat", companyId: "company-a", conversationAgentId: agentId, conversationUserId: "paul" },
+  ]);
+}
+
+it("Kate opens Paul's Smarty: only Paul's chat, read-only, without toggle or own-chat lookup", async () => {
+  paulSmarty();
   render();
-  await waitFor(() => expect(container.textContent).toContain("All members"));
-  flushSync(() => [...container.querySelectorAll("button")].find(button => button.textContent === "All members")!.click());
-  await waitFor(() => expect(container.textContent).toContain("Member B"));
-  expect(container.textContent).toContain("Launch plan");
-  expect(container.querySelector('a[href="/issues/member-chat"]')).not.toBeNull();
-  expect(api.listChats).toHaveBeenCalledWith("company-a", { agentId, members: "all", limit: 50, offset: 0 });
+  await waitFor(() => expect(container.textContent).toContain("Paul's chat with Paul's Smarty"));
+  expect(container.querySelector('[data-issue-id="paul-chat"]')).not.toBeNull();
+  expect(container.querySelector("textarea")).toBeNull();
+  expect(container.querySelector('[aria-label="Conversation members"]')).toBeNull();
+  expect(container.textContent).not.toContain("All members");
+  expect(container.querySelector('[data-issue-id="unrelated"]')).toBeNull();
+  expect(api.getChat).not.toHaveBeenCalled();
   expect(api.ensure).not.toHaveBeenCalled();
-  flushSync(() => [...container.querySelectorAll("button")].find(button => button.textContent === "Mine")!.click());
-  expect(container.textContent).toContain("History for Helper");
+});
+
+it.each(["own", "unclaimed", "shared-with-me"])("Kate opens %s Smarty: interactive own chat without toggle", async mode => {
+  api.list.mockResolvedValue([{ id: agentId, companyId: "company-a", name: "Helper" }]);
+  client.setQueryData(["primary-agent", "company-a", "members", "viewer-a"], mode === "unclaimed" ? [] : [
+    ...(mode === "shared-with-me" ? [{ userId: "paul", agentId }] : []), { userId: "viewer-a", agentId },
+  ]);
+  render();
+  await waitFor(() => expect(container.querySelector("textarea")).not.toBeNull());
+  expect(container.querySelector('[data-issue-id="existing-chat"]')).not.toBeNull();
+  expect(container.querySelector('[aria-label="Conversation members"]')).toBeNull();
+  expect(api.listChats).not.toHaveBeenCalled();
+});
+
+it("shows one plain line when the other member has no shared chat, without creating one", async () => {
+  paulSmarty(); api.listChats.mockResolvedValue([]);
+  render();
+  await waitFor(() => expect(container.textContent).toBe("Paul hasn't chatted with Paul's Smarty yet"));
+  expect(container.querySelector("textarea")).toBeNull();
+  expect(api.getChat).not.toHaveBeenCalled();
+  expect(api.ensure).not.toHaveBeenCalled();
+});
+
+it("finds the owner's conversation beyond the first members=all page", async () => {
+  paulSmarty();
+  api.listChats.mockResolvedValueOnce(Array.from({ length: 100 }, (_, i) => ({ id: `other-${i}`, conversationUserId: `other-${i}` })))
+    .mockResolvedValueOnce([{ id: "paul-chat", conversationAgentId: agentId, conversationUserId: "paul" }]);
+  render();
+  await waitFor(() => expect(container.querySelector('[data-issue-id="paul-chat"]')).not.toBeNull());
+  expect(api.listChats).toHaveBeenLastCalledWith("company-a", { agentId, members: "all", limit: 100, offset: 100 });
+});
+
+it("never flashes the interactive view while primary ownership is loading", async () => {
+  paulSmarty(); client.removeQueries({ queryKey: ["primary-agent"] });
+  api.primaries.mockImplementation(() => new Promise(() => {}));
+  render(); await settle(); await settle();
+  expect(container.textContent).toContain("Loading conversation");
+  expect(container.querySelector("textarea")).toBeNull();
+  expect(api.getChat).not.toHaveBeenCalled();
+});
+
+it("shows ownership lookup errors instead of falling back to an interactive view", async () => {
+  paulSmarty(); client.removeQueries({ queryKey: ["primary-agent"] });
+  api.primaries.mockRejectedValue(new ApiError("Denied", 403, {}));
+  render();
+  await waitFor(() => expect(container.querySelector('[role="alert"]')).not.toBeNull());
+  expect(container.querySelector("textarea")).toBeNull();
+  expect(api.getChat).not.toHaveBeenCalled();
 });
 
 it("does not reuse another account's cached conversation", async () => {
