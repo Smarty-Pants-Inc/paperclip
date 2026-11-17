@@ -53,7 +53,6 @@ import { canonicalNativeRuntimeContextDigest, configuredEnvironmentProjection } 
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { nativeSha256 } from "../services/native-runtime/canonical.js";
 import { selectPiConversation } from "../services/native-runtime/pi-conversation-record.js";
-import { PENDING_WAIT_BOUND_MS, UNANSWERED_MESSAGE_SETTLE_MS } from "../services/recovery/unanswered-person-message.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -1093,32 +1092,23 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
     }
     let [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.runId));
     const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, next.runId));
-    // adopt-lead 15:44Z/15:47Z: a refused route's 'no note' means no note AFTER the real 15 s
-    // unanswered-message sweep (as in RE4/RE5). This harness drives the executor directly, so it
-    // settles the refused run's row the way the heartbeat does (failed + finishedAt + the executor's
-    // error), waits the production settle bound, then runs the production sweep.
+    // This harness drives the executor directly. Settle a refused run as the
+    // heartbeat does, then drive upstream recovery and its returned deadlines.
     let sweep: unknown = null;
     if (outcome.error != null || persisted?.error != null) {
       if (persisted && !persisted.finishedAt) await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
         error: persisted.error ?? (outcome.error == null ? null : String(outcome.error)),
         errorCode: persisted.errorCode ?? (outcome.errorCode == null ? null : String(outcome.errorCode)) }).where(eq(heartbeatRuns.id, next.runId));
       [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.runId));
-      const dueAt = persisted!.finishedAt!.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
-      await new Promise(resolve => setTimeout(resolve, Math.max(0, dueAt - Date.now()) + 250));
-      // As x-red-tl08 (xr-tl08-sweep2 16:19Z): a real retryable_failure coordinator makes the first
-      // pass record a durable wait (unanswered-person-message.ts:605-608, bounded at :486-497);
-      // production's recovery/work.ts:79-83 re-arms the earliest onDeferredDeadline. Consume only
-      // returned deadlines, with real time and a finite bound; never rewrite the coordinator.
       const sweepPasses: Array<{ at: number; deferredDeadlines: number[]; result: unknown }> = [];
-      const sweepStopAt = Date.now() + PENDING_WAIT_BOUND_MS + UNANSWERED_MESSAGE_SETTLE_MS;
+      const sweepStopAt = Date.now() + 2 * 60_000;
       let nextSweepAt: number | null = Date.now();
       for (let pass = 0; pass < 8 && nextSweepAt !== null && nextSweepAt <= sweepStopAt; pass += 1) {
         await new Promise(resolve => setTimeout(resolve, Math.max(0, nextSweepAt! - Date.now()) + 250));
         const at = Date.now(), deferredDeadlines: number[] = [];
-        sweep = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId, unanswered: true,
+        sweep = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId,
           onDeferredDeadline: deadline => { deferredDeadlines.push(deadline); } });
         sweepPasses.push({ at, deferredDeadlines, result: sweep });
-        if (Number(record(sweep).unansweredMessagesNoticed ?? 0) > 0) break;
         nextSweepAt = deferredDeadlines.length ? Math.min(...deferredDeadlines) : null;
       }
       console.log(`E2E-PI-SWEEP: ${JSON.stringify({ runId: next.runId, sweep, sweepPasses })}`);

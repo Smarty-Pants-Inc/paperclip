@@ -1,5 +1,5 @@
 // Imported history (org decision 20:29Z, .local/IMPORT-ARRIVAL.md): person comments that ARRIVED by a company import
-// are history: answered, so never carried into a continuation and never noticed by B'. Live comments after the
+// are history: answered, so never carried into a continuation. Live comments after the
 // task's arrival keep the normal rules, and a live run-less agent comment still never answers. Everything here goes
 // through the REAL companyPortabilityService import with SYNTHETIC bundles (no real bundle content).
 import { randomUUID } from "node:crypto";
@@ -11,7 +11,6 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { companyPortabilityService } from "./company-portability.js";
 import { logActivity } from "./activity-log.js";
 import { readContinuationCommentInput } from "./continuation-comment-input.js";
-import { settleUnansweredPersonMessage } from "./recovery/unanswered-person-message.js";
 import { issueService } from "./issues.js";
 import { createHeartbeatRunPreparation } from "./heartbeat/run-preparation.js";
 import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
@@ -43,7 +42,7 @@ function bundle(slug: string, comments: BundleComment[]) {
   return { rootPath: `history-${slug}`, files };
 }
 
-describe.skipIf(!support.supported)("imported person comments are history: never carried, never noticed", () => {
+describe.skipIf(!support.supported)("imported person comments are history: never carried", () => {
   let temp: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: Db;
   beforeAll(async () => { temp = await startEmbeddedPostgresTestDatabase("import-history-"); db = createDb(temp.connectionString); }, 60_000);
@@ -80,12 +79,6 @@ describe.skipIf(!support.supported)("imported person comments are history: never
       createdAt: new Date(), finishedAt: new Date() }).returning();
     return readContinuationCommentInput(db, { companyId: issue.companyId, issueId: issue.id, runId: run!.id });
   }
-  const notice = async (issue: typeof issues.$inferSelect) => {
-    const settled = await settleUnansweredPersonMessage(db, { companyId: issue.companyId, issueId: issue.id, now: new Date(Date.now() + 30 * 60_000) });
-    const notes = (await commentsOf(issue.id)).filter(note => note.authorType === "system"
-      && String((note.metadata as Record<string, unknown> | null)?.authorizationReason ?? "").startsWith("unanswered_message:"));
-    return { kind: settled.kind, notes: notes.length };
-  };
   const past = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
 
   // Consumer guards use only the real importer to create comments. Distinct source times
@@ -167,7 +160,7 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     }
   });
 
-  it("(R1) new_company import: an imported person comment + an imported run-less agent reply -> not carried, not noticed", async () => {
+  it("(R1) new_company import: an imported person comment + an imported run-less agent reply -> not carried", async () => {
     const userId = await importer();
     const { issue } = await runImport(userId, { mode: "new_company", newCompanyName: "History R1" }, "r1",
       [{ body: "Imported question.", authorType: "user", createdAt: past(600) }, { body: "Imported reply.", authorType: "agent", createdAt: past(590) }]);
@@ -177,24 +170,18 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     expect(reply!.createdByRunId, "the importer writes run-less replies").toBeNull();
     const agentId = await makeActionable(issue);
     expect.soft(await carried(issue, agentId, person!.id), "imported history is never carried").toEqual({});
-    const n = await notice(issue);
-    expect.soft(n.kind, "imported history is never noticed").not.toBe("noticed");
-    expect.soft(n.notes).toBe(0);
   });
 
-  it("(R2) an imported person comment with NO reply -> not carried, not noticed", async () => {
+  it("(R2) an imported person comment with NO reply -> not carried", async () => {
     const userId = await importer();
     const { issue } = await runImport(userId, { mode: "new_company", newCompanyName: "History R2" }, "r2",
       [{ body: "Imported question, never answered.", authorType: "user", createdAt: past(600) }]);
     const [person] = await commentsOf(issue.id);
     const agentId = await makeActionable(issue);
     expect.soft(await carried(issue, agentId, person!.id)).toEqual({});
-    const n = await notice(issue);
-    expect.soft(n.kind).not.toBe("noticed");
-    expect.soft(n.notes).toBe(0);
   });
 
-  it("(R3) a SECOND import (existing_company) whose messages are NEWER than the first import, with run-less replies -> not carried, not noticed", async () => {
+  it("(R3) a SECOND import (existing_company) whose messages are NEWER than the first import, with run-less replies -> not carried", async () => {
     const userId = await importer();
     const first = await runImport(userId, { mode: "new_company", newCompanyName: "History R3" }, "r3-first",
       [{ body: "First import question.", authorType: "user", createdAt: past(600) }]);
@@ -209,12 +196,9 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     expect(person!.createdAt.getTime(), "newer than the FIRST import").toBeGreaterThan(afterFirst.getTime());
     const agentId = await makeActionable(second.issue);
     expect.soft(await carried(second.issue, agentId, person!.id)).toEqual({});
-    const n = await notice(second.issue);
-    expect.soft(n.kind).not.toBe("noticed");
-    expect.soft(n.notes).toBe(0);
   });
 
-  it("(R4) a LIVE person message on an imported task after its arrival, then a live run-less agent post -> carried AND noticed", async () => {
+  it("(R4) a LIVE person message on an imported task after its arrival, then a live run-less agent post -> carried", async () => {
     const userId = await importer();
     const { issue } = await runImport(userId, { mode: "new_company", newCompanyName: "History R4" }, "r4",
       [{ body: "Imported question.", authorType: "user", createdAt: past(600) }, { body: "Imported reply.", authorType: "agent", createdAt: past(590) }]);
@@ -225,8 +209,6 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     await db.insert(issueComments).values({ companyId: issue.companyId, issueId: issue.id, authorType: "agent", authorAgentId: agentId,
       createdByRunId: null, body: "A live run-less post.", createdAt: new Date(live!.createdAt.getTime() + 1_000) });
     expect.soft(await carried(issue, agentId, live!.id)).toMatchObject({ wakeCommentIds: [live!.id] });
-    const n = await notice(issue);
-    expect.soft(n.kind, "a live message is still owed a notice").toBe("noticed");
   });
 
   it("(R5) an imported task with no arrival record and no company import row -> nothing is history (normal behaviour)", async () => {
@@ -242,7 +224,6 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     const [person] = await commentsOf(issue!.id);
     const agentId = await makeActionable(issue!);
     expect.soft(await carried(issue!, agentId, person!.id)).toMatchObject({ wakeCommentIds: [person!.id] });
-    expect.soft((await notice(issue!)).kind).toBe("noticed");
   });
 
   // (R7) The company.imported FALLBACK (an import made before the per-task record): which row it reads.
@@ -268,7 +249,6 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     expect.soft(await carried(issue, agentId, old!.id), "older than the FIRST import row: history").toEqual({});
     expect.soft(await carried(issue, agentId, live!.id), "newer than the first row, older than the second: live")
       .toMatchObject({ wakeCommentIds: [live!.id] });
-    expect.soft((await notice(issue)).kind).toBe("noticed");
   });
 
   it("(R7) ANOTHER company's company.imported row does not count for this company's tasks", async () => {
@@ -281,7 +261,6 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     const [person] = await commentsOf(a.issue.id);
     const agentId = await makeActionable(a.issue);
     expect.soft(await carried(a.issue, agentId, person!.id)).toMatchObject({ wakeCommentIds: [person!.id] });
-    expect.soft((await notice(a.issue)).kind).toBe("noticed");
   });
 
   it.each(["new_company", "existing_company"] as const)("(M1.5) %s marks imported comments even when the source clock is ahead; destination comments stay live", async mode => {
@@ -306,9 +285,6 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     expect(reply!.createdByRunId).toBeNull();
     const agentId = await makeActionable(issue);
     expect.soft(await carried(issue, agentId, person!.id), "marked history is never continuation input").toEqual({});
-    const importedNotice = await notice(issue);
-    expect.soft(importedNotice.kind, "marked history is never noticed by B'").not.toBe("noticed");
-    expect.soft(importedNotice.notes).toBe(0);
 
     // The destination's ordinary insert still gets the database's existing 'comment' default.
     const [live] = await db.insert(issueComments).values({ companyId: issue.companyId, issueId: issue.id,
@@ -317,7 +293,6 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     expect(live!.origin).toBe("comment");
     expect.soft(await carried(issue, agentId, live!.id), "live destination input is still carried")
       .toMatchObject({ wakeCommentIds: [live!.id] });
-    expect.soft((await notice(issue)).kind, "live destination input is still noticed").toBe("noticed");
   });
 
   it("(M1.5) RE-IMPORT of the same bundle carries a source person message written after the first import as marked history", async () => {
@@ -343,14 +318,10 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     expect.soft(person!.origin, "the second import marks even post-first-import source messages").toBe("import");
     const agentId = await makeActionable(issue!);
     expect.soft(await carried(issue!, agentId, person!.id)).toEqual({});
-    expect.soft((await notice(issue!)).notes).toBe(0);
     // Arrival records are only a legacy fallback: the insert-time marker remains sufficient without them.
     await db.execute(sql`delete from activity_log where company_id = ${first.companyId}
       and action in ('issue.imported', 'company.imported')`);
     expect.soft(await carried(issue!, agentId, person!.id), "re-import provenance survives absent arrival records").toEqual({});
-    const n = await notice(issue!);
-    expect.soft(n.kind).not.toBe("noticed");
-    expect.soft(n.notes).toBe(0);
   });
 
   it.each(["new_company", "existing_company"] as const)("(R6) a %s import writes exactly ONE issue.imported row per created issue, in the import", async mode => {

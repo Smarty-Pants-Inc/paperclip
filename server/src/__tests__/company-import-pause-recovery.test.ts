@@ -10,7 +10,6 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { companyPortabilityService } from "../services/company-portability.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { configureAgentLifecycle, createAgentLifecycle } from "../services/agent-lifecycle.js";
-import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 
 // Keep reason: regression from M12 gate S3/S4, where import's safety pause
 // blocked carried-over work and posted two false failure/wait notices.
@@ -72,10 +71,7 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
     // Keep admitted runs queued at the real run-start handover gate. This
     // proves admission without launching a provider or leaving work running.
     const heartbeat = heartbeatService(db, { runStartHandover: { isYielding: () => true, refreshIfStale: async () => {} } });
-    // Run both owners repeatedly, including beyond B's bounded waiting window.
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
-    await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issue.id,
-      now: new Date(Date.now() + 30 * 60_000) });
     const beforeResumeNotes = await notes(f.issue.id);
     const [beforeResume] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
     console.log(JSON.stringify({ shape: monitored ? "S4" : "S3", phase: "import-paused",
@@ -114,26 +110,6 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
     } finally { await worker.stop(); await heartbeat.drainActiveRunExecutions(); }
   });
 
-  it("an additional manual hold still posts B's true paused note even when import remains the primary pause reason", async () => {
-    const f = await imported(false);
-    // RFL ruling 20:43Z: the bundle message is imported history (never noticed). The note is driven by a LIVE
-    // person message posted after the import: the import arrived 8 min ago, the live message 5 min ago.
-    const [importedMessage] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issue.id),
-      eq(issueComments.authorType, "user")));
-    await db.execute(sql`update activity_log set created_at = now() - interval '8 minutes'
-      where action = 'issue.imported' and entity_type = 'issue' and entity_id = ${f.issue.id}`);
-    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issue.id, authorType: "user", authorUserId: "m12-board",
-      body: "A live follow-up after the import.", createdAt: new Date(Date.now() - 5 * 60_000) });
-    await createAgentLifecycle(db).pauseAgent(f.agentId, "manual");
-    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
-    expect((await notes(f.issue.id)).map(n => n.body)).toEqual([
-      "Import Coder is paused. Your message is saved, and it will run when Import Coder is resumed. "
-      + "A board user or Import Coder's manager can resume Import Coder.",
-    ]);
-    expect((await notes(f.issue.id)).filter(n => (n.metadata as Record<string, unknown> | null)?.authorizationReason
-      === `unanswered_message:${importedMessage!.id}`), "the imported bundle message gets no paused note (imported history)").toHaveLength(0);
-  });
-
   it("an armed monitor survives import-pause recovery and its timer admits a run after resume", async () => {
     const f = await imported(true);
     // The portability format deliberately imports monitor metadata unarmed.
@@ -152,7 +128,7 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
       await worker.process(f.agentId);
       await createAgentLifecycle(db).resumeAgent(f.agentId);
       await worker.process(f.agentId);
-      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id, unanswered: false });
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
       const tick = await heartbeat.tickIssueMonitors(new Date(due.getTime() + 1));
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
@@ -198,8 +174,6 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
       for (let pass = 0; pass < 2; pass++) {
         await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
         await heartbeat.checkAssignedWorkInvariant({ companyId: f.companyId, issueId: f.issue.id });
-        await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issue.id,
-          now: new Date(Date.now() + 30 * 60_000) });
         await heartbeat.tickIssueMonitors(new Date());
       }
       console.log(JSON.stringify({ check: "monitor-patch-import-paused", status, phase: "swept",

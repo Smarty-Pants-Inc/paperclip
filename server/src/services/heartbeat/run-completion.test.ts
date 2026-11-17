@@ -58,7 +58,6 @@ import { heartbeatService } from "../heartbeat.js";
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
 import { claimFirstTurnQueuedInput } from "../native-runtime/first-turn-queued-input.js";
-import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -271,20 +270,6 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(replies.find(reply => reply.createdByRunId === run.id)?.body).toBe("Finished my own assigned work.");
   });
 
-  it.each([false, true])("carry-comment (d): B' notice remains only while the message is unanswered (answered=%s)", async answered => {
-    const f = await commentContinuationFixture();
-    const scope = { companyId: f.run.companyId, issueId: f.issue.id, now: new Date(Date.now() + 60 * 60_000) };
-    const first = await settleUnansweredPersonMessage(db, scope);
-    expect(first.kind).toBe("noticed");
-    if (answered) {
-      await f.start();
-      await f.finish("Your new recall word is COBALT.");
-    }
-    const outcome = await settleUnansweredPersonMessage(db, scope);
-    expect(outcome.kind).toBe(answered ? "answered" : "noticed_before");
-    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issue.id), eq(issueComments.authorType, "system")));
-    expect(notes.filter(note => !note.deletedAt && String(note.metadata?.authorizationReason).startsWith("unanswered_message:"))).toHaveLength(answered ? 0 : 1);
-  });
 
   it("replays saved user intent through normal Retry after a first-attempt retained runner failure", async () => {
     for (const mode of ["unattached", "archive_failed", "provider_started", "system_wake", "stopped", "stopped_failed", "promoted"] as const) {

@@ -649,7 +649,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       const { deliverReconciledExecutions } = await import("../execution-recovery-resolution.js");
       const { deliverPendingPauseResumes } = await import("../issue-tree-resume.js");
       const { deliverBudgetResumeContinuations } = await import("../budget-resume-continuation.js");
-      const { settleUnansweredPersonMessages, UNANSWERED_MESSAGE_SETTLE_MS } = await import("../recovery/unanswered-person-message.js");
       const { environmentRuntimeService: inspectionRuntime } = await import("../environment-runtime.js");
       let stopped = false;
       const inspectLeaseResource = vi.fn(async (leaseId: string) => {
@@ -701,11 +700,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         // Admission is proved while the provider's stop is still unconfirmed.
         expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id)))
           .filter(run => run.id !== f.run.id).map(run => run.status)).toEqual(["queued"]);
-        const source = await read(f.run.id);
-        await new Promise(resolve => setTimeout(resolve, Math.max(0,
-          Math.max(message.createdAt.getTime(), source.finishedAt!.getTime()) + UNANSWERED_MESSAGE_SETTLE_MS + 25 - Date.now())));
-        await settleUnansweredPersonMessages(db, {});
-        await observe("unanswered sweep after real 15s settle bound");
         await hb.sweepPendingCleanupLeases({ backoffMs: 0 });
         await observe("pending-cleanup sweep");
         expect(await notes()).toHaveLength(0);

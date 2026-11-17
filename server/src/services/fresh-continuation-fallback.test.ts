@@ -35,7 +35,6 @@ import { createSystemRecovery } from "./system-recovery-state.js";
 import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 const NATIVE_CONTINUATION_REFUSED_ACTION = "Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.";
-import { settleUnansweredPersonMessagesForTask, PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS } from "./recovery/unanswered-person-message.js";
 import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";
 import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
@@ -775,18 +774,13 @@ suite("fresh-continuation fallback", () => {
       sql`${issueRecoveryActions.evidence}->'freshContinuation' is not null`));
     expect(records).toHaveLength(FRESH_CONTINUATIONS_PER_HOUR);
     expect(records.every(record => !/Send a new message|tried to continue this task twice/.test(record.nextAction))).toBe(true);
-    // Expire the message owner's durable 2-minute wait, without expiring the
-    // upstream hour. No recheck may post a contradictory resend instruction.
-    await db.insert(activityLog).values({ companyId, actorType: "system", actorId: "recovery", action: PENDING_WAIT_ACTION,
-      entityType: "issue", entityId: f.issueId, createdAt: new Date(Date.now() - PENDING_WAIT_BOUND_MS - 1_000),
-      details: { messageId: message.id, runId: sourceId } });
+    // Step 5 deletes the temporary message-owner wait. The upstream scheduled
+    // retry remains the only instruction, including after controller restart.
     const scheduled = await taskInterruptionPresentation(db, await issue(f.issueId));
     expect(scheduled).toMatchObject({ state: "retry_scheduled", canRetry: false, nextRetryAt: expect.any(String) });
     const restarted = createDb(temporary!.connectionString);
     try {
       for (let pass = 0; pass < 3; pass++) {
-        expect(await settleUnansweredPersonMessagesForTask(restarted, { companyId, issueId: f.issueId,
-          now: new Date(Date.now() + PENDING_WAIT_BOUND_MS + 30_000) })).toEqual({ noticed: 0, pending: 1 });
         await settleUnrecoverableExecutions(restarted); await continueHeldExecutions(restarted);
         await deliverReconciledExecutions(restarted, heartbeatService(restarted).wakeup);
         expect(await successors(sourceId)).toHaveLength(0);
@@ -2093,17 +2087,9 @@ suite("fresh-continuation fallback", () => {
     const f = await preparationDeathChain();
     const visible = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
       eq(issueComments.authorType, "system")))).filter(note => !note.deletedAt);
-    // The unanswered sweep may run before the held sweep, and again later
-    // while the continuation is still queued.
-    for (const ahead of [30_000, 3 * 60_000]) {
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + ahead) });
-    }
     await continueHeldExecutions(db);
     await occupySlot();
     await deliver();
-    for (const ahead of [30_000, 4 * 60_000]) {
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + ahead) });
-    }
     expect(await successors(f.refusedRunId)).toHaveLength(1);
     for (const note of await visible()) {
       expect(note.body.trim()).not.toBe("");

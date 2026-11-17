@@ -49,7 +49,6 @@ import { claimNativeSessionResumptions } from "./native-finalization-reconciler.
 import { FRESH_THREAD_STARTED_NOTE, freshThreadStartedNote } from "./fresh-thread-stop-gate.js";
 import { selectFreshContinuationThread } from "./pi-conversation-record.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
-import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
 
 /** The transport's own stall text (runnerd-codex-transport.ts describeRunnerCommandStall). */
 const PREPARE_NEVER_CONNECTED = "runner_ingress_unavailable: PRP command run.prepare timed out "
@@ -145,8 +144,6 @@ describe("a first start whose Runner never connected keeps its automatic fresh c
     return claims[0]!.leaseOwner;
   }
 
-  const unanswered = (seeded: Seeded, now: Date) => settleUnansweredPersonMessage(db, { companyId, issueId: seeded.issueId, now });
-
   /** The plain note this case owes: nothing was restored, a fresh run starts. */
   const TRUTHFUL = "Provider startup failed 3 times before any work began; starting again in a fresh run.";
 
@@ -158,13 +155,7 @@ describe("a first start whose Runner never connected keeps its automatic fresh c
 
   /** The continuation is recorded and delivered, and its run selects its thread. */
   async function continueAndSelect(seeded: Seeded) {
-    // Every owner gets its turn in the order they run: the unanswered-message
-    // owner after its settle time, the execution-disposition worker, the
-    // unanswered owner again while the continuation is on its way, then the
-    // continuation's run selects its thread (where its one note is owed).
-    await unanswered(seeded, new Date(Date.now() + 16_000));
     await settleUnrecoverableExecutions(db, new Date(Date.now() + 20_000));
-    await unanswered(seeded, new Date(Date.now() + 60_000));
     const state = await read(seeded);
     expect(state.continued).toHaveLength(1);
     // The continuation's run as the delivery wake creates it (deliverReconciledExecutions' wake;
@@ -186,7 +177,6 @@ describe("a first start whose Runner never connected keeps its automatic fresh c
     const selected = await selectFreshContinuationThread(db, input);
     expect(selected).toEqual(expect.any(String));
     expect(await selectFreshContinuationThread(db, input)).toBe(selected);
-    await unanswered(seeded, new Date(Date.now() + 10 * 60_000));
     return read(seeded);
   }
 

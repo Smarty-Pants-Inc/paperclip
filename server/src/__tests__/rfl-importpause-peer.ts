@@ -17,7 +17,7 @@ try {
     }).reconcileStrandedAssignedIssues({ companyId, issueId });
     throw new Error("Expected crash point was not reached");
   }
-  await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId, unanswered: false });
+  await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
   const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
   if (process.env.RFL_STOP_FIRST === "1") {
     if (runs.length !== 1) throw new Error(`Expected one initial run, got ${runs.length}`);

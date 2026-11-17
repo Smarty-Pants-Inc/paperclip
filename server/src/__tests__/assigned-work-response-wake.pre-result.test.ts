@@ -34,8 +34,7 @@ vi.mock("../services/heartbeat.js", async importOriginal => {
   }) };
 });
 
-import { answeredPersonMessageSql } from "../services/person-message-answer.js";
-import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition } from "../services/recovery/unanswered-person-message.js";
+import { answeredPersonMessageSql } from "../services/continuation-comment-input.js";
 
 const describePostgres = recoveryPostgresSupport.supported ? describe : describe.skip;
 if (!recoveryPostgresSupport.supported) console.warn(`Skipping response-wake sweep tests: ${recoveryPostgresSupport.reason}`);
