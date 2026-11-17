@@ -47,6 +47,7 @@ import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 export const UNANSWERED_MESSAGE_REASON_PREFIX = "unanswered_message:";
 /** A transient-retry line for the same message (heartbeat retries) is superseded the same way. */
 const RETRYING_MESSAGE_REASON_PREFIX = "retrying_message:";
+const FRESH_THREAD_REASON_PREFIX = "fresh_provider_thread:";
 export const UNANSWERED_MESSAGE_LOOKBACK_MS = 24 * 60 * 60_000;
 /** The native blocked-request repair publishes on the sweep pass after its run
  * ends. Deferring to it is bounded by this fixed time after the run's durable
@@ -196,6 +197,22 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 
+function answeredFreshThreadNoticeSql(n: { metadata: SQL; companyId: SQL; issueId: SQL }): SQL {
+  return sql`(starts_with(${n.metadata}->>'authorizationReason', ${FRESH_THREAD_REASON_PREFIX})
+    and exists (select 1 from ${issueComments} m
+      join ${heartbeatRuns} r on r.company_id = m.company_id
+        and coalesce(r.native_issue_id::text, r.issue_id::text, r.context_snapshot->>'issueId') = m.issue_id::text
+      where m.company_id = ${n.companyId} and m.issue_id = ${n.issueId}
+        and m.author_type = 'user' and m.deleted_at is null
+        and ${n.metadata}->'sections' @> jsonb_build_array(jsonb_build_object('rows',
+          jsonb_build_array(jsonb_build_object('type', 'run_link', 'runId', r.id::text))))
+        and (r.context_snapshot->>'wakeCommentId' = m.id::text or r.context_snapshot->>'commentId' = m.id::text
+          or r.context_snapshot->>'conversationReplyBoundaryCommentId' = m.id::text
+          or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? m.id::text
+          or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? m.id::text)
+        and ${answeredSql(rawMessage("m"))}))`;
+}
+
 /**
  * SQL: message m is still in scope. It is within the lookback, or its own
  * obligation saw durable activity within it: a run that carries it finished,
@@ -238,7 +255,10 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and ${answeredSql(rawMessage("m"))}))`;
+      and ${answeredSql(rawMessage("m"))})
+    or exists (select 1 from ${issueComments} n where n.company_id = ${companyId} and n.issue_id = ${issueId}
+      and n.author_type = 'system' and n.deleted_at is null
+      and ${answeredFreshThreadNoticeSql({ metadata: sql`n.metadata`, companyId: sql`n.company_id`, issueId: sql`n.issue_id` })}))`;
 }
 
 /**
@@ -264,7 +284,10 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-          and ${answeredSql(rawMessage("m"))})))`;
+          and ${answeredSql(rawMessage("m"))}))
+    or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
+      and ${answeredFreshThreadNoticeSql({ metadata: sql`${issueComments.metadata}`,
+        companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}` })}))`;
 }
 
 export type UnansweredMessageOutcome =
@@ -325,17 +348,19 @@ export async function settleUnansweredPersonMessage(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
     or(sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
-      sql`starts_with(${reasonOf(issueComments.metadata)}, ${RETRYING_MESSAGE_REASON_PREFIX})`))).limit(1);
+      sql`starts_with(${reasonOf(issueComments.metadata)}, ${RETRYING_MESSAGE_REASON_PREFIX})`,
+      sql`starts_with(${reasonOf(issueComments.metadata)}, ${FRESH_THREAD_REASON_PREFIX})`))).limit(1);
   if (liveNotice) await db.transaction(async tx => {
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
     await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
-      and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+      and (((starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
-      and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
-        and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
-        and ${answeredSql(rawMessage("m"))})`);
+        and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
+          and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
+          and ${answeredSql(rawMessage("m"))}))
+        or ${answeredFreshThreadNoticeSql({ metadata: sql`n.metadata`, companyId: sql`n.company_id`, issueId: sql`n.issue_id` })})`);
   });
 
   const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
