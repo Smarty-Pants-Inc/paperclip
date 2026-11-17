@@ -1,4 +1,5 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_SEND_AFTER_STOP_KEY } from "../run-cancellation.js";
@@ -3567,6 +3568,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+          await lockAgentForRunAdmission(tx, { companyId: agent.companyId, agentId });
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
@@ -5502,10 +5504,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     const queueOutcome = await db.transaction(async (tx) => {
       await lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent);
+      // The fallback may still bind a fresh continuation to a context issue.
+      // Match scoped admission/recovery: issue first, then agent, then inserts.
+      const continuedIssueId = readNonEmptyString(enrichedContextSnapshot.issueId);
+      if (continuedIssueId && readNonEmptyString(enrichedContextSnapshot.freshContinuationIsolation)) {
+        await tx.execute(sql`select id from issues where company_id = ${agent.companyId} and id = ${continuedIssueId} for update`);
+      }
+      await lockAgentForRunAdmission(tx, { companyId: agent.companyId, agentId });
       await notifyRunDispatch(tx, { companyId: agent.companyId });
-      await tx.execute(
-        sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
-      );
 
       const dailyCapBlock = await getHeartbeatDailyCapBlock(
         agent,
@@ -5588,9 +5594,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         .returning()
         .then((rows) => rows[0]);
 
-      const continuedIssueId = readNonEmptyString(enrichedContextSnapshot.issueId);
       if (continuedIssueId && readNonEmptyString(enrichedContextSnapshot.freshContinuationIsolation)) {
-        await tx.execute(sql`select id from issues where company_id = ${agent.companyId} and id = ${continuedIssueId} for update`);
         await foldWaitingRetriesIntoContinuation(tx as unknown as Db, { companyId: agent.companyId, issueId: continuedIssueId, runId: newRun.id,
           sourceRunId: readNonEmptyString(enrichedContextSnapshot.previousRunId) });
       }
