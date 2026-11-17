@@ -47,7 +47,7 @@ vi.mock("./current-wake-comments.js", async importOriginal => ({
   resolveCurrentWakeCommentsBinding: async () => null,
   assertCurrentWakeCommentsRead: async () => undefined,
 }));
-import { buildNativeHarnessBackupManifest, createRunnerdBackend, inspectFinishedPerTurnRunnerdOwner, quarantinedBootstrapOfOwnerHeldNoProviderWork, resolveNativeHarnessPersistenceProfile,
+import { buildNativeHarnessBackupManifest, createRunnerdBackend, executePaperclipNativeSession, inspectFinishedPerTurnRunnerdOwner, quarantinedBootstrapOfOwnerHeldNoProviderWork, resolveNativeHarnessPersistenceProfile,
   scopedRunnerdStateRoot, warmSessionReleaseWait } from "./native-session-executor.js";
 
 // Durable-root admission is the boundary under test. Reaching the run's tool
@@ -1430,6 +1430,40 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       warmSessionReleaseWait.timeoutMs = bound;
     }
     expect(followUp.failures.at(-1)).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect(await quarantined()).toEqual([]);
+  }, 60_000);
+
+  /** settle-unit STEP 3 (i): the same :6409 refusal met at the PRODUCTION
+   * entry. executePaperclipNativeSession -> executePaperclipNativeSessionAttempt
+   * runs migrateRunnerdStateRootForExecution (the "state_migration" step)
+   * BEFORE its coordinator claim, so at the bound the typed recovery wait is
+   * caught at attempt 0 and the run is deferred (retryable, waiting for its
+   * owner), never written failed. Boat remote, pi_rpc, warm. */
+  it("executor entry: the Stop's pending runner.suspend at the state migration, before the claim, defers the run at the bound", async () => {
+    const { prior, followUp } = await seedStoppedOwnerWithPendingSuspend();
+    const execution = prior.executionFor(followUp.runId);
+    const bound = warmSessionReleaseWait.timeoutMs;
+    warmSessionReleaseWait.timeoutMs = 300;
+    let failure: unknown;
+    try {
+      failure = await executePaperclipNativeSession({ db, execution, runnerInstanceId: followUp.native.runnerInstanceId,
+        useRunnerd: true, onLog: async (_stream: "stdout" | "stderr", chunk: string) => { followUp.logs.push(chunk); },
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "boat", environmentId: followUp.environmentId,
+          leaseId: followUp.leaseId, remoteCwd: "/workspace", reusableLeaseConfigured: true,
+          runner: { execute: followUp.remoteExecute },
+          sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: followUp.providerLeaseId } } as never,
+      } as never).then(() => "completed", (error: unknown) => error);
+    } finally {
+      warmSessionReleaseWait.timeoutMs = bound;
+    }
+    expect(failure).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect(followUp.logs.join("")).toContain("waiting for the Stop's runner lifecycle command");
+    const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, followUp.runId));
+    expect(finalization).toMatchObject({ phase: "retryable_failure", attempt: 0, failureCode: "native_controller_recovery_waiting_for_owner" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    expect(run.status).toBe("running");
+    expect(run.errorCode).toBeNull();
+    expect(followUp.remoteExecute).not.toHaveBeenCalled();
     expect(await quarantined()).toEqual([]);
   }, 60_000);
 
