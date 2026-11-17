@@ -400,11 +400,14 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
     expect(kept?.metadata?.reusableSandboxKeptAfterReplacement).toMatchObject({ runId: seeded.runId, replacementLeaseId: acquired.lease.id });
   });
 
-  // B fix (iv): the kept old box has a selection fence. Its runnerd is not
-  // trusted to be gone (Boat: detached processes do not continue after a stop
-  // or resume, background-commands.md:222; but a resume within 10 minutes
-  // usually keeps memory and programs, snapshots.md:15), so Paperclip must never
-  // select, resume, release, stop or destroy it again after the rotation.
+  // B fix (iv): the kept old box has a selection fence, not a provider write
+  // fence. Boat's docs (docs.boat.dev, fetched 2026-11-17) do not prove its
+  // runnerd is gone: long-running-tasks/background-commands.md:222 "Detached
+  // processes do not continue after a stop, resume or fork", but
+  // snapshots.md:15 and snapshots/stop.md:82-83 say a resume within 10 minutes
+  // of a stop usually gets the same machine back "with memory and programs".
+  // So Paperclip must never select, resume, release, stop or destroy the kept
+  // box again after the rotation.
   it("never selects or writes the kept old box after the rotation (negative)", async () => {
     const seeded = await seed();
     const first = worker(seeded, async () => { throw boatRefusal(410, "snapshot_data_expired"); });
