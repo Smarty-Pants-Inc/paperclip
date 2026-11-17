@@ -15,7 +15,7 @@ import { readChatAuthorizationRun } from "./authorization-run-read.js";
 import { selectTaskRetryInput, claimTaskRetryInput, settleTaskRetryInput, releaseUnadmittedTaskRetryInput, taskRetryInputSchema, type TaskRetryInput } from "./task-retry-input.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { taskRetryMutationAllowed } from "../task-retry.js";
-import { decideRetryAuthority, readRetryAuthorityFacts } from "../task-retry-eligibility.js";
+import { retryRefusedBeforeAdmission } from "../task-retry-eligibility.js";
 import { z } from "zod";
 import type { TaskRetryWakeAuthority } from "./github/task-retry-authorization.js";
 
@@ -1625,10 +1625,6 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
         eq(heartbeatRuns.companyId, action.companyId), or(eq(heartbeatRuns.issueId, input.issueId),
           eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`),
       )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-      // Retry fold: the chat channel dispatches a task Retry only where the one
-      // Retry authority (the same one the task Retry API reads) offers it.
-      if (latest && decideRetryAuthority({ ...await readRetryAuthorityFacts(tx as unknown as Db, { companyId: action.companyId,
-        issueId: input.issueId }), retrySource: true }).reason === "conversation_held") throw failedChatRetryDenied();
       if (latest?.id !== input.failedRunId || source.endpointId !== action.endpointId ||
           source.conversationId !== action.conversationId || source.principalId !== action.principalId) throw failedChatRetryDenied();
       await notifyChatActionWork(tx, "failed_run_retry");
@@ -1641,6 +1637,12 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       if (!prepared) throw failedChatRetryDenied();
       return prepared;
     });
+  }
+
+  /** Retry fold: a chat Retry is refused wherever the task Retry API refuses it before admission. */
+  async function assertChatRetryAuthority(tx: DbOrTransaction, scope: { companyId: string; issueId: string }) {
+    if (await retryRefusedBeforeAdmission(tx as unknown as Db, { companyId: scope.companyId, issueId: scope.issueId }))
+      throw failedChatRetryDenied();
   }
 
   async function authorizeFailedChatRunRetry(
@@ -1955,6 +1957,10 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       };
       const source = await db.transaction(async tx => {
         const authorized = await authorizeFailedChatRunRetry(tx, scope);
+        // Retry fold (rf-3 B): every chat Retry (prepared or pending-source)
+        // reads the one Retry authority the task Retry API reads, before it
+        // asks for a wake.
+        await assertChatRetryAuthority(tx, scope);
         if (contentionResult.identityContentionPending === true) {
           await notifyChatActionWork(tx, "failed_run_retry");
           assertIdentityContentionDeadline(claimed);
@@ -2020,6 +2026,8 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
             failedRunRetry: { failedRunId: source.failedRunId },
             authorize: async (tx) => {
               const current = await authorizeFailedChatRunRetry(tx, scope);
+              // Rechecked inside the admitting transaction (one authority).
+              await assertChatRetryAuthority(tx, scope);
               await assertFailedNativeRetryState(
                 tx,
                 current,

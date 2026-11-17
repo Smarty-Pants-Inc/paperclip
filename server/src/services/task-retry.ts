@@ -11,7 +11,7 @@ import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, chatActions, chatConversations, chatEndpoints, heartbeatRuns, issues, issueComments, runIdentityContexts, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { conflict, forbidden, notFound, HttpError } from "../errors.js";
 import { readRetryStopGate, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON } from "./task-retry-stop-gate.js";
-import { decideRetryAuthority, readRetryAuthorityFacts } from "./task-retry-eligibility.js";
+import { retryRefusedBeforeAdmission } from "./task-retry-eligibility.js";
 import { persistActivity } from "./activity-log.js";
 import { createSystemRecovery, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
 import { adoptSystemRecovery, updateSystemRecovery } from "./system-recovery.js";
@@ -298,24 +298,12 @@ export async function requestTaskRetry(input: TaskRetryRequest) {
   }
 }
 
-/**
- * Retry fold (judge R8, rf-3 A): accept only a Retry the card offers. The one
- * authority (decideRetryAuthority) decides; this refuses before anything is
- * saved where no admission refusal would ever be recorded for it:
- * - conversation_held: a standing HELD notice or the prior-owner fence; the
- *   same thread meets the same fence on every Retry.
- * - agent_paused: the card says "Resume this agent"; a Retry runs nothing.
- * A refusal admission itself records (previous_execution_unverified,
- * cleanup_quarantined, the fence reasons, ...) is answered by upstream #21497's
- * taskRetryRefusal on the Retry route after admission, not here.
- */
-const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["conversation_held", "agent_paused"]);
+/** Retry fold (judge R8, rf-3 A): accept only a Retry the card offers; the
+ * one authority decides (task-retry-eligibility.ts retryRefusedBeforeAdmission). */
 async function refuseRetryTheCardDoesNotOffer(db: Db, issue: { companyId: string; id: string }) {
-  const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId: issue.companyId,
-    issueId: issue.id }), retrySource: true });
-  if (!authority.canRetry && REFUSED_BEFORE_ADMISSION.has(authority.reason))
-    throw conflict(authority.cardText!, { code: "retry_not_available", reason: authority.reason,
-      userAction: authority.userAction, nextAction: authority.nextAction });
+  const authority = await retryRefusedBeforeAdmission(db, { companyId: issue.companyId, issueId: issue.id });
+  if (authority) throw conflict(authority.cardText!, { code: "retry_not_available", reason: authority.reason,
+    userAction: authority.userAction, nextAction: authority.nextAction });
 }
 
 function admitTaskRetry(input: TaskRetryRequest) {
