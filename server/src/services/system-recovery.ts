@@ -1,10 +1,10 @@
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { agents, issues, heartbeatRuns, issueComments, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { createSystemRecovery, exhaustedSystemRecoveryAction, readSystemRecovery, type SystemRecoveryState } from "./system-recovery-state.js";
-import { workspaceRecoverySourceEligible, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
+import { workspaceExportCauses, workspaceRecoverySourceEligible, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
 import { capturePolicyRearmDueAt, capturePolicyRearmPendingCondition, retainedSourceFallbackDueAt,
   retainedSourceFallbackPendingCondition, stopProofRearmDueAt, stopProofRearmPendingCondition } from "./workspace-recovery-fallback-discovery.js";
 
@@ -119,7 +119,23 @@ export async function loadSystemRecovery(db: Db, source: WorkspaceRecoverySource
   return readSystemRecovery(row?.evidence);
 }
 
+/** A recovery hold the worker has not adopted yet (adoptHistoricalWorkspaceRecoveries,
+ * the worker's first step, selects exactly these rows and gives each a systemRecovery). */
+export function unadoptedWorkspaceRecoveryCondition() {
+  return and(
+    sql`not (${issueRecoveryActions.evidence} ? 'systemRecovery')`,
+    sql`${issueRecoveryActions.evidence}->>'runId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'`,
+    sql`(${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = 'paperclip.workspace-restore-recovery.v1'
+      or ${inArray(issueRecoveryActions.cause, workspaceExportCauses)})`,
+  )!;
+}
+
 export async function nextWorkspaceRecoveryAt(db: Db): Promise<number | null> {
+  // A hold written but not yet adopted is due now, so a lost wake cannot leave
+  // it unscheduled. Adoption removes it from this set on the worker's next run.
+  const [unadopted] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+    .where(unadoptedWorkspaceRecoveryCondition()).limit(1);
+  if (unadopted) return 0;
   const rows = await db.select({ at: sql<number>`case
     when ${retainedSourceFallbackPendingCondition()} then ${retainedSourceFallbackDueAt()}
     when ${stopProofRearmPendingCondition()} then ${stopProofRearmDueAt()}

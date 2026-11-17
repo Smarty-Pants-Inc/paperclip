@@ -1,17 +1,13 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, heartbeatRuns, issues, issueRecoveryActions, type Db } from "@paperclipai/db";
-import { adoptSystemRecovery } from "./system-recovery.js";
+import { adoptSystemRecovery, unadoptedWorkspaceRecoveryCondition } from "./system-recovery.js";
 import { terminalWorkspaceRunStates, workspaceExportCauses } from "./workspace-recovery-source.js";
 
 /** Progress lives on each source, so restarts and additional servers neither
  * restart a global scan nor grant a second policy-adoption budget. */
 export async function adoptHistoricalWorkspaceRecoveries(db: Db) {
-  const rows = await db.select().from(issueRecoveryActions).where(and(
-    sql`not (${issueRecoveryActions.evidence} ? 'systemRecovery')`,
-    sql`${issueRecoveryActions.evidence}->>'runId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'`,
-    sql`(${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = 'paperclip.workspace-restore-recovery.v1'
-      or ${inArray(issueRecoveryActions.cause, workspaceExportCauses)})`,
-  )).orderBy(asc(issueRecoveryActions.id)).limit(50);
+  const rows = await db.select().from(issueRecoveryActions).where(unadoptedWorkspaceRecoveryCondition())
+    .orderBy(asc(issueRecoveryActions.id)).limit(50);
   for (const action of rows) await adoptSystemRecovery(db, {
     companyId: action.companyId, issueId: action.sourceIssueId, actionId: action.id, runId: String(action.evidence.runId),
   });
