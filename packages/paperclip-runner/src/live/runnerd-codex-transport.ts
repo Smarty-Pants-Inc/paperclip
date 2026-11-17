@@ -8747,6 +8747,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         ? this.#core?.store.state.commands.find((candidate) => candidate.type === type)
         : this.#core?.getCommand(commandId),
       runnerHasExited: () => this.#runnerHasExited(),
+      // Wait for the SAME pending durable turn across eligible confirmed-exit
+      // recovery. The watcher still owns confirmation/grace; never resubmit it.
+      runnerRecoveryPending: () => this.#startupComplete && !this.#closed && this.#failure === null
+        && this.options.runnerReconnectGraceMs !== undefined && !!this.#handle?.restart,
       failureCode: () => this.#startupComplete ? "provider_transport_failed" : this.#startupFailureCode,
       answeredProgressAt: () => {
         const core = this.#core;
@@ -9696,6 +9700,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           );
           return;
         }
+        // Preserve the process owner's closed budget outcome and action text.
+        // This is NOT an exit receipt and cannot enter the restart branch.
+        if (error instanceof Error && (error as Error & { code?: unknown }).code === "runner_process_observation_budget_exhausted") {
+          this.#failTransport(error);
+          return;
+        }
         const code = handle.isExitConfirmed?.() === false
           ? "runner_process_termination_unconfirmed"
           : this.#startupComplete
@@ -10573,6 +10583,8 @@ export async function waitForRunnerCommand(input: {
   throwIfFailed: () => void;
   command: () => { status: string; result?: unknown } | undefined;
   runnerHasExited: () => Promise<boolean>;
+  /** Only a pending durable turn may outlive its old process generation. */
+  runnerRecoveryPending?: () => boolean;
   failureCode: () => string;
   /** Bounded, content-free evidence of what the command waited behind. */
   describeStall?: () => string | null;
@@ -10621,7 +10633,9 @@ export async function waitForRunnerCommand(input: {
       if (extended) completeExtended();
       return;
     }
-    if (await input.runnerHasExited()) {
+    if (await input.runnerHasExited()
+      && !settled()
+      && !(input.type === "turn.start" && input.command()?.status === "pending" && input.runnerRecoveryPending?.())) {
       throw new Error(`runnerd exited while waiting for ${input.type}`);
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 10));
