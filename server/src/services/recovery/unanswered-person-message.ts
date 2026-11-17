@@ -517,7 +517,17 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // paused and who can resume it; it stays a waiting-kind note, so after the
   // resume the saved message's own run decides (its answer supersedes it).
   const [agentRow] = await q.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
-    lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason }).from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
+    lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason, lifecycleError: agents.lifecycleError })
+    .from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
+  // Setup uses the compatibility status "paused", but completes by itself.
+  // Its saved message remains an obligation: recheck through the existing
+  // sweep deadline, without a pause/resume notice or a second wake. Explicit
+  // holds, operator pauses and lifecycle failures keep their existing path.
+  if (agentRow?.status === "paused" && ["preparing", "verifying"].includes(agentRow.lifecycleState)
+    && (agentRow.pauseReason == null || agentRow.pauseReason === "setup")
+    && (agentRow.lifecycleHolds ?? []).length === 0 && !agentRow.lifecycleError) {
+    return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+  }
   const agentPaused = Boolean(agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)
     || (agentRow.lifecycleHolds ?? []).length > 0));
   // Import intentionally parks automations until activation. It lost neither
