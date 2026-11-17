@@ -189,13 +189,29 @@ describe.skipIf(!support.supported)("Retry is offered only when no automatic pat
     expect(presentation?.retryAction).toBeUndefined();
   });
 
-  it("offers no Retry for a continuation recorded without a delivery request", async () => {
-    const { issue, primary } = await seedRecordedContinuation(45);
+  // SUPERSEDE (rf-3 (E), RFL ruling 14:12Z): the old title pinned 'working'
+  // for a 45-minute-old never-requested continuation with no wake and no run
+  // (the R-SILENT lie). Upstream's case is kept: 'not_requested' is what
+  // fresh-continuation-fallback.ts:961 records for saved_input deliveries, which
+  // come WITH a deferred wake (:882-898, :958), and that is 'working'.
+  it("supersedes: offers no Retry for a continuation recorded without a delivery request", async () => {
+    const { companyId, agentId, issue, primary } = await seedRecordedContinuation(45);
     await db.update(issueRecoveryActions).set({ evidence: { ...primary.evidence, continuationDelivery: "not_requested" } })
       .where(eq(issueRecoveryActions.id, primary.id));
+    // Upstream's case: the saved input's deferred wake will deliver it.
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", triggerDetail: "manual",
+      reason: "issue_comment", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: randomUUID(),
+      payload: { issueId: issue.id } }).returning();
     const presentation = await taskInterruptionPresentation(db, issue);
     expect(presentation).toMatchObject({ state: "working", canRetry: false });
     expect(presentation?.retryAction).toBeUndefined();
+    // The same record once that wake ended with no run (task-retry-stop-gate.ts
+    // retireUnprovenStopRetry; heartbeat/queue.ts QUEUED_MESSAGES_DELIVERED_REASON):
+    // no wake and no run is NOT working, and the card is not silent.
+    await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date() }).where(eq(agentWakeupRequests.id, wake!.id));
+    const silent = await taskInterruptionPresentation(db, issue);
+    expect(silent?.state).not.toBe("working");
+    expect(silent?.canRetry).toBe(true);
   });
 
   it("offers no second Retry once a person already asked to move the undelivered continuation forward", async () => {
