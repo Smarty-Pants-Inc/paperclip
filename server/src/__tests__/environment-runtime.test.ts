@@ -1021,6 +1021,54 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     },
   );
 
+  // Keep: data safety. A verified archive is not durable custody until its stamp
+  // UPDATE affects a row; a lost write must leave the disk's destruction guard intact.
+  it("nativeHarnessBackupMissing survives a later same-session backup when the stamp UPDATE affects zero rows", async () => {
+    const { recordNativeHarnessBackupStampOnLeaseChain } = await import("../services/native-runtime/native-retired-backup-source.ts");
+    const f = await seedReusablePluginSandboxLease("paperclip_runner");
+    const sessionId = randomUUID(), at = new Date().toISOString();
+    const marker = { runId: f.runId, sessionId, sessionRootDigest: createHash("sha256").update(sessionId).digest("hex"), reason: "close_failed", at };
+    const metadata = { ...f.reusableLease.metadata, preserved: "current authority", nativeHarnessBackupMissing: marker };
+    await db.update(environmentLeases).set({ status: "retained", metadata }).where(eq(environmentLeases.id, f.reusableLease.id));
+    const stamp = { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: sessionId,
+      runnerInstanceId: "backup-runner", sessionScopeSha256: "c".repeat(64), sourceProviderLeaseId: f.reusableLease.providerLeaseId,
+      authorizedProviderLeaseId: f.reusableLease.providerLeaseId, manifestSha256: `sha256:${"d".repeat(64)}`,
+      completedAt: new Date(Date.parse(at) + 1000).toISOString() };
+    const input = { leaseId: f.reusableLease.id, companyId: f.companyId,
+      providerLeaseId: f.reusableLease.providerLeaseId!, runId: f.runId, stamp };
+    const rejectStampWrite = sql.identifier(`reject_backup_stamp_${randomUUID().replaceAll("-", "")}`);
+    // PostgreSQL's BEFORE UPDATE RETURN NULL suppresses the stamp write and
+    // produces a real empty RETURNING result, as a lost race/conflict would.
+    // Only this fixture's stamp UPDATE is suppressed: marker removal is still
+    // allowed, so clearing without a successful write cannot hide behind the trigger.
+    await db.execute(sql`CREATE FUNCTION ${rejectStampWrite}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF OLD.id::text = TG_ARGV[0]
+          AND NEW.metadata->'nativeHarnessBackup' IS DISTINCT FROM OLD.metadata->'nativeHarnessBackup'
+        THEN RETURN NULL; END IF;
+        RETURN NEW;
+      END;
+    $$`);
+    try {
+      await db.execute(sql`CREATE TRIGGER ${rejectStampWrite} BEFORE UPDATE ON ${environmentLeases}
+        FOR EACH ROW EXECUTE FUNCTION ${rejectStampWrite}(${sql.raw(`'${f.reusableLease.id}'`)})`);
+      expect(await recordNativeHarnessBackupStampOnLeaseChain(db, input)).toBe(false);
+      const saved = (await environmentService(db).getLeaseById(f.reusableLease.id))!;
+      expect(saved.metadata?.nativeHarnessBackupMissing).toEqual(marker);
+      expect(saved.metadata).toEqual(metadata);
+      expect(saved.metadata).not.toHaveProperty("nativeHarnessBackup");
+    } finally {
+      await db.execute(sql`DROP TRIGGER IF EXISTS ${rejectStampWrite} ON ${environmentLeases}`);
+      await db.execute(sql`DROP FUNCTION ${rejectStampWrite}()`);
+    }
+    // Positive control: the exact same later, valid same-session stamp clears
+    // the marker once its UPDATE is actually permitted to affect the row.
+    expect(await recordNativeHarnessBackupStampOnLeaseChain(db, input)).toBe(true);
+    const saved = (await environmentService(db).getLeaseById(f.reusableLease.id))!;
+    expect(saved.metadata).toMatchObject({ preserved: "current authority", nativeHarnessBackup: stamp });
+    expect(saved.metadata).not.toHaveProperty("nativeHarnessBackupMissing");
+  });
+
   // Regression: cold workspace/instructions sync must not inherit the 30 s plugin RPC default.
   it.each((["syncIn", "syncOut"] as const).flatMap(method => [
     { timeoutMs: null, expectedRpcTimeoutMs: 120_000 },
