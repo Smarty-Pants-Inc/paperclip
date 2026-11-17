@@ -74,7 +74,7 @@ import { toolActionRequests, toolInvocations, toolPolicies } from "@paperclipai/
 import { GitHubPublicationLeaseLost, withGitHubPublicationLease } from "../services/chat-github-publication-lease.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { secretService } from "../services/secrets.js";
-import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
+import { enqueueSecretAccessEvent, flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 import { githubChatWizardService } from "../services/chat-github-wizard.js";
 import { dispatchGitHubBotCloudEvent, registerGitHubBotCloudSetupPoller } from "../services/chat-github-cloud-ingress.js";
 import { githubChatManagementService } from "../services/chat-github-management.js";
@@ -81078,7 +81078,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   });
 
-  it.each(["task", "company", "startup"] as const)("bounds inbound notice scope discovery with denied history (%s)", async mode => {
+  it.each([
+    { label: "task", mode: "task", queuedAudit: false },
+    { label: "company", mode: "company", queuedAudit: false },
+    { label: "startup", mode: "startup", queuedAudit: false },
+    { label: "startup with queued secret audit", mode: "startup", queuedAudit: true },
+  ] as const)("bounds inbound notice scope discovery with denied history ($label)", async ({ mode, queuedAudit }) => {
     const context = await deferredChatQueueFixture();
     const other = await deferredChatQueueFixture();
     const rejectedIds = Array.from({ length: 250 }, () => randomUUID());
@@ -81092,11 +81097,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ...receipt, id, idempotencyKey: `chat-discovery-budget:${id}`,
       })));
       const scope = { companyId: context.fixture.companyId, issueId: context.conversation.issueId };
+      if (queuedAudit) {
+        // Start the real one-second audit deadline on a controlled clock, after
+        // settling fixture writes, so the unrelated INSERT cannot miss capture.
+        await flushSecretResolutionWrites(db);
+        vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+        await enqueueSecretAccessEvent(db, { companyId: scope.companyId,
+          provider: "local_encrypted", actorType: "system", consumerType: "environment",
+          consumerId: "startup-discovery-capture", outcome: "success" });
+      }
       const events: Array<Record<string, unknown>> = [], now = Date.now();
       const capture = createFullDatabaseResponseCapture({ start: now - 1, end: now + 59_000 }, event => events.push(event));
       installDatabaseResponseCapture(db, { chatActions, agentWakeupRequests }, capture);
       let scopes: Array<{ companyId: string; issueId: string }>;
       try {
+        if (queuedAudit) {
+          await vi.advanceTimersByTimeAsync(1000);
+          // The deadline starts real PostgreSQL I/O; await its completion, too.
+          await flushSecretResolutionWrites(db);
+        }
         scopes = await context.service.loadInboundWakeNoticeScopes(
           mode === "task" ? scope : mode === "company" ? { companyId: scope.companyId } : undefined,
         );
@@ -81113,6 +81132,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(events.filter(event => event.event === "paperclip.test_db_response_capture.entry.v1")
         .reduce((count, event) => count + Number(event.rows), 0)).toBe(mode === "task" ? 0 : scopes.length);
     } finally {
+      if (queuedAudit) {
+        await flushSecretResolutionWrites(db);
+        vi.useRealTimers();
+      }
       await context.service.shutdown(); await other.service.shutdown();
       await db.delete(chatActions).where(inArray(chatActions.id, [...rejectedIds, context.action.id]));
       await db.delete(agentWakeupRequests).where(inArray(agentWakeupRequests.id, [...rejectedIds, context.action.id]));
