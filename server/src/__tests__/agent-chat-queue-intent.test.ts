@@ -318,6 +318,22 @@ describeEmbeddedPostgres("agent chat queue: every message, stored delivery inten
     },
   );
 
+  it("reorders the head wake and deletes a row behind a /new, answering with the whole chat queue each time", async () => {
+    const chat = await seedChat();
+    const [one, two, reset, behind] = await send(chat, ["One", "Two", "/new", "Behind"]);
+    const queue = await queueRead(chat);
+    const reordered = await request(app(chat.companyId)).put(`/api/issues/${chat.issue.id}/queued-comments/order`)
+      .send({ queueId: queue.queueId, revision: queue.revision, orderedCommentIds: [two!.id, one!.id] });
+    expect(reordered.status, JSON.stringify(reordered.body)).toBe(200);
+    expect(reordered.body.entries.map((entry: any) => entry.comment.id)).toEqual([two!.id, one!.id, reset!.id, behind!.id]);
+    const row = reordered.body.entries[3];
+    const deleted = await request(app(chat.companyId)).delete(`/api/issues/${chat.issue.id}/queued-comments/${behind!.id}`)
+      .send({ queueId: row.queueId, revision: row.queueRevision });
+    expect(deleted.status, JSON.stringify(deleted.body)).toBe(200);
+    expect(deleted.body.queueId).toBe(queue.queueId);
+    expect(deleted.body.entries.map((entry: any) => entry.comment.id)).toEqual([two!.id, one!.id, reset!.id]);
+  });
+
   it("Interrupt now on one row sends that message first and keeps the rest queued, in order", async () => {
     const chat = await seedChat();
     const [one, two, three] = await send(chat, ["One", "Two", "Three"]);

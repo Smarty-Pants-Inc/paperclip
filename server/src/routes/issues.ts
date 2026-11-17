@@ -17901,6 +17901,21 @@ export function issueRoutes(
     }
   }
 
+  /**
+   * Agent Chat: after an edit, reorder or delete, answer with the whole chat
+   * queue (every waiting message, also behind a /new), not only the mutated
+   * wake, so the list never shrinks to one wake until the next poll.
+   */
+  async function chatQueueAfterMutation(
+    issue: Parameters<typeof buildQueuedCommentQueue>[0]["issue"],
+    queue: IssueQueuedCommentQueue,
+    actor: ReturnType<typeof getActorInfo>,
+  ) {
+    if (!issue.conversationAgentId) return queue;
+    return buildQueuedCommentQueue({ executor: db, issue, actor,
+      activeRun: await resolveActiveIssueRun(issue as Parameters<typeof resolveActiveIssueRun>[0], { queueStateOnly: true }) });
+  }
+
   router.get("/issues/:id/queued-comments", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(
@@ -17976,7 +17991,7 @@ export function issueRoutes(
         }),
       );
       publishActivity(activityPublication as ActivityPublication);
-      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, await chatQueueAfterMutation(issue, queue, actor)));
     },
   );
 
@@ -18029,7 +18044,7 @@ export function issueRoutes(
         }),
       );
       publishActivity(activityPublication as ActivityPublication);
-      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, await chatQueueAfterMutation(issue, queue, actor)));
     },
   );
 
@@ -18542,7 +18557,7 @@ export function issueRoutes(
       if (result.cancelledRun) {
         void emitAgentTaskRunById(db, { runId: result.cancelledRun.id, companyId: issue.companyId });
       }
-      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, result.queue));
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, await chatQueueAfterMutation(issue, result.queue, actor)));
     },
   );
 
