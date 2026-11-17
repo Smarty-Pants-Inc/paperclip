@@ -1,4 +1,5 @@
-import type { heartbeatRuns } from "@paperclipai/db";
+import { sql } from "drizzle-orm";
+import { heartbeatRuns } from "@paperclipai/db";
 import { hasWorkspaceRestoreFailure, WORKSPACE_RESTORE_PENDING_KEY } from "@paperclipai/shared";
 
 export const LEGACY_WORKSPACE_RECOVERY_KEY = "workspaceRestoreRecovery";
@@ -33,6 +34,29 @@ export function hasRequiredWorkspaceRecovery(result: Record<string, unknown> | n
 }
 
 
+
+/**
+ * The run's owed-files label follows its hold, read where the recovery worker
+ * records it: updateSystemRecovery (system-recovery.ts) writes
+ * workspaceRecovery.status queued/recovering/blocked/recovered on the hold
+ * (evidence.runId = the run), the same field the hold card renders
+ * (workspaceRecoveryDisplay). A recovered hold wins over a sibling; otherwise
+ * the latest write. No hold row yet means the worker has not adopted it: owed.
+ */
+const runRestoreHoldStatusSql = sql`(select hold.evidence #>> '{workspaceRecovery,status}'
+  from issue_recovery_actions hold
+  where hold.company_id = ${heartbeatRuns.companyId}
+    and hold.evidence ->> 'runId' = ${heartbeatRuns.id}::text
+    and hold.evidence #>> '{workspaceRecovery,runId}' = ${heartbeatRuns.id}::text
+  order by (hold.evidence #>> '{workspaceRecovery,status}' = 'recovered') desc, hold.updated_at desc
+  limit 1)`;
+const runOwesRestoreSql = sql`${heartbeatRuns.resultJson} -> '${sql.raw(WORKSPACE_RESTORE_PENDING_KEY)}' = 'true'::jsonb`;
+/** Projection of the run's owed fact: still in progress (no terminal hold state). */
+export const workspaceRestorePendingProjectionSql = sql`case when ${runOwesRestoreSql}
+  and coalesce(${runRestoreHoldStatusSql}, 'queued') in ('queued', 'recovering') then to_jsonb(true) end`;
+/** Projection of the run's owed fact once the worker recovered the files. */
+export const workspaceRestoreRecoveredProjectionSql = sql`case when ${runOwesRestoreSql}
+  and ${runRestoreHoldStatusSql} = 'recovered' then to_jsonb(true) end`;
 
 /** Late adapter/projection writes cannot certify recovery or remove its pin. */
 export function preserveWorkspaceRestoreRecoveryMetadata(

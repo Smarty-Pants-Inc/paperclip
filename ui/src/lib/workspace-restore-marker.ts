@@ -1,14 +1,20 @@
-import { isWorkspaceRestorePending, safeWorkspaceRestorePath, WORKSPACE_RESTORE_RECOVERING_TEXT } from "@paperclipai/shared";
+import { isWorkspaceRestorePending, isWorkspaceRestoreRecovered, safeWorkspaceRestorePath, WORKSPACE_RESTORE_RECOVERED_TEXT,
+  WORKSPACE_RESTORE_RECOVERING_TEXT } from "@paperclipai/shared";
 
 /** The run marker reads the server's owed fact (workspaceRestorePending), never
  * the raw workspaceRestoreFailure value alone: owed files are recovering. */
 export function workspaceRestoreMarker(result: Record<string, unknown> | null | undefined): {
-  pending: boolean; label: string; tone: "neutral" | "error";
+  pending: boolean; recovered: boolean; label: string; tone: "neutral" | "error";
 } {
+  // The server projects both facts from the run's hold: in progress, or the
+  // worker saved the files. A hold that ended blocked projects neither.
   const pending = isWorkspaceRestorePending(result);
+  const recovered = !pending && isWorkspaceRestoreRecovered(result);
   return pending
-    ? { pending, label: "Recovering saved work", tone: "neutral" }
-    : { pending, label: "Workspace restore failed", tone: "error" };
+    ? { pending, recovered, label: "Recovering saved work", tone: "neutral" }
+    : recovered
+    ? { pending, recovered, label: "Saved work recovered", tone: "neutral" }
+    : { pending, recovered, label: "Workspace restore failed", tone: "error" };
 }
 
 export function workspaceRestoreMarkerDetail(input: {
@@ -16,8 +22,10 @@ export function workspaceRestoreMarkerDetail(input: {
   savedPlan: boolean;
   hasResponse: boolean;
 }): string {
-  const parts = workspaceRestoreMarker(input.result).pending
-    ? [WORKSPACE_RESTORE_RECOVERING_TEXT, ...(input.savedPlan ? ["The saved plan is available."] : [])]
+  const marker = workspaceRestoreMarker(input.result);
+  const parts = marker.pending || marker.recovered
+    ? [marker.pending ? WORKSPACE_RESTORE_RECOVERING_TEXT : WORKSPACE_RESTORE_RECOVERED_TEXT,
+      ...(input.savedPlan ? ["The saved plan is available."] : [])]
     : [input.savedPlan
       ? "Workspace restore failed after the plan was saved. The saved plan is available."
       : "Workspace restore failed.", "Workspace files need recovery."];
