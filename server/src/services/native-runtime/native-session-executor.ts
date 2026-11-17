@@ -1100,39 +1100,45 @@ subscribeRunStartHandoverChanges(() => {
  */
 export const warmSessionReleaseWait = { timeoutMs: 30_000, pollMs: 25 };
 
-async function waitForWarmNativeSessionSettled(scope: string): Promise<void> {
-  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
-  // Wait while the owner's turn is over and it is releasing the session, until
-  // it has handed every scope back (its execution's final cleanup), so the
-  // follow-up's own admission does not meet the old owner's scopes either.
-  while (settlingNativeSessionScopes.has(scope) && Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
-  }
-  const closing = closingWarmNativeSessions.get(scope);
-  if (!closing) return;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  await Promise.race([
-    closing.catch(() => undefined),
-    new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, deadline - Date.now())); }),
-  ]).finally(() => clearTimeout(timer));
+/** The one deadline of a predecessor-settle wait: now + warmSessionReleaseWait. */
+export function predecessorSettleDeadline(): number {
+  return Date.now() + warmSessionReleaseWait.timeoutMs;
 }
 
-/** Waits, within warmSessionReleaseWait, while the previous turn's owner is
- * still releasing (busy without a successor's claim, settling or closing). A
- * session still busy at the deadline fails its caller as before. */
-async function waitForWarmNativeSessionRelease(scope: string, entry: WarmNativeSession): Promise<void> {
-  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+/**
+ * The ONE predecessor-settle wait at the retirement fence, bounded only by
+ * warmSessionReleaseWait (pass predecessorSettleDeadline()). In order, until
+ * the deadline:
+ * 1. while the owner's turn is over and it is releasing the session (its
+ *    execution's final cleanup hands every scope back), or, with `entry`,
+ *    while that registered owner is still busy without a successor's claim;
+ * 2. the owner's in-flight close (a retained Boat close retries transient
+ *    sandbox errors), success or failure;
+ * 3. with `pending`, while that re-read still reports the predecessor's own
+ *    settle work (a Stop-issued Runner lifecycle command) as pending.
+ * It never throws on the bound: each caller re-reads and recomputes its own
+ * retirement proof after it. Callers wait outside any database transaction.
+ */
+export async function awaitPredecessorSettle(scope: string, deadline: number, options: {
+  entry?: WarmNativeSession;
+  pending?: () => Promise<boolean>;
+} = {}): Promise<void> {
+  const { entry, pending } = options;
   while (Date.now() < deadline && (settlingNativeSessionScopes.has(scope)
-    || (warmNativeSessions.get(scope) === entry && entry.busy && !entry.preparingRunId))) {
+    || (entry !== undefined && warmNativeSessions.get(scope) === entry && entry.busy && !entry.preparingRunId))) {
     await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
   }
   const closing = closingWarmNativeSessions.get(scope);
-  if (!closing) return;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  await Promise.race([
-    closing.catch(() => undefined),
-    new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, deadline - Date.now())); }),
-  ]).finally(() => clearTimeout(timer));
+  if (closing) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      closing.catch(() => undefined),
+      new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, deadline - Date.now())); }),
+    ]).finally(() => clearTimeout(timer));
+  }
+  while (pending && Date.now() < deadline && await pending()) {
+    await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
+  }
 }
 
 /** Reserve the existing physical copy before heartbeat composes AGENT_HOME and
@@ -1159,7 +1165,9 @@ export async function claimWarmNativeInstructionCopy(input: {
     })) || prior.workspace.cwd !== input.workspace.cwd) return null;
   const scope = nativeSessionScopeKey(prior);
   const busyEntry = warmNativeSessions.get(scope);
-  if (busyEntry?.busy || settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope)) await waitForWarmNativeSessionSettled(scope);
+  if (busyEntry?.busy || settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope)) {
+    await awaitPredecessorSettle(scope, predecessorSettleDeadline());
+  }
   // Re-read after the wait: the release may have retired or replaced the session.
   const entry = warmNativeSessions.get(scope);
   if (!entry || !entry.instructionWorkingCopy?.runId || entry.environmentId !== input.environmentId) return null;
@@ -1224,7 +1232,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
     // once, bounded like claimWarmNativeInstructionCopy's wait, then re-read.
     // Another run's claim (preparingRunId) is a real concurrent owner.
     if (!releaseWaited && !entry.preparingRunId && (entry.busy || settlingNativeSessionScopes.has(id) || closingWarmNativeSessions.has(id))) {
-      await waitForWarmNativeSessionRelease(id, entry);
+      await awaitPredecessorSettle(id, predecessorSettleDeadline(), { entry });
       return reserveWarmNativeInstructionDirectory(input, true);
     }
     if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
@@ -2844,7 +2852,7 @@ async function retireSupersededWarmNativeSessions(
     const releasing = !foreignPreparation
       && (settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope));
     if (releasing && !releaseWaited) {
-      await waitForWarmNativeSessionRelease(scope, entry);
+      await awaitPredecessorSettle(scope, predecessorSettleDeadline(), { entry });
       return retireSupersededWarmNativeSessions(ownerScope, nextSessionScope, nextSessionId, runId, ingress, target, true);
     }
     if (entry.busy || foreignPreparation || executingRunnerdSessionScopes.has(scope)) {
@@ -6780,7 +6788,7 @@ async function pendingLifecycleCommandsIssuedByStop(db: Db, root: string, identi
 /** A Runner lifecycle command that the person's acknowledged Stop issued is
  * still settling, not an unprovable owner. Wait for it through the same
  * predecessor-settle helper and bound as warm admission
- * (waitForWarmNativeSessionSettled, warmSessionReleaseWait), outside any
+ * (awaitPredecessorSettle, warmSessionReleaseWait), outside any
  * database transaction, then re-read and recompute the same retirement proof.
  * At the bound, while the Stop's own command is still pending, defer this run
  * through the typed recovery wait (never a failed run). Commands the Stop did
@@ -6792,13 +6800,11 @@ async function retireAfterStopIssuedLifecycleCommands(input: Parameters<typeof i
     || !await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
     return { retired: false, refused };
   }
-  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+  const deadline = predecessorSettleDeadline();
   await input.onLog?.("stderr", `[paperclip-runner] waiting for the Stop's runner lifecycle command of run ${String(input.identity.runId)}\n`);
-  await waitForWarmNativeSessionSettled(nativeSessionScopeKey(input.execution));
-  while (Date.now() < deadline
-    && await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
-    await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
-  }
+  await awaitPredecessorSettle(nativeSessionScopeKey(input.execution), deadline, {
+    pending: () => pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId),
+  });
   const retirement = await retireFinishedPerTurnRunnerdOwner(input);
   if (!retirement.retired && retirement.refused.startsWith("journal_commands_unsettled(")
     && await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
