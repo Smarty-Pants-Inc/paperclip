@@ -759,9 +759,9 @@ export async function admitExplicitNativeContinuation(input: {
   // The new box cannot restore the old box's provider thread: the Retry's first
   // run opens a fresh thread with the saved history, never a doomed restore.
   if (taskRetry && readiness?.mode === "fresh_isolated_workspace") {
-    const { recordRetryFreshProviderThread } = await import("./fresh-continuation-fallback.js");
+    const { recordRetryFreshProviderThread, retryFreshThreadTrigger } = await import("./fresh-continuation-fallback.js");
     await recordRetryFreshProviderThread(db, { companyId, issueId, agentId, sourceRunId: readiness.sourceRunId,
-      successorRunId: input.successorRunId });
+      successorRunId: input.successorRunId, trigger: retryFreshThreadTrigger(taskRetry) });
   }
   if (input.taskRetryRequestId) {
     const payload = sql`jsonb_set(${agentWakeupRequests.payload} #- '{taskRetry,continuation}', '{taskRetry,strategy}',
