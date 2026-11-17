@@ -6,8 +6,6 @@ import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } fro
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
-import { hasAcknowledgedNativeStopIntent } from "./acknowledged-native-stop.js";
-import { hasStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
@@ -35,48 +33,13 @@ export async function runExecutionsHaveStopped(db: Db, companyId: string, runIds
     and(eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids))!, ids.length, false)) === null;
 }
 
-type Run = typeof heartbeatRuns.$inferSelect;
-type Lease = typeof environmentLeases.$inferSelect;
-type Coordinator = typeof nativeRunFinalizations.$inferSelect;
-/** A person's Stop on a keep_running warm box hands the box off warm; no
- * termination receipt is ever written. Only the executor's settled-turn proof
- * (native-session-executor retainCancelledSession: cancellation cleanup done,
- * idle snapshot, no pending runtime requests, instruction checkpoint) proves
- * that handoff. Its sole durable form is this receipt, issued atomically with
- * the coordinator's native_retry_cancelled settlement and bound to its
- * controller boot/generation. A cancel ack or policy label is not this proof;
- * a missing/mismatched receipt or a stop_and_retain lease keeps the blocker. */
-function provedWarmTurnHandoff(run: Run, runLeases: Lease[], coordinator: Coordinator | undefined): boolean {
-  const value = run.runnerProfileJson?.nativeRetainedIdleCheckpoint;
-  const receipt = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-  return run.status === "cancelled" && run.runtimeMode === "native" && hasAcknowledgedNativeStopIntent(run)
-    && receipt.schema === "paperclip.native-retained-idle-checkpoint.v1"
-    && receipt.companyId === run.companyId && receipt.runId === run.id && receipt.issueId === run.nativeIssueId
-    && typeof receipt.sessionId === "string" && receipt.sessionId === run.nativeSessionId
-    && !!coordinator && coordinator.runId === run.id && coordinator.phase === "terminal_failure"
-    && coordinator.failureCode === "native_retry_cancelled" && !coordinator.leaseOwner && !coordinator.resultId
-    && receipt.bootId === coordinator.controllerBootId && receipt.generation === coordinator.controllerGeneration
-    && runLeases.length > 0 && runLeases.every(lease => !!lease.provider && lease.provider !== "local"
-      && lease.status === "active" && lease.leasePolicy === "reuse_by_environment" && !lease.releasedAt
-      && !lease.cleanupStatus && lease.metadata?.pendingCleanupInFlight !== true
-      && !readLeaseReleaseDeferral(lease.metadata) && !hasStopOnlyCleanup(lease));
-}
-
 async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
   expectedRunCount?: number, settleCoordinators = true): Promise<string | null> {
   const runs = await db.select().from(heartbeatRuns).where(condition);
   // A missing or cross-company binding cannot establish execution Stop.
   if (expectedRunCount !== undefined && runs.length !== expectedRunCount) return "run_binding_unproven";
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition);
-  const allLeases = await db.select().from(environmentLeases).where(leaseCondition);
-  // Task-scoped proof only (never whole-agent lifecycle Stop): a proved warm
-  // handoff's still-active warm lease is the retained box, not live execution.
-  const coordinatorRows = settleCoordinators ? [] : await db.select().from(nativeRunFinalizations)
-    .where(inArray(nativeRunFinalizations.runId, runs.map(run => run.id)));
-  const handedOff = new Set(settleCoordinators ? [] : runs.filter(run => provedWarmTurnHandoff(run,
-    allLeases.filter(lease => lease.heartbeatRunId === run.id),
-    coordinatorRows.find(row => row.runId === run.id))).map(run => run.id));
-  const leases = allLeases.filter(lease => !lease.heartbeatRunId || !handedOff.has(lease.heartbeatRunId));
+  const leases = await db.select().from(environmentLeases).where(leaseCondition);
   const deferred = leases.find(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata));
   if (deferred) return `environment_lease_release_deferred:${readLeaseReleaseDeferral(deferred.metadata)!.reason}`;
   if (leases.some(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed")) return "environment_lease_unreleased";
@@ -99,7 +62,6 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
   for (const run of runs) {
     if (!["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status)) return "run_not_terminal";
     if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) return "run_controller_lease_held";
-    if (handedOff.has(run.id)) continue;
     const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
     if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
       if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return "remote_stop_unconfirmed";

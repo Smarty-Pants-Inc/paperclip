@@ -514,10 +514,10 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     expect((await recovery.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId })).cleared).toBe(1);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
   });
-  // Keep reason: adopt-h6-src (S1 card d1bc0612, written 1 ms after the cancel).
-  // A person's Stop on a keep_running warm box hands the box off warm and never
-  // writes a termination receipt. One sweep pass inside that no-receipt window
-  // must accept the executor's settled-turn proof, and only that proof.
+  // adopt-stopu-d4752: d4752b6b's warm-turn handoff proof is reverted on U (a
+  // person's Stop is stop_and_retain, never a warm handoff). These helpers stay:
+  // U's bounded person Stop tests (b152a154) build on them, and the settled-turn
+  // receipt below is now only a control that it is NOT Stop proof.
   async function warmStopFixture(proof: "settled" | "missing" | "generation_mismatch" | "coordinator_owned" | "unacknowledged") {
     const f = await warmFixture();
     const sessionId = randomUUID(), bootId = "boot-1", generation = 3;
@@ -545,21 +545,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       held: await nativeUserStopRecoveryHeld(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId }) };
   }
 
-  it("a proved warm-turn handoff Stop with no termination receipt raises no card and holds no owner", async () => {
-    const f = await warmStopFixture("settled");
-    const { cards, held } = await onePass(f);
-    // Base: an escalated execution_stop_pending card that holds the warm owner
-    // (native refusal owner_recovery_action_pending, so a FRESH thread).
-    expect(cards.map(card => card.cause)).toEqual([]);
-    expect(held).toBe(false);
-    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
-    // The warm box stays as it was: no release, no termination.
-    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0]).toEqual(f.lease);
-    // Whole-agent lifecycle Stop is not broadened by the task-scoped proof.
-    expect(await agentExecutionStopBlocker(db, [f.agentId])).toBe("environment_lease_unreleased");
-  });
-
-  it.each(["missing", "generation_mismatch", "coordinator_owned", "unacknowledged"] as const)(
+  it.each(["settled", "missing", "generation_mismatch", "coordinator_owned", "unacknowledged"] as const)(
     "settled-turn proof %s keeps the Stop-pending card", async proof => {
       const f = await warmStopFixture(proof);
       expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
