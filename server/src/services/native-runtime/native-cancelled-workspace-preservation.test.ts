@@ -348,6 +348,29 @@ import { readRemoteWorkspaceAuthority } from "@paperclipai/shared";
     } finally { await worker.stop(); }
   }, 120_000);
 
+  // Never-OK guard for the warm-Stop handoff policy: an ordinary person's Stop
+  // of a warm (keep_running) turn is a handoff only while the box keeps running.
+  // A warm box that later REALLY stopped (released, reusable, stop receipts)
+  // still has its files preserved by both producers.
+  it.each(["worker", "startup-scan"] as const)("preserves files of an ordinary warm Stop whose box later really stopped (%s)", async kind => {
+    const f = await seed();
+    const stopped = await stopAndRetainReusableSource(f);
+    const resultJson = { ...f.run.resultJson, cancelledByActorType: "user", cancelledByUserId: "responsible-user" };
+    await db.update(heartbeatRuns).set({ errorCode: "cancelled", error: "Cancelled by a board operator", resultJson })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const worker = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+    try {
+      if (kind === "startup-scan") await preserveCancelledNativeWorkspaces(db);
+      else await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true).ready;
+      const [retained] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(retained.runnerProfileJson).toMatchObject({ nativeResourceDisposition: "keep_running" });
+      expect(retained.resultJson).toMatchObject({ workspaceRestoreFailure: "restore_failed",
+        workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [f.leaseId] } });
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]).toEqual(stopped);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toHaveLength(1);
+    } finally { await worker.stop(); }
+  }, 120_000);
+
   // Stop during an accepted result's copy-back retries ends the copy-back. No
   // finalization exports those files afterwards, so preservation keeps them.
   it.each(["worker", "startup-scan", "stopped-sandbox"] as const)("preserves files of an accepted result whose copy-back was stopped (%s)", async kind => {
