@@ -21,6 +21,7 @@ import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { recordTaskStopPending } from "../recovery/stop-pending.js";
+import { recoveryService } from "../recovery/service.js";
 import { nativeUserStopRecoveryHeld } from "./native-user-stop-settlement.js";
 import { FRESH_THREAD_STARTED_NOTE } from "./fresh-thread-stop-gate.js";
 import {
@@ -100,9 +101,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     | "failed-turn-start" | "rejected-turn-start" | "indeterminate-turn-start" | "unknown-outcome-turn-start"
     | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" = "settled",
     options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
-      lifecycle?: "warm"; governedWait?: boolean } = {}) {
-    const issueId = randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
-    await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: agentId, status: "in_progress" });
+      lifecycle?: "warm"; governedWait?: boolean; issueId?: string } = {}) {
+    const issueId = options.issueId ?? randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
+    if (!options.issueId) await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: agentId, status: "in_progress" });
     const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
       nativeIssueId: issueId, contextSnapshot: { issueId } }).returning();
     const native = await prepareNativeHeartbeatRun({ db, run: row, issue: issueFields(issueId), environmentLeaseId: randomUUID() });
@@ -773,6 +774,89 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     // The card's own visibility and clear are unchanged.
     const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, card.id));
     expect(after).toMatchObject({ status: card.status, nextAction: card.nextAction, evidence: card.evidence });
+  }, 60_000);
+
+  // RFL's deterministic no-receipt window: the person's Stop is acknowledged,
+  // but its finalizer has not released ownership when the real sweep runs once.
+  // No timer, fake recovery card, provider process or receipt is substituted.
+  it("continues the same provider thread after one real recovery sweep races a person's Stop", async () => {
+    const prior = await seedRecoveredPriorRun();
+    await stopSettledOwner(prior, { leaseOwner: "stopping-controller", events: [
+      { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
+    ] });
+    await db.update(issues).set({ checkoutRunId: prior.runId, executionRunId: prior.runId })
+      .where(eq(issues.id, prior.issueId));
+    const enqueueWakeup = vi.fn();
+    const swept = await recoveryService(db, { enqueueWakeup }).sweepStaleIssueLocks({ companyId, issueId: prior.issueId });
+    expect(swept).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [card] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, prior.issueId));
+    expect(card).toMatchObject({ cause: "execution_stop_pending", status: "escalated", evidence: {
+      runId: prior.runId, stopPending: { standalone: true, owner: "recovery.sweep_stale_issue_locks", runIds: [prior.runId] },
+    } });
+    const [during] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, prior.runId));
+    expect(during).toMatchObject({ leaseOwner: "stopping-controller", failureCode: "native_retry_cancelled" });
+    // The Stop finishes after that one sweep; do not run recovery again to
+    // clear its card before the person's next message reaches admission.
+    await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+      .where(eq(nativeRunFinalizations.runId, prior.runId));
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(ADMITTED);
+    expect(followUp.selectedRunId).toBe(prior.runId);
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    expect(next!.runnerProfileJson?.sessionCheckpoint).toMatchObject({ sessionId: prior.native.normalizedSessionId,
+      providerSessionId: "provider-session-before-recovery" });
+    expect(followUp.logs.join("")).not.toContain(FRESH_THREAD_STARTED_NOTE);
+    expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, card!.id));
+    expect(after).toEqual(card);
+  }, 60_000);
+
+  it.each([
+    { label: "both Stops proven", held: false },
+    { label: "second Stop unacknowledged", held: true, stop: { ack: "none" as const } },
+    { label: "second Stop has a live finalizer", held: true, stop: { leaseOwner: "still-stopping" } },
+    { label: "second Stop has an escalated Pi abort", held: true, stop: { events: [
+      { eventType: "harness.diagnostic", payload: { code: "pi_abort_escalated" } },
+    ] } },
+    { label: "second journal has an unanswered tool", held: true, control: "unanswered-tool" as const },
+    { label: "second journal is missing", held: true, missingCheckpoint: true },
+    { label: "second run is not stopped", held: true, notStopped: true },
+  ])("checks every named run of a two-run Stop-pending card: $label", async ({ held, stop, control, missingCheckpoint, notStopped }) => {
+    const first = await seedRecoveredPriorRun();
+    const second = await seedRecoveredPriorRun(control ?? "settled", { issueId: first.issueId });
+    await stopSettledOwner(first, { leaseOwner: "stopping-first-controller" });
+    if (!notStopped) await stopSettledOwner(second, stop ?? {});
+    if (missingCheckpoint) await db.delete(nativeRunnerCheckpoints).where(eq(nativeRunnerCheckpoints.runId, second.runId));
+    await db.update(issues).set({ checkoutRunId: first.runId, executionRunId: second.runId })
+      .where(eq(issues.id, first.issueId));
+    expect((await recoveryService(db, { enqueueWakeup: vi.fn() })
+      .sweepStaleIssueLocks({ companyId, issueId: first.issueId })).cleared).toBe(0);
+    const [card] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, first.issueId));
+    expect(card.evidence.stopPending).toMatchObject({ runIds: [first.runId, second.runId].sort() });
+    await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+      .where(eq(nativeRunFinalizations.runId, first.runId));
+    // Include the non-primary run: recordTaskStopPending sorts runIds and puts
+    // only the first in evidence.runId; membership must not bypass the hold.
+    for (const prior of [first, second]) {
+      const checkpoint = await loadNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId });
+      const controlBytes = checkpoint ? JSON.stringify({
+        commands: [...checkpoint.records].filter(([key]) => key.startsWith("command:")).map(([, bytes]) => JSON.parse(bytes)),
+        committedEvents: [...checkpoint.records].filter(([key]) => key.startsWith("event:")).map(([, bytes]) => JSON.parse(bytes)),
+      }) : SETTLED_JOURNAL;
+      expect(await nativeUserStopRecoveryHeld(db, { companyId, issueId: prior.issueId, runId: prior.runId },
+        checkpoint ? { controlBytes } : undefined)).toBe(held);
+    }
+    if (!held) {
+      const followUp = await admitFollowUp(second);
+      expect(await followUp.start()).toBe(ADMITTED);
+      expect(followUp.selectedRunId).toBe(second.runId);
+      const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+      expect(next!.runnerProfileJson?.sessionCheckpoint).toMatchObject({ sessionId: second.native.normalizedSessionId,
+        providerSessionId: "provider-session-before-recovery" });
+      expect(followUp.logs.join("")).not.toContain(FRESH_THREAD_STARTED_NOTE);
+    }
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, card.id)))[0]).toEqual(card);
   }, 60_000);
 
   it.each([
