@@ -260,6 +260,57 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
         expect(runAfter.runnerProfileJson?.nativeCancelledWarmExport).toMatchObject({ state: "unproven" });
         expect(afterSweep.metadata?.sandboxStopAndRetainReceipt).toMatchObject({ providerLeaseId });
         expect(blocker).toMatchObject({ runId, canRetry: false, workspaceRepairRequired: true, savedMessageCount: 1 });
+        // adopt-stopu-bound2 (Item B): the unprovable-export hold, driven by the
+        // REAL workspace-recovery worker pass (workspace-recovery-work.ts ->
+        // reconcileRetainedWorkspaces, onRecovered = resumeRemoteStopComments)
+        // at a fake clock over its whole retry window (system-recovery-state.ts:8-12).
+        const { reconcileRetainedWorkspaces } = await import("../services/workspace-recovery.js");
+        const { environmentRuntimeService } = await import("../services/environment-runtime.js");
+        const runtime = environmentRuntimeService(db);
+        const t0 = Date.now();
+        const trail: Record<string, unknown>[] = [];
+        vi.useFakeTimers({ toFake: ["Date"], now: t0 });
+        try {
+          // Each pass runs when the worker would: at the hold, then at the saved nextAttemptAt.
+          let at = t0;
+          for (let pass = 0; pass < 12; pass += 1) {
+            vi.setSystemTime(at);
+            const atMin = (at - t0) / 60_000;
+            const work = await reconcileRetainedWorkspaces(db, runtime as never, run => heartbeat.resumeRemoteStopComments(run));
+            await Promise.all(work ?? []);
+            await heartbeat.resumeQueuedRuns();
+            const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+            const current = await getExecutionBlocker(db, companyId, issueId);
+            const runs = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+              sql`${heartbeatRuns.contextSnapshot}->'wakeCommentIds' @> ${JSON.stringify([comment.id])}::jsonb
+                OR ${heartbeatRuns.contextSnapshot}->>'commentId' = ${comment.id} OR ${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${comment.id}`));
+            trail.push({ atMin, actions: actions.map(action => {
+              const sr = (action.evidence as Record<string, any>).systemRecovery;
+              return { cause: action.cause, status: action.status, workspaceRecovery: (action.evidence as Record<string, any>).workspaceRecovery?.status ?? null,
+                systemRecovery: sr ? { state: sr.state, attempts: sr.attempts, retriesUsed: sr.retriesUsed, failure: sr.failure?.code ?? null,
+                  retryClass: sr.failure?.retryClass ?? null, nextAttemptInMin: sr.nextAttemptAt ? (sr.nextAttemptAt - t0) / 60_000 : null,
+                  deadlineInMin: sr.deadlineAt ? (sr.deadlineAt - t0) / 60_000 : null } : null };
+            }), blocker: current ? { nextAction: current.nextAction, canRetry: current.canRetry,
+              workspaceRepairRequired: current.workspaceRepairRequired } : null, messageRuns: runs.length });
+            const next = actions.map(action => (action.evidence as Record<string, any>).systemRecovery?.nextAttemptAt)
+              .find((value): value is number => typeof value === "number");
+            if (runs.length > 0 || next === undefined) break;
+            at = Math.max(at + 1, next);
+          }
+        } finally { vi.useRealTimers(); }
+        await heartbeat.drainActiveRunExecutions();
+        console.log("ITEMB_TRAIL", JSON.stringify(trail));
+        if (process.env.ITEMB_EVIDENCE_FILE) await fs.appendFile(process.env.ITEMB_EVIDENCE_FILE, `${JSON.stringify(trail)}\n`);
+        // The BOUND (system-recovery-state.ts:8-12, :117-122): 1 attempt + at most
+        // 5 retries 30 s * 2^(n-1) * [0.8, 1.2] apart = <= 18.6 min, inside the 30 min
+        // window; then the exhausted hold admits the message (workspace-recovery.ts
+        // recoverRunAction -> onRecovered). While held, the line promises nothing.
+        const admitted = trail.find(row => (row.messageRuns as number) > 0);
+        expect(admitted, JSON.stringify(trail)).toBeDefined();
+        expect(admitted!.atMin as number).toBeLessThanOrEqual(18.6);
+        expect(admitted!.blocker).toBeNull();
+        for (const row of trail) expect(JSON.stringify(row.blocker ?? "")).not.toContain("will start automatically");
+        expect(destroy.mock.calls.filter(([input]) => input.providerLeaseId === providerLeaseId)).toHaveLength(0);
         return;
       }
       expect(executed || actionable,
