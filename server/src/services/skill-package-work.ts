@@ -1,4 +1,5 @@
 import { readPaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
+import { hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { promises as fs } from "node:fs";
 import { and, eq, isNotNull, isNull, lte, sql } from "drizzle-orm";
 import { companySkillRepositorySnapshots as snapshots, companySkillVersions as versions,
@@ -53,8 +54,9 @@ export function skillPackageWork(db: Db, storage?: StorageService) {
       const paths = skillPackagePaths(row.companyId, id);
       try {
         await ensureSkillCacheDirectory(paths.parent);
-        await fs.rm(paths.directory, { recursive: true, force: true });
-        await fs.rm(paths.manifest, { force: true });
+        // pl/keepalive6: under the held cache lock, removals go through its gate (refused after a loss).
+        await hostMutation(() => fs.rm(paths.directory, { recursive: true, force: true }));
+        await hostMutation(() => fs.rm(paths.manifest, { force: true }));
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     };
     if (await withSkillVersionCacheLock(db, row.companyId, async () => {
