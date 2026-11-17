@@ -31,6 +31,7 @@ import { flushDeferredEnvironmentCleanup, registerDeferredEnvironmentCleanup, wr
 import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatchedEnvironmentTask } from "./environment-task-runtime.js";
 import { allowLegacyShutdownWorkspaceCleanup, legacyShutdownWorkspaceResourceProtected } from "./legacy-shutdown-workspace-settlement.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
+import { hasNativeHarnessBackupMissing } from "./native-runtime/native-harness-backup-missing.js";
 import { abandonedWorkspaceFilesHeldOnLease, abandonedWorkspaceFilesParked, parkAbandonedWorkspaceFilesLease } from "./remote-workspace-abandoned-files-hold.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
@@ -2814,6 +2815,9 @@ function createSandboxEnvironmentDriver(
 
     async retryPendingSandboxTeardown(input) {
       const exportResume = hasStopOnlyCleanup(input.lease);
+      if (!exportResume && hasNativeHarnessBackupMissing(input.lease)) {
+        throw new Error("Native harness backup is missing; destructive cleanup is forbidden.");
+      }
       if (!exportResume && await nativeWorkspaceExportPendingForLease(db, input.lease)) {
         throw new Error("Native workspace export is pending; destructive cleanup is forbidden.");
       }
@@ -3602,6 +3606,7 @@ function createSandboxEnvironmentDriver(
     lease: EnvironmentLease;
     failureReason: string;
   }): Promise<EnvironmentLease | null> {
+    if (hasNativeHarnessBackupMissing(input.lease)) return null;
     if (reusableSandboxKeptAfterReplacement(input.lease)) return null;
     if (await legacyShutdownWorkspaceResourceProtected(db, input.lease)) return null;
     if (await abandonedWorkspaceFilesHeldOnLease(db, input.lease)) {
@@ -3750,6 +3755,7 @@ const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "creationOperationId",
   "sandboxLeaseAcquisition",
   "nativeHarnessBackup",
+  "nativeHarnessBackupMissing",
   "nativeWorkspaceSync",
   "reusableSandboxLease",
   // The host process that holds the lease (ownership proof); never provider config.
@@ -4368,6 +4374,7 @@ export function environmentRuntimeService(
     anyLeasePolicy?: boolean;
     releasesKeptSandbox?: boolean;
   }): Promise<EnvironmentLease | null> {
+    if (hasNativeHarnessBackupMissing(input.leaseRow)) return null;
     if (await nativeWorkspaceExportPendingForLease(db, input.leaseRow)) return null;
     if (!(await allowLegacyShutdownWorkspaceCleanup(db, input.leaseRow))) return null;
     const now = new Date();
@@ -5103,6 +5110,7 @@ export function environmentRuntimeService(
     },
 
     async destroyRunLease(input: EnvironmentDriverLeaseInput): Promise<EnvironmentLease | null> {
+      if (hasNativeHarnessBackupMissing(input.lease)) return null;
       if (await nativeWorkspaceExportPendingForLease(db, input.lease)) return null;
       if (await legacyShutdownWorkspaceResourceProtected(db, input.lease)) return null;
       if (input.lease.metadata?.legacyShutdownWorkspaceSettlement) {
