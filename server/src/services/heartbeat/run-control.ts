@@ -890,7 +890,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     let gaveUp = false;
     const proof = proveHandedOffWarmLeases(db, source);
     void proof.then(outcome => {
-      if (gaveUp && outcome !== "none") return resumeQueuedCommentInterrupt(companyId, queueId);
+      // Only a landed proof re-dispatches. A timeout's stop-and-retain intent
+      // admits through its provider receipt; re-dispatching it would re-run the
+      // remote proof in a loop.
+      if (gaveUp && outcome === "proven") return resumeQueuedCommentInterrupt(companyId, queueId);
     }).catch(err => logger.warn({ err, runId: source.id, queueId }, "handed-off warm proof could not re-dispatch the saved Send"));
     const inline = await Promise.race([proof.then(() => true as const).catch(() => true as const),
       new Promise<false>(resolve => setTimeout(() => resolve(false), 1_500))]);

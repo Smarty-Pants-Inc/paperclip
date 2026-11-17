@@ -42,7 +42,9 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(companies).values({ id: companyId, name: "Warm Stop", defaultResponsibleUserId: "board", issuePrefix: `W${companyId.replaceAll("-", "")}` });
     await db.insert(agents).values({ id: agentId, companyId, name: "Native", role: "engineer", adapterType: "paperclip_runner", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Chat", status: "in_progress", assigneeAgentId: agentId });
-    const leaseId = randomUUID(), providerLeaseId = "bx_warm";
+    // One physical box per fixture: a provider lease id names a physical sandbox in
+    // any company (warmSandboxExpiryCandidateCondition, warm-sandbox-expiry.ts:87-89).
+    const leaseId = randomUUID(), providerLeaseId = `bx_warm_${leaseId.slice(0, 8)}`;
     await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native",
       status: "cancelled", errorCode: "cancelled", contextSnapshot: { issueId }, finishedAt: stoppedAt,
       runnerProfileJson: { nativeResourceDisposition: variant === "ephemeral" ? "destroy" : "keep_running",
