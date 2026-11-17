@@ -1,3 +1,4 @@
+import { proveHandedOffWarmLeases } from "../native-runtime/handed-off-warm-lease.js";
 import { assertAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { withAccountingTransaction } from "../accounting-transaction.js";
 import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
@@ -663,6 +664,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   }
 
   async function resumeRemoteStopComments(run: NonNullable<Awaited<ReturnType<typeof getRunExecutionWait>>>, requestId?: string) {
+    // rf-4 row 22a: the deferred-execution work runs the bounded runner-exit
+    // proof here, outside any transaction, and persists it before admission reads it.
+    if (run.runtimeMode === "native" && run.status === "cancelled") await proveHandedOffWarmLeases(db, run).catch(() => "unproven");
     if (!isHeartbeatRunTerminalStatus(run.status) || adapterExecutionControls.has(run.id)) return;
     let interruptedPreparation = false;
     if (["interrupted", "failed"].includes(run.status) && run.runtimeMode === "legacy" &&
@@ -867,6 +871,27 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     return stoppedByThisPress && await nativeStopExecutionProven(companyId, target!.id);
   }
 
+  /** rf-4 row 22a/22b: before the Send's enqueue transaction, run the s3 fence's
+   * runner-exit proof for the stopped native run's handed-off warm box OUTSIDE
+   * any transaction. The Send waits for it at most 1.5 s; past that the enqueue
+   * defers the wake ('interrupt_handoff') and commits, and the bounded proof
+   * (handedOffWarmProofTimeout) re-dispatches this wake when it lands. */
+  async function proveHandedOffWarmBeforeSend(companyId: string, issueId: string, agentId: string, queueId: string) {
+    const [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.runtimeMode, "native"),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`)).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
+    if (!source || source.status !== "cancelled") return true;
+    let gaveUp = false;
+    const proof = proveHandedOffWarmLeases(db, source);
+    void proof.then(outcome => {
+      if (gaveUp && outcome !== "none") return resumeQueuedCommentInterrupt(companyId, queueId);
+    }).catch(err => logger.warn({ err, runId: source.id, queueId }, "handed-off warm proof could not re-dispatch the saved Send"));
+    const inline = await Promise.race([proof.then(() => true as const).catch(() => true as const),
+      new Promise<false>(resolve => setTimeout(() => resolve(false), 1_500))]);
+    gaveUp = !inline;
+    return true;
+  }
+
   async function resumeQueuedCommentInterrupt(companyId: string, queueId: string, opts?: { retryCleanup?: boolean }) {
     return resumeSavedComments(companyId, queueId, true, opts);
   }
@@ -911,6 +936,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       inArray(heartbeatRuns.status, ["running", "queued", "scheduled_retry"]),
     )).limit(1);
     if (active) return;
+    if (interrupted && !await proveHandedOffWarmBeforeSend(companyId, issueId, wake.agentId, queueId)) return;
     if (interrupted && opts?.retryCleanup) {
       // Only the HTTP click grants an extra cleanup attempt. Periodic retries
       // reuse the intent to deliver, never a fresh provider teardown budget.
