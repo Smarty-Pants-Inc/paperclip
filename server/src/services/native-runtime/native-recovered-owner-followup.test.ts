@@ -101,15 +101,16 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     | "failed-turn-start" | "rejected-turn-start" | "indeterminate-turn-start" | "unknown-outcome-turn-start"
     | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" = "settled",
     options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
-      lifecycle?: "warm"; governedWait?: boolean; issueId?: string } = {}) {
+      lifecycle?: "warm"; governedWait?: boolean; issueId?: string; agentId?: string } = {}) {
+    const ownerAgentId = options.agentId ?? agentId;
     const issueId = options.issueId ?? randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
-    if (!options.issueId) await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: agentId, status: "in_progress" });
-    const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
+    if (!options.issueId) await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: ownerAgentId, status: "in_progress" });
+    const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: ownerAgentId, status: "running", runtimeMode: "native",
       nativeIssueId: issueId, contextSnapshot: { issueId } }).returning();
     const native = await prepareNativeHeartbeatRun({ db, run: row, issue: issueFields(issueId), environmentLeaseId: randomUUID() });
     const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.issueId, issueId));
     const executionFor = (currentRunId: string) => buildNativeExecutionInput({
-      companyId, agentId, runId: currentRunId, provider: options.provider ?? "acpx", acpxAgent: "claude",
+      companyId, agentId: ownerAgentId, runId: currentRunId, provider: options.provider ?? "acpx", acpxAgent: "claude",
       model: options.provider === "codex" ? "gpt-6.1-sol"
         : options.provider === "pi_rpc" ? "paperclip/faux"
           : options.provider === "opencode" ? "openrouter/deepseek/deepseek-v4.1-flash-1017" : "claude-opus-5-5",
@@ -179,7 +180,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const snapshot: PersistedNativeSession = { backendKind: "runner", sessionId: native.normalizedSessionId,
       ...(options.provider === "pi_rpc" ? { driverKind: "pi_rpc" as const } : {}),
       providerSessionId: "provider-session-before-recovery", activeTurnId: null, pendingRuntimeRequests: [],
-      identity: { companyId, agentId, issueId, runId, sessionId: native.normalizedSessionId } };
+      identity: { companyId, agentId: ownerAgentId, issueId, runId, sessionId: native.normalizedSessionId } };
     const [prepared] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     const [result] = await db.insert(nativeRunResults).values({ companyId, issueId, runId,
       completionContractId: prepared.completionContractId!, serverFingerprint: "fixture", schemaStatus: "accepted",
@@ -665,12 +666,12 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
    * native_retry_cancelled, no result, with the acknowledged user Stop receipt
    * (the one retainCancelledSession requires to keep a warm Pi owner). */
   async function stopSettledOwner(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, options: {
-    ack?: "own" | "none" | "other-run"; failureCode?: string; leaseOwner?: string;
+    ack?: "own" | "none" | "other-run"; failureCode?: string; leaseOwner?: string; agentId?: string;
     /** The owner's own committed provider events (PRP payloads). */
     events?: Array<{ eventType: string; payload: Record<string, unknown> }> } = {}) {
     const ack = options.ack ?? "own";
     for (const [index, event] of (options.events ?? []).entries()) {
-      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: prior.runId, seq: 800 + index, eventType: event.eventType,
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId: options.agentId ?? agentId, runId: prior.runId, seq: 800 + index, eventType: event.eventType,
         stream: "system", level: "info", payload: { prpEvent: { schema: "paperclip.prp.event.v1", runId: prior.runId,
           eventType: event.eventType, payload: event.payload } } });
     }
@@ -1939,9 +1940,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
    * rows the positive test writes; nothing else is seeded. */
   type WarmStop = "proven" | "no idle-checkpoint receipt" | "an unacknowledged Stop" | "a stop_and_retain lease"
     | "a live runner (coordinator lease held)";
-  async function seedWarmStop(variant: WarmStop) {
-    const prior = await seedRecoveredPriorRun();
-    await stopSettledOwner(prior, { ack: variant === "an unacknowledged Stop" ? "none" : "own",
+  async function seedWarmStop(variant: WarmStop, ownerAgentId = agentId) {
+    const prior = await seedRecoveredPriorRun("settled", { agentId: ownerAgentId });
+    await stopSettledOwner(prior, { agentId: ownerAgentId, ack: variant === "an unacknowledged Stop" ? "none" : "own",
       leaseOwner: variant === "a live runner (coordinator lease held)" ? "still-running-controller" : undefined, events: [
         { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
       ] });
@@ -1957,7 +1958,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     await db.insert(environments).values({ id: environmentId, name: `warm-${environmentId}`, driver: "sandbox" });
     const [warmLease] = await db.insert(environmentLeases).values({ companyId, environmentId, issueId: prior.issueId,
       heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
-      expiresAt: new Date(Date.now() + 900_000), metadata: { remoteCwd: "/workspace", agentId,
+      expiresAt: new Date(Date.now() + 900_000), metadata: { remoteCwd: "/workspace", agentId: ownerAgentId,
         ...(variant === "a stop_and_retain lease" ? { sandboxStopAndRetain: { requestedAt: stoppedAt.toISOString() } } : {}) } })
       .returning();
     await db.update(issues).set({ checkoutRunId: prior.runId, executionRunId: prior.runId, executionLockedAt: stoppedAt })
@@ -1966,6 +1967,143 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   }
   const sweepIssue = (issueId: string, enqueueWakeup = vi.fn()) =>
     recoveryService(db, { enqueueWakeup }).sweepStaleIssueLocks({ companyId, issueId, onDeferredDeadline: () => {} });
+
+  // R-SILENT: unlike the admission-only row above, Send must create its own
+  // successor through heartbeat, after the stranded sweep's warm-card return.
+  it("R-SILENT: Send after a proven warm Stop starts exactly one same-session run after stranded recovery", async () => {
+    const { agentWakeupRequests, agentTaskSessions, authUsers, companyMemberships, executionWorkspaces, issueComments } = await import("@paperclipai/db");
+    const { withQueuedCommentIdsInWakePayload } = await import("../issue-queued-comment-queue.js");
+    const { heartbeatService } = await import("../heartbeat.js");
+    // Other admission-only rows deliberately leave synthetic running owners.
+    // Give this real heartbeat its own agent, with the ordinary one-run limit.
+    const agentId = randomUUID();
+    await db.insert(agents).values({ id: agentId, companyId, name: "R-SILENT", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "acpx", acpxAgent: "claude" } });
+    const { prior, warmLease } = await seedWarmStop("proven", agentId);
+    const [agentBefore] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const hb = heartbeatService(db, { runtimeEnv: { PAPERCLIP_NATIVE_RUNTIME_ENABLED: "true" } });
+    let admitted = false, releaseAdmission = () => {};
+    toolDefinitions.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      admitted = true;
+      releaseAdmission = () => reject(new Error(ADMITTED));
+    }));
+    try {
+    await db.insert(authUsers).values({ id: "board-user", name: "Board", email: "board@example.test",
+      emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user",
+      status: "active", membershipRole: "owner" });
+    // A real retained session carries its configuration metadata. Omitting it
+    // would deliberately request a fresh thread, independently of Stop.
+    const { agentIdentityService } = await import("../agent-identity.js");
+    const { environmentService } = await import("../environments.js");
+    const { buildEffectiveRunSessionConfigMetadata, attachPaperclipSessionMetadataToSessionParams } =
+      await import("../heartbeat/workspaces.js");
+    const identity = await agentIdentityService(db).ensureAgentIdentity(companyId, agentId);
+    const local = await environmentService(db).ensureLocalEnvironment();
+    // The older admission fixtures target a remote harness. This row uses the
+    // real local heartbeat, so give its predecessor a matching durable local
+    // workspace and runtime snapshot rather than testing a target/config switch.
+    const cwd = join(stateDirectory, "workspace");
+    await mkdir(cwd, { recursive: true });
+    const [workspace] = await db.insert(executionWorkspaces).values({ companyId, sourceIssueId: prior.issueId,
+      name: "Retained task workspace", cwd, providerType: "local_fs", strategyType: "project_primary",
+      mode: "shared_workspace", status: "active" }).returning();
+    await db.update(issues).set({ executionWorkspaceId: workspace!.id, executionWorkspacePreference: "reuse_existing" })
+      .where(eq(issues.id, prior.issueId));
+    const { buildNativeRuntimeContext } = await import("./runtime-context.js");
+    const { resolvePaperclipRunnerNativeProviderInput } = await import("./provider-profile.js");
+    const runtimeContext = await buildNativeRuntimeContext({ db, agent: agentBefore!, runId: prior.runId,
+      runtimeConfig: {}, runtimeSkillEntries: [] });
+    const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.issueId, prior.issueId));
+    const execution = buildNativeExecutionInput({ companyId, agentId, runId: prior.runId,
+      ...resolvePaperclipRunnerNativeProviderInput({ companyId, backend: "acpx_runtime", adapterConfig: agentBefore!.adapterConfig }),
+      issue: { ...issueFields(prior.issueId), identifier: null, workMode: "standard" }, taskPrompt: "Continue the conversation.",
+      workspace: { id: workspace!.id, cwd, repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: prior.native.normalizedSessionId, runtimeContext,
+      completionContract: { id: contract!.id, sha256: contract!.canonicalSha256, schemaVersion: contract!.schemaVersion,
+        contract: contract!.contractJson as never } });
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...stopped!.runnerProfileJson, nativeExecutionInput: execution,
+      nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("local", execution.provider.kind) } })
+      .where(eq(heartbeatRuns.id, prior.runId));
+    const metadata = await buildEffectiveRunSessionConfigMetadata({ agentIdentityKeyId: identity.keyId,
+      adapterType: "paperclip_runner", effectiveAdapterConfig: { provider: "acpx", acpxAgent: "claude",
+        paperclipSkillSync: { desiredSkills: [] }, paperclipRuntimeSkills: [], paperclipConnectorSkillDigest: null,
+        paperclipConnectionInstructions: null }, agentRuntimeConfig: {}, issueOverrides: null,
+      workspaceConfig: { requestedMode: "shared_workspace", effectiveMode: "shared_workspace", projectPolicy: null, issueSettings: null },
+      environment: { selectionSource: "instance", selectedEnvironmentId: local.id,
+        selectedEnvironment: { id: local.id, driver: "local", config: {} }, executionPolicy: { managedSandboxOnly: false } },
+      environmentEnv: {}, projectEnv: null, routineEnv: null, secretManifest: [], runtimeSkills: [] });
+    await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner", taskKey: prior.issueId,
+      lastRunId: prior.runId, sessionDisplayId: prior.native.normalizedSessionId,
+      sessionParamsJson: attachPaperclipSessionMetadataToSessionParams({ sessionId: prior.native.normalizedSessionId }, null, metadata) });
+    const enqueueWakeup = vi.fn();
+    const observed = vi.fn();
+    const recovery = recoveryService(db, { enqueueWakeup, afterStrandedLatestRunRead: observed });
+    const sweep = () => recovery.reconcileStrandedAssignedIssues({ companyId, issueId: prior.issueId });
+    const task = async () => (await db.select().from(issues).where(eq(issues.id, prior.issueId)))[0]!;
+    const cards = () => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, prior.issueId));
+    const successors = () => db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+      sql`(${heartbeatRuns.contextSnapshot}->>'issueId' = ${prior.issueId} or ${heartbeatRuns.nativeIssueId} = ${prior.issueId})`,
+      sql`${heartbeatRuns.id} <> ${prior.runId}`));
+    // Non-invokable, but not manually paused: force stranded escalation to
+    // inspect the stopped owner instead of taking the operator-cancel exemption.
+    await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, agentId));
+    const before = await task();
+    expect(before).toMatchObject({ checkoutRunId: prior.runId, executionRunId: prior.runId });
+    expect(await sweep()).toMatchObject({ escalated: 0, issueIds: [] });
+    expect(observed).toHaveBeenCalledWith({ issueId: prior.issueId, runId: prior.runId });
+    expect(await task()).toEqual(before);
+    expect(await cards()).toEqual([]);
+    expect(await successors()).toEqual([]);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    await db.update(agents).set({ status: "idle", lifecycleState: "ready" }).where(eq(agents.id, agentId));
+    // Persist the person's new message and explicit Send intent, using the
+    // existing queue's public resume path (never insert the successor by hand).
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId: prior.issueId,
+      authorUserId: "board-user", body: "Continue after my Stop." }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      triggerDetail: "system", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "board-user",
+      payload: withQueuedCommentIdsInWakePayload({ issueId: prior.issueId, mutation: "comment", commentId: comment!.id,
+        queuedCommentInterrupt: { actorId: "board-user", targetRunId: null, requestedAt: new Date().toISOString() },
+        _paperclipWakeContext: { issueId: prior.issueId, taskId: prior.issueId, wakeReason: "issue_commented",
+          source: "issue.comment", wakeCommentIds: [comment!.id], wakeCommentId: comment!.id } }, [comment!.id]) }).returning();
+    await hb.resumeQueuedCommentInterrupt(companyId, wake!.id);
+    await hb.resumeQueuedCommentInterrupt(companyId, wake!.id);
+    const started = await successors();
+    expect(started).toHaveLength(1);
+    expect(started[0]!.contextSnapshot).toMatchObject({ wakeCommentIds: [comment!.id] });
+    await vi.waitFor(() => expect(admitted).toBe(true), { timeout: 10_000 });
+    const [next] = await successors();
+    // The actual heartbeat executor, not admitFollowUp's hand-inserted run,
+    // reached our existing tool-authority boundary without starting a provider.
+    expect(next!.status).toBe("running");
+    expect(next!.startedAt).not.toBeNull();
+    expect(next!.runtimeMode).toBe("native");
+    await sweep();
+    await hb.resumeQueuedCommentInterrupt(companyId, wake!.id);
+    expect((await successors()).map(run => run.id)).toEqual([started[0]!.id]);
+    expect(await cards()).toEqual([]);
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, warmLease.id)))[0]).toEqual(warmLease);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    console.log("R-SILENT observed", JSON.stringify({ issueId: prior.issueId, stoppedRunId: prior.runId,
+      successorRunId: next!.id, stoppedSessionId: prior.native.normalizedSessionId, successorSessionId: next!.nativeSessionId,
+      admission: ADMITTED, successorsAfterSecondSweep: (await successors()).map(run => run.id), cards: await cards() }));
+    expect(next!.nativeSessionId).toBe(prior.native.normalizedSessionId);
+    expect(next!.runnerProfileJson?.nativeExecutionInput).toMatchObject({ session: {
+      normalizedSessionId: prior.native.normalizedSessionId } });
+    } finally {
+      releaseAdmission();
+      await hb.drainActiveRunExecutions();
+      await db.update(agents).set({ status: agentBefore!.status, lifecycleState: agentBefore!.lifecycleState })
+        .where(eq(agents.id, agentId));
+      // This row owns the test user; keep older Send-only fixtures isolated.
+      await db.delete(companyMemberships).where(and(eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalId, "board-user")));
+      await db.delete(authUsers).where(eq(authUsers.id, "board-user"));
+    }
+  }, 60_000);
 
   // adopt-h6-neg2 (RFL 17:40Z): an UNPROVEN Stop keeps BOTH claims exactly as
   // at base through the same real sweep, and lock_released never fires.
