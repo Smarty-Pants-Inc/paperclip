@@ -8247,6 +8247,28 @@ done
     // Keep: provider receipt identity and billed cost cross the proxy/accounting
     // trust boundary. Use the Pi projector + app-server proxy's wire shape.
     #[test]
+    fn pi_facade_reasoning_dispatch_uses_only_the_pi_normalizer() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../test/fixtures/pi-facade-reasoning-delta.json"
+        ))
+        .unwrap();
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let events = normalize_provider_notification(
+            &mut state,
+            fixture["method"].as_str().unwrap(),
+            &fixture["params"],
+        )
+        .unwrap();
+        // A single dispatch selects Pi OR Codex; it never concatenates both.
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "item.delta");
+        assert_eq!(events[0].payload["provider"], "pi_rpc");
+        assert_eq!(events[0].payload["kind"], "reasoning");
+        assert_eq!(events[0].payload["text"], fixture["params"]["delta"]);
+    }
+
+    #[test]
     fn pi_usage_keeps_receipt_identity_and_provider_cost() {
         let mut state = opencode_result_state();
         state.config.provider = "pi_rpc".to_owned();

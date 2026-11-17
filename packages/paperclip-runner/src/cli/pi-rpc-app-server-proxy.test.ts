@@ -119,6 +119,24 @@ class FakeSession {
   }
 }
 
+it("emits one shared reasoning frame on the native Pi route, not a second Codex-pump delta", async () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../test/fixtures/pi-facade-reasoning-delta.json", import.meta.url), "utf8"));
+  const { threadId: _threadId, turnId, itemId, delta: _delta, item: _item, ...payload } = fixture.params;
+  const sink = new FakeSink();
+  const session = new FakeSession();
+  const proxy = createPiRpcAppServerProxy({ stdout: sink, environment: { PAPERCLIP_RUN_ID: "run-1" }, createDriver: () => makeDriver(session) });
+  try {
+    await request(proxy, sink, 901, "thread/start", { cwd: process.cwd(), model: "neutral/model" });
+    session.push("item.delta", payload, turnId, itemId);
+    // Ordered barrier: prove the pump consumed everything through the next item.
+    session.push("item.completed", { kind: "agentMessage", text: "barrier" }, turnId, "barrier");
+    await vi.waitFor(() => expect(sink.decoded().some(frame => (frame.params as { itemId?: string } | undefined)?.itemId === "barrier")).toBe(true));
+    const frames = sink.decoded().filter(frame => (frame.params as { itemId?: string } | undefined)?.itemId === itemId);
+    expect(frames).toEqual([fixture]);
+    expect(sink.decoded().filter(frame => ["item/delta", "item/reasoning/summaryTextDelta", "item/reasoning/textDelta"].includes(String(frame.method)))).toEqual([fixture]);
+  } finally { await proxy.close(); }
+});
+
 it("forwards Pi RPC timings through the existing sanitized performance notification", async () => {
   const sink = new FakeSink(); const session = new FakeSession();
   const proxy = createPiRpcAppServerProxy({ stdout: sink, environment: { PAPERCLIP_RUN_ID: "run-1" }, createDriver: () => makeDriver(session) });
