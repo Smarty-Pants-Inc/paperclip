@@ -3,7 +3,7 @@ import type { CostByBiller, CostByProviderModel } from "@paperclipai/shared";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { QuotaBar } from "./QuotaBar";
 import { CostAmount } from "./CostAmount";
-import { billingTypeDisplayName, formatCents, formatTokens, providerDisplayName } from "@/lib/utils";
+import { billingTypeDisplayName, formatCents, formatSpendPercent, formatTokens, providerDisplayName } from "@/lib/utils";
 
 interface BillerSpendCardProps {
   row: CostByBiller;
@@ -84,8 +84,9 @@ export function BillerSpendCard({
           <QuotaBar
             label="Period spend"
             percentUsed={budgetPct}
+            spendDerived
             leftLabel={formatCents(row.costCents)}
-            rightLabel={`${Math.round(budgetPct)}% of company budget`}
+            rightLabel={`${formatSpendPercent(Math.round(budgetPct))} of company budget`}
           />
         )}
 

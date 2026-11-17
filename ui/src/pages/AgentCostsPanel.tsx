@@ -10,7 +10,7 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { Button } from "@/components/ui/button";
 import { useDateRange, PRESET_KEYS, PRESET_LABELS } from "../hooks/useDateRange";
 import { queryKeys } from "../lib/queryKeys";
-import { billingTypeDisplayName, formatCents, formatTokens, providerDisplayName } from "../lib/utils";
+import { billingTypeDisplayName, formatCents, formatSpendPercent, formatTokens, providerDisplayName } from "../lib/utils";
 
 export function agentCostRow(rows: readonly CostByAgent[] | undefined, agentId: string): CostByAgent | null {
   return rows?.find((row) => row.agentId === agentId) ?? null;
@@ -101,7 +101,7 @@ export function AgentCostsPanel({ agentId, agentName, companyId }: { agentId: st
                           costCents={model.costCents}
                           eventCount={model.eventCount}
                           estimatedEventCount={model.estimatedEventCount}
-                          suffix={<span className="ml-1 font-normal text-muted-foreground">({share}%)</span>}
+                          suffix={<span className="ml-1 font-normal text-muted-foreground">({formatSpendPercent(share)})</span>}
                         />
                         <div className="text-xs text-muted-foreground">
                           {formatTokens(model.inputTokens + model.cachedInputTokens + model.outputTokens)} tok

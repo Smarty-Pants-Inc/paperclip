@@ -28,7 +28,7 @@ import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSh
 import { ActivityRow } from "../components/ActivityRow";
 import { ActivityList } from "../components/ActivityList";
 import { timeAgo } from "../lib/timeAgo";
-import { cn, formatCents, formatConfiguredCents } from "../lib/utils";
+import { cn, formatCents, formatConfiguredCents, formatSpendPercent } from "../lib/utils";
 import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
 import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
 import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
@@ -490,7 +490,7 @@ export function Dashboard() {
               description={
                 <span>
                   {data.costs.monthBudgetCents > 0
-                    ? `${data.costs.monthUtilizationPercent}% of ${formatConfiguredCents(data.costs.monthBudgetCents)} budget`
+                    ? `${formatSpendPercent(data.costs.monthUtilizationPercent)} of ${formatConfiguredCents(data.costs.monthBudgetCents)} budget`
                     : "Unlimited budget"}
                 </span>
               }
