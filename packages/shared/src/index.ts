@@ -2886,6 +2886,7 @@ export * from "./connection-search.js";
 
 export { WORKSPACE_RESTORE_FAILURE_CODES, WORKSPACE_RESTORE_PENDING_KEY, WORKSPACE_RESTORE_RECOVERING_TEXT, WORKSPACE_RESTORE_RECOVERED_KEY,
   WORKSPACE_RESTORE_RECOVERED_TEXT, hasWorkspaceRestoreFailure, isWorkspaceRestoreRecovered,
+  WORKSPACE_RESTORE_PERSON_BOUND_MS, WORKSPACE_RESTORE_DELAYED_KEY, WORKSPACE_RESTORE_DELAYED_TEXT, isWorkspaceRestoreDelayed,
   isWorkspaceRestorePending, safeWorkspaceRestorePath, isNativeWorkspaceExportRepairCause } from "./workspace-restore.js";
 
 
