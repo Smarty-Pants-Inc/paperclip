@@ -716,7 +716,7 @@ suite("fresh-continuation fallback", () => {
   it.each([
     "native_controller_recovery_unsupported:metadata_format",
     "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=journal_terminal_unsettled",
-  ])("a continuation refusal consumes the second attempt, never a third: %s", async error => {
+  ])("a continuation refusal starts a third attempt within upstream's hourly brake: %s", async error => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
     await settleUnrecoverableExecutions(db);
     const next = await expectOneFreshSuccessor(f);
@@ -742,7 +742,7 @@ suite("fresh-continuation fallback", () => {
     for (let pass = 0; pass < 3; pass++) {
       await settleUnrecoverableExecutions(db); await continueHeldExecutions(db); await deliver();
     }
-    expect(await successors(second[0].id)).toHaveLength(0);
+    expect(await successors(second[0].id)).toHaveLength(1);
     expect(await successors(f.runId)).toHaveLength(1);
     expect(await successors(next.id)).toHaveLength(1);
     const notes = currentNotices(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)));
