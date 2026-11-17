@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, companies, companyMemberships, completionContracts, createDb, heartbeatRuns, issueComments,
+import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, completionContracts, createDb, heartbeatRuns, issueComments,
   issues, nativeRunFinalizations, statusDecisionEffects, statusDecisions } from "@paperclipai/db";
 import type { ControlPlanePort, NativeExecutionInputV1, PrpEvent, PrpTerminalState } from "@paperclipai/paperclip-runner";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -25,6 +25,14 @@ import { createReleaseIssueExecution } from "../../modules/wake-queue/applicatio
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
 import { requestTaskRetry } from "../task-retry.js";
 import { readThinkingCapStop, resolveRunAssigneeAdapterOverrides, thinkingCapStopCandidate } from "../thinking-cap-stop.js";
+import { callbacks } from "../../__tests__/helpers/judge-completion-support.js";
+import { createHeartbeatRunCompletion } from "../heartbeat/run-completion.js";
+import { createHeartbeatRunPreparation } from "../heartbeat/run-preparation.js";
+import { getAdapterSessionCodec } from "../heartbeat/run-state.js";
+import { buildEffectiveRunSessionConfigMetadata } from "../heartbeat/workspaces.js";
+import { issueService } from "../issues.js";
+import * as usageReceipts from "../usage-receipts.js";
+import { settleUnansweredPersonMessagesForTask, unansweredPersonMessageCondition } from "../recovery/unanswered-person-message.js";
 
 // dl famlong-u1. Live (review-fleet-2): after a mid-stream cut the recovery
 // path never ran. The status arbiter's GENERIC successor ran instead (context
@@ -46,13 +54,20 @@ describe("native mid-stream cut: one successor, through recovery", () => {
   const agentId = randomUUID();
 
   beforeAll(async () => {
+    vi.spyOn(usageReceipts, "indexPendingUsageReceipts").mockResolvedValue(new Map());
+    vi.spyOn(usageReceipts, "recoverPendingRunUsageReceipts").mockResolvedValue([]);
     temporary = await startEmbeddedPostgresTestDatabase("native-mid-stream-cut-");
     db = createDb(temporary.connectionString);
+    await db.insert(authUsers).values({ id: "board-user", name: "Judge", email: "judge@example.test", createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companies).values({ id: companyId, name: "Native mid-stream cut", issuePrefix: "MSC" });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Pi agent", status: "active", adapterType: "paperclip_runner", adapterConfig: STORED });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Pi agent", status: "active", adapterType: "paperclip_runner", adapterConfig: STORED,
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
+    // Keep dispatch real but hold execution: these rows qualify scheduling/publication,
+    // not a live provider. No background provider or gate access is allowed here.
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user", status: "active", membershipRole: "member" });
   });
-  afterAll(async () => { await temporary?.cleanup(); });
+  afterAll(async () => { await heartbeatService(db).drainActiveRunExecutions(); await db?.$client.end(); await temporary?.cleanup(); });
 
   async function task() {
     const issueId = randomUUID();
@@ -83,12 +98,13 @@ describe("native mid-stream cut: one successor, through recovery", () => {
   async function cutTurn(issueId: string, shape: CutShape, existingRunId?: string) {
     const runId = existingRunId ?? randomUUID();
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [message] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "user")));
     const [run] = existingRunId
       ? await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: issueId, error: null, errorCode: null,
         startedAt: new Date() }).where(eq(heartbeatRuns.id, existingRunId)).returning()
       : await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId,
         responsibleUserId: "board-user", invocationSource: "on_demand", triggerDetail: "manual",
-        contextSnapshot: { issueId, wakeReason: "issue_commented" } }).returning();
+        contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: message.id } }).returning();
     await db.update(issues).set({ status: "in_progress", executionRunId: runId, checkoutRunId: null }).where(eq(issues.id, issueId));
     const native = await prepareNativeHeartbeatRun({ db, run, issue, environmentLeaseId: randomUUID() });
     const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.issueId, issueId));
@@ -128,6 +144,53 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, runId));
     const effects = await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, decision.id));
     return { runId, decision, effects };
+  }
+
+  /** Real completion publication, replay and the unanswered-message worker boundary. */
+  async function assertOnePublishedNoteAfterSweep(issueId: string, runId: string) {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const deps = callbacks(db, true);
+    deps.issuesSvc.addComment.mockImplementation(issueService(db).addComment);
+    const completion = createHeartbeatRunCompletion(db, deps);
+    const input: Parameters<typeof completion.completeRun>[0] = {
+      run, agent, issueId, issueRef: issue, signal: new AbortController().signal,
+      output: { handle: { store: "local_file", logRef: "second-cut" }, outputProgressState: { pending: { bytes: 0 } },
+        flushOutputProgress: async () => {}, stdoutExcerpt: "", stderrExcerpt: "" },
+      session: { runtimeForAdapter: { sessionId: null, sessionDisplayId: null }, previousSessionParams: null, taskKey: issueId,
+        configuredModel: "paperclip/faux", sessionConfigMetadata: await buildEffectiveRunSessionConfigMetadata({ adapterType: agent.adapterType,
+          effectiveAdapterConfig: agent.adapterConfig, agentRuntimeConfig: {}, issueOverrides: null, workspaceConfig: null,
+          environment: null, environmentEnv: null, projectEnv: null, routineEnv: null, runtimeSkills: [] }) },
+      readFailureReportSecrets: () => [],
+      adapterResult: { exitCode: 1, signal: null, timedOut: false, sessionId: "fixture-provider-session",
+        sessionParams: { sessionId: "fixture-provider-session" }, errorCode: "adapter_failed",
+        errorMessage: "Pi's final assistant response reached its output limit.", resultJson: run.resultJson ?? {},
+        nativeFinalization: { schema: "paperclip.native-finalization.v1", runtimeMode: "native", runId, issueId, companyId, result: {},
+          terminal: { schema: "paperclip.prp.terminal.v1", turnTerminalState: "failed", runTerminalState: "failed", reportedWorkDisposition: "needs_review" },
+          turnId: null, sourceInstanceId: run.runnerInstanceId!, normalizedSessionId: run.nativeSessionId!, providerSessionId: "fixture-provider-session",
+          driverKind: "opencode_server", driverVersion: "fixture", nativeEventCount: 2, highestContiguousSourceSeq: 2, workspaceFinalizeStatus: "succeeded" } },
+      sessionCodec: getAdapterSessionCodec(agent.adapterType), taskSessionForRun: null, sessionCompaction: { rotate: false, reason: null },
+      configFreshnessResultMetadata: { version: 1 }, runLedgerScope: {}, currentUserRedactionOptions: { enabled: false },
+      providerTraceCapture: false, onProviderTraceFinalized: () => {},
+      issueContext: await createHeartbeatRunPreparation(db).getIssueExecutionContext(companyId, issueId), onLog: async () => {},
+    };
+    await completion.completeRun(input);
+    await completion.completeRun(input); // crash/replay must not duplicate the completion note
+    // No grace-period escape: revisit long after both the settle and bounded-wait windows.
+    for (const delay of [60_000, 60 * 60_000]) {
+      expect(await settleUnansweredPersonMessagesForTask(db, { companyId, issueId, now: new Date(Date.now() + delay) }))
+        .toEqual({ noticed: 0, pending: 0 });
+    }
+    const comments = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+      .filter(comment => comment.authorType !== "user" && !comment.deletedAt);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ createdByRunId: runId,
+      body: "The model ran out of output budget before answering. Press Retry to try once more." });
+    expect(comments[0]!.body).not.toMatch(/continuing|wasn't answered|Sending it again is safe/u);
+    expect(await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, issueId),
+      unansweredPersonMessageCondition(issues.id, issues.companyId)))).toEqual([]);
+    console.log("SECOND CUT PUBLICATION + SWEEP", JSON.stringify({ runId, issueId, comments, task: issue }));
   }
 
   const issueWakes = async (issueId: string) => (await db.select().from(agentWakeupRequests)
@@ -210,11 +273,12 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     const stop = await readThinkingCapStop(db, { companyId, runId: successor.id });
     expect(stop).toMatchObject({ repeated: true });
     const note = thinkingCapStopCandidate(stop!).text;
-    expect(note).toBe("The model ran out of output budget again before answering. Press Retry to try once more.");
+    expect(note).toBe("The model ran out of output budget before answering. Press Retry to try once more.");
     expect(note).not.toMatch(/continuing|wasn't answered|Sending it again is safe/u);
     const [blocked] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(blocked).toMatchObject({ status: "blocked", unblockDescriptor: { owner: "board", action: NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION } });
     expect(NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION).not.toMatch(/continuing|Sending it again is safe/u);
+    await assertOnePublishedNoteAfterSweep(issueId, second.runId);
     // A real Retry: accepted, and it starts one run of the task.
     const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: "board-user", actorSource: "session",
       idempotencyKey: randomUUID(), observedRunId: second.runId });
@@ -223,6 +287,26 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     const retried = (await successorsOf(issueId, first.runId)).filter(run => run.contextSnapshot?.taskRetryRequestId === receipt.requestId);
     expect(retried).toHaveLength(1);
     await after.heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  it("(vii) provider-error -> cap exhausts the automatic budget: one published true note survives the unanswered sweep, and Retry queues one run", async () => {
+    const issueId = await task();
+    const first = await cutTurn(issueId, "eof_mid_thinking");
+    const { heartbeat, successors } = await dispatchEverything(issueId, first.runId);
+    expect(successors).toHaveLength(1);
+    const second = await cutTurn(issueId, "cap_no_text", successors[0]!.id);
+    expect(second.decision.reasonCode).toBe("native_run_failed_continuation_exhausted");
+    const after = await dispatchEverything(issueId, first.runId);
+    expect(after.successors.map(run => run.id)).toEqual([second.runId]);
+    await assertOnePublishedNoteAfterSweep(issueId, second.runId);
+    const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: "board-user", actorSource: "session",
+      idempotencyKey: randomUUID(), observedRunId: second.runId });
+    expect(receipt).toMatchObject({ accepted: true, stale: false });
+    await heartbeat.resumeTaskRetry(companyId, receipt.requestId!);
+    const manual = (await successorsOf(issueId, first.runId)).filter(run => run.contextSnapshot?.taskRetryRequestId === receipt.requestId);
+    expect(manual).toHaveLength(1);
+    expect(manual[0]!.status).toBe("queued");
+    await heartbeat.drainActiveRunExecutions();
   }, 180_000);
 
   it("RED gate 5 (6490dd70 -> 3a301e73): an EOF mid-thinking has ONE successor through recovery, resuming the session, and no generic wake", async () => {

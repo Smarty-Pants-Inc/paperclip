@@ -10,7 +10,7 @@ import { NATIVE_MID_STREAM_CUT_CODE, type NativeMidStreamCut } from "./native-mi
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 
-const REFUSAL_PATTERN = /reasoning_extraction|terms of service/iu;
+const REFUSAL_PATTERN = /reasoning_extraction|terms of service|\bprovider refused (?:this |the )?request\b/iu;
 
 /** The provider's own refusal: its stop category, or its Terms-of-Service text. */
 export function isNativeProviderRefusal(error: unknown): boolean {
@@ -30,7 +30,9 @@ export function classifyNativeMidStreamCut(rows: readonly { seq: number; payload
   if (!last || last.eventType !== "turn.failed") return null;
   const error = record(record(last.payload).error);
   if (error.code === "pi_output_truncated") return readThinkingOnlyCapStop(rows) ? "output_cap_no_text" : "output_cap";
-  if (error.code === "pi_provider_error") return isNativeProviderRefusal(error) ? "provider_refusal" : "provider_error";
+  if (error.code === "pi_provider_error" || error.code === "pi_rpc_transport_failed") {
+    return isNativeProviderRefusal(error) ? "provider_refusal" : "provider_error";
+  }
   return null;
 }
 

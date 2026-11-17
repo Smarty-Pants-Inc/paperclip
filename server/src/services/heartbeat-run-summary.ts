@@ -819,7 +819,7 @@ const UNREBUILT_BLOCK = "\u0000unrebuilt";
 export const THINKING_CAP_STOP_NOTE = "The model used its whole output budget thinking; continuing with the answer.";
 /** dl-n5-cont2 item 3: the one note when the single automatic continuation also stopped at the cap. */
 export const THINKING_CAP_STOP_AGAIN_NOTE =
-  "The model ran out of output budget again before answering. Press Retry to try once more.";
+  "The model ran out of output budget before answering. Press Retry to try once more.";
 /** dl-n5-cont2 item 3: the continuation's opening instruction after a thinking-only cap stop. */
 export const THINKING_CAP_STOP_CONTINUATION_INSTRUCTION =
   "Write the answer now; keep further thinking short. The person has not seen any answer yet.";
