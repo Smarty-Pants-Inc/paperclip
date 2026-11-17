@@ -8,6 +8,7 @@ import * as conversationContinuation from "../services/conversation-continuation
 import { classifyEnvironmentCapabilities, environmentRuntimeService } from "../services/environment-runtime.js";
 import * as workspaceRuntime from "../services/workspace-runtime.js";
 import * as workspacePreparation from "../services/heartbeat/workspace-preparation.js";
+import * as freshWorkspaceContinuation from "../services/fresh-workspace-continuation.js";
 import { nativeWorkspaceSyncInternals } from "../services/native-runtime/native-workspace-sync.js";
 import { ensureNativeCompletionContract } from "../services/native-runtime/completion-contracts.js";
 import { readNativePlanWait, hasCommittedNativePlanWait } from "../services/native-runtime/native-plan-wait.js";
@@ -10552,60 +10553,111 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await seedAssignedTodoNoRunFixture();
     const heartbeat = heartbeatService(db);
 
-    const result = await heartbeat.reconcileStrandedAssignedIssues();
-    expect(result.assignmentDispatched).toBe(1);
-    expect(result.dispatchRequeued).toBe(0);
-    expect(result.continuationRequeued).toBe(0);
-    expect(result.escalated).toBe(0);
-    expect(result.issueIds).toEqual([issueId]);
+    // The dispatch starts executeRun in the background (queue.ts
+    // startClaimedRun), and the run's own checkout moves the issue to
+    // in_progress. Hold the run at its workspace-readiness read, the last
+    // step before that checkout, so 'todo' is read before the checkout and
+    // 'in_progress' after it, never by winning a race.
+    const realReadiness = freshWorkspaceContinuation.readFreshWorkspaceReadiness;
+    let releaseCheckout!: () => void;
+    const checkoutGate = new Promise<void>(resolve => { releaseCheckout = resolve; });
+    let heldRunId: string | null = null;
+    const runReachedCheckout = new Promise<void>((resolve) => {
+      vi.spyOn(freshWorkspaceContinuation, "readFreshWorkspaceReadiness").mockImplementationOnce(async (database, run) => {
+        heldRunId = run.id;
+        resolve();
+        await checkoutGate;
+        return realReadiness(database, run);
+      });
+    });
+    // Hold the adapter too (the file's adapter-hold pattern) so the
+    // in_progress checkout is read while the dispatched run is still live.
+    let releaseAdapter!: () => void;
+    const adapterRelease = new Promise<void>(resolve => { releaseAdapter = resolve; });
+    const adapterStarted = new Promise<void>((resolve) => {
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        resolve();
+        await adapterRelease;
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Assigned todo run completed.",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    });
+    try {
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.assignmentDispatched).toBe(1);
+      expect(result.dispatchRequeued).toBe(0);
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).toEqual([issueId]);
 
-    const wakeups = await selectRecoveryWakesByAgent(agentId);
-    expect(wakeups).toHaveLength(1);
-    expect(wakeups[0]).toMatchObject({
-      companyId,
-      agentId,
-      source: "assignment",
-      triggerDetail: "system",
-      reason: "issue_assigned",
-      payload: expect.objectContaining({
+      const wakeups = await selectRecoveryWakesByAgent(agentId);
+      expect(wakeups).toHaveLength(1);
+      expect(wakeups[0]).toMatchObject({
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: expect.objectContaining({
+          issueId,
+          mutation: "assigned_todo_liveness_dispatch",
+        }),
+      });
+      expect(wakeups[0]?.payload as Record<string, unknown>).not.toHaveProperty(
+        "modelProfile",
+      );
+
+      const runs = await selectRecoveryRunsByAgent(agentId);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.retryOfRunId).toBeNull();
+      expect(runs[0]?.contextSnapshot).toMatchObject({
         issueId,
-        mutation: "assigned_todo_liveness_dispatch",
-      }),
-    });
-    expect(wakeups[0]?.payload as Record<string, unknown>).not.toHaveProperty(
-      "modelProfile",
-    );
+        taskId: issueId,
+        wakeReason: "issue_assigned",
+        source: "issue.assigned_todo_liveness_dispatch",
+      });
+      expect(
+        runs[0]?.contextSnapshot as Record<string, unknown>,
+      ).not.toHaveProperty("modelProfile");
+      expect(
+        (runs[0]?.contextSnapshot as Record<string, unknown>)?.retryReason,
+      ).toBeUndefined();
 
-    const runs = await selectRecoveryRunsByAgent(agentId);
-    expect(runs).toHaveLength(1);
-    expect(runs[0]?.retryOfRunId).toBeNull();
-    expect(runs[0]?.contextSnapshot).toMatchObject({
-      issueId,
-      taskId: issueId,
-      wakeReason: "issue_assigned",
-      source: "issue.assigned_todo_liveness_dispatch",
-    });
-    expect(
-      runs[0]?.contextSnapshot as Record<string, unknown>,
-    ).not.toHaveProperty("modelProfile");
-    expect(
-      (runs[0]?.contextSnapshot as Record<string, unknown>)?.retryReason,
-    ).toBeUndefined();
+      await runReachedCheckout;
+      expect(heldRunId).toBe(runs[0]?.id);
+      const issue = await selectRecoveryIssueById(issueId);
+      expect(issue?.status).toBe("todo");
+      expect(issue?.checkoutRunId).toBeNull();
 
-    const issue = await selectRecoveryIssueById(issueId);
-    expect(issue?.status).toBe("todo");
+      const recoveryIssues = await selectStrandedRecoveryIssuesForCompany(companyId);
+      expect(recoveryIssues).toHaveLength(0);
+      await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual(
+        [],
+      );
 
-    const recoveryIssues = await selectStrandedRecoveryIssuesForCompany(companyId);
-    expect(recoveryIssues).toHaveLength(0);
-    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual(
-      [],
-    );
+      const comments = await selectRecoveryCommentsForIssue(issueId);
+      expect(comments).toHaveLength(0);
 
-    const comments = await selectRecoveryCommentsForIssue(issueId);
-    expect(comments).toHaveLength(0);
+      releaseCheckout();
+      await adapterStarted;
+      const checkedOut = await selectRecoveryIssueById(issueId);
+      expect(checkedOut?.status).toBe("in_progress");
+      expect(checkedOut?.checkoutRunId).toBe(runs[0]?.id);
+      releaseAdapter();
 
-    if (runs[0]?.id) {
-      await waitForRunToSettle(heartbeat, runs[0].id);
+      if (runs[0]?.id) {
+        await waitForRunToSettle(heartbeat, runs[0].id);
+      }
+    } finally {
+      releaseCheckout();
+      releaseAdapter();
     }
   });
 
