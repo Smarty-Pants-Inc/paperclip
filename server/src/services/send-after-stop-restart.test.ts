@@ -49,7 +49,7 @@ const support = await getEmbeddedPostgresTestSupport();
         intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } } });
     await db.insert(nativeRunFinalizations).values({ runId: sourceRunId, companyId, issueId, phase: "terminal_failure", failureCode: "native_retry_cancelled" });
     // The warm policy's handoff (retained, cleanup success, NO stop receipt) on a plugin (Boat) box.
-    await db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: sourceRunId, provider: "boat", providerLeaseId,
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, issueId, heartbeatRunId: sourceRunId, provider: "boat", providerLeaseId,
       status: variant === "non_retained" ? "active" : "retained", leasePolicy: "reuse_by_environment",
       cleanupStatus: "success", metadata: { pluginId: "boat-plugin" } });
     const comments = ["A", "B", "C"].map((body, index) => ({ id: randomUUID(), companyId, issueId, authorType: "user" as const,
