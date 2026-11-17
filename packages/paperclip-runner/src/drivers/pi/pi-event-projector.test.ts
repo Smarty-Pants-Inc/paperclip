@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildTranscript } from "../../browser/transcript-model.js";
 import { validatePrpEvent, type PrpEvent } from "../../protocol/replay-contract.js";
@@ -216,10 +218,20 @@ describe("large native tool output projection (synthetic incident regression)", 
     expect(JSON.stringify(input)).toBe(serialized);
     expect(projector.project({ type: "tool_execution_end", toolCallId: "typed", toolName: "bash", result: {} })[0].eventType).toBe("item.completed");
     // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was text: stringContaining("[Pi projection truncated]").
-    // An 800 KB answer cannot fit one 256 KiB record: it is spilled whole and referenced, never cut.
-    const huge = projector.project(final({ content: [{ type: "text", text: "semantic".repeat(100000) }] }))[0];
-    expect(huge).toMatchObject({ eventType: "item.completed", payload: { channel: "final", text: expect.stringMatching(/\[Full (?:answer|text): \//u) } });
-    expect(spilled(huge.payload.text)).toBe("semantic".repeat(100000));
+    // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was text: stringMatching(/\[Full (?:answer|text): \//u)
+    // (a box path in the person's text). An 800 KB answer cannot fit one 256 KiB record: the person's
+    // line says plainly the full text is kept, with a labelled excerpt and no path; the event carries
+    // the path and sha256 for the agent, and the file holds the whole answer.
+    const whole = "semantic".repeat(100000);
+    const huge = projector.project(final({ content: [{ type: "text", text: whole }] }))[0];
+    expect(huge).toMatchObject({ eventType: "item.completed", payload: { channel: "final" } });
+    const shown = String(huge.payload.text);
+    expect(shown.startsWith("This answer is longer than one message (800 KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\nsemantic")).toBe(true);
+    expect(shown).not.toMatch(/truncat|\[Full |\/paperclip-pi-spill|sha256/iu);
+    const fullText = huge.payload.fullText as { path: string; sha256: string; bytes: number };
+    expect(fullText).toMatchObject({ bytes: 800000, sha256: createHash("sha256").update(whole).digest("hex") });
+    expect(shown).not.toContain(fullText.path);
+    expect(readFileSync(fullText.path, "utf8")).toBe(whole);
     expectNoCutMarker(huge);
     expect(Buffer.byteLength(JSON.stringify(envelope(huge, 0)))).toBeLessThan(256 * 1024);
     expect(() => projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: "receipt", toolName: "bash", content: [], usage: { opaque: "receipt".repeat(100000) } } })).not.toThrow();
@@ -264,6 +276,64 @@ describe("large native tool output projection (synthetic incident regression)", 
     expect(events[1].payload).toMatchObject({ status: "completed", exitCode: 0, name: "find synthetic", output: result.content[0].text });
     expect(JSON.stringify(events)).not.toContain("fullOutput");
     expect(projector.project(input)).toEqual([]);
+  });
+});
+
+// Keep reason: F1/F4 are data-safety regressions at the native event -> spill-file trust boundary.
+describe("F1/F4 spill-file safety", () => {
+  it("redacts a 300 KiB final answer before any spill, including a secret after 64 KiB", () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-spill-redaction-"));
+    try {
+      const previewSecret = "fixture-preview-bearer";
+      const lateSecret = "fixture-late-bearer";
+      const prefix = `Authorization: Bearer ${previewSecret}\n${"x".repeat(80 * 1024)}\nAuthorization: Bearer ${lateSecret}\n`;
+      const body = prefix + "y".repeat(300 * 1024 - Buffer.byteLength(prefix));
+      expect(Buffer.byteLength(body)).toBe(300 * 1024);
+      expect(Buffer.byteLength(body.slice(0, body.indexOf(lateSecret)))).toBeGreaterThan(64 * 1024);
+      const events = createPiEventProjector({ runId: "run", turnId: "turn", spillDirectory: directory })
+        .project(final({ content: [{ type: "text", text: body }] }));
+      const answer = events.find(event => event.payload.kind === "agentMessage")!;
+      expect(answer).toMatchObject({ eventType: "item.completed", payload: { channel: "final", text: expect.stringContaining("Authorization: Bearer [REDACTED]") } });
+      expect(JSON.stringify(events)).not.toContain(previewSecret);
+      expect(JSON.stringify(events)).not.toContain(lateSecret);
+      const fullText = answer.payload.fullText as { path: string };
+      expect(readFileSync(fullText.path, "utf8")).toContain(`${"x".repeat(80 * 1024)}\nAuthorization: Bearer [REDACTED]`);
+      const filesUnder = (root: string): string[] => readdirSync(root, { withFileTypes: true }).flatMap(entry => {
+        const path = join(root, entry.name);
+        return entry.isDirectory() ? filesUnder(path) : [path];
+      });
+      const files = filesUnder(directory);
+      expect(files.length).toBeGreaterThan(0);
+      for (const path of files) {
+        const saved = readFileSync(path, "utf8");
+        expect(saved.includes(lateSecret), path).toBe(false);
+        expect(saved.includes(previewSecret), path).toBe(false);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["tool output", "final answer"])("repairs a pre-existing 0644 %s spill file to 0600", kind => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-spill-mode-"));
+    try {
+      // The escaped answer exceeds the JSON budget but not displayValue's raw-byte
+      // budget, so only finalAnswerText writes it; tool output exercises spillText.
+      const body = kind === "tool output" ? "x".repeat(128 * 1024) : "\\".repeat(240 * 1024);
+      const path = join(directory, `${createHash("sha256").update(body).digest("hex").slice(0, 32)}.txt`);
+      writeFileSync(path, "old spill", { mode: 0o644 });
+      chmodSync(path, 0o644);
+      expect(statSync(path).mode & 0o777).toBe(0o644);
+      const projector = createPiEventProjector({ runId: "run", turnId: "turn", spillDirectory: directory });
+      const events = projector.project(kind === "final answer" ? final({ content: [{ type: "text", text: body }] })
+        : { type: "tool_execution_end", toolCallId: "spill-mode", toolName: "read", result: { content: [{ type: "text", text: body }] } });
+      if (kind === "final answer") expect(events[0].payload.fullText).toMatchObject({ path });
+      else expect(spilled(events.find(event => event.eventType === "item.completed")?.payload.output)).toBe(body);
+      expect(readFileSync(path, "utf8")).toBe(body);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 

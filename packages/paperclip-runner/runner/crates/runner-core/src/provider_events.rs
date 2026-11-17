@@ -636,6 +636,20 @@ fn final_agent_message_text(value: &str) -> String {
     bounded
 }
 
+/// The agent-facing reference to the whole text of an answer longer than one
+/// record: only a well-formed {path, sha256, bytes} is carried.
+pub(crate) fn full_text_reference(value: Option<&Value>) -> Option<Value> {
+    let value = value?;
+    let path = value.get("path").and_then(Value::as_str)?;
+    let sha256 = value.get("sha256").and_then(Value::as_str)?;
+    let bytes = value.get("bytes").and_then(Value::as_u64)?;
+    (!path.is_empty()
+        && path.len() <= 4_096
+        && sha256.len() == 64
+        && sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| json!({"path": path, "sha256": sha256, "bytes": bytes}))
+}
+
 fn bounded_text(value: &str, max_chars: usize) -> String {
     let redacted = redact_text(value);
     if redacted.chars().count() <= max_chars {
@@ -1678,7 +1692,11 @@ pub(crate) fn normalize_pi_notification_in(
                 },
                 "text": params.get("text").or_else(|| provider_item.get("text"))
                     .and_then(Value::as_str).map(|text| bounded_text(text, MAX_TEXT_CHARS)),
-                "message": bounded_text(string(params.get("message")), MAX_TEXT_CHARS),
+                // Shown in the person's transcript (ui adapters/paperclip-runner
+                // index.ts item.failed): whole and redacted, never cut. The Pi
+                // projector already bounds it to one record. (`text` above is
+                // not rendered for a failed item and keeps its preview.)
+                "message": redact_sensitive_text_values(string(params.get("message"))),
             }),
         }];
     }
@@ -1716,6 +1734,27 @@ pub(crate) fn normalize_pi_notification_in(
                         // The durable outbox keeps it whole when it fits a frame.
                         .map(|text| json!(redact_sensitive_text_values(text)))
                         .unwrap_or(Value::Null);
+                    // An answer longer than one record: the person's text is a
+                    // plain line and a labelled excerpt; the path and sha256 of
+                    // the whole text are for the agent, never shown.
+                    if let Some(full) = full_text_reference(params.get("fullText")) {
+                        event.payload["fullText"] = full;
+                    }
+                }
+            }
+        }
+    }
+    // A Pi progress message is shown in the person's task chat. The Pi
+    // projector already bounds it to one record: keep it whole (redacted), not
+    // the 4,000-character "…[truncated]" preview.
+    if method == "item/completed"
+        && string(params.get("channel")) == "progress"
+        && string(item(params).get("type")) == "agentMessage"
+    {
+        for event in &mut events {
+            if event.payload.get("kind").and_then(Value::as_str) == Some("agentMessage") {
+                if let Some(text) = item(params).get("text").and_then(Value::as_str) {
+                    event.payload["text"] = json!(redact_sensitive_text_values(text));
                 }
             }
         }
@@ -2618,6 +2657,68 @@ mod tests {
         assert!(!events[0].payload.to_string().contains("pi-failure-secret"));
         let codex = normalize_codex_notification("item/failed", &json!({}));
         assert!(codex.is_empty());
+    }
+
+    // Paul NOTE 5 (RFL 11-17): an answer longer than one record is shown as a
+    // plain line and a labelled excerpt; the path and sha256 of the whole text
+    // travel in the event for the agent, never in the person's text.
+    #[test]
+    fn pi_final_answer_carries_the_full_text_reference_for_the_agent() {
+        let full = json!({"path": "/runner/tmp/paperclip-pi-spill/abc.txt",
+            "sha256": "0".repeat(64), "bytes": 800_000});
+        let events = normalize_pi_notification_in(
+            "item/completed",
+            &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:reply",
+                "kind":"agentMessage", "channel":"final", "fullText": full,
+                "item":{"id":"turn:reply", "type":"agentMessage", "text":"This answer is longer than one message (800 KB)."}}),
+            None,
+        );
+        let reply = events
+            .iter()
+            .find(|event| event.event_type == "item.completed")
+            .unwrap();
+        assert_eq!(reply.payload["channel"], "final");
+        assert_eq!(reply.payload["fullText"], full);
+        assert!(!reply.payload["text"].as_str().unwrap().contains("/runner"));
+    }
+
+    // Paul NOTE 5: a Pi progress message and a failed Pi item's message reach
+    // the person's task chat and transcript; neither is cut at 4,000
+    // characters with "…[truncated]".
+    #[test]
+    fn pi_progress_message_and_failed_item_message_arrive_whole() {
+        let long = format!(
+            "token=pi-secret {}",
+            "Checking the next file, then the tests. ".repeat(250)
+        );
+        assert!(long.chars().count() > 4_000);
+        let progress = normalize_pi_notification_in(
+            "item/completed",
+            &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:note",
+                "kind":"agentMessage", "channel":"progress",
+                "item":{"id":"turn:note", "type":"agentMessage", "text": long, "phase":"commentary"}}),
+            None,
+        );
+        let note = progress
+            .iter()
+            .find(|event| event.event_type == "item.completed")
+            .unwrap();
+        assert_eq!(note.payload["channel"], "progress");
+        assert_eq!(
+            note.payload["text"],
+            long.replace("pi-secret", "[REDACTED]")
+        );
+        let failed = normalize_pi_notification_in(
+            "item/failed",
+            &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:tool",
+                "kind":"commandExecution", "message": long}),
+            None,
+        );
+        assert_eq!(
+            failed[0].payload["message"],
+            long.replace("pi-secret", "[REDACTED]")
+        );
+        assert!(!failed[0].payload.to_string().contains("truncat"));
     }
 
     #[test]

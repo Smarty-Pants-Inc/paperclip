@@ -620,6 +620,7 @@ impl DurableState {
             &payload,
             sanitized_payload,
             config.max_frame_bytes,
+            &config.state_dir,
         );
         // Restore authoritative tool arguments before checking protocol identities.
         // Their contents are execution data, not a redacted diagnostic preview.
@@ -2052,70 +2053,104 @@ fn preserve_bounded_display_content(
 /// diagnostic preview cap would turn it into a cut-off copy, so keep its
 /// complete redacted text when it fits comfortably inside one transport frame.
 /// Otherwise (paged delivery is not built yet) the whole redacted answer is
-/// saved to a file and the person's text says so plainly, with a labelled
-/// excerpt; a cut preview is never presented as the answer.
+/// kept in the Runner state directory, which the server copies out at every
+/// settled checkpoint and restores into a replacement box, and the person's
+/// text is one plain, true line plus a labelled excerpt. The path and sha256
+/// travel in the event's `fullText` for the agent; they are never shown.
 fn preserve_final_agent_message_text(
     event_type: &str,
     original: &Value,
-    mut sanitized: Value,
+    sanitized: Value,
     max_frame_bytes: usize,
+    state_dir: &Path,
 ) -> Value {
-    if event_type != "item.completed"
-        || !matches!(
-            original.get("kind").and_then(Value::as_str),
-            Some("agentMessage" | "assistant_message")
-        )
-        || original.get("channel").and_then(Value::as_str) != Some("final")
-    {
-        return sanitized;
-    }
-    let Some(text) = original.get("text").and_then(Value::as_str) else {
+    let message_kind = matches!(
+        original.get("kind").and_then(Value::as_str),
+        Some("agentMessage" | "assistant_message")
+    );
+    let channel = original.get("channel").and_then(Value::as_str);
+    // Person-visible text: the final answer, a progress message (task chat)
+    // and a failed Pi item's message (transcript).
+    let (field, noun) = match event_type {
+        "item.completed" if message_kind && channel == Some("final") => ("text", "answer"),
+        "item.completed" if message_kind && channel == Some("progress") => ("text", "text"),
+        "item.failed" if original.get("provider").and_then(Value::as_str) == Some("pi_rpc") => {
+            ("message", "text")
+        }
+        _ => return sanitized,
+    };
+    let Some(text) = original.get(field).and_then(Value::as_str) else {
         return sanitized;
     };
     let mut candidate = sanitized.clone();
     let Some(object) = candidate.as_object_mut() else {
         return sanitized;
     };
+    // An upstream projector may already have kept a longer answer whole.
+    match crate::provider_events::full_text_reference(original.get("fullText")) {
+        Some(full) if noun == "answer" => object.insert("fullText".to_owned(), full),
+        _ => object.remove("fullText"),
+    };
     let whole = redact_sensitive_text_values(text);
-    object.insert("text".to_owned(), Value::String(whole.clone()));
+    object.insert(field.to_owned(), Value::String(whole.clone()));
     // Size the serialized payload, not the raw text: JSON escaping can double
     // the text, and the secure frame hex-encodes the encrypted envelope,
-    // doubling it again. Keep the bounded preview unless the complete payload,
-    // its envelope and the secure-frame wrapper all fit in one frame.
-    let Ok(serialized_bytes) = serde_json::to_vec(&candidate).map(|bytes| bytes.len()) else {
+    // doubling it again. Keep the whole text only if the complete payload, its
+    // envelope and the secure-frame wrapper all fit in one frame.
+    let Ok(serialized_bytes) = serde_json::to_vec(&*object).map(|bytes| bytes.len()) else {
         return sanitized;
     };
     let budget = (max_frame_bytes / 2).saturating_sub(FINAL_AGENT_MESSAGE_FRAME_HEADROOM_BYTES);
     if serialized_bytes <= budget {
         return candidate;
     }
-    // Too large for one frame: keep the frame bound, never cut silently.
-    let Some(object) = sanitized.as_object_mut() else {
-        return sanitized;
-    };
-    let base_bytes = serialized_bytes.saturating_sub(
-        serde_json::to_vec(&whole)
-            .map(|bytes| bytes.len())
-            .unwrap_or(0),
-    );
+    // Longer than one frame: keep the frame bound, never cut silently.
+    object.remove("fullText");
+    let full = keep_whole_final_answer(&whole, state_dir);
+    if let Some(full) = &full {
+        object.insert("fullText".to_owned(), full.clone());
+    }
+    let base_bytes = serde_json::to_vec(&*object)
+        .map(|bytes| bytes.len())
+        .unwrap_or(serialized_bytes)
+        .saturating_sub(
+            serde_json::to_vec(&whole)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0),
+        );
     object.insert(
-        "text".to_owned(),
+        field.to_owned(),
         Value::String(oversized_final_answer_notice(
             &whole,
+            noun,
+            full.is_some(),
             budget.saturating_sub(base_bytes),
         )),
     );
-    sanitized
+    candidate
 }
 
-/// The person's text for a final answer too large for one frame: a plain
-/// statement, where the whole answer is kept, and a clearly labelled excerpt
-/// that fits `budget` serialized bytes.
-fn oversized_final_answer_notice(whole: &str, budget: usize) -> String {
+/// Above this, the whole answer is not copied into the Runner state directory
+/// (the server's checkpoint archive is bounded); it stays in the agent's own
+/// conversation transcript.
+const MAX_KEPT_FINAL_ANSWER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Keeps the whole redacted answer in `<state_dir>/final-answers/` (the Runner
+/// state directory is the `runner` directory of the server's harness
+/// checkpoint) and returns the agent-facing reference.
+fn keep_whole_final_answer(whole: &str, state_dir: &Path) -> Option<Value> {
+    if whole.len() > MAX_KEPT_FINAL_ANSWER_BYTES {
+        return None;
+    }
     let digest = format!("{:x}", Sha256::digest(whole.as_bytes()));
-    let directory = std::env::temp_dir().join("paperclip-runner-final-answers");
+    let directory = state_dir.join("final-answers");
     let path = directory.join(format!("{}.txt", &digest[..32]));
-    let saved = fs::create_dir_all(&directory)
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(&directory)
         .and_then(|()| {
             let mut options = OpenOptions::new();
             options.write(true).create(true).truncate(true);
@@ -2123,14 +2158,32 @@ fn oversized_final_answer_notice(whole: &str, budget: usize) -> String {
             options.mode(0o600);
             options.open(&path)
         })
-        .and_then(|mut file| file.write_all(whole.as_bytes()));
-    let location = match saved {
-        Ok(()) => format!("The whole answer is saved at {} (sha256 {digest}).", path.display()),
-        Err(error) => format!("The whole answer could not be saved to a file ({error}); it remains in the agent's session (sha256 {digest})."),
+        .and_then(|mut file| file.write_all(whole.as_bytes()))
+        .ok()?;
+    Some(json!({
+        "path": path.to_string_lossy(),
+        "sha256": digest,
+        "bytes": whole.len(),
+    }))
+}
+
+/// The person's text for a final answer longer than one frame: one plain,
+/// true line and a clearly labelled excerpt that fits `budget` serialized
+/// bytes. No path, digest or cut marker.
+fn oversized_final_answer_notice(
+    whole: &str,
+    noun: &str,
+    kept_in_runner_state: bool,
+    budget: usize,
+) -> String {
+    let kilobytes = whole.len().div_ceil(1000);
+    let kept = if kept_in_runner_state {
+        "The full text is kept"
+    } else {
+        "The full text is kept in the agent's conversation"
     };
     let notice = format!(
-        "This answer is too large to deliver in one message ({} bytes), so it was not cut. {location}\n\nThe answer begins (an excerpt, not the whole answer):\n\n",
-        whole.len()
+        "This {noun} is longer than one message ({kilobytes} KB). {kept}; ask me to show any part.\n\nExcerpt (the start of the {noun}, not the whole {noun}):\n\n"
     );
     let mut used = serde_json::to_vec(&notice)
         .map(|bytes| bytes.len())
@@ -4665,10 +4718,16 @@ mod tests {
     #[test]
     fn keeps_the_complete_final_answer_instead_of_a_display_preview() {
         let config = config(PathBuf::from("unused"));
-        let mut state = DurableState::new(&config);
         let answer = format!("token=secret-value {}", "Every open task. ".repeat(400));
         assert!(answer.len() > 4_096);
-        for (channel, complete) in [("final", true), ("progress", false)] {
+        // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was
+        // [("final", true), ("progress", false)]: a progress message (shown in
+        // the person's task chat) kept the 4,096-byte preview ending
+        // "…[truncated]". Now it is kept whole when it fits a frame, like the
+        // final answer.
+        for (channel, complete) in [("final", true), ("progress", true)] {
+            // One outbox per channel: two whole answers exceed the test outbox.
+            let mut state = DurableState::new(&config);
             state
                 .enqueue_event(
                     &config,
@@ -4696,9 +4755,14 @@ mod tests {
 
         // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): this
         // half formerly asserted that a frame too small for the complete answer
-        // keeps the 4,096-byte preview ending "…[truncated]". Now the person is
-        // told plainly, and the whole answer is kept in a referenced file.
+        // keeps the 4,096-byte preview ending "…[truncated]", and then (pack-n5b)
+        // that the person's text names a TMPDIR file. Now the person is told
+        // plainly that the full text is kept, with a labelled excerpt and no
+        // box path; the whole answer is kept in the Runner state directory (the
+        // server checkpoints it), and its path and sha256 are in the event for
+        // the agent.
         let mut small_frame = config.clone();
+        small_frame.state_dir = temporary_directory("final-answer-notice");
         small_frame.max_frame_bytes = 8_000;
         let mut small = DurableState::new(&small_frame);
         small
@@ -4709,27 +4773,103 @@ mod tests {
                 json!({"kind": "agentMessage", "channel": "final", "text": answer}),
             )
             .unwrap();
-        let shown = small.outbox[0]
+        let payload = small.outbox[0]
             .envelope
-            .pointer("/payload/payload/text")
-            .and_then(Value::as_str)
+            .pointer("/payload/payload")
             .unwrap()
-            .to_owned();
-        assert_oversized_answer_notice(&shown, &answer.replace("secret-value", "[REDACTED]"));
+            .clone();
+        assert_oversized_answer_notice(
+            &payload,
+            &answer.replace("secret-value", "[REDACTED]"),
+            &small_frame.state_dir,
+        );
+        let _ = std::fs::remove_dir_all(&small_frame.state_dir);
     }
 
-    /// The person sees a plain statement (not a cut copy presented as the
-    /// answer), and the referenced file holds the whole redacted answer.
-    fn assert_oversized_answer_notice(shown: &str, whole: &str) {
-        assert!(!shown.contains("…[truncated]"), "{shown}");
-        assert!(shown.starts_with("This answer is too large"), "{shown}");
-        assert!(shown.contains("excerpt, not the whole answer"), "{shown}");
-        let path = shown
-            .split("The whole answer is saved at ")
-            .nth(1)
-            .and_then(|rest| rest.split(' ').next())
-            .expect("spill path in the notice");
+    /// The person sees one plain, true line (the full text is kept; ask for
+    /// any part) and a clearly labelled excerpt: never a cut marker, a box
+    /// path or a digest. The event carries the path and sha256 for the agent,
+    /// and that file, in the Runner state directory the server checkpoints,
+    /// holds the whole redacted answer.
+    fn assert_oversized_answer_notice(payload: &Value, whole: &str, state_dir: &Path) {
+        let shown = payload.get("text").and_then(Value::as_str).unwrap();
+        let kb = whole.len().div_ceil(1000);
+        assert!(
+            shown.starts_with(&format!(
+                "This answer is longer than one message ({kb} KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n"
+            )),
+            "{}",
+            &shown[..shown.len().min(400)]
+        );
+        assert!(!shown.to_lowercase().contains("truncat"));
+        let full = payload.get("fullText").expect("fullText for the agent");
+        let path = full.get("path").and_then(Value::as_str).unwrap();
+        let digest = full.get("sha256").and_then(Value::as_str).unwrap();
+        assert!(!shown.contains(path));
+        assert!(!shown.contains(digest));
+        assert!(!shown.contains("final-answers"));
+        assert!(Path::new(path).starts_with(state_dir), "{path}");
+        assert_eq!(digest, format!("{:x}", Sha256::digest(whole.as_bytes())));
+        assert_eq!(
+            full.get("bytes").and_then(Value::as_u64),
+            Some(whole.len() as u64)
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), whole);
+    }
+
+    // Paul NOTE 5: a failed Pi item's message is shown in the person's
+    // transcript (ui adapters/paperclip-runner index.ts item.failed); it is kept
+    // whole when it fits a frame, never the 4,096-byte "…[truncated]" preview.
+    #[test]
+    fn pi_failed_item_message_leaves_the_outbox_whole() {
+        let frame = config(PathBuf::from("unused"));
+        let mut state = DurableState::new(&frame);
+        let message = format!(
+            "token=secret-value {}",
+            "Pi tool failed: line\n".repeat(500)
+        );
+        assert!(message.len() > 4_096);
+        state
+            .enqueue_event(
+                &frame,
+                "item.failed",
+                EventPriority::P1,
+                json!({"provider": "pi_rpc", "kind": "commandExecution", "status": "failed",
+                    "channel": "detail", "message": message}),
+            )
+            .unwrap();
+        let shown = state.outbox[0]
+            .envelope
+            .pointer("/payload/payload/message")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(shown, message.replace("secret-value", "[REDACTED]"));
+        assert!(!shown.contains("truncat"));
+    }
+
+    // Paul NOTE 5: a projector's agent-facing reference to an answer longer
+    // than one record leaves the outbox exactly as sent.
+    #[test]
+    fn final_answer_full_text_reference_leaves_the_outbox_unchanged() {
+        let frame = config(PathBuf::from("unused"));
+        let mut state = DurableState::new(&frame);
+        let full = json!({"path": "/runner/tmp/paperclip-pi-spill/0123.txt",
+            "sha256": "ab".repeat(32), "bytes": 800_000});
+        state
+            .enqueue_event(
+                &frame,
+                "item.completed",
+                EventPriority::P1,
+                json!({"kind": "agentMessage", "channel": "final",
+                    "text": "This answer is longer than one message (800 KB).", "fullText": full}),
+            )
+            .unwrap();
+        assert_eq!(
+            state.outbox[0]
+                .envelope
+                .pointer("/payload/payload/fullText"),
+            Some(&full)
+        );
     }
 
     // C4 (pack-n5): at the production frame (paperclip-runnerd default 1 MiB)
@@ -4765,10 +4905,10 @@ mod tests {
 
     #[test]
     fn final_answer_frame_check_counts_json_escaping_and_hex_encoding() {
-        let mut frame = config(PathBuf::from("unused"));
+        let mut frame = config(temporary_directory("final-answer-frame"));
         frame.max_frame_bytes = 64 * 1024;
         frame.max_outbox_bytes = 1024 * 1024;
-        let final_text = |answer: &str| {
+        let final_payload = |answer: &str| {
             let mut state = DurableState::new(&frame);
             state
                 .enqueue_event(
@@ -4785,23 +4925,26 @@ mod tests {
                 envelope_bytes * 2 < frame.max_frame_bytes,
                 "{envelope_bytes}"
             );
-            envelope
-                .pointer("/payload/payload/text")
-                .and_then(Value::as_str)
-                .unwrap()
-                .to_owned()
+            envelope.pointer("/payload/payload").unwrap().clone()
         };
 
         // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was
         // assert!(final_text(&quotes).ends_with("…[truncated]")). 20,000 raw
-        // bytes, about 40,000 once JSON-escaped, do not fit: say so plainly and
-        // keep the whole answer in a referenced file; the frame bound still holds.
+        // bytes, about 40,000 once JSON-escaped, do not fit: say so plainly
+        // (no box path) and keep the whole answer in the Runner state
+        // directory; the frame bound still holds.
         let quotes = "\"".repeat(20_000);
-        assert_oversized_answer_notice(&final_text(&quotes), &quotes);
+        assert_oversized_answer_notice(&final_payload(&quotes), &quotes, &frame.state_dir);
 
         // The same length of plain prose fits and is kept complete.
         let prose = "a".repeat(20_000);
-        assert_eq!(final_text(&prose), prose);
+        let payload = final_payload(&prose);
+        assert_eq!(
+            payload.get("text").and_then(Value::as_str),
+            Some(prose.as_str())
+        );
+        assert!(payload.get("fullText").is_none());
+        let _ = std::fs::remove_dir_all(&frame.state_dir);
     }
 
     #[test]

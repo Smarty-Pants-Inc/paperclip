@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
@@ -61,8 +61,31 @@ function spillText(value: string, label: "input" | "output" | "text" | "answer",
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const path = join(root, `${createHash("sha256").update(value).digest("hex").slice(0, 32)}.txt`);
   writeFileSync(path, value, { mode: 0o600 });
+  chmodSync(path, 0o600);
   const reference = `\n\n[Full ${label}: ${path} (${Buffer.byteLength(value)} bytes; the excerpt above is its beginning; open the file to read all of it)]`;
   return fittingPrefix(value, Math.max(256, Math.min(SPILL_PREVIEW_BYTES, budget) - jsonBytes(reference))) + reference;
+}
+/** Where the whole of a final answer longer than one record is kept, for the agent (never shown to the person). */
+export interface PiFullTextReference { path: string; sha256: string; bytes: number }
+/**
+ * A final answer that fits one record is returned whole. A longer one is kept
+ * WHOLE (the same content-addressed spill file Pi's read tool can open; the
+ * durable copy is the answer itself in Pi's own session transcript, which the
+ * server checkpoints and restores). The person's text is one plain, true line
+ * and a clearly labelled excerpt: no path, digest or cut marker. The path and
+ * sha256 travel in the event's fullText for the agent.
+ */
+function finalAnswerText(value: string, budget = MAX_ANSWER_BYTES, directory?: string): { text: string; fullText?: PiFullTextReference } {
+  if (jsonBytes(value) <= budget) return { text: value };
+  const root = directory ?? join(tmpdir(), "paperclip-pi-spill");
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const sha256 = digest(value);
+  const path = join(root, `${sha256.slice(0, 32)}.txt`);
+  writeFileSync(path, value, { mode: 0o600 });
+  chmodSync(path, 0o600);
+  const bytes = Buffer.byteLength(value);
+  const notice = `This answer is longer than one message (${Math.ceil(bytes / 1000)} KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n`;
+  return { text: notice + fittingPrefix(value, Math.max(256, Math.min(SPILL_PREVIEW_BYTES, budget) - jsonBytes(notice))), fullText: { path, sha256, bytes } };
 }
 /** Live partial output only: a labelled tail; the whole output arrives with the tool result. */
 function liveOutputPreview(value: string, budget = SPILL_PREVIEW_BYTES): string {
@@ -87,7 +110,10 @@ function pages(value: string, budget = PAGE_BYTES): string[] {
 /** Same sensitive-parent rule as codex-boundaries.ts:364-385, before flattening. */
 function displayValue(value: unknown, depth = 0, preview = (value: string) => value, previewStrings = false): unknown {
   if (depth > 32) throw new Error("pi_projection_depth_limit");
-  if (typeof value === "string") return redactProviderDiagnostic(previewStrings && Buffer.byteLength(value) > MAX_ANSWER_BYTES ? preview(value) : value);
+  if (typeof value === "string") {
+    const safe = redactProviderDiagnostic(value);
+    return previewStrings && Buffer.byteLength(safe) > MAX_ANSWER_BYTES ? preview(safe) : safe;
+  }
   if (Array.isArray(value)) return value.map(entry => displayValue(entry, depth + 1, preview, previewStrings));
   if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key,
     /token|secret|password|api.?key|authorization|credential|thinkingSignature|thoughtSignature/i.test(key) && !/^(?:totalTokens|inputTokens|outputTokens|cachedInputTokens|cacheWriteTokens|tokensBefore|estimatedTokensAfter)$/u.test(key) ? "[REDACTED]" : displayValue(entry, depth + 1, preview, previewStrings || /^(?:args|arguments|text|thinking|content|errorMessage)$/u.test(key)),
@@ -466,6 +492,8 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         const failed = message.stopReason === "error" || message.stopReason === "aborted";
         if (failed) { usageComplete = false; costComplete = false; }
         const content = Array.isArray(message.content) ? message.content : [];
+        const nativeMessageContent = record(source.message).content;
+        const nativeContent: unknown[] = Array.isArray(nativeMessageContent) ? nativeMessageContent : [];
         for (const [index, entry] of content.entries()) {
           const part = record(entry);
           if (part.type === "toolCall") {
@@ -478,9 +506,15 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
             const kind = part.type === "thinking" ? "reasoning" : "agentMessage";
             const block = blockFor(index, kind);
             if (block.terminal) continue;
-            // The person's whole answer: inline up to the record bound, else spilled whole and referenced.
-            block.text = projectText(text(kind === "reasoning" ? part.thinking : part.text), MAX_ANSWER_BYTES, kind === "reasoning" ? "text" : "answer"); block.terminal = true;
+            // The person's whole answer: inline up to the record bound; a longer answer is kept whole
+            // and shown as a plain line plus a labelled excerpt (fullText names it for the agent).
+            // Read the native text: displayValue already replaced an oversized string with a spill reference.
+            const answer = kind === "reasoning" ? undefined
+              : finalAnswerText(redactProviderDiagnostic(text(record(nativeContent[index]).text)), MAX_ANSWER_BYTES, spillDirectory);
+            if (answer?.fullText) displayTruncated = true;
+            block.text = answer ? answer.text : projectText(text(part.thinking), MAX_ANSWER_BYTES, "text"); block.terminal = true;
             output.push(emit(failed ? "item.failed" : "item.completed", block.id, { kind, channel: kind === "reasoning" ? "detail" : message.stopReason === "toolUse" ? "progress" : "final", text: block.text,
+              ...(answer?.fullText ? { fullText: answer.fullText } : {}),
               ...(failed ? { message: projectText(text(message.errorMessage) || `Pi ${message.stopReason}`) } : {}),
             }));
           }
