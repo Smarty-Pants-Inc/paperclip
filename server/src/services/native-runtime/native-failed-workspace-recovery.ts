@@ -203,7 +203,10 @@ export async function preserveNativeFailedWorkspace(db: Db, selected: Pick<typeo
     const retainFiles = !nativeRunHasNoWorkspaceAccess(run);
     const alreadyRetained = hasRequiredWorkspaceRecovery(run.resultJson);
     if (retainFiles && !alreadyRetained) await notifyDeliveryWork(tx, DELIVERY_QUEUES.workspaceRecovery);
-    let retained = !retainFiles || alreadyRetained ? run : await recordRequiredWorkspaceRestoreFailure(tx as unknown as Db, run, { workspaceRestoreFailure: "restore_failed" }, source);
+    // Only an exhausted copy-back or a failed export recorded a real failure;
+    // otherwise this pins owed files before any restore was tried (words only).
+    let retained = !retainFiles || alreadyRetained ? run : await recordRequiredWorkspaceRestoreFailure(tx as unknown as Db, run,
+      { workspaceRestoreFailure: "restore_failed" }, source, { restorePending: !exhaustedAcceptedCopyback });
     if (!retained || retainFiles && !hasRequiredWorkspaceRecovery(retained.resultJson)) return;
     if (options.allowPreterminal && coordinator.phase === "observed") {
       await notifyExecutionRunWork(tx, { companyId: run.companyId });
