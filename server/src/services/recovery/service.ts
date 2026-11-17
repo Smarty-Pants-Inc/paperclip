@@ -4973,6 +4973,31 @@ export function recoveryService(
       issueIds: [] as string[],
     };
 
+    // rf-3 R-SILENT (D137/D138 on a BLOCKED task): the person's latest message
+    // to a blocked conversation whose wake failed without a run. The candidates
+    // above exclude blocked tasks, so nothing else would deliver it, and the
+    // card has no run to show. A person's message wakes a blocked task like any
+    // other (heartbeat.ts shouldAutoCheckoutIssueForWake checks out "blocked"),
+    // so the same owner as the unblocked shape re-offers it once (same key).
+    const blockedConversations = await db.select(recoveryIssueFields).from(issues).where(and(
+      opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+      opts?.issueId ? eq(issues.id, opts.issueId) : undefined,
+      eq(issues.status, "blocked"), isNull(issues.assigneeUserId), isNull(issues.hiddenAt),
+      sql`${issues.conversationAgentId} is not null`,
+      opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+      sql`exists (select 1 from agent_wakeup_requests failed_wake where failed_wake.company_id = ${issues.companyId}
+        and failed_wake.status = 'failed' and failed_wake.run_id is null and failed_wake.payload->>'issueId' = ${issues.id}::text)`,
+    ));
+    if (blockedConversations.length && (await instanceSettingsService(db).getExperimental()).enableAgentChat) {
+      for (const issue of blockedConversations) {
+        if (await latestPersonMessageTurn(db, issue)) continue;
+        if (await redeliverFailedConversationDelivery(db, issue, deps.enqueueWakeup) === "redelivered") {
+          result.continuationRequeued += 1;
+          result.issueIds.push(issue.id);
+        }
+      }
+    }
+
     const pass = opts?.pass ?? (candidates.length > 1
       ? createRecoveryPassReads(candidates.filter((issue) => issue.status === "in_review").map((issue) => issue.id)) : undefined);
     const handledIssueIds = await resumeShutdownStoppedRetryPreparations(candidates, result, opts?.onDeferredDeadline);
