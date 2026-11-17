@@ -561,6 +561,134 @@ describe("persistent agent directories", () => {
         expect(await copies.adopt({ companyId, agentId, runId: secondId, previousRunId: first.runId, cwd: home })).toBeNull();
         await copies.collectStopped({ companyId, runId: first.runId });
       }, 20_000);
+
+      // Paul's REAL shape: the chat runs on a REMOTE sandbox (Boat). AGENT_HOME is
+      // the remote executionRoot and is written into the runner's instruction text,
+      // so a fresh restore into a new per-run root forces native_runner_refresh_required.
+      async function sandbox() {
+        const remoteCwd = await fs.mkdtemp(path.join(home, "boat-sandbox-"));
+        const runner: import("@paperclipai/adapter-utils/command-managed-runtime").CommandManagedRuntimeRunner = {
+          execute: async input => {
+            const startedAt = new Date().toISOString();
+            const env = { ...process.env, ...input.env };
+            const args = [...(input.args ?? [])];
+            if (input.stdin != null && (args[0] === "-c" || args[0] === "-lc")) {
+              env.PAPERCLIP_TEST_STDIN = input.stdin;
+              args[1] = `printf '%s' "$PAPERCLIP_TEST_STDIN" | (${args[1]})`;
+            }
+            try {
+              const result = await execFile(input.command, args, { cwd: input.cwd, env, timeout: input.timeoutMs, maxBuffer: 32 * 1024 * 1024 });
+              return { exitCode: 0, signal: null, timedOut: false, stdout: result.stdout, stderr: result.stderr, pid: null, startedAt };
+            } catch (error) {
+              const e = error as { code?: number; signal?: NodeJS.Signals; stdout?: string; stderr?: string };
+              return { exitCode: typeof e.code === "number" ? e.code : 1, signal: e.signal ?? null, timedOut: false, stdout: e.stdout ?? "", stderr: e.stderr ?? "", pid: null, startedAt };
+            }
+          },
+        };
+        const executionTarget = { kind: "remote" as const, transport: "sandbox" as const, environmentId: randomUUID(), leaseId: "", remoteCwd, runner };
+        await db.insert(environments).values({ id: executionTarget.environmentId, name: `Boat sandbox ${executionTarget.environmentId}`, driver: "sandbox" });
+        const prepare = async (options: { warm?: boolean; reuseRunId?: string } = {}) => {
+          const runId = await nextRun();
+          executionTarget.leaseId = randomUUID();
+          await db.insert(environmentLeases).values({ id: executionTarget.leaseId, companyId, environmentId: executionTarget.environmentId,
+            heartbeatRunId: runId, provider: "daytona", providerLeaseId: "boat-fixture-allocation" });
+          return (await copies.prepare({ ...target(), runId, cwd: home, target: executionTarget, ...options }))!;
+        };
+        // A sibling task on the same sandbox saves through its own remote run.
+        const siblingSavesRemote = async (relative: string, body: string) => {
+          const sibling = await prepare();
+          await fs.mkdir(path.dirname(path.join(sibling.executionRoot, relative)), { recursive: true });
+          await fs.writeFile(path.join(sibling.executionRoot, relative), body);
+          expect((await copies.collectStopped({ companyId, runId: sibling.runId, target: executionTarget }))?.state).toBe("saved");
+          expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(body);
+        };
+        return { executionTarget, prepare, siblingSavesRemote };
+      }
+      const contextFor = async (copy: { runId: string; executionRoot: string }) => buildNativeRuntimeContext({ db, agent: { id: agentId, companyId, name: "Target",
+        adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } },
+        runId: copy.runId, runtimeConfig: {}, runtimeSkillEntries: [], instructionWorkingCopy: { rootPath: copy.executionRoot, entryPath: "AGENTS.md", kind: "agent_files" } });
+
+      it("REMOTE sandbox: keeps chat A warm on its SAME AGENT_HOME after a sibling saves a memory note; a NEW chat sees the note and DECISIONS", async () => {
+        await paulBundle();
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect(chatA.location).toBe(`remote:${boat.executionTarget.environmentId}`);
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        const before = await onDisk(root);
+        await boat.siblingSavesRemote(note, "NOTE-FACT: Kate takes the SMA-612 handover.\n");
+
+        // Chat A's FIRST next turn reuses the same remote root: no retirement, no re-copy.
+        expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(true);
+        const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+        expect(turn2.executionRoot).toBe(chatA.executionRoot);
+        expect(turn2.localRoot).toBe(chatA.localRoot);
+        expect(await copies.get(companyId, chatA.runId)).toMatchObject({ state: "superseded", receipt: { successorRunId: turn2.runId } });
+        // 'AGENT_HOME is <root>' and every other instruction byte the runner compares are unchanged.
+        const [contextA, context2] = [await contextFor(chatA), await contextFor(turn2)];
+        expect(context2.instructions).toEqual(contextA.instructions);
+        expect(context2.aggregateDigest).toBe(contextA.aggregateDigest);
+        // The sibling's note is readable in the remote folder chat A is using.
+        expect(await fs.readFile(path.join(turn2.executionRoot, note), "utf8")).toBe("NOTE-FACT: Kate takes the SMA-612 handover.\n");
+        expect(await onDisk(turn2.executionRoot).then(files => files.filter(name => !name.startsWith(".paperclip-runtime/")))).toEqual([...before, note].sort());
+        // The refreshed tree is the new checkpoint baseline: an idle turn saves nothing.
+        expect((await copies.checkpointWarm({ companyId, runId: turn2.runId, target: boat.executionTarget }))).toMatchObject({ state: "warm_saved", receipt: { checkpointState: "unchanged" } });
+
+        // A NEW chat restores the whole folder: the note and the DECISIONS.md fact.
+        const chatB = await boat.prepare({ warm: true });
+        expect(chatB.executionRoot).not.toBe(chatA.executionRoot);
+        expect(await fs.readFile(path.join(chatB.executionRoot, note), "utf8")).toContain("NOTE-FACT");
+        expect(await fs.readFile(path.join(chatB.executionRoot, "DECISIONS.md"), "utf8")).toContain("DECISION-FACT");
+
+        // Never-OK: chat A's own later save keeps every note (nothing dropped or moved).
+        await fs.writeFile(path.join(turn2.executionRoot, "memory/2026-11-17-chat-a.md"), "chat A note\n");
+        expect((await copies.checkpointWarm({ companyId, runId: turn2.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        await copies.collectStopped({ companyId, runId: turn2.runId, target: boat.executionTarget });
+        await copies.collectStopped({ companyId, runId: chatB.runId, target: boat.executionTarget });
+        expect(await onDisk(root)).toEqual([...before, note, "memory/2026-11-17-chat-a.md"].sort());
+        expect(await fs.readFile(path.join(root, note), "utf8")).toContain("NOTE-FACT");
+      }, 30_000);
+
+      it("REMOTE sandbox never-OK: chat A's unsynced write survives a sibling note (no refresh over a dirty tree)", async () => {
+        await paulBundle();
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        // Chat A writes after its last checkpoint (its idle tree no longer equals the baseline).
+        await fs.writeFile(path.join(chatA.executionRoot, "memory/2026-11-17-a-unsynced.md"), "A-UNSYNCED\n");
+        await boat.siblingSavesRemote(note, "NOTE-FACT sibling\n");
+        const runId = await nextRun();
+        await expect(copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId }))
+          .rejects.toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        // The tree was not touched: A's write is still there and the sibling's note was not pushed over it.
+        expect(await fs.readFile(path.join(chatA.executionRoot, "memory/2026-11-17-a-unsynced.md"), "utf8")).toBe("A-UNSYNCED\n");
+        await expect(fs.stat(path.join(chatA.executionRoot, note))).rejects.toMatchObject({ code: "ENOENT" });
+        // Retirement collects A first; then the fresh copy has both A's write and the sibling's note.
+        expect((await copies.collectStopped({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("saved");
+        expect(await fs.readFile(path.join(root, "memory/2026-11-17-a-unsynced.md"), "utf8")).toBe("A-UNSYNCED\n");
+        expect(await fs.readFile(path.join(root, note), "utf8")).toBe("NOTE-FACT sibling\n");
+        const fresh = await boat.prepare({ warm: true });
+        expect(await fs.readFile(path.join(fresh.executionRoot, "memory/2026-11-17-a-unsynced.md"), "utf8")).toBe("A-UNSYNCED\n");
+        expect(await fs.readFile(path.join(fresh.executionRoot, note), "utf8")).toBe("NOTE-FACT sibling\n");
+        await copies.collectStopped({ companyId, runId: fresh.runId, target: boat.executionTarget });
+      }, 30_000);
+
+      it.each(["AGENTS.md", "DECISIONS.md"])("REMOTE sandbox: still retires the warm chat when a sibling edits %s", async edited => {
+        await paulBundle();
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        await boat.siblingSavesRemote(edited, `# ${edited} edited\n`);
+        expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(false);
+        const runId = await nextRun();
+        await expect(copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId }))
+          .rejects.toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        expect(await fs.readFile(path.join(chatA.executionRoot, edited), "utf8")).not.toBe(`# ${edited} edited\n`);
+        await copies.collectStopped({ companyId, runId: chatA.runId, target: boat.executionTarget });
+        const fresh = await boat.prepare({ warm: true });
+        expect(fresh.executionRoot).not.toBe(chatA.executionRoot);
+        expect(await fs.readFile(path.join(fresh.executionRoot, edited), "utf8")).toBe(`# ${edited} edited\n`);
+        await copies.collectStopped({ companyId, runId: fresh.runId, target: boat.executionTarget });
+      }, 30_000);
     });
 
     it("adopts one physical root and fences stale cleanup through final save", async () => {
