@@ -173,7 +173,7 @@ describe("native failed-turn continuation", () => {
     else {
       expect.soft(next).toHaveLength(1);
       expect.soft(next[0]?.contextSnapshot?.source,"must not use generic status-decision retry").not.toBe("native_status_decision");
-      if(code==="pi_output_truncated") expect.soft(next[0]?.contextSnapshot?.forceFreshSession,"cap recovery must be fresh").toBe(true);
+      if(code==="pi_output_truncated") expect.soft(next[0]?.contextSnapshot?.forceFreshSession,"cap recovery: a new process on the SAME conversation; the cut turn is not sent").toBe(true);
     }
     await db.update(heartbeatRuns).set({status:"succeeded",finishedAt:new Date()}).where(eq(heartbeatRuns.id,hold));
     await heartbeat.drainActiveRunExecutions();

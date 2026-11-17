@@ -331,7 +331,8 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
   // runs at 'high' (capacity-lead's probe: xhigh 128k all thinking, high the
   // whole answer at 78k), as a run-level override through the task-override
   // path heartbeat applies (heartbeat.ts -> projectPaperclipRunnerTaskConfig ->
-  // the native input's piRpcThinkingLevel, a FRESH session admits it).
+  // the native input's piRpcThinkingLevel). A new process on the SAME
+  // conversation admits it; the cut turn is not sent.
   it("dl-n5-cont3 (1)(2) RED: the cap-stop recovery run's native input carries 'high'; the stored config and the next normal run stay xhigh", async () => {
     const { resolveRunAssigneeAdapterOverrides } = await import("../thinking-cap-stop.js");
     const { projectPaperclipRunnerTaskConfig, resolvePaperclipRunnerNativeProviderInput } = await import("../native-runtime/provider-profile.js");

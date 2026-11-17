@@ -14,7 +14,8 @@ export const NATIVE_PROVIDER_REFUSAL_TERMINAL_REASON = "native_provider_refusal_
 
 /**
  * - `output_cap_no_text`: the turn stopped at the output cap (`pi_output_truncated`)
- *   having streamed no answer text. Recovery runs in a FRESH session at 'high'.
+ *   having streamed no answer text. Recovery runs at 'high': a new process on
+ *   the SAME conversation; the cut turn is not sent.
  * - `output_cap`: the cap cut an answer that had started. Recovery resumes the session.
  * - `provider_error`: the provider failed mid-turn (an EOF, any provider error).
  *   Recovery resumes the session.
