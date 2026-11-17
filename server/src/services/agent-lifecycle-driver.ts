@@ -2,7 +2,8 @@ import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { pendingFailedNativeRetryCancellationCondition } from "./native-runtime/native-cancellation-request.js";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./heartbeat/recovery.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
-import { agents, companies, environments, heartbeatRuns, plugins, pluginCompanySettings, type Db } from "@paperclipai/db";
+import { agents, companies, environmentLeases, environments, heartbeatRuns, plugins, pluginCompanySettings, type Db } from "@paperclipai/db";
+import { HANDED_OFF_WARM_EXIT_KEY, proveHandedOffWarmLeases } from "./native-runtime/handed-off-warm-lease.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { pluginHasAgentEnvironments, pluginServesAgentEnvironment } from "./plugin-environment-driver.js";
 import { heartbeatService } from "./heartbeat.js";
@@ -23,6 +24,23 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
     const environmentId = placement?.environmentId ?? (await instanceSettingsService(db).get()).defaultEnvironmentId;
     const [environment] = environmentId ? await db.select().from(environments).where(eq(environments.id, environmentId)) : [];
     return environment;
+  }
+
+  /** pl/pausing2: the agent's cancelled native runs holding a retained lease
+   * with no runner-exit stamp yet; proveHandedOffWarmLeases keeps only the
+   * handed-off warm ones (handedOffWarmLease, the shared Send predicate). */
+  async function proveStoppedWarmHandoffs(agent: { id: string; companyId: string }) {
+    const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, agent.companyId),
+      eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.runtimeMode, "native"),
+      sql`exists (select 1 from ${environmentLeases} where ${environmentLeases.heartbeatRunId} = ${heartbeatRuns.id}
+        and ${environmentLeases.companyId} = ${heartbeatRuns.companyId} and ${environmentLeases.status} = 'retained'
+        and not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? ${HANDED_OFF_WARM_EXIT_KEY}))`));
+    let proven = false;
+    for (const run of runs) {
+      const outcome = await proveHandedOffWarmLeases(db, run, { stopFallback: false }).catch(() => "unproven" as const);
+      if (outcome === "proven") proven = true;
+    }
+    return proven;
   }
 
   return {
@@ -91,9 +109,21 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
             or(inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]), pendingFailedNativeRetryCancellationCondition()),
             sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'pauseStop')`));
         }
-        const blocker = await heartbeat.agentInvocationStopBlocker(ids, reason,
-          { preservePauseDeferred: agent.lifecycleState === "pausing",
-            ...(agent.lifecycleOperation?.id ? { trigger: `lifecycle:${agent.lifecycleOperation.id}` } : {}) });
+        const options = { preservePauseDeferred: agent.lifecycleState === "pausing",
+          ...(agent.lifecycleOperation?.id ? { trigger: `lifecycle:${agent.lifecycleOperation.id}` } : {}) };
+        let blocker = await heartbeat.agentInvocationStopBlocker(ids, reason, options);
+        // pl/pausing2: a person's warm Stop with NO Send leaves the stopped run's
+        // retained warm box (idle Runner alive) without any stop receipt, so the
+        // pause waited forever (remote_stop_unconfirmed). Run the Send's own
+        // runner-exit proof here: runHost runs outside any DB transaction, the
+        // proof is bounded (handedOffWarmProofTimeout), stops the PROCESS only
+        // (no box stop/destroy, no lease release, no stop-and-retain fallback),
+        // never TERMs a busy owner, and persists the stamp agentExecutionStopBlocker
+        // then accepts. A failed proof keeps 'pausing'; the driver retries.
+        if (blocker === "remote_stop_unconfirmed" && agent.lifecycleState === "pausing"
+          && await proveStoppedWarmHandoffs(agent)) {
+          blocker = await heartbeat.agentInvocationStopBlocker(ids, reason, options);
+        }
         if (blocker) return { pending: blocker };
       }
       return "complete";
