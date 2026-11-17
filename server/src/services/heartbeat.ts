@@ -3630,7 +3630,6 @@ export function heartbeatService(
             persistedNativeExecutionInput,
             persistedRunnerProfile,
             taskResumeSessionId: preparedSession.taskResumeSessionId,
-            resetTaskSession: preparedSession.resetTaskSession,
             isFailedChatRunRetry,
             getFreshSessionHandoff,
           },

@@ -472,9 +472,9 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
   });
 
   // Keep reason (f1-seed-b's intent, SEED-B/SMA-60): upstream's continuation
-  // asks for a fresh session; Pi follows that task-session reset as Codex does,
-  // so the saved message is answered once on a new conversation chained to the
-  // old one. Never two writers: a replay or an admitted run never re-mints.
+  // asks for a fresh session explicitly (forceFreshSession), so the saved
+  // message is answered once on a new conversation chained to the old one.
+  // Never two writers: a replay or an admitted run never re-mints.
   it("answers a SEED-B continuation on a fresh Pi conversation that follows the task-session reset", async () => {
     const f = await piFixture();
     f.input.workspace.executionWorkspace.cwd = instructionRoot;
@@ -496,21 +496,21 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     // The production wake context and reset decision (retry-fold :70, run-state :816).
     f.input.task.context = undeliveredContinuationContext({ recoveryActionId: randomUUID(), sourceRunId, isolation: null }, {});
     await db.update(heartbeatRuns).set({ contextSnapshot: f.input.task.context }).where(eq(heartbeatRuns.id, f.input.run.id));
-    f.input.session.resetTaskSession = shouldResetTaskSessionForWake(f.input.task.context);
-    expect(f.input.session.resetTaskSession).toBe(true);
+    expect(shouldResetTaskSessionForWake(f.input.task.context)).toBe(true);
+    expect(f.input.task.context.forceFreshSession).toBe(true);
     const fresh = await selectHeartbeatRuntime(db, f.input);
     if (!fresh.selected || !fresh.nativeExecution) throw new Error("Expected fresh selection");
     const newId = fresh.nativeExecution.session.normalizedSessionId!;
     expect(newId).not.toBe(oldId);
     const record = async () => (await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, f.issue.id)))[0]!.sessionParamsJson;
     expect(await record()).toMatchObject({ sessionId: newId, __paperclipPiConversation: {
-      id: newId, generation: 2, previousId: oldId, reason: "task_session_reset", runId: f.input.run.id } });
+      id: newId, generation: 2, previousId: oldId, reason: "force_fresh_session", runId: f.input.run.id } });
     // Replay of the same run reuses its record: one mint, one writer, even
     // before the run row carries the selected id (a crash after the mint).
     const admittedRow = await read(f.input.run.id);
     await db.update(heartbeatRuns).set({ nativeSessionId: null, runnerProfileJson: {} }).where(eq(heartbeatRuns.id, f.input.run.id));
     expect(await selectPiConversation(db, { companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
-      runId: f.input.run.id, resetTaskSession: true, boundary: readPiConversation(await record())!.boundary })).toMatchObject({ id: newId, generation: 2 });
+      runId: f.input.run.id, forceFreshSession: true, boundary: readPiConversation(await record())!.boundary })).toMatchObject({ id: newId, generation: 2 });
     await db.update(heartbeatRuns).set({ nativeSessionId: admittedRow.nativeSessionId, runnerProfileJson: admittedRow.runnerProfileJson })
       .where(eq(heartbeatRuns.id, f.input.run.id));
     expect(await selectHeartbeatRuntime(db, f.input)).toMatchObject({ nativeExecution: { session: { normalizedSessionId: newId } } });
@@ -529,10 +529,89 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     await nextPiTurn(f);
     await db.update(heartbeatRuns).set({ nativeSessionId: newId }).where(eq(heartbeatRuns.id, f.input.run.id));
     f.input.run = { ...f.input.run, nativeSessionId: newId };
-    f.input.session.resetTaskSession = true;
+    f.input.task.context = { ...f.input.task.context, forceFreshSession: true };
     expect(await selectHeartbeatRuntime(db, f.input)).toMatchObject({ nativeExecution: { session: { normalizedSessionId: newId } } });
     expect(await record()).toMatchObject({ __paperclipPiConversation: { id: newId, generation: 2 } });
     expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system")).toHaveLength(0);
+  }, 60_000);
+
+  // 4c (RFL 09:32Z): a new Pi conversation only when the saved Runner state
+  // cannot be reused (piConversationRotationReason). A skill/AGENTS edit keeps
+  // the thread and its Runner state; the Runner refreshes the instructions in
+  // place on the next turn (provider_backend.rs run.prepare rebind, Pi attach).
+  it("keeps the Pi conversation across a skill/AGENTS edit and rotates only when its saved Runner state cannot be reused", async () => {
+    const f = await piFixture();
+    f.input.workspace.executionWorkspace.cwd = instructionRoot;
+    await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id, authorType: "user",
+      authorUserId: "local-board", body: "Remember the word OAK-7. Reply only: noted.", createdAt: new Date(f.run.createdAt.getTime() - 2000) });
+    const select = async () => {
+      const selected = await selectHeartbeatRuntime(db, f.input);
+      if (!selected.selected || !selected.nativeExecution) throw new Error("Expected selection");
+      return selected;
+    };
+    const record = async () => readPiConversation((await db.select().from(agentTaskSessions)
+      .where(eq(agentTaskSessions.taskKey, f.issue.id)))[0]!.sessionParamsJson);
+    const a = (await select()).nativeExecution!.session.normalizedSessionId!;
+    // Control: a follow-up whose task session resumes (no reset) keeps A.
+    await nextPiTurn(f);
+    f.input.session.taskResumeSessionId = a;
+    expect((await select()).nativeExecution!.session.normalizedSessionId).toBe(a);
+    // Skill/AGENTS edit: session-preparation resets the task session (no
+    // resume id) and the runtime context carries the edited instructions.
+    await nextPiTurn(f);
+    vi.mocked(buildNativeRuntimeContext).mockImplementation(async () => {
+      const context = nativeRuntimeContextFixture();
+      context.instructions.bundle = { ...context.instructions.bundle, rootPath: instructionRoot, digest: "1".repeat(64), manifestDigest: "1".repeat(64) };
+      return { ...context, aggregateDigest: canonicalNativeRuntimeContextDigest(context) };
+    });
+    const edited = await select();
+    expect(edited.nativeExecution!.session.normalizedSessionId, "a skill/AGENTS edit keeps the thread").toBe(a);
+    expect(edited.nativeExecution).toMatchObject({ runtimeContext: { instructions: { bundle: { digest: "1".repeat(64) } } } });
+    expect(await record()).toMatchObject({ id: a, generation: 1, previousId: null, reason: "first_message" });
+    // A pending side effect of unknown outcome keeps the thread (R-REPLAY):
+    // its reconciled continuation is the explicit forceFreshSession.
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "native_provider_side_effect_pending" })
+      .where(eq(heartbeatRuns.id, f.input.run.id));
+    await nextPiTurn(f, false);
+    expect((await select()).nativeExecution!.session.normalizedSessionId).toBe(a);
+    // A failed restore: the newest run on A proved its saved state cannot be restored.
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "native_provider_state_incompatible" })
+      .where(eq(heartbeatRuns.id, f.input.run.id));
+    await nextPiTurn(f, false);
+    const b = (await select()).nativeExecution!.session.normalizedSessionId!;
+    expect(b, "a failed restore rotates").not.toBe(a);
+    expect(await record()).toMatchObject({ id: b, generation: 2, previousId: a, reason: "restore_failed", runId: f.input.run.id });
+    // A runtime generation (thinking level) keeps B.
+    await nextPiTurn(f);
+    const setConfig = async (patch: Record<string, unknown>) => {
+      f.input.agent.adapterConfig = { ...f.input.agent.adapterConfig, ...patch };
+      f.input.config.runtimeConfig = f.input.agent.adapterConfig;
+      await db.update(agents).set({ adapterConfig: f.input.agent.adapterConfig }).where(eq(agents.id, f.agent.id));
+    };
+    await setConfig({ piRpcThinkingLevel: "high" });
+    expect((await select()).nativeExecution!.session.normalizedSessionId).toBe(b);
+    // A provider-profile change: Pi's profile fences the model, so it rotates
+    // with previousId, and the history arrives by handoff.
+    await nextPiTurn(f);
+    await setConfig({ model: "anthropic/model-b" });
+    const changed = await select();
+    const c = changed.nativeExecution!.session.normalizedSessionId!;
+    expect(c, "a provider-profile change rotates").not.toBe(b);
+    expect(changed.nativeExecution!.provider).toMatchObject({ kind: "pi_rpc", model: "anthropic/model-b" });
+    expect(await record()).toMatchObject({ id: c, generation: 3, previousId: b, reason: "provider_profile_changed", runId: f.input.run.id });
+    // Replay of the minting run: one mint, one writer.
+    expect((await select()).nativeExecution!.session.normalizedSessionId).toBe(c);
+    expect(await record()).toMatchObject({ id: c, generation: 3 });
+    // A late publisher of the retired id neither restores nor erases the record.
+    const params = (await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, f.issue.id)))[0]!.sessionParamsJson;
+    expect(preservePiConversation(params, { sessionId: b })).toMatchObject({ sessionId: c, __paperclipPiConversation: { id: c, previousId: b } });
+    await db.update(issues).set({ executionRunId: f.input.run.id }).where(eq(issues.id, f.issue.id));
+    const result = await answerWithNativePeer({ db, execution: changed.nativeExecution!, runnerInstanceId: changed.nativeRunnerInstanceId!,
+      text: "OAK-7", getFreshSessionHandoff: createNativeSessionHandoffLoader({ db, companyId: f.agent.companyId,
+        agentId: f.agent.id, issueId: f.issue.id, before: f.input.run.createdAt }) });
+    expect(result.settled).toMatchObject({ status: "succeeded", nativeSessionId: c });
+    expect(JSON.stringify(result.prompts)).toContain("OAK-7");
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(row => row.authorType === "system")).toHaveLength(0);
   }, 60_000);
 
   it("adopts a verified legacy Pi pointer without ending the existing conversation", async () => {
