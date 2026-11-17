@@ -298,6 +298,26 @@ export async function requestTaskRetry(input: TaskRetryRequest) {
   }
 }
 
+/**
+ * Retry fold (judge R8, rf-3 A): accept only a Retry the card offers. The one
+ * authority (decideRetryAuthority) decides; this refuses before anything is
+ * saved where no admission refusal would ever be recorded for it:
+ * - conversation_held: a standing HELD notice or the prior-owner fence; the
+ *   same thread meets the same fence on every Retry.
+ * - agent_paused: the card says "Resume this agent"; a Retry runs nothing.
+ * A refusal admission itself records (previous_execution_unverified,
+ * cleanup_quarantined, the fence reasons, ...) is answered by upstream #21497's
+ * taskRetryRefusal on the Retry route after admission, not here.
+ */
+const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["conversation_held", "agent_paused"]);
+async function refuseRetryTheCardDoesNotOffer(db: Db, issue: { companyId: string; id: string }) {
+  const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId: issue.companyId,
+    issueId: issue.id }), retrySource: true });
+  if (!authority.canRetry && REFUSED_BEFORE_ADMISSION.has(authority.reason))
+    throw conflict(authority.cardText!, { code: "retry_not_available", reason: authority.reason,
+      userAction: authority.userAction, nextAction: authority.nextAction });
+}
+
 function admitTaskRetry(input: TaskRetryRequest) {
   return writeExecutionControl(input.db, DELIVERY_QUEUES.workspaceRecovery, async tx => {
     const db = tx as unknown as Db;
@@ -311,6 +331,9 @@ function admitTaskRetry(input: TaskRetryRequest) {
     if (sameRequest) {
       if (sameRequest.payload?.issueId !== issue.id || sameRequest.requestedByActorId !== input.actorId)
         throw conflict("This retry request belongs to a different task or user.");
+      // A repeat of a Retry that already has its run replays the truth. A
+      // repeat of one that has no run reads the same authority as a new click.
+      if (!sameRequest.runId) await refuseRetryTheCardDoesNotOffer(db, issue);
       const intent = readTaskRetryIntent(sameRequest.payload);
       const [coalescedRun] = sameRequest.status === "coalesced" && sameRequest.runId
         ? await tx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
@@ -332,16 +355,7 @@ function admitTaskRetry(input: TaskRetryRequest) {
     // Stop refuses Retry with its reason instead of accepting a dead end.
     if ((await readRetryStopGate(db, { companyId: issue.companyId, issueId: issue.id, sourceRunId: latest.id }))?.state === "expired")
       throw conflict(RETRY_STOP_UNPROVEN_MESSAGE, { code: RETRY_STOP_UNPROVEN_REASON, reason: "stop_unproven" });
-    // Retry fold (judge R8): accept only a Retry the dispatcher can run. Where
-    // the one authority says the conversation is held (a standing HELD notice,
-    // the run's own prior-owner refusal, or a deferred Retry refused by that
-    // fence), the same thread meets the same fence: refuse with the reason and
-    // the one instruction instead of a 202 that never gets a run.
-    const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId: issue.companyId,
-      issueId: issue.id }), retrySource: true });
-    if (authority.reason === "conversation_held")
-      throw conflict(authority.cardText!, { code: "retry_not_available", reason: authority.reason,
-        userAction: authority.userAction, nextAction: authority.nextAction });
+    await refuseRetryTheCardDoesNotOffer(db, issue);
     if (input.retryAction === "move_forward" && !["queued", "running"].includes(latest.status) &&
         !(await undeliveredContinuation(tx, { companyId: issue.companyId, issueId: issue.id })))
       return { requestId: null, accepted: false, stale: false, alreadyMovedOn: true, observedRunId: latest.id, chatActionId: undefined };
