@@ -89,6 +89,41 @@ describe("compactAdjacentErrors", () => {
     expect(compactAdjacentErrors([failed, withoutAction]).items).toEqual([failed, withoutAction]);
   });
 
+  // Keep: stranded recovery uses these real default/classified producer titles,
+  // not just the family title. Cover both single-attempt bodies under each.
+  it.each([
+    "Automatic recovery blocked",
+    "Error: usage limit reached",
+    "Error: not logged in to Claude",
+    "Error: agent login required",
+  ].flatMap(title => [
+    "Paperclip could not start this task. Press Retry to start it.",
+    "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
+  ].map(text => ({ title, text }))))("one-note4: compacts $title / $text with its Recovery action and Retry", ({ title, text }) => {
+    const notice: TaskChatMessageItem = {
+      ...recovery, text,
+      presentation: { ...recovery.presentation!, title },
+      metadata: { version: 1, sourceRunId: "run-1", sections: [{ title: "Recovery", rows: [
+        { type: "key_value", label: "Recovery action", value: "recovery-action-1" },
+      ] }] },
+    };
+    const compacted = compactAdjacentErrors([failed, notice]);
+    expect(compacted.items).toEqual([notice]);
+    expect(compacted.retryMarkers.get(notice.id)).toBe(failed);
+    expect(compacted.retryMarkers.size).toBe(1);
+    expect(compactAdjacentErrors([notice, failed]).items).toEqual([failed]);
+
+    const withoutAction = { ...notice, metadata: undefined };
+    expect(compactAdjacentErrors([failed, withoutAction]).items).toEqual([failed, withoutAction]);
+    const emptyAction = { ...notice, metadata: { version: 1 as const, sections: [{ rows: [
+      { type: "key_value" as const, label: "Recovery action", value: " " },
+    ] }] } };
+    expect(compactAdjacentErrors([failed, emptyAction]).items).toEqual([failed, emptyAction]);
+    const unstructured = { ...notice, presentation: null, metadata: undefined };
+    expect(compactAdjacentErrors([failed, unstructured]).items).toEqual([unstructured]);
+    expect(compactAdjacentErrors([failed, unstructured]).retryMarkers.get(notice.id)).toBe(failed);
+  });
+
   it.each([
     // CONTINUATION_REFUSED_NOTICE in server/src/services/recovery/service.ts:
     // the shared prefix must not turn a different recovery family into a duplicate.
