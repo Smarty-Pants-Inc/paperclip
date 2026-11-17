@@ -1978,9 +1978,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     if (params.creationOperation) {
       const owner = { ...params, runId: params.creationOperation.runId };
       const ids = await acquisitionMatches(c, params.creationOperation.id, owner);
-      // Absence is not proof a timed-out create cannot materialize later. Throw
-      // to keep core's durable intent retryable, never return an unowned null.
-      if (!ids.length) throw new Error("Boat creation identity is not visible yet; retry inspection");
+      // Report operation-scoped absence as destroyed: core owns the settle
+      // deadline and bounded absence budget; early absence stays inconclusive there.
+      if (!ids.length) return { providerLeaseId: params.creationOperation.id, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: new Date().toISOString() };
       return { providerLeaseId: ids[0], state: "unknown", creationCleanup: cleanupIdentity(c, ids[0], owner, params.creationOperation.id) };
     }
     idleActivity.resource(activityKey(c, params.providerLeaseId));
