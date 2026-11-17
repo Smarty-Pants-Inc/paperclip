@@ -877,7 +877,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect(await createLifecycleStore(db).change(agent.id, "reconcile")).not.toBeNull();
   });
 
-  it("retains the failed phase and the same operation for retry", async () => {
+  it("retains the failed phase and the same operation for retry, supersedes(lifecycle privacy :886; RFL record SUPERSEDE-LIFECYCLE-PRIVACY-886-1117.md)", async () => {
     let fail = true;
     const work = worker(async agent => { if (agent.lifecycleState === "verifying" && fail) throw Object.assign(new Error("private detail"), { code: "harness_test_failed" }); return "complete"; });
     const agent = await hire(); await work.process(agent.id);
