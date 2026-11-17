@@ -24,7 +24,7 @@ import {
   agents, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, issues,
 } from "@paperclipai/db";
 import type { EnvironmentLease } from "@paperclipai/shared";
-import { captureDirectorySnapshot, directorySnapshotSha256 } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { captureDirectorySnapshot, directorySnapshotSha256, withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
@@ -588,4 +588,93 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(EDIT);
     });
   }, 120_000);
+
+  // ---- pl/cancel-finalize4 (rf-4 02:16Z Q3 + lockloss as ONE path): the abort reaches the LOCAL restore ----
+  const NEXT_OWNER_EDIT = "next owner's task edit\n";
+  /** Holds the host merge lock (as a concurrent local writer would) until `release`. */
+  async function holdHostMergeLock(host: string) {
+    let release!: () => void;
+    let held = false;
+    const hold = withDirectoryMergeLock(host, async () => {
+      held = true;
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    await waitFor(() => held);
+    return { hold, release: () => release() };
+  }
+
+  it("(cf4) a local merge waiting on the host merge lock past the deadline does not overwrite the next owner's edit", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
+    await settleLater(f);
+    const lock = await holdHostMergeLock(f.host);
+    let exportPromise: Promise<void> | undefined;
+    const original = f.sync.restoreWorkspace.bind(f.sync);
+    vi.spyOn(f.sync, "restoreWorkspace").mockImplementation((...args) => (exportPromise = original(...args)));
+    const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+      nativeWorkspaceSync: f.sync, timeoutMs: 3_000 });
+    try {
+      expect(await work).toEqual({ outcome: "unproven", reason: "timed_out" });
+      // The next owner takes the finalization ownership and edits the host task file.
+      const probe = await withNativeWorkspaceFinalizationOwnership({ db, companyId: f.companyId, runId: f.runId },
+        async () => { await writeFile(join(f.host, "task.txt"), NEXT_OWNER_EDIT); return "next"; });
+      expect(probe).toMatchObject({ acquired: true });
+      lock.release();
+      await lock.hold;
+      const error = await exportPromise!.then(() => null, (cause: unknown) => cause);
+      expect(error).toBeTruthy();
+      // Base: the abandoned merge overwrites it with the stopped turn's bytes.
+      expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(NEXT_OWNER_EDIT);
+      await expect(stat(join(f.box, ...STAMP))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      lock.release();
+      await lock.hold;
+      await work;
+      await exportPromise?.catch(() => undefined);
+    }
+  }, 60_000);
+
+  it("(cf4 lockloss) the lock session dies while the local merge waits on the host merge lock: the next owner's edit stands", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
+    await settleLater(f);
+    const lock = await holdHostMergeLock(f.host);
+    try {
+      await withLockSessionIdleTimeout("3s", async () => {
+        const outcome = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+          nativeWorkspaceSync: f.sync, timeoutMs: 30_000 });
+        outcome.catch(() => undefined);
+        // The remote part is done; the copyback now waits on the host merge lock.
+        await waitFor(() => f.runnerState.calls > f.callsAtStop && f.runnerState.inflight === 0);
+        let calls = -1;
+        while (calls !== f.runnerState.calls) { calls = f.runnerState.calls; await new Promise(resolve => setTimeout(resolve, 750)); }
+        // The finalization lock session is terminated.
+        const lockers = await db.execute(sql`select pid from pg_locks where locktype = 'advisory' and granted
+          and pid <> pg_backend_pid()`) as unknown as Array<{ pid: number }>;
+        expect(lockers).toHaveLength(1);
+        await db.execute(sql`select pg_terminate_backend(${lockers[0].pid})`);
+        // A second owner acquires the advisory lock and edits the host task file.
+        let second = false;
+        for (let attempt = 0; attempt < 50 && !second; attempt += 1) {
+          second = await db.transaction(async tx => {
+            const acquired = await tryLockNativeWorkspaceFinalization(tx as never, { companyId: f.companyId, runId: f.runId });
+            if (acquired) await writeFile(join(f.host, "task.txt"), NEXT_OWNER_EDIT);
+            return acquired;
+          });
+          if (!second) await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        expect(second).toBe(true);
+        // Let the keepalive see the dead session, then release the host merge lock.
+        await new Promise(resolve => setTimeout(resolve, 2_000));
+        lock.release();
+        await lock.hold;
+        expect(await outcome).toEqual({ outcome: "unproven", reason: "ownership_lost" });
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+        // Base: the copyback merges the stopped turn's bytes over the next owner's edit.
+        expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(NEXT_OWNER_EDIT);
+        await expect(stat(join(f.box, ...STAMP))).rejects.toMatchObject({ code: "ENOENT" });
+      });
+    } finally {
+      lock.release();
+      await lock.hold;
+    }
+  }, 60_000);
 });
