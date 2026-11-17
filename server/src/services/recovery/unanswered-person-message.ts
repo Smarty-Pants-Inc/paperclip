@@ -31,7 +31,7 @@ import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-re
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 import { personHeldChatMessageSql, personStoppedCarrierSql, runStartedAnswering, stoppedBySender } from "./person-stopped-message.js";
 import { automaticRecoveryPending } from "./automatic-recovery-pending.js";
-import { AGENT_LIFECYCLE_STOP_REASON } from "../governance-pause-stop.js";
+import { AGENT_PAUSE_STOP_REASON } from "../governance-pause-stop.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -728,8 +728,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     }
     return recoveryDeadline;
   };
+  // Read the no-run terminal evidence before pending wakes so a NEW carrying
+  // queued wake can supersede it, without an older queue masking a later stop.
+  const terminalWakes = !run && !agentPaused && !settingUp ? await q.select({ payload: agentWakeupRequests.payload,
+    status: agentWakeupRequests.status, error: agentWakeupRequests.error, runId: agentWakeupRequests.runId,
+    updatedAt: agentWakeupRequests.updatedAt }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+    inArray(agentWakeupRequests.status, ["failed", "cancelled"]), gt(agentWakeupRequests.updatedAt, message.createdAt)))
+    .orderBy(desc(agentWakeupRequests.updatedAt), desc(agentWakeupRequests.createdAt)) : [];
+  // Only THIS issue and message's own wake is evidence; the latest terminal
+  // attempt wins over an older pause cancellation.
+  const ownWakes = terminalWakes.filter(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+  const latestWake = ownWakes[0];
   if (!boardHold && !agentPaused && !settingUp) {
-    const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
+    const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status,
+      createdAt: agentWakeupRequests.createdAt })
       .from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
         or(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
@@ -750,7 +763,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       if (wait) return wait;
       // After the short pending grace, use the existing waiting note and its
       // start bound below instead of telling the person to duplicate input.
-      if (pendingExecutionWait) waitingToStart = true;
+      if (pendingExecutionWait || (!run && wakes.some(wake => wake.status === "queued"
+        && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id)
+        && (!latestWake || wake.createdAt > latestWake.updatedAt)))) waitingToStart = true;
     }
   }
 
@@ -777,25 +792,16 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // Paperclip records a deferred or coalesced wake that could not start as
     // FAILED: that is the trigger. The grace covers a wake that threw before
     // any wake row existed (the comment route logs and returns 201).
-    const terminalWakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status,
-      error: agentWakeupRequests.error, runId: agentWakeupRequests.runId }).from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-      inArray(agentWakeupRequests.status, ["failed", "cancelled"]), gt(agentWakeupRequests.updatedAt, message.createdAt)))
-      .orderBy(desc(agentWakeupRequests.updatedAt), desc(agentWakeupRequests.createdAt));
-    // Only THIS message's own wake (Paperclip's queued-comment attribution) is
-    // evidence; a later terminal attempt wins over an older pause cancellation.
-    const ownWakes = terminalWakes.filter(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
     const wakeFailed = ownWakes.some(wake => wake.status === "failed");
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_NO_RUN_GRACE_MS;
     if (!wakeFailed && due > now.getTime()) return { kind: "pending", recheckAt: due };
     // The lifecycle driver's pausing stop cancels unbound queued/deferred wakes
-    // with this exact error, preserving their reason and message payload
+    // with the pause-specific error, preserving their reason and message payload
     // (heartbeat/run-control.ts cancelPendingWakeupsForAgentsInternal). Resume
     // does not replay them. Do not apply this while setup, a hold or live work
     // takes precedence above, or to a stopped/terminating agent.
-    const latestWake = ownWakes[0];
     code = agentRow?.lifecycleState === "ready" && latestWake?.status === "cancelled" && latestWake.runId === null
-      && latestWake.error === AGENT_LIFECYCLE_STOP_REASON ? PAUSE_STOPPED_CODE : UNANSWERED_MESSAGE_NO_RUN_CODE;
+      && latestWake.error === AGENT_PAUSE_STOP_REASON ? PAUSE_STOPPED_CODE : UNANSWERED_MESSAGE_NO_RUN_CODE;
   } else {
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     const due = (run.finishedAt ?? run.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
