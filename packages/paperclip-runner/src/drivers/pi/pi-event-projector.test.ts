@@ -216,10 +216,20 @@ describe("large native tool output projection (synthetic incident regression)", 
     expect(JSON.stringify(input)).toBe(serialized);
     expect(projector.project({ type: "tool_execution_end", toolCallId: "typed", toolName: "bash", result: {} })[0].eventType).toBe("item.completed");
     // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was text: stringContaining("[Pi projection truncated]").
-    // An 800 KB answer cannot fit one 256 KiB record: it is spilled whole and referenced, never cut.
-    const huge = projector.project(final({ content: [{ type: "text", text: "semantic".repeat(100000) }] }))[0];
-    expect(huge).toMatchObject({ eventType: "item.completed", payload: { channel: "final", text: expect.stringMatching(/\[Full (?:answer|text): \//u) } });
-    expect(spilled(huge.payload.text)).toBe("semantic".repeat(100000));
+    // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was text: stringMatching(/\[Full (?:answer|text): \//u)
+    // (a box path in the person's text). An 800 KB answer cannot fit one 256 KiB record: the person's
+    // line says plainly the full text is kept, with a labelled excerpt and no path; the event carries
+    // the path and sha256 for the agent, and the file holds the whole answer.
+    const whole = "semantic".repeat(100000);
+    const huge = projector.project(final({ content: [{ type: "text", text: whole }] }))[0];
+    expect(huge).toMatchObject({ eventType: "item.completed", payload: { channel: "final" } });
+    const shown = String(huge.payload.text);
+    expect(shown.startsWith("This answer is longer than one message (800 KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\nsemantic")).toBe(true);
+    expect(shown).not.toMatch(/truncat|\[Full |\/paperclip-pi-spill|sha256/iu);
+    const fullText = huge.payload.fullText as { path: string; sha256: string; bytes: number };
+    expect(fullText).toMatchObject({ bytes: 800000, sha256: createHash("sha256").update(whole).digest("hex") });
+    expect(shown).not.toContain(fullText.path);
+    expect(readFileSync(fullText.path, "utf8")).toBe(whole);
     expectNoCutMarker(huge);
     expect(Buffer.byteLength(JSON.stringify(envelope(huge, 0)))).toBeLessThan(256 * 1024);
     expect(() => projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: "receipt", toolName: "bash", content: [], usage: { opaque: "receipt".repeat(100000) } } })).not.toThrow();

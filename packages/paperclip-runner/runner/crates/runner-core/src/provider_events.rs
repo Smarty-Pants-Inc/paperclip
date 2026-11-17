@@ -2620,6 +2620,29 @@ mod tests {
         assert!(codex.is_empty());
     }
 
+    // Paul NOTE 5 (RFL 11-17): an answer longer than one record is shown as a
+    // plain line and a labelled excerpt; the path and sha256 of the whole text
+    // travel in the event for the agent, never in the person's text.
+    #[test]
+    fn pi_final_answer_carries_the_full_text_reference_for_the_agent() {
+        let full = json!({"path": "/runner/tmp/paperclip-pi-spill/abc.txt",
+            "sha256": "0".repeat(64), "bytes": 800_000});
+        let events = normalize_pi_notification_in(
+            "item/completed",
+            &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:reply",
+                "kind":"agentMessage", "channel":"final", "fullText": full,
+                "item":{"id":"turn:reply", "type":"agentMessage", "text":"This answer is longer than one message (800 KB)."}}),
+            None,
+        );
+        let reply = events
+            .iter()
+            .find(|event| event.event_type == "item.completed")
+            .unwrap();
+        assert_eq!(reply.payload["channel"], "final");
+        assert_eq!(reply.payload["fullText"], full);
+        assert!(!reply.payload["text"].as_str().unwrap().contains("/runner"));
+    }
+
     #[test]
     fn pi_compaction_keeps_each_native_identity_reason_and_typed_measurements() {
         let compaction = |id: &str| {
