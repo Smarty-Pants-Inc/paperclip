@@ -238,11 +238,11 @@ suite("fresh-continuation fallback", () => {
   }, 120_000);
 
   /** A person's message whose own conversation turn succeeded with no reply, ended at `ended`. */
-  async function silentConversationTurn(ended: Date) {
+  async function silentConversationTurn(ended: Date, person = userId) {
     const f = await unfinishedRun({ runtime: "native", errorCode: "adapter_failed", hold: "none" });
-    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: person,
       body: "Please answer this accepted request.", createdAt: new Date(ended.getTime() - 60_000) }).returning();
-    await db.update(issues).set({ status: "in_progress", conversationAgentId: agentId, conversationUserId: userId,
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: agentId, conversationUserId: person,
       conversationState: "active", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: ended, createdAt: new Date(ended.getTime() - 30_000),
       contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } }).where(eq(heartbeatRuns.id, f.runId));
@@ -278,6 +278,33 @@ suite("fresh-continuation fallback", () => {
     // session-preparation resumes only a session whose last run is another run.
     expect(resumed?.lastRunId).toBe(f.runId);
     expect(resumed?.lastRunId).not.toBe(next!.id);
+  }, 120_000);
+
+  // D109/D131 (isolation) + D159 (race), re-homed onto the R-SILENT owner: one
+  // unscoped stranded sweep over a mixed population, run by two workers at
+  // once, neither throws nor starves a conversation, and each silent message
+  // gets exactly one redelivery (wake key under the conversation-delivery lock).
+  it("R-SILENT: two racing unscoped sweeps over mixed conversations give each silent message exactly one redelivery", async () => {
+    const ended = new Date(Date.now() - 121_000);
+    const people: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const id = randomUUID(); people.push(id);
+      await db.insert(authUsers).values({ id, name: `Person ${i}`, email: `${id}@example.test`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+    }
+    const silent = [];
+    for (let i = 0; i < 4; i++) silent.push(await silentConversationTurn(ended, people[i]));
+    const answered = await silentConversationTurn(ended, people[4]);
+    await db.insert(issueComments).values({ companyId, issueId: answered.issueId, authorType: "agent", authorAgentId: agentId,
+      body: "Here is the answer.", createdAt: new Date(ended.getTime() - 1_000) });
+    const grace = await silentConversationTurn(new Date(Date.now() - 10_000), people[5]);
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    await Promise.all([heartbeat.reconcileStrandedAssignedIssues({ companyId }), heartbeatService(db).reconcileStrandedAssignedIssues({ companyId })]);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId });
+    const counts = { silent: await Promise.all(silent.map(async s => (await s.redeliveries()).length)),
+      answered: (await answered.redeliveries()).length, grace: (await grace.redeliveries()).length };
+    console.info(JSON.stringify({ rSilentMixedRace: counts }));
+    expect(counts).toEqual({ silent: [1, 1, 1, 1], answered: 0, grace: 0 });
   }, 120_000);
 
   // RFL DESIGN-F1 condition 2 (the clock), on a fake clock: the run ends at t,
