@@ -1166,6 +1166,11 @@ export interface IssueQueuedCommentEntry {
   position: number;
   canEdit: boolean;
   canDiscard: boolean;
+  /** Agent Chat: a /new reset, or a message behind one. It waits for the turn boundary and never steers or interrupts. */
+  behindReset?: boolean;
+  /** Set when the message waits in a later wake than the queue's own (behind a /new); its own edits target it. */
+  queueId?: string;
+  queueRevision?: string;
 }
 
 /**

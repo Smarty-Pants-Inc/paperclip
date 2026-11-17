@@ -202,6 +202,58 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     return { companyId, agentId, issueId, runId, wakeId, commentIds };
   }
 
+  async function seedChatTail(bodies: string[]) {
+    const f = await seedQueue();
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" })
+      .where(eq(issues.id, f.issueId));
+    const commentIds = [...f.commentIds, randomUUID()];
+    await db.insert(issueComments).values({ id: commentIds[2], companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "queue-owner", body: bodies[2] });
+    const wakeIds = [f.wakeId, randomUUID(), randomUUID()];
+    for (const [index, id] of commentIds.entries()) {
+      await db.update(issueComments).set({ body: bodies[index] }).where(eq(issueComments.id, id));
+      const wake = { companyId: f.companyId, agentId: f.agentId, source: "issue_comment",
+        status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "queue-owner",
+        requestedAt: new Date(`2026-08-22T15:0${index + 1}:00.000Z`),
+        // Reverse creation order to prove that requestedAt owns delivery order.
+        createdAt: new Date(`2026-08-22T15:1${3 - index}:00.000Z`),
+        payload: { issueId: f.issueId, commentId: id,
+          _paperclipWakeContext: { commentId: id, wakeCommentId: id, wakeCommentIds: [id] } } };
+      if (index === 0) await db.update(agentWakeupRequests).set(wake).where(eq(agentWakeupRequests.id, f.wakeId));
+      else await db.insert(agentWakeupRequests).values({ id: wakeIds[index], ...wake });
+    }
+    return { ...f, commentIds, wakeIds };
+  }
+
+  it("lists the chat tail across /new and marks the reset and every message behind it", async () => {
+    const f = await seedChatTail(["A", "/new", "B"]);
+    const response = await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    expect(response.body.entries.map((entry: any) => entry.comment.id)).toEqual(f.commentIds);
+    expect(response.body.entries.map((entry: any) => entry.behindReset)).toEqual([false, true, true]);
+    expect(response.body.entries.slice(1).map((entry: any) => entry.queueId)).toEqual(f.wakeIds.slice(1));
+    expect(response.body.entries.slice(1).every((entry: any) => typeof entry.queueRevision === "string" && entry.queueRevision.length > 0)).toBe(true);
+  });
+
+  it("deletes only B using the later chat entry's own queue identity and revision", async () => {
+    const f = await seedChatTail(["A", "B", "C"]);
+    const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+    const before = (await request(client).get(path).expect(200)).body;
+    expect(before.entries.map((entry: any) => entry.comment.body)).toEqual(["A", "B", "C"]);
+    const b = before.entries[1];
+    expect(b.queueId).toBe(f.wakeIds[1]);
+    await request(client).delete(`${path}/${b.comment.id}`)
+      .send({ queueId: b.queueId, revision: b.queueRevision }).expect(200);
+    const after = (await request(client).get(path).expect(200)).body;
+    expect(after.entries.map((entry: any) => entry.comment.body)).toEqual(["A", "C"]);
+    expect(after.queueId).toBe(before.queueId);
+    expect(after.revision).toBe(before.revision);
+    const wakes = await db.select().from(agentWakeupRequests);
+    expect(wakes.find(wake => wake.id === f.wakeIds[1])?.status).toBe("cancelled");
+    expect(wakes.filter(wake => wake.id === f.wakeIds[0] || wake.id === f.wakeIds[2]).map(wake => wake.status))
+      .toEqual(["deferred_issue_execution", "deferred_issue_execution"]);
+    expect((await db.select().from(issueComments)).filter(comment => !comment.deletedAt).map(comment => comment.body).sort()).toEqual(["A", "C"]);
+  });
+
   async function commitNativeSuccess(f: Awaited<ReturnType<typeof seedQueue>>) {
     const contractId = randomUUID(), resultId = randomUUID();
     await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: f.issueId,

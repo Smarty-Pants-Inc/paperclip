@@ -59,7 +59,7 @@ import { deferredWakeJoinsFirstTurn, firstTurnClaimedCommentIds, firstTurnQueued
 import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from "../services/native-runtime/native-workspace-reconstruction.js";
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse, type QueuedInteractionResponse } from "../services/queued-interaction-response.js";
-import { deliverConversationComments, heldConversationComments, isConversation } from "../services/agent-conversations.js";
+import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
@@ -430,6 +430,7 @@ import {
   buildQueuedCommentQueueSnapshot,
   decideQueuedCommentQueueSteering,
   queuedCommentIdsFromWakePayload,
+  queuedCommentQueueRevision,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
 
@@ -7908,7 +7909,63 @@ export function issueRoutes(
       });
       if (firstTurnCommentIds.length > 0) queue.firstTurnCommentIds = firstTurnCommentIds;
     }
+    // Agent Chat lists every waiting message, also behind a /new (its own wake).
+    if (input.issue.conversationAgentId && wake && !queuedInteractionId(wake.payload)) {
+      queue.entries = await chatQueueTail(input.executor, { issue: input.issue, headQueueId: wake.id,
+        headEntries: queue.entries, actorType: input.actor.actorType, actorId: input.actor.actorId });
+    }
     return queue;
+  }
+
+  /**
+   * Agent Chat: every waiting message, in order, from the queue's head wake to
+   * the last one. A `/new` keeps its own wake, so the head wake alone would stop
+   * the list at the first reset while the backlog still runs on through it
+   * (S10 C2). Mirrors al/queue-ux `chatQueueTail` without its delivery intent.
+   */
+  async function chatQueueTail(executor: IssueQueueDb, input: {
+    issue: { id: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null };
+    headQueueId: string; headEntries: IssueQueuedCommentQueue["entries"]; actorType: string; actorId: string;
+  }): Promise<IssueQueuedCommentQueue["entries"]> {
+    if (!input.issue.assigneeAgentId) return input.headEntries;
+    const wakes = (await executor.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, input.issue.companyId),
+      eq(agentWakeupRequests.agentId, input.issue.assigneeAgentId),
+      sql`${agentWakeupRequests.payload}->'issueId' = to_jsonb(${input.issue.id}::text)`,
+      inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
+    )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.createdAt)))
+      .flatMap((wake) => {
+        const ids = queuedCommentIdsFromWakePayload(wake.payload);
+        return ids.length && !readObject(wake.payload).interactionId ? [{ wake, ids }] : [];
+      });
+    const headIndex = wakes.findIndex((candidate) => candidate.wake.id === input.headQueueId);
+    if (headIndex < 0) return input.headEntries;
+    const later = wakes.slice(headIndex + 1);
+    const laterIds = later.flatMap((wake) => wake.ids);
+    const rows = laterIds.length ? await executor.select().from(issueComments).where(and(
+      eq(issueComments.companyId, input.issue.companyId), eq(issueComments.issueId, input.issue.id),
+      inArray(issueComments.id, laterIds))) : [];
+    const comments = new Map(rows.filter((row) => !row.deletedAt).map((row) => [row.id, row]));
+    let behindReset = false;
+    const entries = input.headEntries.map((entry) => {
+      behindReset ||= isConversationReset(entry.comment.body);
+      return { ...entry, behindReset };
+    });
+    for (const { wake, ids } of later) {
+      const wakeComments = ids.flatMap((id) => comments.get(id) ?? []);
+      const revision = queuedCommentQueueRevision({ queueId: wake.id, comments: wakeComments });
+      for (const comment of wakeComments) {
+        behindReset ||= isConversationReset(comment.body);
+        entries.push({
+          comment: { ...comment, authorType: comment.authorType ?? (comment.authorAgentId ? "agent" : "user") } as never,
+          position: entries.length,
+          canEdit: input.actorType === "user" && comment.authorUserId === input.actorId,
+          canDiscard: input.actorType === "user" && (comment.authorUserId === input.actorId || Boolean(comment.authorAgentId)),
+          behindReset, queueId: wake.id, queueRevision: revision,
+        });
+      }
+    }
+    return entries;
   }
 
   function assertQueueMutationTarget(input: {
