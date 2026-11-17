@@ -1346,7 +1346,10 @@ describe("renderPaperclipWakePrompt", () => {
       "The semantic completion summary is limited to 12,000 characters; a longer summary is rejected and nothing is delivered.",
     );
     expect(prompt).toContain(
-      "When the answer is longer, the summary is only the answer's opening, copied verbatim and under 12,000 characters, and the whole answer is your final response.",
+      "When the answer is longer, the summary is only the answer's opening, copied verbatim, between 11,000 and 12,000 characters long, and the whole answer is your final response.",
+    );
+    expect(prompt).toContain(
+      "If a completion is refused as too long, do not shorten the answer and retry: send the opening as the summary once, then the whole answer as your final response.",
     );
     expect(prompt).toContain("Never shorten the answer or mark it as truncated to fit the summary.");
     expect(prompt).toContain("Include every requested answer, exact value, description");
