@@ -6544,7 +6544,7 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   if (!prior.owner.resultId && !stoppedByUser) return refuse("owner_result_missing");
   if (prior.owner.leaseOwner) return refuse("owner_lease_held");
   if (prior.owner.recoveryState) return refuse(`owner_recovery_${retirementReasonName("recoveryState", prior.owner.recoveryState)}`);
-  const cancellationRecoveryHeld = () => nativeUserStopRecoveryHeld(input.db, { ...binding, runId: identity.runId });
+  const cancellationRecoveryHeld = () => nativeUserStopRecoveryHeld(input.db, { ...binding, runId: identity.runId }, { controlBytes });
   if (stoppedByUser && await cancellationRecoveryHeld()) return refuse("owner_recovery_action_pending");
   // A durable controller is fenced by its released database lease; a legacy
   // controller still needs process evidence, exactly as for warm recovery.

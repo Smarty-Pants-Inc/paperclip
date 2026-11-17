@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
@@ -20,6 +20,9 @@ import { createNativeControllerRecovery, resolveNativeControllerRecovery } from 
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { recordTaskStopPending } from "../recovery/stop-pending.js";
+import { nativeUserStopRecoveryHeld } from "./native-user-stop-settlement.js";
+import { FRESH_THREAD_STARTED_NOTE } from "./fresh-thread-stop-gate.js";
 import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
 } from "./native-session-resume.js";
@@ -732,6 +735,100 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       status: "expired", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
     await stopSettledOwner(prior);
     expect(await followUp.start()).toBe(outcome);
+  }, 60_000);
+
+  /** H6 (recovery/service.ts): a warm Stop whose release was skipped raises
+   * the Stop-pending card through its real writer, never a hand-made row. */
+  async function raiseStopPendingCard(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, runIds = [prior.runId]) {
+    await db.transaction(async tx => recordTaskStopPending(tx as unknown as typeof db, { companyId, issueId: prior.issueId,
+      runIds, source: "recovery.sweep_stale_issue_locks" }, []));
+    const [card] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, prior.issueId),
+      inArray(issueRecoveryActions.status, ["active", "escalated"])));
+    expect(card?.evidence.stopPending).toBeTruthy();
+    return card!;
+  }
+
+  // adopt-h6-thread (S1 with-file row): after a proven Stop, H6's card for
+  // the stopped run alone is not an owner-recovery obligation. The follow-up
+  // retires that owner and continues the same provider thread.
+  it("continues the same provider thread after a proven Stop that left a Stop-pending card", async () => {
+    const prior = await seedRecoveredPriorRun();
+    const followUp = await admitFollowUp(prior);
+    await stopSettledOwner(prior, { events: [
+      { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
+    ] });
+    const card = await raiseStopPendingCard(prior);
+    expect(card.evidence).toMatchObject({ runId: prior.runId, stopPending: { standalone: true, runIds: [prior.runId] } });
+    expect(await followUp.start()).toBe(ADMITTED);
+    expect(followUp.selectedRunId).toBe(prior.runId);
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    const checkpoint = next!.runnerProfileJson?.sessionCheckpoint as PersistedNativeSession;
+    expect(checkpoint.sessionId).toBe(prior.native.normalizedSessionId);
+    expect(checkpoint.providerSessionId).toBe("provider-session-before-recovery");
+    // Only the stopped per-turn Runner is retired (archived, as for any
+    // proven board Stop); the provider thread is resumed, not replaced.
+    expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+    expect(followUp.logs.join("")).not.toContain(FRESH_THREAD_STARTED_NOTE);
+    expect(followUp.logs.join("")).not.toContain("retirement_refused");
+    // The card's own visibility and clear are unchanged.
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, card.id));
+    expect(after).toMatchObject({ status: card.status, nextAction: card.nextAction, evidence: card.evidence });
+  }, 60_000);
+
+  it.each([
+    ["an escalated Pi abort", { events: [{ eventType: "harness.diagnostic",
+      payload: { code: "pi_abort_escalated", message: "abort did not settle" } }] }],
+    ["a failed turn", { events: [{ eventType: "turn.failed", payload: { status: "failed" } }] }],
+  ])("keeps a Stop-pending owner held while its Stop is unproven: %s", async (_label, options) => {
+    const prior = await seedRecoveredPriorRun();
+    const followUp = await admitFollowUp(prior);
+    await stopSettledOwner(prior, options);
+    await raiseStopPendingCard(prior);
+    expect(await followUp.start()).toBe(stranded("owner_stop_unsettled"));
+  }, 60_000);
+
+  it("keeps a Stop-pending card that annotates a stronger recovery obligation holding retirement", async () => {
+    const prior = await seedRecoveredPriorRun();
+    const followUp = await admitFollowUp(prior);
+    await stopSettledOwner(prior);
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: prior.issueId, kind: "active_run_watchdog",
+      cause: "native_execution_requires_reconciliation", fingerprint: randomUUID(), status: "active",
+      nextAction: "Preserve the cancelled run's workspace", evidence: { runId: prior.runId,
+        workspaceRecovery: { schema: "paperclip.workspace-recovery.v1", runId: prior.runId, status: "pending" } } });
+    const card = await raiseStopPendingCard(prior);
+    expect(card.evidence).toMatchObject({ stopPending: { standalone: false }, workspaceRecovery: { status: "pending" } });
+    expect(await followUp.start()).toBe(stranded("owner_recovery_action_pending"));
+  }, 60_000);
+
+  // The retirement fence refuses owner_stop_unsettled before it reads the
+  // card; the warm-adoption path (native-controller-recovery) reads both. The
+  // card itself must therefore hold for every unproven or stronger case.
+  const SETTLED_JOURNAL = JSON.stringify({ commands: [{ type: "turn.interrupt", status: "completed" }], committedEvents: [] });
+  it.each([
+    { label: "a proven Stop", held: false },
+    { label: "no caller journal", held: true, journal: null },
+    { label: "an undelivered tool answer", held: true, journal: JSON.stringify({ commands: [],
+      committedEvents: [{ eventType: "semantic_tool.input", sourceEventId: "unanswered" }] }) },
+    { label: "an escalated Pi abort", held: true, stop: { events: [{ eventType: "harness.diagnostic",
+      payload: { code: "pi_abort_escalated", message: "abort did not settle" } }] } },
+    { label: "an unacknowledged Stop", held: true, stop: { ack: "none" as const } },
+    { label: "another failure code", held: true, stop: { failureCode: "native_session_interrupted" } },
+    { label: "a live finalization lease", held: true, stop: { leaseOwner: "still-running-controller" } },
+    { label: "a card naming another run", held: true, otherRun: true },
+    { label: "a stronger obligation", held: true, stronger: true },
+  ])("nativeUserStopRecoveryHeld on a Stop-pending card with $label: held=$held", async ({ held, journal, stop, otherRun, stronger }) => {
+    const prior = await seedRecoveredPriorRun();
+    await stopSettledOwner(prior, stop ?? {});
+    if (stronger) {
+      await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: prior.issueId, kind: "active_run_watchdog",
+        cause: "native_execution_requires_reconciliation", fingerprint: randomUUID(), status: "active", nextAction: "Recover",
+        evidence: { runId: prior.runId, automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", runId: prior.runId } } });
+    }
+    // Sorted after any UUID v4, so evidence.runId stays the stopped run.
+    await raiseStopPendingCard(prior, otherRun ? [prior.runId, "ffffffff-ffff-4fff-bfff-ffffffffffff"] : [prior.runId]);
+    const binding = { companyId, issueId: prior.issueId, runId: prior.runId };
+    expect(await nativeUserStopRecoveryHeld(db, binding,
+      journal === null ? undefined : { controlBytes: journal ?? SETTLED_JOURNAL })).toBe(held);
   }, 60_000);
 
   it("keeps a Stop-settled owner held while its controller is still running", async () => {

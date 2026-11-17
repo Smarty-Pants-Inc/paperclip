@@ -300,6 +300,10 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
   if (pending.length > 0 && (!retainedUserStop || !input.sourceRunnerGenerationLost
     || !await input.sourceRunnerGenerationLost({ remoteCwd: sourceLease.metadata!.remoteCwd as string,
       identity: { runnerInstanceId: source.runnerInstanceId, normalizedSessionId } }))) return false;
+  const stopControlBytes = () => JSON.stringify({
+    commands: [...checkpoint.records].filter(([key]) => key.startsWith("command:")).map(([, bytes]) => JSON.parse(bytes)),
+    committedEvents: [...checkpoint.records].filter(([key]) => key.startsWith("event:")).map(([, bytes]) => JSON.parse(bytes)),
+  });
   if (retainedUserStop) {
     // A warm Runner's physical lease can predate the stopped business turn.
     // Accept it only within the already verified same-sandbox handoff chain.
@@ -307,12 +311,9 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
     if (admitted.session.lifecyclePolicy.mode !== "warm" || !origin || origin.acquiredAt > sourceLease.acquiredAt
       || typeof origin.metadata?.remoteCwd !== "string"
       || !sameSandboxWorkspaceAllocation(origin.metadata.remoteCwd, sourceLease.metadata!.remoteCwd as string)) return false;
-    const controlBytes = JSON.stringify({
-      commands: [...checkpoint.records].filter(([key]) => key.startsWith("command:")).map(([, bytes]) => JSON.parse(bytes)),
-      committedEvents: [...checkpoint.records].filter(([key]) => key.startsWith("event:")).map(([, bytes]) => JSON.parse(bytes)),
-    });
+    const controlBytes = stopControlBytes();
     if (stopJournalLeftUndeliveredTool(controlBytes) || await userStopLeftUncertainty(db, source)
-      || await nativeUserStopRecoveryHeld(db, input)) return false;
+      || await nativeUserStopRecoveryHeld(db, input, { controlBytes })) return false;
     // Use the pack's existing no-follow, owner/cwd/native-header validator.
     // This is only a read of retained history, not process death evidence.
     const packRoot = posix.join(sourceLease.metadata!.remoteCwd as string, ".paperclip-runtime", "paperclip-runner", "provider-pack");
@@ -343,7 +344,7 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
   const sorted = <T extends { id: string }>(rows: T[]) => [...rows].sort((left, right) => left.id.localeCompare(right.id));
   const freshCheckpoint = await loadNativeRunnerCheckpoint(db, { companyId: input.companyId, issueId: input.issueId, runId: source.id });
   const parts = (value: DurablePrpCheckpoint) => [...value.records].sort(([left], [right]) => left.localeCompare(right));
-  if (retainedUserStop && (await userStopLeftUncertainty(db, source) || await nativeUserStopRecoveryHeld(db, input))) return false;
+  if (retainedUserStop && (await userStopLeftUncertainty(db, source) || await nativeUserStopRecoveryHeld(db, input, { controlBytes: stopControlBytes() }))) return false;
   return freshCheckpoint !== null && nativeSha256(parts(freshCheckpoint)) === nativeSha256(parts(checkpoint))
     && nativeSha256(freshOwner) === nativeSha256(owner)
     && nativeSha256(sorted(freshHistory)) === nativeSha256(sorted(history))
