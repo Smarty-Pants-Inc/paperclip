@@ -957,6 +957,47 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   const resume = (f: { agentId: string }) => db.update(agents).set({ status: "active", lifecycleState: "ready",
     lifecycleHolds: [], pauseReason: null }).where(eq(agents.id, f.agentId));
 
+  // Keep: NOTE 7(c), first-chat setup was falsely described as an operator pause.
+  it.each([
+    ["preparing", null], ["preparing", "setup"],
+    ["verifying", null], ["verifying", "setup"],
+  ] as const)("NOTE7c: %s with pauseReason=%s keeps the first message pending, then its own run answers after ready", async (lifecycleState, pauseReason) => {
+    const f = await fixture();
+    await db.update(agents).set({ status: "paused", lifecycleState, pauseReason, lifecycleHolds: [], lifecycleError: null })
+      .where(eq(agents.id, f.agentId));
+    const commentId = await f.message("My first chat message, while setup is still running.");
+    // The fixture's message is already older than both settle and no-run grace.
+    const now = new Date();
+    expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now }))
+      .toEqual({ kind: "pending", recheckAt: now.getTime() + 30_000 });
+    await f.sweep();
+    await settleAt(f, 11 * 60_000);
+    expect(await f.visible()).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+    await resume(f);
+    const runId = await f.run({ commentId, status: "running" });
+    expect((await settleAt(f, 12 * 60_000)).kind).toBe("pending");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, runId));
+    await f.reply(runId);
+    expect((await settleAt(f, 13 * 60_000)).kind).toBe("answered");
+    expect(await f.visible()).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+  });
+
+  it.each([
+    { lifecycleHolds: ["manual"] as const, pauseReason: "setup" as const, lifecycleError: null },
+    { lifecycleHolds: [] as const, pauseReason: "manual" as const, lifecycleError: null },
+    { lifecycleHolds: [] as const, pauseReason: "setup" as const, lifecycleError: "Saved execution configuration failed verification." },
+  ])("NOTE7c guard: setup-looking state with a hold, explicit pause or lifecycle failure still follows the existing notice path (%j)", async input => {
+    const f = await fixture();
+    await db.update(agents).set({ status: "paused", lifecycleState: "verifying", ...input,
+      lifecycleHolds: [...input.lifecycleHolds] }).where(eq(agents.id, f.agentId));
+    await f.message();
+    expect((await settleAt(f, 0)).kind).toBe("noticed");
+    expect((await f.visible()).map(notice => notice.body)).toEqual([PAUSED_TEXT]);
+  });
+
   it("paused agent: a person's message gets ONE note that says the agent is paused and who can resume it, never 'sending again is safe'", async () => {
     const f = await fixture();
     await pause(f);

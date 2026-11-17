@@ -42,6 +42,28 @@ afterEach(async () => {
 });
 
 describe("AgentChatPicker", () => {
+  it.each([
+    ["preparing", "Preparing agent", "setup"], ["verifying", "Verifying agent", "setup"],
+    ["preparing", "Preparing agent", null], ["verifying", "Verifying agent", null],
+  ] as const)("NOTE7c: shows %s lifecycle copy instead of Paused during setup (%s; reason=%s)", async (lifecycleState, label, pauseReason) => {
+    await render({ agents: [{ ...agents[1], lifecycleState, pauseReason, lifecycleHolds: [], lifecycleError: null }] });
+    expect(options()[0].textContent).toContain(label);
+    expect(options()[0].textContent).not.toContain("Paused");
+    // Setup does not prevent saving the person's first chat message.
+    await act(async () => options()[0].click());
+    expect(props.onSelect).toHaveBeenCalledWith(expect.objectContaining({ id: "second", lifecycleState }), expect.any(AbortSignal));
+  });
+
+  it.each([
+    { lifecycleHolds: ["manual"], pauseReason: "setup", lifecycleError: null },
+    { lifecycleHolds: [], pauseReason: "manual", lifecycleError: null },
+    { lifecycleHolds: [], pauseReason: "setup", lifecycleError: "Verification failed" },
+  ] as const)("NOTE7c guard: does not disguise an operator pause or failed setup (%j)", async state => {
+    await render({ agents: [{ ...agents[1], lifecycleState: "verifying", ...state, lifecycleHolds: [...state.lifecycleHolds] }] });
+    expect(options()[0].textContent).toContain("Paused");
+    expect(options()[0].textContent).not.toContain("Verifying agent");
+  });
+
   it("shows unread per agent through search and clears it when read state updates", async () => {
     await render({ existingChatAgentIds: ["first", "second"], unreadMessageCounts: new Map([["first", 0], ["second", 12]]) });
     expect(options()[0].querySelector('[aria-label*="unread message"]')).toBeNull();
