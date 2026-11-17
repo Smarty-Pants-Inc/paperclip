@@ -915,6 +915,24 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(next.selectedRunId).toBe(refused);
   }, 60_000);
 
+  it("metaformat guard: runner origin with a NULL sourceEventId is execution start evidence", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    const refused = await failUnstartedFollowUp(prior);
+    await shapeLiveFenceRefusal(prior, refused);
+    expect(await refusedAtPriorOwnerFenceBeforeLaunch(db, { companyId, runId: refused })).toBe(true);
+    expect(await hasNativeExecutionStartEvidence(db, { companyId, id: refused })).toBe(false);
+    // Not a registry name or provider-work event: only the persisted runner
+    // origin can prove that this attempt reached a runner.
+    const [event] = await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: refused,
+      seq: 100, stream: "system", eventType: "runner.diagnostic", payload: {},
+      sourceInstanceId: "runner-with-missing-event-id", sourceEventId: null, sourceSeq: 1 }).returning();
+    expect(event.sourceEventId).toBeNull();
+    expect(await hasNativeExecutionStartEvidence(db, { companyId, id: refused })).toBe(true);
+    expect(await refusedAtPriorOwnerFenceBeforeLaunch(db, { companyId, runId: refused })).toBe(false);
+    const next = await admitFollowUp(prior);
+    expect(next.selectedRunId).toBe(refused);
+  }, 60_000);
+
   it("metaformat negative: a fence-refused run with its own launch request stays the source", async () => {
     const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
     await startedThenStopped(prior);
