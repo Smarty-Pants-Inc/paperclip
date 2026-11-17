@@ -81106,6 +81106,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           provider: "local_encrypted", actorType: "system", consumerType: "environment",
           consumerId: "startup-discovery-capture", outcome: "success" });
       }
+      // Fixture credential resolution batches audit writes on this same DB.
+      // Finish those producers' writes before measuring scope discovery.
+      await flushSecretResolutionWrites(db);
       const events: Array<Record<string, unknown>> = [], now = Date.now();
       const capture = createFullDatabaseResponseCapture({ start: now - 1, end: now + 59_000 }, event => events.push(event));
       installDatabaseResponseCapture(db, { chatActions, agentWakeupRequests }, capture);
