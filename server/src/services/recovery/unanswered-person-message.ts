@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, PENDING_WAIT_START_BOUND_MS, unansweredCardAnswerSql } from "../person-message-answer.js";
+import { completedPersonMessageAnswerSql, PENDING_WAIT_START_BOUND_MS, unansweredCardAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -207,9 +207,10 @@ const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorization
  * A run-less comment, shared session or unrelated later run is not an answer.
  */
 function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
-  // The ONE shared definition (person-message-answer.ts), so B's notice and the continuation carry never
-  // disagree on a message (RFL 20:22Z: run-less agent comments never answer; org 20:29Z: imported history).
-  return answeredPersonMessageSql(m);
+  // The ONE shared ANSWERED definition (person-message-answer.ts), so B's notice and the continuation carry never
+  // disagree on a message (RFL 20:22Z: run-less agent comments never answer; org 20:29Z: imported history;
+  // RFL 21:28Z: only a completed run's final answer, never a progress comment or a failed run's partial).
+  return completedPersonMessageAnswerSql(m);
 }
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
@@ -289,7 +290,7 @@ function cardAnswerNoticeAnsweredSql(companyId: SQL, issueId: SQL, reason: SQL):
   return sql`(starts_with(${reason}, ${UNANSWERED_MESSAGE_REASON_PREFIX}) and exists (select 1 from ${issueThreadInteractions} ca
     where ca.company_id = ${companyId} and ca.issue_id = ${issueId} and ca.resolved_at is not null
       and ca.id::text = substr(${reason}, ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-      and ${answeredPersonMessageSql({ id: sql`ca.id`, companyId: sql`ca.company_id`, issueId: sql`ca.issue_id`,
+      and ${completedPersonMessageAnswerSql({ id: sql`ca.id`, companyId: sql`ca.company_id`, issueId: sql`ca.issue_id`,
         createdAt: sql`ca.resolved_at` })}))`;
 }
 

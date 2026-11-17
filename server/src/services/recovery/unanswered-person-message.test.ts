@@ -48,6 +48,7 @@ import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
 import * as sweepModule from "./unanswered-person-message.js";
+import { completedPersonMessageAnswerSql, answeredPersonMessageSql, unansweredCardAnswerSql } from "../person-message-answer.js";
 import * as pendingModule from "./automatic-recovery-pending.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
@@ -602,6 +603,98 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.reply(retry);
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
+  });
+
+  // ANSWERED vs DELIVERED (RFL 21:28Z/21:29Z): only a completed run's FINAL answer answers a message.
+  const messageState = async (f: { companyId: string; issueId: string }, id: string) => {
+    const m = { id: sql`${id}::uuid`, companyId: sql`${f.companyId}::uuid`, issueId: sql`${f.issueId}::uuid`,
+      createdAt: sql`(select created_at from issue_comments where id = ${id}::uuid)` };
+    const [row] = await db.select({ delivered: answeredPersonMessageSql(m), answered: completedPersonMessageAnswerSql(m) })
+      .from(issues).where(eq(issues.id, f.issueId));
+    return row!;
+  };
+  const progress = async (f: { companyId: string; issueId: string; agentId: string; at: () => Date }, runId: string,
+    body = "Working on it: reading the files now.") => {
+    const [row] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: runId, createdAt: f.at() }).returning();
+    return row!.id;
+  };
+
+  it("RED ANSWERED: a run that posted a progress comment and then FAILED -> delivered, not answered: exactly one notice; a completed run's final answer then supersedes it", async () => {
+    const f = await fixture();
+    const commentId = await f.message("Please fix the build.");
+    const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    await progress(f, failed);
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: false });
+    await f.sweep(); await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    // The carry still carries it (continuation-comment-input.ts reads the same ANSWERED).
+    expect(await readContinuationCommentInput(db, { ...f, runId: failed })).toMatchObject({ wakeCommentIds: [commentId] });
+    // A completed run's final answer (its presentation decision names it) answers it: the notice is superseded.
+    const retry = await f.run({ commentId, status: "succeeded", retryOfRunId: failed });
+    const finalId = await progress(f, retry, "Fixed: the build is green.");
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "create", commentId: finalId } } })
+      .where(eq(heartbeatRuns.id, retry));
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: true });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    expect(await readContinuationCommentInput(db, { ...f, runId: failed })).toEqual({});
+  });
+
+  it.each(["cancelled", "timed_out", "interrupted"] as const)(
+    "RED ANSWERED: a %s run's partial reply is delivered, never answered", async status => {
+      const f = await fixture();
+      const commentId = await f.message();
+      await f.reply(await f.run({ commentId, status, errorCode: status === "cancelled" ? "cancelled" : status }));
+      expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: false });
+    });
+
+  it("RED ANSWERED: a SUCCEEDED run's progress comment is not its final answer when its presentation decision names another", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const done = await f.run({ commentId, status: "succeeded" });
+    // The presentation decision (native-run-finalizer.ts presentationDecision.commentId) names a different comment as
+    // the final answer -> the earlier progress comment is not it.
+    const early = await progress(f, done, "Still checking.");
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "create", commentId: randomUUID() } } })
+      .where(eq(heartbeatRuns.id, done));
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: false });
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "reuse", commentId: early } } })
+      .where(eq(heartbeatRuns.id, done));
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: true });
+  });
+
+  it("RED card point (1): an OPEN card asked by the carrying run that then FAILED holds the duty (no notice); once answered, the card-answer duty takes over", async () => {
+    const f = await fixture();
+    const commentId = await f.message("Ship it; ask me which region first.");
+    const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    await progress(f, failed);
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "ask_user_questions",
+      status: "pending", createdByAgentId: f.agentId, sourceRunId: failed, addresseeUserId: f.userId,
+      payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
+        options: [{ id: "eu", label: "EU" }] }] } as never, createdAt: f.at() }).returning();
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: true });
+    await f.sweep(); await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    // The person answers; its answer-resume run fails after a progress comment: the CARD ANSWER is now the owed input.
+    const resolvedAt = f.at();
+    await db.update(issueThreadInteractions).set({ status: "answered", resolvedByUserId: f.userId, resolvedAt })
+      .where(eq(issueThreadInteractions.id, card!.id));
+    const resume = await f.run({ status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, interactionId: card!.id,
+      interactionStatus: "answered", source: "issue.interaction.respond" } }).where(eq(heartbeatRuns.id, resume));
+    await progress(f, resume, "On it: deploying to EU.");
+    const owed = async () => (await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions)
+      .where(and(eq(issueThreadInteractions.id, card!.id), unansweredCardAnswerSql("issue_thread_interactions", new Date())))).length;
+    expect(await owed()).toBe(1);
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: true });
+    await f.sweep(); await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card!.id}`);
   });
 
   it("no false notice: a task with no person message (an agent or timer wake failed) adds none", async () => {
@@ -1595,7 +1688,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.sweep();
       expect((await f.visible())[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
     }
+    // supersedes(RFL 21:28Z ANSWERED): the paused (cancelled) run's own late reply is delivered, not an answer: the stop note stays.
     await f.reply(stopped);
+    await f.sweep();
+    expect((await f.visible()).map(n => n.body)).toEqual(["Managed Pi was paused before it answered your message. Send it again to continue."]);
+    // A COMPLETED run carrying the message publishes its final answer: that supersedes the note.
+    await f.reply(await f.run({ commentId, status: "succeeded" }));
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
@@ -2567,6 +2665,16 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
     it("RED: the sender's Stop of the run that started answering -> no resend notice at +2 min, +11 min or a later sweep", async () => {
       const f = await stopCase(f => stopFields(f.userId));
+      expect((await f.sweepAt(2 * 60_000)).kind).toBe("person_stopped");
+      expect((await f.sweepAt(11 * 60_000)).kind).toBe("person_stopped");
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+    });
+
+    it("RED card point (2): the sender-stopped run's PARTIAL reply stays under the person-stop exclusion: not answered, no notice", async () => {
+      const f = await stopCase(f => stopFields(f.userId));
+      await f.reply(f.runId);
+      expect(await messageState(f, f.commentId)).toEqual({ delivered: true, answered: false });
       expect((await f.sweepAt(2 * 60_000)).kind).toBe("person_stopped");
       expect((await f.sweepAt(11 * 60_000)).kind).toBe("person_stopped");
       await f.sweep();

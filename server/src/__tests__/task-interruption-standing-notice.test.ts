@@ -83,7 +83,7 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
 
-  it.each(["pending", "answered", "unrelated_reply", "history_only", "partly_answered"] as const)(
+  it.each(["pending", "answered", "unrelated_reply", "history_only", "partly_answered", "failed_progress", "answering_failed"] as const)(
     "R-ONCE: failed carried input %s offers Retry only while an answer is still owed", async outcome => {
       const f = await conversation("native_run_failed");
       const [message, other] = await db.insert(issueComments).values([
@@ -92,8 +92,9 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
       ]).returning();
       // The answering run was queued first, but posts its reply after the later
       // created failed attempt. The displayed failure remains the same run.
+      // answering_failed (RFL 21:28Z): the answering run carried the message but FAILED after its reply.
       const [answering] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
-        nativeIssueId: f.issueId, status: "succeeded", runtimeMode: "native", createdAt: next(), finishedAt: next(),
+        nativeIssueId: f.issueId, status: outcome === "answering_failed" ? "failed" : "succeeded", runtimeMode: "native", createdAt: next(), finishedAt: next(),
         contextSnapshot: { issueId: f.issueId, wakeCommentIds: [outcome === "unrelated_reply" || outcome === "history_only"
           ? other!.id : message!.id], ...(outcome === "history_only" ? { conversationCommentIds: [message!.id] } : {}) } }).returning();
       const [failed] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
@@ -102,8 +103,10 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
           wakeCommentIds: outcome === "partly_answered" ? [message!.id, other!.id] : [message!.id] } }).returning();
       expect(await card(f)).toMatchObject({ state: "failed", canRetry: true, observedRunId: failed!.id });
       if (outcome !== "pending") await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
-        authorType: "agent", authorAgentId: f.agentId, createdByRunId: answering!.id,
-        body: "Here is the answer.", createdAt: next() });
+        authorType: "agent", authorAgentId: f.agentId,
+        // failed_progress (RFL 21:28Z): the failed run's OWN progress comment is delivered, not an answer.
+        createdByRunId: outcome === "failed_progress" ? failed!.id : answering!.id,
+        body: outcome === "failed_progress" ? "Working on it..." : "Here is the answer.", createdAt: next() });
       const presentation = await card(f);
       expect(presentation).toMatchObject({ observedRunId: failed!.id,
         state: outcome === "answered" ? "resolved" : "failed", canRetry: outcome !== "answered" });
@@ -146,10 +149,13 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
     expect(notes).toHaveLength(1);
     expect(notes[0]!.metadata).toMatchObject({ authorizationReason: `unanswered_message:${answer!.id}`, sourceRunId: last!.id });
     expect(notes[0]!.body).toBe("Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.");
-    // A published reply on the answer-resume chain settles the card input too,
-    // even when the latest failed successor only carries its predecessor id.
+    // supersedes(RFL 21:28Z ANSWERED): a reply from the FAILED answer-resume run is delivered, not an answer: Retry stays.
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
       authorAgentId: f.agentId, createdByRunId: resume!.id, body: "Your chosen scope is complete.", createdAt: next() });
+    expect(await card(f)).toMatchObject({ state: "failed", canRetry: true, observedRunId: last!.id });
+    // A COMPLETED run's final answer on the answer-resume chain settles the card input too,
+    // even when the latest failed successor only carries its predecessor id.
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, resume!.id));
     expect(await card(f)).toMatchObject({ state: "resolved", canRetry: false, observedRunId: last!.id });
   });
 
