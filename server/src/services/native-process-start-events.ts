@@ -1,5 +1,6 @@
 export const PROCESS_START_REQUESTED = "native.process_start_requested";
 export const PROCESS_IDENTITY_RECORDED = "native.process_identity_recorded";
+export const PROCESS_STARTED = "native.process_started";
 /** Server-authored: the runner-state fence refused this run before it asked for
  * a runner, because a prior run's saved state could not be proven finished.
  * Both writers (native-session-executor recordPriorOwnerFenceRefusal) throw
@@ -7,4 +8,10 @@ export const PROCESS_IDENTITY_RECORDED = "native.process_identity_recorded";
 export const PRIOR_OWNER_FENCE_REFUSED = "native.prior_owner_fence_refused";
 
 /** Server-authored events (no source event ID) that prove a run started its own process. */
-export const OWN_PROCESS_START_EVENT_TYPES = [PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED] as const;
+export const OWN_PROCESS_START_EVENT_TYPES = [PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED, PROCESS_STARTED] as const;
+
+export const NATIVE_EXECUTION_START_EVENT_TYPES = [
+  "adapter.invoke",
+  ...OWN_PROCESS_START_EVENT_TYPES,
+  "tool.execution.started",
+] as const;
