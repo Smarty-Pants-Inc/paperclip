@@ -15,9 +15,11 @@ import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  agents, agentTaskSessions, agentWakeupRequests, companies, createDb, environmentLeases, environments, executionWorkspaces,
-  heartbeatRuns, issueComments, issueRecoveryActions, issues, issueThreadInteractions, nativeRunFinalizations,
+  agents, agentTaskSessions, agentWakeupRequests, companies, companyMemberships, completionContracts, createDb, environmentLeases, environments,
+  executionWorkspaces, heartbeatRuns, issueComments, issueRecoveryActions, issues, issueThreadInteractions, nativeRunFinalizations,
+  nativeRunResults,
 } from "@paperclipai/db";
+import { instanceSettingsService } from "./instance-settings.js";
 import { heartbeatService } from "./heartbeat.js";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
 import { materializeNativeInteractionResponses } from "./native-runtime/native-interaction-bridge.js";
@@ -421,5 +423,105 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(JSON.stringify(responses)).toContain("YES H3_PERSON");
     expect((await systemNotes(f)).filter(note => String(note.metadata?.authorizationReason ?? "").startsWith("fresh_provider_thread:")))
       .toHaveLength(1);
+  }, 90_000);
+  // h3-ii-live (gate 4 fam-h3 famh3-retry-2, 2026-11-17 19:50Z, fork fl/h3-fam 094cfd30): the
+  // live rows, field by field. Source 1c722cee: native answer-resume run (wakeReason
+  // issue_commented, interactionStatus answered), failed native_run_failed after a Pi SIGKILL,
+  // its failed result ACCEPTED and COMMITTED (nativePhase committed, coordinator committed,
+  // finalizationReasonCode run_failed_partial_evidence_preserved, issue stays in_progress).
+  // NO recovery action names it: no native terminal hold, no recovery generation. The
+  // conversation owner pressed Retry (receipt 4e20b9f6, actorSource session). Successor
+  // bbbdd169: forceFreshSession=true, previousRunId=1c722cee, taskRetryRequestId=4e20b9f6,
+  // NO explicitUserContinuation; a NEW box; the OLD Pi id 234bcf10; failed
+  // runner_state_identity_mismatch: prior_owner_scope_mismatch. No fresh-continuation:retry record.
+  // remote: the old box is a sandbox whose lease carries its termination receipt.
+  it.each(["task", "chat", "remote"] as const)("h3-ii-live: a person's Retry of a COMMITTED failed answer run with no hold records the retry-fresh decision at admission and opens a NEW Pi thread on the new box (%s)", async shape => {
+    const f = await seed(shape === "remote" ? "remote" : "not_task_owned");
+    const settings = instanceSettingsService(db), experimental = await settings.getExperimental();
+    const person = `person-${randomUUID()}`;
+    try {
+      // The conversation owner: a signed-in board member of the company.
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: person,
+        status: "active", membershipRole: "owner" });
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+        kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, resolvedByUserId: person,
+        resolvedAt: new Date(), title: "TEST famh3-retry-2 person answer", idempotencyKey: randomUUID(), payload: { version: 1,
+          questions: [{ id: "answer", prompt: "Which should I use: ALDER-A or ALDER-B?", required: true, selectionMode: "single",
+            options: [{ id: "a", label: "ALDER-A" }, { id: "b", label: "ALDER-B" }] }] },
+        result: { version: 1, answers: [{ questionId: "answer", optionIds: ["b"] }], summaryMarkdown: "ALDER-B" } } as never).returning();
+      // The live source row: an accepted, committed failed result (no hold names it).
+      const contractId = randomUUID(), resultId = randomUUID();
+      await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: f.issueId, revision: 1,
+        schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard", completionAuthority: "server_arbiter",
+        incompleteCriteriaPolicy: "preserve_non_terminal", contractJson: {}, canonicalSha256: contractId,
+        createdByActorType: "system", createdByActorId: "test" });
+      await db.update(heartbeatRuns).set({ errorCode: "native_run_failed", nativePhase: "committed", completionContractId: contractId,
+        invocationSource: "automation", triggerDetail: "system", responsibleUserId: person,
+        resultJson: { finalizationPhase: "committed", finalizationReasonCode: "run_failed_partial_evidence_preserved",
+          issueStatusAfter: "in_progress", prpRunTerminalState: "failed", nativeTerminal: { schema: "paperclip.prp.terminal.v1",
+            runTerminalState: "failed", turnTerminalState: "failed", reportedWorkDisposition: "needs_review" } },
+        contextSnapshot: { issueId: f.issueId, source: "issue.interaction.respond", mutation: "interaction",
+          wakeReason: "issue_commented", interactionId: card!.id, interactionKind: "ask_user_questions",
+          interactionStatus: "answered", ...(shape === "chat" ? { conversationSessionGeneration: 0 } : {}) } })
+        .where(eq(heartbeatRuns.id, f.sourceRunId));
+      await db.insert(nativeRunResults).values({ id: resultId, companyId: f.companyId, issueId: f.issueId, runId: f.sourceRunId,
+        completionContractId: contractId, serverFingerprint: resultId, schemaStatus: "accepted", canonicalSha256: resultId,
+        resultJson: { schema: "paperclip.run_result.v1", summary: "The Pi run failed before it completed.",
+          terminal: { runTerminalState: "failed", turnTerminalState: "failed" } } });
+      await db.update(nativeRunFinalizations).set({ phase: "committed", resultId, attempt: 1, failureDetail: null })
+        .where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+      // No recovery action names the source (recovery-actions [] at 19:50:31.919Z).
+      await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      await db.update(issues).set({ status: "in_progress", ...(shape === "chat" ? { conversationAgentId: f.agentId,
+        conversationUserId: person, conversationState: "waiting", conversationSessionGeneration: 0 } : {}) })
+        .where(eq(issues.id, f.issueId));
+      if (shape === "chat") await settings.updateExperimental({ enableAgentChat: true });
+      // Hold dispatch: the admitted successor is the assertion, not a live turn.
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+      // POST /issues/:id/retry as the conversation owner (route: requestTaskRetry, then resumeTaskRetry).
+      const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: person,
+        actorSource: "session", idempotencyKey: randomUUID(), observedRunId: f.sourceRunId });
+      expect(receipt).toMatchObject({ accepted: true, stale: false, observedRunId: f.sourceRunId });
+      await heartbeatService(db).resumeTaskRetry(f.companyId, receipt.requestId!);
+      const queued = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+        eq(heartbeatRuns.status, "queued")))).filter(run => run.contextSnapshot?.issueId === f.issueId);
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!));
+      expect(queued, JSON.stringify({ wake: wake && { status: wake.status, payload: wake.payload, error: wake.error } })).toHaveLength(1);
+      const successor = queued[0]!;
+      // The live successor's fields (bbbdd169), as queue admission writes them.
+      expect(successor.contextSnapshot).toMatchObject({ wakeReason: "task_retry", forceFreshSession: true,
+        previousRunId: f.sourceRunId, taskRetryRequestId: receipt.requestId, actorId: person, interactionIds: [card!.id] });
+      // Admission adopted the Retry: its readiness is the new box, bound to this Retry.
+      expect(successor.contextSnapshot?.explicitUserContinuation).toMatchObject({ previousRunId: f.sourceRunId,
+        taskRetryRequestId: receipt.requestId, readiness: { mode: "fresh_isolated_workspace", sourceRunId: f.sourceRunId,
+          retryIntentId: receipt.requestId } });
+      // The retry-fresh record exists BEFORE selection, naming this Retry.
+      const [record] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
+        eq(issueRecoveryActions.fingerprint, `fresh-continuation:retry:${successor.id}`)));
+      expect(record?.evidence).toMatchObject({ continuationRunId: successor.id, freshContinuation: { sourceRunId: f.sourceRunId,
+        trigger: "person_retry", retryIntentId: receipt.requestId } });
+      expect(await readFreshWorkspaceReadiness(db, successor)).toMatchObject({ mode: "fresh_isolated_workspace",
+        sourceRunId: f.sourceRunId, retryIntentId: receipt.requestId });
+      // The live successor ran with the chat's generation in its context (bbbdd169: conversationSessionGeneration 0).
+      await db.update(heartbeatRuns).set({ status: "running", ...(shape === "chat" ? { contextSnapshot: {
+        ...successor.contextSnapshot, conversationSessionGeneration: 0 } } : {}) }).where(eq(heartbeatRuns.id, successor.id));
+      const conversation = await selectPiConversation(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+        runId: successor.id, boundary: { provider: "pi_rpc", cwd: "/workspaces/new-box", remoteCwd: null, workspaceId: null, trust: "trust" } });
+      // A NEW Pi id on the new box, never the failed run's 234bcf10-equivalent.
+      expect(conversation.id).not.toBe(f.sessionId);
+      expect(conversation).toMatchObject({ previousId: f.sessionId, runId: successor.id,
+        reason: `fresh_continuation:${record!.id}` });
+      // The answer is carried exactly once.
+      const responses = await materializeNativeInteractionResponses({ db, companyId: f.companyId, issueId: f.issueId,
+        runId: successor.id, agentId: f.agentId, interactionIds: successor.contextSnapshot!.interactionIds as string[],
+        wakeReason: "task_retry" });
+      expect(responses.map(response => response.interactionId)).toEqual([card!.id]);
+      expect(JSON.stringify(responses)).toContain("ALDER-B");
+      expect((await systemNotes(f)).filter(note => String(note.metadata?.authorizationReason ?? "").startsWith("fresh_provider_thread:")))
+        .toHaveLength(1);
+    } finally {
+      await settings.updateExperimental({ enableAgentChat: experimental.enableAgentChat });
+    }
   }, 90_000);
 });
