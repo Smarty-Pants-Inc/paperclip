@@ -2,7 +2,6 @@ import express from "express";
 import request from "supertest";
 import { environmentRoutes } from "../routes/environments.js";
 import { errorHandler } from "../middleware/index.js";
-import { activityLog } from "@paperclipai/db";
 import { gitExclusionRetryContract } from "./helpers/git-exclusion-retry-contract.js";
 import { queueGitExclusionNextTry } from "./helpers/git-exclusion-next-try.js";
 import { heartbeatService } from "../services/heartbeat.js";
