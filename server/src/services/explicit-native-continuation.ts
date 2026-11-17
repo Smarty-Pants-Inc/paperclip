@@ -12,7 +12,7 @@ import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
-import { handedOffWarmLeaseSettled, requestHandedOffWarmLeaseStop } from "./native-runtime/handed-off-warm-lease.js";
+import { handedOffWarmLease, handedOffWarmLeaseSettled, handedOffWarmProofInFlight, requestHandedOffWarmLeaseStop } from "./native-runtime/handed-off-warm-lease.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun, QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, userStopBoundaryAt } from "./run-cancellation.js";
@@ -583,14 +583,18 @@ export async function admitExplicitNativeContinuation(input: {
       const handedOff = new Set<string>();
       for (const lease of leases) {
         if (hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease)) continue;
-        if (!await handedOffWarmLeaseSettled(run, lease)) break;
+        if (!handedOffWarmLeaseSettled(run, lease)) break;
         handedOff.add(lease.id);
       }
       const unsettled = leases.filter(lease => !handedOff.has(lease.id) && !hasRemoteTerminationReceipt(lease) && !hasRecoveredCleanupStopReceipt(lease));
       if (unsettled.length) {
         // pl/send-after-stop3: a handed-off box whose proof is unavailable here
         // (a controller restart) is stopped and kept now, not at warm expiry.
+        // rf-4 row 22c: a DB-only intent write in the caller's transaction; no remote call.
         for (const lease of unsettled) await requestHandedOffWarmLeaseStop(db, run, lease, { dryRun: input.dryRun === true && input.requestHandedOffWarmStop !== true });
+        // rf-4 row 22a: the runner-exit proof runs outside this transaction (proveHandedOffWarmLeases).
+        if (handedOffWarmProofInFlight(run.id) && unsettled.some(lease => handedOffWarmLease(run, lease)))
+          return blocked("interrupt_handoff", "Sending your messages.");
         return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
       }
       if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({

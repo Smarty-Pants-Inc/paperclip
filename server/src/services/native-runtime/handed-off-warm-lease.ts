@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { environmentLeases, type Db, type heartbeatRuns } from "@paperclipai/db";
 import { admittedNativeResourceDisposition, nativeStopWorkspaceOutcome } from "./native-failed-workspace-recovery.js";
 import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
@@ -17,7 +17,7 @@ type Run = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "nativeI
  * (keep_running) turn handed off: native run, lease retained and unreleased
  * with a reusable policy, no stop in flight on it, the warm-stop helper says
  * handoff. */
-function handedOffWarmLease(run: Run, lease: typeof environmentLeases.$inferSelect): boolean {
+export function handedOffWarmLease(run: Run, lease: typeof environmentLeases.$inferSelect): boolean {
   return !(run.runtimeMode !== "native" || lease.status !== "retained" || lease.releasedAt
     || !reusableNativeLeasePolicies.includes(lease.leasePolicy)
     || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease)
@@ -31,10 +31,65 @@ function handedOffWarmLease(run: Run, lease: typeof environmentLeases.$inferSele
  * proof says the stopped run's Runner exited. Shared by the explicit Send gate
  * (explicit-native-continuation.ts) and the automatic remote-stop resume
  * (acknowledgedNativeStopExecutionHasStopped). */
-export async function handedOffWarmLeaseSettled(run: Run, lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
+export function handedOffWarmLeaseSettled(run: Run, lease: typeof environmentLeases.$inferSelect): boolean {
+  // rf-4 row 22a: DB-only. The s3 fence's proof (handedOffWarmOwnerRunnerExited)
+  // talks to the box's Runner, so it never runs here (callers hold a transaction
+  // or a dryRun); proveHandedOffWarmLeases runs it outside any transaction and
+  // persists its answer, which is the only thing read here.
   if (!handedOffWarmLease(run, lease)) return false;
-  const { handedOffWarmOwnerRunnerExited } = await import("./native-session-executor.js");
-  return handedOffWarmOwnerRunnerExited({ runId: run.id, providerLeaseId: lease.providerLeaseId });
+  const evidence = lease.metadata?.[HANDED_OFF_WARM_EXIT_KEY] as { runId?: unknown } | undefined;
+  return evidence?.runId === run.id;
+}
+
+/** rf-4 row 22: persisted evidence that the s3 fence proved the stopped run's Runner exited. */
+export const HANDED_OFF_WARM_EXIT_KEY = "handedOffWarmOwnerRunnerExited";
+/** rf-4 row 22f: bound on the remote proof (stop the idle Runner, wait for its exit). */
+export const handedOffWarmProofTimeout = { ms: 20_000 };
+const proofsInFlight = new Map<string, Promise<"none" | "proven" | "unproven" | "timed_out">>();
+/** A proof for this run is running outside the transaction right now. */
+export function handedOffWarmProofInFlight(runId: string): boolean { return proofsInFlight.has(runId); }
+
+/** rf-4 row 22a/22f: run the s3 fence's runner-exit proof for every handed-off
+ * warm lease of this run that has no persisted answer yet, OUTSIDE any
+ * transaction (callers pass the root Db), bounded by handedOffWarmProofTimeout.
+ * Proven -> the evidence key is written on the lease. Timed out -> sas3's
+ * stop_and_retain intent (its provider receipt then admits the successor). */
+export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<"none" | "proven" | "unproven" | "timed_out"> {
+  const running = proofsInFlight.get(run.id);
+  if (running) return running;
+  const work = (async () => {
+    const leases = (await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
+      eq(environmentLeases.heartbeatRunId, run.id)))).filter(lease => handedOffWarmLease(run, lease) && !handedOffWarmLeaseSettled(run, lease));
+    if (!leases.length) return "none" as const;
+    const { handedOffWarmOwnerRunnerExited } = await import("./native-session-executor.js");
+    let outcome: "proven" | "unproven" | "timed_out" = "proven";
+    for (const lease of leases) {
+      let timer: NodeJS.Timeout | undefined;
+      const answer = await Promise.race([
+        handedOffWarmOwnerRunnerExited({ runId: run.id, providerLeaseId: lease.providerLeaseId }).catch(() => false),
+        new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), handedOffWarmProofTimeout.ms); }),
+      ]).finally(() => clearTimeout(timer));
+      if (answer === true) {
+        await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+          [HANDED_OFF_WARM_EXIT_KEY]: { runId: run.id, provenAt: new Date().toISOString() } })}::jsonb`, updatedAt: new Date() })
+          .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, run.companyId)));
+        continue;
+      }
+      if (answer === "timeout") {
+        const [candidate] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.id, lease.id),
+          eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+          warmSandboxExpiryCandidateCondition())).limit(1);
+        if (candidate && handedOffWarmLease(run, candidate))
+          await prepareSupersededWarmSandboxStop(db, candidate, { [HANDED_OFF_WARM_STOP_KEY]: true, proofTimedOutMs: handedOffWarmProofTimeout.ms });
+        return "timed_out" as const;
+      }
+      outcome = "unproven";
+      break;
+    }
+    return outcome;
+  })().finally(() => proofsInFlight.delete(run.id));
+  proofsInFlight.set(run.id, work);
+  return work;
 }
 
 /** pl/send-after-stop3: the predicate above refused a handed-off warm lease
