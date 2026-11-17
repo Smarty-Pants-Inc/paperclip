@@ -3,7 +3,7 @@ import { activityLog, agents, companies, createDb, environmentLeases, environmen
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { agentExecutionStopBlocker, runExecutionsHaveStopped } from "../services/agent-execution-stop.js";
+import { agentExecutionStopBlocker, runExecutionsHaveStopped, runExecutionsStoppedOrHandedOffWarm } from "../services/agent-execution-stop.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { claimCancellationRequest } from "../services/native-runtime/native-cancellation-request.js";
@@ -546,12 +546,17 @@ describe("stale-lock sweep requires execution Stop proof", () => {
 
   it("a proved warm-turn handoff Stop with no termination receipt raises no card and holds no owner", async () => {
     const f = await warmStopFixture("settled");
+    const before = await task(f.issueId);
     const { cards, held } = await onePass(f);
     // Base: an escalated execution_stop_pending card that holds the warm owner
     // (native refusal owner_recovery_action_pending, so a FRESH thread).
     expect(cards.map(card => card.cause)).toEqual([]);
     expect(held).toBe(false);
-    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
+    // adopt-h6-narrow (rf-3): the handoff passes the CARD path only. The shared
+    // claim-release proof still refuses it, so both claims are kept.
+    expect(await runExecutionsStoppedOrHandedOffWarm(db, f.companyId, [f.runId])).toBe(true);
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    expect(await task(f.issueId)).toEqual(before);
     // The warm box stays as it was: no release, no termination.
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0]).toEqual(f.lease);
     // Whole-agent lifecycle Stop is not broadened by the task-scoped proof.
@@ -562,6 +567,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     "settled-turn proof %s keeps the Stop-pending card", async proof => {
       const f = await warmStopFixture(proof);
       expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+      expect(await runExecutionsStoppedOrHandedOffWarm(db, f.companyId, [f.runId])).toBe(false);
       const { cards, held } = await onePass(f);
       expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
       expect(held).toBe(true);
@@ -572,6 +578,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata, sandboxStopAndRetain: { requestedAt: new Date().toISOString() } } })
       .where(eq(environmentLeases.id, f.lease.id));
     expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    expect(await runExecutionsStoppedOrHandedOffWarm(db, f.companyId, [f.runId])).toBe(false);
     const { cards, held } = await onePass(f);
     expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
     expect(held).toBe(true);
@@ -581,7 +588,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
   // a person's Stop). The sweep can run while the executor still owns the
   // native_retry_cancelled settlement, before it writes the idle-checkpoint
   // receipt. It defers to its own deferred deadline (the existing recheck);
-  // the unchanged Stop guard then decides on the receipt.
+  // the card path (runExecutionsStoppedOrHandedOffWarm) then decides on the receipt.
   async function awaitingReceiptFixture() {
     const f = await warmStopFixture("missing");
     // The executor still owns the coordinator: no receipt, no settlement yet.
@@ -623,8 +630,10 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     const recheck = await sweepOnce(f);
     expect(recheck.cards).toEqual([]);
     expect(recheck.held).toBe(false);
-    expect(recheck.swept.cleared).toBe(1);
-    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
+    // adopt-h6-narrow (rf-3): the handoff suppresses the card only; the
+    // recheck clears nothing and both claims are kept.
+    expect(recheck.swept.cleared).toBe(0);
+    expect(await task(f.issueId)).toEqual(before);
     // The warm box is untouched: it is the successor's retained box.
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0]).toEqual(f.lease);
   });

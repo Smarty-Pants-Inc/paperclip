@@ -1850,17 +1850,16 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await cards()).toEqual([]);
   }, 60_000);
 
-  // adopt-h6-claims (rf-3 F1): a PROVEN warm handoff makes the shared Stop
-  // proof true, so the real sweep releases both task claims, exactly as the
-  // Stop path's own release (run-control.ts cancel -> releaseIssueExecution)
-  // does, and promotes the message saved behind the lock (lock_released). The
-  // claims are not the box: the sweep never writes the warm lease, so the next
-  // message continues on the same box and the same provider thread, with one
-  // task owner and the warm lease neither orphaned nor destroyed.
-  it("a proven warm handoff releases the claims, promotes the saved message and the next message keeps box and thread", async () => {
+  // adopt-h6-narrow (rf-3 ruling, RFL 18:42Z): a PROVEN warm handoff only
+  // suppresses the Stop-pending CARD. It does not pass the shared Stop proof
+  // (runExecutionsHaveStopped) that gates claim release, so the real sweep
+  // clears NOTHING: both claims are kept exactly as before d4752b6b, no
+  // lock_released promotion fires, no card is raised and the warm lease is
+  // untouched. The next message continues the same session (keep-thread).
+  it("a proven warm handoff keeps both claims, raises no card and the next message keeps the thread", async () => {
     const { recoveryService } = await import("../recovery/service.js");
     const { nativeUserStopRecoveryHeld } = await import("./native-user-stop-settlement.js");
-    const { runExecutionsHaveStopped } = await import("../agent-execution-stop.js");
+    const { runExecutionsHaveStopped, runExecutionsStoppedOrHandedOffWarm } = await import("../agent-execution-stop.js");
     const { agentWakeupRequests } = await import("@paperclipai/db");
     const prior = await seedRecoveredPriorRun();
     // The person's Stop, settled by the executor: coordinator released and the
@@ -1894,29 +1893,33 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const { queuedSendAfterStop, userStopBoundaryAt } = await import("../run-cancellation.js");
     expect(queuedSendAfterStop(saved!.payload, { stoppedAt: userStopBoundaryAt(stoppedRun!)!, actorId: "board-user" }))
       .toEqual({ actorId: "board-user", requestedAt: sentAt.toISOString() });
-    expect(await runExecutionsHaveStopped(db, companyId, [prior.runId])).toBe(true);
+    // Card path accepts the handoff; the shared claim-release proof does not.
+    expect(await runExecutionsStoppedOrHandedOffWarm(db, companyId, [prior.runId])).toBe(true);
+    expect(await runExecutionsHaveStopped(db, companyId, [prior.runId])).toBe(false);
     const enqueueWakeup = vi.fn();
     const sweep = () => recoveryService(db, { enqueueWakeup }).sweepStaleIssueLocks({ companyId, issueId: prior.issueId,
       onDeferredDeadline: () => {} });
     const cards = () => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, prior.issueId));
     const lease = async () => (await db.select().from(environmentLeases).where(eq(environmentLeases.id, warmLease!.id)))[0];
-    // Base (claims kept): cleared 0 and an escalated execution_stop_pending card.
-    expect(await sweep()).toMatchObject({ cleared: 1, issueIds: [prior.issueId] });
-    const [released] = await db.select().from(issues).where(eq(issues.id, prior.issueId));
-    expect(released).toMatchObject({ checkoutRunId: null, executionRunId: null, executionLockedAt: null });
+    const [before] = await db.select().from(issues).where(eq(issues.id, prior.issueId));
+    const claims = (row: typeof before) => ({ checkoutRunId: row!.checkoutRunId, executionRunId: row!.executionRunId,
+      executionAgentNameKey: row!.executionAgentNameKey, executionLockedAt: row!.executionLockedAt });
+    // Base d4752b6b..1be2feb5: cleared 1 and both claims released. Before
+    // d4752b6b: cleared 0 but an escalated execution_stop_pending card.
+    expect(await sweep()).toMatchObject({ cleared: 0, issueIds: [] });
+    const [kept] = await db.select().from(issues).where(eq(issues.id, prior.issueId));
+    expect(claims(kept)).toEqual(claims(before));
+    expect(kept).toMatchObject({ checkoutRunId: prior.runId, executionRunId: prior.runId });
     expect(await cards()).toEqual([]);
     expect(await nativeUserStopRecoveryHeld(db, { companyId, issueId: prior.issueId, runId: prior.runId })).toBe(false);
-    // lock_released promotion: the saved message is due now (30 s backoff waived).
-    const [promoted] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, saved!.id));
-    expect(promoted!.status).toBe("deferred_issue_execution");
-    expect(promoted!.updatedAt.getTime()).toBeLessThanOrEqual(Date.now() - 29_000);
+    // No lock_released promotion: the saved message is untouched.
+    const [unpromoted] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, saved!.id));
+    expect(unpromoted).toMatchObject({ status: "deferred_issue_execution", updatedAt: saved!.updatedAt });
     // The box: byte-identical, still active and owned by the stopped turn.
     expect(await lease()).toEqual(warmLease);
-    // The next message: one new owner claims the task and continues the SAME
-    // native session and provider thread through the fence, on the same box.
+    // The next message continues the SAME native session and provider thread
+    // through the fence, on the same box.
     const followUp = await admitFollowUp(prior, false, { environmentId, providerLeaseId });
-    const [claimed] = await db.select().from(issues).where(eq(issues.id, prior.issueId));
-    expect(claimed).toMatchObject({ executionRunId: followUp.runId, checkoutRunId: null });
     expect(await followUp.start()).toBe(ADMITTED);
     expect(followUp.selectedRunId).toBe(prior.runId);
     const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
@@ -1924,11 +1927,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       providerSessionId: "provider-session-before-recovery" });
     expect(followUp.logs.join("")).not.toContain(FRESH_THREAD_STARTED_NOTE);
     expect(followUp.logs.join("")).not.toContain("retirement_refused");
-    // No double owner: a later sweep leaves the successor's claim alone and
-    // raises no card; the warm lease is still neither released nor cleaned.
-    expect(await sweep()).toMatchObject({ cleared: 0 });
-    expect((await db.select().from(issues).where(eq(issues.id, prior.issueId)))[0]).toMatchObject({
-      executionRunId: followUp.runId, checkoutRunId: null });
+    // A later sweep still raises no card and leaves the warm lease alone.
+    await sweep();
     expect(await cards()).toEqual([]);
     expect(await lease()).toEqual(warmLease);
     expect(enqueueWakeup).not.toHaveBeenCalled();
@@ -1997,11 +1997,11 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
 
   // adopt-h6-neg2 Send-only row (RFL 17:51Z, org 17:30Z): M2 and M3 were
   // queued behind the running turn BEFORE the person's Stop and never Sent.
-  // A proven warm handoff then releases the claims and lock_released fires.
-  // The held messages stay deferred and nothing starts them; only the
-  // person's Send releases them, once, in order.
+  // A proven warm handoff then raises no card and keeps both claims
+  // (adopt-h6-narrow). The held messages stay deferred and nothing starts
+  // them; only the person's Send releases them, once, in order.
   it.each(["plain", "with an execution wait"] as const)(
-    "messages held before a proven warm Stop stay deferred after the claim release until the person's Send (%s)", async shape => {
+    "messages held before a proven warm Stop stay deferred until the person's Send (%s)", async shape => {
       const { agentWakeupRequests, issueComments } = await import("@paperclipai/db");
       const { withQueuedCommentIdsInWakePayload, queuedCommentIdsFromWakePayload } = await import("../issue-queued-comment-queue.js");
       const { heartbeatService } = await import("../heartbeat.js");
@@ -2026,17 +2026,15 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         .where(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${prior.issueId} or ${heartbeatRuns.nativeIssueId} = ${prior.issueId}`))
         .filter(run => run.id !== prior.runId);
       const wakes = async () => db.select().from(agentWakeupRequests).where(inArray(agentWakeupRequests.id, held.map(row => row.wakeId)));
-      // The proven warm handoff: the real sweep releases both claims (lock_released fires).
-      expect(await sweepIssue(prior.issueId)).toMatchObject({ cleared: 1, issueIds: [prior.issueId] });
+      // The proven warm handoff: the real sweep keeps both claims and raises no card.
+      expect(await sweepIssue(prior.issueId)).toMatchObject({ cleared: 0, issueIds: [] });
       expect((await db.select().from(issues).where(eq(issues.id, prior.issueId)))[0])
-        .toMatchObject({ checkoutRunId: null, executionRunId: null });
-      for (const wake of await wakes()) expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
-      // lock_released only waives the 30 s backoff of a wake with an execution
-      // wait (work-intent-outbox.ts promoteDeferredWorkIntents); it starts nothing.
+        .toMatchObject({ checkoutRunId: prior.runId, executionRunId: prior.runId });
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, prior.issueId))).toEqual([]);
+      // No lock_released promotion: every held wake is untouched.
       for (const wake of await wakes()) {
-        const before = held.find(row => row.wakeId === wake.id)!.updatedAt.getTime();
-        if (shape === "plain") expect(wake.updatedAt.getTime()).toBe(before);
-        else expect(wake.updatedAt.getTime()).toBeLessThanOrEqual(Date.now() - 29_000);
+        expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+        expect(wake.updatedAt.getTime()).toBe(held.find(row => row.wakeId === wake.id)!.updatedAt.getTime());
       }
       // 60 s pass (every 30 s age gate expires): the real admission passes
       // that run on their own find nothing to start. A message queued before
