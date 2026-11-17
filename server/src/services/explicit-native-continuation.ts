@@ -12,7 +12,7 @@ import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
-import { handedOffWarmLeaseSettled } from "./native-runtime/handed-off-warm-lease.js";
+import { handedOffWarmLeaseSettled, requestHandedOffWarmLeaseStop } from "./native-runtime/handed-off-warm-lease.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun, QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, userStopBoundaryAt } from "./run-cancellation.js";
@@ -192,6 +192,10 @@ export async function admitExplicitNativeContinuation(input: {
   durableChatRequest?: DurableChatWakeupRequest;
   interactionPayload?: unknown;
   dryRun?: boolean;
+  /** pl/send-after-stop3: the Send's own gate inside its enqueue transaction
+   * (queue.ts) runs as a dry run; it alone may request the handed-off box's
+   * stop. Other dry runs (previews) never do. */
+  requestHandedOffWarmStop?: boolean;
   onBlocked?: (reason: string, message: string) => void;
 }): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; taskRetryRequestId?: string; queuedCommentInterruptId?: string; readiness?: ContinuationReadiness } | null> {
   const { db, companyId, issueId, agentId, actorId, commentId } = input;
@@ -582,7 +586,13 @@ export async function admitExplicitNativeContinuation(input: {
         if (!await handedOffWarmLeaseSettled(run, lease)) break;
         handedOff.add(lease.id);
       }
-      if (!leases.every(lease => handedOff.has(lease.id) || hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      const unsettled = leases.filter(lease => !handedOff.has(lease.id) && !hasRemoteTerminationReceipt(lease) && !hasRecoveredCleanupStopReceipt(lease));
+      if (unsettled.length) {
+        // pl/send-after-stop3: a handed-off box whose proof is unavailable here
+        // (a controller restart) is stopped and kept now, not at warm expiry.
+        for (const lease of unsettled) await requestHandedOffWarmLeaseStop(db, run, lease, { dryRun: input.dryRun === true && input.requestHandedOffWarmStop !== true });
+        return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      }
       if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
       }))) return refused("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
