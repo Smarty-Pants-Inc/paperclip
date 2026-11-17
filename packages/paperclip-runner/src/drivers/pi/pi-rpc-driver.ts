@@ -1707,7 +1707,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         // provenance/session/effect gates remain unchanged. Budget exhaustion
         // drops only the unrouteable display record with an explicit marker.
         if (this.#activeIdentityCount >= 65_536) {
-          if (!this.#identityLimited) this.#emit("harness.diagnostic", { code: "pi_native_identity_projection_limit", message: "[Pi projection truncated]: turn identity budget reached." }, turn);
+          if (!this.#identityLimited) this.#emit("harness.diagnostic", { code: "pi_native_identity_projection_limit", message: "Pi turn identity budget reached; further native identities are not projected." }, turn);
           this.#identityLimited = true;
           return false;
         }
