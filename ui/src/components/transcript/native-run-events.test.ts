@@ -74,6 +74,34 @@ function runResult(summary: string): Record<string, unknown> {
 }
 
 describe("cut native text snapshots", () => {
+  it.each(["reasoning", "agentMessage"] as const)("preserves literal terminal markers outside the runner byte window for %s, including reload", kind => {
+    const payload = { kind, channel: kind === "reasoning" ? "detail" : "final" };
+    for (const body of ["The literal marker is ", "r".repeat(4092), "r".repeat(4097), "é".repeat(4093)]) {
+      const value = body + "…[truncated]";
+      const completion = itemEvent(2, "item.completed", "literal-1", { ...payload, text: value });
+      for (const deltas of [[], [itemEvent(1, "item.delta", "literal-1", { ...payload, text: "An earlier draft" })]]) {
+        const entries = nativeRunEventsToTranscript([...deltas, completion]);
+        expect(entries[0]).toMatchObject({ text: value });
+        expect(JSON.stringify(entries)).not.toContain("is kept in the run log");
+      }
+    }
+  });
+
+  it.each(["reasoning", "agentMessage"] as const)("recognizes every UTF-8 cap boundary for %s by bytes, not string length", kind => {
+    const payload = { kind, channel: kind === "reasoning" ? "detail" : "final" };
+    for (const bytes of [4093, 4094, 4095, 4096]) {
+      const body = "é".repeat(2046) + "r".repeat(bytes - 4092);
+      const whole = body + "😀" + "tail".repeat(65);
+      const completion = itemEvent(2, "item.completed", "boundary-1", { ...payload, text: body + "…[truncated]" });
+      expect(Buffer.byteLength(body)).toBe(bytes);
+      expect(nativeRunEventsToTranscript([
+        itemEvent(1, "item.delta", "boundary-1", { ...payload, text: whole }), completion,
+      ])[0]).toMatchObject({ text: whole });
+      expect(nativeRunEventsToTranscript([completion])[0]).toMatchObject({ text: body +
+        `\n\nThe full ${kind === "reasoning" ? "thinking" : "response"} is kept in the run log.` });
+    }
+  });
+
   it.each(["reasoning", "agentMessage"] as const)("preserves streamed %s instead of preferring a cut completion", kind => {
     const whole = "é" + "r".repeat(4352);
     const cut = Buffer.from(whole).subarray(0, 4096).toString() + "…[truncated]";
@@ -266,7 +294,8 @@ describe("native proposed-plan presentation", () => {
     ]);
     expect(transcript[0]).toMatchObject({ kind: "assistant", text: "Plan ready." });
 
-    const fenced = "Format:\n```\n<proposed_plan>\n# Plan…[truncated]";
+    const fencedBody = "Format:\n```\n<proposed_plan>\n# Plan".padEnd(4096, "r");
+    const fenced = fencedBody + "…[truncated]";
     const fencedTranscript = nativeRunEventsToTranscript([
       itemEvent(1, "item.completed", "msg-2", { kind: "agentMessage", channel: "final", text: fenced }),
       event(2, "plan.proposed", {
@@ -274,7 +303,7 @@ describe("native proposed-plan presentation", () => {
         markdown: "# Other", source: "codex_plan_item",
       }),
     ]);
-    expect(fencedTranscript[0]).toMatchObject({ kind: "assistant", text: "Format:\n```\n<proposed_plan>\n# Plan\n\nThe full response is kept in the run log." });
+    expect(fencedTranscript[0]).toMatchObject({ kind: "assistant", text: fencedBody + "\n\nThe full response is kept in the run log." });
     expect(JSON.stringify(fencedTranscript)).not.toContain("[truncated]");
   });
 

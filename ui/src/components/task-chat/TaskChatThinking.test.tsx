@@ -82,10 +82,26 @@ describe("inline reasoning is plain text in the turn", () => {
     expect(container.textContent).not.toContain("[truncated]");
   });
 
+  it.each([390, 1440])("renders a legitimate terminal marker literally on reload at a %spx host width", width => {
+    container.style.width = `${width}px`;
+    const value = "The literal marker is …[truncated]";
+    const entries = paperclipRunnerUIAdapter.parseStdoutLine(JSON.stringify({
+      type: "paperclip.prp.event", event: { eventType: "item.completed", itemId: "literal-1",
+        payload: { kind: "reasoning", item: { type: "reasoning", text: value } } },
+    }), "2026-11-17T12:00:00.000Z");
+    const item = transcriptToTaskChatItems(entries, { runId: "literal-reload", running: false })[0];
+    expect(item.kind).toBe("thinking");
+    if (item.kind !== "thinking") return;
+    render(item.lines.join("\n"), true);
+    expect(container.querySelector('[data-testid="task-chat-thinking"]')!.textContent).toBe(value);
+    expect(container.textContent).not.toContain("is kept in the run log");
+  });
+
   it("renders a no-stream excerpt with the run-log notice, never the cut marker", () => {
+    const excerpt = "Stored excerpt".padEnd(4096, "r");
     const entries = paperclipRunnerUIAdapter.parseStdoutLine(JSON.stringify({
       type: "paperclip.prp.event", event: { eventType: "item.completed", itemId: "r1",
-        payload: { kind: "reasoning", item: { type: "reasoning", text: "Stored excerpt…[truncated]" } } },
+        payload: { kind: "reasoning", item: { type: "reasoning", text: excerpt + "…[truncated]" } } },
     }), "2026-11-17T12:00:00.000Z");
     const item = transcriptToTaskChatItems(entries, { runId: "reload", running: false })[0];
     expect(item.kind).toBe("thinking");

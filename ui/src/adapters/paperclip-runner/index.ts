@@ -78,6 +78,11 @@ export function runnerSnapshotText(value: string, previous: string | undefined, 
   const marker = "…[truncated]";
   if (!value.endsWith(marker)) return value;
   const body = value.slice(0, -marker.length);
+  // redact_text cuts at a UTF-8 boundary at or below 4,096 bytes. A
+  // four-byte code point can move that boundary back by at most three bytes;
+  // a marker outside this window is literal content, not a runner snapshot.
+  const bodyBytes = new TextEncoder().encode(body).byteLength;
+  if (bodyBytes < 4_093 || bodyBytes > 4_096) return value;
   if (previous && previous.startsWith(body)) return previous;
   return `${body}\n\nThe full ${kind} is kept in the run log.`;
 }
