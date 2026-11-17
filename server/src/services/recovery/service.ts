@@ -117,6 +117,7 @@ import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
+import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
 import { isCancelledNativeStartup } from "../cancelled-native-startup.js";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
@@ -4321,7 +4322,12 @@ export function recoveryService(
       inArray(nativeRunFinalizations.runId, [...leaseRunIds]));
     if (coordinators.some(row => row.leaseOwner)) return false;
     for (const run of runs.filter(run => leaseRunIds.has(run.id))) {
-      if (leases.some(lease => lease.heartbeatRunId === run.id && lease.provider && lease.provider !== "local")) continue;
+      const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
+      if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
+        // Lease cleanup masks this independent blocker in the shared guard.
+        if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return false;
+        continue;
+      }
       const processProof = await proveRunProcessGone(run, "recovery_lease_release_pending");
       if (processProof && processProof.verdict !== "gone") return false;
       // Preserve the guard's independent local cancellation-proof requirements.
