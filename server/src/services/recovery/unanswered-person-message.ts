@@ -92,6 +92,13 @@ export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
+/** A carried steer (a person's message steered mid-task, restored at its run end because that turn did not answer
+ * it, then carried into the next turn) whose carrying turn ended failed or cancelled without answering it. */
+export const UNANSWERED_CARRIED_STEER_FAILED_TEXT =
+  "Your message (received mid-task) wasn't answered because the run failed. Sending it again is safe.";
+export const UNANSWERED_CARRIED_STEER_STOPPED_TEXT =
+  "Your message (received mid-task) wasn't answered because the run was stopped. Sending it again is safe.";
+const CARRIED_STEER_FAILED_ENDS = ["failed", "cancelled", "timed_out", "interrupted"];
 /** The ONE bound (follow-Paperclip B-2, RFL 05:51Z): the fork's K=2 fresh-continuation chain cap. */
 export const FRESH_CONTINUATION_BOUND = 2;
 export const UNANSWERED_MESSAGE_BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, "
@@ -337,7 +344,22 @@ export async function settleUnansweredPersonMessage(
         and ${answeredSql(rawMessage("m"))})`);
   });
 
+  // A carried steer whose carrying turn failed or was stopped gets its own ONE notice (same key, same fence),
+  // also when a later message is the latest one. It runs first, so the latest-message step below sees it noticed.
+  const carried = await settleCarriedSteerNotices(db, issue, now);
   const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
+  const outcome = await settleLatestPersonMessage(db, issue, now, decision, input.nativeBlockedRepairApplies);
+  if (outcome.kind === "noticed") return outcome;
+  if (carried.noticed) return carried.noticed;
+  if (carried.recheckAt !== null) {
+    return { kind: "pending", recheckAt: outcome.kind === "pending" ? Math.min(outcome.recheckAt, carried.recheckAt) : carried.recheckAt };
+  }
+  return outcome;
+}
+
+async function settleLatestPersonMessage(db: Db, issue: DecisionIssue, now: Date, decision: Decision,
+  nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<UnansweredMessageOutcome> {
+  const input = { nativeBlockedRepairApplies };
   if (decision.kind === "pending") {
     if (decision.recordDeferral) {
       await appendHeartbeatRunEvent(db, { companyId: issue.companyId, runId: decision.recordDeferral.runId,
@@ -380,6 +402,128 @@ export async function settleUnansweredPersonMessage(
     return comment?.id ?? null;
   });
   return commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" };
+}
+
+type CarriedSteerNotice = { reason: string; code: string; upgradeCommentId: string | null;
+  notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice> };
+
+/**
+ * Carried steers (restoreUnansweredSteersAtRunEnd: resultJson.restoredSteeredCommentIds; S10 C1:
+ * stopRestoredSteeredCommentIds) that the turn carrying them ended FAILED or cancelled without answering, with
+ * nothing further that will deliver them (no live run carrying it, no waiting wake holding it). Each gets ONE
+ * notice under its message's own key (unanswered_message:<id>); never a silent answered-mark, never twice. Reads only.
+ */
+async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date):
+  Promise<{ notices: CarriedSteerNotice[]; recheckAt: number | null }> {
+  const none = { notices: [], recheckAt: null };
+  if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
+    || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return none;
+  const agentId = issue.assigneeAgentId;
+  const since = new Date(now.getTime() - UNANSWERED_MESSAGE_LOOKBACK_MS);
+  const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
+  const restorers = await q.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
+    sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) > ${since.toISOString()}::timestamptz`,
+    sql`(${heartbeatRuns.resultJson} ? 'restoredSteeredCommentIds' or ${heartbeatRuns.resultJson} ? 'stopRestoredSteeredCommentIds')`));
+  const restoredIds = (result: unknown) => {
+    const value = (result ?? {}) as Record<string, unknown>;
+    return [value.restoredSteeredCommentIds, value.stopRestoredSteeredCommentIds]
+      .flatMap((ids) => Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : []);
+  };
+  const ids = [...new Set(restorers.flatMap((row) => restoredIds(row.resultJson)))]
+    .filter((id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id));
+  if (ids.length === 0) return none;
+  const messages = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids),
+    eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+    sql`not ${answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`));
+  if (messages.length === 0) return none;
+  const runs = await q.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
+    error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson,
+    contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt, updatedAt: heartbeatRuns.updatedAt,
+    createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
+    sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) > ${since.toISOString()}::timestamptz`))
+    .orderBy(desc(heartbeatRuns.createdAt)).limit(50);
+  const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+    inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+    // A wake already promoted into a run is that run's: the run's own end decides.
+    isNull(agentWakeupRequests.runId)));
+  const notices: CarriedSteerNotice[] = [];
+  let recheckAt: number | null = null;
+  for (const message of messages) {
+    // The turn that carried it after its restore: never the run that restored it (that run no longer carries it).
+    const carriers = runs.filter((run) => runCarriesMessage(run.contextSnapshot, message.id)
+      && !restoredIds(run.resultJson).includes(message.id));
+    const carrying = carriers[0];
+    if (!carrying || carriers.some((run) => LIVE.includes(run.status))) continue;
+    if (!CARRIED_STEER_FAILED_ENDS.includes(carrying.status)) continue;
+    if (wakes.some((wake) => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id))) continue;
+    const code = unansweredMessageCode(carrying);
+    // A held conversation has its own notice ("send a new message"), never "sending it again is safe".
+    if (HELD_CODES.has(code) || isNativeContinuationRefusal(carrying)) continue;
+    const due = (carrying.finishedAt ?? carrying.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
+    if (due > now.getTime()) { recheckAt = Math.min(recheckAt ?? due, due); continue; }
+    // A same-run retry or a pending native finalization is a further attempt that still carries it: not yet.
+    const [coordinator] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
+      .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, issue.companyId),
+        eq(nativeRunFinalizations.runId, carrying.id)));
+    if (carrying.issueCommentStatus === "retry_queued" || (coordinator && (NATIVE_PENDING_PHASES.includes(coordinator.phase)
+      || (coordinator.phase === "retryable_failure"
+        && (!coordinator.nextAttemptAt || coordinator.nextAttemptAt.getTime() + OVERDUE_NATIVE_RETRY_MS > now.getTime()))))) {
+      const later = now.getTime() + 30_000;
+      recheckAt = Math.min(recheckAt ?? later, later);
+      continue;
+    }
+    const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
+    const [noticed] = await q.select({ id: issueComments.id,
+      waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)` })
+      .from(issueComments).where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+        sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
+    if (noticed && !noticed.waiting) continue;
+    const stopped = carrying.status === "cancelled";
+    notices.push({ reason, code, upgradeCommentId: noticed?.id ?? null, notice: buildStrandedRecoveryEscalationNotice({
+      seed: { title: "Your message wasn't answered", tone: "warning",
+        body: stopped ? UNANSWERED_CARRIED_STEER_STOPPED_TEXT : UNANSWERED_CARRIED_STEER_FAILED_TEXT,
+        nextAction: "Send the message again; if it fails again, assign this agent a new task." },
+      recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",
+      sourceRun: { id: carrying.id, agentId: carrying.agentId, status: carrying.status, errorCode: code },
+    }) });
+  }
+  return { notices, recheckAt };
+}
+
+/** Posts the carried-steer notices; each is decided again unchanged under the issue fence before it is written. */
+async function settleCarriedSteerNotices(db: Db, issue: DecisionIssue, now: Date):
+  Promise<{ noticed: UnansweredMessageOutcome | null; recheckAt: number | null }> {
+  const decided = await decideCarriedSteerNotices(db, issue, now);
+  let noticed: UnansweredMessageOutcome | null = null;
+  for (const candidate of decided.notices) {
+    const commentId = await db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues)
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+      const fenced = (await decideCarriedSteerNotices(tx as unknown as Db, issue, now)).notices
+        .find((entry) => entry.reason === candidate.reason && entry.upgradeCommentId === candidate.upgradeCommentId);
+      if (!fenced) return null;
+      if (fenced.upgradeCommentId) {
+        // The message's standing waiting note becomes this text: still one note.
+        const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
+          metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now })
+          .where(and(eq(issueComments.id, fenced.upgradeCommentId), eq(issueComments.companyId, issue.companyId),
+            isNull(issueComments.deletedAt))).returning({ id: issueComments.id });
+        return updated?.id ?? null;
+      }
+      const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
+        authorType: "system", presentation: fenced.notice.presentation,
+        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason },
+      }, tx);
+      return comment?.id ?? null;
+    });
+    if (commentId) noticed ??= { kind: "noticed", code: candidate.code, commentId };
+  }
+  return { noticed, recheckAt: decided.recheckAt };
 }
 
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
