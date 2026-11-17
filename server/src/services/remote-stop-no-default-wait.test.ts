@@ -11,6 +11,7 @@ import { providerResourceDispositionForTerminalRun } from "./runner-environment-
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { agentExecutionStopBlocker } from "./agent-execution-stop.js";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
+import { personFacingText, STOP_ABSENT_LINES } from "../__tests__/helpers/person-facing-lines.js";
 
 // adopt-stopu: no handed-off lease. The stopped run's lease is released as its
 // own teardown releases it (runner-environment-lifecycle.ts, the real
@@ -121,6 +122,11 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(done.status).not.toBe("deferred_issue_execution");
     expect((done.payload?.executionWait as { reason?: string } | undefined)?.reason).not.toBe("execution_recovery");
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toHaveLength(0);
+    // adopt-stopu r2 (rf-4 ii): none of the absent lines in the Stop line, the
+    // transcript or the notices (control: the reader sees the held messages).
+    const seen = await personFacingText(db, f.companyId, f.issueId);
+    expect(seen.text).toContain("\"m2\"");
+    expect(STOP_ABSENT_LINES.filter(line => (seen.text + queue.executionWait.message.toLowerCase()).includes(line))).toEqual([]);
   }, 60_000);
   // adopt-stopu U5 (RED at c1x: the warm handoff leaves no stop receipt, so the
   // admission gate explicit-native-continuation.ts remote_cleanup holds the wake).
@@ -148,6 +154,9 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await wakeOf(nextId)).status).not.toBe("deferred_issue_execution");
     // The pre-Stop held messages are not started by the automatic pass (Send-only).
     expect((await wakeOf(f.queueId)).status).toBe("deferred_issue_execution");
+    const seen = await personFacingText(db, f.companyId, f.issueId);
+    expect(seen.text).toContain("next message");
+    expect(STOP_ABSENT_LINES.filter(line => seen.text.includes(line))).toEqual([]);
   }, 60_000);
   // adopt-stopu PAUSE row (unit): after a Stop + a successor, the agent's pause is not
   // held by remote_stop_unconfirmed (agent-execution-stop.ts executionStopBlocker): the

@@ -31,6 +31,7 @@ import { captureDirectorySnapshot, directorySnapshotSha256, withDirectoryMergeLo
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
+import { personFacingText, STOP_ABSENT_LINES } from "../__tests__/helpers/person-facing-lines.js";
 import { createAdapterExecutionControl } from "./adapter-execution-control.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./heartbeat/runtime-execution.js";
@@ -350,6 +351,13 @@ const support = await getEmbeddedPostgresTestSupport();
       boxSha: sha(await readFile(join(f.box, "task.txt"), "utf8")) };
     expect(record).toEqual({ box: f.providerLeaseId, sameBox: true, hostSha: sha(expected), boxSha: sha(expected) });
     console.info(`[adopt-stopu U3 ${_label}] ${JSON.stringify(record)}`);
+    // adopt-stopu r2 (rf-4 ii): the person's transcript and notices carry NONE
+    // of the absent lines (producers by line: helpers/person-facing-lines.ts).
+    const seen = await personFacingText(db, f.companyId, f.issueId);
+    // Control: the reader does see this Stop's own transcript line.
+    expect(seen.text).toContain("stopped turn's workspace exported to the host");
+    expect(STOP_ABSENT_LINES.filter(line => seen.text.includes(line))).toEqual([]);
+    console.info(`[adopt-stopu r2 absent lines ${_label}] ${JSON.stringify({ sources: seen.sources, found: [] })}`);
   }, 60_000);
 
   // adopt-stopu step 6/7 (H6 decision): a stale-lock sweep BETWEEN the person's
