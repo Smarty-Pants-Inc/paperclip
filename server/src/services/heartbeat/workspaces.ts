@@ -1,5 +1,5 @@
 import { PI_CONVERSATION_KEY } from "../native-runtime/pi-conversation-record.js";
-import { retainCurrentWorkspaceSource } from "../workspace-source-lock.js";
+import { IsolatedRepositorySourceBusy, retainCurrentWorkspaceSource } from "../workspace-source-lock.js";
 import { isGitMountBoundaryMessage } from "../git-mount-boundary-message.js";
 import { localWorkspaceSourcePaths } from "../execution-workspace-source-roots.js";
 import { effectiveProjectWorkspacePolicy } from "../project-workspace-provider.js";
@@ -3653,6 +3653,7 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
           projectCwd = resolvedCwd.cwd;
           managedWorkspaceWarning = resolvedCwd.warning;
         } catch (error) {
+          if (error instanceof IsolatedRepositorySourceBusy) throw error;
           const scrubbedError = scrubGitCredentialText(
             error instanceof Error ? error.message : String(error),
           );

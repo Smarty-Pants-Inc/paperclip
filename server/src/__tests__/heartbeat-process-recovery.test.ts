@@ -8072,7 +8072,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(sourceIssue?.status).toBe("blocked");
   });
 
-  it("escalates an in_progress issue whose interrupted run has spent its transient retry budget", async () => {
+  it("(superseded by replacement: one-note wording, RFL record 00:01Z) escalates an in_progress issue whose interrupted run has spent its transient retry budget", async () => {
     // Restarts in a row interrupted a run until its server-restart bound for
     // the window was spent. The retry scheduler then reports the budget
     // exhausted and queues nothing, and the sweeper used to skip the issue
@@ -8132,7 +8132,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     const comments = await selectRecoveryCommentsForIssue(issueId);
     expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("Paperclip tried to continue this task again, but it still could not continue");
+    expect(comments[0]?.body).toBe("Paperclip could not continue this task. Press Retry to start it again from the saved work.");
     expect(comments[0]?.body).toContain("Press Retry");
     expect(comments[0]?.authorType).toBe("system");
     expect(comments[0]?.presentation).toMatchObject({
@@ -8195,7 +8195,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(sourceIssue?.status).toBe("in_progress");
   });
 
-  it("escalates an assigned todo issue whose lost dispatch has spent its transient retry budget", async () => {
+  it("(superseded by replacement: one-note wording, RFL record 00:01Z) escalates an assigned todo issue whose lost dispatch has spent its transient retry budget", async () => {
     const { agentId, runId, issueId } = await seedStrandedIssueFixture({
       status: "todo",
       runStatus: "failed",
@@ -8229,7 +8229,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(sourceIssue?.status).toBe("blocked");
     expect(sourceIssue?.assigneeAgentId).toBe(agentId);
     const comments = await selectRecoveryCommentsForIssue(issueId);
-    expect(comments[0]?.body).toContain("Paperclip tried to start this task again, but it still could not start. Press Retry");
+    expect(comments[0]?.body).toBe("Paperclip could not start this task. Press Retry to start it.");
   });
 
   it("escalates an exhausted successful handoff run that still leaves no disposition", async () => {
@@ -10538,7 +10538,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(events[0]).toMatchObject({
       eventType: "lifecycle",
       stream: "system",
-      level: "warn",
+      level: "info",
       message: "run interrupted by board comment",
       payload: expect.objectContaining({
         issueId,
@@ -12333,7 +12333,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("blocks assigned todo work after the one automatic dispatch recovery was already used", async () => {
+  it("(superseded by replacement: one-note wording, RFL record 00:01Z) blocks assigned todo work after the one automatic dispatch recovery was already used", async () => {
     const { companyId, agentId, issueId, runId } =
       await seedStrandedIssueFixture({
         status: "todo",
@@ -12372,7 +12372,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await selectRecoveryCommentsForIssue(issueId);
     expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("tried to start this task again");
+    expect(comments[0]?.body).toBe("Paperclip could not start this task. Press Retry to start it.");
     expect(comments[0]?.body).not.toContain("sk-test-recovery-secret");
     expect(JSON.stringify(comments[0]?.metadata)).not.toContain(
       "sk-test-recovery-secret",
@@ -12834,7 +12834,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       wakes.some((row) => row.reason === "run_liveness_continuation"),
     ).toBe(false);
   });
-  it("blocks stranded in-progress work after the continuation retry was already used", async () => {
+  it("(superseded by replacement: one-note wording, RFL record 00:01Z) blocks stranded in-progress work after the continuation retry was already used", async () => {
     const { companyId, agentId, issueId, runId } =
       await seedStrandedIssueFixture({
         status: "in_progress",
@@ -12863,7 +12863,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await selectRecoveryCommentsForIssue(issueId);
     expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("tried to continue this task again");
+    expect(comments[0]?.body).toBe("Paperclip could not continue this task. Press Retry to start it again from the saved work.");
     expect(comments[0]?.presentation).toMatchObject({
       kind: "system_notice",
       tone: "danger",
@@ -17304,6 +17304,40 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await waitForRunToSettle(heartbeat, retryRun.id);
     }
   });
+
+  it.each(["queued", "claimed"] as const)(
+    "does not queue a second continuation while the finished run's own status wake (%s) awaits dispatch (Gate C C1 t169)",
+    async (intentStatus) => {
+      const { companyId, agentId, issueId, runId } =
+        await seedStrandedIssueFixture({
+          status: "in_progress",
+          runStatus: "succeeded",
+          livenessState: "advanced",
+        });
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_continuation_needed",
+        status: intentStatus,
+        claimedAt: intentStatus === "claimed" ? new Date() : null,
+        requestedByActorType: "system",
+        requestedByActorId: "native-status-committer",
+        idempotencyKey: `agent_tool_call_loop:${runId}`,
+        payload: { issueId, taskId: issueId, sourceRunId: runId, continuationCause: "agent_tool_call_loop" },
+      });
+      await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId }).where(eq(heartbeatRuns.id, runId));
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.escalated).toBe(0);
+      expect(result.skipped).toBe(1);
+      expect(await selectRecoveryRunsByAgent(agentId)).toHaveLength(1);
+      expect((await selectRecoveryIssueById(issueId))?.status).toBe("in_progress");
+    },
+  );
 
   it("does not replenish exhausted legacy repair from a recent comment", async () => {
     const { companyId, agentId, issueId, runId } =

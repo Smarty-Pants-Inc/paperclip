@@ -36,7 +36,7 @@ function CreationVisibilityStory({ included = false }: { included?: boolean }) {
   useState(() => {
     hydrateStorybookQueries(queryClient);
     saveTaskCollectionPreferences({ companyId, collectionKey: viewStateKey, legacyViewStorageKey: `${viewStateKey}:${companyId}` }, {
-      viewState: { ...defaultIssueFilterState, showAgentCreatedTasks: included, viewMode: "list", groupBy: "none", sortField: "updated", sortDir: "desc", nestingEnabled: true, collapsedParents: [], collapsedGroups: [] },
+      viewState: { ...defaultIssueFilterState, hideAgentCreatedTasks: !included, hideAgentCreatedTasksExplicit: !included, viewMode: "list", groupBy: "none", sortField: "updated", sortDir: "desc", nestingEnabled: true, collapsedParents: [], collapsedGroups: [] },
       columns: ["status", "id", "assignee", "updated"],
     });
     const listKey = queryKeys.issues.list(companyId);
@@ -63,7 +63,7 @@ function CreationVisibilityStory({ included = false }: { included?: boolean }) {
 }
 
 const hidden: Story = {
-  name: "Agent-created tasks — hidden by default",
+  name: "Agent-created tasks — explicitly hidden",
   render: () => <CreationVisibilityStory />,
   parameters: { docs: { description: { story: "Production task collection with simulated creation metadata and hierarchy reads. Agent and routine roots are hidden; agent subtasks and ancestors remain as context. Server participation and pagination are covered separately." } } },
   play: async ({ canvasElement }) => {
@@ -78,7 +78,7 @@ const hidden: Story = {
 };
 
 const included: Story = {
-  name: "Agent-created tasks — explicit opt-in",
+  name: "Agent-created tasks — shown by default",
   render: () => <CreationVisibilityStory included />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
@@ -90,13 +90,13 @@ const included: Story = {
 
 const filter: Story = {
   name: "Agent-created tasks — filter control",
-  render: () => <CreationVisibilityStory />,
+  render: () => <CreationVisibilityStory included />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText("Human request")).toBeVisible();
     canvas.getByTitle("Filter").click();
     const page = within(canvasElement.ownerDocument.body);
-    await expect(await page.findByRole("checkbox", { name: /Show agent-created tasks/ })).not.toBeChecked();
+    await expect(await page.findByRole("checkbox", { name: /Hide agent-created tasks/ })).not.toBeChecked();
   },
 };
 
