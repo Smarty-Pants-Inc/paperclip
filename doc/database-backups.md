@@ -36,6 +36,8 @@ Restore into a separate disposable database before you use a backup for recovery
 `runDatabaseRestore` uses `psql` when available. For JavaScript backups with
 statement boundaries, it can also apply the SQL with the database client.
 
+Archives made by the old JavaScript engine (before this fix) can still fail a whole restore on a violated constraint; the guard covers backups taken by the fixed build, so take a fixed-build backup before you rely on a restore.
+
 JavaScript dumps restore CHECK, UNIQUE and EXCLUDE constraints after the data.
 If existing rows violate a CHECK, restore adds it as `NOT VALID`, which still
 checks new inserts and updates. A UNIQUE or EXCLUDE constraint cannot be added
