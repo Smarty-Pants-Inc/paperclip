@@ -64,6 +64,18 @@ describe("issuesApi.list", () => {
     expect(mockApi.get).toHaveBeenNthCalledWith(2, "/companies/company-1/issues?createdFromIssueId=source-1&limit=500&sortField=id&sortDir=asc&afterId=task-499");
   });
 
+  // Trust boundary: the inverted UI must keep the existing API wire contract.
+  it.each([true, false])("preserves includeAgentCreatedTasks=%s on list, compact and all-page reads", async includeAgentCreatedTasks => {
+    await issuesApi.list("company-1", { includeAgentCreatedTasks });
+    expect(mockApi.get.mock.lastCall?.[0]).toBe(`/companies/company-1/issues?includeAgentCreatedTasks=${includeAgentCreatedTasks}`);
+    await issuesApi.listCompact("company-1", { includeAgentCreatedTasks });
+    expect(mockApi.get.mock.lastCall?.[0]).toBe(`/companies/company-1/issues?includeAgentCreatedTasks=${includeAgentCreatedTasks}&view=compact`);
+    await issuesApi.listAll("company-1", { projectId: "project-1", includeAgentCreatedTasks });
+    const params = new URLSearchParams(mockApi.get.mock.lastCall?.[0].split("?")[1]);
+    expect(params.get("includeAgentCreatedTasks")).toBe(String(includeAgentCreatedTasks));
+    expect(params.get("projectId")).toBe("project-1");
+  });
+
   it("passes parentId through to the company issues endpoint", async () => {
     await issuesApi.list("company-1", {
       parentId: "issue-parent-1",
