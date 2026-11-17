@@ -2064,16 +2064,22 @@ fn preserve_final_agent_message_text(
     max_frame_bytes: usize,
     state_dir: &Path,
 ) -> Value {
-    if event_type != "item.completed"
-        || !matches!(
-            original.get("kind").and_then(Value::as_str),
-            Some("agentMessage" | "assistant_message")
-        )
-        || original.get("channel").and_then(Value::as_str) != Some("final")
-    {
-        return sanitized;
-    }
-    let Some(text) = original.get("text").and_then(Value::as_str) else {
+    let message_kind = matches!(
+        original.get("kind").and_then(Value::as_str),
+        Some("agentMessage" | "assistant_message")
+    );
+    let channel = original.get("channel").and_then(Value::as_str);
+    // Person-visible text: the final answer, a progress message (task chat)
+    // and a failed Pi item's message (transcript).
+    let (field, noun) = match event_type {
+        "item.completed" if message_kind && channel == Some("final") => ("text", "answer"),
+        "item.completed" if message_kind && channel == Some("progress") => ("text", "text"),
+        "item.failed" if original.get("provider").and_then(Value::as_str) == Some("pi_rpc") => {
+            ("message", "text")
+        }
+        _ => return sanitized,
+    };
+    let Some(text) = original.get(field).and_then(Value::as_str) else {
         return sanitized;
     };
     let mut candidate = sanitized.clone();
@@ -2082,11 +2088,11 @@ fn preserve_final_agent_message_text(
     };
     // An upstream projector may already have kept a longer answer whole.
     match crate::provider_events::full_text_reference(original.get("fullText")) {
-        Some(full) => object.insert("fullText".to_owned(), full),
-        None => object.remove("fullText"),
+        Some(full) if noun == "answer" => object.insert("fullText".to_owned(), full),
+        _ => object.remove("fullText"),
     };
     let whole = redact_sensitive_text_values(text);
-    object.insert("text".to_owned(), Value::String(whole.clone()));
+    object.insert(field.to_owned(), Value::String(whole.clone()));
     // Size the serialized payload, not the raw text: JSON escaping can double
     // the text, and the secure frame hex-encodes the encrypted envelope,
     // doubling it again. Keep the whole text only if the complete payload, its
@@ -2113,9 +2119,10 @@ fn preserve_final_agent_message_text(
                 .unwrap_or(0),
         );
     object.insert(
-        "text".to_owned(),
+        field.to_owned(),
         Value::String(oversized_final_answer_notice(
             &whole,
+            noun,
             full.is_some(),
             budget.saturating_sub(base_bytes),
         )),
@@ -2163,7 +2170,12 @@ fn keep_whole_final_answer(whole: &str, state_dir: &Path) -> Option<Value> {
 /// The person's text for a final answer longer than one frame: one plain,
 /// true line and a clearly labelled excerpt that fits `budget` serialized
 /// bytes. No path, digest or cut marker.
-fn oversized_final_answer_notice(whole: &str, kept_in_runner_state: bool, budget: usize) -> String {
+fn oversized_final_answer_notice(
+    whole: &str,
+    noun: &str,
+    kept_in_runner_state: bool,
+    budget: usize,
+) -> String {
     let kilobytes = whole.len().div_ceil(1000);
     let kept = if kept_in_runner_state {
         "The full text is kept"
@@ -2171,7 +2183,7 @@ fn oversized_final_answer_notice(whole: &str, kept_in_runner_state: bool, budget
         "The full text is kept in the agent's conversation"
     };
     let notice = format!(
-        "This answer is longer than one message ({kilobytes} KB). {kept}; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n"
+        "This {noun} is longer than one message ({kilobytes} KB). {kept}; ask me to show any part.\n\nExcerpt (the start of the {noun}, not the whole {noun}):\n\n"
     );
     let mut used = serde_json::to_vec(&notice)
         .map(|bytes| bytes.len())
