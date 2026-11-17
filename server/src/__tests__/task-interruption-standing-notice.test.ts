@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
-import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_TEXT } from "../services/recovery/unanswered-person-message.js";
+import { isNativeContinuationRefusal } from "../services/native-continuation-refusal.js";
 import { HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
 import { EXECUTION_BLOCKER_PERSON_RETRY_ACTION, getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "../services/execution-control-deadline.js";
@@ -57,11 +58,19 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
     const failed = await run("failed", errorCode);
     return { companyId, agentId, issueId, sessionId, issue: issue!, failed, run };
   }
-  // The executor's notice (noticeHeldUnfinishedPredecessor): same author, metadata and text.
+  // #21066: use the real sweep, not a hand-written deleted-writer comment.
+  // Exact text remains asserted: only actual held refusals get held wording.
   async function holdConversation(f: Awaited<ReturnType<typeof conversation>>) {
-    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "system", body: HELD_PREDECESSOR_NOTICE,
-      createdAt: next(), metadata: { version: 1, authorizationReason: `native_prior_owner_held:${f.sessionId}`,
-        sections: [{ rows: [{ type: "run_link", runId: f.failed.id, agentId: f.agentId, title: "Held conversation" }] }] } });
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", body: "Continue the conversation.", createdAt: new Date(f.failed.createdAt.getTime() - 1_000) }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, commentId: message!.id } })
+      .where(eq(heartbeatRuns.id, f.failed.id));
+    expect(await settleUnansweredPersonMessage(db, { ...f,
+      now: new Date(f.failed.finishedAt!.getTime() + 2 * 60_000) })).toMatchObject({ kind: "noticed" });
+    const heldCodes = ["native_session_cleanup_quarantined", "runner_state_identity_mismatch", "native_sandbox_cold_resume_unproven",
+      "native_event_replay_conflict", "native_execution_ownership_unverified"];
+    return { message: message!, text: isNativeContinuationRefusal(f.failed) || heldCodes.includes(f.failed.errorCode ?? "")
+      ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT };
   }
   const card = async (f: Awaited<ReturnType<typeof conversation>>) => {
     const listed = (await taskInterruptionPresentations(db, f.companyId, [f.issue])).get(f.issueId);
@@ -71,14 +80,14 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
 
   // follow-Paperclip Cut B R8: the held notice stays visible but cannot withhold an otherwise valid Retry.
   it("(a) a held conversation whose last run failed: the card carries the notice text and offers Retry", async () => {
-    const f = await conversation("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+    const f = await conversation("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate");
     await holdConversation(f);
     const presentation = await card(f);
     expect(presentation).toMatchObject({ state: "failed", canRetry: true,
-      notice: { code: "native_prior_owner_held", text: HELD_PREDECESSOR_NOTICE } });
+      notice: { code: "unanswered_message", text: HELD_PREDECESSOR_NOTICE } });
     // The output reader and the card show the same standing notice.
     expect(await readStandingRunNotice(db, { companyId: f.companyId, issueId: f.issueId }))
-      .toMatchObject({ source: "held", text: HELD_PREDECESSOR_NOTICE });
+      .toMatchObject({ source: "unanswered", text: HELD_PREDECESSOR_NOTICE });
     // No recovery action here, so there is no execution blocker to refuse Retry.
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
@@ -131,10 +140,14 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
   // follow-Paperclip Cut B R8: success supersedes notice output; Retry does not wait for that success.
   it("(c) a later committed success on the same conversation clears it", async () => {
     const f = await conversation("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate");
-    await holdConversation(f);
+    const { message } = await holdConversation(f);
     expect(await card(f)).toMatchObject({ canRetry: true, notice: { text: HELD_PREDECESSOR_NOTICE } });
     const succeeded = await f.run("succeeded", null);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, commentId: message.id } })
+      .where(eq(heartbeatRuns.id, succeeded.id));
     await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: succeeded.id, phase: "committed" });
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: succeeded.id, body: "Continued from the saved work.", createdAt: next() });
     // A later ordinary failure on the continued conversation shows the generic card again.
     await f.run("failed", "native_session_interrupted");
     const presentation = await card(f);
@@ -163,11 +176,12 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
   });
 
   // follow-Paperclip Cut B R8: every diagnostic row keeps its notice text without a notice-derived Retry veto.
-  it.each(PARTIAL_ROWS)("(d) %s %s: a standing held notice shows its text without withholding Retry", async (_row, code) => {
+  it.each(PARTIAL_ROWS)("(d) %s %s: the sweep's exact standing text shows without withholding Retry", async (_row, code) => {
     const f = await conversation(code);
-    await holdConversation(f);
+    const { text } = await holdConversation(f);
     expect(await card(f)).toMatchObject({ state: "failed", canRetry: true,
-      notice: { code: "native_prior_owner_held", text: HELD_PREDECESSOR_NOTICE } });
+      notice: { code: "unanswered_message", text } });
+    expect(await readStandingRunNotice(db, f)).toMatchObject({ source: "unanswered", text });
   });
   // C2 (RFL 4x3): the execution-deadline notice exactly as reconciliation commits it.
   async function deadlineNotice(f: Awaited<ReturnType<typeof conversation>>) {

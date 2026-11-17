@@ -34,7 +34,7 @@ import { questionResponseDeliveryService } from "../question-response-delivery.j
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "../continuation-comment-input.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
-import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
+import { HELD_PREDECESSOR_NOTICE as HELD } from "../native-runtime/held-predecessor-notice-text.js";
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
@@ -317,8 +317,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect((await f.visible())[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
   });
 
-  // Keep: recorded D10 F0 catch. One continuation must not abort the ordinary conversations behind it.
-  it("RFL round4 F0 sweeps a continued conversation with five ordinary unanswered ones without throwing", async () => {
+  // RFL supersede record: SUPERSEDE-RFL-ROUND4-F0-1117.md (BAR.md 17:53Z).
+  // Keep the recorded D10 F0 catch: a continuation must not abort the ordinary
+  // conversations behind it, but an ended run cannot hide forever past its bound.
+  it("supersedes(RFL round4 F0; SUPERSEDE-RFL-ROUND4-F0-1117.md): continued conversation past its bound and five ordinary ones", async () => {
     const held = await fixture();
     const heldRunId = await held.run({ commentId: await held.message(), status: "failed", errorCode: "runner_remote_state_unavailable" });
     await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, heldRunId));
@@ -341,10 +343,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         expect(notices).toHaveLength(1);
         expect(notices[0]!.body).toBe(NOT_ANSWERED);
       }
-      // RFL 17:18Z: its fresh continuation is recorded and its delivery is
-      // pending (automaticRecoveryPending (b)), so no resend advice for it;
-      // the sweep's own bound still posts one note if it never delivers.
-      expect(await held.visible()).toHaveLength(0);
+      // This fixture's run ended 15 min ago. RFL 17:28Z bounds ALL pending
+      // recovery states at failed END +10 min, including delivery pending.
+      // The same once-only truthful notice stands on every pass.
+      expect(await held.visible()).toHaveLength(1);
+      expect((await held.visible())[0]!.body).toBe(NOT_ANSWERED);
     }
   });
 
@@ -1503,7 +1506,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(codeOf(notices[0]!)).toBe("provider_process_exited");
   });
 
-  it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
+  it("RFL F2 sole-owner replacement (#21066, rf5 18:20Z): concurrent sweep passes, no deadlock, exactly one notice", async () => {
     for (let round = 0; round < 4; round++) {
       const f = await fixture();
       const sessionId = randomUUID();
@@ -1512,20 +1515,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const refused = await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
         error: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate" });
       await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, refused));
-      const [late] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", runtimeMode: "native",
-        nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId } }).returning();
-      const writer = () => noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
-        binding: { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, runId: late!.id },
-        session: { normalizedSessionId: sessionId } } as never }, new Error("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate"));
       const sweep = () => heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
-      await expect(Promise.all(round % 2 ? [writer(), sweep()] : [sweep(), writer()])).resolves.toBeDefined();
-      await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, late!.id));
+      await expect(Promise.all([sweep(), sweep()])).resolves.toBeDefined();
       await sweep();
       expect(await f.visible(), `round ${round}`).toHaveLength(1);
     }
   });
 
-  it("RFL F2, the other order: the sweep's notice first, then the executor's held-notice writer adds none (same issue fence)", async () => {
+  it("RFL F2 sole-owner replacement (#21066, rf5 18:20Z): later sweep passes add no second notice", async () => {
     const f = await fixture();
     const sessionId = randomUUID();
     await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "failed", runtimeMode: "native",
@@ -1535,11 +1532,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, refused));
     await f.sweep();
     expect(await f.visible()).toHaveLength(1);
-    const [late] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", runtimeMode: "native",
-      nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId } }).returning();
-    await noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
-      binding: { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, runId: late!.id },
-      session: { normalizedSessionId: sessionId } } as never }, new Error("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate"));
+    await f.sweep();
     expect(await f.visible()).toHaveLength(1);
   });
 

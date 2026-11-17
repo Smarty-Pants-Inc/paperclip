@@ -426,8 +426,8 @@ export async function settleUnansweredPersonMessage(
   }
   if (decision.kind !== "notice") return decision;
   const commentId = await db.transaction(async tx => {
-    // The issue fence that comment writers, the executor's held-notice writer
-    // and execution admission take. The SAME predicate is evaluated again
+    // The issue fence that comment writers and execution admission take.
+    // The SAME predicate is evaluated again
     // under it: an answer (prose or the turn's own card), a held notice, a
     // newer message, a run or a wake that committed while this sweep waited
     // means no notice.
@@ -579,6 +579,14 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // failed. A chain that ended otherwise is outside this rule.
   if (cardAnswer && run && run.status === "succeeded") return { kind: "answered" };
 
+  // One predicate and one hard bound for all automatic-recovery states,
+  // including queued/deferred continuation delivery. A later first sweep
+  // must not restart the clock for an already-ended failed run.
+  const recoveryPending = Boolean(run && TERMINAL.includes(run.status) && run.status !== "succeeded"
+    && await automaticRecoveryPending(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id }));
+  const recoveryStartDeadline = run ? (run.finishedAt ?? run.updatedAt).getTime() + PENDING_WAIT_START_BOUND_MS : 0;
+  const recoveryBoundReached = recoveryPending && recoveryStartDeadline <= now.getTime();
+
   // Every wait for a further attempt is BOUNDED, except a turn in progress:
   // T0 is recorded ONCE (durably, PENDING_WAIT_ACTION, keyed by the message
   // and its carrying run, messageRun; a refused successor below never
@@ -669,7 +677,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   }
   let waitingToStart = false;
   let continuationWaiting = false;
-  if (liveRuns.length && !agentPaused && !settingUp) {
+  if (liveRuns.length && !agentPaused && !settingUp && !recoveryBoundReached) {
     const wait = await bounded(now.getTime() + 30_000);
     if (wait) return wait;
     for (const candidate of liveRuns) {
@@ -693,7 +701,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     inArray(issueRecoveryActions.status, ["active", "escalated"])))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
-  if (!boardHold && !agentPaused && !settingUp) {
+  if (!boardHold && !agentPaused && !settingUp && !recoveryBoundReached) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
       .from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
@@ -763,14 +771,16 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // The system's own automatic recovery of this run is on its way: no
     // resend advice. The same short grace, then the true waiting note, and
     // the existing start bound: past it, today's notice below.
-    if (run.status !== "succeeded" && !boardHold
-      && await automaticRecoveryPending(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) {
-      const wait = await bounded(now.getTime() + 30_000);
-      if (wait) return wait;
-      const startDeadline = (waitT0 ?? now.getTime()) + PENDING_WAIT_START_BOUND_MS;
-      if (startDeadline > now.getTime()) {
+    // The shared predicate scopes recovery to THIS run. An older predecessor's
+    // board-owned stop does not cancel this run's automatic reconciliation.
+    if (recoveryPending) {
+      // Automatic recovery's hard bound is measured from the failed run's
+      // durable END, never from when a sweep happened to observe it first.
+      if (recoveryStartDeadline > now.getTime()) {
+        const wait = await bounded(Math.min(now.getTime() + 30_000, recoveryStartDeadline));
+        if (wait) return wait;
         if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_RECOVERING_CODE) {
-          return { kind: "pending", recheckAt: startDeadline };
+          return { kind: "pending", recheckAt: recoveryStartDeadline };
         }
         recovering = true;
       }
@@ -864,7 +874,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     }
   }
 
-  // Already explained: the executor's held notice for this conversation, or a
+  // Already explained: a historical executor held notice for this conversation, or a
   // person-facing recovery notice, posted after the message. An older held
   // notice never silences a newer message.
   const heldNotice = await readUnsupersededHeldConversationNotice(q, { companyId: issue.companyId, issueId: issue.id });
