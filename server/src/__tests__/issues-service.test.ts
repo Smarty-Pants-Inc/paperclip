@@ -6994,6 +6994,32 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
     expect(comment.body).toBe("transaction-safe comment");
   });
 
+  it("resolves caller-transaction agent creation within a fixed single-connection bound", async () => {
+    const callerDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const created = await Promise.race([
+        callerDb.transaction((tx) =>
+          issueService(callerDb).create(
+            companyId,
+            { title: "bounded caller-transaction create", assigneeAgentId: agentId },
+            tx,
+          ),
+        ),
+        new Promise<never>((_resolve, reject) => {
+          deadline = setTimeout(() => reject(new Error("caller-transaction create exceeded 2000ms")), 2_000);
+        }),
+      ]);
+      expect(created.assigneeAgentId).toBe(agentId);
+      expect(created.title).toBe("bounded caller-transaction create");
+      const [persisted] = await db.select().from(issues).where(eq(issues.id, created.id));
+      expect(persisted?.assigneeAgentId).toBe(agentId);
+    } finally {
+      clearTimeout(deadline);
+      await callerDb.$client.end({ timeout: 0 });
+    }
+  });
+
   it("keeps update and create transaction reads on a single pooled connection", async () => {
     const memberUserId = randomUUID();
     await db.insert(companyMemberships).values({
