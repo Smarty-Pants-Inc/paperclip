@@ -27,7 +27,12 @@ export type CancelledWarmExportOutcome =
   | { outcome: "unproven"; reason: string };
 
 function deferredLine(reason: string): string {
-  return `Stopped turn's workspace export could not be proven (${reason}); the warm box stays protected and its files are not yet on the host.`;
+  // pl/cancel-finalize3: say only what is known. The export was not CONFIRMED in
+  // time (the host may already hold some or all of the files); the box stays a
+  // protected export source; the person's recovery action today is the task's
+  // "Recover saved files" (ui WorkspaceExportRecovery.tsx -> POST
+  // /issues/:id/recovery-actions/recover-workspace -> resumeNativeWorkspaceSync).
+  return `Stopped turn's workspace export could not be confirmed in time (${reason}); its files may or may not be on the host yet, and the warm box stays protected, so nothing on it is lost. To copy them back, use Recover saved files on the task.`;
 }
 
 function record(value: unknown): Record<string, unknown> {

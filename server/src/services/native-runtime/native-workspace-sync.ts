@@ -685,6 +685,37 @@ function providerLeaseIdFor(input: {
   return providerLeaseId;
 }
 
+/** pl/cancel-finalize3: the copyback's remote commands run through this runner.
+ * Once the export's signal is aborted (its deadline passed and its ownership was
+ * released), a command is not started, and a command that joins late fails
+ * before its result reaches the copyback's host-side steps (download, Git
+ * import, merge into the host workspace): an abandoned export writes nothing
+ * more to the host. Without a signal it is the runner unchanged. */
+function abandonableTarget(
+  target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>,
+  signal: () => AbortSignal | undefined,
+): Extract<AdapterExecutionTarget, { transport: "sandbox" }> {
+  const runner = target.runner;
+  if (!runner) return target;
+  // execute, and the provider-native file copies (syncOut/syncIn), are fenced;
+  // every other member is the runner's own, bound to it.
+  const fencedMembers = new Set<PropertyKey>(["execute", "syncOut", "syncIn"]);
+  const fenced = new Proxy(runner, {
+    get(base, property) {
+      const value = Reflect.get(base, property, base);
+      if (typeof value !== "function") return value;
+      if (!fencedMembers.has(property)) return value.bind(base);
+      return async (...args: unknown[]) => {
+        signal()?.throwIfAborted();
+        const result = await value.apply(base, args);
+        signal()?.throwIfAborted();
+        return result;
+      };
+    },
+  });
+  return { ...target, runner: fenced };
+}
+
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
@@ -943,7 +974,8 @@ export async function prepareNativeWorkspaceSync(input: {
   if (input.target?.kind !== "remote" || input.target.transport !== "sandbox" || input.target.runnerTask) {
     return null;
   }
-  const target = input.target;
+  let exportSignal: AbortSignal | undefined;
+  const target = abandonableTarget(input.target, () => exportSignal);
   const providerLeaseId = providerLeaseIdFor({ target, lease: input.lease });
   // Reattachment may never seed a replacement sandbox over a still-live run.
   if (input.restartRecovery?.kind === "reattach_remote_runner") {
@@ -1155,6 +1187,7 @@ export async function prepareNativeWorkspaceSync(input: {
     },
     restoreWorkspace: async (assertOwnership, options) => {
       if (!restorePromise) {
+        exportSignal = options?.signal;
         restorePromise = finalizePreparedRuntime({
           db: input.db,
           runId: input.runId,
