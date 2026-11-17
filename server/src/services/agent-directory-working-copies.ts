@@ -144,7 +144,7 @@ fs.rmSync(staging,{recursive:true,force:true});`;
  * "clean" (AFTER the checkpoint is recorded): an unchanged copy is removed; a
  * copy that changed since "surface" stays for the next checkpoint. Never drops a
  * changed copy. Prints {surfaced, kept, remaining}. */
-export const notesAsideProgram = String.raw`const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");const [root,mode]=process.argv.slice(1);
+const notesAsideProgram = String.raw`const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");const [root,mode]=process.argv.slice(1);
 const base=path.join(root,".paperclip-runtime","notes-aside"),out={surfaced:[],kept:[],remaining:0};
 const sha=f=>crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
 const tree=(p,rel,o)=>{const s=fs.lstatSync(p,{throwIfNoEntry:false});if(!s)return o;if(s.isSymbolicLink())o[rel]="link";else if(s.isDirectory()){o[rel]="dir";for(const n of fs.readdirSync(p))tree(path.join(p,n),rel?rel+"/"+n:n,o);}else o[rel]=s.isFile()?sha(p):"other";return o;};
