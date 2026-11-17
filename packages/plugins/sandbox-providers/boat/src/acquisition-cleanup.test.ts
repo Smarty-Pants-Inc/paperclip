@@ -42,7 +42,7 @@ function fixture(options: { lost?: boolean; stopFailures?: number; pages?: boole
   vi.stubGlobal("fetch", fetch);
   return { calls, fetch, running: () => running };
 }
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 describe("acquisition recovery ownership", () => {
   it("declares and implements core's existing creation inspection contract", () => {
     expect(manifest.environmentDrivers?.[0].creationOperationVersion).toBe(1);
@@ -80,8 +80,25 @@ describe("acquisition recovery ownership", () => {
     expect(result.providerLeaseId).toBe(id);
     expect(readEnvironmentCreationCleanupError({ data: { schema: "paperclip/environment-creation-cleanup/v1", cleanup: result.creationCleanup } })).toMatchObject({ providerLeaseId: id, attemptId: "attempt", runId: "run" });
   });
-  it.each(["empty", "unavailable", "foreign", "cursor-loop"])("inspection keeps %s lookup retryable rather than pretending cleanup settled", async mode => {
-    vi.stubGlobal("fetch", vi.fn(async () => mode === "empty" ? response({ sandboxes: [] }) : mode === "unavailable" ? response({}, 503) : mode === "foreign" ? response({ sandboxes: [{ id, labels: { ...labels, owner: "foreign" } }] }) : response({ sandboxes: [{ id, labels }], pageInfo: { nextCursor: "loop" } })));
+  it("inspection reports an empty operation lookup for core's bounded absence recovery", async () => {
+    const now = new Date("2026-11-17T12:00:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
+    const fetch = vi.fn(async () => response({ sandboxes: [] }));
+    vi.stubGlobal("fetch", fetch);
+    const result = await plugin.definition.onEnvironmentInspectLease!({ ...params, providerLeaseId: "attempt", creationOperation: { id: "attempt", runId: "run" } });
+    expect(result).toEqual({ providerLeaseId: "attempt", state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: now.toISOString() });
+    expect(result).not.toHaveProperty("creationLease");
+    expect(result).not.toHaveProperty("creationCleanup");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [input, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
+    const url = new URL(String(input));
+    expect(init.method ?? "GET").toBe("GET");
+    expect(url.pathname).toBe("/api/v1/sandboxes");
+    expect(url.searchParams.get("label")).toBe("paperclip-acquire=attempt");
+  });
+  it.each(["unavailable", "foreign", "cursor-loop"])("inspection keeps %s lookup retryable rather than pretending cleanup settled", async mode => {
+    vi.stubGlobal("fetch", vi.fn(async () => mode === "unavailable" ? response({}, 503) : mode === "foreign" ? response({ sandboxes: [{ id, labels: { ...labels, owner: "foreign" } }] }) : response({ sandboxes: [{ id, labels }], pageInfo: { nextCursor: "loop" } })));
     await expect(plugin.definition.onEnvironmentInspectLease!({ ...params, providerLeaseId: "attempt", creationOperation: { id: "attempt", runId: "run" } })).rejects.toThrow();
   });
   it.each([undefined, false, true])("durable orphan cleanup stops all matches and the bound ID with retain=%s", async retain => {
