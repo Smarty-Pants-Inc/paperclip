@@ -633,7 +633,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
   // Stop: (A) that sweep and (B) the cleanup retry (heartbeat/recovery.ts ->
   // recordPersonStopCleanupPending). Both must read ONE bound. recordedAt stands in for the clock.
   const PERSON_CARD = "Stop pending: Paperclip cannot confirm that the previous execution stopped. " +
-    "Messages you send are saved and will be sent once the stop is confirmed.";
+    "New messages you send now are saved and will start once the stop is confirmed. Messages waiting from before Stop still need Send.";
   async function stopRecordedAgo(f: { runId: string }, ms: number) {
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
     await db.update(heartbeatRuns).set({ resultJson: { ...run!.resultJson,

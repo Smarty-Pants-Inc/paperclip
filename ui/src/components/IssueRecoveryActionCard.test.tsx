@@ -148,7 +148,7 @@ describe("IssueRecoveryActionCard", () => {
       evidence: { runId: "run-1", stopPending: { schema: "paperclip.task-stop-pending.v1", code: "execution_stop_pending",
         runIds: ["run-1"], ...(personStop ? { personStop: true } : {}) } },
       nextAction: personStop
-        ? "Stop pending: Paperclip cannot confirm that the previous execution stopped. Messages you send are saved and will be sent once the stop is confirmed."
+        ? "Stop pending: Paperclip cannot confirm that the previous execution stopped. New messages you send now are saved and will start once the stop is confirmed. Messages waiting from before Stop still need Send."
         : "Stop pending (execution_stop_pending): Paperclip cannot confirm that the previous execution stopped. The task stays held until Stop is proved; starting a replacement or waiting longer is not proof.",
     })} />);
     const text = node.textContent ?? "";
