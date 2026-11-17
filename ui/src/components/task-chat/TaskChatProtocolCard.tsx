@@ -56,6 +56,7 @@ import { planPreviewContent, TaskChatPlanPreviewCard } from "./TaskChatPlanPrevi
 import { TaskChatDiffCounts, TaskChatDiffView } from "./TaskChatDiffView";
 import { parseUnifiedDiffLines } from "./diff-lines";
 import { SavedOutputNotice } from "./SavedOutputNotice";
+import { savedOutputForDisplay } from "./saved-output";
 import { useArtifactsV1Enabled } from "@/hooks/useArtifactsV1Enabled";
 import { ArtifactFileRow, ArtifactRow, fileRowSourceFromAttachment, fileRowSourceFromWorkProduct, subjectFromAttachment, subjectFromDocumentSummary, subjectFromWorkProduct, workProductStateBadge } from "@/components/artifacts/v1";
 
@@ -293,17 +294,18 @@ function PlanProposalCard({ item }: { item: TaskChatProviderActivityItem }) {
 }
 
 function ProviderActivityCard({
-  item,
+  item: rawItem,
 }: {
   item: TaskChatProviderActivityItem;
 }) {
+  const item = { ...rawItem, ...savedOutputForDisplay(rawItem.output, rawItem.outputTruncated), summary: savedOutputForDisplay(rawItem.summary).output };
   if (item.family === "plan_proposal") return <PlanProposalCard item={item} />;
   const Icon = FAMILY_ICON[item.family];
   const hasDetails =
     item.details.length > 0 ||
     item.links.length > 0 ||
     item.children.length > 0 ||
-    Boolean(item.output);
+    Boolean(item.output) || Boolean(item.outputTruncated);
   return (
     <CardShell
       icon={Icon}

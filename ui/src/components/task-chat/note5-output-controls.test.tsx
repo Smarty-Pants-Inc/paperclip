@@ -26,12 +26,82 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
   beforeEach(() => { container = document.createElement("div"); document.body.append(container); root = createRoot(container); });
   afterEach(() => { act(() => root.unmount()); container.remove(); });
   const render = (child: React.ReactNode) => act(() => root.render(<MemoryRouter><ThemeProvider>{child}</ThemeProvider></MemoryRouter>));
-  it("names the genuine runner omission without the forbidden label and links to the saved run", () => {
+  it("names the kept full text without the forbidden labels and links to the saved run", () => {
     render(<TaskChatProtocolActivityDetails item={base} />);
-    expect(container.textContent).not.toMatch(/truncated/i);
-    expect(container.textContent).toContain("runner saved only part");
+    expect(container.textContent).not.toMatch(/truncated|saved only part|\bcut\b/i);
+    expect(container.textContent).toContain("The full text is kept; ask me to show any part.");
     expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')?.textContent).toContain("run log");
     expect(container.querySelector("pre")?.textContent).toBe(text);
+  });
+  it("hides only the spill marker line in compact provider details", () => {
+    const output = "  FIRST_BYTE\n\nLAST_BYTE\t \n";
+    render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output: output + "[Full output: /tmp/compact-spill.log (102400 bytes; sha256: abc123)]\nAFTER_MARKER" }} />);
+    expect(container.querySelector("pre")?.textContent).toBe(output + "AFTER_MARKER");
+    expect(container.textContent?.split("The full text is kept; ask me to show any part.")).toHaveLength(2);
+    expect(container.textContent).not.toMatch(/\[Full output:|\/tmp\/compact-spill|saved only part|truncated/i);
+  });
+  it("hides the spill marker in legacy provider output and summary without needing a true flag", () => {
+    const output = "  LEGACY_FIRST\nLEGACY_LAST\t \n";
+    const spilled = output + "[Full output: /tmp/legacy-spill.log (102400 bytes; sha256: abc123)]";
+    render(<RunTranscriptView entries={[{ kind: "provider_activity", ts: "2026-11-17T00:00:00Z", family: "tool_execution", eventType: "tool.started", status: "running", title: "Tool", summary: spilled, payload: { output: spilled, outputTruncated: false } }]} />);
+    expect(container.querySelector("pre")?.textContent).toBe(output);
+    expect(container.querySelector("p.whitespace-pre-wrap")?.textContent).toBe(output);
+    expect(container.textContent?.split("The full text is kept; ask me to show any part.")).toHaveLength(2);
+    expect(container.textContent).not.toMatch(/\[Full output:|\/tmp\/legacy-spill/);
+  });
+  it.each([
+    ["card", "Read", true], ["card", "Read", false],
+    ["nice", "Read", true], ["nice", "Read", false],
+    ["nice", "bash", true], ["nice", "bash", false],
+    ["raw", "Read", true], ["raw", "Read", false],
+  ] as const)("keeps native tool output whole and private (%s, %s, flag=%s)", (view, name, outputTruncated) => {
+    const output = '  {"first":"NATIVE_FIRST","last":"NATIVE_LAST"}\t \n';
+    const event = {
+      id: 1, companyId: "c", agentId: "a", runId: "r", seq: 1, stream: null, level: null, color: null, message: null,
+      eventType: "tool.execution.completed", createdAt: new Date("2026-11-17T00:00:00Z"),
+      payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: "r", eventType: "tool.execution.completed", payload: {
+        schema: "paperclip.tool.execution.v1", executionId: "read-spill", transport: "builtin", operation: name === "bash" ? "execute" : "read", name, status: "completed",
+        output: outputTruncated ? output : output + "[Full output: /tmp/native-spill.log (100000 bytes; sha256: abc123)]", outputTruncated,
+      } } },
+    } as HeartbeatRunEvent;
+    const entries = nativeRunEventsToTranscript([event]);
+    if (view === "card") {
+      const item = transcriptToTaskChatItems(entries, { runId: "r", running: false }).find(item => item.kind === "tool");
+      if (item?.kind !== "tool") throw new Error("expected tool");
+      render(<TaskChatToolCard item={item} />);
+      act(() => container.querySelector("button")!.click());
+    } else {
+      render(<RunTranscriptView mode={view} entries={entries} />);
+      if (view === "nice") act(() => container.querySelector<HTMLButtonElement>('button[aria-label^="Expand"]')!.click());
+    }
+    expect([...container.querySelectorAll("pre")].some(node => node.textContent === output)).toBe(true);
+    expect(container.textContent?.split("The full text is kept; ask me to show any part.")).toHaveLength(2);
+    expect(container.innerHTML).not.toMatch(/\[Full output:|\/tmp\/native-spill/);
+  });
+  it.each(["bubble", "nice", "raw"] as const)("renders the final producer text as is, never fullText metadata (%s)", (view) => {
+    const answer = "This answer is longer than one message (100 KB).\nThe full text is kept; ask me to show any part.\n\n## Excerpt (the start of the answer, not the whole answer)\n\nANSWER_START";
+    const path = "/tmp/full-answer-private.md";
+    const sha256 = "1a2b3c4d".repeat(8);
+    const event = {
+      id: 1, companyId: "c", agentId: "a", runId: "r", seq: 1, stream: null, level: null, color: null, message: null,
+      eventType: "item.completed", createdAt: new Date("2026-11-17T00:00:00Z"),
+      payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: "r", eventType: "item.completed", itemId: "final-answer", payload: {
+        kind: "agent_message", channel: "final", text: answer, fullText: { path, sha256, bytes: 102400 },
+      } } },
+    } as HeartbeatRunEvent;
+    const entries = nativeRunEventsToTranscript([event]);
+    if (view === "bubble") {
+      const [item] = transcriptToTaskChatItems(entries, { runId: "r", running: false });
+      if (item?.kind !== "message") throw new Error("expected final answer bubble");
+      expect(item.text).toBe(answer);
+      render(<TaskChatBubble item={item} />);
+    } else render(<RunTranscriptView mode={view} entries={entries} />);
+    expect(container.textContent).toContain("This answer is longer than one message (100 KB).");
+    expect(container.textContent).toContain("The full text is kept; ask me to show any part.");
+    expect(container.textContent).toContain("Excerpt (the start of the answer, not the whole answer)");
+    expect(container.textContent).toContain("ANSWER_START");
+    expect(container.innerHTML).not.toContain(path);
+    expect(container.innerHTML).not.toContain(sha256);
   });
   it("shows the actual research output and wraps source snippets after expansion", () => {
     render(<TaskChatProtocolActivityDetails item={{ ...base, family: "research", links: [{ label: "Research source", href: "https://example.com", description: text }] }} />);
@@ -104,7 +174,7 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
     if (item.kind !== "protocol" || item.surface !== "provider_activity") throw new Error("expected activity");
     render(<TaskChatProtocolActivityDetails item={item} />);
     expect(container.querySelector("pre")?.textContent).toBe(output);
-    expect(container.textContent).not.toContain("runner saved only part");
+    expect(container.textContent).not.toMatch(/runner saved only part|full text is kept/);
   });
   it("judge: native diff fallback renders the saved-run reference as an anchor", () => {
     const event = { id: 1, companyId: "c", agentId: "a", runId: "r", seq: 1, stream: null, level: null, color: null, message: null, eventType: "tool.execution.completed", createdAt: new Date("2026-11-17T00:00:00Z"), payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: "r", eventType: "tool.execution.completed", payload: { schema: "paperclip.tool.execution.v1", executionId: "edit", transport: "builtin", operation: "edit", name: "Edit", status: "completed", output: "", fileChanges: [{ path: "a.txt", operation: "modify", additions: 1, deletions: 0, diff: "+hello", diffTruncated: true }] } } } } as HeartbeatRunEvent;

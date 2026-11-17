@@ -397,6 +397,34 @@ describe("TaskChatProtocolCard", () => {
     for (const label of absent) expect(container.textContent).not.toContain(label);
   });
 
+  it.each([
+    [true, "", ""],
+    [false, "[Full output: /tmp/pi-output-42.log (102400 bytes; sha256: abc123)]", ""],
+    [true, "  First byte\n\nLast byte\t \n", "  First byte\n\nLast byte\t \n"],
+    [false, "  First byte\n\nLast byte\t \n[Full output: /tmp/pi-output-42.log (102400 bytes; sha256: abc123)]\nAFTER_MARKER\n", "  First byte\n\nLast byte\t \nAFTER_MARKER\n"],
+  ])("shows one kept line for spilled provider output (flag=%s), preserving all other bytes", (outputTruncated, output, displayed) => {
+    renderCard(root, {
+      id: "spilled-tool", kind: "protocol", surface: "provider_activity",
+      family: "tool_execution", eventType: "tool.completed", status: "completed", title: "Read",
+      details: [], steps: [], links: [], children: [], output, outputTruncated,
+      runLogHref: "/agents/a/runs/r",
+    });
+    expect(container.querySelector("pre")?.textContent ?? "").toBe(displayed);
+    expect([...container.querySelectorAll("p")].filter(node => node.textContent?.includes("The full text is kept; ask me to show any part."))).toHaveLength(1);
+    expect(container.textContent).not.toMatch(/\[Full output:|\/tmp\/pi-output-42|saved only part|truncated|\bcut\b/i);
+    expect(container.querySelector('a[href*="/agents/a/runs/r"]')).not.toBeNull();
+  });
+
+  it("shows no producer notice for an unflagged tool output", () => {
+    renderCard(root, {
+      id: "whole-tool", kind: "protocol", surface: "provider_activity",
+      family: "tool_execution", eventType: "tool.completed", status: "completed", title: "Read",
+      details: [], steps: [], links: [], children: [], output: "All the output", outputTruncated: false,
+    });
+    expect(container.querySelector("pre")?.textContent).toBe("All the output");
+    expect(container.textContent).not.toMatch(/full text is kept|saved only part/);
+  });
+
   it("renders provider plan steps and status", () => {
     renderCard(root, {
       id: "provider-plan",

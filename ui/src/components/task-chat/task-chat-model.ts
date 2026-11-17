@@ -243,6 +243,8 @@ export interface TaskChatToolItem {
    */
   taskRefId?: string;
   detail?: string;
+  /** A producer flag or full-output marker, not a browser display limit. */
+  outputTruncated?: boolean;
   diff?: TaskChatDiff;
   /** Resolved permission decision badge, when one applied. */
   decision?: "allowed" | "rejected";

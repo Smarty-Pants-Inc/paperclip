@@ -1355,6 +1355,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
           toolUseId: executionId,
           toolName: presentation.name,
           content,
+          ...(payload.outputTruncated === true ? { outputTruncated: true } : {}),
           isError: payload.status === "failed" || nativeToolItem?.isError === true,
         });
       }

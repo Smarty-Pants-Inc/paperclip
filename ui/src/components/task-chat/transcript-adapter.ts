@@ -6,6 +6,7 @@
  * only showing a response after the turn settles.
  */
 import { foldApprovedAutoReviews } from "./fold-auto-reviews";
+import { savedOutputForDisplay } from "./saved-output";
 import type { ReasoningDisplay } from "./reasoning-display";
 import { isFatalProviderError, isStatusNotice, isStatusNoticePayload, statusNoticeCategory } from "./status-notice-presentation";
 import type { TranscriptEntry } from "@/adapters";
@@ -518,7 +519,7 @@ function providerActivityItem(
 
   const outputValue = entry.family === "plan_proposal" ? entry.payload.markdown : entry.payload.output;
   const rawOutput = typeof outputValue === "string" ? outputValue : undefined;
-  const outputTruncated = entry.payload.outputTruncated === true;
+  const displayedOutput = savedOutputForDisplay(rawOutput, entry.payload.outputTruncated === true);
   const summary =
     entry.summary && entry.summary !== entry.eventType
       ? entry.summary
@@ -535,13 +536,12 @@ function providerActivityItem(
     eventType: entry.eventType,
     status: entry.status,
     title: entry.title,
-    summary,
+    summary: savedOutputForDisplay(summary).output,
     details,
     steps,
     links,
     children,
-    output: rawOutput,
-    outputTruncated,
+    ...displayedOutput,
     transcriptIndex: index,
     startedAt: entry.ts,
     ...(entry.family === "tool_execution"
@@ -926,7 +926,9 @@ export function transcriptToTaskChatItems(
               existing.name = toolDisplayName(entry.toolName);
               existing.rawName = entry.toolName;
             }
-            const detail = formatToolResultDetail(entry.content);
+            const displayedOutput = savedOutputForDisplay(entry.content, entry.outputTruncated);
+            if (displayedOutput.outputTruncated) existing.outputTruncated = true;
+            const detail = formatToolResultDetail(displayedOutput.output);
             if (detail) {
               existing.detail =
                 entry.delta && existing.detail

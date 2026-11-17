@@ -7,6 +7,9 @@ import { ThemeProvider } from "@/context/ThemeContext";
 import { MemoryRouter } from "@/lib/router";
 import { TaskChatRunnerActivityGroup } from "./TaskChatRunnerActivityGroup";
 import { TaskChatBubble } from "./TaskChatBubble";
+import { nativeRunEventsToTranscript } from "../transcript/native-run-events";
+import { transcriptToTaskChatItems } from "./transcript-adapter";
+import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import { TaskChatExpansionState } from "./expansion-state";
 import type {
   TaskChatActivityPhaseItem,
@@ -97,6 +100,53 @@ describe("TaskChatRunnerActivityGroup", () => {
     act(() => container.querySelector<HTMLButtonElement>('[data-activity-item-id="edit"] button')!.click());
     expect(container.textContent).toContain("runner saved only part");
     expect(container.querySelector('a[href*="/agents/a/runs/r"]')).not.toBeNull();
+  });
+
+  it.each([true, false])("keeps spilled native tool output private in the expanded runner group (flag=%s)", (outputTruncated) => {
+    const output = "  NATIVE_FIRST\nNATIVE_LAST\t \n";
+    const event = {
+      id: 1, companyId: "c", agentId: "a", runId: "r", seq: 1, stream: null, level: null, color: null, message: null,
+      eventType: "tool.execution.completed", createdAt: new Date("2026-11-17T00:00:00Z"),
+      payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: "r", eventType: "tool.execution.completed", payload: {
+        schema: "paperclip.tool.execution.v1", executionId: "read-spill", transport: "builtin", operation: "read", name: "Read", status: "completed",
+        output: outputTruncated ? output : output + "[Full output: /tmp/native-spill.log (100000 bytes; sha256: abc123)]", outputTruncated,
+      } } },
+    } as HeartbeatRunEvent;
+    const items = transcriptToTaskChatItems(nativeRunEventsToTranscript([event]), { runId: "r", running: false, runLogHref: "/agents/a/runs/r" });
+    const item = items.find(candidate => candidate.kind === "tool");
+    if (item?.kind !== "tool") throw new Error("expected native tool row");
+    act(() => root.render(<MemoryRouter><ThemeProvider>
+      <TaskChatRunnerActivityGroup defaultExpanded item={{ id: "phase", kind: "activity_phase", active: false, summary: "", items: [item] }} />
+    </ThemeProvider></MemoryRouter>));
+    act(() => container.querySelector<HTMLButtonElement>(`[data-activity-item-id="${item.id}"] button`)!.click());
+    expect(container.querySelector("pre")?.textContent).toBe(output);
+    expect(container.textContent?.split("The full text is kept; ask me to show any part.")).toHaveLength(2);
+    expect(container.textContent).not.toMatch(/\[Full output:|\/tmp\/native-spill|saved only part|truncated/i);
+    expect(container.querySelector('a[href*="/agents/a/runs/r"]')).not.toBeNull();
+  });
+
+  it("keeps a spilled edit result inspectable alongside its existing diff", () => {
+    act(() => root.render(<MemoryRouter><ThemeProvider>
+      <TaskChatRunnerActivityGroup defaultExpanded item={{ id: "edit-phase", kind: "activity_phase", active: false, summary: "", items: [{
+        ...tool("spilled-edit", "completed"), name: "apply_patch", rawName: "apply_patch", outputTruncated: true,
+        detail: "EDIT_RESULT\n[Full output: /tmp/edit-spill.log (100000 bytes; sha256: abc123)]",
+        diff: { path: "a.txt", added: 1, removed: 0, lines: [{ kind: "add", text: "hello" }] },
+      }] }} />
+    </ThemeProvider></MemoryRouter>));
+    act(() => container.querySelector<HTMLButtonElement>('[data-activity-item-id="spilled-edit"] button')!.click());
+    expect(container.querySelector('[data-testid="task-chat-diff-view"]')).not.toBeNull();
+    expect(container.querySelector("pre")?.textContent).toBe("EDIT_RESULT\n");
+    expect(container.textContent?.split("The full text is kept; ask me to show any part.")).toHaveLength(2);
+    expect(container.innerHTML).not.toMatch(/\[Full output:|\/tmp\/edit-spill/);
+  });
+
+  it("does not invent a kept notice for an unflagged native tool row", () => {
+    act(() => root.render(<MemoryRouter><ThemeProvider>
+      <TaskChatRunnerActivityGroup defaultExpanded item={{ id: "whole", kind: "activity_phase", active: false, summary: "", items: [tool("whole", "completed")] }} />
+    </ThemeProvider></MemoryRouter>));
+    act(() => container.querySelector<HTMLButtonElement>('[data-activity-item-id="whole"] button')!.click());
+    expect(container.textContent).toContain("output-whole");
+    expect(container.textContent).not.toMatch(/full text is kept|saved only part/);
   });
 
   const toggle = () =>

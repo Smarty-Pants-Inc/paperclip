@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { SavedOutputNotice } from "../task-chat/SavedOutputNotice";
+import { savedOutputForDisplay } from "../task-chat/saved-output";
 import type { TranscriptEntry } from "../../adapters";
 import type { ToolRunDecision } from "@paperclipai/shared";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "../MarkdownBody";
@@ -77,6 +78,7 @@ type TranscriptBlock =
       actionRequestId?: string;
       input: unknown;
       result?: string;
+      outputTruncated?: boolean;
       isError?: boolean;
       status: "running" | "completed" | "error";
     }
@@ -100,6 +102,7 @@ type TranscriptBlock =
         actionRequestId?: string;
         input: unknown;
         result?: string;
+        outputTruncated?: boolean;
         isError?: boolean;
         status: "running" | "completed" | "error";
       }>;
@@ -117,6 +120,7 @@ type TranscriptBlock =
         actionRequestId?: string;
         input: unknown;
         result?: string;
+        outputTruncated?: boolean;
         isError?: boolean;
         status: "running" | "completed" | "error";
       }>;
@@ -490,6 +494,7 @@ function groupCommandBlocks(blocks: TranscriptBlock[]): TranscriptBlock[] {
         actionRequestId: block.actionRequestId,
         input: block.input,
         result: block.result,
+        outputTruncated: block.outputTruncated,
         isError: block.isError,
         status: block.status,
       });
@@ -537,6 +542,7 @@ function groupToolBlocks(blocks: TranscriptBlock[]): TranscriptBlock[] {
         actionRequestId: block.actionRequestId,
         input: block.input,
         result: block.result,
+        outputTruncated: block.outputTruncated,
         isError: block.isError,
         status: block.status,
       });
@@ -687,6 +693,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
 
       if (matched) {
         matched.result = entry.content;
+        matched.outputTruncated = entry.outputTruncated;
         matched.isError = entry.isError;
         matched.status = entry.isError ? "error" : "completed";
         matched.endTs = entry.ts;
@@ -700,6 +707,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
           toolUseId: entry.toolUseId,
           input: null,
           result: entry.content,
+          outputTruncated: entry.outputTruncated,
           isError: entry.isError,
           status: entry.isError ? "error" : "completed",
         });
@@ -1053,10 +1061,12 @@ function TranscriptToolCard({
   block,
   density,
   decision,
+  runLogHref,
 }: {
   block: Extract<TranscriptBlock, { type: "tool" }>;
   density: TranscriptDensity;
   decision: ToolRunDecision | null;
+  runLogHref?: string;
 }) {
   const [open, setOpen] = useState(block.status === "error" || Boolean(decision?.pendingAction || decision?.denialReason));
   const compact = density === "compact";
@@ -1145,10 +1155,11 @@ function TranscriptToolCard({
                   "overflow-x-auto whitespace-pre-wrap break-words font-mono text-(length:--text-micro)",
                   block.status === "error" ? "text-red-700 dark:text-red-300" : "text-foreground/80",
                 )}>
-                  {block.result ? formatToolPayload(block.result) : "Waiting for result..."}
+                  {block.result ? (block.outputTruncated ? block.result : formatToolPayload(block.result)) : "Waiting for result..."}
                 </pre>
               </div>
             </div>
+            {block.outputTruncated ? <SavedOutputNotice runLogHref={runLogHref} /> : null}
             <ToolDecisionDetails decision={decision} compact={compact} />
           </div>
         </div>
@@ -1166,10 +1177,12 @@ function TranscriptCommandGroup({
   block,
   density,
   toolDecisionMaps,
+  runLogHref,
 }: {
   block: Extract<TranscriptBlock, { type: "command_group" }>;
   density: TranscriptDensity;
   toolDecisionMaps: ToolDecisionMaps;
+  runLogHref?: string;
 }) {
   const [open, setOpen] = useState(false);
   const compact = density === "compact";
@@ -1290,9 +1303,10 @@ function TranscriptCommandGroup({
                   "overflow-x-auto whitespace-pre-wrap break-words font-mono text-(length:--text-micro)",
                   item.status === "error" ? "text-red-700 dark:text-red-300" : "text-foreground/80",
                 )}>
-                  {formatToolPayload(item.result)}
+                  {item.outputTruncated ? item.result : formatToolPayload(item.result)}
                 </pre>
               )}
+              {item.outputTruncated ? <SavedOutputNotice runLogHref={runLogHref} /> : null}
               <ToolDecisionDetails decision={findToolDecision(toolDecisionMaps, item)} compact={compact} />
             </div>
           ))}
@@ -1306,10 +1320,12 @@ function TranscriptToolGroup({
   block,
   density,
   toolDecisionMaps,
+  runLogHref,
 }: {
   block: Extract<TranscriptBlock, { type: "tool_group" }>;
   density: TranscriptDensity;
   toolDecisionMaps: ToolDecisionMaps;
+  runLogHref?: string;
 }) {
   const [open, setOpen] = useState(false);
   const compact = density === "compact";
@@ -1438,11 +1454,12 @@ function TranscriptToolGroup({
                       "overflow-x-auto whitespace-pre-wrap break-words font-mono text-(length:--text-micro)",
                       item.status === "error" ? "text-red-700 dark:text-red-300" : "text-foreground/80",
                     )}>
-                      {formatToolPayload(item.result)}
+                      {item.outputTruncated ? item.result : formatToolPayload(item.result)}
                     </pre>
                   </div>
                 )}
               </div>
+              {item.outputTruncated ? <SavedOutputNotice runLogHref={runLogHref} /> : null}
               <div className="pl-7">
                 <ToolDecisionDetails decision={findToolDecision(toolDecisionMaps, item)} compact={compact} />
               </div>
@@ -1774,7 +1791,7 @@ function rawEntryContent(entry: TranscriptEntry): string {
     return `${entry.name}\n${formatToolPayload(entry.input)}`;
   }
   if (entry.kind === "tool_result") {
-    return formatToolPayload(entry.content);
+    return entry.outputTruncated ? entry.content : formatToolPayload(entry.content);
   }
   if (entry.kind === "result") {
     return `${entry.text}\n${usageDetail(entry)}`;
@@ -1793,9 +1810,11 @@ function rawEntryContent(entry: TranscriptEntry): string {
 function RawTranscriptView({
   entries,
   density,
+  runLogHref,
 }: {
   entries: TranscriptEntry[];
   density: TranscriptDensity;
+  runLogHref?: string;
 }) {
   const compact = density === "compact";
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -1866,6 +1885,7 @@ function RawTranscriptView({
           <pre className="min-w-0 whitespace-pre-wrap break-words text-foreground/80">
             {rawEntryContent(entry)}
           </pre>
+          {(entry.kind === "tool_result" && entry.outputTruncated) || (entry.kind === "provider_activity" && entry.payload.outputTruncated === true) ? <div className="col-start-2"><SavedOutputNotice runLogHref={runLogHref} /></div> : null}
         </div>
       ))}
       {bottomSpacer > 0 && <div aria-hidden="true" style={{ height: bottomSpacer }} />}
@@ -1874,7 +1894,7 @@ function RawTranscriptView({
 }
 
 export function RunTranscriptView({
-  entries,
+  entries: rawEntries,
   runLogHref,
   toolDecisions,
   mode = "nice",
@@ -1887,6 +1907,17 @@ export function RunTranscriptView({
   thinkingClassName,
   externalReferences,
 }: RunTranscriptViewProps) {
+  const entries = useMemo(() => rawEntries.map((entry): TranscriptEntry => {
+    if (entry.kind === "tool_result") {
+      const displayed = savedOutputForDisplay(entry.content, entry.outputTruncated);
+      return { ...entry, content: displayed.output ?? "", outputTruncated: displayed.outputTruncated };
+    }
+    if (entry.kind === "provider_activity") {
+      const displayed = savedOutputForDisplay(typeof entry.payload.output === "string" ? entry.payload.output : undefined, entry.payload.outputTruncated === true);
+      return { ...entry, summary: savedOutputForDisplay(entry.summary).output ?? "", payload: { ...entry.payload, ...displayed } };
+    }
+    return entry;
+  }), [rawEntries]);
   const toolDecisionMaps = useMemo(() => buildToolDecisionMaps(toolDecisions), [toolDecisions]);
   const blocks = useMemo(
     () => (mode === "raw" ? [] : normalizeTranscript(entries, streaming)),
@@ -1908,7 +1939,7 @@ export function RunTranscriptView({
   if (mode === "raw") {
     return (
       <div className={className}>
-        <RawTranscriptView entries={entries} density={density} />
+        <RawTranscriptView entries={entries} density={density} runLogHref={runLogHref} />
       </div>
     );
   }
@@ -1945,13 +1976,14 @@ export function RunTranscriptView({
               block={block}
               density={density}
               decision={findToolDecision(toolDecisionMaps, block)}
+              runLogHref={runLogHref}
             />
           )}
           {block.type === "command_group" && (
-            <TranscriptCommandGroup block={block} density={density} toolDecisionMaps={toolDecisionMaps} />
+            <TranscriptCommandGroup block={block} density={density} toolDecisionMaps={toolDecisionMaps} runLogHref={runLogHref} />
           )}
           {block.type === "tool_group" && (
-            <TranscriptToolGroup block={block} density={density} toolDecisionMaps={toolDecisionMaps} />
+            <TranscriptToolGroup block={block} density={density} toolDecisionMaps={toolDecisionMaps} runLogHref={runLogHref} />
           )}
           {block.type === "diff_group" && <TranscriptDiffGroup block={block} density={density} runLogHref={runLogHref} />}
           {block.type === "stderr_group" && <TranscriptStderrGroup block={block} density={density} />}

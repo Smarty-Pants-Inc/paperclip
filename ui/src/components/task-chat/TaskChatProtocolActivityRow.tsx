@@ -30,6 +30,7 @@ import {
 } from "./task-chat-activity-presentation";
 
 import { SavedOutputNotice } from "./SavedOutputNotice";
+import { savedOutputForDisplay } from "./saved-output";
 
 const COMPACT_RESEARCH_RESULT_LIMIT = 5;
 const COMPACT_WORKSPACE_FILE_LIMIT = 8;
@@ -292,6 +293,9 @@ export function hasTaskChatProtocolActivityDetails(item: TaskChatProtocolItem): 
 }
 
 export function TaskChatProtocolActivityDetails({ item, neutral = false }: { item: TaskChatProtocolItem; neutral?: boolean }) {
+  if (item.surface === "provider_activity") {
+    item = { ...item, ...savedOutputForDisplay(item.output, item.outputTruncated), summary: savedOutputForDisplay(item.summary).output };
+  }
   const detail = detailContent(item, neutral);
   if (item.surface === "resource") {
     const href = safeActivityHref(item.href);
