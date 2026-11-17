@@ -128,8 +128,12 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pic
     const [owner] = await db.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).limit(1);
     if (!owner) return false;
-    const { handedOffWarmLeaseSettled } = await import("./native-runtime/handed-off-warm-lease.js");
-    for (const lease of unreceipted) if (!await handedOffWarmLeaseSettled(owner, lease)) return false;
+    const { handedOffWarmLeaseSettled, requestHandedOffWarmLeaseStop } = await import("./native-runtime/handed-off-warm-lease.js");
+    for (const [index, lease] of unreceipted.entries()) if (!await handedOffWarmLeaseSettled(owner, lease)) {
+      // pl/send-after-stop3: proof unavailable here (a restart) -> stop and keep now.
+      for (const unsettled of unreceipted.slice(index)) await requestHandedOffWarmLeaseStop(db, owner, unsettled);
+      return false;
+    }
     return true;
   }
   if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return false;
