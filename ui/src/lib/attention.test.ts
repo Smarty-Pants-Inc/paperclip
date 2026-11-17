@@ -421,7 +421,7 @@ describe("attentionDetailLine (§7)", () => {
         detail: { kind: "budget", observedPercent: 100, amountObserved: 10000, amountLimit: 10000, images: [] },
       }),
     );
-    expect(line).toBe("100% of budget used (— / $100.00)");
+    expect(line).toBe("— of budget used (— / $100.00)");
   });
 
   it("returns null when there is no detail block", () => {

@@ -1,9 +1,11 @@
-import { cn } from "@/lib/utils";
+import { cn, COST_FIGURES_HIDDEN, formatSpendPercent } from "@/lib/utils";
 
 interface QuotaBarProps {
   label: string;
   // value between 0 and 100
   percentUsed: number;
+  /** Computed spend only; provider-reported quota percentages stay visible. */
+  spendDerived?: boolean;
   leftLabel: string;
   rightLabel?: string;
   // shows a 2px destructive notch at the fill tip when true
@@ -20,12 +22,14 @@ function fillColor(pct: number): string {
 export function QuotaBar({
   label,
   percentUsed,
+  spendDerived = false,
   leftLabel,
   rightLabel,
   showDeficitNotch = false,
   className,
 }: QuotaBarProps) {
-  const clampedPct = Math.min(100, Math.max(0, percentUsed));
+  const hidden = spendDerived && COST_FIGURES_HIDDEN;
+  const clampedPct = hidden ? 0 : Math.min(100, Math.max(0, percentUsed));
   // keep the notch visible even near the edges
   const notchLeft = Math.min(clampedPct, 97);
 
@@ -47,10 +51,11 @@ export function QuotaBar({
         {/* fill */}
         <div
           role="progressbar"
-          aria-valuenow={Math.round(clampedPct)}
+          aria-valuenow={hidden ? undefined : Math.round(clampedPct)}
+          aria-valuetext={hidden ? "—" : undefined}
           aria-valuemin={0}
           aria-valuemax={100}
-          aria-label={`${label}: ${Math.round(clampedPct)}%`}
+          aria-label={`${label}: ${spendDerived ? formatSpendPercent(Math.round(clampedPct)) : `${Math.round(clampedPct)}%`}`}
           className={cn(
             "absolute inset-y-0 left-0 transition-(--tp-width-background-color) duration-150",
             fillColor(clampedPct),
