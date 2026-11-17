@@ -2390,6 +2390,30 @@ describe("IssueChatThread", () => {
     }
   });
 
+  // fam-retry4 (rf-3 finding 3), board mode: a held note posted while Retry was
+  // offered must not say "Press Retry" beside the paused agent's "Resume agent".
+  it("fam-retry4: a held note beside a paused agent shows one instruction (board)", () => {
+    const root = createRoot(container);
+    const pausedAgent = { id: "agent-1", companyId: "company-1", name: "CodexCoder", status: "paused", pauseReason: "manual" } as Agent;
+    const held = "Your message and saved work are kept, but the previous run of this conversation did not finish. "
+      + "Press Retry to continue in a fresh run with this conversation's history.";
+    act(() => {
+      renderIssueThread(root, {
+        agentMap: new Map([["agent-1", pausedAgent]]),
+        currentAssigneeValue: "agent:agent-1",
+        onResumeAssignee: vi.fn(),
+        comments: [{ id: "held-note", companyId: "company-1", issueId: "issue-1", authorType: "system", authorAgentId: null,
+          authorUserId: null, body: held, createdAt: new Date("2026-11-17T10:00:00Z"), updatedAt: new Date("2026-11-17T10:00:00Z"),
+          presentation: { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true },
+          metadata: { version: 1, authorizationReason: "native_prior_owner_held:session-1", sections: [] } } as never],
+      });
+    });
+    expect(container.textContent).toContain("the previous run of this conversation did not finish.");
+    expect(container.textContent).not.toContain("Press Retry");
+    expect(container.querySelector('[data-testid="issue-assignee-paused-resume"]')?.textContent).toBe("Resume agent");
+    act(() => { root.unmount(); });
+  });
+
   it("shows paused responsible agent context above the composer", () => {
     const root = createRoot(container);
     const pausedAgent = {
