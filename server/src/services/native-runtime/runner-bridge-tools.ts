@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { constants, existsSync } from "node:fs";
+import { constants, existsSync, writeSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
@@ -33,7 +33,7 @@ const specs = [
   ["workspace_list", "List entries inside the assigned workspace.", z.object({ path: z.union([relativeFile, z.literal("")]).default(""), after: z.string().optional() }).strict(), "read"],
   ["workspace_read", "Read a UTF-8 workspace file with SHA-256 and byte size. Paginate with nextOffset.", z.object({ path: relativeFile, offset: z.number().int().min(0).default(0) }).strict(), "read"],
   ["workspace_write", "Write a UTF-8 workspace file. expectedSha256 null requires a new file; existing files require the hash from workspace_read. Parent directories must exist. Use a stable call ID.", z.object({ path: relativeFile, text: z.string().max(128000), expectedSha256: z.string().regex(/^[a-f0-9]{64}$/).nullable() }).strict(), "mutation"],
-  ["workspace_run", "Execute a program in an OS sandbox confined to the assigned workspace plus read-only system runtime files. No host home or Paperclip/provider credentials are exposed. Output and time are bounded; authority loss stops the sandbox and its descendants. Use assigned app tools for external services.", z.object({ program: z.string().min(1).max(1000), args: z.array(z.string().max(16000)).max(100).default([]), timeoutMs: z.number().int().min(100).max(120000).default(30000) }).strict(), "mutation"],
+  ["workspace_run", "Execute a program in an OS sandbox confined to the assigned workspace plus read-only system runtime files. No host home or Paperclip/provider credentials are exposed. Time and the inline output preview are bounded; complete stdout and stderr are saved in the workspace at the returned outputPath. Read that file with workspace_read, or use workspace_run to select byte ranges for files over 16 MiB. Authority loss stops the sandbox and its descendants. Use assigned app tools for external services.", z.object({ program: z.string().min(1).max(1000), args: z.array(z.string().max(16000)).max(100).default([]), timeoutMs: z.number().int().min(100).max(120000).default(30000) }).strict(), "mutation"],
 ] as const;
 export const RUNNER_BRIDGE_READ_OPERATIONS: ReadonlySet<string> = new Set(specs.filter(([, , , effect]) => effect === "read").map(([name]) => name));
 export const RUNNER_BRIDGE_SCHEMAS = new Map<string, z.ZodType>(specs.map(([name, , schema]) => [name, schema]));
@@ -48,7 +48,9 @@ export function runnerBridgeDefinitions(options: { workspace: boolean; skills: b
     .map(([name, description, schema]) => ({ name, description, inputSchema: z.toJSONSchema(schema) }));
 }
 const digest = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
-const PAGE_BYTES = 24000;
+// Keep encoded previews below the Runner's delivery limit even for control
+// characters (JSON escaping expands each byte). Complete bytes live on disk.
+const OUTPUT_PREVIEW_HALF_BYTES = 16 * 1024;
 const instanceStateName = (name: string) => name.toLowerCase() === ".paperclip";
 /** Instance state is never part of the remotely exposed task workspace. */
 export function assertRunnerWorkspacePathAllowed(name: string) {
@@ -195,19 +197,59 @@ async function executeWorkspaceToolInLane(root: string, name: string, raw: unkno
   const program = "/usr/bin/bwrap";
   const protectedPaths = await protectedWorkspaceDirectories(cwd);
   const masks = protectedPaths.flatMap(directory => ["--tmpfs", directory, "--remount-ro", directory]);
-  const args = ["--die-with-parent", "--unshare-all", "--cap-drop", "ALL", "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib", ...(existsSync("/lib64") ? ["--ro-bind", "/lib64", "/lib64"] : []), "--proc", "/proc", "--dev", "/dev", "--bind", cwd, cwd, ...masks, "--chdir", cwd, "--", input.program, ...input.args];
+  const outputPath = `.workspace-run-${randomUUID()}.log`, outputFile = path.join(cwd, outputPath);
   await authorize();
-  return new Promise<Record<string, unknown>>((resolve, reject) => {
+  const outputHandle = await openRunnerWorkspaceFile(outputFile, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  // The child may read its output, but cannot replace, unlink or overwrite the
+  // file while the server is capturing it through the already-open descriptor.
+  const args = ["--die-with-parent", "--unshare-all", "--cap-drop", "ALL", "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib", ...(existsSync("/lib64") ? ["--ro-bind", "/lib64", "/lib64"] : []), "--proc", "/proc", "--dev", "/dev", "--bind", cwd, cwd, ...masks, "--ro-bind", outputFile, outputFile, "--chdir", cwd, "--", input.program, ...input.args];
+  try { return await new Promise<Record<string, unknown>>((resolve, reject) => {
     const child = spawn(program, args, { cwd, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: privateHome, TMPDIR: privateHome, LANG: "en_US.UTF-8" } });
-    let output = "", outputBytes = 0, truncated = false, stopped: string | null = null, checking = false;
-    const capture = (bytes: Buffer) => { const available = Math.max(0, PAGE_BYTES - outputBytes); output += bytes.subarray(0, available).toString("utf8"); outputBytes += Math.min(available, bytes.length); truncated ||= bytes.length > available; };
+    const head = Buffer.alloc(OUTPUT_PREVIEW_HALF_BYTES), tail = Buffer.alloc(OUTPUT_PREVIEW_HALF_BYTES);
+    let headBytes = 0, tailBytes = 0, outputBytes = 0, captureError: unknown;
+    let stopped: string | null = null, checking = false;
+    const capture = (bytes: Buffer) => {
+      if (captureError) return;
+      try {
+        // Synchronous writes apply pipe backpressure without an unbounded async
+        // write queue. Retained capture data is 32 KiB plus one pipe read chunk;
+        // runtime is bounded by timeoutMs. Handle short filesystem writes too.
+        for (let written = 0; written < bytes.length;) {
+          const count = writeSync(outputHandle.fd, bytes, written, bytes.length - written);
+          if (!count) throw new Error("runner_workspace_output_write_failed");
+          written += count;
+        }
+        outputBytes += bytes.length;
+        const take = Math.min(head.length - headBytes, bytes.length);
+        bytes.copy(head, headBytes, 0, take); headBytes += take;
+        const remaining = bytes.subarray(take);
+        if (remaining.length >= tail.length) {
+          remaining.copy(tail, 0, remaining.length - tail.length); tailBytes = tail.length;
+        } else if (remaining.length) {
+          const keep = Math.min(tailBytes, tail.length - remaining.length);
+          tail.copy(tail, 0, tailBytes - keep, tailBytes);
+          remaining.copy(tail, keep); tailBytes = keep + remaining.length;
+        }
+      } catch (error) { captureError = error; stop("output_write_failed"); }
+    };
     child.stdout.on("data", capture); child.stderr.on("data", capture);
     const stop = (reason: string) => { stopped = reason; if (child.pid) try { process.kill(-child.pid, "SIGKILL"); } catch { /* already stopped */ } };
     const timeout = setTimeout(() => stop("timeout"), input.timeoutMs);
     const poll = setInterval(() => { if (checking) return; checking = true; void authorize().catch(() => stop("authority_revoked")).finally(() => { checking = false; }); }, 500);
     const clear = () => { clearTimeout(timeout); clearInterval(poll); };
     child.once("error", error => { clear(); reject(error); });
-    child.once("close", (exitCode, signal) => { clear(); if (child.pid) try { process.kill(-child.pid, "SIGKILL"); } catch { /* owned group already exited */ } resolve({ exitCode, signal, output, truncated, stopped }); });
-  });
+    child.once("close", (exitCode, signal) => {
+      clear();
+      if (child.pid) try { process.kill(-child.pid, "SIGKILL"); } catch { /* owned group already exited */ }
+      if (captureError) { reject(captureError); return; }
+      const completeInline = outputBytes <= head.length + tail.length;
+      // Decode after joining small output so UTF-8 split across pipe reads is
+      // preserved. Large previews are two excerpts; the log always has raw bytes.
+      const output = completeInline ? Buffer.concat([head.subarray(0, headBytes), tail.subarray(0, tailBytes)]).toString("utf8")
+        : `${head.toString("utf8")}\n\nFull output is saved in ${outputPath}. Read it for the complete command output. The end of the output follows:\n\n${tail.toString("utf8")}`;
+      // Put the recovery path before the preview in serialized receipts too.
+      resolve({ exitCode, signal, outputPath, outputBytes, output, stopped });
+    });
+  }); } finally { await outputHandle.close(); }
 }
