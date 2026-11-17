@@ -140,7 +140,14 @@ const support = await getEmbeddedPostgresTestSupport();
     await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
   });
 
-  type Variant = { edit: boolean; settled: boolean; exportFails: boolean };
+  type Variant = { edit: boolean; settled: boolean; exportFails: boolean;
+    /** pl/r4-work3 (a), taken into U: NSE's record of the CLOSED session's close for this Stop
+     * (native-session-executor.ts releaseWarmNativeSession onStoppedSessionClose):
+     * "clean" = closeWarmNativeSession did not throw (the Pi transport ladder completed;
+     * on the Boat path the Runner's suspension receipt was accepted); "threw" = the close
+     * threw (swallowed by the release, recorded here); "none" = no record at all.
+     * Default: "clean" when NSE settled the Stop (what NSE writes on a clean close). */
+    closeProof?: "clean" | "threw" | "none" };
   async function stopMidTurn(variant: Variant) {
     const root = await mkdtemp(join(tmpdir(), "paperclip-cancel-finalize-"));
     roots.push(root);
@@ -208,7 +215,12 @@ const support = await getEmbeddedPostgresTestSupport();
           nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId, companyId, issueId, scope: "run",
             reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
             intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } },
-        runnerProfileJson: { ...current.runnerProfileJson },
+        runnerProfileJson: { ...current.runnerProfileJson,
+          ...((variant.closeProof ?? (variant.settled ? "clean" : "none")) !== "none" ? { nativeStoppedSessionClose: {
+            schema: "paperclip.native-stopped-session-close.v1", companyId, issueId, runId, sessionId,
+            clean: (variant.closeProof ?? "clean") === "clean",
+            ...(variant.closeProof === "threw" ? { failure: "Pi RPC process did not exit after bounded shutdown escalation" } : {}),
+            at: stoppedAt.toISOString() } } : {}) },
       }).where(eq(heartbeatRuns.id, runId));
       if (variant.settled) await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId,
         phase: "terminal_failure", failureCode: "native_retry_cancelled" });
@@ -289,6 +301,36 @@ const support = await getEmbeddedPostgresTestSupport();
         sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: f.providerLeaseId } } }))!;
     try { return successor.mode; } finally { await successor.cleanup(); }
   }
+
+  // ---- pl/r4-work3 (a) rf-4 F13, taken into U: the export runs only on a clean-close proof ----
+  const TOOLS_NOT_PROVEN_LINE = "Stopped, but the box's tools could not be proven stopped, so the workspace was not copied back. The box is kept.";
+  it.each([
+    ["the close THREW (recorded unclean): the stopped tool keeps writing after the Stop", "threw"],
+    ["no close record at all: the stopped tool keeps writing after the Stop", "none"],
+  ] as const)("r4work3 F13 RED (U): settled Stop, %s -> no export, 'prepared' kept, the true line, the box kept", async (_label, closeProof) => {
+    const f = await stopMidTurn({ edit: true, settled: true, exportFails: false, closeProof });
+    // Not one box command after the Stop: nothing copied while a stopped tool may still write.
+    expect(f.runnerState.calls).toBe(f.callsAtStop);
+    expect(f.reference).toMatchObject({ state: "prepared", finalHostSha256: null });
+    expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
+    expect(await readFile(join(f.box, "task.txt"), "utf8")).toBe(EDIT);
+    expect(f.stoppedRunProfile?.nativeCancelledWarmExport).toMatchObject({ state: "unproven", reason: "tools_not_proven_stopped" });
+    const deferred = f.events.filter(event => event.eventType === "workspace_export_deferred");
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]).toMatchObject({ level: "warn", message: TOOLS_NOT_PROVEN_LINE });
+    expect(f.events.filter(event => event.eventType === "provider.notice.recorded").map(event => event.message))
+      .toEqual([TOOLS_NOT_PROVEN_LINE]);
+    expect(f.events.filter(event => event.eventType === "workspace_export_finalized")).toEqual([]);
+    // The box stays a protected export source (reuse filter).
+    expect(f.excluded).toBe(true);
+  }, 60_000);
+
+  it("r4work3 F13 (U): with the clean-close proof the settled Stop exports (finalized, host sha-equal)", async () => {
+    const f = await stopMidTurn({ edit: true, settled: true, exportFails: false, closeProof: "clean" });
+    expect(f.reference?.state).toBe("finalized");
+    expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(EDIT);
+    expect(f.excluded).toBe(false);
+  }, 60_000);
 
   it.each([
     ["remote-only edit", true],
@@ -408,6 +450,11 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(current.status).toBe("cancelled");
     await db.insert(nativeRunFinalizations).values({ runId: f.runId, companyId: f.companyId, issueId: f.issueId,
       phase: "terminal_failure", failureCode: "native_retry_cancelled" });
+    // pl/r4-work3 (a): NSE's settle writes the clean-close proof of the closed session with it.
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...current.runnerProfileJson,
+      nativeStoppedSessionClose: { schema: "paperclip.native-stopped-session-close.v1", companyId: f.companyId,
+        issueId: f.issueId, runId: f.runId, sessionId: f.sessionId, clean: true, at: new Date().toISOString() } } })
+      .where(eq(heartbeatRuns.id, f.runId));
   }
 
   it("aggregate bound + late stamp: a stamp write held past the deadline publishes nothing; the lock is free at the deadline", async () => {
