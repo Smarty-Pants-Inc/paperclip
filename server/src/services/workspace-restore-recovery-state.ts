@@ -83,17 +83,12 @@ const runRestoreInProgressSql = sql`${runOwesRestoreSql}
 /** Past the person bound (WORKSPACE_RESTORE_PERSON_BOUND_MS after the hold was written). */
 const runRestorePastBoundSql = sql`coalesce(${runRestoreHoldWrittenSql}, ${heartbeatRuns.updatedAt})
   < now() - make_interval(secs => ${WORKSPACE_RESTORE_PERSON_BOUND_MS / 1000})`;
-/** Projection of the run's owed fact: still in progress (no terminal hold state), within the person bound. */
-export const workspaceRestorePendingProjectionSql = sql`case when ${runRestoreInProgressSql}
-  and not (${runRestorePastBoundSql}) then to_jsonb(true) end`;
-/** Projection: still in progress past the person bound; the person may Retry. */
-export const workspaceRestoreDelayedProjectionSql = sql`case when ${runRestoreInProgressSql}
-  and ${runRestorePastBoundSql} then to_jsonb(true) end`;
-/** rf-3 15:30Z (3): the run's latest hold is exhausted on an unconfirmed stop
- * (the SQL form of exhaustedStopWait in system-recovery-state.ts): the value is
- * the failure code; the chat reads it as waiting with the card's words, no Retry.
- * A recovered sibling wins, as for the status above. */
-export const workspaceRestoreStopWaitProjectionSql = sql`(select case
+/** The run's latest hold exhausted on an unconfirmed stop (the SQL form of
+ * exhaustedStopWait in system-recovery-state.ts): the failure code, else null.
+ * A recovered sibling wins, as for the status above. `bounded` ends an owed
+ * hold's wait at the person bound (restore-card8 J5, task-retry-eligibility.ts
+ * restoreStopWaitFact): past it the hold reads delayed. */
+const runRestoreStopWaitSql = (bounded: boolean) => sql`(select case
     when hold.evidence #>> '{systemRecovery,state}' = 'exhausted'
       and (hold.evidence #>> '{systemRecovery,failure,code}' = 'copyback_stop_unconfirmed'
         or (hold.evidence #>> '{systemRecovery,failure,code}' = 'agent_stop_unconfirmed'
@@ -101,6 +96,8 @@ export const workspaceRestoreStopWaitProjectionSql = sql`(select case
           and coalesce(case when hold.evidence #>> '{stopProofRecovery,schema}' = ${STOP_PROOF_RECOVERY_SCHEMA}
             and jsonb_typeof(hold.evidence #> '{stopProofRecovery,rearms}') = 'number'
             then (hold.evidence #>> '{stopProofRecovery,rearms}')::numeric end, 0) < ${STOP_PROOF_MAX_REARMS}))
+      ${bounded ? sql`and not (hold.evidence -> '${sql.raw(WORKSPACE_RESTORE_PENDING_KEY)}' = 'true'::jsonb
+        and hold.created_at < now() - make_interval(secs => ${WORKSPACE_RESTORE_PERSON_BOUND_MS / 1000}))` : sql``}
     then hold.evidence #> '{systemRecovery,failure,code}' end
   from issue_recovery_actions hold
   where hold.company_id = ${heartbeatRuns.companyId}
@@ -108,6 +105,18 @@ export const workspaceRestoreStopWaitProjectionSql = sql`(select case
     and hold.evidence #>> '{workspaceRecovery,runId}' = ${heartbeatRuns.id}::text
   order by (hold.evidence #>> '{workspaceRecovery,status}' = 'recovered') desc, hold.updated_at desc
   limit 1)`;
+/** Projection of the run's owed fact: still in progress (no terminal hold state), within the person bound. */
+export const workspaceRestorePendingProjectionSql = sql`case when ${runRestoreInProgressSql}
+  and not (${runRestorePastBoundSql}) then to_jsonb(true) end`;
+/** Projection: still in progress past the person bound; the person may Retry.
+ * restore-card8 J5: a wait on an unconfirmed stop is in progress too. */
+export const workspaceRestoreDelayedProjectionSql = sql`case when (${runRestoreInProgressSql}
+    or (${runOwesRestoreSql} and ${runRestoreStopWaitSql(false)} is not null))
+  and ${runRestorePastBoundSql} then to_jsonb(true) end`;
+/** rf-3 15:30Z (3): the run's latest hold is exhausted on an unconfirmed stop:
+ * the value is the failure code; the chat reads it as waiting with the card's
+ * words, no Retry. Within the person bound for an owed hold (restore-card8 J5). */
+export const workspaceRestoreStopWaitProjectionSql = runRestoreStopWaitSql(true);
 /** Projection of the run's owed fact once the worker recovered the files. */
 export const workspaceRestoreRecoveredProjectionSql = sql`case when ${runOwesRestoreSql}
   and ${runRestoreHoldStatusSql} = 'recovered' then to_jsonb(true) end`;
