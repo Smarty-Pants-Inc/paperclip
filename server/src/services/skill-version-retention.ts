@@ -1,4 +1,5 @@
 import { withSkillPackageReadScope } from "./skill-package-store.js";
+import { hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -101,12 +102,13 @@ async function removeSnapshotTree(target: string) {
   if (activeTrash.has(target)) return;
   activeTrash.add(target);
   try {
-    await fs.rm(target, { recursive: true, force: true });
+    // pl/keepalive6: under a held cache lock, removals go through its gate (refused after a loss, drained before release).
+    await hostMutation(() => fs.rm(target, { recursive: true, force: true }));
   } catch (error) {
     const code = errorCode(error);
     if (code !== "EACCES" && code !== "EPERM" && code !== "ENOTEMPTY") throw error;
-    await makeTreeWritable(target);
-    await fs.rm(target, { recursive: true, force: true });
+    await hostMutation(() => makeTreeWritable(target));
+    await hostMutation(() => fs.rm(target, { recursive: true, force: true }));
   } finally {
     activeTrash.delete(target);
   }
@@ -121,7 +123,7 @@ async function removeVersionDirectory(parent: string, name: string): Promise<str
   if (path.dirname(target) !== parent) return null;
   if (versionSnapshotFlights.has(target) || versionSnapshotRemovals.has(target)) return null;
   const trash = path.join(parent, `${TRASH_PREFIX}${randomUUID()}`);
-  const rename = fs.rename(target, trash);
+  const rename = hostMutation(() => fs.rename(target, trash));
   versionSnapshotRemovals.set(target, rename);
   try {
     await rename;
