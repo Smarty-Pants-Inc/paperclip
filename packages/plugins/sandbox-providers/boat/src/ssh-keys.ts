@@ -1,3 +1,4 @@
+import type { ProbeOptions } from "./runner-support.js";
 import { GUARDIAN_COMMAND as CONTRACT_COMMAND, guardianCommand as CONTRACT_BUILDER, GUARDIAN_ENTRY, GUARDIAN_SOCKET } from "./guardian-contract.js";
 // Local binding also makes the public-only editor source independent of module
 // import rewriting in the worker loader.
@@ -48,7 +49,7 @@ export function keyEditorSource(key: KeyRegistration, retire: boolean): string {
     `if(limited)process.exitCode=73;\n`;
 }
 export const IMAGE_PREFLIGHT = `test -x /usr/bin/node && test -x /usr/bin/flock && test -x ${GUARDIAN_ENTRY} && test -S ${GUARDIAN_SOCKET} && (pgrep -x sshd >/dev/null)`;
-export type KeyApi = { request(path: string, init?: RequestInit): Promise<any>; run(command: string, timeout: number, signal?: AbortSignal): Promise<{ exitCode: number | null; timedOut: boolean; stdout: string; stderr: string }> };
+export type KeyApi = { request(path: string, init?: RequestInit): Promise<any>; run(command: string, timeout: number, signal?: AbortSignal, options?: ProbeOptions): Promise<{ exitCode: number | null; timedOut: boolean; stdout: string; stderr: string }> };
 const quote = (text: string) => `'${text.replace(/'/g, `'"'"'`)}'`;
 export async function editGuestKey(api: KeyApi, sandbox: string, key: KeyRegistration, retire: boolean, signal?: AbortSignal): Promise<void> {
   const helper = `/tmp/paperclip-boat-key-${key.workerId}-${retire ? "retire" : "add"}.mjs`;

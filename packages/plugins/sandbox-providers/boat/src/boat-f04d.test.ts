@@ -76,6 +76,21 @@ it.each([{}, { code: "sandbox_not_ready" }, { code: "sandbox_starting" }, { code
   expect(count("/commands")).toBe(2); expect(count("/resume")).toBe(1);
 });
 
+it("snapshot_data_expired remains permanent even on the second command response", async () => {
+  let resumed = false;
+  transport(route => {
+    if (route.endsWith("/commands")) return json(count("/commands") === 1 ? {} : { code: "snapshot_data_expired", state: "archived" }, 409);
+    if (route.endsWith("/resume")) { resumed = true; return json({ sandbox: { id, state: "ready" } }); }
+    if (route === `/sandboxes/${id}`) return json({ sandbox: { id, state: resumed ? "running" : "archived" } });
+    return undefined;
+  });
+  const error = await execute().catch(e => e);
+  expect(error).toMatchObject({ status: 409, boatCode: "snapshot_data_expired" });
+  expect(transientSandboxResumeFailure(error)).toBe(false);
+  expect(transientSandboxResumeFailure(new Error(error.message))).toBe(false);
+  expect(count("/commands")).toBe(2); expect(count("/resume")).toBe(1);
+});
+
 it.each(["poll", "resume"])("Stop during %s of general execute recovery: zero later sends", async phase => {
   let enter!: () => void, release!: () => void;
   const entered = new Promise<void>(resolve => { enter = resolve; });
@@ -88,7 +103,10 @@ it.each(["poll", "resume"])("Stop during %s of general execute recovery: zero la
     if (route === `/sandboxes/${id}`) return json({ sandbox: { id, state: "archived" } });
     return undefined;
   });
-  const work = execute().catch(e => e); await entered;
+  const work = execute().catch(e => e);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(calls.some(c => phase === "poll" ? c.method === "GET" : c.route.endsWith("/resume"))).toBe(true);
+  await entered;
   await plugin.definition.onEnvironmentStopLease!({ ...scope, providerLeaseId: id, cancelActiveWork: true } as any);
   const atStop = calls.length; release(); await vi.advanceTimersByTimeAsync(2000);
   expect(await work).toBeInstanceOf(Error); expect(calls.slice(atStop)).toEqual([]);

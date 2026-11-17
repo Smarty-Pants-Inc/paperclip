@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import manifest from "./manifest.js";
 import { assertBoatActivityAdmission } from "./lease-gates.js";
-import { quote, type BoatIO } from "./runner-support.js";
+import { quote, type BoatIO, type ProbeOptions } from "./runner-support.js";
 import { GUARDIAN_ENTRY, GUARDIAN_SOCKET } from "./guardian-contract.js";
 
 export const GUARDIAN_FILES = ["host-channel.mjs", "protocol.mjs", "runner-control.mjs", "runner-supervisor.mjs",
@@ -50,12 +50,22 @@ export function guardianConfigError(config: Record<string, unknown>): string | u
 function script(phase: string, source: string): string {
   return `/usr/bin/env -i HOME=/home/user PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/node --input-type=module -e ${quote(`/* paperclip-guardian:${phase} */\n${source}`)}`;
 }
-async function command(io: BoatIO, phase: string, source: string, failure: Failure): Promise<string> {
+async function command(io: BoatIO, phase: string, source: string, failure: Failure, options?: ProbeOptions): Promise<string> {
   try {
-    const result = await io.run(script(phase, source), TIMEOUT);
+    const result = await io.run(script(phase, source), TIMEOUT, options);
     if (result.timedOut || result.exitCode !== 0) throw new Error();
     return result.stdout;
-  } catch { throw new BoatGuardianPreflightError(failure); }
+  } catch (error) {
+    // Preserve the already-scrubbed request outcome for these individual reads,
+    // so Core can retry resume. Never promote prepare/seal/service or the mixed
+    // guardian adapter to a repeatable probe, nor pass through guest output.
+    if (options?.intent === "idempotent_probe" && error instanceof Error) {
+      const candidate = error as Error & { category?: string; code?: string; status?: number };
+      if (candidate.category === "network_error" || candidate.code === "boat_sandbox_state_transition" ||
+        (candidate.category === "http_error" && candidate.status !== undefined && candidate.status >= 500)) throw error;
+    }
+    throw new BoatGuardianPreflightError(failure);
+  }
 }
 const paths = `const guest = ${JSON.stringify(GUARDIAN_DIRECTORY)}, runner = ${JSON.stringify(GUARDIAN_RUNNER_DIRECTORY)}, files = ${JSON.stringify(GUARDIAN_FILES)}, upload = ${JSON.stringify(GUARDIAN_UPLOAD_DIRECTORY)}, entry = ${JSON.stringify(GUARDIAN_ENTRY)}, socket = ${JSON.stringify(GUARDIAN_SOCKET)};`;
 const safeDirectories = `
@@ -113,7 +123,7 @@ for (const name of files) {
  catch { hashes[name] = null; }
 }
 console.log(JSON.stringify({ nodeVersion: process.versions.node, bootId: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(), hashes, installed }));
-`, "PROBE_FAILED");
+`, "PROBE_FAILED", { intent: "idempotent_probe" });
   let result;
   try { result = JSON.parse(stdout); } catch { throw new BoatGuardianPreflightError("PROBE_FAILED"); }
   if (typeof result?.nodeVersion !== "string" || typeof result?.bootId !== "string" || !UUID.test(result.bootId) || !result.hashes || typeof result.hashes !== "object") throw new BoatGuardianPreflightError("PROBE_FAILED");
@@ -262,7 +272,7 @@ for(const entry of fs.readFileSync('/proc/'+pid+'/environ','utf8').split('\\0').
 const until=Date.now()+5000;while(!fs.existsSync(socket)&&Date.now()<until)await setTimeout(25);
 const s=fs.lstatSync(socket);if(!s.isSocket()||s.uid!==process.getuid()||(s.mode&0o777)!==0o600)throw new Error();
 ${statusSource}
-`, "PREFLIGHT_FAILED");
+`, "PREFLIGHT_FAILED", { intent: "idempotent_probe" });
   const status = parseStatus(stdout);
   if (status.state !== "empty" && status.bootId.toLowerCase() !== observed.bootId.toLowerCase()) throw new BoatGuardianPreflightError("STATUS_INVALID");
   const prior = previous?.boot_id ?? (previous?.guardianPreflight as { bootId?: unknown } | undefined)?.bootId;

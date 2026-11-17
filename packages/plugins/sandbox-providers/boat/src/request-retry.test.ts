@@ -46,9 +46,10 @@ describe("Boat 429 retry", () => {
   it.each([500, 409, 404])("(superseded by replacement: frozen8 F-04 possibly-ran outcome, rf2 record) does not retry HTTP %s", async status => {
     const fetch = vi.fn().mockResolvedValue(response({}, status)); vi.stubGlobal("fetch", fetch);
     await expect(plugin.definition.onEnvironmentExecute!({ driverKey: "boat", companyId: "c", environmentId: "e", config, lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000 })).rejects.toMatchObject({ httpStatus: status });
-    // F-04: one command send; a 500 possibly ran, so its only other call is the evidence-only history GET.
+    // F-04D: unknown 409 first reads readiness. This double refuses that read,
+    // so it stays possibly_ran, with the existing evidence-only history GET.
     expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
-    expect(fetch.mock.calls.filter(([, init]) => init?.method !== "POST").map(([url]) => new URL(String(url)).pathname)).toEqual(status === 500 ? [`/api/v1/sandboxes/${id}/command-history`] : []);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method !== "POST").map(([url]) => new URL(String(url)).pathname)).toEqual(status === 500 ? [`/api/v1/sandboxes/${id}/command-history`] : status === 409 ? [`/api/v1/sandboxes/${id}`, `/api/v1/sandboxes/${id}/command-history`] : []);
   });
   it("(superseded by replacement: frozen8 F-04 possibly-ran outcome, rf2 record) does not retry a network error", async () => {
     const fetch = vi.fn().mockRejectedValue(new Error("secret")); vi.stubGlobal("fetch", fetch);

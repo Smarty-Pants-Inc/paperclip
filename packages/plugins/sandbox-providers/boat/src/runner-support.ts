@@ -13,9 +13,11 @@ export type RunnerConfig = {
   runnerLifecycleMode: "inherit" | "per_turn" | "warm";
   runnerIdleTimeoutMs: number; warmRunnerIdleTimeoutMs?: number; runnerReconnectGraceMs?: number;
 };
+// Private plugin intent, not a public execute/worker protocol permission.
+export type ProbeOptions = { intent?: "idempotent_probe" };
 export type BoatIO = {
   request(path: string, init?: RequestInit, allowMissing?: boolean): Promise<any>;
-  run(command: string, timeout: number): Promise<PluginEnvironmentExecuteResult>;
+  run(command: string, timeout: number, options?: ProbeOptions): Promise<PluginEnvironmentExecuteResult>;
 };
 export function quote(value: string): string { return `'${value.replace(/'/g, `'"'"'`)}'`; }
 export function workspaceDirectory(value: unknown): string {

@@ -7,6 +7,7 @@ import { readGuardianPreflightFailure, GUARDIAN_FILES, GUARDIAN_DIRECTORY, GUARD
 import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin from "./plugin.js";
 import manifest from "./manifest.js";
+import { transientSandboxResumeFailure } from "./test-fixtures/real-resume-predicate.js";
 
 // Keep: secret-bearing provider boundary and failure paths that cannot be
 // exercised on live Boat in this task. These are not live continuity proofs.
@@ -58,7 +59,7 @@ function mockBoat(options: { staged?: boolean; nodeVersion?: string; fail?: stri
         nodeVersion: options.nodeVersion ?? "24.11.0", bootId, installed: names.every(name => disk.has(`${guest}/${name}`)),
         hashes: Object.fromEntries(names.map(name => [name, disk.has(`${guest}/${name}`) ? (options.poisonHash ? "0".repeat(64) : hashes[name]) : null])),
       }) });
-      if (command.includes("paperclip-guardian:preflight")) return ok({ exitCode: 0, stdout: options.badReply ? secret : JSON.stringify({ ok: true, result: options.state === "running" || options.state === "exited" ? {
+      if (command.includes("paperclip-guardian:preflight") || command.includes("paperclip-guardian:health")) return ok({ exitCode: 0, stdout: options.badReply ? secret : JSON.stringify({ ok: true, result: options.state === "running" || options.state === "exited" ? {
         state: options.state, pid: 123, startTime: "456", bootId, generation: "33333333-3333-4333-8333-333333333333", code: null, signal: null,
       } : { state: options.state ?? "empty" } }) });
       return ok({ exitCode: 0, stdout: "", stderr: "" });
@@ -177,11 +178,28 @@ describe("guardian staging through Boat lease hooks", () => {
     const params = { ...base, providerLeaseId: "bx_guardian" };
     const error = await plugin.definition.onEnvironmentResumeLease!(params).catch(e => e);
     expect(error).toMatchObject({ code: "ECONNRESET", category: "network_error" });
-    expect(error.message).toContain("connection reset");
+    expect(transientSandboxResumeFailure(error)).toBe(true);
+    expect(transientSandboxResumeFailure(new Error(error.message))).toBe(true);
     expect(error.message).not.toContain("PRIVATE-RESET");
     expect(boat.commands.filter(c => c.includes(`paperclip-guardian:${resetOnce}`))).toHaveLength(1);
     const recovered = await plugin.definition.onEnvironmentResumeLease!(params);
     expect(recovered.metadata?.guardianPreflight).toMatchObject({ usable: true });
+  });
+  it("F-04D R6 health ECONNRESET is a read, never possibly-ran; next health recovers", async () => {
+    const boat = mockBoat({ staged: true, resetOnce: "health" });
+    await plugin.definition.onEnvironmentResumeLease!({ ...base, providerLeaseId: "bx_guardian" });
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "error" });
+    expect(boat.commands.filter(c => c.includes("paperclip-guardian:health"))).toHaveLength(1);
+    expect((globalThis.fetch as any).mock.calls.filter(([url]: any) => String(url).includes("/command-history"))).toHaveLength(0);
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "ok" });
+    expect(boat.commands.filter(c => c.includes("paperclip-guardian:health"))).toHaveLength(2);
+  });
+  it.each(["prepare", "service"])("F-04D mixed guardian %s reset is NOT promoted to a probe", async resetOnce => {
+    const boat = mockBoat({ staged: true, resetOnce });
+    const error = await plugin.definition.onEnvironmentResumeLease!({ ...base, providerLeaseId: "bx_guardian" }).catch(e => e);
+    expect(error).toMatchObject({ code: `BOAT_GUARDIAN_${resetOnce === "prepare" ? "PREPARE" : "SERVICE"}_FAILED` });
+    expect(boat.commands.filter(c => c.includes(`paperclip-guardian:${resetOnce}`))).toHaveLength(1);
+    expect((globalThis.fetch as any).mock.calls.filter(([url]: any) => String(url).includes("/command-history"))).toHaveLength(1);
   });
   it("does not return stale usable metadata or delete a retained lease on resume failure", async () => {
     const boat = mockBoat({ staged: true, fail: "preflight" });

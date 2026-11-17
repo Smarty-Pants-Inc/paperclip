@@ -108,7 +108,7 @@ export class BoatSshCarrier {
         refreshedPin = true;
       }
     }
-    const preflight = await api.run(IMAGE_PREFLIGHT, 10_000);
+    const preflight = await api.run(IMAGE_PREFLIGHT, 10_000, undefined, { intent: "idempotent_probe" });
     if (preflight.exitCode !== 0 || preflight.timedOut) throw new BoatDuplexError("BOAT_SSH_PREFLIGHT_FAILED");
     state.key = { workerId: identity.workerId, publicKey: identity.publicKey, expiresAt: Date.now() + 24 * 3600_000, runnerId: state.lease.runnerId! };
     for (let attempt = 0; attempt < (refreshedPin ? 1 : 2); attempt++) {
@@ -204,7 +204,7 @@ export class BoatSshCarrier {
   async health(lease: DuplexLease): Promise<void> {
     // S9 has no public status verb. Probe the resident owner's private status
     // socket, not a forged S9 frame or a new key before Core selects a Runner.
-    const response = await this.apiFor(lease).run(guardianHealthCommand(), 10_000);
+    const response = await this.apiFor(lease).run(guardianHealthCommand(), 10_000, undefined, { intent: "idempotent_probe" });
     let status: any; try { status = JSON.parse(response.stdout); } catch { throw new BoatDuplexError("BOAT_SSH_SESSION_LOST"); }
     if (response.exitCode !== 0 || response.timedOut || status?.ok !== true || !["empty", "running", "exited"].includes(status.result?.state)) throw new BoatDuplexError("BOAT_SSH_SESSION_LOST");
   }

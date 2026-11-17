@@ -30,7 +30,7 @@ export type BoatDirectFields = { boatCode?: string; boatRetryable?: boolean; boa
 /** 'ran': history holds this attempt's exact prefixed text. Otherwise 'unknown', never 'not run'. */
 export type CommandEvidence = "ran" | "unknown";
 /** Why the command possibly ran: a closed reason, never provider text. */
-export type PossiblyRanReason = "network_error" | "timeout" | "aborted" | "http_5xx" | "unreadable_response";
+export type PossiblyRanReason = "network_error" | "timeout" | "aborted" | "http_409" | "http_5xx" | "unreadable_response";
 /** How a command or files call that Boat answered with a 5xx is handled. */
 export type DirectFailureClass = "did_not_run" | "possibly_ran" | "other";
 

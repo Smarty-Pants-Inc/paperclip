@@ -4,7 +4,7 @@ import { transientSandboxResumeFailure } from "./test-fixtures/real-resume-predi
 
 // Keep: F-04C, run d5698c67's 409 during runnerd supervision. Transport-level
 // fault injection through real plugin hooks; no live Boat. Data-safety boundary:
-// only explicit F-04B repeatable probes can resume/resend, never user commands.
+// F-04D also recovers arbitrary commands after a confirmed not-run refusal.
 // The actual supervision caller is in SERVER, not this plugin (see REPORT).
 const config = { apiKey: "not-live-f04c", type: "small", ttlSeconds: 1800, reuseLease: true, labels: {} };
 const scope = { driverKey: "boat", companyId: "f04c-c", environmentId: "f04c-e", config };
@@ -60,18 +60,23 @@ function transient(error: any) {
 
 describe("F-04C R1: an explicit repeatable probe waits for archived, resumes, then succeeds", () => {
   it.each(shapes)("R1 $name", async ({ body }) => {
-    boat(body);
+    const documented = body && "code" in body && body.code === "sandbox_not_ready";
+    boat(body, documented ? 0 : 1000);
     const work = probe().catch(e => e);
-    await vi.advanceTimersByTimeAsync(999);
-    expect(count("/commands")).toHaveLength(1);
-    expect(count("/resume")).toHaveLength(0);
-    await vi.advanceTimersByTimeAsync(1);
+    if (!documented) {
+      await vi.advanceTimersByTimeAsync(999);
+      expect(count("/commands")).toHaveLength(1);
+      expect(count("/resume")).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+    }
     await expect(work).resolves.toEqual({ cwd: "/home/user/f04c", metadata: { provider: "boat", remoteCwd: "/home/user/f04c" } });
     expect(count("/commands")).toHaveLength(2);
     expect(count("/resume")).toHaveLength(1);
     const resumeIndex = calls.findIndex(c => c.route.endsWith("/resume"));
-    expect(calls[resumeIndex].at - calls[0].at).toBeGreaterThanOrEqual(1000);
-    expect(calls[resumeIndex - 1]).toMatchObject({ method: "GET", route: `/sandboxes/${id}` });
+    if (!documented) {
+      expect(calls[resumeIndex].at - calls[0].at).toBeGreaterThanOrEqual(1000);
+      expect(calls[resumeIndex - 1]).toMatchObject({ method: "GET", route: `/sandboxes/${id}` });
+    }
     expect(calls.slice(resumeIndex).map(c => c.method)).toEqual(["POST", "GET", "POST"]);
   });
 });
@@ -106,17 +111,17 @@ it("R1 real read-only sentinel cat: a box archives during resume verification, t
   expect(count("/commands").filter(c => c.command?.includes("cat "))).toHaveLength(2);
 });
 
-describe("F-04C R2: non-idempotent commands never resume/resend on the same 409", () => {
-  it.each(shapes)("R2 $name: one command, named transient for the real resume predicate", async ({ body }) => {
+describe("F-04D replaces F-04C R2: confirmed archive refusals recover arbitrary commands", () => {
+  it.each(shapes)("R2 $name: observe archive, one resume, one resend", async ({ body }) => {
     boat(body);
     const work = execute().catch(e => e);
     await vi.advanceTimersByTimeAsync(1500);
-    const error = await work;
-    expect(count("/commands")).toHaveLength(1);
-    transient(error);
-    expect(count("/resume")).toHaveLength(0);
-    expect(calls).toHaveLength(1); // no history/read side channel is needed for a definite refusal
+    expect(await work).toMatchObject({ exitCode: 0, stdout: "PROBE-OK" });
+    expect(count("/commands")).toHaveLength(2);
+    expect(count("/resume")).toHaveLength(1);
+    expect(count("/command-history")).toHaveLength(0);
     expect(count("/commands")[0].command).toContain("exec 'charge-once'");
+    expect(count("/commands")[1].command?.replace(/^: paperclip-attempt=[0-9a-f-]+; /, "")).toBe("exec 'charge-once'");
   });
 });
 
@@ -198,9 +203,9 @@ it("snapshot_data_expired stays permanent, even with archived state", async () =
   expect(calls).toHaveLength(1);
 });
 it("a 409 in a known ready state is not made resendable", async () => {
-  boat({ state: "ready", code: "PRIVATE-UNKNOWN-CODE" });
+  boat({ state: "ready", code: "PRIVATE-UNKNOWN-CODE" }, Infinity, c => c.method === "GET" ? json({ sandbox: { id, state: "ready" } }) : undefined);
   const error = await probe().catch(e => e);
   expect(error).toMatchObject({ status: 409, boatCode: "other" });
   expect(transientSandboxResumeFailure(error)).toBe(false);
-  expect(calls).toHaveLength(1);
+  expect(calls).toHaveLength(2); // F-04D reads readiness even if the body says ready
 });

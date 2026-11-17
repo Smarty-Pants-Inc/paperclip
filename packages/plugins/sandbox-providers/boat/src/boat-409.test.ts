@@ -51,8 +51,8 @@ function fakeBoat(script: { commands?: Reply[]; files?: Reply[]; resume?: Reply[
 }
 const resume = () => plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: id });
 const execute = (extra: Record<string, unknown> = {}) => plugin.definition.onEnvironmentExecute!({ ...scope, lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000, ...extra } as any);
-// F-04C: only explicit repeatable probes retain archive resume/resend; arbitrary
-// execute is covered by boat-archiving R2 and must surface a transient instead.
+// Explicit probe fixture; F-04D also recovers arbitrary commands after the
+// documented refusal or a separate archiving/archived readiness observation.
 const probe = () => plugin.definition.onEnvironmentRealizeWorkspace!({ ...scope, lease: { providerLeaseId: id }, workspace: { remotePath: "/home/user/409" } } as any);
 function assertClosed(error: Error) {
   expect(Object.hasOwn(error, "cause")).toBe(false);
@@ -78,26 +78,28 @@ describe("#20974 (a) a Boat 409 keeps only its closed code, state and retryable"
     assertClosed(error);
   });
   it("409-A reads the fields nested under error too, and drops unknown or non-closed values", async () => {
-    fakeBoat({ commands: [{ status: 409, body: { error: { code: "machine_not_running", state: "archived", retryable: false, message: canary } } }] });
+    const nestedReply = { status: 409, body: { error: { code: "machine_not_running", state: "archived", retryable: false, message: canary } } };
+    fakeBoat({ commands: [nestedReply, nestedReply] });
     const nested = await execute().catch(e => e);
     expect(nested).toMatchObject({ status: 409, boatCode: "machine_not_running", boatState: "archived", boatRetryable: false });
     assertClosed(nested);
-    fakeBoat({ commands: [{ status: 409, body: { code: `${canary}_code`, state: `${canary} state`, retryable: "yes", message: canary } }] });
+    const boat = fakeBoat({ commands: [{ status: 409, body: { code: `${canary}_code`, state: `${canary} state`, retryable: "yes", message: canary } }] });
+    boat.setState("running");
     const odd = await execute().catch(e => e);
-    expect(odd).toMatchObject({ status: 409, boatCode: "other" });
+    expect(odd).toMatchObject({ code: "boat_command_possibly_ran", httpStatus: 409, boatCode: "other" });
     expect(odd.boatState).toBeUndefined();
     expect(odd.boatRetryable).toBeUndefined();
-    expect(odd.message).toBe(`Boat POST /sandboxes/${id}/commands failed (409): http_error [boat 409 code=other] (state change in progress)`);
+    expect(odd.message).toBe("Boat POST /sandboxes/{sandboxId}/commands failed (409): result_unconfirmed, evidence=unknown (possibly ran)");
     assertClosed(odd);
   });
 });
 
 describe("#20974 (b) documented 409 handling inside the call's bounded budget", () => {
-  it("409-B sandbox_starting on a command is sent again and then runs", async () => {
+  it("409-B sandbox_starting on a command resumes/waits once and then runs", async () => {
     const boat = fakeBoat({ commands: [conflict("sandbox_starting", { state: "provisioned", retryable: true })] });
     await expect(execute()).resolves.toMatchObject({ exitCode: 0, stdout: "ran" });
     expect(boat.count("POST", "/commands")).toBe(2);
-    expect(boat.count("POST", "/resume")).toBe(0);
+    expect(boat.count("POST", "/resume")).toBe(1);
   });
   it("409-B sandbox_starting on a files PUT is sent again, then the command runs", async () => {
     const boat = fakeBoat({ files: [conflict("sandbox_starting", { state: "provisioned", retryable: true })] });
@@ -111,7 +113,9 @@ describe("#20974 (b) documented 409 handling inside the call's bounded budget", 
     const boat = fakeBoat({ commands: [starting, starting, starting, starting, starting] });
     const error = await execute().catch(e => e);
     expect(error).toMatchObject({ status: 409, boatCode: "sandbox_starting", boatState: "provisioned", boatRetryable: true });
-    expect(boat.count("POST", "/commands")).toBe(3);
+    expect(boat.count("POST", "/commands")).toBe(2); // resume used the third send
+    expect(boat.count("POST", "/resume")).toBe(1);
+    expect(error).toMatchObject({ code: "boat_sandbox_state_transition" });
     assertClosed(error);
   });
   it.each(["machine_not_running", "sandbox_not_ready"])("409-B %s on a command soon after OUR resume: one more resume + ready wait, then one retry", async code => {
@@ -135,7 +139,7 @@ describe("#20974 (b) documented 409 handling inside the call's bounded budget", 
     expect(boat.count("POST", "/resume")).toBe(2);
     expect(boat.count("PUT", "/files")).toBe(2);
   });
-  it("409-B the recovery happens once per resume: a second not-ready is surfaced, never another resume", async () => {
+  it("409-B recovery happens once per CALL: a second 409 is surfaced, a new call may recover", async () => {
     const notRunning = conflict("machine_not_running", { state: "archived", retryable: false });
     const boat = fakeBoat({ commands: [notRunning, notRunning, notRunning] });
     await resume();
@@ -145,26 +149,26 @@ describe("#20974 (b) documented 409 handling inside the call's bounded budget", 
     expect(boat.count("POST", "/resume")).toBe(2);
     expect(boat.count("POST", "/commands")).toBe(2);
     const later = await probe().catch(e => e);
-    expect(later).toMatchObject({ status: 409, boatCode: "machine_not_running" });
-    expect(boat.count("POST", "/resume")).toBe(2);
-    expect(boat.count("POST", "/commands")).toBe(3);
+    expect(later).toMatchObject({ cwd: "/home/user/409" });
+    expect(boat.count("POST", "/resume")).toBe(3);
+    expect(boat.count("POST", "/commands")).toBe(4);
     assertClosed(first);
   });
-  it("409-B machine_not_running with no resume of ours, or long after it, is surfaced without a resume", async () => {
+  it("409-B machine_not_running recovers even with no resume of ours, or long after it", async () => {
     const notRunning = conflict("machine_not_running", { state: "archived", retryable: false });
     let boat = fakeBoat({ commands: [notRunning] });
     const unowned = await execute().catch(e => e);
-    expect(unowned).toMatchObject({ status: 409, boatCode: "machine_not_running" });
-    expect(boat.count("POST", "/resume")).toBe(0);
-    expect(boat.count("POST", "/commands")).toBe(1);
+    expect(unowned).toMatchObject({ exitCode: 0 });
+    expect(boat.count("POST", "/resume")).toBe(1);
+    expect(boat.count("POST", "/commands")).toBe(2);
     boat = fakeBoat({ commands: [notRunning] });
     const now = Date.now();
     await resume();
     vi.spyOn(Date, "now").mockReturnValue(now + 6 * 60_000);
     const stale = await execute().catch(e => e);
-    expect(stale).toMatchObject({ status: 409, boatCode: "machine_not_running" });
-    expect(boat.count("POST", "/resume")).toBe(1);
-    expect(boat.count("POST", "/commands")).toBe(1);
+    expect(stale).toMatchObject({ exitCode: 0 });
+    expect(boat.count("POST", "/resume")).toBe(2);
+    expect(boat.count("POST", "/commands")).toBe(2);
   });
   it("409-B after OUR stop of the box, nothing wakes it: the call is refused before any Boat request", async () => {
     // The lease gate refuses the call; the stop also forgets our resume (defense in depth).

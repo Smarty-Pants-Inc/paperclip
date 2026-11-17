@@ -54,9 +54,8 @@ function fakeBoat(handle: Handler = () => undefined, initial = "archived") {
 const resumeLease = (s = scope) => plugin.definition.onEnvironmentResumeLease!({ ...s, providerLeaseId: id } as any);
 const userExecute = (s = scope) =>
   plugin.definition.onEnvironmentExecute!({ ...s, lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000 } as any);
-// F-04C: resend bounds use an EXPLICIT repeatable plugin probe, not arbitrary
-// environmentExecute. That old resend expectation is superseded by R2 in
-// boat-archiving.test.ts. This probe's signal is 35 s; its call budget is 30 s.
+// Explicit repeatable probe; F-04D also recovers general execute after not-run
+// refusals. This probe's signal is 35 s; its call budget remains 30 s.
 const execute = (s = scope) =>
   plugin.definition.onEnvironmentRealizeWorkspace!({ ...s, lease: { providerLeaseId: id }, workspace: { remotePath: "/home/user/bounds" } } as any);
 const stopHooks = ["onEnvironmentStopLease", "onEnvironmentReleaseLease", "onEnvironmentDestroyLease"] as const;
@@ -208,7 +207,7 @@ describe("F-02 the recovery resume is one send inside the call's 3-send cap", ()
     expect(boat.n.resume).toBe(2);
     expect(boat.n.commands).toBe(1);
   });
-  it("F-02 the recovery resume counts as a send: after a starting resend there is no room for resume plus retry", async () => {
+  it("F-02 a starting recovery uses resume plus resend: a second 409 cannot resume again", async () => {
     const boat = fakeBoat((call, n) => {
       if (call.route.endsWith("/commands") && n.commands === 1) return conflict("sandbox_starting", "provisioned");
       if (call.route.endsWith("/commands") && n.commands === 2) return conflict("machine_not_running", "archived");
@@ -217,8 +216,9 @@ describe("F-02 the recovery resume is one send inside the call's 3-send cap", ()
     await resumeLease();
     const error = await execute().catch(e => e);
     expect(error).toMatchObject({ status: 409, boatCode: "machine_not_running" });
-    // One explicit resume; the command call itself used 2 sends and had no room for 2 more.
-    expect(boat.n.resume).toBe(1);
+    // One explicit resume + one recovery resume. The command call used all
+    // three sends (command/resume/command), with no room for another recovery.
+    expect(boat.n.resume).toBe(2);
     expect(boat.n.commands).toBe(2);
   });
 });

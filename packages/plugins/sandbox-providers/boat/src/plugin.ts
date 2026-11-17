@@ -126,6 +126,9 @@ const ourResumes = new Map<string, { at: number; recovery?: Promise<boolean>; se
 // a generation as it starts and again once it completes; a call bound to an older
 // generation never sends again, so no in-flight 409 recovery outlives our stop.
 const boxLifecycles = new Map<string, number>();
+// An explicit stop also fences NEW calls under another lease scope. Only an
+// explicit resume reopens recovery; a command refusal can never undo our Stop.
+const stoppedBoxes = new Set<string>();
 function boxLifecycle(key: string): number { return boxLifecycles.get(key) ?? 0; }
 function endBoxLifecycle(key: string): void { boxLifecycles.set(key, boxLifecycle(key) + 1); }
 function markOurResume(config: Config, id: string): void {
@@ -133,6 +136,7 @@ function markOurResume(config: Config, id: string): void {
   // Marks past the window can never act; drop them so the map stays small
   // (an in-flight recovery keeps its own reference to its mark).
   for (const [key, mark] of ourResumes) if (now - mark.at > BOAT_RESUME_RECOVERY_WINDOW_MS) ourResumes.delete(key);
+  stoppedBoxes.delete(activityKey(config, id));
   ourResumes.set(activityKey(config, id), { at: now });
 }
 function stateTimestamp(value: unknown): number | undefined {
@@ -539,18 +543,20 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       if (response.status === 409) {
         category = "http_error";
         boat409 = boat409Fields(await response.clone().json().catch(() => null));
-        // F-04C: readiness.md:21-22 refuses archiving/archived commands, but
-        // neither it nor commands-table.md:13-16 names an archiving-specific
-        // code/body. The observed 409 has no known code. An unreadable state
-        // is NOT permission to resend; only an explicit probe may observe it.
-        archivingCommandConflict = commandCall && boat409.boatCode !== "snapshot_data_expired" && (
-          ["archiving", "archived", "stopping", "stopped"].includes(boat409.boatState ?? "") ||
-          (boat409.boatState === undefined && !["sandbox_starting", "sandbox_stopping"].includes(boat409.boatCode ?? ""))
-        );
+        // F-04D: http_error is OUR fallback, not a documented Boat refusal.
+        // Unknown/unparsed command 409s require a separate readiness GET. Only
+        // archiving/archived proves not-run (readiness.md:21-22); otherwise an
+        // arbitrary command stays possibly_ran, regardless of the body state.
+        const unknownCommand = commandCall && (boat409.boatCode === undefined || boat409.boatCode === "other");
+        const documentedNotRun = ["sandbox_starting", "sandbox_not_ready", "machine_not_running"].includes(boat409.boatCode ?? "");
+        archivingCommandConflict = commandCall && boat409.boatCode !== "snapshot_data_expired" && (documentedNotRun || resumeRecoveryUsed ||
+          (responseOptions.intent === "idempotent_probe" && unknownCommand && !["ready", "idle", "running"].includes(boat409.boatState ?? "")));
+        if (unknownCommand && commandSend && !resumeRecoveryUsed) possiblyRan = "http_409";
         const resend = await boat409Resend(config, path, method, allocation ? decodeURIComponent(allocation) : undefined, boat409, {
           attempt, maxSends, deadline, callSignal, retryAfter: response.headers.get("Retry-After"),
           commandOrFilesCall: commandOrFilesCall && !isStreamBody, resumeCall, sendGuard,
-          archivingCommand: archivingCommandConflict, idempotentProbe: responseOptions.intent === "idempotent_probe" && !isStreamBody,
+          commandCall, unknownCommand, idempotentProbe: responseOptions.intent === "idempotent_probe" && !isStreamBody,
+          confirmNotRun: () => { possiblyRan = undefined; archivingCommandConflict = true; },
           resumeRecoveryUsed, useResumeRecovery: () => { resumeRecoveryUsed = true; },
         });
         if (resend === false) break;
@@ -649,7 +655,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
             // not only to the early evidence check above. A refusal means unknown.
             sendGuard: () => { if (!evidenceAllowed()) throw new Error("Boat sandbox lease is no longer active."); },
           }));
-      const outcome = commandPossiblyRanError(httpStatus, category, reason, evidence, direct);
+      const outcome = commandPossiblyRanError(httpStatus, category, reason, evidence, direct ?? boat409);
       if (outcome.stack) outcome.stack = redactKey(config, outcome.stack);
       throw outcome;
     }
@@ -659,9 +665,8 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       : isOwnDeadline(error, signal) ? "ETIMEDOUT" : closedTransportCode(error);
     const failure = requestError(config, init.method ?? "GET", path, httpStatus, category, code, boat409, direct);
     if (archivingCommandConflict) {
-      // A definite 409 refusal is not possibly-ran. Do not repeat arbitrary
-      // commands here. Preserve a named, closed transient across RPC via the
-      // REAL server resume predicate's 'state change in progress' phrase.
+      // A documented or state-confirmed refusal, including a second 409 after
+      // recovery, gets ONE named transient across the real RPC text predicate.
       failure.message += " (state change in progress)";
       if (failure.stack) failure.stack = failure.stack.replace("\n", " (state change in progress)\n");
       Object.assign(failure, { code: "boat_sandbox_state_transition" });
@@ -678,28 +683,32 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
  * - sandbox_starting (readiness.md:29; troubleshooting): Boat held the command
  *   or files call up to 60 s; send it again after BOAT_STARTING_RESEND_MS.
  * - sandbox_not_ready / machine_not_running (readiness.md:31; troubleshooting:
- *   'Run boat resume, then retry'): only within minutes of OUR resume of that
- *   box, ONE more POST /resume (a single send of this call) plus the ready wait,
- *   once per resume; then the call is retried once.
+ *   'Run boat resume, then retry'): command calls get ONE resume + ready wait
+ *   + resend, even without a prior resume; files retain the recent-OUR-resume
+ *   gate. sandbox_starting commands use the same single recovery.
  * - sandbox_stopping (troubleshooting: the resume answer carries Retry-After;
  *   'Wait that many seconds ... Then run the same resume again'): resume only.
- * - F-04C archiving/archived command refusal (including a missing/unknown code
- *   or unreadable state): ONLY an explicit idempotent_probe may observe the
- *   stop, wait until archived, resume, wait ready, then resend. Arbitrary
- *   commands surface a named transient instead. readiness.md:93 and
- *   troubleshooting-409.md:57 say wait for stopped before retrying a resume.
- * - Anything else is surfaced as is: snapshot_data_expired
+ * - F-04D unknown/unparsed command 409: GET readiness, never infer from the
+ *   error body. Archiving/archived proves not-run for ANY command. Poll until
+ *   archived, resume once, wait ready, resend once. Other/unreadable states
+ *   remain possibly_ran for arbitrary commands. Explicit probes retain their
+ *   F-04C stopping/stopped aliases. No idle poller or new command budget.
+ * - Other documented codes are surfaced as is: snapshot_data_expired
  *   (https://docs.boat.dev/troubleshooting.md, section '409 snapshot_data_expired':
  *   'Resume, fork and a saved snapshot save of this sandbox fail. You cannot get
- *   the data back.') and any code outside the closed list.
+ *   the data back.'). Unknown non-command codes are surfaced as is.
  */
 async function boat409Resend(config: Config, path: string, method: string, id: string | undefined, fields: Boat409Fields, call: {
   attempt: number; maxSends: number; deadline: number; callSignal: AbortSignal; retryAfter: string | null;
   commandOrFilesCall: boolean; resumeCall: boolean; sendGuard: () => void; resumeRecoveryUsed: boolean; useResumeRecovery: () => void;
-  archivingCommand: boolean; idempotentProbe: boolean;
+  commandCall: boolean; unknownCommand: boolean; idempotentProbe: boolean; confirmNotRun: () => void;
 }): Promise<number | false> {
-  if (call.callSignal.aborted || call.attempt >= call.maxSends || !id) return false;
-  const resume = async (signal = call.callSignal): Promise<boolean> => {
+  if (call.callSignal.aborted || !id || Date.now() >= call.deadline || stoppedBoxes.has(activityKey(config, id))) return false;
+  // A command's own signal can outlast its 30 s request budget. Bound actual
+  // recovery fetches too, for unknown AND documented refusals.
+  const signal = AbortSignal.any([call.callSignal, AbortSignal.timeout(Math.max(1, call.deadline - Date.now()))]);
+  const canResume = () => call.commandOrFilesCall && !call.resumeRecoveryUsed && call.attempt + 2 <= call.maxSends;
+  const resume = async (): Promise<boolean> => {
     // Shared with the existing not-ready recovery: one resume send, followed
     // by ready observations, all bound to the ORIGINAL admission/deadline.
     try {
@@ -707,31 +716,47 @@ async function boat409Resend(config: Config, path: string, method: string, id: s
         body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(config), ...(config.boatEnvironment === undefined ? { noEnv: true } : {}) }) },
       false, { maxSends: 1, deadline: call.deadline, sendGuard: call.sendGuard });
       await waitReady(config, id, true, { signal, deadline: call.deadline, sendGuard: call.sendGuard });
+      call.sendGuard(); // even a late ready response cannot authorize a resend
       return true;
     } catch { return false; }
   };
-  if (call.archivingCommand) {
-    // Boat never retries commands automatically (command-history.md:18).
-    // This opt-in is intent, NOT shell-text inference, and does not promote a
-    // server-owned supervision command to a probe. No new worker idle poller:
-    // only a refused call's bounded transition observation (readiness.md:89-93).
-    if (!call.idempotentProbe || call.resumeRecoveryUsed || call.attempt + 2 > call.maxSends) return false;
-    call.useResumeRecovery();
-    // The command's signal can outlast its 30 s request budget. Bound actual
-    // fetches too, not just the observation cadence and next-send guard.
-    const signal = AbortSignal.any([call.callSignal, AbortSignal.timeout(Math.max(1, call.deadline - Date.now()))]);
+  if (call.unknownCommand) {
+    if (call.resumeRecoveryUsed) return false; // second 409: named error, never a loop
+    // A body field or missing history is not evidence that a command did not
+    // run. Read the SAME box using the existing readiness endpoint first.
     while (Date.now() < call.deadline) {
-      const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, { signal }, false,
-        { maxSends: 1, deadline: call.deadline, sendGuard: call.sendGuard, requireJson: true });
-      call.sendGuard(); // a late response cannot authorize a resume
-      const sandbox = result?.sandbox ?? result;
-      assertSandboxId(sandbox, id);
-      if (["archived", "stopped"].includes(sandbox.state)) return await resume(signal) ? 1 : false;
-      if (!["archiving", "stopping"].includes(sandbox.state)) return false;
+      let sandbox: any;
+      try {
+        const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, { signal }, false,
+          { maxSends: 1, deadline: call.deadline, sendGuard: call.sendGuard, requireJson: true });
+        call.sendGuard();
+        sandbox = result?.sandbox ?? result;
+        assertSandboxId(sandbox, id);
+      } catch { return false; } // unreadable GET never grants replay authority
+      const archived = sandbox.state === "archived" || (call.idempotentProbe && sandbox.state === "stopped");
+      const archiving = sandbox.state === "archiving" || (call.idempotentProbe && sandbox.state === "stopping");
+      if (!archived && !archiving) return false;
+      call.confirmNotRun();
+      if (!canResume()) return false;
+      if (archived) {
+        call.useResumeRecovery();
+        return await resume() ? 1 : false;
+      }
+      // No new worker timer: only this refused call's bounded transition wait.
       await delay(Math.min(500, Math.max(0, call.deadline - Date.now())), undefined, { signal });
     }
     return false;
   }
+  if (call.commandCall && ["sandbox_not_ready", "machine_not_running", "sandbox_starting"].includes(fields.boatCode ?? "")) {
+    if (!canResume()) return false;
+    if (fields.boatCode === "sandbox_starting") {
+      if (BOAT_STARTING_RESEND_MS >= call.deadline - Date.now()) return false;
+      await delay(BOAT_STARTING_RESEND_MS, undefined, { signal });
+    }
+    call.useResumeRecovery();
+    return await resume() ? 1 : false;
+  }
+  if (call.attempt >= call.maxSends) return false;
   const route = path.replace(/^\/sandboxes\/[^/?]+/, "/sandboxes/{sandboxId}").replace(/\?.*$/, "");
   const log = (action: string) => duplexLogger?.warn("Boat API 409", { method, route, attempt: `${call.attempt}/${call.maxSends}`, action, ...fields });
   if (fields.boatCode === "sandbox_starting" && call.commandOrFilesCall) {
@@ -898,6 +923,7 @@ async function waitSetup(config: Config, id: string): Promise<any> {
 async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseId: string; state: "stopped" }> {
   // Our stop ends "our resume": a later not-ready 409 must never wake this box.
   ourResumes.delete(activityKey(config, id));
+  stoppedBoxes.add(activityKey(config, id));
   // It also ends the box's lifecycle generation, now and once it completes, so
   // no call bound to the old generation (an in-flight 409 recovery) sends again.
   endBoxLifecycle(activityKey(config, id));
@@ -1043,7 +1069,7 @@ let duplexContext: PluginContext["duplexChannel"] | undefined;
 let duplexLogger: PluginContext["logger"] | undefined;
 const sshCarrier = new BoatSshCarrier(lease => {
   const config = parse(lease.config);
-  return { request: (path, init) => request(config, path, init), run: (command, timeout, signal) => runCommand(config, lease.providerLeaseId, command, timeout, undefined, signal) };
+  return { request: (path, init) => request(config, path, init), run: (command, timeout, signal, options) => runCommand(config, lease.providerLeaseId, command, timeout, undefined, signal, options) };
 });
 const duplexChannels = new BoatDuplexChannels({
   prepare: lease => sshCarrier.prepare(lease), connect: connectSsh,
@@ -1458,7 +1484,7 @@ async function finishAcquisition(
     run: (command, timeout) => runCommand(config, id, command, timeout, undefined, undefined, { intent: "idempotent_probe" }),
   });
   const guardianPreflight = await stageGuardian(params.config, id, {
-    request: (path, init) => request(config, path, init), run: (command, timeout) => runCommand(config, id, command, timeout),
+    request: (path, init) => request(config, path, init), run: (command, timeout, options) => runCommand(config, id, command, timeout, undefined, undefined, options),
   });
   await bindDuplexLease(params, id, guardianPreflight);
   return { providerLeaseId: id, expiresAt: expiry, metadata: { provider: config.provider, sandboxId: id, remoteCwd,
@@ -1897,7 +1923,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }) : undefined;
     if (workspaceSentinel && workspaceSentinel.result !== "matched") return { providerLeaseId: null, metadata: { expired: true, workspaceSentinel, ...(ttlRefresh ? { ttlRefresh } : {}) } };
     const guardianPreflight = await stageGuardian(params.config, id, {
-      request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, id, command, timeout),
+      request: (path, init) => request(c, path, init), run: (command, timeout, options) => runCommand(c, id, command, timeout, undefined, undefined, options),
     }, metadata);
     // A disabled carrier must not inherit an earlier lease's usable receipt.
     const { guardianPreflight: _previousGuardian, runnerGuardianVersion: _previousVersion,
