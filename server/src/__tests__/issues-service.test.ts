@@ -7003,7 +7003,15 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
     expect(comment.body).toBe("transaction-safe comment");
   });
 
-  it("resolves caller-transaction agent creation within a fixed single-connection bound", async () => {
+  it.each(["agent", "user"] as const)("resolves caller-transaction %s creation within a fixed single-connection bound", async (assignee) => {
+    const userId = randomUUID();
+    if (assignee === "user") {
+      await db.insert(companyMemberships).values({
+        id: randomUUID(), companyId, principalType: "user", principalId: userId,
+        membershipRole: "member", status: "active",
+      });
+    }
+    const assignment = assignee === "agent" ? { assigneeAgentId: agentId } : { assigneeUserId: userId };
     const callerDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
     let deadline: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -7011,7 +7019,7 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
         callerDb.transaction((tx) =>
           issueService(callerDb).create(
             companyId,
-            { title: "bounded caller-transaction create", assigneeAgentId: agentId },
+            { title: "bounded caller-transaction create", ...assignment },
             tx,
           ),
         ),
@@ -7019,10 +7027,10 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
           deadline = setTimeout(() => reject(new Error("caller-transaction create exceeded 2000ms")), 2_000);
         }),
       ]);
-      expect(created.assigneeAgentId).toBe(agentId);
+      expect(created).toMatchObject(assignment);
       expect(created.title).toBe("bounded caller-transaction create");
       const [persisted] = await db.select().from(issues).where(eq(issues.id, created.id));
-      expect(persisted?.assigneeAgentId).toBe(agentId);
+      expect(persisted).toMatchObject(assignment);
     } finally {
       clearTimeout(deadline);
       await callerDb.$client.end({ timeout: 0 });
@@ -7152,6 +7160,10 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
   });
 
   it("keeps externalObjects syncComment on caller transaction on a single pooled connection", async () => {
+    // Exercise plugin detection, not just the disabled feature's early return.
+    const settings = instanceSettingsService(db);
+    const wasEnabled = (await settings.getExperimental()).enableExternalObjects;
+    await settings.updateExperimental({ enableExternalObjects: true });
     const pluginWorkerManager = {
       call: vi.fn().mockResolvedValue({
         ok: true,
@@ -7174,11 +7186,15 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
       .returning()
       .then((rows) => rows[0]!);
 
-    await expect(
-      singleConnectionDb.transaction(async (tx) => {
-        await extSvc.syncComment(commentRow.id, tx);
-      }),
-    ).resolves.toBeUndefined();
+    try {
+      await expect(
+        singleConnectionDb.transaction(async (tx) => {
+          await extSvc.syncComment(commentRow.id, tx);
+        }),
+      ).resolves.toBeUndefined();
+    } finally {
+      await settings.updateExperimental({ enableExternalObjects: wasEnabled });
+    }
   });
 
   it("nulls out a non-UUID x-paperclip-run-id instead of 500-ing", async () => {
