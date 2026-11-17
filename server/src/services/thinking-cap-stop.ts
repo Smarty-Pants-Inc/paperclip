@@ -87,8 +87,16 @@ async function readRecoveryRunParentId(tx: Pick<Db, "select">, input: { companyI
 export const THINKING_CAP_STOP_RECOVERY_LEVEL = "high" as const;
 const LEVELS_ABOVE_RECOVERY = new Set(["xhigh", "max"]);
 
-/** dl-n5-cont3: this run is the automatic recovery run of a thinking-only output-cap stop. */
+/**
+ * dl-n5-cont3: this run is the automatic recovery run of a thinking-only
+ * output-cap stop that starts a FRESH session (`forceFreshSession`, as the
+ * fresh continuation's wake sets it). A same-session retry is not: pi_rpc
+ * refuses a per-turn level change in a live session (pi-rpc-driver.ts :954-955).
+ */
 export async function isThinkingCapStopRecoveryRun(tx: Pick<Db, "select">, input: { companyId: string; runId: string }): Promise<boolean> {
+  const [run] = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId))).limit(1);
+  if (object(run?.contextSnapshot).forceFreshSession !== true) return false;
   const parentRunId = await readRecoveryRunParentId(tx, input);
   return Boolean(parentRunId && readThinkingOnlyCapStop(await readRunAnswerEvents(tx, input.companyId, parentRunId)));
 }

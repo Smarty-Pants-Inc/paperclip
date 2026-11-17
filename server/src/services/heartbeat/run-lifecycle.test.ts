@@ -359,6 +359,12 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
     const [next] = await db.insert(heartbeatRuns).values({ companyId: first.companyId, agentId: first.agentId, status: "queued",
       runtimeMode: "native", contextSnapshot: { wakeReason: "issue_commented", previousRunId: recovery!.id } }).returning();
     expect(await nativeInputLevel(next!.id)).toBe("xhigh");
+    // A same-session retry of the cap stop keeps the stored level (pi_rpc
+    // refuses a per-turn level change in a live session; a named residual).
+    const [sameSession] = await db.insert(heartbeatRuns).values({ companyId: first.companyId, agentId: first.agentId, status: "queued",
+      runtimeMode: "native", retryOfRunId: first.runId, scheduledRetryReason: "transient_failure",
+      contextSnapshot: { previousRunId: first.runId, wakeReason: "transient_failure_retry" } }).returning();
+    expect(await nativeInputLevel(sameSession!.id)).toBe("xhigh");
     // A person's Retry of the cap stop is a new ask at the stored level.
     const [retry] = await db.insert(heartbeatRuns).values({ companyId: first.companyId, agentId: first.agentId, status: "queued",
       runtimeMode: "native", contextSnapshot: { wakeReason: "task_retry", previousRunId: first.runId } }).returning();
