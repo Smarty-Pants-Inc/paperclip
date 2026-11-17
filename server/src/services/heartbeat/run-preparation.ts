@@ -2,6 +2,7 @@ import { skillPackageStore, skillVersionMetadataColumns } from "../skill-package
 import { skillAccessService } from "../skill-access.js";
 import { buildReviewPathRecoveryDisposition } from "../recovery/review-path-recovery.js";
 import { readByEarlierTurnCommentIds } from "../queued-comment-delivery.js";
+import { carriedSteerCommentIds } from "../carried-steer.js";
 import type { AuthorizationActor } from "../authorization.js";
 import { spekoToolsForSession } from "../voice/speko-agent-tools.js";
 import { githubConfiguredInstructionSources } from "../chat-github-review-policy.js";
@@ -2431,6 +2432,11 @@ export async function buildPaperclipWakePayload(input: {
       commentIds: commentRows.filter(row => !row.deletedAt).map(row => row.id), currentRunId: input.runId ?? null })
       .catch(() => new Set<string>())
     : new Set<string>();
+  // A carried steer (restored at an earlier run end, never an ordinary queued message) says it was received mid-task.
+  const receivedMidTask = issueId
+    ? await carriedSteerCommentIds(input.db, { companyId: input.companyId, issueId,
+      commentIds: commentRows.filter(row => !row.deletedAt).map(row => row.id), currentRunId: input.runId ?? null })
+    : new Set<string>();
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
     issueDescription !== null &&
@@ -2500,6 +2506,7 @@ export async function buildPaperclipWakePayload(input: {
       sourceTrust: row.sourceTrust ?? null,
       createdAt: row.createdAt.toISOString(),
       ...(readByEarlierTurn.has(row.id) ? { readByEarlierTurn: true } : {}),
+      ...(receivedMidTask.has(row.id) ? { receivedMidTask: true } : {}),
       author: row.authorAgentId
         ? { type: "agent", id: row.authorAgentId }
         : row.authorUserId

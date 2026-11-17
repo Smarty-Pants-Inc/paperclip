@@ -29,6 +29,11 @@ import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 import { runningProcesses } from "../adapters/index.js";
+import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
+import { renderFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { waitForPendingRunFailureReports } from "../services/run-failure-report.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -67,7 +72,19 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
   }, 60_000);
 
+  /**
+   * rf5 F1: join every piece of work a test started before its rows are truncated. A Send dispatches its
+   * successor fire-and-forget; that run's execution, its wakes and its post-commit failure report keep writing
+   * after the successor leaves queued/running. Joined, never caught: a deadlock still fails the test.
+   */
+  async function joinOwnedWork() {
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await waitForPendingRunFailureReports();
+    await heartbeatService(db).drainActiveRunExecutions();
+  }
+
   afterEach(async () => {
+    await joinOwnedWork();
     for (const id of [...runningProcesses.keys()]) runningProcesses.delete(id);
     mocks.steer.mockReset();
     mocks.steer.mockImplementation(mocks.actual.steerNativeSession as never);
@@ -697,6 +714,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       expect(["queued", "running"]).not.toContain(run!.status);
       expect(agent!.status).not.toBe("running");
     }, { timeout: 20_000, interval: 100 });
+    // rf5 F1: the successor's owned post-commit work (its execution, wakes and failure report) is joined too.
+    await joinOwnedWork();
   });
 
   // S10 C2: A, /new, B behind a person's Stop. One Send runs A, then /new, then
@@ -832,5 +851,112 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const answeringRuns = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId)))
       .filter((run) => ((run.contextSnapshot as any).wakeCommentIds ?? []).includes(b!.id));
     expect(answeringRuns.map((run) => run.id)).toEqual([successor!.id]);
+  });
+  const RECEIVED_MID_TASK = "Received mid-task (while you were working):";
+
+  /** B is steered mid-turn, never read, and the turn ends: B is restored and carried into the next turn. */
+  async function restoredSteer(chat: Chat) {
+    const [b] = await send(chat, ["B, steered mid-turn"]);
+    const [wake] = await deferredWakes(chat);
+    mocks.steer.mockResolvedValueOnce({ turnId: "turn-1" });
+    expect((await steer(chat, b!.id, wake!.id)).status).toBe(200);
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      ...SHAPES.unread(b!.id),
+      { eventType: "turn.completed", itemId: "turn-1:end" },
+    ]);
+    await finishTurn(chat, { status: "succeeded", log: false });
+    const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect((ended!.resultJson as any).restoredSteeredCommentIds).toEqual([b!.id]);
+    return b!;
+  }
+
+  /** The turn that carries B after its restore: the promoted run, or a run started from B's waiting wake. */
+  async function carryingTurn(chat: Chat, id: string) {
+    const carriers = await carriersOf(chat, id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    if (carriers.runs.length) return carriers.runs[0]!;
+    const wake = carriers.wakes[0]!;
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: chat.companyId, agentId: chat.agentId, status: "running", runtimeMode: "native",
+      wakeupRequestId: wake.id, contextSnapshot: (wake.payload as any)._paperclipWakeContext,
+    }).returning();
+    await db.update(agentWakeupRequests).set({ status: "completed", runId: run!.id, finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, wake.id));
+    return run!;
+  }
+
+  // Follow-up 1: the carried steer's turn input says, in one prefix line, that it was received mid-task, then the
+  // person's text unchanged. Only the carried steer: an ordinary queued message in the same turn has no label.
+  it("labels a carried steer 'received mid-task' in the next turn's input, and never an ordinary queued message", async () => {
+    const chat = await seedChat();
+    const b = await restoredSteer(chat);
+    const [c] = await send(chat, ["C, an ordinary queued message"]);
+    const successor = await carryingTurn(chat, b.id);
+    const context = { ...(successor.contextSnapshot as Record<string, unknown>), wakeCommentIds: [b.id, c!.id],
+      wakeCommentId: c!.id, commentId: c!.id };
+    const payload = await buildPaperclipWakePayload({ db, companyId: chat.companyId, agentId: chat.agentId,
+      runId: successor.id, contextSnapshot: context });
+    const comments = (payload as any).comments as Array<Record<string, unknown>>;
+    expect(comments.find((comment) => comment.id === b.id)).toMatchObject({ body: "B, steered mid-turn", receivedMidTask: true });
+    expect(comments.find((comment) => comment.id === c!.id)?.receivedMidTask).toBeUndefined();
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain(`${RECEIVED_MID_TASK}\nB, steered mid-turn`);
+    expect(prompt).toContain("C, an ordinary queued message");
+    expect(prompt.split(RECEIVED_MID_TASK)).toHaveLength(2);
+    // A first turn that takes waiting messages renders the same one line, only for the carried steer.
+    const firstTurn = renderFirstTurnQueuedInput([
+      { id: b.id, body: "B, steered mid-turn", createdAt: new Date(), receivedMidTask: true },
+      { id: c!.id, body: "C, an ordinary queued message", createdAt: new Date() },
+    ])!;
+    expect(firstTurn).toContain(`${RECEIVED_MID_TASK}\nB, steered mid-turn`);
+    expect(firstTurn.split(RECEIVED_MID_TASK)).toHaveLength(2);
+    // An ordinary queued message that was never steered is never labelled.
+    const plain = await buildPaperclipWakePayload({ db, companyId: chat.companyId, agentId: chat.agentId,
+      runId: successor.id, contextSnapshot: { ...context, wakeCommentIds: [c!.id] } });
+    expect(renderPaperclipWakePrompt(plain)).not.toContain(RECEIVED_MID_TASK);
+  });
+
+  // Follow-up 2: the turn that carried a restored steer ends FAILED or cancelled without answering it. ONE true
+  // notice for that message (the sweep's notice path, its own key), never a silent answered-mark, never twice;
+  // also when a later message is the latest one.
+  it.each([
+    ["failed", false], ["cancelled", false], ["failed", true],
+  ] as const)("posts exactly one true notice when the turn carrying a restored steer ends %s without answering it (later message: %s)", async (status, later) => {
+    const chat = await seedChat();
+    const b = await restoredSteer(chat);
+    const successor = await carryingTurn(chat, b.id);
+    const [c] = later ? await send(chat, ["C, sent after"]) : [];
+    await db.update(heartbeatRuns).set({ status, finishedAt: new Date(), ...(status === "failed"
+      ? { error: "adapter_failed: the provider exited", errorCode: "adapter_failed" } : {}) })
+      .where(eq(heartbeatRuns.id, successor.id));
+    const notices = async () => db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+      sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + b.id}`));
+    // Before the settle delay nothing is posted yet.
+    await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id });
+    expect(await notices()).toHaveLength(0);
+    const outcome = await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id,
+      now: new Date(Date.now() + 60_000) });
+    expect(outcome.kind).toBe("noticed");
+    const posted = await notices();
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toBe(status === "failed"
+      ? "Your message (received mid-task) wasn't answered because the run failed. Sending it again is safe."
+      : "Your message (received mid-task) wasn't answered because the run was stopped. Sending it again is safe.");
+    expect(posted[0]!.authorType).toBe("system");
+    // Never a silent answered-mark.
+    expect(await answered(b.id)).toBe(false);
+    // Never twice: later passes keep the one notice.
+    for (const offset of [120_000, 600_000]) {
+      await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id,
+        now: new Date(Date.now() + offset) });
+    }
+    expect(await notices()).toHaveLength(1);
+    if (c) {
+      // The later message keeps its own path: it waits for its own turn, with no notice of B's kind.
+      const forC = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+        sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + c.id}`));
+      expect(forC.every((notice) => !notice.body.includes("received mid-task"))).toBe(true);
+    }
   });
 });
