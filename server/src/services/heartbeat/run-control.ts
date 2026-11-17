@@ -48,6 +48,8 @@ import {
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { readQueuedInteractionResponse } from "../queued-interaction-response.js";
 import {
+  MANAGEMENT_STOP_SCHEMA,
+  recordedStopErrorCode,
   isAcknowledgedNativeStop,
   acknowledgedNativeApiStopExecutionHasStopped,
   acknowledgedNativeStopExecutionHasStopped,
@@ -308,6 +310,9 @@ export type CancelRunOptions = {
     terminationGraceMs?: number;
     /** Caller is immediately scheduling an explicit successor path. */
     suppressImmediateRecovery?: boolean;
+    /** Recovery finishes an already recorded Stop: keep its requested code,
+     * initiator and reason instead of recording a new system cancellation. */
+    recoverRecordedCancellation?: boolean;
   };
 
 /** The same durable fence protects both individual Stop and budget fan-out.
@@ -315,7 +320,7 @@ export type CancelRunOptions = {
 function runCancellationFenceSql(input: {
   cancellation: ReturnType<typeof requestedRunCancellation>;
   errorCode: string;
-  attribution?: Pick<Record<string, unknown>, "cancelledByActorType" | "cancelledByUserId">;
+  attribution?: Record<string, unknown>;
   reassignmentStopRequested?: boolean;
   preserveCancellation?: boolean;
   budgetEnforcement?: BudgetEnforcementScope;
@@ -1420,15 +1425,32 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       // follows this already-authorized intent, not a fresh management request.
       run = await withAccountingTransaction(db, run.companyId, async tx => {
         await assertAgentLifecycleAuthority(tx, actor, { id: run!.agentId, companyId: run!.companyId });
+        // The authority check above passed in this transaction. Record that,
+        // so native settlement can tell this intentional Stop from an
+        // unexplained cancelled turn without treating the agent as a user.
+        const managementStop = actor.type === "agent" && typeof actor.agentId === "string" && actor.agentId &&
+          options.resultJson?.cancelledByActorType === "agent" && options.resultJson.cancelledByAgentId === actor.agentId ? {
+            cancelledByAgentId: actor.agentId,
+            managementStop: { schema: MANAGEMENT_STOP_SCHEMA, companyId: run!.companyId, runId: run!.id,
+              targetAgentId: run!.agentId, actorAgentId: actor.agentId, authorizedAt: new Date().toISOString() },
+          } : {};
         const [accepted] = await tx.update(heartbeatRuns).set({ resultJson: runCancellationFenceSql({
           cancellation: requestedRunCancellation(options.resultJson ?? {}, reason),
           errorCode: options.errorCode ?? "cancelled",
           attribution: { cancelledByActorType: options.resultJson?.cancelledByActorType,
-            cancelledByUserId: options.resultJson?.cancelledByUserId },
+            cancelledByUserId: options.resultJson?.cancelledByUserId, ...managementStop },
         }) }).where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]))).returning();
         return accepted ?? run!;
       });
       options = { ...options, managementActor: undefined };
+    }
+    // Cancellation recovery finishes the Stop that was already accepted. Its
+    // default options must not replace the recorded initiator (for example a
+    // managing agent) with a system one, or lose the requested code.
+    const recoveredCancellation = options.recoverRecordedCancellation ? readRunCancellation(run.resultJson) : null;
+    if (options.recoverRecordedCancellation && !options.errorCode) {
+      const requestedCode = recordedStopErrorCode(run);
+      if (requestedCode) options = { ...options, errorCode: requestedCode };
     }
 
     const attribution = {
@@ -1436,7 +1458,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       cancelledByUserId: options.resultJson?.cancelledByUserId,
     };
     const handoffIssueId = run.nativeIssueId ?? run.issueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
-    const supersedesCaseHandoff = options.resultJson?.cancelledByActorType === "user" || options.errorCode === "issue_reassigned";
+    const supersedesCaseHandoff = !options.recoverRecordedCancellation &&
+      (options.resultJson?.cancelledByActorType === "user" || options.errorCode === "issue_reassigned");
     let cancellationClaimed = false;
     let caseHandoffRetryClaimed = false;
     if (handoffIssueId && supersedesCaseHandoff && options.resultJson?.caseHandoffYieldStop !== true) {
@@ -1560,7 +1583,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     }
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
-    const cancellation = ((options.expectedStatus || committedBudgetCancellation) && run.resultJson?.startupCancellation
+    const cancellation = recoveredCancellation ?? ((options.expectedStatus || committedBudgetCancellation) && run.resultJson?.startupCancellation
       ? readRunCancellation(run.resultJson) : null) ?? requestedRunCancellation(options.resultJson ?? {}, reason);
 
     const pendingProcessCancellation = processRunCancellationSettlements.get(
@@ -1591,7 +1614,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           // Record handoff intent before native cancellation can finalize and release
           // the run. Only its audited stop acknowledgement suppresses recovery.
           resultJson: runCancellationFenceSql({ cancellation, errorCode, attribution,
-            reassignmentStopRequested: options.errorCode === "issue_reassigned" && options.resultJson?.reassignmentStopConfirmed === true }),
+            reassignmentStopRequested: options.errorCode === "issue_reassigned" && options.resultJson?.reassignmentStopConfirmed === true,
+            preserveCancellation: recoveredCancellation !== null }),
         }).where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status,
           options.expectedStatus ? [options.expectedStatus] : pendingNativeRetry ? [...CANCELLABLE_HEARTBEAT_RUN_STATUSES, "failed"] : [...CANCELLABLE_HEARTBEAT_RUN_STATUSES],
         ))).returning();
