@@ -1,6 +1,7 @@
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import { enqueueFastResponse, supersedeFastResponse } from "../services/fast-responses.js";
 import { Router } from "express";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -62,7 +63,13 @@ export function isConciergeReply(comment: {
 }
 
 /** Max simultaneous `claude` subprocesses across all board-chat requests. */
-const MAX_CONCURRENT_BOARD_CHATS = 3;
+export const MAX_CONCURRENT_BOARD_CHATS = 3;
+export const BOARD_CHAT_MAX_CONCURRENT_ENV = "PAPERCLIP_BOARD_CHAT_MAX_CONCURRENT";
+
+/** Absence preserves the upstream cap; malformed settings refuse startup. */
+export function resolveBoardChatMaxConcurrent(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntegerEnvironment(env, BOARD_CHAT_MAX_CONCURRENT_ENV, MAX_CONCURRENT_BOARD_CHATS);
+}
 
 export function boardChatRoutes(
   db: Db,
@@ -139,7 +146,7 @@ export function boardChatRoutes(
 
     // Back-pressure: each request holds a subprocess + SSE stream for up to
     // 2 minutes; cap simultaneous spawns instead of forking without bound.
-    if (liveBoardChats >= MAX_CONCURRENT_BOARD_CHATS) {
+    if (liveBoardChats >= resolveBoardChatMaxConcurrent()) {
       res.status(429).json({
         error: "Too many concurrent board chats — retry shortly",
         code: "BOARD_CHAT_BUSY",
