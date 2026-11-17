@@ -340,6 +340,85 @@ async function readCarriedRetryReadiness(db: Db, run: Pick<typeof heartbeatRuns.
   return parsed.data;
 }
 
+/** The workspace a person's Retry (or an automatic resume filed through the
+ * Retry path) takes when its source has no admitted fresh receipt. Read-only:
+ * preparation (readFreshWorkspaceReadiness) records the choice on the Retry's
+ * wake, and admission (admitExplicitNativeContinuation) adopts a fresh choice
+ * so the Retry's fresh-thread record and successor-bound readiness exist before
+ * native selection. One decision, two callers. */
+export async function decideTaskRetryWorkspace(db: Db, input: {
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "contextSnapshot">;
+  issueId: string; retryIntentId: string; strategy: string; source: typeof heartbeatRuns.$inferSelect;
+}): Promise<ContinuationReadiness> {
+  const { run, issueId, source } = input;
+  const wake = { id: input.retryIntentId };
+  if (input.strategy !== "fresh_isolated_workspace") {
+    const stoppedWorkspace = await stoppedNativeContinuationWorkspace(db, source, { runId: run.id, issueId, retryIntentId: wake.id });
+    if (stoppedWorkspace) return stoppedWorkspace;
+    const preservationReceiptId = await verifiedWorkspaceRepairReceipt(db, source);
+    if (preservationReceiptId) return { mode: "resume_preserved_workspace", preservationReceiptId };
+    const [bound] = await db.select({ id: executionWorkspaces.id, metadata: executionWorkspaces.metadata }).from(issues)
+      .innerJoin(executionWorkspaces, and(eq(executionWorkspaces.companyId, issues.companyId),
+        eq(executionWorkspaces.id, issues.executionWorkspaceId)))
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)));
+    const authority = readRemoteWorkspaceAuthority(bound?.metadata);
+    if (bound && authority && !authority.dirty && !authority.writerRunId && authority.snapshotId) {
+      const recovered = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+        nativeIssueId: heartbeatRuns.nativeIssueId, issueId: heartbeatRuns.issueId,
+        contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object('issueId', ${heartbeatRuns.contextSnapshot}->'issueId')`,
+        runnerProfileJson: sql<Record<string, unknown>>`jsonb_build_object('remoteWorkspace', ${heartbeatRuns.runnerProfileJson}->'remoteWorkspace',
+          'nativeWorkspaceSync', ${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync')`,
+      }).from(issueRecoveryActions)
+        .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
+          sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'`))
+        .where(and(eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+          eq(heartbeatRuns.agentId, run.agentId),
+          sql`${issueRecoveryActions.evidence}#>>'{explicitUserContinuation,runId}' = ${run.id}`,
+          sql`${heartbeatRuns.runnerProfileJson}#>>'{remoteWorkspace,workspaceId}' = ${bound.id}`,
+          sql`${heartbeatRuns.runnerProfileJson}#>>'{remoteWorkspace,snapshotId}' = ${authority.snapshotId}`)).limit(1);
+      for (const writer of recovered) {
+        const remote = remoteWorkspaceRunReferenceSchema.safeParse(writer.runnerProfileJson?.remoteWorkspace);
+        if (!remote.success || remote.data.state !== "saved" || remote.data.workspaceId !== bound.id
+          || remote.data.epoch !== authority.epoch || remote.data.snapshotId !== authority.snapshotId) continue;
+        const receipt = await verifiedWorkspaceRepairReceipt(db, writer);
+        if (receipt) return { mode: "resume_preserved_workspace", preservationReceiptId: receipt };
+      }
+    }
+    const workspace = run.contextSnapshot?.previousRunId === source.id
+      ? await reusableDirectoryAfterPreparationFailure(db, source, issueId) : null;
+    if (workspace?.cwd) {
+      const readiness: ContinuationReadiness = { mode: "reuse_current_workspace", retryIntentId: wake.id,
+        sourceRunId: source.id, workspaceId: workspace.id, cwd: workspace.cwd };
+      return readiness;
+    }
+    // R2: a Retry whose source has no admitted fresh receipt (for example a
+    // blocked recovery without a generation) also keeps a safe task workspace.
+    // Every hold recorded for the source must permit the reuse.
+    const holds = await db.select({ cause: issueRecoveryActions.cause, evidence: issueRecoveryActions.evidence })
+      .from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, run.companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId), sql`${issueRecoveryActions.evidence}->>'runId' = ${source.id}`));
+    let retained: { id: string; cwd: string | null } | null = null;
+    const gitProbes = new Map<string, Promise<boolean>>();
+    for (const hold of holds.length ? holds : [{ cause: null, evidence: null }]) {
+      const checked = await retainedIssueWorkspaceForRetry(db, { companyId: run.companyId, issueId,
+        agentId: run.agentId, successorRunId: run.id, cause: hold.cause, source, evidence: hold.evidence, gitProbes });
+      if (!checked || (retained && retained.id !== checked.id)) { retained = null; break; }
+      retained = checked;
+    }
+    if (retained) {
+      const readiness: ContinuationReadiness = { mode: "reuse_issue_workspace", retryIntentId: wake.id,
+        sourceRunId: source.id, workspaceId: retained.id, cwd: retained.cwd };
+      return readiness;
+    }
+  }
+  const leases = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, source.id),
+  ));
+  const readiness: ContinuationReadiness = { mode: "fresh_isolated_workspace",
+    retryIntentId: wake.id, sourceRunId: source.id, retainedSourceIds: leases.map(lease => lease.id) };
+  return readiness;
+}
+
 /** Preparation trusts the committed admission receipt, not a raw wake payload. */
 export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "agentId" | "issueId" | "nativeIssueId" | "contextSnapshot" | "runtimeMode" | "runnerProfileJson">): Promise<ContinuationReadiness | null> {
@@ -406,88 +485,22 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
         ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
     )).limit(1);
     if (!source) throw new Error("Fresh retry source changed");
-    if (intent.strategy !== "fresh_isolated_workspace") {
-      const stoppedWorkspace = await stoppedNativeContinuationWorkspace(db, source, { runId: run.id, issueId, retryIntentId: wake.id });
-      if (stoppedWorkspace) return stoppedWorkspace;
-      const preservationReceiptId = await verifiedWorkspaceRepairReceipt(db, source);
-      if (preservationReceiptId) return { mode: "resume_preserved_workspace", preservationReceiptId };
-      const [bound] = await db.select({ id: executionWorkspaces.id, metadata: executionWorkspaces.metadata }).from(issues)
-        .innerJoin(executionWorkspaces, and(eq(executionWorkspaces.companyId, issues.companyId),
-          eq(executionWorkspaces.id, issues.executionWorkspaceId)))
-        .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)));
-      const authority = readRemoteWorkspaceAuthority(bound?.metadata);
-      if (bound && authority && !authority.dirty && !authority.writerRunId && authority.snapshotId) {
-        const recovered = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
-          nativeIssueId: heartbeatRuns.nativeIssueId, issueId: heartbeatRuns.issueId,
-          contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object('issueId', ${heartbeatRuns.contextSnapshot}->'issueId')`,
-          runnerProfileJson: sql<Record<string, unknown>>`jsonb_build_object('remoteWorkspace', ${heartbeatRuns.runnerProfileJson}->'remoteWorkspace',
-            'nativeWorkspaceSync', ${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync')`,
-        }).from(issueRecoveryActions)
-          .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
-            sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'`))
-          .where(and(eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
-            eq(heartbeatRuns.agentId, run.agentId),
-            sql`${issueRecoveryActions.evidence}#>>'{explicitUserContinuation,runId}' = ${run.id}`,
-            sql`${heartbeatRuns.runnerProfileJson}#>>'{remoteWorkspace,workspaceId}' = ${bound.id}`,
-            sql`${heartbeatRuns.runnerProfileJson}#>>'{remoteWorkspace,snapshotId}' = ${authority.snapshotId}`)).limit(1);
-        for (const writer of recovered) {
-          const remote = remoteWorkspaceRunReferenceSchema.safeParse(writer.runnerProfileJson?.remoteWorkspace);
-          if (!remote.success || remote.data.state !== "saved" || remote.data.workspaceId !== bound.id
-            || remote.data.epoch !== authority.epoch || remote.data.snapshotId !== authority.snapshotId) continue;
-          const receipt = await verifiedWorkspaceRepairReceipt(db, writer);
-          if (receipt) return { mode: "resume_preserved_workspace", preservationReceiptId: receipt };
-        }
-      }
-      const workspace = run.contextSnapshot?.previousRunId === source.id
-        ? await reusableDirectoryAfterPreparationFailure(db, source, issueId) : null;
-      if (workspace?.cwd) {
-        const readiness: ContinuationReadiness = { mode: "reuse_current_workspace", retryIntentId: wake.id,
-          sourceRunId: source.id, workspaceId: workspace.id, cwd: workspace.cwd };
-        await db.transaction(async tx => {
-          const changed = await tx.update(agentWakeupRequests).set({
-            payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{taskRetry,strategy}', '"continue"'::jsonb)`,
-          }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.runId, run.id),
-            sql`${agentWakeupRequests.payload}#>>'{taskRetry,strategy}' = 'evaluate'`)).returning({ id: agentWakeupRequests.id });
-          if (changed.length) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
-            actorType: "system", actorId: "task-recovery", action: "issue.retry_workspace_reused",
-            entityType: "issue", entityId: issueId, runId: run.id, details: readiness });
-        });
-        return readiness;
-      }
-      // R2: a Retry whose source has no admitted fresh receipt (for example a
-      // blocked recovery without a generation) also keeps a safe task workspace.
-      // Every hold recorded for the source must permit the reuse.
-      const holds = await db.select({ cause: issueRecoveryActions.cause, evidence: issueRecoveryActions.evidence })
-        .from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, run.companyId),
-          eq(issueRecoveryActions.sourceIssueId, issueId), sql`${issueRecoveryActions.evidence}->>'runId' = ${source.id}`));
-      let retained: { id: string; cwd: string | null } | null = null;
-      const gitProbes = new Map<string, Promise<boolean>>();
-      for (const hold of holds.length ? holds : [{ cause: null, evidence: null }]) {
-        const checked = await retainedIssueWorkspaceForRetry(db, { companyId: run.companyId, issueId,
-          agentId: run.agentId, successorRunId: run.id, cause: hold.cause, source, evidence: hold.evidence, gitProbes });
-        if (!checked || (retained && retained.id !== checked.id)) { retained = null; break; }
-        retained = checked;
-      }
-      if (retained) {
-        const readiness: ContinuationReadiness = { mode: "reuse_issue_workspace", retryIntentId: wake.id,
-          sourceRunId: source.id, workspaceId: retained.id, cwd: retained.cwd };
-        await db.transaction(async tx => {
-          const changed = await tx.update(agentWakeupRequests).set({
-            payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{taskRetry,strategy}', '"continue"'::jsonb)`,
-          }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.runId, run.id),
-            sql`${agentWakeupRequests.payload}#>>'{taskRetry,strategy}' = 'evaluate'`)).returning({ id: agentWakeupRequests.id });
-          if (changed.length) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
-            actorType: "system", actorId: "task-recovery", action: "issue.retry_workspace_reused",
-            entityType: "issue", entityId: issueId, runId: run.id, details: readiness });
-        });
-        return readiness;
-      }
+    const readiness = await decideTaskRetryWorkspace(db, { run, issueId, retryIntentId: wake.id,
+      strategy: intent.strategy, source });
+    if (readiness.mode === "reuse_current_workspace" || readiness.mode === "reuse_issue_workspace") {
+      await db.transaction(async tx => {
+        const changed = await tx.update(agentWakeupRequests).set({
+          payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{taskRetry,strategy}', '"continue"'::jsonb)`,
+        }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.runId, run.id),
+          sql`${agentWakeupRequests.payload}#>>'{taskRetry,strategy}' = 'evaluate'`)).returning({ id: agentWakeupRequests.id });
+        if (changed.length) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
+          actorType: "system", actorId: "task-recovery", action: "issue.retry_workspace_reused",
+          entityType: "issue", entityId: issueId, runId: run.id, details: readiness });
+      });
+      return readiness;
     }
-    const leases = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
-      eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, source.id),
-    ));
-    const readiness: ContinuationReadiness = { mode: "fresh_isolated_workspace",
-      retryIntentId: wake.id, sourceRunId: source.id, retainedSourceIds: leases.map(lease => lease.id) };
+    if (readiness.mode !== "fresh_isolated_workspace") return readiness;
+    // Reached only when admission did not already select the fresh attempt.
     await db.transaction(async tx => {
       const changed = await tx.update(agentWakeupRequests).set({
         payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{taskRetry,strategy}', '"fresh_isolated_workspace"'::jsonb)`,

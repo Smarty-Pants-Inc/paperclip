@@ -16,8 +16,11 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents, agentTaskSessions, agentWakeupRequests, companies, createDb, environmentLeases, environments, executionWorkspaces,
-  heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
+  heartbeatRuns, issueComments, issueRecoveryActions, issues, issueThreadInteractions, nativeRunFinalizations,
 } from "@paperclipai/db";
+import { heartbeatService } from "./heartbeat.js";
+import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
+import { materializeNativeInteractionResponses } from "./native-runtime/native-interaction-bridge.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { admitExplicitNativeContinuation } from "./explicit-native-continuation.js";
 import { createSystemRecovery, failSystemRecovery, SystemRecoveryFailure } from "./system-recovery-state.js";
@@ -119,7 +122,7 @@ const support = await getEmbeddedPostgresTestSupport();
     // Queue admission stores the continuation on the one successor run it creates.
     await db.insert(heartbeatRuns).values({ id: f.successorRunId, companyId: f.companyId, agentId: f.agentId,
       nativeIssueId: f.issueId, runtimeMode: "native", status: "running", invocationSource: "on_demand",
-      contextSnapshot: { issueId: f.issueId, wakeReason: "task_retry", forceFreshSession: true,
+      contextSnapshot: { issueId: f.issueId, wakeReason: "task_retry", forceFreshSession: true, taskRetryRequestId: f.wakeId,
         previousRunId: admitted!.previousRunId, explicitUserContinuation: admitted } });
     const select = () => selectPiConversation(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
       runId: f.successorRunId, boundary: { provider: "pi_rpc", cwd: "/workspaces/new-box", remoteCwd: null,
@@ -184,7 +187,7 @@ const support = await getEmbeddedPostgresTestSupport();
       await tx.insert(heartbeatRuns).values({ id: f.successorRunId, companyId: f.companyId, agentId: f.agentId,
         nativeIssueId: f.issueId, runtimeMode: "native", status: "queued", invocationSource: "on_demand",
         contextSnapshot: { issueId: f.issueId, wakeReason: "task_retry", forceFreshSession: true,
-          previousRunId: continuation?.previousRunId, explicitUserContinuation: continuation } });
+          taskRetryRequestId: receipt.requestId, previousRunId: continuation?.previousRunId, explicitUserContinuation: continuation } });
       return continuation;
     });
     expect(admitted?.readiness).toMatchObject({ mode: "fresh_isolated_workspace", sourceRunId: f.sourceRunId });
@@ -215,7 +218,7 @@ const support = await getEmbeddedPostgresTestSupport();
       await tx.insert(heartbeatRuns).values({ id: f.successorRunId, companyId: f.companyId, agentId: f.agentId,
         nativeIssueId: f.issueId, runtimeMode: "native", status: "queued", invocationSource: "on_demand",
         contextSnapshot: { issueId: f.issueId, wakeReason: "task_retry", forceFreshSession: true,
-          previousRunId: continuation?.previousRunId, explicitUserContinuation: continuation } });
+          taskRetryRequestId: receipt.requestId, previousRunId: continuation?.previousRunId, explicitUserContinuation: continuation } });
       return continuation;
     });
     expect(admitted?.readiness).toMatchObject({ mode: "fresh_isolated_workspace", sourceRunId: f.sourceRunId });
@@ -291,6 +294,19 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await boundary({ evidence: { ...evidence, freshContinuation: { ...fresh, trigger: "held_recovery" } } })).toBeNull();
     const { trigger: _trigger, ...untriggered } = fresh;
     expect(await boundary({ evidence: { ...evidence, freshContinuation: untriggered } })).toBeNull();
+    // A foreign Retry's record (h3-ii): the record names this Retry's request,
+    // the run's context names the same one, and its readiness agrees.
+    expect(fresh.retryIntentId).toBe(f.wakeId);
+    expect(await boundary({ evidence: { ...evidence, freshContinuation: { ...fresh, retryIntentId: randomUUID() } } })).toBeNull();
+    const { retryIntentId: _intent, ...unintended } = fresh;
+    expect(await boundary({ evidence: { ...evidence, freshContinuation: unintended } })).toBeNull();
+    expect(await boundary({ readiness: { ...readiness, retryIntentId: randomUUID() } })).toBeNull();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...context, taskRetryRequestId: randomUUID() } })
+      .where(eq(heartbeatRuns.id, f.successorRunId));
+    const [foreign] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.successorRunId));
+    await db.update(issueRecoveryActions).set({ evidence }).where(eq(issueRecoveryActions.id, action!.id));
+    expect(await readFreshContinuationSessionBoundary(db, foreign!, f.issueId)).toBeNull();
+    await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, f.successorRunId));
     // A non-fresh admitted readiness (M2): the run reused the box, so its thread is kept.
     expect(await boundary({ readiness: { ...readiness, mode: "reuse_issue_workspace" } })).toBeNull();
     expect(await boundary({ readiness: { ...readiness, sourceRunId: randomUUID() } })).toBeNull();
@@ -331,7 +347,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await seed("not_task_owned");
     await db.update(heartbeatRuns).set(state).where(eq(heartbeatRuns.id, f.sourceRunId));
     expect(await recordRetryFreshProviderThread(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
-      sourceRunId: f.sourceRunId, successorRunId: f.successorRunId, trigger: "person_retry" })).toBeNull();
+      sourceRunId: f.sourceRunId, successorRunId: f.successorRunId, trigger: "person_retry", retryIntentId: f.wakeId })).toBeNull();
     expect(await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
       eq(issueRecoveryActions.fingerprint, `fresh-continuation:retry:${f.successorRunId}`)))).toHaveLength(0);
     const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
@@ -339,6 +355,71 @@ const support = await getEmbeddedPostgresTestSupport();
     // Control: the finished cut-off source does get the record.
     await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.sourceRunId));
     expect(await recordRetryFreshProviderThread(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
-      sourceRunId: f.sourceRunId, successorRunId: f.successorRunId, trigger: "person_retry" })).toEqual(expect.any(String));
+      sourceRunId: f.sourceRunId, successorRunId: f.successorRunId, trigger: "person_retry", retryIntentId: f.wakeId })).toEqual(expect.any(String));
   }, 60_000);
+
+  // h3-ii (gate 4, RC2A-H3-A2-2): a person's Retry after a failed answer run.
+  // The source has only the native terminal hold (no recovery generation), so
+  // admission had no fresh candidate; preparation picked the new box after
+  // native selection had kept the old Pi thread, and the fence refused it
+  // (prior_owner_scope_mismatch). The production path end to end:
+  // requestTaskRetry -> heartbeat resumeTaskRetry -> queue admission.
+  it("h3-ii: a person's Retry after a failed answer run, on a new box, opens a NEW Pi thread and carries the answer once", async () => {
+    const f = await seed("not_task_owned");
+    // The answer the failed answer-resume run held: a card the agent asked, the person answered.
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, resolvedByUserId: "board",
+      resolvedAt: new Date(), title: "Continue?", idempotencyKey: randomUUID(), payload: { version: 1, questions: [{ id: "q",
+        prompt: "Continue?", required: true, selectionMode: "single", options: [{ id: "yes", label: "YES" }] }] },
+      result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }], summaryMarkdown: "YES H3_PERSON" } } as never).returning();
+    await db.update(heartbeatRuns).set({ errorCode: "native_run_failed", contextSnapshot: { issueId: f.issueId,
+      source: "issue.interaction.respond", mutation: "interaction", wakeReason: "issue_commented",
+      interactionId: card!.id, interactionIds: [card!.id], interactionStatus: "answered" } })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    // Only the native terminal hold the wake queue writes (postgres.ts recordNativeTerminalRecoveryIfNeeded).
+    await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
+      status: "active", ownerType: "board", returnOwnerAgentId: f.agentId,
+      cause: "native_continuation_requires_reconciliation", fingerprint: `native-continuation:${f.sourceRunId}`,
+      nextAction: "The run stopped before it finished. Paperclip continues the task from its last saved work.",
+      evidence: { runId: f.sourceRunId, originalFailureCode: "native_run_failed", nativeFailureBlock: { runId: f.sourceRunId } },
+      attemptCount: 1, maxAttempts: 3 } as never);
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    // Hold dispatch: the admitted successor is the assertion, not a live turn.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    // The person, as the local board acts (the route's actor).
+    const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "local-board",
+      actorSource: "local_implicit", idempotencyKey: randomUUID(), observedRunId: f.sourceRunId });
+    expect(receipt).toMatchObject({ accepted: true });
+    await heartbeatService(db).resumeTaskRetry(f.companyId, receipt.requestId!);
+    const queued = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      eq(heartbeatRuns.status, "queued")))).filter(run => run.contextSnapshot?.issueId === f.issueId);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!));
+    // Exactly one successor: pressing Retry acts on the answer once.
+    expect(queued, JSON.stringify({ wake: wake && { status: wake.status, payload: wake.payload, error: wake.error } })).toHaveLength(1);
+    const successor = queued[0]!;
+    expect(successor.contextSnapshot).toMatchObject({ taskRetryRequestId: receipt.requestId, previousRunId: f.sourceRunId,
+      interactionIds: [card!.id] });
+    // Preparation picks the new box (this task owns no reusable workspace).
+    expect(await readFreshWorkspaceReadiness(db, successor)).toMatchObject({ mode: "fresh_isolated_workspace",
+      sourceRunId: f.sourceRunId, retryIntentId: receipt.requestId });
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successor.id));
+    const conversation = await selectPiConversation(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+      runId: successor.id, boundary: { provider: "pi_rpc", cwd: "/workspaces/new-box", remoteCwd: null, workspaceId: null, trust: "trust" } });
+    // A NEW Pi conversation id, never the failed run's nativeSessionId.
+    expect(conversation.id).not.toBe(f.sessionId);
+    expect(conversation).toMatchObject({ previousId: f.sessionId, runId: successor.id, reason: expect.stringMatching(/^fresh_continuation:/) });
+    const [record] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
+      eq(issueRecoveryActions.fingerprint, `fresh-continuation:retry:${successor.id}`)));
+    expect(record!.evidence).toMatchObject({ continuationRunId: successor.id, freshContinuation: { sourceRunId: f.sourceRunId,
+      trigger: "person_retry", retryIntentId: receipt.requestId } });
+    // Its built input carries the person's answer (H3's seam -> interactionResponses).
+    const responses = await materializeNativeInteractionResponses({ db, companyId: f.companyId, issueId: f.issueId,
+      runId: successor.id, agentId: f.agentId, interactionIds: successor.contextSnapshot!.interactionIds as string[],
+      wakeReason: "task_retry" });
+    expect(responses.map(response => response.interactionId)).toEqual([card!.id]);
+    expect(JSON.stringify(responses)).toContain("YES H3_PERSON");
+    expect((await systemNotes(f)).filter(note => String(note.metadata?.authorizationReason ?? "").startsWith("fresh_provider_thread:")))
+      .toHaveLength(1);
+  }, 90_000);
 });
