@@ -4919,6 +4919,51 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("reports a missing-snapshot native run with durable native state as recovery-owned, not lost", async () => {
+    const durable = await seedRunFixture({ adapterType: "paperclip_runner", agentStatus: "running", runtimeMode: "native",
+      processPid: null, processGroupId: null });
+    const stateless = await seedRunFixture({ adapterType: "paperclip_runner", agentStatus: "running", runtimeMode: "native",
+      processPid: null, processGroupId: null });
+    await db.update(heartbeatRuns).set({ nativeIssueId: durable.issueId, nativeSessionId: randomUUID() })
+      .where(eq(heartbeatRuns.id, durable.runId));
+    await db.insert(nativeRunFinalizations).values({ runId: durable.runId, companyId: durable.companyId,
+      issueId: durable.issueId, phase: "observed" });
+
+    await withTempPaperclipHome(async (home) => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "missing-snapshot-native-version",
+        requestedAt: new Date("2026-08-01T01:05:00.000Z"),
+        preflightActiveRunIds: [durable.runId, stateless.runId],
+      });
+
+      const adoption = await heartbeatService(db).reconcileHotRestartAdoption(
+        new Date("2026-08-01T01:07:00.000Z"),
+      );
+      // Native recovery scans durable DB state independently of the snapshot;
+      // a run it owns is pending recovery, not lost. A run with no durable
+      // native state stays reported lost.
+      expect(adoption).toMatchObject({
+        mode: "reported",
+        adoptedRunIds: [],
+        finalizedWhileDownRunIds: [],
+        lostRunIds: [stateless.runId],
+        skippedRunIds: [durable.runId],
+      });
+
+      const report = JSON.parse(
+        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+      ) as { lostRunIds?: string[]; runs?: Array<Record<string, unknown>> };
+      expect(report.lostRunIds).toEqual([stateless.runId]);
+      expect(report.runs).toEqual(expect.arrayContaining([
+        expect.objectContaining({ runId: durable.runId, classification: "skipped",
+          reason: "native_restart_recovery_pending_missing_snapshot" }),
+        expect.objectContaining({ runId: stateless.runId, classification: "lost",
+          reason: "missing_shutdown_snapshot" }),
+      ]));
+    });
+  });
+
   it("reports a preflight run that finished before snapshot capture as finalized", async () => {
     const { runId } = await seedRunFixture({
       agentStatus: "running",
