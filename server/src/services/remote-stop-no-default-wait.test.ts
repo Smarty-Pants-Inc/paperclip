@@ -291,7 +291,9 @@ const support = await getEmbeddedPostgresTestSupport();
       trail.push({ atMs: RETRY_MS, attempts: calls.n, ...atBound });
       expect(calls.n).toBe(1);
       expect(atBound.cards).toEqual([CARD]);
-      expect(atBound.blocker).toContain("Paperclip cannot confirm that the previous execution stopped.");
+      const [card] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      trail.push({ cardLine: card!.nextAction });
+      expect(card!.nextAction).toContain("Paperclip cannot confirm that the previous execution stopped.");
       expect(atBound.status).toBe("deferred_issue_execution");
       // The person presses Send at the bound.
       const queue = await readQueue(f);
@@ -312,6 +314,8 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(wakes.find(w => w.id === "queue")?.wait).toMatchObject({ reason: "execution_stop_pending",
         message: "Stop pending: Paperclip cannot confirm that the previous execution stopped. Your message is saved." });
       expect(lines).not.toContain("will start automatically");
+      expect(afterSendQueue.executionWait).toEqual({ reason: "execution_stop_pending",
+        message: "Stop pending: Paperclip cannot confirm that the previous execution stopped. Your message is saved." });
     } finally { vi.useRealTimers(); await evidence(`bound ${JSON.stringify(trail)}`); }
   }, 60_000);
 
