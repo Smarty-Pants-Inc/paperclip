@@ -293,7 +293,8 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(atBound.cards).toEqual([CARD]);
       const [card] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
       trail.push({ cardLine: card!.nextAction });
-      expect(card!.nextAction).toContain("Paperclip cannot confirm that the previous execution stopped.");
+      expect(card!.nextAction).toBe("Stop pending: Paperclip cannot confirm that the previous execution stopped. Messages you send are saved and will be sent once the stop is confirmed.");
+      expect(card!.nextAction).not.toMatch(/explicit decision|stays held until Stop is proved/);
       expect(atBound.status).toBe("deferred_issue_execution");
       // The person presses Send at the bound.
       const queue = await readQueue(f);
