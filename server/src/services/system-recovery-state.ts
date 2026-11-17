@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
-import { ENVIRONMENT_LEASE_POLICIES, WORKSPACE_SOURCE_VERIFICATION_REASONS,
-  type WorkspaceSourceVerificationFailure } from "@paperclipai/shared";
+import { ENVIRONMENT_LEASE_POLICIES, WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT, WORKSPACE_RESTORE_COPYBACK_STOP_WAIT_TEXT,
+  WORKSPACE_SOURCE_VERIFICATION_REASONS, type WorkspaceSourceVerificationFailure } from "@paperclipai/shared";
 import { REMOTE_WORKSPACE_CAPTURE_POLICY_VERSION } from "./remote-workspace-snapshot-archive.js";
 
 export const SYSTEM_RECOVERY_POLICY_VERSION = 1;
@@ -188,18 +188,26 @@ export function stopProofRearmsSpent(evidence: Record<string, unknown> | null | 
   return (readStopProofRecovery(evidence)?.rearms ?? 0) >= STOP_PROOF_MAX_REARMS;
 }
 
+/** The one decision (rf-3 15:30Z (3)) for an exhausted hold that is waiting on
+ * an unconfirmed stop: Retry cannot release it, so the card, the chat
+ * projection (workspace-restore-recovery-state.ts workspaceRestoreStopWaitProjectionSql) and
+ * savedWorkOffersRetry all read it as waiting, no Retry. Returns the code. */
+export function exhaustedStopWait(state: Pick<SystemRecoveryState, "state" | "failure"> | null | undefined,
+  evidence: Record<string, unknown> | null | undefined): "copyback_stop_unconfirmed" | "agent_stop_unconfirmed" | null {
+  if (state?.state !== "exhausted") return null;
+  if (state.failure?.code === "copyback_stop_unconfirmed") return "copyback_stop_unconfirmed";
+  return isExhaustedStopProofWait(state) && !stopProofRearmsSpent(evidence) ? "agent_stop_unconfirmed" : null;
+}
+
 /** User-facing text for a spent recovery budget. It names what happens next and
  * never asks a person to inspect a sandbox or environment. The code stays for support. */
 export function exhaustedSystemRecoveryAction(state: SystemRecoveryState, evidence?: Record<string, unknown> | null): string {
   // Another Retry cannot release a copyback owner that stopped without reporting.
-  if (state.failure?.code === "copyback_stop_unconfirmed")
-    return "Recovery of saved work is waiting for the previous server's file copy to stop. "
-      + "Recovery resumes once Paperclip can confirm that it stopped. No provider turn is submitted.";
+  if (state.failure?.code === "copyback_stop_unconfirmed") return WORKSPACE_RESTORE_COPYBACK_STOP_WAIT_TEXT;
   // An unproven agent stop is re-proven automatically once the run is over
   // (workspace-recovery-stop-proof), while a bounded re-arm remains.
   if (evidence !== undefined && isExhaustedStopProofWait(state) && !stopProofRearmsSpent(evidence))
-    return "Recovery of saved work is waiting to confirm that the previous run stopped. "
-      + "Paperclip tries again automatically, and the agent will not repeat its work.";
+    return WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT;
   if (state.failure?.cause?.label === "sandbox_disk_full")
     return "Saving the agent's files stopped because the sandbox disk is full. Paperclip deletes only inactive tool "
       + "caches it can prove safe, and that did not free enough space. Automatic recovery does not repeat a save that fails the same way. "

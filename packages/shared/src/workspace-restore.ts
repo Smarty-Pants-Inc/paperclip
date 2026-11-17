@@ -52,6 +52,23 @@ export function isWorkspaceRestoreDelayed(result: Record<string, unknown> | null
   return hasWorkspaceRestoreFailure(result) && result?.[WORKSPACE_RESTORE_DELAYED_KEY] === true;
 }
 
+/** rf-3 15:30Z (3): a restore hold exhausted on an unconfirmed stop is a wait,
+ * not a failure: Retry cannot release it (the stop must be proven first). Read-only
+ * projection key whose value is the failure code; never stored. The card
+ * (exhaustedSystemRecoveryAction) and the chat read these same words. */
+export const WORKSPACE_RESTORE_STOP_WAIT_KEY = "workspaceRestoreStopWait";
+export const WORKSPACE_RESTORE_COPYBACK_STOP_WAIT_TEXT = "Recovery of saved work is waiting for the previous server's file copy to stop. "
+  + "Recovery resumes once Paperclip can confirm that it stopped. No provider turn is submitted.";
+export const WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT = "Recovery of saved work is waiting to confirm that the previous run stopped. "
+  + "Paperclip tries again automatically, and the agent will not repeat its work.";
+/** The stop-wait words when the server projected one, else null. */
+export function workspaceRestoreStopWaitText(result: Record<string, unknown> | null | undefined): string | null {
+  if (!hasWorkspaceRestoreFailure(result)) return null;
+  const code = result?.[WORKSPACE_RESTORE_STOP_WAIT_KEY];
+  return code === "copyback_stop_unconfirmed" ? WORKSPACE_RESTORE_COPYBACK_STOP_WAIT_TEXT
+    : code === "agent_stop_unconfirmed" ? WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT : null;
+}
+
 /** Display only ordinary repository paths, never targets, host paths or temp IDs. */
 export function safeWorkspaceRestorePath(value: unknown): string | null {
   if (typeof value !== "string" || value.length > 180) return null;
