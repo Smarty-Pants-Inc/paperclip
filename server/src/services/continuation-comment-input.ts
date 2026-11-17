@@ -15,8 +15,9 @@ export async function pendingContinuationCommentInput(db: Pick<Db, "select">, in
   const rows = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     inArray(issueComments.id, candidates), isNull(issueComments.deletedAt),
-    // Only still-pending input: a comment with a PUBLISHED agent answer attributed to it (or to a later person
-    // input) is never re-presented, or every continuation re-answers it (the re-wake loop, org 19:48Z).
+    // Only still-pending input: a comment with a PUBLISHED agent answer from a run that carried it as pending
+    // input is never re-presented, or every continuation re-answers it (the re-wake loop, org 19:48Z). A reply
+    // to a later input alone does not settle it (R-ONCE, RFL 18:19Z): it rides into the next run's input.
     sql`not ${answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`,
   )).orderBy(asc(issueComments.createdAt), asc(issueComments.id));
