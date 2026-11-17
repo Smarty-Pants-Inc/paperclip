@@ -1385,7 +1385,7 @@ export const warmRetainedRunnerStopWait = { waitMs: 10_000, pollMs: 500 };
  * (retireSandboxRunnerPortHolders: same company/agent/run, terminal run status,
  * idle state, else `owner_not_settled`), then require the exit proof. */
 async function stopSessionRunnerAndProveExit(entry: WarmNativeSession, db: Db,
-  sandboxRunner: NonNullable<WarmNativeSession["sandboxRunner"]>): Promise<boolean> {
+  sandboxRunner: NonNullable<WarmNativeSession["sandboxRunner"]>, options: { surfaceProofError?: boolean } = {}): Promise<boolean> {
   const { runner, remoteCwd } = sandboxRunner;
   const runtimeRoot = posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner");
   const sessionDirectory = createHash("sha256").update(entry.normalizedSessionId).digest("hex");
@@ -1396,6 +1396,9 @@ async function stopSessionRunnerAndProveExit(entry: WarmNativeSession, db: Db,
   } catch (stopError) {
     logger.warn({ runId: entry.runId, providerLeaseId: entry.providerLeaseId ?? null, stopFailure: describeWarmCloseFailure(stopError) },
       "could not stop the retained Runner of a finished warm session");
+    // rf-4 row 22f: the remote observation failed (e.g. the Runner answered 502),
+    // which is not "the owner is not idle" (owner_not_settled stays a plain false).
+    if (options.surfaceProofError && !runnerRefusedAsNotSettled(stopError)) throw stopError;
     return false;
   }
   return sandboxSessionRunnerExited({ runner, runtimeRoot, sessionDirectory });
@@ -1407,13 +1410,14 @@ async function stopSessionRunnerAndProveExit(entry: WarmNativeSession, db: Db,
  * decides: true only when this session's Runner is proven exited. False when
  * the sandbox runner or lease database is missing, on any throw, and for a
  * Runner that is not idle (its stop is refused, owner_not_settled). */
-async function supersededOwnerRunnerExited(entry: WarmNativeSession): Promise<boolean> {
+async function supersededOwnerRunnerExited(entry: WarmNativeSession, options: { surfaceProofError?: boolean } = {}): Promise<boolean> {
   if (!entry.sandboxRunner || !entry.sandboxLeaseDb) return false;
   try {
-    if (!await stopSessionRunnerAndProveExit(entry, entry.sandboxLeaseDb, entry.sandboxRunner)) return false;
+    if (!await stopSessionRunnerAndProveExit(entry, entry.sandboxLeaseDb, entry.sandboxRunner, options)) return false;
   } catch (proofError) {
     logger.warn({ runId: entry.runId, providerLeaseId: entry.providerLeaseId ?? null, proofFailure: describeWarmCloseFailure(proofError) },
       "could not prove the superseded warm owner's Runner exited");
+    if (options.surfaceProofError) throw proofError;
     return false;
   }
   logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
@@ -1426,14 +1430,35 @@ async function supersededOwnerRunnerExited(entry: WarmNativeSession): Promise<bo
  * proof (supersededOwnerRunnerExited, above) for a warm owner that a person's
  * Stop handed off on a still-running box. True only when this run's warm
  * session on this box is idle and its Runner is proven exited; false when no
- * such session is held here, it is busy or preparing, or the proof fails. */
+ * such session is held here, it is busy or preparing, or its Runner is not
+ * idle (owner_not_settled). rf-4 row 22f: it THROWS when the proof itself
+ * failed (the remote observation errored, e.g. a 502), so the caller
+ * (proveHandedOffWarmLeases) can take the bounded fallback instead. */
 export async function handedOffWarmOwnerRunnerExited(input: { runId: string; providerLeaseId: string | null }): Promise<boolean> {
   for (const entry of warmNativeSessions.values()) {
     if (entry.runId !== input.runId || (input.providerLeaseId && entry.providerLeaseId !== input.providerLeaseId)) continue;
     if (entry.busy || entry.preparingRunId) return false;
-    return supersededOwnerRunnerExited(entry);
+    return supersededOwnerRunnerExited(entry, { surfaceProofError: true });
   }
   return false;
+}
+
+/** rf-4 row 22f: the same idle check handedOffWarmOwnerRunnerExited applies
+ * (entry.busy / entry.preparingRunId): true when this process holds this run's
+ * warm session on this box and it is busy or preparing a turn. A failed proof
+ * never stops such an owner. */
+export function handedOffWarmOwnerBusy(input: { runId: string; providerLeaseId: string | null }): boolean {
+  for (const entry of warmNativeSessions.values()) {
+    if (entry.runId !== input.runId || (input.providerLeaseId && entry.providerLeaseId !== input.providerLeaseId)) continue;
+    return Boolean(entry.busy || entry.preparingRunId);
+  }
+  return false;
+}
+
+function runnerRefusedAsNotSettled(error: unknown): boolean {
+  const text = `${error instanceof Error ? error.message : String(error)} ${
+    error instanceof Error && error.cause instanceof Error ? error.cause.message : ""}`;
+  return text.includes("owner_not_settled");
 }
 
 /** pl/send-after-stop3: whether the s3 fence's proof (handedOffWarmOwnerRunnerExited)
