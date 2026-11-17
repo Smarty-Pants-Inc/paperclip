@@ -22,6 +22,9 @@ import { admitExplicitNativeContinuation } from "./explicit-native-continuation.
 import { requestTaskRetry } from "./task-retry.js";
 import { recordTaskStopPending } from "./recovery/stop-pending.js";
 import { taskInterruptionPresentation } from "./task-interruption-presentation.js";
+import { agentTaskSessions, environmentLeases, environments } from "@paperclipai/db";
+import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
+import { PI_CONVERSATION_KEY, selectPiConversation } from "./native-runtime/pi-conversation-record.js";
 
 const SIX_MINUTES = 6 * 60_000;
 const INSTRUCTION = "assign this agent a new task";
@@ -140,4 +143,45 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(blockedWith?.reason).not.toBe("execution_settling");
     expect(blockedWith?.reason).not.toBe("execution_stop_unproven");
   });
+  it("A: after the Stop is proved, a Retry that preparation (not admission) routes to a fresh isolated workspace opens a NEW provider thread, keeping saved history", async () => {
+    const f = await seed("A");
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const sessionId = source!.nativeSessionId!;
+    // The old box was remote: nothing task-owned can be reused.
+    const [environment] = await db.insert(environments).values({ name: `box-${f.sourceRunId}`, driver: "sandbox" }).returning();
+    await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.sourceRunId, environmentId: environment!.id,
+      issueId: f.issueId, provider: "daytona", providerLeaseId: "sandbox-a", status: "released", leasePolicy: "ephemeral",
+      releasedAt: new Date(), cleanupStatus: "success" });
+    await db.insert(agentTaskSessions).values({ companyId: f.companyId, agentId: f.agentId, adapterType: "paperclip_runner",
+      taskKey: f.issueId, lastRunId: f.sourceRunId, sessionParamsJson: { sessionId, [PI_CONVERSATION_KEY]: {
+        schema: "paperclip.pi-conversation.v1", id: sessionId, generation: 1, previousId: null, reason: "first_message",
+        runId: f.sourceRunId, boundary: { provider: "pi_rpc", cwd: "/workspaces/old-box", remoteCwd: null, workspaceId: null, trust: "trust" } } } });
+    const { clearTaskStopPending } = await import("./recovery/stop-pending.js");
+    await db.transaction(tx => clearTaskStopPending(tx as unknown as typeof db, { companyId: f.companyId, issueId: f.issueId,
+      runIds: [f.sourceRunId] }, []));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", nextAttemptAt: null })
+      .where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    const receipt = await press(f);
+    // No hold: admission has no explicit continuation and the queue starts an ordinary run for the Retry.
+    const { admitted } = await admit(f, receipt.requestId!);
+    expect(admitted).toBeNull();
+    const successorRunId = randomUUID();
+    const [run] = await db.insert(heartbeatRuns).values({ id: successorRunId, companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, runtimeMode: "native", status: "running", invocationSource: "on_demand",
+      contextSnapshot: { issueId: f.issueId, wakeReason: "task_retry", forceFreshSession: true, previousRunId: f.sourceRunId,
+        taskRetryRequestId: receipt.requestId } }).returning();
+    await db.update(agentWakeupRequests).set({ status: "coalesced", runId: successorRunId })
+      .where(eq(agentWakeupRequests.id, receipt.requestId!));
+    expect(await readFreshWorkspaceReadiness(db, run!)).toMatchObject({ mode: "fresh_isolated_workspace", sourceRunId: f.sourceRunId });
+    const select = () => selectPiConversation(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+      runId: successorRunId, boundary: { provider: "pi_rpc", cwd: "/workspaces/new-box", remoteCwd: null, workspaceId: null, trust: "trust" } });
+    const conversation = await select();
+    // Base: the old id, restored into the new scope -> prior_owner_scope_mismatch.
+    expect(conversation.id).not.toBe(sessionId);
+    expect(conversation).toMatchObject({ previousId: sessionId, runId: successorRunId, generation: 2,
+      reason: expect.stringMatching(/^fresh_continuation:/) });
+    expect(await select()).toEqual(conversation);
+    const fresh = (await notes(f)).filter(note => String(note.metadata?.authorizationReason ?? "").startsWith("fresh_provider_thread:"));
+    expect(fresh).toHaveLength(1);
+  }, 60_000);
 });
