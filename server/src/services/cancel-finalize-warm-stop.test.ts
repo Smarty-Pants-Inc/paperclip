@@ -18,7 +18,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, issues,
@@ -37,7 +37,7 @@ import { recoveryService } from "./recovery/service.js";
 import { runExecutionsStoppedOrHandedOffWarm } from "./agent-execution-stop.js";
 import { environmentService } from "./environments.js";
 import { handedOffWarmLeaseSettled } from "./native-runtime/handed-off-warm-lease.js";
-import { withNativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
+import { tryLockNativeWorkspaceFinalization, withNativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
 import * as nativeExecutor from "./native-runtime/native-session-executor.js";
 import { nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
@@ -516,4 +516,76 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(lines.some(line => /source does not match/i.test(line) || /new task/i.test(line))).toBe(false);
     expect(lines.some(line => line.includes("could not be confirmed in time (timed_out)"))).toBe(true);
   }, 90_000);
+
+  /** pl/lockloss: the finalization lock session's idle_in_transaction_session_timeout, for new sessions only. */
+  async function withLockSessionIdleTimeout<T>(value: string, body: () => Promise<T>): Promise<T> {
+    const [{ name }] = await db.execute(sql`select current_database() as name`) as unknown as Array<{ name: string }>;
+    await db.execute(sql.raw(`alter database "${name}" set idle_in_transaction_session_timeout = '${value}'`));
+    try { return await body(); }
+    finally { await db.execute(sql.raw(`alter database "${name}" reset idle_in_transaction_session_timeout`)); }
+  }
+
+  it("(lockloss) the lock session dies mid-copyback: the copyback stops, writes nothing more to the host, the export is unproven", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
+    await settleLater(f);
+    let release!: () => void;
+    // Hold the copyback's first remote command (the box export) while the lock session is killed.
+    f.runnerState.gate = { match: () => true, until: new Promise<void>(resolve => { release = resolve; }) };
+    await withLockSessionIdleTimeout("3s", async () => {
+      const outcome = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+        nativeWorkspaceSync: f.sync, timeoutMs: 30_000 });
+      outcome.catch(() => undefined);
+      await waitFor(() => (f.runnerState.held ?? 0) >= 1);
+      // The finalization lock session is terminated (as the idle timeout or an operator would).
+      const lockers = await db.execute(sql`select pid from pg_locks where locktype = 'advisory' and granted
+        and pid <> pg_backend_pid()`) as unknown as Array<{ pid: number }>;
+      expect(lockers).toHaveLength(1);
+      await db.execute(sql`select pg_terminate_backend(${lockers[0].pid})`);
+      // A second owner acquires the advisory lock and writes the host workspace.
+      let second = false;
+      for (let attempt = 0; attempt < 50 && !second; attempt += 1) {
+        second = await db.transaction(async tx => {
+          const acquired = await tryLockNativeWorkspaceFinalization(tx as never, { companyId: f.companyId, runId: f.runId });
+          if (acquired) await writeFile(join(f.host, "next.txt"), "the next owner's write\n");
+          return acquired;
+        });
+        if (!second) await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      expect(second).toBe(true);
+      // Let the keepalive see the dead session (it pings every second here), then release the held copyback.
+      await new Promise(resolve => setTimeout(resolve, 2_000));
+      f.runnerState.gate = null;
+      release();
+      await waitFor(() => f.runnerState.inflight === 0);
+      await new Promise(resolve => setTimeout(resolve, 1_500));
+      await waitFor(() => f.runnerState.inflight === 0);
+      // Base: the copyback merges the box edit into the host after the lock was lost.
+      expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
+      expect(await readFile(join(f.host, "next.txt"), "utf8")).toBe("the next owner's write\n");
+      await expect(stat(join(f.box, ...STAMP))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await outcome).toEqual({ outcome: "unproven", reason: "ownership_lost" });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync))
+        .toMatchObject({ state: "prepared", finalHostSha256: null });
+      expect(run.runnerProfileJson?.nativeCancelledWarmExport).toMatchObject({ state: "unproven", reason: "ownership_lost" });
+    });
+  }, 60_000);
+
+  it("(lockloss) no false cut: timeout 120 s and 45 s of quiet remote work, the keepalive holds and the export finalizes", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
+    await settleLater(f);
+    let release!: () => void;
+    f.runnerState.gate = { match: () => true, until: new Promise<void>(resolve => { release = resolve; }) };
+    await withLockSessionIdleTimeout("120s", async () => {
+      const outcome = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+        nativeWorkspaceSync: f.sync, timeoutMs: 90_000 });
+      outcome.catch(() => undefined);
+      await waitFor(() => (f.runnerState.held ?? 0) >= 1);
+      await new Promise(resolve => setTimeout(resolve, 45_000));
+      f.runnerState.gate = null;
+      release();
+      expect(await outcome).toEqual({ outcome: "finalized" });
+      expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(EDIT);
+    });
+  }, 120_000);
 });

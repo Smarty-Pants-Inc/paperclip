@@ -69,3 +69,26 @@ it("preserves the work error when its keepalive query fails", async () => {
   await setImmediate();
   expect(execute).toHaveBeenCalledOnce();
 });
+
+it("pl/lockloss: a failed ping is reported once through onLost, not swallowed", async () => {
+  const execute = vi.fn(async () => { throw new Error("connection_terminated"); });
+  const onLost = vi.fn();
+  let lostSeen!: () => void;
+  const seen = new Promise<void>(resolve => { lostSeen = resolve; });
+  onLost.mockImplementation(() => lostSeen());
+  const result = await withWorkspaceLockKeepalive({ execute } as unknown as Db, 3, async () => {
+    await seen;
+    return 7;
+  }, { onLost });
+  expect(result).toBe(7);
+  expect(onLost).toHaveBeenCalledOnce();
+  expect((onLost.mock.calls[0] as unknown[])[0]).toMatchObject({ message: "connection_terminated" });
+});
+
+it("pl/lockloss: finishing the work is not a loss", async () => {
+  const execute = vi.fn(async () => undefined);
+  const onLost = vi.fn();
+  await expect(withWorkspaceLockKeepalive({ execute } as unknown as Db, 3, async () => 1, { onLost })).resolves.toBe(1);
+  await setImmediate();
+  expect(onLost).not.toHaveBeenCalled();
+});
