@@ -267,6 +267,8 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   cancelActiveForAgentInternal: (agentId: string, reason: string) => Promise<unknown>;
   resumeExecutionWaitComments: (scope?: DeferredReceiptRecoveryOptions) => Promise<unknown>;
   resumeQueuedCommentInterrupt: (companyId: string, queueId: string) => Promise<unknown>;
+  /** The native run this Interrupt stopped has proven it can no longer write. */
+  queuedCommentInterruptTargetStopped?: (companyId: string, queueId: string) => Promise<boolean>;
   resumeSavedLegacyComments: (companyId: string, queueId: string) => Promise<unknown>;
   formatIssueIdentifierLink: (identifier: string | null, fallback: string) => string;
 }
@@ -486,6 +488,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     resumeExecutionWaitComments,
     getWorktreeExecutionCutoff,
     resumeQueuedCommentInterrupt,
+    queuedCommentInterruptTargetStopped,
     resumeSavedLegacyComments,
     cancelActiveForAgentInternal,
     listCompanyAgentOrgRows,
@@ -2058,6 +2061,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments(scope);
     const cutoff = await getWorktreeExecutionCutoff();
+    // S8q: the age gate waits out a run that may still write. An exact hint for
+    // an Interrupt whose stopped run has finished teardown needs no wait; every
+    // other wake keeps the gate, and admission still rechecks under its locks.
+    const stoppedInterrupt = scope.companyId && scope.requestId && queuedCommentInterruptTargetStopped
+      ? await queuedCommentInterruptTargetStopped(scope.companyId, scope.requestId) : false;
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
       .where(and(scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
@@ -2065,7 +2073,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(companies.status, "active"),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
-        lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
+        stoppedInterrupt ? undefined : lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const wake of pendingInterrupts) {
