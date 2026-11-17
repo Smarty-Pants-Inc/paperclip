@@ -4,9 +4,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { agents, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRunEvents, heartbeatRuns,
-  issueRecoveryActions, issues, nativeRunFinalizations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  issueRecoveryActions, issues, plugins, nativeRunFinalizations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { prepareNativeWorkspaceSync, nativeWorkspaceSyncInternals } from "../services/native-runtime/native-workspace-sync.js";
 import * as recovery from "../services/native-runtime/native-failed-workspace-recovery.js";
@@ -155,6 +156,49 @@ describe.skipIf(!support.supported)("JUDGE CR6 real prepared native-sync stopped
       expect(actions).toHaveLength(1);
       expect(actions[0]).toMatchObject({ fingerprint: `native-workspace:${runId}`, nextAction: RECOVERING_SAVED_WORK_NEXT_ACTION });
       expect(run.resultJson).toHaveProperty("workspaceRestoreRecovery");
+      if (warm) {
+        // Minimal V3 delta: same real stopped source and hold, actual sandbox
+        // runtime and expiry-to-destroy driver. Only provider RPC is scripted.
+        const pluginId = String(stopped!.metadata!.pluginId);
+        await db.insert(plugins).values({ id: pluginId, pluginKey: `v3-guard-${pluginId}`, packageName: "judge-provider",
+          version: "1.0.0", apiVersion: 1, categories: ["automation"], status: "ready",
+          manifestJson: { id: `v3-guard-${pluginId}`, apiVersion: 1, version: "1.0.0", displayName: "Judge",
+            description: "Destroy boundary", author: "Judge", categories: ["automation"],
+            capabilities: ["environment.drivers.register"], entrypoints: { worker: "dist/worker.js" },
+            environmentDrivers: [{ driverKey: "daytona", kind: "sandbox_provider", displayName: "Judge",
+              supportsReusableLeases: true, configSchema: { type: "object" } }] } });
+        const [environment] = await db.update(environments).set({ config: { provider: "daytona", image: "judge:test", reuseLease: true } })
+          .where(eq(environments.id, environmentId)).returning();
+        // Preserve every field the recorder actually wrote, rather than
+        // overwriting it from the pre-preservation stop settlement snapshot.
+        const [recordedSource] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+        const [held] = await db.update(environmentLeases).set({ expiresAt: new Date(Date.now() - 1000), metadata: { ...recordedSource.metadata,
+          provider: "daytona", image: "judge:test", reuseLease: true } }).where(eq(environmentLeases.id, leaseId)).returning();
+        const providerCalls: string[] = [];
+        const call = vi.fn(async (_id: string, method: string) => {
+          providerCalls.push(method);
+          if (method === "environmentDestroyLease") await fs.rm(path.join(remote, "notes.md"));
+          return { providerLeaseId, state: "destroyed" };
+        });
+        const runtime = environmentRuntimeService(db, { pluginWorkerManager: { isRunning: () => true, call,
+          getWorker: () => ({ supportedMethods: ["environmentDestroyLease"] }) } as never });
+        const direct = await runtime.destroyRunLease({ environment, lease: held } as never);
+        const directSha = createHash("sha256").update(await fs.readFile(path.join(remote, "notes.md"))).digest("hex");
+        expect(directSha).toBe(remoteSha);
+        expect(providerCalls).toEqual([]);
+        const expired = await runtime.getDriver("sandbox")!.releaseRunLease({ environment, lease: held, status: "expired" } as never);
+        const remaining = await fs.readFile(path.join(remote, "notes.md")).catch(() => null);
+        const proof = { kind, direct: direct?.status ?? null, directSha, expired: expired?.status ?? null, providerCalls,
+          bytesIntact: remaining !== null && createHash("sha256").update(remaining).digest("hex") === remoteSha,
+          leaseRecoveryMarker: held.metadata?.workspaceRestoreRecovery ?? null,
+          runRecovery: run.resultJson?.workspaceRestoreRecovery, actionCount: actions.length };
+        console.log("DESTROY_GUARD_PROOF", JSON.stringify(proof));
+        await fs.writeFile(path.join(evidenceDir, "destroy-guard.json"), JSON.stringify(proof, null, 2));
+        expect.soft(direct).toBeNull();
+        expect.soft(expired).toBeNull();
+        expect.soft(providerCalls).toEqual([]);
+        expect(proof.bytesIntact).toBe(true);
+      }
     } finally { await worker.stop(); await prepared!.cleanup(); }
   }, 120000);
 });
