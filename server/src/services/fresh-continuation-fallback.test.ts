@@ -961,6 +961,76 @@ suite("fresh-continuation fallback", () => {
     }
   }, 120_000);
 
+  // RFL 20:46Z (ruled): a TASK-level hold. c9a2f934's fixture, but the failed turn whose sandbox
+  // cleanup failed is the TASK's execution owner (issues.execution_run_id), so the dispatcher declines
+  // every start of this task (heartbeat/queue.ts lockIssueExecutionClaim, executionOwnerId ->
+  // predecessor_cleanup_pending), a Retry's fresh run included. At +10 min the card names the hold:
+  // not failed, no Retry. When the hold clears, liveness starts exactly ONE run.
+  it("D168 task-level hold: the card names the hold at +10 min (no failed, no Retry); the hold clears and one run starts", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    const t = new Date(Date.now() - 1_800_000);
+    const at = (offset: number) => new Date(t.getTime() + offset);
+    const [task] = await db.insert(issues).values({ companyId, title: "F3 D168 task-level hold", status: "in_progress", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: at(-300_000) }).returning();
+    const issueId = task!.id;
+    const [failedTurn] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "failed",
+      errorCode: "adapter_failed", error: "adapter failed before an answer", createdAt: at(-200_000), startedAt: at(-190_000),
+      finishedAt: at(-70_000), responsibleUserId: userId, contextSnapshot: { issueId, wakeReason: "issue_commented" } }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: failedTurn!.id, issueId, provider: "boat",
+      providerLeaseId: `d168-task-${randomUUID()}`, status: "released", releasedAt: at(-69_000), cleanupStatus: "failed" }).returning();
+    // The failed turn still owns the task's execution slot.
+    await db.update(issues).set({ executionRunId: failedTurn!.id }).where(eq(issues.id, issueId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "Is it deployed?", clientRequestId: randomUUID(), createdAt: at(-61_000) }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
+      requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${message!.id}`,
+      payload: { issueId, commentId: message!.id }, createdAt: at(-60_000), requestedAt: at(-60_000) }).returning();
+    const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
+      createdAt: at(-60_000), responsibleUserId: userId, wakeupRequestId: wake!.id,
+      contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: message!.id, wakeCommentIds: [message!.id] } }).returning();
+    await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const heartbeat = heartbeatService(db);
+      const carrying = async () => (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.issueId, issueId)))).filter(r => r.contextSnapshot?.wakeCommentId === message!.id
+          || (r.contextSnapshot?.wakeCommentIds as string[] | undefined)?.includes(message!.id));
+      const repoke = async (elapsed: number) => {
+        vi.setSystemTime(t.getTime() + elapsed);
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
+        await settleUnrecoverableExecutions(db);
+        await deliverReconciledExecutions(db, heartbeat.wakeup);
+        await heartbeat.resumeQueuedRunsAfterDrain({ companyId });
+        await heartbeat.drainActiveRunExecutions();
+      };
+      for (const elapsed of [5_000, 300_000, 541_000, 1_200_000]) {
+        await repoke(elapsed);
+        const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
+        expect(row, `the task-level hold declines the start (t+${elapsed})`).toMatchObject({ status: "queued", startedAt: null });
+        const card = await taskInterruptionPresentation(db, await issue(issueId));
+        console.info(JSON.stringify({ d168TaskHold: { elapsed, card: card && { state: card.state, canRetry: card.canRetry, retryWait: card.retryWait } } }));
+        expect(card?.state, `under a task-level hold the card never says failed (t+${elapsed})`).not.toBe("failed");
+        expect(card?.canRetry ?? false, `no Retry while the hold blocks every start (t+${elapsed})`).toBe(false);
+        if (elapsed >= 541_000) expect(card, "past the 10-min bound: the named hold").toMatchObject({ state: "working",
+          observedRunId: queued!.id, retryWait: { reason: "previous_run_cleanup", message: expect.stringMatching(/^Waiting: the previous run is still cleaning up/) } });
+      }
+      // The hold clears (the failed turn's cleanup succeeds): the next liveness pass starts exactly one run.
+      await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, lease!.id));
+      await repoke(1_205_000);
+      const runs = await carrying();
+      console.info(JSON.stringify({ d168TaskHoldCleared: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) }));
+      expect(runs.map(r => r.id), "exactly one run carries the message").toEqual([queued!.id]);
+      expect(runs[0]!.startedAt, "it started once the hold cleared").not.toBeNull();
+      // (This suite has no provider or membership, so the started run ends at setup; it STARTED, which is the point.)
+      expect(runs[0]!.status, "the message's own run left the queue").not.toBe("queued");
+      for (const elapsed of [1_500_000]) await repoke(elapsed);
+      expect((await carrying()).map(r => r.id), "later passes start no second run").toEqual([queued!.id]);
+    } finally {
+      vi.useRealTimers();
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: false });
+    }
+  }, 120_000);
+
   // rf-3 (c) R-ONCE: a message queued behind a busy turn; the busy turn ends; exactly ONE run starts
   // and answers once. The card offers no Retry, and later sweeps/liveness passes start nothing.
   it("R-ONCE: a message queued behind a busy turn starts exactly one run when the turn ends and is answered once", async () => {
