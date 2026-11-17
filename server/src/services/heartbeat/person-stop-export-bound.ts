@@ -14,7 +14,8 @@ export const PERSON_STOP_EXPORT_BOUND_MS = 5 * 60_000;
 export const PERSON_STOP_PROBE_TIMEOUT_MS = 5_000;
 export const PERSON_STOP_EXPORT_UNPROVEN = "person_stop_export_unproven";
 export const PERSON_STOP_BOUND_KEY = "personStopExportBound";
-export const PERSON_STOP_WITHOUT_FILES_LINE = "The earlier changes couldn't be restored; they're kept on the previous machine. This reply runs without them.";
+// adopt-stopu-cap5 (al/fam-stopu-cap 579574d1) folded in: its exhaustion line, verbatim, is this path's ONE line.
+export const PERSON_STOP_WITHOUT_FILES_LINE = "Couldn't restore the files from the stopped turn; they're kept on the previous machine. This reply runs without them.";
 
 export type PersonStopBoundDecision = {
   schema: "paperclip.person-stop-export-bound.v1";
