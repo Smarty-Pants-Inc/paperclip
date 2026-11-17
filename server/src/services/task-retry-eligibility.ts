@@ -142,3 +142,19 @@ export async function readRetryAuthorityFacts(db: Db, input: { companyId: string
   return { agentPaused: assignee?.status === "paused", heldConversation: Boolean(notice),
     heldRefusal: refusals.get(input.issueId) ?? null } satisfies RetryAuthorityFacts;
 }
+
+/**
+ * Retry fold (judge R8, rf-3 A/B): the decisions a Retry is refused for before
+ * anything is saved, on every Retry path (task Retry API and chat Retry):
+ * - conversation_held: a standing HELD notice or the prior-owner fence; the
+ *   same thread meets the same fence on every Retry.
+ * - agent_paused: the card says "Resume this agent"; a Retry runs nothing.
+ * A refusal that admission itself records (previous_execution_unverified,
+ * cleanup_quarantined, the fence reasons, ...) is answered by upstream #21497's
+ * taskRetryRefusal on the Retry route after admission, not here.
+ */
+const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["conversation_held", "agent_paused"]);
+export async function retryRefusedBeforeAdmission(db: Db, input: { companyId: string; issueId: string }): Promise<RetryAuthority | null> {
+  const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, input), retrySource: true });
+  return !authority.canRetry && REFUSED_BEFORE_ADMISSION.has(authority.reason) ? authority : null;
+}
