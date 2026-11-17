@@ -23,9 +23,10 @@ export function providerResourceDispositionForTerminalRun(
   if (!["failed", "cancelled", "interrupted"].includes(status ?? "")) return "stop_and_retain";
   // These are ordinary run outcomes, not integrity/reconciliation failures.
   // In particular, native_restart_recovery_blocked, replay conflicts and
-  // quarantined cleanup retain their existing stop policy.
-  if (errorCode && !["adapter_failed", "adapter_error", "native_session_interrupted",
-    "native_retry_cancelled", "cancelled"].includes(errorCode)) {
+  // quarantined cleanup retain their existing stop policy. A person's Stop
+  // (cancelled / native_retry_cancelled) is not kept warm: as upstream
+  // run-control, a non-succeeded run stops and retains its box.
+  if (errorCode && !["adapter_failed", "adapter_error", "native_session_interrupted"].includes(errorCode)) {
     return "stop_and_retain";
   }
   return desired;
