@@ -675,13 +675,25 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     .from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId), inArray(issueRecoveryActions.sourceIssueId, ids),
       inArray(sql`${issueRecoveryActions.evidence}->>'runId'`, runIds),
       sql`(${issueRecoveryActions.evidence} ? 'freshContinuationSettlement' or ${issueRecoveryActions.evidence} ? 'freshContinuationCheck')`)) : [];
+  // Retry fold (rf-3 E, R-SILENT): a continuation recorded with no delivery
+  // request ('not_requested') has no worker that will start it. It is shown as
+  // Paperclip continuing only while a live successor exists: a queued, claimed
+  // or deferred wake for the task (a queued or running run is the latest run
+  // and already shows 'working'). 'pending' stays with its delivery worker.
+  const notRequestedIssueIds = [...new Set(freshRows.filter(row => row.recorded && row.delivery === "not_requested").map(row => row.issueId))];
+  const liveSuccessorIssueIds = new Set(notRequestedIssueIds.length ? (await db.selectDistinct({
+    issueId: sql<string>`${agentWakeupRequests.payload}->>'issueId'` }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, companyId),
+    inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+    inArray(sql`${agentWakeupRequests.payload}->>'issueId'`, notRequestedIssueIds)))).map(row => row.issueId) : []);
   const pendingSchema = freshRows.some(row => row.delivery === "pending")
     ? (await import("./fresh-continuation-fallback.js")).FRESH_CONTINUATION_SCHEMA : null;
   const freshContinuationFor = (issueId: string, runId: string | undefined): ProjectionState["freshContinuation"] => {
     const rows = freshRows.filter(row => row.issueId === issueId && row.runId === runId);
     // Only the primary record (it carries `freshContinuation`) says whether a
     // continuation is still on its way; holds coalesced into it never do.
-    if (rows.some(row => row.recorded && ["not_requested", "pending"].includes(row.delivery ?? ""))) {
+    if (rows.some(row => row.recorded && (row.delivery === "pending"
+      || (row.delivery === "not_requested" && liveSuccessorIssueIds.has(issueId))))) {
       const pendingSince = Math.max(...rows.filter(row => row.recorded && row.delivery === "pending" && row.status === "resolved"
         && row.schema === pendingSchema && row.reconciledRunId === runId).map(row => Date.parse(row.recordedAt ?? "")));
       return Number.isFinite(pendingSince) ? { state: "continuing", pendingSince } : { state: "continuing" };
