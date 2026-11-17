@@ -2160,6 +2160,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         // adopt-stopu-bound2: a person's Stop whose box still has no stop
         // receipt after this retry gets the existing Stop-pending card (never
         // an unbounded hold); a retry that settles retires it before resume.
+        // adopt-stopu-card2: the writer itself waits for the ONE person's-Stop bound
+        // (personStopCardBoundAt) that the recovery sweep's deferral also reads.
         await (async () => {
           const stopped = await getRun(lease.heartbeatRunId!);
           if (!stopped || !hasAcknowledgedNativeStopIntent(stopped)) return;

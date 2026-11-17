@@ -12,6 +12,29 @@ const STOP_PENDING_FINDING = "Paperclip cannot confirm that the previous executi
 /** The card's own finding, for the person's held message. It names no wait
  * and promises no automatic start (adopt-stopu-bound2). */
 export const STOP_PENDING_PERSON_LINE = `Stop pending: ${STOP_PENDING_FINDING} Your message is saved.`;
+/** adopt-stopu-card2 (rf-4 F12): a person's Stop card says only what the code does.
+ * Stop proof retires the card (recheckTaskStopPending -> clearTaskStopPending, every
+ * sweep and the cleanup retry) and the held messages are then admitted once. It names
+ * no board decision and no indefinite hold. */
+export const STOP_PENDING_PERSON_ACTION =
+  `Stop pending: ${STOP_PENDING_FINDING} Messages you send are saved and will be sent once the stop is confirmed.`;
+/** ONE bound for a person's Stop card, read by BOTH writers: the recovery sweep's
+ * deferral (recovery/service.ts) and the cleanup retry (recordPersonStopCleanupPending,
+ * called from heartbeat/recovery.ts). Measured from nativeCancellation.recordedAt. */
+export const PERSON_STOP_CARD_AFTER_MS = 5 * 60_000;
+type PersonStopRun = Parameters<typeof hasAcknowledgedNativeStopIntent>[0] & { runtimeMode: string | null };
+/** A person's acknowledged run-only Stop of a native run. */
+export function isPersonStop(run: PersonStopRun): boolean {
+  return run.status === "cancelled" && run.runtimeMode === "native" && hasAcknowledgedNativeStopIntent(run);
+}
+/** When a person's Stop card becomes due, or null: not a person's Stop, or no usable
+ * Stop time (missing, invalid or future recordedAt), which earns no grace. */
+export function personStopCardBoundAt(run: PersonStopRun, now = Date.now()): number | null {
+  if (!isPersonStop(run)) return null;
+  const recordedAt = (run.resultJson?.nativeCancellation as Record<string, unknown> | undefined)?.recordedAt;
+  const at = typeof recordedAt === "string" ? Date.parse(recordedAt) : NaN;
+  return Number.isFinite(at) && at <= now ? at + PERSON_STOP_CARD_AFTER_MS : null;
+}
 const STOP_PENDING_ACTION = `Stop pending (execution_stop_pending): ${STOP_PENDING_FINDING} ` +
   "Recovery retained this task's claims and escalated the failed inspection to the board. " +
   "Inspect the bound runs and use the owning agent's Stop/cleanup controls. If its Stop work is parked, inspect its evidence before using the agent's Retry. " +
@@ -30,7 +53,11 @@ type StopPending = {
   checkedAt: string;
   standalone: boolean;
   previousNextAction: string | null;
+  /** adopt-stopu-card2: a person's Stop; the card carries STOP_PENDING_PERSON_ACTION. */
+  personStop?: true;
 };
+const stopPendingCopy = (pending: Pick<StopPending, "personStop"> | null | undefined) =>
+  pending?.personStop ? STOP_PENDING_PERSON_ACTION : STOP_PENDING_ACTION;
 /** Recorded requests, not a terminal status or a paused assignee, establish intent. */
 export function hasRecordedStopRequest(run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">): boolean {
   const result = run.resultJson ?? {};
@@ -70,8 +97,10 @@ export function hasTaskStopPending(action: { evidence: Record<string, unknown> }
  * Read-model copy (for example an exhausted workspace) remains secondary, not
  * a replacement for this independent obligation. Do not duplicate saved copy. */
 export function withTaskStopPendingInstruction(action: { evidence: Record<string, unknown> }, nextAction: string): string {
-  if (!hasTaskStopPending(action) || nextAction.includes(STOP_PENDING_ACTION)) return nextAction;
-  return `${STOP_PENDING_ACTION}\n\n${nextAction}`;
+  if (!hasTaskStopPending(action)) return nextAction;
+  const copy = stopPendingCopy(action.evidence.stopPending as StopPending);
+  if (nextAction.includes(copy)) return nextAction;
+  return `${copy}\n\n${nextAction}`;
 }
 function stopPending(action: typeof issueRecoveryActions.$inferSelect): StopPending | null {
   const value = action.evidence.stopPending;
@@ -122,7 +151,14 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   if (await laterSuccessfulTaskRun(tx, { ...input, runIds })) return;
   let existing = await activeAction(tx, input);
   const prior = existing && stopPending(existing);
-  if (prior && JSON.stringify(prior.runIds) === JSON.stringify(runIds) && existing!.nextAction.includes(STOP_PENDING_CODE)) return;
+  // One card per binding, whichever writer comes first (no double card).
+  if (prior && JSON.stringify(prior.runIds) === JSON.stringify(runIds) && existing!.nextAction.includes(stopPendingCopy(prior))) return;
+  // adopt-stopu-card2: the copy follows the bound runs, not the writer, so every
+  // writer of this card (sweep, stranded escalation, cleanup retry) says the same.
+  const boundRuns = await tx.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, runIds)));
+  const personStop = runIds.length > 0 && boundRuns.length === runIds.length && boundRuns.every(isPersonStop);
+  const copy = personStop ? STOP_PENDING_PERSON_ACTION : STOP_PENDING_ACTION;
   const now = new Date();
   await notify(tx, input);
   // A different binding is a different hold. Retain the old standalone record
@@ -134,24 +170,24 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
     existing = undefined;
   }
   const previousNextAction = existing
-    ? (prior && existing.nextAction.endsWith(STOP_PENDING_ACTION) ? prior.previousNextAction : existing.nextAction)
+    ? (prior && existing.nextAction.endsWith(stopPendingCopy(prior)) ? prior.previousNextAction : existing.nextAction)
     : null;
   const pending: StopPending = { schema: STOP_PENDING_SCHEMA, code: STOP_PENDING_CODE, owner: input.source, runIds,
     escalation: "board", automaticAttemptsExhausted: true, attemptCount: 1, maxAttempts: 1,
-    checkedAt: now.toISOString(), standalone: !existing, previousNextAction };
+    checkedAt: now.toISOString(), standalone: !existing, previousNextAction, ...(personStop ? { personStop: true as const } : {}) };
   let actionId: string;
   if (existing) {
     // Do not consume, resolve or replace a stronger recovery obligation. Only
     // annotate its existing task-visible state; its owner and budget stay intact.
     await tx.update(issueRecoveryActions).set({ evidence: { ...existing.evidence, stopPending: pending },
-      nextAction: previousNextAction ? `${previousNextAction}\n\n${STOP_PENDING_ACTION}` : STOP_PENDING_ACTION, updatedAt: now,
+      nextAction: previousNextAction ? `${previousNextAction}\n\n${copy}` : copy, updatedAt: now,
     }).where(eq(issueRecoveryActions.id, existing.id));
     actionId = existing.id;
   } else {
     const [created] = await tx.insert(issueRecoveryActions).values({ companyId: input.companyId, sourceIssueId: input.issueId,
       kind: "active_run_watchdog", status: "escalated", ownerType: "board", cause: STOP_PENDING_CODE,
       fingerprint: `${STOP_PENDING_CODE}:${runIds.join(":")}`, evidence: { runId: runIds[0], stopPending: pending },
-      nextAction: STOP_PENDING_ACTION, attemptCount: 1, maxAttempts: 1, lastAttemptAt: now, outcome: "escalated",
+      nextAction: copy, attemptCount: 1, maxAttempts: 1, lastAttemptAt: now, outcome: "escalated",
     }).returning({ id: issueRecoveryActions.id });
     actionId = created!.id;
   }
@@ -182,8 +218,8 @@ export async function clearTaskStopPending(tx: Db, input: TaskBinding & { answer
   } else {
     const { stopPending: _pending, ...evidence } = existing.evidence;
     await tx.update(issueRecoveryActions).set({ evidence, updatedAt: now,
-      nextAction: existing.nextAction.endsWith(STOP_PENDING_ACTION)
-        ? pending.previousNextAction ?? "" : existing.nextAction.replace(STOP_PENDING_ACTION, "").trim(),
+      nextAction: existing.nextAction.endsWith(stopPendingCopy(pending))
+        ? pending.previousNextAction ?? "" : existing.nextAction.replace(stopPendingCopy(pending), "").trim(),
     }).where(eq(issueRecoveryActions.id, existing.id));
   }
   await logActivity(tx, { companyId: input.companyId, actorType: "system", actorId: "recovery",
@@ -194,7 +230,7 @@ export async function clearTaskStopPending(tx: Db, input: TaskBinding & { answer
   }, publications);
 }
 
-type StoppedRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "nativeIssueId" | "issueId" | "resultJson">;
+type StoppedRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "nativeIssueId" | "issueId" | "resultJson" | "runtimeMode">;
 const runIssueId = (run: StoppedRun & { contextSnapshot?: Record<string, unknown> | null }) => {
   const id = run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId;
   return typeof id === "string" ? id : null;
@@ -205,7 +241,11 @@ const runIssueId = (run: StoppedRun & { contextSnapshot?: Record<string, unknown
  * Non-person stops keep the ordinary cleanup escalation. */
 export async function recordPersonStopCleanupPending(db: Db, run: StoppedRun & { contextSnapshot?: Record<string, unknown> | null }) {
   const issueId = runIssueId(run);
-  if (!issueId || run.status !== "cancelled" || !hasAcknowledgedNativeStopIntent(run)) return false;
+  if (!issueId || !isPersonStop(run)) return false;
+  // adopt-stopu-card2: the SAME bound as the sweep's deferral. Before it, the sweep
+  // owns the (re)check and cards at the bound; no card from this writer earlier.
+  const bound = personStopCardBoundAt(run);
+  if (bound !== null && Date.now() < bound) return false;
   const publications: ActivityPublication[] = [];
   const recorded = await db.transaction(async tx => {
     const [task] = await tx.select({ id: issues.id }).from(issues).where(and(
