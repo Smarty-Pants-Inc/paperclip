@@ -217,6 +217,7 @@ import type { instanceSettingsService } from "../instance-settings.js";
 import type { createRunDispatch } from "../../modules/run-dispatch/index.js";
 import { hasRetainedExternalChatRetry, type PostCommitEffect as WakeQueuePostCommitEffect, type createWakeQueue } from "../../modules/wake-queue/index.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
+import { retryUnlessTransactionBound } from "../transaction-retry.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type QueuedRunCandidate = Pick<HeartbeatRun, "id" | "companyId" | "agentId" | "status" | "invocationSource" | "createdAt"
@@ -267,6 +268,8 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   cancelActiveForAgentInternal: (agentId: string, reason: string) => Promise<unknown>;
   resumeExecutionWaitComments: (scope?: DeferredReceiptRecoveryOptions) => Promise<unknown>;
   resumeQueuedCommentInterrupt: (companyId: string, queueId: string) => Promise<unknown>;
+  /** The native run this Interrupt stopped has proven it can no longer write. */
+  queuedCommentInterruptTargetStopped?: (companyId: string, queueId: string) => Promise<boolean>;
   resumeSavedLegacyComments: (companyId: string, queueId: string) => Promise<unknown>;
   formatIssueIdentifierLink: (identifier: string | null, fallback: string) => string;
 }
@@ -486,6 +489,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     resumeExecutionWaitComments,
     getWorktreeExecutionCutoff,
     resumeQueuedCommentInterrupt,
+    queuedCommentInterruptTargetStopped,
     resumeSavedLegacyComments,
     cancelActiveForAgentInternal,
     listCompanyAgentOrgRows,
@@ -2058,6 +2062,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments(scope);
     const cutoff = await getWorktreeExecutionCutoff();
+    // S8q: the age gate waits out a run that may still write. An exact hint for
+    // an Interrupt whose stopped run has finished teardown needs no wait; every
+    // other wake keeps the gate, and admission still rechecks under its locks.
+    const stoppedInterrupt = scope.companyId && scope.requestId && queuedCommentInterruptTargetStopped
+      ? await queuedCommentInterruptTargetStopped(scope.companyId, scope.requestId) : false;
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
       .where(and(scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
@@ -2065,7 +2074,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(companies.status, "active"),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
-        lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
+        stoppedInterrupt ? undefined : lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const wake of pendingInterrupts) {
@@ -3523,7 +3532,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const issueActivityPublications: ActivityPublication[] = [];
       const issuePostCommitActions: IssuePostCommitAction[] = [];
 
-      const outcome = await db
+      // The wake insert sites below run in this one admission transaction. A
+      // deadlock (40P01) or serialization failure (40001) rolls all of it
+      // back, so the admission is retried from a fresh transaction with the
+      // same request (same comment, idempotency key and receipt), bounded by
+      // withTransactionRetry. A person's message is never dropped on a lost
+      // lock race (Hold50 RFL: the route's fire-and-forget wakeup only logs).
+      const contextBeforeAdmission = { ...enrichedContextSnapshot };
+      const payloadBeforeAdmission = payload;
+      const operatorBeforeAdmission = operatorResponsibleUserId;
+      const outcome = await retryUnlessTransactionBound(db, async attempt => {
+        if (attempt > 1) {
+          cancelledRunsToEmit.length = 0;
+          issueActivityPublications.length = 0;
+          issuePostCommitActions.length = 0;
+          for (const key of Object.keys(enrichedContextSnapshot)) delete enrichedContextSnapshot[key];
+          Object.assign(enrichedContextSnapshot, contextBeforeAdmission);
+          payload = payloadBeforeAdmission;
+          operatorResponsibleUserId = operatorBeforeAdmission;
+          logger.warn({ agentId, issueId, attempt }, "wake admission lost a lock race; retrying from a fresh transaction");
+        }
+        return db
         .transaction(withDurableChatAdmission(durableRequest, async (tx) => {
           await lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent);
           await tx.execute(
@@ -5314,6 +5343,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "deferred" as const };
           throw error;
         });
+      });
 
       // The admission has committed. What follows is dispatch of saved rows.
       if (outcome.kind !== "deferred" && outcome.kind !== "skipped") admission?.saved();

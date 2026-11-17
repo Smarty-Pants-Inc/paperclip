@@ -77,12 +77,52 @@ describe("humanizeSystemNotice", () => {
     expect(result.title).toBe("Task could not continue");
   });
 
-  it("humanizes the current recovery notice saved without a presentation title", () => {
-    const result = humanizeSystemNotice({
-      body: "Paperclip tried to continue this task again, but it still could not continue. "
-        + "Press Retry to start it again from the saved work.",
-    });
-    expect(result).toEqual({ title: "Task could not continue", tone: "warning" });
+  it.each([
+    "Paperclip could not start this task. Press Retry to start it.",
+    "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
+    "Paperclip tried to start this task again, but it still could not start after 2 tries. Press Retry to start it again.",
+    "Paperclip tried to continue this task again, but it still could not continue. Press Retry to start it again from the saved work.",
+  ])("humanizes the current recovery notice saved without a presentation title: %s", (body) => {
+    expect(humanizeSystemNotice({ body })).toEqual({ title: "Task could not continue", tone: "warning" });
+    expect(humanizeSystemNotice({
+      body: `${body}\n\n- Recovery owner: [Dana the Manager](/PAP/agents/agent-9)`,
+    })).toEqual({ title: "Task paused — waiting on Dana the Manager", tone: "warning" });
+    expect(humanizeSystemNotice({
+      body,
+      presentation: { kind: "system_notice", title: "Automatic recovery blocked", tone: "danger", detailsDefaultOpen: false },
+    })).toEqual({ title: "Automatic recovery blocked", tone: "danger" });
+  });
+
+  // Keep: all default/classified titles emitted by stranded-notice.ts must
+  // survive, while the same single-attempt bodies still work without one.
+  it.each([
+    "Automatic recovery blocked",
+    "Error: usage limit reached",
+    "Error: not logged in to Claude",
+    "Error: agent login required",
+  ].flatMap(title => [
+    "Paperclip could not start this task. Press Retry to start it.",
+    "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
+  ].map(body => ({ title, body }))))("one-note4: humanizes $title / $body", ({ title, body }) => {
+    expect(humanizeSystemNotice({
+      body,
+      presentation: { kind: "system_notice", title, tone: "danger", detailsDefaultOpen: false },
+    })).toEqual({ title, tone: "danger" });
+    expect(humanizeSystemNotice({ body })).toEqual({ title: "Task could not continue", tone: "warning" });
+  });
+
+  it.each([
+    // CONTINUATION_REFUSED_NOTICE in server/src/services/recovery/service.ts.
+    "Paperclip could not continue this task on its own. The earlier Retry or message no longer matches the task, "
+      + "for example because the task or the message changed since. Nothing was lost. Press Retry to continue.",
+    // Successful-run disposition escalation, not stranded execution recovery.
+    "Paperclip could not resolve this issue's missing disposition automatically. The source assignment is unchanged and a board decision is required.",
+    "Child task report: Paperclip could not continue this task. Press Retry to start it again from the saved work.",
+  ])("does not humanize an unrelated could-not notice as stranded recovery: %s", (body) => {
+    const result = humanizeSystemNotice({ body });
+    expect(result.title).toBe("System update");
+    expect(result.tone).toBe("neutral");
+    expect(result.detail).toBeDefined();
   });
 
   it("falls back to System update plus a truncated first sentence", () => {

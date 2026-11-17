@@ -217,6 +217,43 @@ describePostgres("heartbeat recovery module ownership", () => {
     return (await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, invocationSource: "automation", status: "running", runtimeMode: "legacy" }).returning())[0];
   }
 
+  // Keep: data safety at the sweep entry, including recorded orphan teardown.
+  it.each((["ephemeral", "reuse_by_environment"] as const).flatMap(leasePolicy =>
+    [true, false].map(flagged => ({ leasePolicy, flagged }))))(
+    "nativeHarnessBackupMissing sweep refuses $leasePolicy destruction only when flagged=$flagged", async ({ leasePolicy, flagged }) => {
+      const run = await seedRun(), environmentId = randomUUID();
+      await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+      const marker = { runId: run.id, sessionId: "pi-session", sessionRootDigest: "a".repeat(64), reason: "close_failed", at: new Date().toISOString() };
+      const [lease] = await db.insert(environmentLeases).values({ companyId: run.companyId, environmentId,
+        heartbeatRunId: run.id, provider: "fixture", providerLeaseId: `box-${run.id}`, status: "pending_cleanup", leasePolicy,
+        metadata: { driver: "sandbox", ...(flagged ? { nativeHarnessBackupMissing: marker } : {}) } }).returning();
+      const deps = callbacks(db);
+      const teardown = vi.fn(async () => ({ providerLeaseId: lease.providerLeaseId, state: "destroyed" }));
+      const destroy = vi.fn(async () => environmentService(db).releaseLease(lease.id, "expired", { cleanupStatus: "success" }));
+      deps.environmentRuntime = { ...deps.environmentRuntime, retryPendingSandboxTeardown: teardown,
+        destroyRunLease: destroy, isPendingCleanupWorkerReady: async () => true };
+      try {
+        const result = await createHeartbeatRecovery(db, deps).sweepPendingCleanupLeases({ backoffMs: 0 });
+        expect(result.destroyed).toBe(flagged ? 0 : 1);
+        if (flagged) {
+          expect(teardown).not.toHaveBeenCalled(); expect(destroy).not.toHaveBeenCalled();
+          expect((await environmentService(db).getLeaseById(lease.id))!).toMatchObject({ status: "pending_cleanup",
+            metadata: { nativeHarnessBackupMissing: marker } });
+        } else {
+          expect(teardown.mock.calls.length + destroy.mock.calls.length).toBe(1);
+          expect((await environmentService(db).getLeaseById(lease.id))!.status).toBe("expired");
+        }
+      } finally {
+        await db.delete(environmentLeases).where(eq(environmentLeases.id, lease.id));
+        await db.delete(environments).where(eq(environments.id, environmentId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+        await db.delete(issues).where(eq(issues.id, run.issueId!));
+        await db.delete(agents).where(eq(agents.id, run.agentId));
+        await db.delete(companies).where(eq(companies.id, run.companyId));
+      }
+    },
+  );
+
   it.each(["unlaunched", "dispatched", "reassigned", "ambiguous"] as const)("claims the same expired portable preparation only with its original task lock (%s)", async state => {
     const run = await seedRun(), deps = callbacks(db);
     const environmentId = randomUUID(), leaseId = randomUUID();

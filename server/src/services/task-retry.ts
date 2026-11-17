@@ -59,6 +59,9 @@ const taskRetryIntentSchema = z.object({
   chatActionId: z.string().uuid().optional(), canonicalIntentId: z.string().uuid().optional(),
   queuedChatRequestId: z.string().uuid().optional(),
   initiatedBy: z.enum(["restart_recovery", "provider_limit_reset"]).optional(),
+  /** Filed by the budget resume for the board member who chose Raise budget and
+   * resume; it keeps that person's authority, but nobody pressed it now. */
+  resumedBy: z.literal("budget_resume").optional(),
   boardMessageOrigin: z.object({ commentId: z.string().uuid(), identityContextId: z.string().uuid() }).optional(),
 });
 export type TaskRetryIntent = z.infer<typeof taskRetryIntentSchema>;
@@ -249,6 +252,9 @@ type TaskRetryRequest = {
   /** Paperclip requests the user's Retry itself: after a restart lost an
    * unstarted turn, or once a provider usage limit it waited on has reset. */
   initiatedBy?: "restart_recovery" | "provider_limit_reset";
+  /** The budget resume files the board member's Retry with their authority;
+   * recorded so it is not mistaken for a person's click (it is automatic). */
+  resumedBy?: "budget_resume";
   prepareChatRetry?: (tx: Db, scope: { companyId: string; issueId: string; agentId: string;
     failedRunId: string; initiatedByUserId: string; retryIntentId?: string }) => Promise<{ actionId: string }>;
 };
@@ -425,7 +431,8 @@ function admitTaskRetry(input: TaskRetryRequest) {
       ...(active && activeIntent?.chatActionId ? { chatActionId: activeIntent.chatActionId } : {}),
       ...(active && activeIntent?.queuedChatRequestId ? { queuedChatRequestId: activeIntent.queuedChatRequestId } : {}),
       ...(active ? { canonicalIntentId: active.id } : {}),
-      ...(input.initiatedBy && !active ? { initiatedBy: input.initiatedBy } : {}) };
+      ...(input.initiatedBy && !active ? { initiatedBy: input.initiatedBy } : {}),
+      ...(input.resumedBy && !active ? { resumedBy: input.resumedBy } : {}) };
     // Preserve external chat authority through its existing admission owner.
     // Generic board Retry must never manufacture a chat-inbound request.
     const [chat] = await tx.select({ id: chatConversations.id }).from(chatConversations)

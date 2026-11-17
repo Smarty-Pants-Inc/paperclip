@@ -168,7 +168,7 @@ describe("InstanceGeneralSettings sign-out", () => {
     expect(toggle).not.toBeNull();
     flushSync(() => toggle?.click());
     await vi.waitFor(() => expect(mockInstanceSettingsApi.updateGeneral.mock.calls[0]?.[0]).toEqual(
-      { taskListsShowAgentCreatedByDefault: true },
+      { taskListsShowAgentCreatedByDefault: false },
     ));
   });
 

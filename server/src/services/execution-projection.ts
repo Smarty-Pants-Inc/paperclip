@@ -26,6 +26,7 @@ import { agentQueueLinesForRuns } from "./heartbeat/queued-run-line.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE } from "./native-runtime/completed-turn-cleanup.js";
 import { NATIVE_CLEANUP_HOLD_CAUSE, NATIVE_CLEANUP_HOLD_NEXT_ACTION, nativeCleanupAdmissionBlock }
   from "./native-runtime/native-cleanup-admission-hold.js";
+import { isAcknowledgedLegacyUserStop, runStopPresentationJson } from "./run-cancellation.js";
 const MAX_PREDECESSOR_CLEANUP_CHECKS = 16;
 const ANOTHER_ROUTINE_TASK = "another task in this routine";
 const text = (v: unknown) => (typeof v === "string" ? v : null);
@@ -55,7 +56,7 @@ const executionRunColumns = {
     'failureRetriesBeforeAiConnectionWait', ${heartbeatRuns.contextSnapshot}->'failureRetriesBeforeAiConnectionWait',
     'failureRetriesBeforeWorkspaceWait', ${heartbeatRuns.contextSnapshot}->'failureRetriesBeforeWorkspaceWait',
     'executionRetryAccounting', ${heartbeatRuns.contextSnapshot}->'executionRetryAccounting')`,
-  resultJson: sql<Record<string, unknown>>`jsonb_build_object(
+  resultJson: sql<Record<string, unknown>>`${runStopPresentationJson(heartbeatRuns.resultJson)} || jsonb_build_object(
     'finalizationPhase', ${heartbeatRuns.resultJson}->'finalizationPhase',
     'finalizationReasonCode', ${heartbeatRuns.resultJson}->'finalizationReasonCode')`,
 };
@@ -555,6 +556,11 @@ export function projectExecution(
       return set("waiting_for_answer", "Waiting for a reply");
     }
     return set("completed", "Completed");
+  }
+  if (isAcknowledgedLegacyUserStop(run)) {
+    projection.cause = null;
+    projection.nextAction = "Send a new message to continue from saved work.";
+    return set("completed", "Stopped");
   }
   if (["failed", "cancelled", "timed_out", "interrupted"].includes(run.status))
     return set("failed", run.status === "cancelled" ? "Cancelled" : "Failed");

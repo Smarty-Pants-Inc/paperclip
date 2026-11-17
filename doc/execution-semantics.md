@@ -1631,6 +1631,8 @@ lease row for that sandbox is no longer active or retained, the host has given t
 sandbox up: the warm owner is released and the next run on the task prepares its
 instructions fresh. A follow-up whose predecessor's warm instruction copy cannot be
 handed off retires that owner and prepares fresh instead of failing.
+A failed close that releases its owner without a backup, or exhausts its retries,
+sets `nativeHarnessBackupMissing` on its exact lease: destroy is refused; stop keeps the disk.
 
 A remote runner also keeps working while its controller is offline, and the host
 reattaches it within the remote runner reconnect grace (7 minutes). Daytona counts
@@ -3065,6 +3067,21 @@ present the turn, so its answer is still posted. Background presentation recover
 restart between the status commit and the live presentation posts the held
 turn's answer once, or records that its card presented the turn.
 
+The unanswered-person-message sweep and continuation input selection share one
+answer rule. A published agent reply after the person's message answers input
+carried by that run or an ancestor on its continuation chain. A pending or
+answered card on that chain also answers its carried input; answering the card
+does not reopen the original message. An answer-resume links back through its
+answered interaction or durable question-response delivery. A native status
+continuation links through its applied decision's materialized continuation or
+retry effect and the wake bound to the successor. These links stay company- and
+task-scoped. A shared session, an unrelated later run, provider
+acceptance without a published response, or a run-less comment is not an answer.
+A later chain answer supersedes an existing unanswered-message notice, even if
+an intermediate run failed. A proven pending continuation keeps a waiting note,
+not resend text, until it starts or terminates. This attribution does not change
+automatic retry budgets or the ordinary first-start bounds.
+
 A delegated-task completion callback can finish native execution before its
 accepted final reply is saved. The completion outbox must retain that callback's
 queued target and attempt while the existing presentation selector finds pending
@@ -3469,6 +3486,8 @@ without first trying to resume, and its transcript shows the session as started
 rather than resumed. A failure before the result is accepted, a backup that
 saves after a retry, a retained sandbox, an SSH host, and records saved without
 the key keep the resume path described next.
+For retained disks, a later successful server backup of the same session clears
+`nativeHarnessBackupMissing`; an older backup or another session does not clear it.
 
 A Runner that keeps no control-plane state for the saved session (none is live
 and no archived authority epoch matches it) reports a typed refusal. This
@@ -4553,7 +4572,7 @@ Real gates still apply: company and task ownership, active provider ownership, b
 
 A source that already stopped and was released remains fenced until its export settles; restart reconciliation scans these released sources too. Both provider reuse and destruction check the physical allocation for a shutdown fence or file-repair pin, including historical lease rows.
 
-An operator Stop waits for provider termination. Remote sandbox providers may return a stopped/deleted receipt after their control-plane operation completes. Paperclip binds that receipt to the company, run, and exact lease; successful file cleanup, a terminal run row, or an in-sandbox shutdown event is not sufficient. Legacy conversational runs and native runs with an audited run-only Stop receive their shared cancellation acknowledgement after all remote leases have confirmed termination. A native interrupt acknowledgement alone does not establish containment. Workspace preservation remains a separate obligation and its recovery hold survives this acknowledgement. Stop alone never creates a continuation. A user message queued during remote cleanup is reconsidered when the provider confirms termination; it still passes normal admission and adopts pending comment IDs in order. Once stopped, the next explicit wake uses the same queue. A compatible saved ACP session can resume, and an unavailable or incompatible session can start fresh with the full task context. Run credentials and scratch paths remain scoped to the new run. A subtree pause requires Resume; a message does not bypass it.
+An operator Stop waits for provider termination. Remote sandbox providers may return a stopped/deleted receipt after their control-plane operation completes. Paperclip binds that receipt to the company, run, and exact lease; successful file cleanup, a terminal run row, or an in-sandbox shutdown event is not sufficient. Legacy conversational runs and native runs with an audited run-only Stop receive their shared cancellation acknowledgement after all remote leases have confirmed termination. A native interrupt acknowledgement alone does not establish containment. Workspace preservation remains a separate obligation and its recovery hold survives this acknowledgement. Stop alone never creates a continuation. In an Agent Chat this holds too: a person's Stop sends none of the messages waiting behind the stopped turn. They stay listed as one queue, in the order sent, with the line "Stopped. These messages are waiting: Send them, or delete any first." The chat owner's Send (`POST /api/issues/:id/queued-comments/interrupt`) starts one turn with the messages still waiting, each once and in order; a paused agent or a chat pause hold refuses Send with its reason and runs nothing. A user message queued during remote cleanup is reconsidered when the provider confirms termination; it still passes normal admission and adopts pending comment IDs in order. Once stopped, the next explicit wake uses the same queue. A compatible saved ACP session can resume, and an unavailable or incompatible session can start fresh with the full task context. Run credentials and scratch paths remain scoped to the new run. A subtree pause requires Resume; a message does not bypass it.
 
 Native workspace finalization can complete after an operator Stop has cancelled
 its run. The accepted provider result and saved-file receipts remain available,

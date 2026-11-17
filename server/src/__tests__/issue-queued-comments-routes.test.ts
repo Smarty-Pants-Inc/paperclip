@@ -37,6 +37,9 @@ import { remoteTerminationReceipt } from "../services/remote-execution-terminati
 import { initializeRunIdentity, reconcileSteeredIdentity } from "../services/run-identity.js";
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import { claimFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { registerDeferredReceiptWork } from "../services/heartbeat/deferred-receipt-work.js";
+import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../services/deferred-execution-notifications.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -198,6 +201,58 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     })));
     return { companyId, agentId, issueId, runId, wakeId, commentIds };
   }
+
+  async function seedChatTail(bodies: string[]) {
+    const f = await seedQueue();
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" })
+      .where(eq(issues.id, f.issueId));
+    const commentIds = [...f.commentIds, randomUUID()];
+    await db.insert(issueComments).values({ id: commentIds[2], companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "queue-owner", body: bodies[2] });
+    const wakeIds = [f.wakeId, randomUUID(), randomUUID()];
+    for (const [index, id] of commentIds.entries()) {
+      await db.update(issueComments).set({ body: bodies[index] }).where(eq(issueComments.id, id));
+      const wake = { companyId: f.companyId, agentId: f.agentId, source: "issue_comment",
+        status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "queue-owner",
+        requestedAt: new Date(`2026-08-22T15:0${index + 1}:00.000Z`),
+        // Reverse creation order to prove that requestedAt owns delivery order.
+        createdAt: new Date(`2026-08-22T15:1${3 - index}:00.000Z`),
+        payload: { issueId: f.issueId, commentId: id,
+          _paperclipWakeContext: { commentId: id, wakeCommentId: id, wakeCommentIds: [id] } } };
+      if (index === 0) await db.update(agentWakeupRequests).set(wake).where(eq(agentWakeupRequests.id, f.wakeId));
+      else await db.insert(agentWakeupRequests).values({ id: wakeIds[index], ...wake });
+    }
+    return { ...f, commentIds, wakeIds };
+  }
+
+  it("lists the chat tail across /new and marks the reset and every message behind it", async () => {
+    const f = await seedChatTail(["A", "/new", "B"]);
+    const response = await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    expect(response.body.entries.map((entry: any) => entry.comment.id)).toEqual(f.commentIds);
+    expect(response.body.entries.map((entry: any) => entry.behindReset)).toEqual([false, true, true]);
+    expect(response.body.entries.slice(1).map((entry: any) => entry.queueId)).toEqual(f.wakeIds.slice(1));
+    expect(response.body.entries.slice(1).every((entry: any) => typeof entry.queueRevision === "string" && entry.queueRevision.length > 0)).toBe(true);
+  });
+
+  it("deletes only B using the later chat entry's own queue identity and revision", async () => {
+    const f = await seedChatTail(["A", "B", "C"]);
+    const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+    const before = (await request(client).get(path).expect(200)).body;
+    expect(before.entries.map((entry: any) => entry.comment.body)).toEqual(["A", "B", "C"]);
+    const b = before.entries[1];
+    expect(b.queueId).toBe(f.wakeIds[1]);
+    await request(client).delete(`${path}/${b.comment.id}`)
+      .send({ queueId: b.queueId, revision: b.queueRevision }).expect(200);
+    const after = (await request(client).get(path).expect(200)).body;
+    expect(after.entries.map((entry: any) => entry.comment.body)).toEqual(["A", "C"]);
+    expect(after.queueId).toBe(before.queueId);
+    expect(after.revision).toBe(before.revision);
+    const wakes = await db.select().from(agentWakeupRequests);
+    expect(wakes.find(wake => wake.id === f.wakeIds[1])?.status).toBe("cancelled");
+    expect(wakes.filter(wake => wake.id === f.wakeIds[0] || wake.id === f.wakeIds[2]).map(wake => wake.status))
+      .toEqual(["deferred_issue_execution", "deferred_issue_execution"]);
+    expect((await db.select().from(issueComments)).filter(comment => !comment.deletedAt).map(comment => comment.body).sort()).toEqual(["A", "C"]);
+  });
 
   async function commitNativeSuccess(f: Awaited<ReturnType<typeof seedQueue>>) {
     const contractId = randomUUID(), resultId = randomUUID();
@@ -993,13 +1048,421 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     },
   );
 
-  async function seedFirstTurnQueue(runtime: "preparing" | "native") {
+  // S8q: Interrupt on a native turn. The successor must start when the stopped
+  // run's teardown ends (its end-of-teardown hint), never while it can write,
+  // and not after the 30 s fallback age gate.
+  it("starts one successor for an interrupted native turn as soon as its teardown ends", async () => {
+    const seeded = await seedQueue();
+    await db.update(heartbeatRuns).set({ nativeIssueId: seeded.issueId, responsibleUserId: "queue-owner" })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: seeded.companyId,
+      issueId: seeded.issueId, runId: seeded.runId, phase: "observed" });
+    // Hold the successor in the ordinary queue without launching a provider.
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, seeded.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
+      status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const successors = async () => (await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, seeded.companyId)))
+      .filter(run => run.id !== seeded.runId && run.contextSnapshot?.issueId === seeded.issueId);
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    const work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true);
+    try {
+      await work.ready;
+      const client = app(seeded.companyId);
+      const queue = await request(client).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+      const pressedAt = Date.now();
+      const pressed = await request(client).post(`/api/issues/${seeded.issueId}/queued-comments/interrupt`).send({
+        queueId: seeded.wakeId, targetRunId: seeded.runId, revision: queue.body.revision,
+      });
+      expect(pressed.status, JSON.stringify(pressed.body)).toBe(200);
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+      expect(stopped.status).toBe("cancelled");
+      expect(stopped.resultJson).toMatchObject({ queuedCommentInterruptQueueId: seeded.wakeId, cancelledByUserId: "queue-owner" });
+      // The runner acknowledged the Stop, but its teardown (checkpoint + force
+      // stop) still owns the session: the coordinator lease is held.
+      // The provider child (modelled by this live process) can still write.
+      await db.update(heartbeatRuns).set({ processPid: process.pid, processGroupId: null, resultJson: { ...stopped.resultJson,
+        nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: seeded.runId,
+          companyId: seeded.companyId, issueId: seeded.issueId, scope: "run", reasonCode: "cancellation_run_only",
+          dispatchState: "acknowledged", dispatched: true, intentAuditId: "intent", acknowledgementAuditId: "ack" } },
+      }).where(eq(heartbeatRuns.id, seeded.runId));
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: "teardown-owner" })
+        .where(eq(nativeRunFinalizations.runId, seeded.runId));
+      await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: seeded.companyId }));
+      await new Promise(resolve => setTimeout(resolve, 750));
+      // (i) Nothing starts while the old run can still write.
+      expect(await successors()).toEqual([]);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].status)
+        .toBe("deferred_issue_execution");
+      // Teardown ends: the controller releases the session and the runner
+      // records the provider's stop; that release emits the deferred-work hint.
+      const teardownEndedAt = Date.now();
+      await db.transaction(async tx => {
+        await tx.update(nativeRunFinalizations).set({ leaseOwner: null }).where(eq(nativeRunFinalizations.runId, seeded.runId));
+        await tx.update(heartbeatRuns).set({ processPid: 999_999_999 }).where(eq(heartbeatRuns.id, seeded.runId));
+        // The release emitters' company hint plus their exact per-wake hints.
+        await notifyDeferredExecutionWork(tx, { companyId: seeded.companyId });
+        await notifyDeferredWakesForIssue(tx, { companyId: seeded.companyId, issueId: seeded.issueId });
+      });
+      // (ii) The successor exists within seconds of teardown end, well inside
+      // the 30 s fallback age gate that the press just reset.
+      await vi.waitFor(async () => {
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].status)
+          .toBe("coalesced");
+      }, { timeout: 5_000, interval: 50 });
+      expect(Date.now() - teardownEndedAt).toBeLessThan(5_000);
+      expect(Date.now() - pressedAt).toBeLessThan(10_000);
+      // (iii) Exactly one successor carries the queued messages, once.
+      await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: seeded.companyId, requestId: seeded.wakeId }));
+      await heartbeatService(db).resumeQueuedCommentInterrupt(seeded.companyId, seeded.wakeId);
+      const [successor, ...extra] = await successors();
+      expect(extra).toEqual([]);
+      expect(successor.contextSnapshot?.wakeCommentIds).toEqual(seeded.commentIds);
+      // (iv) A second press with nothing to target answers plainly.
+      const after = await request(client).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+      const second = await request(client).post(`/api/issues/${seeded.issueId}/queued-comments/interrupt`).send({
+        queueId: seeded.wakeId, targetRunId: null, revision: after.body.revision,
+      });
+      expect(second.status, JSON.stringify(second.body)).toBe(409);
+      expect(second.body).toMatchObject({ error: "Nothing is waiting.", code: "queued_comment_not_pending",
+        details: { reason: "nothing_waiting" } });
+      expect(await successors()).toHaveLength(1);
+    } finally { await work.stop(); }
+  });
+
+  // Independent judge: separate controller and process barriers on the real HTTP path.
+  it("JUDGE S8q holds each writer barrier and dispatches exactly once after both retire", async () => {
+    const f = await seedQueue();
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId, responsibleUserId: "queue-owner" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "observed" });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const client = app(f.companyId);
+    const queue = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId: f.wakeId, targetRunId: f.runId, revision: queue.body.revision }).expect(200);
+    const [cancelled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+    testProcesses.set(f.runId, child);
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    await db.update(heartbeatRuns).set({ processPid: child.pid!, processGroupId: null, resultJson: { ...cancelled.resultJson,
+      nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId, issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true, intentAuditId: "judge-intent", acknowledgementAuditId: "judge-ack" } } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: "judge-held-controller" }).where(eq(nativeRunFinalizations.runId, f.runId));
+    const successors = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => r.id !== f.runId && r.contextSnapshot?.issueId === f.issueId);
+    const service = heartbeatService(db);
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+    const work = service.registerDeferredReceiptWork(coordinator, () => true);
+    try {
+      await work.ready;
+      await service.resumeQueuedCommentInterrupt(f.companyId, f.wakeId);
+      expect(await successors()).toEqual([]);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId)))[0].payload?.executionWait).toMatchObject({ reason: "controller_settling" });
+      await db.update(nativeRunFinalizations).set({ leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+      await service.resumeQueuedCommentInterrupt(f.companyId, f.wakeId);
+      expect(await successors()).toEqual([]);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId)))[0].payload?.executionWait).toMatchObject({ reason: "process_running" });
+      const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
+      child.kill(); await exited; testProcesses.delete(f.runId);
+      await db.transaction(tx => notifyDeferredWakesForIssue(tx, { companyId: f.companyId, issueId: f.issueId }));
+      await vi.waitFor(async () => expect(await successors()).toHaveLength(1), { timeout: 5000, interval: 50 });
+      await Promise.all(Array.from({ length: 4 }, () => service.resumeQueuedCommentInterrupt(f.companyId, f.wakeId)));
+      const runs = await successors(); expect(runs).toHaveLength(1); expect(runs[0].contextSnapshot?.wakeCommentIds).toEqual(f.commentIds);
+    } finally { await work.stop(); }
+  });
+
+  it.each(["different queue", "agent stop", "agent stop with stale marker", "later untargeted press"])("JUDGE S8q no early dispatch for %s", async scenario => {
+    const f = await seedQueue();
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId, responsibleUserId: "queue-owner" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "observed" });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const client = app(f.companyId);
+    const queue = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId: f.wakeId, targetRunId: f.runId, revision: queue.body.revision }).expect(200);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const result = { ...stopped.resultJson, nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId, issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true, intentAuditId: "judge", acknowledgementAuditId: "judge" } } as Record<string, unknown>;
+    if (scenario === "agent stop") delete result.queuedCommentInterruptQueueId;
+    else if (scenario === "agent stop with stale marker") { result.cancelledByActorType = "agent"; delete result.cancelledByUserId; }
+    else if (scenario === "different queue") result.queuedCommentInterruptQueueId = randomUUID();
+    else {
+      const again = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+      await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId: f.wakeId, targetRunId: null, revision: again.body.revision }).expect(200);
+      const [latest] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      expect(latest.payload?.queuedCommentInterrupt).not.toHaveProperty("targetRunId");
+    }
+    await db.update(heartbeatRuns).set({ processPid: 999999999, resultJson: result }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+    const work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true);
+    try {
+      await work.ready;
+      await db.transaction(tx => notifyDeferredWakesForIssue(tx, { companyId: f.companyId, issueId: f.issueId }));
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId)))[0].status).toBe("deferred_issue_execution");
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => r.id !== f.runId && r.contextSnapshot?.issueId === f.issueId)).toEqual([]);
+    } finally { await work.stop(); }
+  });
+
+  // S8q delta: the early release is bound to THIS press's recorded target run,
+  // actor and time, in both the eligibility check and the worker's hint.
+  it("S8q releases an Interrupt early only on its own press's stopped target, in the check and the hint", async () => {
+    const f = await seedQueue();
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId, responsibleUserId: "queue-owner" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "observed" });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const client = app(f.companyId);
+    const queue = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId: f.wakeId, targetRunId: f.runId, revision: queue.body.revision }).expect(200);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [pressA] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    expect(pressA.payload?.queuedCommentInterrupt).toMatchObject({ targetRunId: f.runId });
+    // The stop proof, short of the controller's terminal phase until each read.
+    await db.update(heartbeatRuns).set({ processPid: 999999999, resultJson: { ...stopped.resultJson, nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId, issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true, intentAuditId: "s8q", acknowledgementAuditId: "s8q" } } }).where(eq(heartbeatRuns.id, f.runId));
+    const phase = (value: "observed" | "terminal_failure") => db.update(nativeRunFinalizations).set({ phase: value, leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+    const press = (payload: Record<string, unknown>) => db.update(agentWakeupRequests).set({ payload }).where(eq(agentWakeupRequests.id, f.wakeId));
+    const service = heartbeatService(db);
+    // The hint alone decides immediacy here: the stubbed check always agrees.
+    const hinted = async () => {
+      const resume = vi.fn(async (_scope: { requestId?: string }) => {});
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+      const work = registerDeferredReceiptWork(db, coordinator, { resume, interruptTargetStopped: async () => true,
+        settleTaskChat: async () => {}, createNativeBatch: () => async () => {}, schedulingSuppressed: async () => false }, () => true);
+      try {
+        await work.ready;
+        await new Promise(resolve => setTimeout(resolve, 300));
+        return resume.mock.calls.some(([scope]) => scope.requestId === f.wakeId);
+      } finally { await work.stop(); }
+    };
+    const released = async () => {
+      await phase("terminal_failure");
+      try { return [await service.queuedCommentInterruptTargetStopped(f.companyId, f.wakeId), await hinted()]; }
+      finally { await phase("observed"); }
+    };
+    await phase("observed");
+    expect(await service.queuedCommentInterruptTargetStopped(f.companyId, f.wakeId)).toBe(false);
+    expect(await released()).toEqual([true, true]);
+    // A later press that stopped nothing records no target of its own.
+    const again = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId: f.wakeId, targetRunId: null, revision: again.body.revision }).expect(200);
+    const [pressB] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    expect(pressB.status).toBe("deferred_issue_execution");
+    expect(pressB.payload?.queuedCommentInterrupt).not.toHaveProperty("targetRunId");
+    expect(await released()).toEqual([false, false]);
+    const intentA = pressA.payload!.queuedCommentInterrupt as Record<string, unknown>;
+    const at = (offset: number) => new Date(stopped.finishedAt!.getTime() + offset).toISOString();
+    // A press that targeted this run but was recorded after its stop.
+    await press({ ...pressB.payload, queuedCommentInterrupt: { ...intentA, requestedAt: at(60_000) } });
+    expect(await released()).toEqual([false, false]);
+    // A press before the stop that targeted a different run.
+    await press({ ...pressB.payload, queuedCommentInterrupt: { ...intentA, targetRunId: randomUUID(), requestedAt: at(-60_000) } });
+    expect(await released()).toEqual([false, false]);
+    // A press by someone else.
+    await press({ ...pressB.payload, queuedCommentInterrupt: { ...intentA, actorId: "someone-else" } });
+    expect(await released()).toEqual([false, false]);
+    // Control: the first press's own record releases again.
+    await press({ ...pressB.payload, queuedCommentInterrupt: intentA });
+    expect(await released()).toEqual([true, true]);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId)))[0].status).toBe("deferred_issue_execution");
+  });
+
+  it("JUDGE S8q queued-comment-interrupt key is not a database uniqueness fence", async () => {
+    const f = await seedQueue();
+    const key = `queued-comment-interrupt:${f.wakeId}`;
+    await db.insert(agentWakeupRequests).values([0, 1].map(() => ({ companyId: f.companyId, agentId: f.agentId, source: "on_demand", status: "queued", idempotencyKey: key })));
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, key))).toHaveLength(2);
+  });
+
+  it("JUDGE S8q demonstrates the interruptedLegacy SQL binding on real Postgres", async () => {
+    const f = await seedQueue();
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled", resultJson: { queuedCommentInterruptQueueId: f.wakeId } }).where(eq(heartbeatRuns.id, f.runId));
+    const query = db.select({ broken: sql<boolean>`exists (select 1 from heartbeat_runs r where r.company_id = ${agentWakeupRequests.companyId} and r.agent_id = ${agentWakeupRequests.agentId} and r.runtime_mode = 'legacy' and r.status = 'cancelled' and r.result_json->>'queuedCommentInterruptQueueId' = ${agentWakeupRequests.id}::text)`,
+      qualified: sql<boolean>`exists (select 1 from heartbeat_runs r where r.company_id = agent_wakeup_requests.company_id and r.agent_id = agent_wakeup_requests.agent_id and r.runtime_mode = 'legacy' and r.status = 'cancelled' and r.result_json->>'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text)` }).from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    console.log("JUDGE SQL", query.toSQL().sql);
+    const rows = await query;
+    console.log("JUDGE SQL ROWS", JSON.stringify(rows));
+    expect(rows).toEqual([{ broken: false, qualified: true }]);
+    // The candidate's new native expression explicitly qualifies the outer table.
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "terminal_failure", leaseOwner: null });
+    const native = await db.select({ released: sql<boolean>`exists (select 1 from heartbeat_runs r
+      join native_run_finalizations f on f.company_id = r.company_id and f.run_id = r.id
+      where r.company_id = agent_wakeup_requests.company_id and r.agent_id = agent_wakeup_requests.agent_id
+        and r.runtime_mode = 'native' and r.status = 'cancelled'
+        and r.result_json->>'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text
+        and f.lease_owner is null and f.phase in ('terminal_failure', 'applied'))` }).from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    console.log("JUDGE NEW NATIVE SQL ROWS", JSON.stringify(native));
+    expect(native).toEqual([{ released: true }]);
+  });
+
+  // Hold50: a person's Stop mid-turn, then a NEW message at +0. That message
+  // is a non-interrupt deferred wake. Its successor must start when the
+  // stopped native run's teardown ends (its per-wake hint), never while the
+  // old run can still write, and not after the two 30 s age gates. Messages
+  // queued before the Stop stay waiting; a delivered message never replays.
+  async function stopNativeMidTurn(seeded: Awaited<ReturnType<typeof seedQueue>>) {
+    await db.update(heartbeatRuns).set({ nativeIssueId: seeded.issueId, responsibleUserId: "queue-owner" })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: seeded.companyId,
+      issueId: seeded.issueId, runId: seeded.runId, phase: "observed" });
+    // Hold the successor in the ordinary queue without launching a provider.
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, seeded.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
+      status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const service = heartbeatService(db);
+    // The person's Stop, mid-turn: the board Stop route's exact call
+    // (routes/agents.ts POST /heartbeat-runs/:runId/cancel).
+    await service.cancelRun(seeded.runId, "Cancelled by a board operator", {
+      cancellationRequestId: randomUUID(), cancellationRequestedByUserId: "queue-owner",
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "queue-owner" },
+    });
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(stopped.status).toBe("cancelled");
+    // The runner acknowledged the Stop, but teardown still owns the session:
+    // the coordinator lease is held and the provider child (this live
+    // process) can still write.
+    await db.update(heartbeatRuns).set({ processPid: process.pid, processGroupId: null, resultJson: { ...stopped.resultJson,
+      nativeCancellation: { ...(stopped.resultJson?.nativeCancellation as object ?? {}),
+        schema: "paperclip.native-cancellation.v1", runId: seeded.runId,
+        companyId: seeded.companyId, issueId: seeded.issueId, scope: "run", reasonCode: "cancellation_run_only",
+        dispatchState: "acknowledged", dispatched: true, intentAuditId: "intent", acknowledgementAuditId: "ack" } },
+    }).where(eq(heartbeatRuns.id, seeded.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: "teardown-owner" })
+      .where(eq(nativeRunFinalizations.runId, seeded.runId));
+    // The native terminal path records the no-replay hold for the stopped run
+    // (legacy-execution-recovery.ts); new input must pass explicit admission.
+    await db.insert(issueRecoveryActions).values({ companyId: seeded.companyId, sourceIssueId: seeded.issueId,
+      kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation",
+      fingerprint: seeded.runId, status: "resolved", outcome: "blocked", nextAction: "Inspect stopped execution",
+      evidence: { runId: seeded.runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+    // The live executor still owns the task's execution lock mid-teardown.
+    await db.update(issues).set({ executionRunId: seeded.runId }).where(eq(issues.id, seeded.issueId));
+    return { service, stopped };
+  }
+
+  /** The executor ends: its lock is released (a native Stop's release never
+   * drains queued input), then its finally path reconsiders saved messages
+   * while the controller still settles; that refusal writes executionWait. */
+  async function endExecutor(seeded: Awaited<ReturnType<typeof seedQueue>>, service: ReturnType<typeof heartbeatService>) {
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, seeded.issueId));
+    await service.resumeRemoteStopComments((await service.getRun(seeded.runId))!);
+  }
+
+  const hold50Successors = async (seeded: Awaited<ReturnType<typeof seedQueue>>) => (await db.select().from(heartbeatRuns)
+    .where(eq(heartbeatRuns.companyId, seeded.companyId)))
+    .filter(run => run.id !== seeded.runId && run.contextSnapshot?.issueId === seeded.issueId);
+
+  async function endTeardown(seeded: Awaited<ReturnType<typeof seedQueue>>, step: "lease" | "process" | "both") {
+    await db.transaction(async tx => {
+      if (step !== "process") await tx.update(nativeRunFinalizations).set({ leaseOwner: null })
+        .where(eq(nativeRunFinalizations.runId, seeded.runId));
+      if (step !== "lease") await tx.update(heartbeatRuns).set({ processPid: 999_999_999 })
+        .where(eq(heartbeatRuns.id, seeded.runId));
+      // The release emitters' company hint plus their exact per-wake hints.
+      await notifyDeferredExecutionWork(tx, { companyId: seeded.companyId });
+      await notifyDeferredWakesForIssue(tx, { companyId: seeded.companyId, issueId: seeded.issueId });
+    });
+  }
+
+  it("Hold50 starts a message sent after a native Stop as soon as the stopped run's teardown ends", async () => {
+    const seeded = await seedQueue();
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    const work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true);
+    try {
+      await work.ready;
+      const { service } = await stopNativeMidTurn(seeded);
+      // A NEW message at +0 after the Stop: the old run can still write, so
+      // admission saves it as a deferred wake.
+      const client = app(seeded.companyId);
+      const sent = await request(client).post(`/api/issues/${seeded.issueId}/comments`)
+        .send({ body: "New direction after Stop" }).expect(201);
+      const newWake = async () => (await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, seeded.companyId)))
+        .find(wake => wake.id !== seeded.wakeId &&
+          JSON.stringify(wake.payload ?? {}).includes(sent.body.id));
+      await vi.waitFor(async () => expect(await newWake()).toBeTruthy(), { timeout: 5_000, interval: 50 });
+      expect((await newWake())!.status).toBe("deferred_issue_execution");
+      // The executor's own end-of-run attempt (heartbeat.ts finally) is
+      // refused while teardown owns the session; it rewrites executionWait.
+      await endExecutor(seeded, service);
+      const held = (await newWake())!;
+      expect(held.status, JSON.stringify(held)).toBe("deferred_issue_execution");
+      expect(held.payload?.executionWait, JSON.stringify(held.payload)).toBeTruthy();
+      // (4) Nothing starts while the old run can still write: lease held.
+      await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: seeded.companyId, requestId: held.id }));
+      await new Promise(resolve => setTimeout(resolve, 750));
+      expect(await hold50Successors(seeded)).toEqual([]);
+      // (4) Lease released but the provider process is alive: still nothing.
+      await endTeardown(seeded, "lease");
+      await new Promise(resolve => setTimeout(resolve, 750));
+      expect(await hold50Successors(seeded)).toEqual([]);
+      // Without the stop proof the hint does not even re-attempt admission:
+      // the saved wake is untouched (no early bypass without proof).
+      await service.resumeExecutionWaitComments({ companyId: seeded.companyId, requestId: held.id });
+      expect((await newWake())!.updatedAt.getTime()).toBe(held.updatedAt.getTime());
+      // Teardown ends: the provider's stop is recorded and the release emits
+      // the per-wake hints.
+      const cleanupProvenAt = Date.now();
+      await endTeardown(seeded, "process");
+      // (1) The successor exists within 10 s of the cleanup proof, well inside
+      // the 30 s age gates the refusal just reset.
+      await vi.waitFor(async () => expect(await hold50Successors(seeded)).toHaveLength(1),
+        { timeout: 10_000, interval: 50 });
+      expect(Date.now() - cleanupProvenAt).toBeLessThan(10_000);
+      const [successor] = await hold50Successors(seeded);
+      expect(successor.contextSnapshot?.wakeCommentIds).toContain(sent.body.id);
+      // (2) Messages queued BEFORE the Stop stay waiting: Stop means stop.
+      for (const commentId of seeded.commentIds) expect(successor.contextSnapshot?.wakeCommentIds).not.toContain(commentId);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].status)
+        .toBe("deferred_issue_execution");
+      // (3) A delivered message is never replayed: more hints, one successor.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, successor.id));
+      await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: seeded.companyId, requestId: held.id }));
+      await endTeardown(seeded, "both");
+      await service.resumeExecutionWaitComments({ companyId: seeded.companyId, requestId: held.id });
+      await new Promise(resolve => setTimeout(resolve, 750));
+      expect(await hold50Successors(seeded)).toHaveLength(1);
+    } finally { await work.stop(); }
+  });
+
+  it("Hold50 keeps messages queued before a native Stop waiting after its teardown ends", async () => {
+    const seeded = await seedQueue();
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    const work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true);
+    try {
+      await work.ready;
+      const { service } = await stopNativeMidTurn(seeded);
+      // The executor's end-of-run attempt marks the pre-Stop queue as waiting.
+      await endExecutor(seeded, service);
+      const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+      expect(saved.payload?.executionWait, JSON.stringify(saved.payload)).toBeTruthy();
+      await endTeardown(seeded, "both");
+      await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: seeded.companyId, requestId: seeded.wakeId }));
+      await service.resumeExecutionWaitComments({ companyId: seeded.companyId, requestId: seeded.wakeId });
+      await new Promise(resolve => setTimeout(resolve, 1_500));
+      // (2) Stop alone is not intent: only a new message or Send is. The
+      // proven stop does not bypass the gates for input that predates it.
+      expect(await hold50Successors(seeded)).toEqual([]);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].updatedAt
+        .getTime()).toBe(saved.updatedAt.getTime());
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].status)
+        .toBe("deferred_issue_execution");
+    } finally { await work.stop(); }
+  });
+
+  async function seedFirstTurnQueue(runtime: "preparing" | "native", queueStartedBy: "user" | "system" = "user") {
     const seeded = await seedQueue();
     // A user's follow-ups, as the comment route saves them behind that user's run.
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
     await db.update(agentWakeupRequests).set({ payload: { ...wake!.payload,
       _paperclipWakeContext: { ...(wake!.payload?._paperclipWakeContext as Record<string, unknown>),
-        issueId: seeded.issueId, wakeReason: "issue_commented" } } }).where(eq(agentWakeupRequests.id, seeded.wakeId));
+        issueId: seeded.issueId, wakeReason: "issue_commented" } },
+      // An earlier automatic wake that waited behind the task's execution: the
+      // comment route merges the user's message into it and keeps its requester.
+      ...(queueStartedBy === "system" ? { source: "automation", reason: "issue_execution_deferred",
+        requestedByActorType: "system", requestedByActorId: null } : {}),
+    }).where(eq(agentWakeupRequests.id, seeded.wakeId));
     await db.update(heartbeatRuns).set(runtime === "preparing"
       ? { responsibleUserId: "queue-owner", runtimeMode: "legacy", runtimeModeResolvedAt: null, executionStage: "preparing",
           runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } } }
@@ -1051,6 +1514,29 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     },
   );
 
+  it("gives a booting run's first turn the user's message merged into an earlier automatic wake", async () => {
+    const seeded = await seedFirstTurnQueue("preparing", "system");
+    const client = app(seeded.companyId);
+    // Shown as sent: Steer cannot reach a provider that has not started yet.
+    const queue = await request(client).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+    expect(queue.body.firstTurnCommentIds).toEqual(seeded.commentIds);
+    // Interrupt must not cancel the boot and leave the message behind a recovery wait.
+    const response = await request(client).post(`/api/issues/${seeded.issueId}/queued-comments/interrupt`).send({
+      queueId: seeded.wakeId, targetRunId: seeded.runId, revision: queue.body.revision,
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body.executionWait).toMatchObject({ reason: "first_turn_pending" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run!.status).toBe("running");
+    expect(run!.errorCode).toBeNull();
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", runtimeModeResolvedAt: new Date(),
+      nativeIssueId: seeded.issueId }).where(eq(heartbeatRuns.id, seeded.runId));
+    const firstTurn = await claimFirstTurnQueuedInput(db, { companyId: seeded.companyId, runId: seeded.runId,
+      issueId: seeded.issueId, agentId: seeded.agentId });
+    expect(firstTurn).toContain("First queued message");
+    expect(firstTurn).toContain("Second queued message");
+  });
+
   it.each(["preparing", "native"] as const)(
     "reports the messages a %s run's first turn takes, before and after it seals them",
     async (runtime) => {
@@ -1093,7 +1579,11 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       queueId: seeded.wakeId, targetRunId: seeded.runId, revision: queue.body.revision,
     });
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(response.body.executionWait?.reason).not.toBe("first_turn_pending");
+    // The stop is the user's own click: the messages are on their way, not
+    // waiting on a recovery the user should read about.
+    expect(response.body.executionWait?.reason).toBe("interrupt_handoff");
+    const polled = await request(client).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+    expect(polled.body.executionWait?.reason).toBe("interrupt_handoff");
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
     expect(run!.status).toBe("cancelled");
     expect(run!.errorCode).toBe("operator_interrupted");
@@ -2522,6 +3012,44 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       await new Promise(resolve => setTimeout(resolve, 250));
     },
   );
+
+  // Hold50 RFL: the whole-file run lost the next message's wake to a Postgres
+  // deadlock (1 wake where 2 were expected). The route's wakeup is
+  // fire-and-forget and only logs a failure, so admission itself must retry a
+  // wake insert that loses a deadlock. Force exactly one 40P01 on the insert
+  // (a sequence is not rolled back with the aborted transaction).
+  it("retries a wake insert that loses a deadlock and still queues the next message (stopped run)", async () => {
+    const seeded = await seedDeclinedConnectionReceipt("stopped");
+    await db.execute(sql.raw("create sequence if not exists hold50_forced_deadlock"));
+    await db.execute(sql.raw(`create or replace function hold50_forced_deadlock() returns trigger language plpgsql as $$
+      begin
+        if nextval('hold50_forced_deadlock') = 1 then
+          raise exception 'forced deadlock on wake insert' using errcode = '40P01';
+        end if;
+        return new;
+      end $$`));
+    await db.execute(sql.raw(`create trigger hold50_forced_deadlock before insert on agent_wakeup_requests
+      for each row execute function hold50_forced_deadlock()`));
+    try {
+      const client = app(seeded.companyId);
+      const sent = await request(client).post(`/api/issues/${seeded.issueId}/comments`)
+        .send({ body: "Skip Slack for now and continue" }).expect(201);
+      await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests)).toHaveLength(2),
+        { timeout: 10_000, interval: 50 });
+      const [{ calls }] = await db.execute(sql.raw("select last_value as calls from hold50_forced_deadlock")) as unknown as
+        [{ calls: string }];
+      // The first insert was the deadlock victim; a later attempt saved it.
+      expect(Number(calls)).toBeGreaterThanOrEqual(2);
+      const queue = await request(client).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+      expect(queue.body.entries.find((entry: any) => entry.comment.id === sent.body.id))
+        .toMatchObject({ canEdit: true, canDiscard: true });
+      await new Promise(resolve => setTimeout(resolve, 250));
+    } finally {
+      await db.execute(sql.raw("drop trigger if exists hold50_forced_deadlock on agent_wakeup_requests"));
+      await db.execute(sql.raw("drop function if exists hold50_forced_deadlock()"));
+      await db.execute(sql.raw("drop sequence if exists hold50_forced_deadlock"));
+    }
+  });
 
   it.each(["legacy", "stopped"] as const)(
     "queues every later message together after a declined connection (%s run)",

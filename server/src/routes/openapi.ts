@@ -1546,6 +1546,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/resource-memberships/me",
   "GET /api/workspace-preferences/me",
   "PUT /api/companies/{companyId}/workspace-preferences/me",
+  "GET /api/companies/{companyId}/primary-agents",
   "GET /api/companies/{companyId}/primary-agent/me",
   "PUT /api/companies/{companyId}/primary-agent/me",
   "PUT /api/companies/{companyId}/resource-memberships/me/agents/{agentId}",
@@ -7282,6 +7283,19 @@ registry.registerPath({
     body: jsonBody(upsertSidebarOrderPreferenceSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/primary-agents",
+  tags: ["agents"],
+  summary: "List active members' primary agents",
+  description: "Company board members can read primary assignments for active human members. Only agents the caller may read are returned. This read changes no preference or permissions. Agent credentials cannot access it.",
+  request: { params: z.object({ companyId: z.string().uuid() }) },
+  responses: {
+    200: r.ok(z.array(z.object({ userId: z.string(), agentId: z.string().uuid() }))),
+    401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+  },
 });
 
 const primaryAgentPreferenceResponse = z.object({

@@ -59,7 +59,7 @@ import { deferredWakeJoinsFirstTurn, firstTurnClaimedCommentIds, firstTurnQueued
 import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from "../services/native-runtime/native-workspace-reconstruction.js";
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse, type QueuedInteractionResponse } from "../services/queued-interaction-response.js";
-import { deliverConversationComments, heldConversationComments, isConversation } from "../services/agent-conversations.js";
+import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
@@ -430,6 +430,7 @@ import {
   buildQueuedCommentQueueSnapshot,
   decideQueuedCommentQueueSteering,
   queuedCommentIdsFromWakePayload,
+  queuedCommentQueueRevision,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
 
@@ -450,6 +451,8 @@ function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comme
     + `Tell the author to discard it there.`;
 }
 
+const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
+const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting: Send them, or delete any first.";
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -7678,6 +7681,8 @@ export function issueRoutes(
     response?: QueuedInteractionResponse | null;
   };
 
+  const QUEUED_INTERRUPT_HANDOFF_WAIT = { reason: "interrupt_handoff", message: "Sending your messages." } as const;
+
   async function findQueuedCommentWake(
     executor: IssueQueueDb,
     issue: { id: string; companyId: string; assigneeAgentId: string | null },
@@ -7860,10 +7865,15 @@ export function issueRoutes(
             .then((state) => state.disposition)
             .catch(() => "temporarily_unavailable" as const));
     const wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    // The user's Interrupt click is delivering these messages. Its stopped run
+    // settling is not something to read about under the composer; the task
+    // notice owns any wait that needs the user.
+    const interruptHandoff = queueState?.state === "deferred" && readObject(wake?.payload).queuedCommentInterrupt != null;
     const queue = buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
-      executionWait: typeof wait.reason === "string" && typeof wait.message === "string"
-        ? { reason: wait.reason, message: wait.message } : null,
+      executionWait: interruptHandoff ? QUEUED_INTERRUPT_HANDOFF_WAIT
+        : typeof wait.reason === "string" && typeof wait.message === "string"
+          ? { reason: wait.reason, message: wait.message } : null,
       queueId: wake?.id ?? null,
       state: queueState?.state ?? null,
       activeRunId: input.activeRun?.id ?? null,
@@ -7873,6 +7883,21 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
+    if (wake && queueState?.state === "deferred" && !input.activeRun && !queue.executionWait && comments.length > 0 &&
+        input.issue.conversationAgentId && input.issue.conversationAgentId === input.issue.assigneeAgentId &&
+        !queuedInteractionId(wake.payload)) {
+      // Stop means stop (org 11-17): after a person's Stop the chat's waiting
+      // messages are not sent. The person sends them, or deletes some first.
+      const [lastTurn] = await input.executor.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.issue.companyId),
+          eq(heartbeatRuns.agentId, input.issue.conversationAgentId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issue.id}`))
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      const stop = readObject(lastTurn?.resultJson);
+      if (lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId) {
+        queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+      }
+    }
     if (wake && queuedInteractionId(wake.payload)) {
       if (response?.source.requiresFreshSession) queue.steeringDisposition = "unsupported";
       queue.entries = response ? [{ comment: response.comment, source: response.source, position: 0, canEdit: false, canDiscard: false }] : [];
@@ -7884,7 +7909,63 @@ export function issueRoutes(
       });
       if (firstTurnCommentIds.length > 0) queue.firstTurnCommentIds = firstTurnCommentIds;
     }
+    // Agent Chat lists every waiting message, also behind a /new (its own wake).
+    if (input.issue.conversationAgentId && wake && !queuedInteractionId(wake.payload)) {
+      queue.entries = await chatQueueTail(input.executor, { issue: input.issue, headQueueId: wake.id,
+        headEntries: queue.entries, actorType: input.actor.actorType, actorId: input.actor.actorId });
+    }
     return queue;
+  }
+
+  /**
+   * Agent Chat: every waiting message, in order, from the queue's head wake to
+   * the last one. A `/new` keeps its own wake, so the head wake alone would stop
+   * the list at the first reset while the backlog still runs on through it
+   * (S10 C2). Mirrors al/queue-ux `chatQueueTail` without its delivery intent.
+   */
+  async function chatQueueTail(executor: IssueQueueDb, input: {
+    issue: { id: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null };
+    headQueueId: string; headEntries: IssueQueuedCommentQueue["entries"]; actorType: string; actorId: string;
+  }): Promise<IssueQueuedCommentQueue["entries"]> {
+    if (!input.issue.assigneeAgentId) return input.headEntries;
+    const wakes = (await executor.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, input.issue.companyId),
+      eq(agentWakeupRequests.agentId, input.issue.assigneeAgentId),
+      sql`${agentWakeupRequests.payload}->'issueId' = to_jsonb(${input.issue.id}::text)`,
+      inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
+    )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.createdAt)))
+      .flatMap((wake) => {
+        const ids = queuedCommentIdsFromWakePayload(wake.payload);
+        return ids.length && !readObject(wake.payload).interactionId ? [{ wake, ids }] : [];
+      });
+    const headIndex = wakes.findIndex((candidate) => candidate.wake.id === input.headQueueId);
+    if (headIndex < 0) return input.headEntries;
+    const later = wakes.slice(headIndex + 1);
+    const laterIds = later.flatMap((wake) => wake.ids);
+    const rows = laterIds.length ? await executor.select().from(issueComments).where(and(
+      eq(issueComments.companyId, input.issue.companyId), eq(issueComments.issueId, input.issue.id),
+      inArray(issueComments.id, laterIds))) : [];
+    const comments = new Map(rows.filter((row) => !row.deletedAt).map((row) => [row.id, row]));
+    let behindReset = false;
+    const entries = input.headEntries.map((entry) => {
+      behindReset ||= isConversationReset(entry.comment.body);
+      return { ...entry, behindReset };
+    });
+    for (const { wake, ids } of later) {
+      const wakeComments = ids.flatMap((id) => comments.get(id) ?? []);
+      const revision = queuedCommentQueueRevision({ queueId: wake.id, comments: wakeComments });
+      for (const comment of wakeComments) {
+        behindReset ||= isConversationReset(comment.body);
+        entries.push({
+          comment: { ...comment, authorType: comment.authorType ?? (comment.authorAgentId ? "agent" : "user") } as never,
+          position: entries.length,
+          canEdit: input.actorType === "user" && comment.authorUserId === input.actorId,
+          canDiscard: input.actorType === "user" && (comment.authorUserId === input.actorId || Boolean(comment.authorAgentId)),
+          behindReset, queueId: wake.id, queueRevision: revision,
+        });
+      }
+    }
+    return entries;
   }
 
   function assertQueueMutationTarget(input: {
@@ -18005,13 +18086,32 @@ export function issueRoutes(
         if (req.actor.userId !== issue.conversationUserId) {
           throw forbidden("Only the conversation owner can interrupt a chat to send queued messages");
         }
+        // A paused chat runs nothing: Send says why and keeps the messages.
+        const [chatAgent] = await db.select({ status: agents.status }).from(agents).where(and(
+          eq(agents.companyId, issue.companyId), eq(agents.id, issue.conversationAgentId)));
+        if (chatAgent?.status === "paused") {
+          throw conflict("This agent is paused. Resume it to send these messages.", { code: "queued_comment_chat_paused" });
+        }
+        if (await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id)) {
+          throw conflict("This chat is paused. Resume it to send these messages.", { code: "queued_comment_chat_paused" });
+        }
       }
       const actor = getActorInfo(req);
+      // S8q(5): a press with no run to stop and nothing left in the queue keeps
+      // the existing 409 queued_comment_not_pending contract, worded plainly so
+      // the client can say "Nothing is waiting." instead of showing an error.
+      const untargeted = !req.body.targetRunId;
+      const nothingWaiting = () => conflict("Nothing is waiting.", {
+        code: "queued_comment_not_pending", reason: "nothing_waiting" });
       const interruptPlan = await db.transaction(async (tx): Promise<{ firstTurnRunId: string } | { runToInterrupt: string | null }> => {
         const locked = await lockQueuedCommentState({
           tx, issue, actor, queueId: req.body.queueId, targetRunId: req.body.targetRunId ?? undefined,
           allowStoppedTarget: true,
+        }).catch((error: unknown) => {
+          if (untargeted && (error as { details?: { code?: string } })?.details?.code === "queued_comment_not_pending") throw nothingWaiting();
+          throw error;
         });
+        if (untargeted && (locked.state !== "deferred" || !locked.queue.entries.length)) throw nothingWaiting();
         assertQueueMutationTarget({ queue: locked.queue, queueId: req.body.queueId, revision: req.body.revision });
         // Explicit Interrupt is also the fallback when a native turn cannot
         // accept steering. Cancellation and ordinary admission still own Stop
