@@ -83,6 +83,16 @@ describe("retry fold: one authority across card, transcript, Retry API", () => {
     expect(presentation).toMatchObject({ canRetry: false, userAction: "resume", state: "waiting_for_user" });
   });
 
+  it("R6 G: a paused assignee behind a hold that has no saved-work receipt also names Resume (blocker next action), no Retry", async () => {
+    const f = await seed();
+    await db.update(issueRecoveryActions).set({ status: "active", resolvedAt: null,
+      evidence: { runId: f.runId, originalFailureCode: "native_session_interrupted" } }).where(eq(issueRecoveryActions.id, f.actionId));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+    const { card, presentation } = await surfaces(f);
+    expect(card).toMatchObject({ canRetry: false, nextAction: PAUSED });
+    expect(presentation).toMatchObject({ canRetry: false, userAction: "resume" });
+  });
+
   it("R7 M1: a fence-refused dead end never says 'Retry continues from it'; card = transcript; canRetry false", async () => {
     const f = await seed();
     await fenceRefused(f);
