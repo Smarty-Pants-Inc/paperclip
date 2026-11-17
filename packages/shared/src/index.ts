@@ -2883,7 +2883,8 @@ export { MEMORY_CONNECTOR_IDS, isMemoryConnectorId, type MemoryConnectorId } fro
 export * from "./connection-routing.js";
 export * from "./connection-search.js";
 
-export { WORKSPACE_RESTORE_FAILURE_CODES, hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, isNativeWorkspaceExportRepairCause } from "./workspace-restore.js";
+export { WORKSPACE_RESTORE_FAILURE_CODES, WORKSPACE_RESTORE_PENDING_KEY, WORKSPACE_RESTORE_RECOVERING_TEXT, hasWorkspaceRestoreFailure,
+  isWorkspaceRestorePending, safeWorkspaceRestorePath, isNativeWorkspaceExportRepairCause } from "./workspace-restore.js";
 
 
 export type { AgentInstructionErrorCode, AgentInstructionErrorDetails, AgentInstructionSource, AgentInstructionRevision, AgentInstructionSnapshot, AgentInstructionCommitReceipt, AgentInstructionHistory, AgentInstructionDiff } from "./types/agent.js";

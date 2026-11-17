@@ -13,7 +13,8 @@ import { PLUGIN_WORKER_UNAVAILABLE_CODE } from "./plugin-worker-unavailable-erro
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "./environment-provider-unavailable-error.js";
 import { REPOSITORY_CATALOG_UNAVAILABLE_CODE } from "./repository-catalog-unavailable-error.js";
 import { RUNNER_REVISION_MISMATCH_CODE } from "./runner-revision-mismatch.js";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, isWorkspaceRestorePending, WORKSPACE_RESTORE_PENDING_KEY as SHARED_WORKSPACE_RESTORE_PENDING_KEY,
+  WORKSPACE_RESTORE_RECOVERING_TEXT } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
@@ -38,11 +39,12 @@ type Run = typeof heartbeatRuns.$inferSelect;
 export const UNRESTORED_FILES_NEXT_ACTION = "The task's saved files could not be put back after the run stopped. "
   + "They are kept where they were and are not applied. Press Retry to continue from the last saved version in a new workspace.";
 /** Files are owed but no restore has been tried or has failed yet. */
-export const RECOVERING_SAVED_WORK_NEXT_ACTION = "Recovering your saved work; your message is kept and runs when it's back.";
-/** Hold evidence key: the files were pinned before any restore was tried. It
- * changes only the words; the hold, its predicates and recovery key on
- * workspaceRestoreFailure/workspaceRestoreRecovery exactly as before. */
-export const WORKSPACE_RESTORE_PENDING_KEY = "workspaceRestorePending";
+export const RECOVERING_SAVED_WORK_NEXT_ACTION = WORKSPACE_RESTORE_RECOVERING_TEXT;
+/** Hold evidence and run resultJson key: the files were pinned before any
+ * restore was tried. It changes only the words; the hold, its predicates and
+ * recovery key on workspaceRestoreFailure/workspaceRestoreRecovery exactly as
+ * before. Defined in shared so the UI reads the same fact. */
+export const WORKSPACE_RESTORE_PENDING_KEY = SHARED_WORKSPACE_RESTORE_PENDING_KEY;
 /** One authority for the restore-hold words: only a recorded restore failure
  * says the files could not be put back; owed files say they are recovering. */
 export function workspaceRestoreHoldNextAction(evidence: Record<string, unknown> | null | undefined): string {
@@ -174,6 +176,12 @@ export async function terminalizeLegacyExecution(input: {
       resultJson: preserveWorkspaceRestoreRecoveryMetadata(current.resultJson,
         input.recordRestoreFailureOnly ? { ...current.resultJson, ...patch.resultJson } : patch.resultJson),
     };
+    // The owed fact rides beside the raw marker in this same write (and the
+    // hold below reads the same input); a recorded real failure clears it.
+    if (input.recordRestoreFailureOnly && patch?.resultJson) {
+      const { [WORKSPACE_RESTORE_PENDING_KEY]: _owed, ...marker } = patch.resultJson;
+      patch = { ...patch, resultJson: input.workspaceRestorePending === true ? { ...marker, [WORKSPACE_RESTORE_PENDING_KEY]: true } : marker };
+    }
     if (issueId) await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: current.companyId, issueId });
     await notifyInstructionCollection(tx, { companyId: current.companyId, runId: current.id });
     await notifyExecutionRunWork(tx, { companyId: current.companyId });
@@ -327,6 +335,17 @@ export async function terminalizeLegacyExecution(input: {
           ),
         )).limit(1);
       if (reconciled) return updated;
+      const evidence = {
+          runId: run.id,
+          ...(isCurrentReviewer ? { reviewParticipantAgentId: run.agentId } : {}),
+          originalFailureCode: updated.errorCode,
+          ...(hasWorkspaceRestoreFailure(updated.resultJson) ? { workspaceRestoreFailure: updated.resultJson!.workspaceRestoreFailure } : {}),
+          ...(hasRequiredWorkspaceRecovery(updated.resultJson) ? { workspaceRestoreRecovery: updated.resultJson!.workspaceRestoreRecovery } : {}),
+          // The owed fact the hold authority recorded on the run, never the raw marker alone.
+          ...(isWorkspaceRestorePending(updated.resultJson) ? { [WORKSPACE_RESTORE_PENDING_KEY]: true } : {}),
+          adapterRecovery: "unsupported_or_unknown",
+          attempt: executionFailureRetryCount(run) + 1,
+      };
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,
         sourceIssueId: task.id,
@@ -335,17 +354,9 @@ export async function terminalizeLegacyExecution(input: {
         returnOwnerAgentId: task.assigneeAgentId,
         cause: LEGACY_RECOVERY_CAUSE,
         fingerprint: `legacy-execution:${run.id}`,
-        evidence: {
-          runId: run.id,
-          ...(isCurrentReviewer ? { reviewParticipantAgentId: run.agentId } : {}),
-          originalFailureCode: updated.errorCode,
-          ...(hasWorkspaceRestoreFailure(updated.resultJson) ? { workspaceRestoreFailure: updated.resultJson!.workspaceRestoreFailure } : {}),
-          ...(hasRequiredWorkspaceRecovery(updated.resultJson) ? { workspaceRestoreRecovery: updated.resultJson!.workspaceRestoreRecovery } : {}),
-          adapterRecovery: "unsupported_or_unknown",
-          attempt: executionFailureRetryCount(run) + 1,
-        },
+        evidence,
         nextAction: hasRequiredWorkspaceRecovery(updated.resultJson)
-          || hasWorkspaceRestoreFailure(updated.resultJson) ? workspaceRestoreHoldNextAction(null)
+          || hasWorkspaceRestoreFailure(updated.resultJson) ? workspaceRestoreHoldNextAction(evidence)
           : "The run stopped before it finished, and Paperclip cannot tell which of its last actions took effect. "
             + "Press Retry to continue the task in a fresh run; the agent checks those actions before repeating any.",
         maxAttempts: 3,
