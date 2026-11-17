@@ -1891,7 +1891,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notices, "exactly one true notice, never one for the answer and one for the original message").toHaveLength(1);
       expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
       expect(notices[0]!.metadata?.sourceRunId).toBe(last);
-      expect(notices[0]!.body).toBe(NOT_ANSWERED);
+      expect(notices[0]!.body).toBe("Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.");
+      expect(notices[0]!.presentation?.title).toBe("Your answer wasn't acted on");
       expect(await f.visible()).toHaveLength(1);
       // A later reply on the answer's chain supersedes the notice; nothing new is posted.
       await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, last));
@@ -1911,6 +1912,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const notices = await cardNotices(f);
       expect(notices).toHaveLength(1);
       expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
+      expect(notices[0]!.body).toBe("Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.");
     });
 
     it("guard: answer, answer-resume answers: no notice", async () => {

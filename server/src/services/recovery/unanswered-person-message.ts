@@ -93,6 +93,8 @@ export function agentPausedText(name: string) {
 
 export const UNANSWERED_MESSAGE_TEXT =
   "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
+export const UNANSWERED_CARD_ANSWER_TEXT =
+  "Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_WAITING_TEXT =
@@ -818,6 +820,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     : paused ? agentPausedText(pausedName)
     : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
     : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : cardAnswer ? UNANSWERED_CARD_ANSWER_TEXT
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
@@ -825,13 +828,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused`
-        : pauseStopped ? `${pausedName} was paused before it answered` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
+        : pauseStopped ? `${pausedName} was paused before it answered` : waiting ? "Your message is waiting to start"
+        : cardAnswer ? "Your answer wasn't acted on" : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: settingUp ? "No action is needed; your message is saved."
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : pauseStopped ? "Send it again to continue."
         : waiting ? "No action is needed; it will start by itself."
+        : cardAnswer ? "Retry; if it fails again, assign this agent a new task."
         : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
