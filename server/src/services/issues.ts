@@ -7128,6 +7128,12 @@ async function lockIssueForCommentMutation(tx: DbTransaction, commentId: string)
   return Boolean(issue);
 }
 
+/** The posted body is the accepted summary, or the whole answer that the
+ * schema-capped (12,000-character) summary previews. */
+function presentsAcceptedSummary(summary: unknown, body: string): boolean {
+  return typeof summary === "string" && (summary === body || (summary.length >= 12_000 && body.startsWith(summary)));
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -13827,7 +13833,7 @@ export function issueService(db: Db) {
         if (
           presentationRun?.resultJson?.finalizationReasonCode ===
             "governed_response_waiting" &&
-          (parseObject(presentationRun.resultJson.nativeResult).summary !== body ||
+          (!presentsAcceptedSummary(parseObject(presentationRun.resultJson.nativeResult).summary, body) ||
             !(await authorizeNativeChatReviewPresentation(
               dbOrTx,
               {

@@ -901,7 +901,10 @@ describe("PiRpcDriver", () => {
       await flushFailure();
       expect(f.events.some(event => event.eventType === "turn.failed")).toBe(false);
       const projected = f.events.find(event => event.eventType === "item.delta" && typeof event.payload.output === "string");
-      expect(projected?.payload.output).toContain("[Pi tool output truncated");
+      // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was output: toContain("[Pi tool output truncated").
+      // A live partial is a labelled preview (no cut marker); the final receipt below is whole.
+      expect(projected?.payload.output).toContain("Live output");
+      expect(JSON.stringify(projected)).not.toContain("truncated]");
       expect(projected?.debug).toMatchObject({ piProjection: { truncated: true, recordBytes: Buffer.byteLength(JSON.stringify(partial)), recordSha256: createHash("sha256").update(JSON.stringify(partial)).digest("hex") } });
       expect(validatePrpEvent(projected).ok).toBe(true);
       expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThan(1024 * 1024);

@@ -1707,7 +1707,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         // provenance/session/effect gates remain unchanged. Budget exhaustion
         // drops only the unrouteable display record with an explicit marker.
         if (this.#activeIdentityCount >= 65_536) {
-          if (!this.#identityLimited) this.#emit("harness.diagnostic", { code: "pi_native_identity_projection_limit", message: "[Pi projection truncated]: turn identity budget reached." }, turn);
+          if (!this.#identityLimited) this.#emit("harness.diagnostic", { code: "pi_native_identity_projection_limit", message: "Pi turn identity budget reached; further native identities are not projected." }, turn);
           this.#identityLimited = true;
           return false;
         }
@@ -2034,7 +2034,7 @@ function usageDelta(usage: Record<string, unknown>): Record<string, unknown> {
 
 const SAFE_PI_ENV_KEYS = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SystemRoot", "WINDIR", "PATHEXT"] as const;
 
-export function piProcessEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+function piProcessEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   for (const key of SAFE_PI_ENV_KEYS) if (process.env[key] !== undefined) environment[key] = process.env[key];
   for (const [key, value] of Object.entries(overrides)) if (value !== undefined) environment[key] = value;

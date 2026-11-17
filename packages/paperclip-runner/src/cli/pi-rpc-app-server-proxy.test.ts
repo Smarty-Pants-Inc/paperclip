@@ -740,7 +740,10 @@ describe("Pi RPC app-server facade proxy", () => {
       session.push("item.completed", { ...payload, text: final, output: final }, "turn-1", "tool");
       await new Promise<void>(resolve => setImmediate(resolve));
       const frames = sink.decoded().filter(frame => typeof frame.method === "string" && frame.method.startsWith("item/"));
-      expect(JSON.stringify(frames[0])).toContain("[Pi tool output truncated");
+      // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was toContain("[Pi tool output truncated").
+      // A live partial frame is a labelled preview; the final frame below is whole.
+      expect(JSON.stringify(frames[0])).toContain("Live output");
+      for (const frame of frames) expect(JSON.stringify(frame)).not.toMatch(/truncated\]|for display/u);
       for (const frame of frames) expect(Buffer.byteLength(JSON.stringify(frame))).toBeLessThan(1024 * 1024);
       expect(frames[1]).toMatchObject({ params: { output: "short output" } });
       expect(frames[2]).toMatchObject({ params: { output: final, text: final } });

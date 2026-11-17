@@ -15,7 +15,8 @@ const MAX_TEXT_CHARS: usize = 4_000;
 /// preview. It keeps its complete (redacted) text up to this transport-safe
 /// bound; the durable outbox applies its own frame check.
 pub(crate) const MAX_FINAL_AGENT_MESSAGE_CHARS: usize = 32_000;
-/// Pi final replies and synthesized result summaries share the result schema's cap.
+/// Pi synthesized result summaries keep the result schema's cap. The Pi final
+/// reply itself (item.completed, channel final) is never cut to this bound.
 pub(crate) const MAX_PI_FINAL_TEXT_CHARS: usize = 12_000;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1711,12 +1712,9 @@ pub(crate) fn normalize_pi_notification_in(
                     event.payload["text"] = item(params)
                         .get("text")
                         .and_then(Value::as_str)
-                        .map(|text| {
-                            json!(redact_sensitive_text_values(text)
-                                .chars()
-                                .take(MAX_PI_FINAL_TEXT_CHARS)
-                                .collect::<String>())
-                        })
+                        // The person's complete answer: redacted, never cut.
+                        // The durable outbox keeps it whole when it fits a frame.
+                        .map(|text| json!(redact_sensitive_text_values(text)))
                         .unwrap_or(Value::Null);
                 }
             }
