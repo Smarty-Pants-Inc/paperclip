@@ -126,6 +126,10 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
       const saved = await instructionCopies.checkpointWarm({ companyId: agent.companyId, runId: readRun().id, target: executionTarget });
       if (saved) await recordInstructionSave(saved);
       return saved?.state === "warm_saved" && saved.errorCode === null;
+    }, unchangedSinceBaseline: async () => {
+      const unchanged = await instructionCopies.unchangedSinceBaseline({ companyId: agent.companyId, runId: readRun().id, target: executionTarget });
+      if (unchanged) await recordInstructionSave(unchanged);
+      return unchanged !== null;
     } } : {}),
     hasChanges: () => instructionCopies.hasChanges({ companyId: agent.companyId, runId: readRun().id, target: executionTarget }),
     collectStopped: collectStoppedInstructions,

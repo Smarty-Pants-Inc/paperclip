@@ -302,6 +302,11 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     })());
   }
 
+  /** Row 23: the unchanged-content check behind warm retention (see directories). */
+  async function unchangedSinceBaseline(input: { companyId: string; runId: string; target?: AdapterExecutionTarget | null; timeoutMs?: number }) {
+    const row = await get(input.companyId, input.runId);
+    return row && isAgentDirectoryCopy(row) ? directories.unchangedSinceBaseline(row, input.target, input.timeoutMs) : null;
+  }
   async function acknowledgeExplicitSave(input: { companyId: string; agentId: string; runId: string; entryFile: string; revisionId: string; contentHash: string }) {
     const row = await get(input.companyId, input.runId);
     if (!row || isAgentDirectoryCopy(row) || row.agentId !== input.agentId || row.entryFile !== input.entryFile || row.state !== "prepared") return;
@@ -708,5 +713,5 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     }
     return row;
   }
-  return { registerStoppedCollectionWork, registerDirectoryCleanupWork, registerCapturedCommitWork, prepare, checkpointWarm, claimConflictNotice: directories.claimConflictNotice, canReuseWarm: directories.canReuse, adopt, reportRetirementUnconfirmed, get, hasChanges, acknowledgeExplicitSave, collectStopped, recoverCaptured, recoverStopped, list, resolve, reportUnavailable, release };
+  return { registerStoppedCollectionWork, registerDirectoryCleanupWork, registerCapturedCommitWork, prepare, checkpointWarm, unchangedSinceBaseline, claimConflictNotice: directories.claimConflictNotice, canReuseWarm: directories.canReuse, adopt, reportRetirementUnconfirmed, get, hasChanges, acknowledgeExplicitSave, collectStopped, recoverCaptured, recoverStopped, list, resolve, reportUnavailable, release };
 }
