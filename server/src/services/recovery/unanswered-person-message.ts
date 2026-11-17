@@ -17,6 +17,7 @@ import { issueService } from "../issues.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
+import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
@@ -586,12 +587,23 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
   if (!boardHold && !agentPaused && !settingUp) {
-    const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-      inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
-    if (wakes.some(wake => wakeCarriesIssue(wake.payload, issue.id))) {
+    const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+        or(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+          and(eq(agentWakeupRequests.status, "deferred"), wellFormedExecutionWaitSql(agentWakeupRequests.payload)))));
+    // Admission has saved a real further attempt for THIS message, not a
+    // failed start. Coalesced receipts alone are not live; missing/malformed
+    // waits retain the ordinary no-run/failure decision.
+    const pendingExecutionWait = wakes.some(wake => ["deferred", "deferred_issue_execution"].includes(wake.status)
+      && isWellFormedExecutionWait(wake.payload?.executionWait)
+      && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+    if (pendingExecutionWait || wakes.some(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id))) {
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
+      // After the short pending grace, use the existing waiting note and its
+      // start bound below instead of telling the person to duplicate input.
+      if (pendingExecutionWait) waitingToStart = true;
     }
   }
 
