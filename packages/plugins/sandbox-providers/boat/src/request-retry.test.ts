@@ -37,7 +37,7 @@ describe("Boat 429 retry", () => {
     expect(fetch.mock.calls[1][1]?.method).toBe("POST");
   });
 
-  it("fails at once when Retry-After exceeds the remaining whole-call budget", async () => {
+  it("(superseded by replacement: frozen7 transient shape, RFL record 23:42Z) fails at once when Retry-After exceeds the remaining whole-call budget", async () => {
     const fetch = vi.fn().mockResolvedValue(response({ code: "rate_limited" }, 429, { "Retry-After": "31" })); vi.stubGlobal("fetch", fetch);
     await expect(plugin.definition.onEnvironmentResumeLease!({ driverKey: "boat", companyId: "c", environmentId: "e", config, providerLeaseId: id })).rejects.toMatchObject({ message: `Boat POST /sandboxes/${id}/resume failed (429): http_error (rate limit)`, status: 429, httpStatus: 429, category: "http_error" });
     expect(fetch).toHaveBeenCalledTimes(1);

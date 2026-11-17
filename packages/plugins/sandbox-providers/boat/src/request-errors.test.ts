@@ -20,7 +20,7 @@ function assertSafe(error: Error, key = canary) {
   expect(Object.hasOwn(error, "cause")).toBe(false);
 }
 describe("central safe request errors", () => {
-  it.each(["message", "nested", "statusText"])('drops provider %s and retains status', async source => {
+  it.each(["message", "nested", "statusText"])('(superseded by replacement: frozen7 transient shape, RFL record 23:42Z) drops provider %s and retains status', async source => {
     const error = await failure(async () => new Response(source === "statusText" ? null : JSON.stringify(source === "message" ? { message: canary } : { error: { message: canary } }), { status: 503, statusText: source === "statusText" ? canary : "fixture" }));
     assertSafe(error);
     expect(error).toMatchObject({ status: 503, httpStatus: 503, category: "http_error" });
