@@ -314,7 +314,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   // Keep: recorded D10 F0 catch. One continuation must not abort the ordinary conversations behind it.
-  it("RFL round4 F0 sweeps a continued conversation with five ordinary unanswered ones without throwing", async () => {
+  it("supersedes(RFL round4 F0; /srv/scratch/paul/rfl-verdicts/SUPERSEDE-RFL-ROUND4-F0-1117.md): RFL round4 F0 sweeps a continued conversation with five ordinary unanswered ones without throwing", async () => {
     const held = await fixture();
     const heldRunId = await held.run({ commentId: await held.message(), status: "failed", errorCode: "runner_remote_state_unavailable" });
     await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, heldRunId));
@@ -2332,6 +2332,66 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notes).toHaveLength(1);
       expect(notes[0]!.id).toBe(waiting!.id);
       expect(notes[0]!.body).toBe(NOT_ANSWERED);
+    });
+
+    // Keep: gate 3 s1 refusal (adca2f56), with the held writer's notice removed (#21066).
+    // If its automatic recovery never delivers, the SWEEP alone must own the bound and the one notice.
+    it("gate 3 bound: refused message, no held-writer notice, recovery never delivers -> one true notice at ten minutes, never a second", async () => {
+      const f = await fixture();
+      const base = Date.now() - 90_000;
+      const messageId = await f.message("Please continue.");
+      await db.update(issueComments).set({ createdAt: new Date(base) }).where(eq(issueComments.id, messageId));
+      const runId = await f.run({ commentId: messageId, status: "failed", errorCode: CODE,
+        error: "native_session_supervisor_busy" });
+      await db.update(heartbeatRuns).set({ createdAt: new Date(base + 63), startedAt: new Date(base + 211),
+        finishedAt: new Date(base + 5_885) }).where(eq(heartbeatRuns.id, runId));
+      const g = { ...f, messageId, runId, base };
+      const actionId = await hold(g);
+      await recordDelivery(g, actionId); // Fresh continuation recorded, but no wake or continuation run ever arrives.
+      expect(await pending(g, runId)).toBe(true);
+      const systemNotes = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, g.issueId),
+        eq(issueComments.authorType, "system"))); // Count ALL notices, including hidden/deleted ones.
+      expect(await systemNotes()).toHaveLength(0); // Deliberately no noticeHeldUnfinishedPredecessor call.
+
+      expect((await at(g, 90_000)).kind).toBe("pending");
+      expect(await systemNotes()).toHaveLength(0);
+      const waits = () => db.select().from(activityLog).where(and(eq(activityLog.entityId, g.issueId),
+        eq(activityLog.action, PENDING_WAIT_ACTION)));
+      const recorded = await waits();
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]!.details).toMatchObject({ messageId, runId });
+      // The writer stamps T0 with the database clock, not the injected decision clock.
+      // Read that durable start so +10 min is EXACTLY the bound, without a timing cushion.
+      const t0 = recorded[0]!.createdAt.getTime() - base;
+      let waitingId: string | undefined;
+      for (const minutes of [1, 5, 9]) {
+        await at(g, t0 + minutes * 60_000);
+        const notes = await systemNotes();
+        expect(notes.map(note => note.body).join(" ")).not.toMatch(/send(?:ing)? it again/i);
+        if (minutes === 1) {
+          expect(notes).toHaveLength(0); // Still inside the short grace.
+        } else {
+          expect((await g.visible()).map(note => note.body)).toEqual([recoveringText()]);
+          expect(notes).toHaveLength(1);
+          expect(codeOf(notes[0]!)).toBeUndefined();
+          waitingId ??= notes[0]!.id;
+          expect(notes[0]!.id).toBe(waitingId);
+        }
+      }
+
+      expect(PENDING_WAIT_START_BOUND_MS).toBe(10 * 60_000);
+      expect(await at(g, t0 + 10 * 60_000)).toMatchObject({ kind: "noticed", code: "native_session_supervisor_busy" });
+      for (const minutes of [10, 11, 30]) {
+        if (minutes > 10) expect((await at(g, t0 + minutes * 60_000)).kind).toBe("noticed_before");
+        const notes = await systemNotes();
+        expect(notes).toHaveLength(1);
+        expect(notes[0]!.id).toBe(waitingId);
+        expect(notes[0]!.body).toBe(NOT_ANSWERED);
+        expect(codeOf(notes[0]!)).toBe("native_session_supervisor_busy");
+        expect((await g.visible()).map(note => note.id)).toEqual([waitingId]);
+      }
+      expect((await waits()).map(wait => ({ id: wait.id, createdAt: wait.createdAt })))
+        .toEqual(recorded.map(wait => ({ id: wait.id, createdAt: wait.createdAt })));
     });
 
     // Keep: gate 3 s1, chat 253cb37f: run adca2f56 failed native_continuation_requires_reconciliation; the held
