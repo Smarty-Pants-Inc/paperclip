@@ -1243,6 +1243,162 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(native).toEqual([{ released: true }]);
   });
 
+  // Hold50: a person's Stop mid-turn, then a NEW message at +0. That message
+  // is a non-interrupt deferred wake. Its successor must start when the
+  // stopped native run's teardown ends (its per-wake hint), never while the
+  // old run can still write, and not after the two 30 s age gates. Messages
+  // queued before the Stop stay waiting; a delivered message never replays.
+  async function stopNativeMidTurn(seeded: Awaited<ReturnType<typeof seedQueue>>) {
+    await db.update(heartbeatRuns).set({ nativeIssueId: seeded.issueId, responsibleUserId: "queue-owner" })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: seeded.companyId,
+      issueId: seeded.issueId, runId: seeded.runId, phase: "observed" });
+    // Hold the successor in the ordinary queue without launching a provider.
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, seeded.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
+      status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const service = heartbeatService(db);
+    // The person's Stop, mid-turn: the board Stop route's exact call
+    // (routes/agents.ts POST /heartbeat-runs/:runId/cancel).
+    await service.cancelRun(seeded.runId, "Cancelled by a board operator", {
+      cancellationRequestId: randomUUID(), cancellationRequestedByUserId: "queue-owner",
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "queue-owner" },
+    });
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(stopped.status).toBe("cancelled");
+    // The runner acknowledged the Stop, but teardown still owns the session:
+    // the coordinator lease is held and the provider child (this live
+    // process) can still write.
+    await db.update(heartbeatRuns).set({ processPid: process.pid, processGroupId: null, resultJson: { ...stopped.resultJson,
+      nativeCancellation: { ...(stopped.resultJson?.nativeCancellation as object ?? {}),
+        schema: "paperclip.native-cancellation.v1", runId: seeded.runId,
+        companyId: seeded.companyId, issueId: seeded.issueId, scope: "run", reasonCode: "cancellation_run_only",
+        dispatchState: "acknowledged", dispatched: true, intentAuditId: "intent", acknowledgementAuditId: "ack" } },
+    }).where(eq(heartbeatRuns.id, seeded.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: "teardown-owner" })
+      .where(eq(nativeRunFinalizations.runId, seeded.runId));
+    // The native terminal path records the no-replay hold for the stopped run
+    // (legacy-execution-recovery.ts); new input must pass explicit admission.
+    await db.insert(issueRecoveryActions).values({ companyId: seeded.companyId, sourceIssueId: seeded.issueId,
+      kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation",
+      fingerprint: seeded.runId, status: "resolved", outcome: "blocked", nextAction: "Inspect stopped execution",
+      evidence: { runId: seeded.runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+    // The live executor still owns the task's execution lock mid-teardown.
+    await db.update(issues).set({ executionRunId: seeded.runId }).where(eq(issues.id, seeded.issueId));
+    return { service, stopped };
+  }
+
+  /** The executor ends: its lock is released (a native Stop's release never
+   * drains queued input), then its finally path reconsiders saved messages
+   * while the controller still settles; that refusal writes executionWait. */
+  async function endExecutor(seeded: Awaited<ReturnType<typeof seedQueue>>, service: ReturnType<typeof heartbeatService>) {
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, seeded.issueId));
+    await service.resumeRemoteStopComments((await service.getRun(seeded.runId))!);
+  }
+
+  const hold50Successors = async (seeded: Awaited<ReturnType<typeof seedQueue>>) => (await db.select().from(heartbeatRuns)
+    .where(eq(heartbeatRuns.companyId, seeded.companyId)))
+    .filter(run => run.id !== seeded.runId && run.contextSnapshot?.issueId === seeded.issueId);
+
+  async function endTeardown(seeded: Awaited<ReturnType<typeof seedQueue>>, step: "lease" | "process" | "both") {
+    await db.transaction(async tx => {
+      if (step !== "process") await tx.update(nativeRunFinalizations).set({ leaseOwner: null })
+        .where(eq(nativeRunFinalizations.runId, seeded.runId));
+      if (step !== "lease") await tx.update(heartbeatRuns).set({ processPid: 999_999_999 })
+        .where(eq(heartbeatRuns.id, seeded.runId));
+      // The release emitters' company hint plus their exact per-wake hints.
+      await notifyDeferredExecutionWork(tx, { companyId: seeded.companyId });
+      await notifyDeferredWakesForIssue(tx, { companyId: seeded.companyId, issueId: seeded.issueId });
+    });
+  }
+
+  it("Hold50 starts a message sent after a native Stop as soon as the stopped run's teardown ends", async () => {
+    const seeded = await seedQueue();
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    const work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true);
+    try {
+      await work.ready;
+      const { service } = await stopNativeMidTurn(seeded);
+      // A NEW message at +0 after the Stop: the old run can still write, so
+      // admission saves it as a deferred wake.
+      const client = app(seeded.companyId);
+      const sent = await request(client).post(`/api/issues/${seeded.issueId}/comments`)
+        .send({ body: "New direction after Stop" }).expect(201);
+      const newWake = async () => (await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, seeded.companyId)))
+        .find(wake => wake.id !== seeded.wakeId &&
+          JSON.stringify(wake.payload ?? {}).includes(sent.body.id));
+      await vi.waitFor(async () => expect(await newWake()).toBeTruthy(), { timeout: 5_000, interval: 50 });
+      expect((await newWake())!.status).toBe("deferred_issue_execution");
+      // The executor's own end-of-run attempt (heartbeat.ts finally) is
+      // refused while teardown owns the session; it rewrites executionWait.
+      await endExecutor(seeded, service);
+      const held = (await newWake())!;
+      expect(held.status, JSON.stringify(held)).toBe("deferred_issue_execution");
+      expect(held.payload?.executionWait, JSON.stringify(held.payload)).toBeTruthy();
+      // (4) Nothing starts while the old run can still write: lease held.
+      await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: seeded.companyId, requestId: held.id }));
+      await new Promise(resolve => setTimeout(resolve, 750));
+      expect(await hold50Successors(seeded)).toEqual([]);
+      // (4) Lease released but the provider process is alive: still nothing.
+      await endTeardown(seeded, "lease");
+      await new Promise(resolve => setTimeout(resolve, 750));
+      expect(await hold50Successors(seeded)).toEqual([]);
+      // Without the stop proof the hint does not even re-attempt admission:
+      // the saved wake is untouched (no early bypass without proof).
+      await service.resumeExecutionWaitComments({ companyId: seeded.companyId, requestId: held.id });
+      expect((await newWake())!.updatedAt.getTime()).toBe(held.updatedAt.getTime());
+      // Teardown ends: the provider's stop is recorded and the release emits
+      // the per-wake hints.
+      const cleanupProvenAt = Date.now();
+      await endTeardown(seeded, "process");
+      // (1) The successor exists within 10 s of the cleanup proof, well inside
+      // the 30 s age gates the refusal just reset.
+      await vi.waitFor(async () => expect(await hold50Successors(seeded)).toHaveLength(1),
+        { timeout: 10_000, interval: 50 });
+      expect(Date.now() - cleanupProvenAt).toBeLessThan(10_000);
+      const [successor] = await hold50Successors(seeded);
+      expect(successor.contextSnapshot?.wakeCommentIds).toContain(sent.body.id);
+      // (2) Messages queued BEFORE the Stop stay waiting: Stop means stop.
+      for (const commentId of seeded.commentIds) expect(successor.contextSnapshot?.wakeCommentIds).not.toContain(commentId);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].status)
+        .toBe("deferred_issue_execution");
+      // (3) A delivered message is never replayed: more hints, one successor.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, successor.id));
+      await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: seeded.companyId, requestId: held.id }));
+      await endTeardown(seeded, "both");
+      await service.resumeExecutionWaitComments({ companyId: seeded.companyId, requestId: held.id });
+      await new Promise(resolve => setTimeout(resolve, 750));
+      expect(await hold50Successors(seeded)).toHaveLength(1);
+    } finally { await work.stop(); }
+  });
+
+  it("Hold50 keeps messages queued before a native Stop waiting after its teardown ends", async () => {
+    const seeded = await seedQueue();
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    const work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true);
+    try {
+      await work.ready;
+      const { service } = await stopNativeMidTurn(seeded);
+      // The executor's end-of-run attempt marks the pre-Stop queue as waiting.
+      await endExecutor(seeded, service);
+      const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+      expect(saved.payload?.executionWait, JSON.stringify(saved.payload)).toBeTruthy();
+      await endTeardown(seeded, "both");
+      await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: seeded.companyId, requestId: seeded.wakeId }));
+      await service.resumeExecutionWaitComments({ companyId: seeded.companyId, requestId: seeded.wakeId });
+      await new Promise(resolve => setTimeout(resolve, 1_500));
+      // (2) Stop alone is not intent: only a new message or Send is. The
+      // proven stop does not bypass the gates for input that predates it.
+      expect(await hold50Successors(seeded)).toEqual([]);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].updatedAt
+        .getTime()).toBe(saved.updatedAt.getTime());
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].status)
+        .toBe("deferred_issue_execution");
+    } finally { await work.stop(); }
+  });
+
   async function seedFirstTurnQueue(runtime: "preparing" | "native", queueStartedBy: "user" | "system" = "user") {
     const seeded = await seedQueue();
     // A user's follow-ups, as the comment route saves them behind that user's run.
