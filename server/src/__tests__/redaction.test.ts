@@ -6,13 +6,44 @@ describe("explicit diagnostic credential forms", () => {
     expect(redactEventPayload({ authorizationHeader: "abcdefghijkl", apiKeyProduction: "sensitivevalue", credentialHandling: "harness", tokenPolicy: "least privilege" }))
       .toEqual({ authorizationHeader: "***REDACTED***", apiKeyProduction: "***REDACTED***", credentialHandling: "harness", tokenPolicy: "least privilege" });
   });
-  it.each(["a bearer of good news", "ern bearer lanterns", "the bearer bonds", "ern bearer [REDACTED]"])("preserves prose and upstream redaction markers: %s", input => {
+  it.each([
+    "a bearer of good news", "bearer bonds", "standard bearer Washington",
+    "Bearer Instruments", "bearer instruments.", "bearer obligations,",
+    "bearer well-known", "bearer abcdefghijkl",
+    "bearer abcdefgh.", "bearer .abcdefgh",
+    "bearer abcdefgh_", "bearer _abcdefgh", "bearer abcdefgh~",
+    "bearer ~abcdefgh", "bearer abcdefgh+", "bearer +abcdefgh",
+    "bearer abcdefgh/", "bearer /abcdefgh", "bearer abcdefgh=",
+    "bearer abcdefgh!", "bearer abcdefgh?",
+    "bearer abcdefghijklmnopqrs.",
+    "bearer abcdefgh)", "bearer abcdefgh]", "bearer abcdefgh'",
+    'bearer abcdefgh"', "bearer abc1def",
+    "ern bearer lanterns", "the bearer bonds", "ern bearer [REDACTED]",
+  ])("preserves prose and upstream redaction markers: %s", input => {
     expect(redactSensitiveText(input)).toBe(input);
     expect(redactEventPayload({ text: input })?.text).toBe(input);
   });
   it.each([
     ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD", "Authorization: ***REDACTED***"],
     ["Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD", "Bearer ***REDACTED***"],
+    ["bearer abc123def456", "bearer ***REDACTED***"],
+    ["bearer AbCdEfGhIjKl", "bearer ***REDACTED***"],
+    ["bearer abc.def.ghi", "bearer ***REDACTED***"],
+    ["bearer Ab3-xY9_kk", "bearer ***REDACTED***"],
+    ["bearer eyJhbGciOiJIUzI1NiJ9", "bearer ***REDACTED***"],
+    ["bearer abcdefg1", "bearer ***REDACTED***"],
+    ["bearer abcdefgH", "bearer ***REDACTED***"],
+    ["bearer abcDefgh", "bearer ***REDACTED***"],
+    ["bearer ABCDEFGH", "bearer ***REDACTED***"],
+    ["bearer abc_defg", "bearer ***REDACTED***"],
+    ["bearer abc~defg", "bearer ***REDACTED***"],
+    ["bearer abc+defg", "bearer ***REDACTED***"],
+    ["bearer abc/defg", "bearer ***REDACTED***"],
+    ["bearer abc=defg", "bearer ***REDACTED***"],
+    ["bearer abc1-def", "bearer ***REDACTED***"],
+    ["bearer abcD-efg", "bearer ***REDACTED***"],
+    ["bearer abcdefghijklmnopqrst", "bearer ***REDACTED***"],
+    ["bearer abc123def456.!?)'\"", "bearer ***REDACTED***"],
     ["Authorization: Bearer x", "Authorization: ***REDACTED***"],
     ['bearer "x"', 'bearer "***REDACTED***"'],
     ["bearer 'x'", "bearer '***REDACTED***'"],
@@ -20,9 +51,22 @@ describe("explicit diagnostic credential forms", () => {
     expect(redactSensitiveText(input)).toBe(expected);
     expect(redactEventPayload({ text: input })?.text).toBe(expected);
   });
-  it("masks standalone bearer values and whitespace-prefixed JSON token headers", () => {
+  it.each([".", ",", ";", ":", "!", "?", ")", "]", "'", '"'])("classifies bare bearer values before trailing sentence punctuation: %s", suffix => {
+    const prose = `bearer abcdefghijklmnopqrs${suffix}`;
+    expect(redactSensitiveText(prose)).toBe(prose);
+    expect(redactEventPayload({ text: prose })?.text).toBe(prose);
+    for (const token of ["abc123def456", "AbCdEfGhIjKl", "abc.def.ghi", "abcdefghijklmnopqrst"]) {
+      const input = `bearer ${token}${suffix}`;
+      const text = redactSensitiveText(input);
+      expect(text).toContain(REDACTED_EVENT_VALUE);
+      expect(text).not.toContain(token);
+      expect(redactEventPayload({ text: input })?.text).toBe(text);
+    }
+  });
+  it("supersedes: bare bearer 12-char lowercase assertion with digit-bearing and interior-mixed-case guards (RFL + rf-2)", () => {
     const jwt = `${Buffer.from(' {"alg":"HS256","typ":"JWT"}').toString("base64url")}.abcdefghijk.abcdefghijkl`;
-    expect(redactSensitiveText("provider said Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD")).not.toContain("abcdefghijklmnopqrstuvwxyz0123456789ABCD");
+    expect(redactSensitiveText("provider said Bearer abc123def456")).toBe("provider said Bearer ***REDACTED***");
+    expect(redactSensitiveText("provider said Bearer AbCdEfGhIjKl")).toBe("provider said Bearer ***REDACTED***");
     expect(redactEventPayload({ diagnostic: jwt })?.diagnostic).toBe("***REDACTED***");
     expect(redactSensitiveText("Use bearer authentication and bearer tokens.")).toBe("Use bearer authentication and bearer tokens.");
   });

@@ -702,6 +702,20 @@ function redactAuthorizationCredentials(input: string): string {
   return parts.join("");
 }
 
+function isStandaloneBearerCredential(candidate: string): boolean {
+  // Explicitly quoted (including malformed/embedded-quote) values remain private;
+  // a closing sentence quote alone must not turn an ordinary word into a secret.
+  if (/^(?:\\?["'])/.test(candidate)) return true;
+  const token = candidate.replace(/[.,;:!?)\]'"]+$/, "");
+  if (/["']/.test(token)) return true;
+  return /^[A-Za-z0-9._~+/=-]{8,}$/.test(token) && (
+    token.length >= 20 ||
+    /[0-9]/.test(token) ||
+    /[A-Z]/.test(token.slice(1)) ||
+    /[._~+/=]/.test(token.slice(1, -1))
+  );
+}
+
 function redactStandaloneBearerCredentials(input: string): string {
   const bearerWord = /\bBearer\b/gi;
   const parts: string[] = [];
@@ -744,10 +758,9 @@ function redactStandaloneBearerCredentials(input: string): string {
     }
 
     const candidate = input.slice(credentialStart, end);
-    // A bare bearer is also ordinary prose ("bearer of good news"). Require
-    // a token-shaped run; quotes still explicitly delimit private values,
-    // including malformed quoted credentials. Named headers are handled above.
-    if (!/["']/.test(candidate) && !/^[A-Za-z0-9._~+/=-]{20,}$/.test(candidate)) continue;
+    // Bare bearer prose stays prose; short values need a credential signal.
+    // Quoted values stay private, and named headers are handled above.
+    if (!isStandaloneBearerCredential(candidate)) continue;
     if (credentialStart < copiedThrough) continue;
     parts.push(input.slice(copiedThrough, credentialStart), replacement);
     copiedThrough = end;
