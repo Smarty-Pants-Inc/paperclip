@@ -1653,6 +1653,35 @@ describePostgres("heartbeat recovery module ownership", () => {
     }
   });
 
+  it("logs per-phase hot-restart preparation timings, including when the preparation times out", async () => {
+    const run = await seedOwnedNativeRun(), recovery = createHeartbeatRecovery(db, callbacks(db));
+    hotRestart.read.mockResolvedValue({ version: 1, requestedAt: new Date().toISOString(), previousServerPid: process.pid,
+      previousServerVersion: null, drainRequired: false, requestedByRunId: null, preflightActiveRunIds: [] });
+    const info = vi.spyOn(logger, "info");
+    const phaseLogs = () => info.mock.calls.filter(([, message]) => message === "hot-restart shutdown preparation phases")
+      .map(([fields]) => fields as unknown as { phases: Record<string, number>; outcome: string });
+    try {
+      await recovery.prepareHotRestartShutdown("SIGTERM", new Date());
+      expect(phaseLogs()).toHaveLength(1);
+      expect(phaseLogs()[0]).toMatchObject({ outcome: "hot_restart" });
+      for (const phase of ["idleCleanupMs", "intentReadMs", "runSelectMs", "snapshotWriteMs", "runEventsMs", "nativeDetachMs"]) {
+        expect(phaseLogs()[0]!.phases[phase]).toEqual(expect.any(Number));
+      }
+      let finishIdleClose!: () => void;
+      native.closeIdle.mockImplementationOnce(() => new Promise(resolve => { finishIdleClose = () => resolve({ closed: 0, failed: 0 }); }));
+      const step = await runBoundedShutdownStep({ step: "hot_restart_prepare", signal: "SIGTERM", timeoutMs: 50,
+        log: { info: vi.fn(), error: vi.fn() },
+        run: abort => recovery.prepareHotRestartShutdown("SIGTERM", new Date(), abort).catch(error => { throw error; }) });
+      expect(step.outcome).toBe("timed_out");
+      finishIdleClose();
+      await vi.waitFor(() => expect(phaseLogs()).toHaveLength(2));
+      expect(phaseLogs()[1]).toMatchObject({ outcome: "aborted" });
+    } finally {
+      info.mockRestore();
+      await removeNativeRun(run.id);
+    }
+  });
+
   it("does not dispatch recovery for a run still preparing in this heartbeat process", async () => {
     const run = await seedRun();
     await db.update(agents).set({ adapterType: "paperclip_runner" }).where(eq(agents.id, run.agentId));
