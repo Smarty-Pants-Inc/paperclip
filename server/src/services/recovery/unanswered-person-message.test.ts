@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import {
   activityLog,
   agentWakeupRequests,
   agents,
   approvals,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issueApprovals,
@@ -26,6 +29,10 @@ import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
+import { agentRoutes } from "../../routes/agents.js";
+import { issueRoutes } from "../../routes/issues.js";
+import { errorHandler } from "../../middleware/index.js";
+import { allocateHeartbeatRunEventSeq } from "../heartbeat-run-events.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
@@ -2236,6 +2243,159 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await f.visible()).toHaveLength(0);
       await f.sweep();
       expect(await f.visible()).toHaveLength(0);
+    });
+  });
+
+  // Keep: rf5-famnotices-independent RF5_HELD_RESULT / RF5_LEGACY_HELD_RESULT:
+  // the real Stop route leaves M2 in the held list, but the sweep invited a duplicate.
+  describe("person-stopped held list (RF5)", () => {
+    async function heldChatCase(mode: "native" | "legacy") {
+      const f = await fixture();
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: f.userId,
+        principalType: "user", membershipRole: "owner", status: "active" });
+      const client = express();
+      client.use(express.json());
+      client.use((req, _res, next) => {
+        (req as any).actor = { type: "board", userId: f.userId, source: "session", companyIds: [f.companyId],
+          memberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }], isInstanceAdmin: true };
+        next();
+      });
+      client.use("/api", agentRoutes(db));
+      client.use("/api", issueRoutes(db, {} as any, {}));
+      client.use(errorHandler);
+      const m1 = await f.message("Write the requested document.");
+      const runId = await f.run({ commentId: m1, status: "running" });
+      const startedAt = f.at(0);
+      await db.update(heartbeatRuns).set({ runtimeMode: mode, scopeKind: "issue", issueId: f.issueId,
+        responsibleUserId: f.userId, startedAt, contextSnapshot: { issueId: f.issueId, taskId: f.issueId,
+          wakeReason: "issue_commented", wakeCommentId: m1, wakeCommentIds: [m1], firstTurnQueuedInput: {
+            schema: "paperclip.first-turn-queued-input.v1", runId, commentIds: [], wakeupRequestIds: [],
+            claimedAt: startedAt.toISOString() } } }).where(eq(heartbeatRuns.id, runId));
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, f.issueId));
+      await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId, phase: "observed" });
+      for (const [i, kind] of ["userMessage", "agentMessage"].entries()) {
+        await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId,
+          seq: await allocateHeartbeatRunEventSeq(db, runId), eventType: "item.started", sourceEventId: `rf5-${randomUUID()}`, payload: { prpEvent: {
+            eventType: "item.started", turnId: `turn-${runId}`, itemId: `item-${i}`, payload: { kind, item: { type: kind } } } } });
+      }
+      // Real admission remains queued behind an unrelated task: no provider is mocked or launched.
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running",
+        runtimeMode: "legacy", contextSnapshot: { issueId: randomUUID() } });
+      const m2 = await f.message("Then deploy it, but keep it waiting until I Send.");
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        status: "deferred_issue_execution", source: "issue_comment", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: f.userId, payload: { issueId: f.issueId, commentId: m2,
+          _paperclipWakeContext: { issueId: f.issueId, commentId: m2, wakeCommentId: m2,
+            wakeCommentIds: [m2], wakeReason: "issue_commented" } } }).returning();
+      const stop = await request(client).post(`/api/heartbeat-runs/${runId}/cancel`).send({});
+      expect(stop.status, JSON.stringify(stop.body)).toBe(200);
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(stopped).toMatchObject({ status: "cancelled", resultJson: {
+        cancelledByActorType: "user", cancelledByUserId: f.userId } });
+      const stopAt = new Date(startedAt.getTime() + 30_000);
+      await db.update(heartbeatRuns).set({ finishedAt: stopAt }).where(eq(heartbeatRuns.id, runId));
+      const path = `/api/issues/${f.issueId}/queued-comments`;
+      const queue = async () => (await request(client).get(path).expect(200)).body;
+      const sweep = (minutes: number) => settleUnansweredPersonMessage(db, { ...f,
+        now: new Date(stopAt.getTime() + minutes * 60_000) });
+      const notes = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+        eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
+      return { ...f, client, path, m1, m2, runId, wakeId: wake!.id, queue, sweep, notes, stopAt };
+    }
+
+    it.each(["native", "legacy"] as const)("RF5 %s: held M2 has no notice at +2/+11 min; Send answers it, delete removes its duty", async mode => {
+      const f = await heldChatCase(mode);
+      for (const minutes of [2, 11]) {
+        const before = await f.queue();
+        expect(before.executionWait?.reason).toBe("stopped_by_person");
+        expect(before.entries.filter((e: any) => e.comment.id === f.m2)).toHaveLength(1);
+        await f.sweep(minutes);
+        // Check BEFORE another sweep can supersede anything: posting and then
+        // hiding resend advice is not "posts nothing", even if the final view is clean.
+        expect(await db.select({ id: issueComments.id }).from(issueComments).where(and(
+          eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")))).toHaveLength(0);
+        await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId, unanswered: true });
+        const after = await f.queue();
+        expect(after.entries.map((e: any) => e.comment.id)).toEqual([f.m2]);
+        console.log(mode === "native" ? "RF5_HELD_RESULT" : "RF5_LEGACY_HELD_RESULT",
+          JSON.stringify({ minutes, queue: after, notes: await f.notes() }));
+        expect(await f.notes()).toHaveLength(0);
+      }
+      const queue = await f.queue();
+      await request(f.client).post(`${f.path}/interrupt`).send({ queueId: queue.queueId,
+        revision: queue.revision, targetRunId: null }).expect(200);
+      // The real Send route records intent. With admission deliberately occupied,
+      // materialize its carrying run's result, as RF5 materializes successor outcomes;
+      // this checks notice policy, not a live provider's deployment or execution.
+      const [sent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      expect(sent!.payload?.queuedCommentInterrupt).toBeTruthy();
+      expect((await f.queue()).executionWait?.reason).not.toBe("stopped_by_person");
+      const successor = await f.run({ commentId: f.m2, status: "succeeded" });
+      await db.update(heartbeatRuns).set({ runtimeMode: mode, wakeupRequestId: f.wakeId })
+        .where(eq(heartbeatRuns.id, successor));
+      await db.update(agentWakeupRequests).set({ status: "coalesced", runId: successor })
+        .where(eq(agentWakeupRequests.id, f.wakeId));
+      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "agent", authorAgentId: f.agentId, createdByRunId: successor, body: "Deployed; here is the receipt." });
+      await f.sweep(12);
+      expect(await f.notes()).toHaveLength(0);
+
+      const deleted = await heldChatCase(mode);
+      const held = await deleted.queue();
+      await request(deleted.client).delete(`${deleted.path}/${deleted.m2}`).send({ queueId: held.queueId,
+        revision: held.revision }).expect(200);
+      expect((await deleted.queue()).entries).toHaveLength(0);
+      await deleted.sweep(2); await deleted.sweep(11);
+      expect(await deleted.notes()).toHaveLength(0);
+      expect(await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.id, deleted.m2)))
+        .toHaveLength(0);
+    });
+
+    it.each(["native", "legacy"] as const)("RF5 %s: a sent message that fails is no longer silenced by the held list", async mode => {
+      const f = await heldChatCase(mode);
+      const queue = await f.queue();
+      await request(f.client).post(`${f.path}/interrupt`).send({ queueId: queue.queueId,
+        revision: queue.revision, targetRunId: null }).expect(200);
+      const successor = await f.run({ commentId: f.m2, status: "failed", errorCode: "adapter_failed" });
+      await db.update(heartbeatRuns).set({ runtimeMode: mode }).where(eq(heartbeatRuns.id, successor));
+      await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.id, f.wakeId));
+      await f.sweep(2); await f.sweep(11);
+      const notes = await f.notes();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.metadata).toMatchObject({ authorizationReason: `unanswered_message:${f.m2}`, sourceRunId: successor });
+    });
+
+    it.each(["native", "legacy"] as const)("RF5 %s: a queued message outside Agent Chat keeps its ordinary notice rules", async mode => {
+      const f = await heldChatCase(mode);
+      await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null })
+        .where(eq(issues.id, f.issueId));
+      expect((await f.queue()).executionWait?.reason).not.toBe("stopped_by_person");
+      await f.sweep(2); await f.sweep(11);
+      const notes = await f.notes();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.m2}`);
+    });
+
+    it.each(["native", "legacy"] as const)("RF5 %s: a standing resend notice for held M2 is discovered and superseded", async mode => {
+      const f = await heldChatCase(mode);
+      const [notice] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "system", body: NO_RUN, metadata: { version: 1, sections: [],
+          authorizationReason: `unanswered_message:${f.m2}` } }).returning();
+      // Another wake behind /new is in the same held list. M2's older note
+      // must disappear even though M2 is no longer the latest person message.
+      const m3 = await f.message("/new Start fresh after I Send.");
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        status: "deferred_issue_execution", source: "issue_comment", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: f.userId, payload: { issueId: f.issueId, commentId: m3,
+          _paperclipWakeContext: { issueId: f.issueId, wakeCommentId: m3, wakeCommentIds: [m3] } } });
+      expect((await f.queue()).entries.map((e: any) => e.comment.id)).toEqual([f.m2, m3]);
+      const discovered = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+        eq(issueComments.id, notice!.id), unansweredPersonMessageCommentCondition()));
+      expect(discovered).toHaveLength(1);
+      await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId, unanswered: true });
+      expect(await f.notes()).toHaveLength(0);
+      await f.sweep(11);
+      expect(await f.notes()).toHaveLength(0);
     });
   });
 

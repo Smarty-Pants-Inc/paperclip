@@ -60,6 +60,47 @@ export async function runStartedAnswering(db: Db, input: { companyId: string; ru
     && row.kind && row.kind !== "userMessage"));
 }
 
+/** The durable held-list state (routes/issues.ts buildQueuedCommentQueue):
+ * a chat's last turn was stopped by a person, there is no active turn, and
+ * its plain-message queue head is deferred without a different execution wait.
+ * The whole list, including separate wakes behind /new, awaits the person's
+ * Send. Send records queuedCommentInterrupt before admission; consuming or
+ * deleting a message removes it from this predicate. Native and legacy share
+ * this queue state; neither a recovery incident nor a clock is its authority. */
+export function personHeldChatMessageSql(m: { id: SQL; companyId: SQL; issueId: SQL }): SQL {
+  return sql`exists (select 1 from issues held_issue
+    join lateral (select r.status, r.result_json from heartbeat_runs r
+      where r.company_id = held_issue.company_id and r.agent_id = held_issue.conversation_agent_id
+        and r.context_snapshot->>'issueId' = held_issue.id::text
+      order by r.created_at desc, r.id desc limit 1) stopped on true
+    join lateral (select w.status, w.payload from agent_wakeup_requests w
+      where w.company_id = held_issue.company_id and w.agent_id = held_issue.assignee_agent_id
+        and w.payload->>'issueId' = held_issue.id::text
+        and w.payload->>'interactionId' is null
+        and (w.status = 'deferred_issue_execution' or (w.status = 'queued' and exists (
+          select 1 from heartbeat_runs qr where qr.company_id = w.company_id and qr.agent_id = w.agent_id
+            and qr.id = w.run_id and qr.wakeup_request_id = w.id and qr.status = 'queued')))
+        and exists (select 1 from issue_comments c where c.company_id = held_issue.company_id
+          and c.issue_id = held_issue.id and c.author_type = 'user' and c.deleted_at is null
+          and coalesce(w.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? c.id::text)
+      order by w.requested_at asc limit 1) head on true
+    where held_issue.company_id = ${m.companyId} and held_issue.id = ${m.issueId}
+      and held_issue.conversation_agent_id = held_issue.assignee_agent_id and held_issue.assignee_user_id is null
+      and stopped.status = 'cancelled' and stopped.result_json->>'cancelledByActorType' = 'user'
+      and coalesce(stopped.result_json->>'queuedCommentInterruptQueueId', '') = ''
+      and head.status = 'deferred_issue_execution' and head.payload->>'queuedCommentInterrupt' is null
+      and not (coalesce(jsonb_typeof(head.payload->'executionWait'->'reason') = 'string', false)
+        and coalesce(jsonb_typeof(head.payload->'executionWait'->'message') = 'string', false))
+      and not exists (select 1 from heartbeat_runs active where active.company_id = held_issue.company_id
+        and active.agent_id = held_issue.assignee_agent_id and active.status = 'running'
+        and (active.id = held_issue.execution_run_id or active.context_snapshot->>'issueId' = held_issue.id::text))
+      and exists (select 1 from agent_wakeup_requests held where held.company_id = held_issue.company_id
+        and held.agent_id = held_issue.assignee_agent_id and held.payload->>'issueId' = held_issue.id::text
+        and held.status in ('deferred_issue_execution', 'queued') and held.payload->>'interactionId' is null
+        and held.payload->>'queuedCommentInterrupt' is null
+        and coalesce(held.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text))`;
+}
+
 /** SQL: a cancelled run on the issue that the message's sender stopped and that
  * carried the message as its own input (discovery only; the decision decides). */
 export function personStoppedCarrierSql(m: { id: SQL; companyId: SQL; issueId: SQL; authorUserId: SQL }): SQL {
