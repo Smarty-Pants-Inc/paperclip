@@ -1641,8 +1641,11 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
 
   /** Retry fold: a chat Retry is refused wherever the task Retry API refuses it before admission. */
   async function assertChatRetryAuthority(tx: DbOrTransaction, scope: { companyId: string; issueId: string }) {
-    if (await retryRefusedBeforeAdmission(tx as unknown as Db, { companyId: scope.companyId, issueId: scope.issueId }))
-      throw failedChatRetryDenied();
+    const refused = await retryRefusedBeforeAdmission(tx as unknown as Db, { companyId: scope.companyId, issueId: scope.issueId });
+    // A refused chat Retry says the authority's ONE instruction (the card's
+    // words), never FAILED_CHAT_RETRY_DIAGNOSTIC's "Retry continues the task".
+    if (refused) throw conflict(refused.cardText ?? FAILED_CHAT_RETRY_DIAGNOSTIC, { code: "chat_failed_run_retry_not_authorized",
+      reason: refused.reason, userAction: refused.userAction, nextAction: refused.nextAction });
   }
 
   async function authorizeFailedChatRunRetry(
@@ -2074,6 +2077,12 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
           "chat_failed_run_retry_not_authorized",
           "chat_action_authorization_changed",
         ].includes(String(error.details.code));
+      // A refused chat Retry carries the one authority's words (the card's),
+      // whichever check refused it first; never "Retry continues the task".
+      const refusedBy = denied && typeof claimed.payload.issueId === "string"
+        ? await retryRefusedBeforeAdmission(db, { companyId: claimed.companyId, issueId: claimed.payload.issueId }) : null;
+      const authorityRefusal = refusedBy
+        ? { message: refusedBy.cardText, userAction: refusedBy.userAction, nextAction: refusedBy.nextAction } : {};
       if (receipt) {
         if (denied && typeof claimed.payload.taskRetryIntentId === "string" &&
             receipt.status === "deferred_issue_execution" && !receipt.runId &&
@@ -2092,7 +2101,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
               eq(agentWakeupRequests.companyId, claimed.companyId),
               eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)));
           });
-          return settle("failed", { code: "failed_chat_retry_not_authorized", attemptCount });
+          return settle("failed", { code: "failed_chat_retry_not_authorized", attemptCount, ...authorityRefusal });
         }
         return settle(["skipped", "failed", "cancelled"].includes(receipt.status) ? "failed" : "processed", {
           code: "failed_chat_retry_durable", attemptCount,
@@ -2121,7 +2130,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
         code: retryable
           ? "failed_chat_retry_contended"
           : "failed_chat_retry_not_authorized",
-        attemptCount,
+        attemptCount, ...(retryable ? {} : authorityRefusal),
         ...(retryable
           ? {
               retryAt: new Date(
