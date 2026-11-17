@@ -61,8 +61,11 @@ export async function readContinuationCommentInput(db: Pick<Db, "select">, input
   if (!source) return {};
   // A person's answer to the predecessor's question is pending input exactly as
   // a pending comment is: an automatic successor that drops it re-asks (RFL 09:35Z).
-  return {
-    ...await pendingContinuationCommentInput(db, { ...input, contextSnapshot: source.contextSnapshot }),
-    ...await pendingContinuationInteractionInput(db, { ...input, agentId: source.agentId, contextSnapshot: source.contextSnapshot }),
-  };
+  const answered = await pendingContinuationInteractionInput(db, { ...input, agentId: source.agentId, contextSnapshot: source.contextSnapshot });
+  // The current state is the answer. An interaction-respond wake also names the
+  // asking turn's origin comment; carrying it makes the successor's contract
+  // re-request that turn and cuts its fresh history before the answer (upstream's
+  // seed carries no comment ids at all).
+  if (answered.interactionIds) return answered;
+  return pendingContinuationCommentInput(db, { ...input, contextSnapshot: source.contextSnapshot });
 }
