@@ -448,9 +448,9 @@ describe("Coordinator Inbox badge counts only the default For you list (#20846)"
   const projections = [
     { name: "summary", pathname: "/COO/issues", search: "", seed: (data: ReturnType<typeof counts>) => fixture.summary.mockResolvedValue(data) },
     { name: "Inbox list", pathname: "/COO/decisions", search: "",
-      seed: (data: ReturnType<typeof counts>) => client.setQueryData(coordinatorAttentionQueryKey("company"), { ...data, nextCursor: null, items: [] }) },
+      seed: (data: ReturnType<typeof counts>) => client.setQueryData(coordinatorAttentionQueryKey("company", "reviewer", "mine"), { ...data, nextCursor: null, items: [] }) },
     { name: "task index", pathname: "/COO/issues", search: "?view=needs_attention",
-      seed: (data: ReturnType<typeof counts>) => client.setQueryData(coordinatorAttentionTasksQueryKey("company"), { ...data, taskIds: [] }) },
+      seed: (data: ReturnType<typeof counts>) => client.setQueryData(coordinatorAttentionTasksQueryKey("company", "reviewer"), { ...data, taskIds: [] }) },
   ];
   const badge = () => decisionLink().querySelector('[data-slot="badge"]')?.textContent ?? null;
 
