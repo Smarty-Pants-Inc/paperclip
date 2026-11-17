@@ -11,6 +11,9 @@ import { FAILED_BEFORE_PROVIDER_TURN_KEY, FAILED_BEFORE_PROVIDER_TURN_SCHEMA, fi
   readFailedBeforeProviderTurnRecord } from "../native-runtime/failed-before-provider-turn.js";
 import { abandonUnverifiedRemoteWorkspaceEpoch } from "../remote-workspace-epoch-abandonment.js";
 import { releaseUnchangedRemoteWorkspaceWriter } from "../remote-workspaces.js";
+import { toEnvironmentLease } from "../environments.js";
+import { reusableSandboxReplacementPlan } from "../reusable-sandbox-resume-replacement.js";
+import { deferNativeRunForBusyAgentDirectory, NATIVE_PREDECESSOR_ROTATION_WAIT } from "../native-runtime/native-controller-recovery.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">;
 
@@ -67,6 +70,66 @@ export async function preparePredecessorRetirementFallback(db: Db, run: Run, err
     return { version: 1 as const, providerWorkStarted: false as const, predecessorRunId: failure.predecessorRunId,
       replacedProviderLeaseIds };
   });
+}
+
+/** Context key counting this run's in-run rotations; one is the bound. */
+export const PREDECESSOR_ROTATION_COUNTER_KEY = "predecessorSandboxRotations";
+
+/**
+ * Rotate inside the first run. The run met a predecessor it cannot retire on
+ * its RESUMED sandbox, before any provider work, and
+ * `preparePredecessorRetirementFallback` marked that sandbox
+ * replace-before-reuse. When the replacement plan the next acquisition applies
+ * already allows replacing it (a verified, lease-bound harness backup, and a
+ * clean committed workspace, or a projectless chat whose box is kept), this
+ * same run lets go of the sandbox and is continued by the same-run resume
+ * dispatch. Its acquisition then takes the replacement path to a new sandbox
+ * restored from the saved history, where the predecessor is retired as usual.
+ * No failed run, no second run. Once per run: a second unretired predecessor
+ * keeps today's failure and its automatic attempt.
+ *
+ * Returns false, before it changes anything, when the plan would refuse or the
+ * run can no longer wait; the caller then keeps today's failure path. The
+ * caller dispatches the run again only after this attempt's teardown.
+ */
+export async function rotatePredecessorRetirementInRun(db: Db, input: {
+  run: Run;
+  adapterType: string;
+  error: unknown;
+  fallback: PredecessorRetirementFallback;
+  releaseLeases: () => Promise<unknown>;
+  retryAt: Date;
+  /** The same-run resume claim this attempt runs under, if any. */
+  leaseOwner?: string;
+}): Promise<boolean> {
+  const { run } = input;
+  const failure = findNativePredecessorRetirementUnproven(input.error);
+  if (!failure?.providerLeaseId || !input.fallback.replacedProviderLeaseIds.includes(failure.providerLeaseId)) return false;
+  const [current] = await db.select({ status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+  const rotations = current?.contextSnapshot?.[PREDECESSOR_ROTATION_COUNTER_KEY];
+  if (current?.status !== "running" || (typeof rotations === "number" && rotations >= 1)) return false;
+  const leases = await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
+    eq(environmentLeases.heartbeatRunId, run.id), inArray(environmentLeases.providerLeaseId, input.fallback.replacedProviderLeaseIds)));
+  if (leases.length === 0) return false;
+  for (const lease of leases) {
+    // Read-only: the plan exactly as the next acquisition sees this lease once released.
+    const plan = await reusableSandboxReplacementPlan({ db, lease: { ...toEnvironmentLease(lease), status: "released" },
+      companyId: run.companyId, heartbeatRunId: run.id, executionWorkspaceId: lease.executionWorkspaceId,
+      issueId: lease.issueId, adapterType: input.adapterType, cause: failure });
+    if (!plan) return false;
+  }
+  // The same-run wait is recorded first: recovery never claims a run whose
+  // executor is still active, and the caller dispatches it after teardown.
+  if (await deferNativeRunForBusyAgentDirectory(db, { companyId: run.companyId, runId: run.id, leaseOwner: input.leaseOwner,
+    retryAt: input.retryAt,
+    maxDeferrals: 1, wait: { failureCode: NATIVE_PREDECESSOR_ROTATION_WAIT, counterKey: PREDECESSOR_ROTATION_COUNTER_KEY,
+      message: "Continuing this run on a new sandbox restored from the saved history." } }) !== "deferred") return false;
+  // The run stays its workspace's writer: the next preparation restores the
+  // same clean saved version into a new allocation on the new sandbox. A lease
+  // that stays held is resumed again, and that attempt keeps today's failure.
+  await input.releaseLeases().catch(() => undefined);
+  return true;
 }
 
 async function replacementAlreadyMissed(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect, "companyId" | "retryOfRunId">,

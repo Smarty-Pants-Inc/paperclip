@@ -19,9 +19,9 @@ import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js"
 import { nativeUserStopRecoveryHeld, stopJournalLeftUndeliveredTool, userStopLeftUncertainty } from "./native-user-stop-settlement.js";
 import { probePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { nativeReconciliationError } from "./runner-reconciliation-refusal.js";
-import { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_RETAINED_OWNER_WAIT } from "./native-recovery-wait-codes.js";
+import { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_PREDECESSOR_ROTATION_WAIT, NATIVE_RETAINED_OWNER_WAIT } from "./native-recovery-wait-codes.js";
 
-export { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_RETAINED_OWNER_WAIT };
+export { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_PREDECESSOR_ROTATION_WAIT, NATIVE_RETAINED_OWNER_WAIT };
 
 export const NATIVE_CONTROLLER_RECOVERY_MAX_BYTES = 4 * 1024;
 
@@ -149,9 +149,15 @@ export async function deferNativeControllerRecovery(db: Db, input: {
 }
 
 
+/** A same-run wait before any provider work: the run keeps its id and the
+ * same-run resume dispatch starts it again at `retryAt`. `wait` names why
+ * (default: another run of this agent still uses its files). */
 export async function deferNativeRunForBusyAgentDirectory(db: Db, input: {
   companyId: string; runId: string; leaseOwner?: string; retryAt: Date; maxDeferrals: number;
+  wait?: { failureCode: string; message: string; counterKey: string };
 }): Promise<"deferred" | "pre_admission" | "refused"> {
+  const wait = input.wait ?? { failureCode: NATIVE_AGENT_DIRECTORY_BUSY_WAIT,
+    message: "Waiting for another run of this agent to finish with its files.", counterKey: "agentDirectoryBusyDeferrals" };
   return db.transaction(async tx => {
     const [current] = await tx.select({ issueId: heartbeatRuns.nativeIssueId }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
@@ -169,7 +175,7 @@ export async function deferNativeRunForBusyAgentDirectory(db: Db, input: {
     const cancellation = record(run?.resultJson?.nativeCancellation);
     const stop = readRunCancellation(run?.resultJson);
     const context = record(run?.contextSnapshot);
-    const deferrals = typeof context.agentDirectoryBusyDeferrals === "number" ? context.agentDirectoryBusyDeferrals : 0;
+    const deferrals = typeof context[wait.counterKey] === "number" ? context[wait.counterKey] as number : 0;
     const [clock] = await tx.execute<{ now: Date }>(sql`select clock_timestamp() as now`);
     if (!run || run.runtimeMode !== "native" || run.status !== "running" || task?.executionRunId !== input.runId
       || !owner || owner.resultId || owner.phase !== "observed"
@@ -179,18 +185,21 @@ export async function deferNativeRunForBusyAgentDirectory(db: Db, input: {
       || (["run", "issue"].includes(String(cancellation.scope)) && ["pending", "acknowledged"].includes(String(cancellation.dispatchState)))
       || deferrals >= input.maxDeferrals) return "refused";
     await notifyNativeFinalizationWork(tx, { companyId: input.companyId, issueId: current.issueId, runId: input.runId });
-    await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context, agentDirectoryBusyDeferrals: deferrals + 1 }, updatedAt: new Date() })
+    // A failed attempt armed the execution-control deadline; its same-run
+    // continuation has started no provider work, so nothing is due yet.
+    await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context, [wait.counterKey]: deferrals + 1 },
+      ...(input.wait ? { executionControlDeadlineAt: null } : {}), updatedAt: new Date() })
       .where(eq(heartbeatRuns.id, input.runId));
     const detail = record(owner.failureDetail);
     await tx.update(nativeRunFinalizations).set({
       phase: "retryable_failure", leaseOwner: null, leaseExpiresAt: null, controlDeadlineAt: null,
-      nextAttemptAt: input.retryAt, recoveryState: "resuming_session", failureCode: NATIVE_AGENT_DIRECTORY_BUSY_WAIT,
+      nextAttemptAt: input.retryAt, recoveryState: "resuming_session", failureCode: wait.failureCode,
       failureDetail: {
         recoveryMode: record(run.runnerProfileJson).sessionCheckpoint ? "same_session_resume" : "bootstrap_retry",
         providerSessionEstablished: false, providerEventsExist: false,
         ...detail,
-        originalFailureCode: detail.originalFailureCode ?? NATIVE_AGENT_DIRECTORY_BUSY_WAIT,
-        message: "Waiting for another run of this agent to finish with its files.",
+        originalFailureCode: detail.originalFailureCode ?? wait.failureCode,
+        message: wait.message,
       },
       updatedAt: new Date(),
     }).where(eq(nativeRunFinalizations.runId, input.runId));

@@ -49,7 +49,7 @@ import { withRunExecutionTiming, measureRunPhase, measureWorkspaceSyncPhase, isW
 import { createHeartbeatPreparationTiming } from "./heartbeat/preparation-timing.js";
 import { createHeartbeatInstructionCopyRelease, createHeartbeatInstructionWorkingCopy } from "./heartbeat/instruction-working-copy.js";
 import { AgentDirectoryPreparationDeferral, deferRunForBusyAgentDirectory, prepareWithAgentDirectoryDeferral, REATTACH_AGENT_DIRECTORY_WAIT_MS } from "./heartbeat/agent-directory-busy.js";
-import { preparePredecessorRetirementFallback } from "./heartbeat/predecessor-retirement-fallback.js";
+import { preparePredecessorRetirementFallback, rotatePredecessorRetirementInRun } from "./heartbeat/predecessor-retirement-fallback.js";
 import { prepareHeartbeatRuntimeServiceIntents, startHeartbeatRuntimeServices, recordHeartbeatAdapterRuntimeServices } from "./heartbeat/runtime-services.js";
 import { bindHeartbeatRunnerHomeMode, buildHeartbeatWorkspaceConfiguration, prepareHeartbeatExecutionConfiguration } from "./heartbeat/execution-configuration.js";
 import { adoptsLiveRemoteRunner } from "./heartbeat/live-runner-adoption.js";
@@ -2135,6 +2135,8 @@ export function heartbeatService(
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
     let nativeSessionResumeScheduled = false;
+    // Set when this attempt hands the same run to a fresh sandbox.
+    let predecessorRotationDispatchAt: Date | null = null;
     let restartClaimLapsed = false;
     // The executor detached for "the next controller" because its own lease
     // lapsed (for example after a stall), with no shutdown or hot-restart
@@ -4022,6 +4024,27 @@ export function heartbeatService(
           logger.warn({ err: error, runId: run.id }, "could not prepare a fresh sandbox for the next attempt; keeping the failed workspace");
           return null;
         });
+        // Rotate inside this run when the replacement plan already allows the
+        // fresh sandbox: the same run continues there, with no failed attempt.
+        const rotationAt = new Date();
+        if (predecessorRetirementFallback && await rotatePredecessorRetirementInRun(db, {
+          run, adapterType: agent.adapterType, error: err, fallback: predecessorRetirementFallback, retryAt: rotationAt,
+          leaseOwner: runOptions.nativeLeaseOwner,
+          releaseLeases: () => envOrchestrator.releaseForRun({ heartbeatRunId: run.id, companyId: run.companyId,
+            agentId: run.agentId, status: "released", providerResourceDisposition: "keep_running" }),
+        }).catch(error => {
+          logger.warn({ err: error, runId: run.id }, "could not continue this run on a fresh sandbox; keeping today's next attempt");
+          return false;
+        })) {
+          await appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "info",
+            message: "Continuing this run on a new sandbox restored from the saved history",
+            payload: { retryReasonCode: "native_predecessor_rotation", nextAttemptAt: rotationAt.toISOString(),
+              predecessorRunId: predecessorRetirementFallback.predecessorRunId,
+              replacedProviderLeaseIds: predecessorRetirementFallback.replacedProviderLeaseIds } }).catch(() => undefined);
+          nativeSessionResumeScheduled = true;
+          predecessorRotationDispatchAt = rotationAt;
+          return;
+        }
         if (!predecessorRetirementFallback && !(await preserveNativeWorkspaceOnFailure())) {
           const claim = runOptions.nativeRestartRecovery;
           let releaseFailed = false;
@@ -4368,6 +4391,8 @@ export function heartbeatService(
         activeRunExecutions.delete(run.id);
         heartbeatQueue.releaseClaimBackoffsForTask(run);
         if (restartClaimLapsed || detachedWithoutHandoff) scheduleNativeSessionResumeDispatch(run.id, new Date(), "restart");
+        // Dispatched only now: this attempt's executor and teardown have ended.
+        if (predecessorRotationDispatchAt) scheduleNativeSessionResumeDispatch(run.id, predecessorRotationDispatchAt);
         // A failed owned Stop remains visible until this exact executor settles,
         // including a graceful exit result arriving after the cancellation error.
         // It is never retained beyond the active execution's cleanup.
