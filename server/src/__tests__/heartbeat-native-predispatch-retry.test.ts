@@ -37,6 +37,21 @@ vi.mock("../services/budget-reservations.js", async importOriginal => {
   };
 });
 
+// A lease-bound harness backup is a boundary here (its storage has its own
+// tests): only the stamp this file writes verifies; every other read is real.
+const VERIFIED_TEST_MANIFEST = `sha256:${"a".repeat(64)}`;
+vi.mock("../services/native-runtime/native-harness-backup-storage.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/native-runtime/native-harness-backup-storage.js")>();
+  return {
+    ...actual,
+    verifyRecoverableNativeHarnessBackup: async (...args: Parameters<typeof actual.verifyRecoverableNativeHarnessBackup>) => {
+      const stamp = args[0].stamp as { manifestSha256?: unknown; authorizedProviderLeaseId?: unknown } | undefined;
+      if (stamp?.manifestSha256 === VERIFIED_TEST_MANIFEST) return stamp.authorizedProviderLeaseId === args[0].providerLeaseId;
+      return actual.verifyRecoverableNativeHarnessBackup(...args);
+    },
+  };
+});
+
 const support = await getRecoveryPostgresSupport({});
 
 type AdmissionFailure = { remaining: number; turnNeverIssued: boolean; environmentId: string; provider: string;
@@ -44,7 +59,8 @@ type AdmissionFailure = { remaining: number; turnNeverIssued: boolean; environme
   sessionRoots: string[] };
 
 function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescriptorOnce?: { failed: boolean };
-  unretiredPredecessorOnce?: { failed: boolean; environmentId: string; leasePolicy?: AdmissionFailure["leasePolicy"]; taskBlocked?: boolean; repeat?: string[] }; turnMessages?: Map<string, string>;
+  unretiredPredecessorOnce?: { failed: boolean; environmentId: string; leasePolicy?: AdmissionFailure["leasePolicy"]; taskBlocked?: boolean; repeat?: string[];
+    verifiedBackup?: boolean }; turnMessages?: Map<string, string>;
   admissionFailure?: AdmissionFailure } = {}):
   NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> {
   return execution => {
@@ -97,7 +113,12 @@ function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescripto
           const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId));
           await db.insert(environmentLeases).values({ companyId: run!.companyId, environmentId: unretired.environmentId,
             issueId: execution.binding.issueId, heartbeatRunId: run!.id, provider: "daytona", providerLeaseId: "sandbox-reused",
-            leasePolicy: unretired.leasePolicy ?? "reuse_by_environment", status: "active", metadata: { remoteCwd: "/workspace" } });
+            leasePolicy: unretired.leasePolicy ?? "reuse_by_environment", status: "active", metadata: { remoteCwd: "/workspace",
+              // A person's chat on its resumed box, with the history saved before the Stop.
+              ...(unretired.verifiedBackup ? { nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2",
+                normalizedSessionId: run!.nativeSessionId, runnerInstanceId: "previous-runner", sessionScopeSha256: "b".repeat(64),
+                sourceProviderLeaseId: "sandbox-reused", authorizedProviderLeaseId: "sandbox-reused",
+                manifestSha256: VERIFIED_TEST_MANIFEST, completedAt: new Date().toISOString() } } : {}) } });
           throw new NativePredecessorRetirementUnprovenError("previous-run", "sandbox-reused",
             new Error("Controller journal drain timed out; preserve the session before replacing its writer."));
         }
@@ -240,6 +261,45 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     } finally {
       await heartbeat.drainActiveRunExecutions();
       await closeIdleWarmNativeSessionsForRestart();
+      await db.$client.end();
+    }
+  }, 90_000);
+
+  it("continues the same run on a fresh sandbox when the saved history already allows it, with no failed attempt", async () => {
+    // RFL 08:51Z: Stop, wait, ask again. The first run met the stopped chat's
+    // unretirable Runner on its resumed box. It must answer itself, on a new box.
+    const { companyId } = fixture.current;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const [environment] = await db.insert(environments).values({ name: `reused-${randomUUID()}`, driver: "sandbox" }).returning();
+    const unretired = { failed: false, environmentId: environment!.id, verifiedBackup: true };
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, { unretiredPredecessorOnce: unretired }) });
+    try {
+      const { issueId, runId } = await startTask(db, heartbeat);
+      await waitForCondition("the same run to finish", async () =>
+        (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status === "succeeded");
+      await waitForCondition("the run to settle", () => heartbeat.getTaskDrainStatus().quiescent);
+      expect(unretired.failed).toBe(true);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run).toMatchObject({ status: "succeeded", errorCode: null, error: null });
+      expect(run?.contextSnapshot).toMatchObject({ predecessorSandboxRotations: 1 });
+      expect(run?.resultJson ?? {}).not.toHaveProperty("predecessorRetirementFallback");
+      // One run id: no failed attempt and no automatic or manual retry.
+      expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.retryOfRunId, runId)))).toHaveLength(0);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)))
+        .filter(row => row.contextSnapshot?.issueId === issueId).map(row => row.id)).toEqual([runId]);
+      // The resumed box is replaced at the continued run's acquisition, not resumed.
+      const [lease] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.heartbeatRunId, runId),
+        eq(environmentLeases.providerLeaseId, "sandbox-reused")));
+      expect(lease?.metadata).toMatchObject({ replaceBeforeReuse: { schema: "paperclip.replace-before-reuse.v1", runId } });
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(await taskInterruptionPresentation(db, issue!)).not.toMatchObject({ canRetry: true });
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+      await closeIdleWarmNativeSessionsForRestart();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(and(
+        eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "scheduled_retry"])));
       await db.$client.end();
     }
   }, 90_000);
