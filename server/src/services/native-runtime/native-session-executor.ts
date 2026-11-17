@@ -8066,18 +8066,26 @@ async function refreshFinishedPerTurnRunnerdProjection(
       const previous = await loadNativeRunnerCheckpoint(tx as unknown as Db, { ...input.execution.binding, runId: reference.runId });
       if (!previous || checkpointState(previous) !== checkpointState(previousCheckpoint)) return refuse("source_changed");
     }
-    // Fence the compare-to-apply interval, including writes committed while the
-    // checkpoint reads above were in flight. Stable order: coordinators (above),
-    // leases by id, runs by id, then checkpoint parts by run id / part.
-    if (JSON.stringify(await leaseState(tx as unknown as Db).for("update")) !== JSON.stringify(expectedState.leases)) {
-      return refuse("source_changed");
-    }
-    if (JSON.stringify(await runState(tx as unknown as Db).for("update")) !== JSON.stringify(expectedState.runs)) {
-      return refuse("source_changed");
-    }
+    // Fence the compare-to-apply interval in the existing production lock order:
+    // coordinators (above) -> runs by id -> leases by id -> checkpoint parts
+    // (as settleWarmRetention, environment-warm-retention.ts, and the native
+    // coordinator -> run -> lease writers). The run locks also fence lease
+    // membership: inserting or re-parenting a lease onto these runs needs a
+    // foreign-key share lock on its run, which waits for these locks.
+    await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds)))
+      .orderBy(heartbeatRuns.id).for("update");
+    await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, runIds)))
+      .orderBy(environmentLeases.id).for("update");
     await tx.select({ part: nativeRunnerCheckpoints.part }).from(nativeRunnerCheckpoints).where(and(
       eq(nativeRunnerCheckpoints.companyId, companyId), inArray(nativeRunnerCheckpoints.runId, runIds)))
       .orderBy(nativeRunnerCheckpoints.runId, nativeRunnerCheckpoints.part).for("update");
+    // Final snapshot, only after every fence is held: the COMPLETE coordinator,
+    // run and lease sets (ids + canonical text), not just the rows locked above.
+    if (JSON.stringify(await decisionState(tx as unknown as Db)) !== JSON.stringify(expectedState)) {
+      return refuse("source_changed");
+    }
     const lockedCheckpoint = await loadNativeRunnerCheckpoint(tx as unknown as Db, { ...input.execution.binding, runId: sourceRunId });
     if (!lockedCheckpoint || checkpointState(lockedCheckpoint) !== checkpointState(recovered.checkpoint)) return refuse("source_changed");
     if (previousCheckpoint) {

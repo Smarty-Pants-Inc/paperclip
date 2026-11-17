@@ -20,6 +20,7 @@ import { createNativeControllerRecovery, resolveNativeControllerRecovery } from 
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { settleWarmRetention } from "../environment-warm-retention.js";
 import { freshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
 import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
@@ -421,13 +422,25 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       "coordinator microsecond changed", "source run changed", "prior run changed", "source lease changed", "source checkpoint deleted"]
       .map(scenario => ({ external, scenario }))),
     { external: true, scenario: "lease changed after CAS" },
+    // S099d: membership phantom, real warm-retention deadlock, late write.
+    { external: true, scenario: "judge lease insert after lease guard" },
+    { external: true, scenario: "lease insert before run fence" },
+    { external: true, scenario: "judge real refresh deadlock" },
+    { external: true, scenario: "lease moved in after final snapshot" },
   ])(
     "probes a resumed projection before locking: $scenario (external=$external)", async ({ external, scenario }) => {
       const fixture = await staleProjection("codex", external), { prior, latest, followUp, root, path } = fixture;
       await recordPriorLeaseOnSameSandbox(prior, followUp);
+      const warmScenario = scenario === "judge real refresh deadlock";
       await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
         issueId: prior.issueId, heartbeatRunId: latest.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
-        status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+        status: warmScenario ? "active" : "released", leasePolicy: warmScenario ? "reuse_by_environment" : "ephemeral",
+        releasedAt: warmScenario ? null : new Date(), metadata: { remoteCwd: "/workspace" } });
+      // A lease of no run yet; the late-write case re-parents it onto a compared run.
+      const [detached] = await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
+        issueId: prior.issueId, heartbeatRunId: null, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace", s099dDetached: true } })
+        .returning({ id: environmentLeases.id });
       if (scenario === "coordinator microsecond changed") {
         // Keep the 1µs mutation inside one JS millisecond, deterministically.
         await db.update(nativeRunFinalizations).set({ updatedAt: sql`date_trunc('milliseconds', ${nativeRunFinalizations.updatedAt}) + interval '123 microseconds'` })
@@ -435,17 +448,113 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       }
       type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
       let active: Transaction | undefined, probes = 0, checks = 0, openProbeTransactions = 0, changed = false;
+      const raced = new Set(["judge lease insert after lease guard", "lease insert before run fence",
+        "judge real refresh deadlock", "lease moved in after final snapshot"]);
+      // Concurrent writers on their own connections. Each records whether it
+      // settled only after the projection-refresh transaction ended (= fenced).
+      let refreshEnded = false, refreshError: any;
+      const writers: Record<string, { settledAfterRefresh?: boolean; error?: string }> = {};
+      const pending: Promise<unknown>[] = [];
+      const startWriter = async (name: string, write: () => Promise<unknown>) => {
+        writers[name] = {};
+        const done = write().then(() => { writers[name]!.settledAfterRefresh = refreshEnded; },
+          (err: any) => { writers[name]!.error = String(err?.cause?.code ?? err?.code ?? err?.message ?? err); });
+        pending.push(done);
+        // Let an unblocked write commit before the refresh continues; a fenced one stays queued.
+        await Promise.race([done, new Promise(r => setTimeout(r, 750))]);
+      };
+      const insertLease = () => db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
+        issueId: prior.issueId, heartbeatRunId: latest.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace", judgePhantom: true } });
+      let triggered = false;
+      // Observe each refresh-transaction SELECT by its SQL text (order-agnostic).
+      const onQuery = async (state: { refresh: boolean; runFenced: boolean }, text: string, phase: "before" | "after") => {
+        if (text.includes('to_jsonb("environment_leases")')) state.refresh = true;
+        if (!state.refresh || triggered) return;
+        const forUpdate = /for update/i.test(text);
+        const runLock = forUpdate && /from "heartbeat_runs"/.test(text);
+        const leaseLock = forUpdate && /from "environment_leases"/.test(text);
+        if (phase === "after" && runLock) state.runFenced = true;
+        if (scenario === "judge lease insert after lease guard" && phase === "after" && leaseLock) {
+          triggered = true; await startWriter("phantomInsert", insertLease);
+        } else if (scenario === "lease insert before run fence" && phase === "before" && runLock) {
+          triggered = true; await startWriter("phantomInsert", insertLease);
+        } else if (scenario === "lease moved in after final snapshot" && phase === "after"
+          && text.includes('to_jsonb("environment_leases")') && (forUpdate || state.runFenced)) {
+          // After the last lease snapshot the refresh compares: re-parent a lease
+          // into the compared set, and rewrite an already compared lease.
+          triggered = true;
+          await Promise.all([
+            startWriter("moveIn", () => db.update(environmentLeases).set({ heartbeatRunId: latest.runId })
+              .where(eq(environmentLeases.id, detached!.id))),
+            startWriter("rewrite", () => db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || '{"lateWrite":true}'::jsonb` })
+              .where(eq(environmentLeases.heartbeatRunId, latest.runId))),
+          ]);
+        }
+      };
+      const instrument = (tx: Transaction) => {
+        const state = { refresh: false, runFenced: false };
+        const originalSelect = tx.select.bind(tx);
+        const wrap = (q: any): any => new Proxy(q, { get(target, key) {
+          if (key === "then" && typeof target.then === "function") return (resolve: any, reject: any) => {
+            let text = ""; try { text = target.toSQL().sql; } catch { /* not a query */ }
+            return onQuery(state, text, "before").then(() => target.then(async (rows: unknown) => {
+              await onQuery(state, text, "after"); return rows;
+            })).then(resolve, reject);
+          };
+          const value = Reflect.get(target, key, target);
+          if (typeof value !== "function" || typeof key === "symbol" || key === "constructor") return value;
+          return (...args: any[]) => {
+            const result = value.apply(target, args);
+            return result && typeof result === "object" && typeof result.then === "function" || result === target ? wrap(result) : result;
+          };
+        } });
+        (tx as any).select = (...args: any[]) => {
+          const builder = (originalSelect as any)(...args);
+          return new Proxy(builder, { get(target, key) {
+            const value = Reflect.get(target, key, target);
+            return key === "from" && typeof value === "function" ? (...args: any[]) => wrap(value.apply(target, args)) : value;
+          } });
+        };
+        return state;
+      };
       const transaction = db.transaction.bind(db);
-      const spy = vi.spyOn(db, "transaction").mockImplementation((callback, config) => transaction(async tx => {
-        active = tx;
-        try { return await callback(tx); }
-        finally { active = undefined; }
-      }, config));
+      const spy = vi.spyOn(db, "transaction").mockImplementation((callback, config) => {
+        let state: { refresh: boolean } | undefined;
+        return transaction(async tx => {
+          active = tx;
+          if (raced.has(scenario)) state = instrument(tx);
+          try {
+            return await callback(tx);
+          } catch (err: any) {
+            if (state?.refresh && refreshError === undefined) refreshError = { code: err?.cause?.code ?? err?.code, message: err?.cause?.message ?? err?.message };
+            throw err;
+          } finally { active = undefined; }
+        }, config).finally(() => { if (state?.refresh) refreshEnded = true; });
+      });
       if (scenario === "lease changed after CAS") checkpointReadHook.callback = async () => {
         if (active && checks >= 2 && !changed) {
           await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || '{"judgeChangedAfterCAS":true}'::jsonb` })
             .where(eq(environmentLeases.heartbeatRunId, latest.runId));
           changed = true;
+        }
+      };
+      let warmResult: Promise<{ status: string; code?: string; message?: string }> | undefined;
+      if (scenario === "judge real refresh deadlock") checkpointReadHook.callback = async () => {
+        if (active && checks >= 2 && !changed) {
+          changed = true;
+          const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, latest.runId));
+          let runLocked!: () => void;
+          const locked = new Promise<void>(r => { runLocked = r; });
+          // The real settleWarmRetention, inside a teardown that already owns the run.
+          warmResult = transaction(async tx => {
+            await tx.execute(sql`set local lock_timeout = '8s'`);
+            await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, latest.runId)).for("update");
+            runLocked();
+            await new Promise(r => setTimeout(r, 100));
+            await settleWarmRetention(tx as unknown as typeof db, lease!, "keep_running");
+          }).then(() => ({ status: "committed" }), (err: any) => ({ status: "rejected", code: err.cause?.code ?? err.code, message: err.cause?.message ?? err.message }));
+          await locked;
         }
       };
       const execute = followUp.remoteExecute.getMockImplementation()!;
@@ -462,7 +571,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
             warmTransition: null })).toString("base64"), stderr: "" };
         const result = await execute(request);
         if (text.includes("paperclip-runner-generation-check") && ++checks === 2
-          && scenario !== "no transaction" && scenario !== "lease changed after CAS") {
+          && scenario !== "no transaction" && scenario !== "lease changed after CAS" && !raced.has(scenario)) {
           if (scenario === "source run changed" || scenario === "prior run changed") {
             await db.update(heartbeatRuns).set({ updatedAt: new Date(Date.now() + 60_000) })
               .where(eq(heartbeatRuns.id, scenario === "source run changed" ? latest.runId : prior.runId));
@@ -484,7 +593,34 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       try {
         const outcome = await followUp.start("resumed");
         expect(probes).toBeGreaterThan(0);
-        if (scenario === "no transaction") {
+        if (raced.has(scenario)) {
+          await Promise.all(pending);
+          const warm = await warmResult;
+          const originalPreserved = await readFile(path, "utf8") === fixture.originalBytes;
+          const result = { scenario, outcome, writers, warm, refreshError, originalPreserved, archives: await archivedOwners(root) };
+          if (process.env.S099D_OUT) {
+            await writeFile(join(process.env.S099D_OUT, `${scenario.replaceAll(" ", "-")}-result.json`), JSON.stringify(result, null, 2));
+          }
+          const held = outcome === "native_runner_checkpoint_projection_held:source_changed" && originalPreserved
+            && result.archives.length === 0;
+          if (scenario === "judge real refresh deadlock") {
+            expect(changed).toBe(true);
+            expect(warm?.code, "warm retention must not be a deadlock victim").not.toBe("40P01");
+            expect(refreshError?.code, "projection refresh must not be a deadlock victim").not.toBe("40P01");
+            expect(warm?.status).toBe("committed");
+            // Warm retention rewrote the compared lease first; the refresh then waits and refuses.
+            expect(held).toBe(true);
+          } else {
+            expect(triggered).toBe(true);
+            expect(Object.keys(writers).length).toBeGreaterThan(0);
+            for (const [name, writer] of Object.entries(writers)) {
+              expect(writer.error, name).toBeUndefined();
+              // Blocked by the fence until the refresh ended, or detected by the final snapshot.
+              expect(writer.settledAfterRefresh === true || held, `${name} was neither fenced nor detected`).toBe(true);
+            }
+            if (scenario === "lease insert before run fence") expect(held).toBe(true);
+          }
+        } else if (scenario === "no transaction") {
           expect(openProbeTransactions, "remote probe must not hold a transaction").toBe(0);
           expect(outcome).toBe(ADMITTED);
           expect(JSON.parse(await readFile(path, "utf8")).identity).toEqual(latest.identity);
@@ -496,7 +632,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
           expect(await archivedOwners(root)).toEqual([]);
         }
         await fixture.assertBackup();
-      } finally { checkpointReadHook.callback = null; spy.mockRestore(); }
+      } finally { checkpointReadHook.callback = null; spy.mockRestore(); await Promise.allSettled(pending); await warmResult; }
     }, 60_000);
 
   it("starts an unclaimed remote follow-up from the previous owner's external marker under a bootstrap claim", async () => {
