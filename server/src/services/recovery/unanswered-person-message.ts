@@ -19,6 +19,7 @@ import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
+import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
@@ -104,6 +105,7 @@ export const UNANSWERED_MESSAGE_BOUND_REACHED_TEXT = "Paperclip tried to continu
 // Codes the notice metadata may name. A run's error is reduced to its leading
 // code token; anything not listed is unclassified_failure, never raw text.
 const SHOWN_CODES = new Set([
+  PROVIDER_POLICY_REFUSAL_CODE,
   "adapter_failed", "cancelled", "timeout", "timed_out", "interrupted", "process_lost", "setup_failed",
   "native_controller_recovery_missing_evidence", "native_controller_recovery_dependency_unavailable",
   "native_controller_recovery_unsupported", "native_controller_recovery_wait_authority_changed",
@@ -744,6 +746,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // A fresh-thread refusal is continued by the fresh-continuation fallback on
   // its own (#20925): never the held-conversation "send a new message" note,
   // as isNativeContinuationRefusal already decides for its own patterns.
+  const policyRefused = code === PROVIDER_POLICY_REFUSAL_CODE;
   const held = (isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run));
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
@@ -755,7 +758,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       >= FRESH_CONTINUATION_BOUND);
   // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
-  const body = settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
+  const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
@@ -763,10 +766,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
+      title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
-      nextAction: settingUp ? "No action is needed; your message is saved."
+      nextAction: policyRefused ? "Automatic retry is disabled for this request."
+        : settingUp ? "No action is needed; your message is saved."
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
         : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",

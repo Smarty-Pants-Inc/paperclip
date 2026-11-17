@@ -1,6 +1,6 @@
 import { COMPLETION_REVIEW_STAGE_REASON, COMPLETION_REVIEW_STAGE_REJECTED_REASON, type CompletionReviewStageEntry } from "../issue-execution-policy.js";
 import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
-import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE } from "./native-provider-failure.js";
+import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE, PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "./native-provider-failure.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_ACTION, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE,
   NATIVE_ENVIRONMENT_BLOCKER_MAX_RETRIES } from "./native-environment-blocker.js";
 import { NATIVE_MID_STREAM_CUT_CODE, NATIVE_PROVIDER_REFUSAL_TERMINAL_REASON, type NativeMidStreamCut } from "./native-mid-stream-cut-cause.js";
@@ -259,6 +259,7 @@ export function arbitrateNativeStatus(input: {
   executionReviewStageStarts?: boolean;
   /** Re-derived from the committed runner terminal and pinned execution identity. */
   providerModelRejected?: boolean;
+  providerPolicyRefused?: boolean;
   providerOverloaded?: boolean;
   providerFailureSuperseded?: boolean;
   /** The current owner's blocked report names a system-owned environment or tool outage. */
@@ -340,6 +341,22 @@ export function arbitrateNativeStatus(input: {
     const status = input.governanceGate?.kind === "execution_stage" ? "in_review" : "in_progress";
     return { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: status, toStatus: status,
       reasonCode: "execution_stage_changes_requested", unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
+  }
+  // A refused request must never enter either generic continuation or capacity
+  // retry. Keep review authority intact; otherwise bind the existing board hold.
+  if (input.providerPolicyRefused && input.terminalState === "failed") {
+    if (input.nativeReviewOutcome) return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: PROVIDER_POLICY_REFUSAL_CODE, unblockDescriptor: null,
+      effects: [{ kind: "release_checkout" }],
+    };
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "blocked", toStatus: "blocked", reasonCode: PROVIDER_POLICY_REFUSAL_CODE,
+      unblockDescriptor: { owner: "board", action: PROVIDER_POLICY_REFUSAL_MESSAGE },
+      effects: [{ kind: "bind_blocker", owner: "board", action: PROVIDER_POLICY_REFUSAL_MESSAGE }],
+    };
   }
   if (input.providerModelRejected && input.terminalState === "failed" &&
       input.nativeReviewOutcome !== "stale" && input.nativeReviewOutcome !== "resolved") {

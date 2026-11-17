@@ -1881,8 +1881,9 @@ async function finalizeNativeRunAndProject(input: {
       planWaitAuthorized: planWait !== null,
       hasPendingChildCompletion,
       providerModelRejected: providerFailure?.errorCode === "native_provider_model_rejected" && ownsProviderFailureDecision,
+      providerPolicyRefused: providerFailure?.errorCode === "provider_policy_refusal" && ownsProviderFailureDecision,
       providerOverloaded: providerFailure?.errorCode === "native_provider_overloaded" && ownsProviderFailureDecision,
-      providerFailureSuperseded: providerFailure?.errorCode === "native_provider_overloaded" && !ownsProviderFailureDecision,
+      providerFailureSuperseded: ["native_provider_overloaded", "provider_policy_refusal"].includes(providerFailure?.errorCode ?? "") && !ownsProviderFailureDecision,
       environmentBlocker: terminalState === "succeeded" && ownsProviderFailureDecision && !reviewContext && !stopRequested
         && isNativeEnvironmentBlocker(result),
       failureRetryCount: executionFailureRetryCount(run),
@@ -2047,6 +2048,7 @@ async function finalizeNativeRunAndProject(input: {
           ? { agentId: run.agentId, reviewContext }
           : undefined,
         requireProviderFailureOwner: decision.reasonCode?.startsWith("native_provider_overloaded")
+          || decision.reasonCode === "provider_policy_refusal"
           || decision.reasonCode === "native_run_failed_continuation_exhausted"
           || decision.reasonCode === NATIVE_ENVIRONMENT_BLOCKER_CODE
           || decision.reasonCode === NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE

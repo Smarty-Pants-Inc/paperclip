@@ -123,7 +123,7 @@ import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { redactNativeFailureError } from "./native-failure-redaction.js";
 import { parseCodexCliVersion } from "./codex-runtime-compatibility.js";
 import { createNativeToolTrace, type NativeToolTrace } from "./native-tool-trace.js";
-import { createNativeProviderFailureObservation } from "./native-provider-failure.js";
+import { createNativeProviderFailureObservation, PROVIDER_POLICY_REFUSAL_CODE } from "./native-provider-failure.js";
 import { explainNativeTurnFailure } from "./native-run-failure-explanation.js";
 import { nativeStartupRetryExhaustedAction, nativeStartupRetryWait, planNativeStartupRetry } from "./native-startup-retry.js";
 import { admitUnclaimedNativeBootstrapRetry } from "./native-bootstrap-retry.js";
@@ -9604,6 +9604,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "runner_remote_provider_artifact_incompatible" ||
     sourceFailureCode === "runner_remote_provider_verification_unavailable" ||
     sourceFailureCode === "native_provider_terminal_failed" ||
+    sourceFailureCode === PROVIDER_POLICY_REFUSAL_CODE ||
     sourceFailureCode === NATIVE_PROVIDER_STATE_INCOMPATIBLE ||
     sourceFailureCode === NATIVE_PROVIDER_SIDE_EFFECT_PENDING ||
     sourceFailureCode === NATIVE_CURRENT_WAKE_COMMENTS_UNREAD ||
@@ -9800,6 +9801,7 @@ export function nativeSessionFailureSourceCode(
   | "pi_conversation_identity_missing"
   | "native_permission_declined"
   | "native_provider_terminal_failed"
+  | typeof PROVIDER_POLICY_REFUSAL_CODE
   | "native_governed_wait_settlement_pending"
   | typeof NATIVE_PROVIDER_STATE_INCOMPATIBLE
   | typeof NATIVE_PROVIDER_SIDE_EFFECT_PENDING
@@ -12434,6 +12436,15 @@ async function executePaperclipNativeSessionAttempt(
   let retainedCancelledCheckpoint: PersistedNativeSession | undefined;
   let piCancellationUnsafe = false;
   const providerFailureObservation = createNativeProviderFailureObservation(input.execution.provider);
+  // Only accepted bound runner events may classify a thrown terminal. Retain
+  // the latest turn boundary, so an earlier refusal cannot label a later turn.
+  const observedProviderTerminal = { event: null as PrpEvent | null };
+  const observeProviderFailure = (event: PrpEvent) => {
+    providerFailureObservation.observe(event);
+    if (event.sourceKind === "runner" && ["turn.started", "turn.failed", "turn.completed", "turn.cancelled"].includes(event.eventType)) {
+      observedProviderTerminal.event = event;
+    }
+  };
   let turnCompletedAtMs: number | null = null;
   let runnerSessionStartupScope: NativeRunSpanScope | null = null;
   let agentTurnScope: NativeRunSpanScope | null = null;
@@ -12675,7 +12686,7 @@ async function executePaperclipNativeSessionAttempt(
         await controllerSteps.measure("question_observation", () => liveQuestions.observe(event));
         await controllerSteps.measure("goal_projection", () => projectSessionGoalEvent(event));
         providerUsageLimitObserved ||= nativeProviderUsageLimitFromEvent(event);
-        providerFailureObservation.observe(event);
+        observeProviderFailure(event);
         const eventAtMs = Date.parse(event.emittedAt);
         const milestoneAtMs = Number.isFinite(eventAtMs)
           ? eventAtMs
@@ -12920,7 +12931,7 @@ async function executePaperclipNativeSessionAttempt(
         await controllerSteps.measure("question_observation", () => liveQuestions.observe(event));
         await controllerSteps.measure("goal_projection", () => projectSessionGoalEvent(event));
         providerUsageLimitObserved ||= nativeProviderUsageLimitFromEvent(event);
-        providerFailureObservation.observe(event);
+        observeProviderFailure(event);
         const questionFallback = await controllerSteps.measure("question_fallback", () => materializeRuntimeQuestionFallback({
           db: input.db,
           binding: input.execution.binding,
@@ -14190,7 +14201,15 @@ async function executePaperclipNativeSessionAttempt(
         throw error;
       }
       const now = new Date();
-      const rawFailureCode = nativeSessionFailureSourceCode(error);
+      const terminalEvent = observedProviderTerminal.event;
+      const observedTerminalFailure = error instanceof NativeProviderTerminalFailure && terminalEvent?.eventType === "turn.failed"
+        ? providerFailureObservation.forTerminal(terminalEvent.turnId, {
+            schema: "paperclip.prp.terminal.v1", turnTerminalState: "failed", runTerminalState: "failed", reportedWorkDisposition: "blocked",
+          }) : null;
+      const thrownFailureCode = nativeSessionFailureSourceCode(error);
+      const policyRefusal = thrownFailureCode === "native_provider_terminal_failed"
+        && observedTerminalFailure?.errorCode === PROVIDER_POLICY_REFUSAL_CODE ? observedTerminalFailure : null;
+      const rawFailureCode = policyRefusal ? PROVIDER_POLICY_REFUSAL_CODE : thrownFailureCode;
       const addressedFailure = !ownershipUnverified && readNativeAddressedInteractionId(input.runContextSnapshot)
         ? await readNativeAddressedInteractionFailure(input.db, input.execution.binding, error) : null;
       const startupClassifiedFailureCode = addressedFailure
@@ -14218,6 +14237,7 @@ async function executePaperclipNativeSessionAttempt(
       const sourceFailureCode = ownershipUnverified
         ? NATIVE_ADOPTED_RUNNER_AUTHENTICATION_TIMEOUT
         : classifiedFailureCode === NATIVE_ADDRESSED_INTERACTION_FAILED ||
+          classifiedFailureCode === PROVIDER_POLICY_REFUSAL_CODE ||
           classifiedFailureCode === "native_event_replay_conflict"
           ? classifiedFailureCode
           : providerUsageLimitObserved
@@ -14322,7 +14342,7 @@ async function executePaperclipNativeSessionAttempt(
       const { exhausted } = recoveryProjection;
       const integrityFailure =
         sourceFailureCode === "native_event_replay_conflict";
-      const message = redactIdentityText(
+      const message = policyRefusal?.errorMessage ?? redactIdentityText(
         error instanceof Error ? error.message : String(error),
       ).slice(0, 2_000);
       const sanitizedStderrTail = redactIdentityText(message).slice(-4_096);
@@ -14598,6 +14618,7 @@ async function executePaperclipNativeSessionAttempt(
             } : {}),
             error: message,
             resultJson: sql`(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'remoteRunnerRecovery')
+              || ${JSON.stringify(policyRefusal ? { nativeProviderFailure: policyRefusal.diagnostic } : {})}::jsonb
               || ${JSON.stringify(remoteRunnerRecovery ? { remoteRunnerRecovery } : {})}::jsonb
               || ${providerFailure ? sql`jsonb_build_object('providerFailure', coalesce(${heartbeatRuns.resultJson}->'providerFailure', ${JSON.stringify(providerFailure)}::jsonb))` : sql`'{}'::jsonb`}`,
             errorCode: ownershipUnverified

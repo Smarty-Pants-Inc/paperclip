@@ -1724,7 +1724,7 @@ export async function commitNativeStatusDecision(input: {
   if (reasonCode === "native_provider_model_rejected" && !input.requireModelRejectionOwner) {
     throw new Error("native_model_rejection_owner_required");
   }
-  if ((reasonCode.startsWith("native_provider_overloaded") || reasonCode === "native_run_failed_continuation_exhausted"
+  if ((reasonCode.startsWith("native_provider_overloaded") || reasonCode === "provider_policy_refusal" || reasonCode === "native_run_failed_continuation_exhausted"
       || reasonCode === NATIVE_ENVIRONMENT_BLOCKER_CODE || reasonCode === NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE)
       && !input.requireProviderFailureOwner) {
     throw new Error("native_provider_failure_owner_required");
