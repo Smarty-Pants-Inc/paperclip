@@ -290,10 +290,10 @@ export async function admitExplicitNativeContinuation(input: {
   // A Retry never dispatches past an unproven Stop: without a hold the
   // refusals below are swallowed (refused() above) and the Retry would start
   // ungated into the old conversation. It waits visibly, bounded.
-  if (taskRetry) {
+  if (taskRetry && !blocker) {
     const gate = await readRetryStopGate(db, { companyId, issueId, sourceRunId: taskRetry.sourceRunId,
       requestedAt: retryWake?.requestedAt ?? null });
-    if (gate && (gate.cause !== "source_settling" || !blocker)) {
+    if (gate) {
       if (gate.state === "waiting") return blocked(RETRY_STOP_WAIT_REASON, RETRY_STOP_WAIT_MESSAGE);
       if (!input.dryRun) await retireUnprovenStopRetry(db, { companyId, issueId, requestId: input.taskRetryRequestId!,
         agentId, sourceRunId: taskRetry.sourceRunId });
