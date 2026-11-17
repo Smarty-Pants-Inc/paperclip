@@ -5658,12 +5658,13 @@ describe("TaskChatThread Paperclip Runner queue", () => {
     let rejectDelivery!: (error: Error) => void;
     const delivery = new Promise<void>((_, reject) => { rejectDelivery = reject; });
     const actionQueue = { ...queue, protocol: action === "interrupt" ? "legacy" as const : queue.protocol };
-    // Exercises the explicit Steer button, so automatic steering is off here.
+    // Steer is the Steering section's automatic send (immediate here); Interrupt is the row's button.
     const props = { comments: [queuedComment], onAdd: async () => {}, queuedCommentQueue: actionQueue,
-      onSteerQueuedComment: () => delivery, onInterruptQueued: () => delivery, queuedMessageAutoSteerDelayMs: null };
+      onSteerQueuedComment: () => delivery, onInterruptQueued: () => delivery,
+      queuedMessageAutoSteerDelayMs: action === "steer" ? 0 : null };
     render(<TaskChatThread {...props} />);
     await act(async () => {
-      container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-${action}-queued-prp-1"]`)!.click();
+      if (action === "interrupt") container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-interrupt-queued-prp-1"]`)!.click();
     });
     render(<TaskChatThread {...props} queuedCommentQueue={null} />);
     expect(container.querySelector('[data-testid="task-chat-queued-messages"]')).toBeNull();
@@ -5718,10 +5719,12 @@ describe("TaskChatThread Paperclip Runner queue", () => {
       '[data-testid="task-chat-queued-interrupt-queued-prp-1"]',
     );
     expect(interrupt).not.toBeNull();
-    expect(interrupt!.textContent).toBe(targetRunId ? "Interrupt" : "Send");
+    // Paul NOTE 6: a running turn offers Interrupt now for this one message.
+    expect(interrupt!.textContent).toBe(targetRunId ? "Interrupt now" : "Send");
     expect(onInterruptQueued).not.toHaveBeenCalled();
     flushSync(() => interrupt!.click());
-    expect(onInterruptQueued).toHaveBeenCalledWith(targetRunId);
+    if (targetRunId) expect(onInterruptQueued).toHaveBeenCalledWith(targetRunId, "queued-prp-1");
+    else expect(onInterruptQueued).toHaveBeenCalledWith(targetRunId);
   });
 
   it("cancels an optimistic queued row locally before server acknowledgement", async () => {
