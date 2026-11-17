@@ -851,6 +851,19 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(settled).toMatchObject({ status: "idle", errorReason: null, lastHeartbeatAt: expect.any(Date) });
   });
 
+  it("settles the agent when the live completion loses to the native finalizer's committed success", async () => {
+    const f = await fixture({ runtimeMode: "native", status: "succeeded", finishedAt: new Date(),
+      nativePhase: "committed", resultJson: { finalizationPhase: "committed" } });
+    await db.update(agents).set({ adapterType: "paperclip_runner", status: "running", lifecycleState: "ready" })
+      .where(eq(agents.id, f.agent.id));
+    f.run.runtimeMode = "native";
+    await f.completion.completeRun(f.input);
+    expect(await read(f.run.id)).toMatchObject({ status: "succeeded" });
+    const [settled] = await db.select().from(agents).where(eq(agents.id, f.agent.id));
+    expect(settled).toMatchObject({ status: "idle", errorReason: null, lastHeartbeatAt: expect.any(Date) });
+    expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
+  });
+
   it("keeps the committed native finalization record when the stored result is larger than the read projection", async () => {
     const decisionId = randomUUID();
     const diagnostics = randomBytes(120_000).toString("base64");

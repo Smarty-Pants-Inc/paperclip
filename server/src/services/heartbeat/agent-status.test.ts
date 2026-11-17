@@ -5,10 +5,23 @@ import {
   issues, nativeRunFinalizations, type Db,
 } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { createHeartbeatAgentStatus, settledAgentWorkCondition } from "./agent-status.js";
+
+// Lets a race test commit a concurrent write between the settle's active-run
+// check and its agent update (the delivery signal runs between the two).
+const raceWindow = vi.hoisted(() => ({ hook: null as null | (() => Promise<void>) }));
+vi.mock("../delivery-work-notifications.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../delivery-work-notifications.js")>();
+  return { ...actual, notifyDeliveryWork: async (...args: Parameters<typeof actual.notifyDeliveryWork>) => {
+    const hook = raceWindow.hook;
+    raceWindow.hook = null;
+    if (hook) await hook();
+    return actual.notifyDeliveryWork(...args);
+  } };
+});
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_AGENT_STATUS_TEST_DATABASE_URL");
 const support = external ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -98,6 +111,16 @@ describePostgres("heartbeat agent status", () => {
       const seeded = await seed("succeeded");
       await otherRun(seeded, status);
       expect(await settle(seeded)).toBeNull();
+      expect(await agent(seeded.agentId)).toMatchObject({ status: "running" });
+    });
+
+    afterEach(() => { raceWindow.hook = null; });
+
+    it.each(["running", "queued"] as const)("never idles an agent whose new %s run commits after the active-run check", async status => {
+      const seeded = await seed("succeeded");
+      raceWindow.hook = () => otherRun(seeded, status);
+      expect(await settle(seeded)).toBeNull();
+      expect(raceWindow.hook).toBeNull();
       expect(await agent(seeded.agentId)).toMatchObject({ status: "running" });
     });
 

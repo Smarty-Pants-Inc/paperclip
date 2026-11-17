@@ -153,7 +153,12 @@ export function createHeartbeatAgentStatus(db: Db) {
         lastHeartbeatAt: now,
         updatedAt: now,
       }).where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
-        eq(agents.status, "running"), eq(agents.lifecycleState, "ready"))).returning();
+        eq(agents.status, "running"), eq(agents.lifecycleState, "ready"),
+        // The agent row lock does not block a new run's insert (its foreign key
+        // takes only KEY SHARE), so re-check in the write itself.
+        sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs r
+          WHERE r.company_id = ${run.companyId} AND r.agent_id = ${run.agentId}
+            AND r.id <> ${run.id} AND r.status IN ('running', 'queued'))`)).returning();
       return updated ? { updated, outcome: committed.status } : null;
     });
     if (!result) return null;
