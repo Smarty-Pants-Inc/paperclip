@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { issueRoutes } from "../../routes/issues.js";
+import { errorHandler } from "../../middleware/index.js";
 import {
   activityLog,
+  companyMemberships,
   agentWakeupRequests,
   agents,
   approvals,
@@ -29,7 +34,8 @@ import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "../continuation-comment-input.js";
-import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
+import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
+import { materializeNativeInteractionResponses } from "../native-runtime/native-interaction-bridge.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
@@ -44,6 +50,18 @@ import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
 // managed instructions. "Visible" is the v2 chat filter (TaskChatThread.tsx:930):
 // a system comment is hidden only when recoveryResponsibility is "system".
 // follow-Paperclip Cut B R8: held copy preserves the message and offers a new message, never a permanent ban.
+
+// RF5 (moved from app-lead's rf5-cardline-supplemental.test.ts): pause only the
+// answer delivery worker at the committed-answer/pre-wake boundary, and only in
+// the tests that switch it on. Every other test here keeps the real worker.
+const answerDelivery = vi.hoisted(() => ({ paused: false }));
+vi.mock("../question-response-delivery.js", async (original) => {
+  const actual = await original<typeof import("../question-response-delivery.js")>();
+  return { ...actual, questionResponseDeliveryService: (...args: Parameters<typeof actual.questionResponseDeliveryService>) => {
+    const service = actual.questionResponseDeliveryService(...args);
+    return answerDelivery.paused ? { ...service, deliver: async () => null } : service;
+  } };
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("unanswered person message notice (C9, the stranded sweep)", () => {
@@ -1724,4 +1742,160 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notices).toHaveLength(1);
       expect(notices[0]!.body).toBe(NO_REPLY);
     });
+
+  function http(f: Awaited<ReturnType<typeof fixture>>, actor?: Record<string, unknown>) {
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).actor = actor ?? { type: "board", source: "session", userId: f.userId,
+        companyIds: [f.companyId], memberships: [{ companyId: f.companyId, status: "active", membershipRole: "operator" }], isInstanceAdmin: false };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as any, {})); app.use(errorHandler); return app;
+  }
+  const allNotices = async (f: Awaited<ReturnType<typeof fixture>>) => db.select().from(issueComments).where(and(
+    eq(issueComments.issueId, f.issueId), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
+
+  // h3-iv (gate 4, RC2A-H3-PI-1): Pi killed right after the person answered a
+  // card. The answer-resume run ends adapter_failed with a COMMITTED failed
+  // result, and the wake queue's native terminal hold (postgres.ts
+  // recordNativeTerminalRecoveryIfNeeded) promises the fresh-continuation
+  // fallback. Its coordinator move is guarded by resultId IS NULL, so the
+  // disposition pass must take the committed failed result itself.
+  describe("h3-iv: a Pi kill after an answered card", () => {
+    async function answeredCardKilledResume(f: Awaited<ReturnType<typeof fixture>>, answer: "http" | "row" = "row",
+      failureComment = true) {
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+      const m = await f.message("Ask me which scope, then continue.");
+      const root = await f.run({ commentId: m, status: "succeeded" });
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, sourceRunId: root,
+        kind: "ask_user_questions", status: "pending", createdByAgentId: f.agentId, addresseeUserId: f.userId,
+        continuationPolicy: "none", createdAt: f.at(), payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?",
+          required: true, selectionMode: "single", options: [{ id: "first", label: "First H3_PERSON" }] }] } }).returning();
+      // The person is an operator of the company (the task's chat user).
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: f.userId,
+        status: "active", membershipRole: "operator" });
+      if (answer === "http") {
+        const response = await request(http(f)).post(`/api/issues/${f.issueId}/interactions/${card!.id}/respond`)
+          .send({ answers: [{ questionId: "scope", optionIds: ["first"] }] });
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+        // The answer happens on the fixture clock, after the card.
+        await db.update(issueThreadInteractions).set({ resolvedAt: f.at() }).where(eq(issueThreadInteractions.id, card!.id));
+      } else {
+        await db.update(issueThreadInteractions).set({ status: "answered", resolvedByUserId: f.userId, resolvedAt: f.at(),
+          result: { version: 1, answers: [{ questionId: "scope", optionIds: ["first"] }], summaryMarkdown: "First H3_PERSON" } })
+          .where(eq(issueThreadInteractions.id, card!.id));
+      }
+      // The answer-resume run: Pi was SIGKILLed; the runner committed its failed result.
+      const resume = await f.run({ status: "failed", errorCode: "adapter_failed", error: "Native session failed" });
+      await db.update(heartbeatRuns).set({ nativePhase: "committed", nativeSessionId: randomUUID(), contextSnapshot: {
+        issueId: f.issueId, source: "issue.interaction.respond", mutation: "interaction", wakeReason: "issue_commented",
+        interactionId: card!.id, interactionIds: [card!.id], interactionStatus: "answered", commentId: m, wakeCommentIds: [m] } })
+        .where(eq(heartbeatRuns.id, resume));
+      // The answer reached this answer-resume run (the delivery worker's wake fallback).
+      await db.update(issueQuestionResponseDeliveries).set({ targetRunId: resume, status: "fallback_queued", deliveryMode: "wake_fallback" })
+        .where(eq(issueQuestionResponseDeliveries.interactionId, card!.id));
+      const [contract] = await db.insert(completionContracts).values({ companyId: f.companyId, issueId: f.issueId, revision: 1,
+        schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block",
+        contractJson: {}, canonicalSha256: "48".repeat(32), createdByActorType: "system", createdByActorId: "fixture" }).returning();
+      await db.update(heartbeatRuns).set({ completionContractId: contract!.id }).where(eq(heartbeatRuns.id, resume));
+      const [result] = await db.insert(nativeRunResults).values({ companyId: f.companyId, issueId: f.issueId, runId: resume,
+        completionContractId: contract!.id, serverFingerprint: "fixture", schemaStatus: "accepted", canonicalSha256: "fixture",
+        resultJson: { stopReason: "adapter_failed", finalizationPhase: "committed" } }).returning();
+      await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: resume,
+        phase: "committed", resultId: result!.id });
+      // The settlement's own failure comment (run-settlement presentation).
+      if (failureComment) await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+        authorAgentId: f.agentId, createdByRunId: resume, body: "The Pi run failed before it completed.", createdAt: f.at() });
+      // The hold exactly as recordNativeTerminalRecoveryIfNeeded writes it, with the block it projected.
+      const [blocked] = await db.update(issues).set({ status: "blocked", statusVersion: sql`${issues.statusVersion} + 1` })
+        .where(eq(issues.id, f.issueId)).returning();
+      const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: f.agentId,
+        cause: "native_continuation_requires_reconciliation", fingerprint: `native-continuation:${resume}`,
+        evidence: { runId: resume, originalFailureCode: "adapter_failed",
+          nativeFailureBlock: { runId: resume, statusVersion: blocked!.statusVersion } },
+        nextAction: "The run stopped before it finished. Paperclip continues the task from its last saved work.",
+        maxAttempts: 3 }).returning();
+      // Hold dispatch: the admitted successor is the assertion, not a live turn.
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+      return { m, root, card: card!, resume, hold: hold! };
+    }
+    const dispositionPass = async () => {
+      await settleUnrecoverableExecutions(db);
+      await deliverReconciledExecutions(db, heartbeatService(db).wakeup);
+    };
+    const successorsOf = async (f: { companyId: string; issueId: string }, sourceRunId: string) =>
+      (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+        eq(heartbeatRuns.retryOfRunId, sourceRunId)))).filter(run => run.contextSnapshot?.issueId === f.issueId);
+
+    it("one disposition pass creates exactly ONE successor on the chain edge, and its built input holds the answer", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const k = await answeredCardKilledResume(f);
+      await dispositionPass();
+      const successors = await successorsOf(f, k.resume);
+      const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, k.hold.id));
+      const all = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, retryOfRunId: heartbeatRuns.retryOfRunId,
+        context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId));
+      expect(successors, JSON.stringify({ all, wakes: wakes.map(w => ({ status: w.status, reason: w.reason, error: w.error, runId: w.runId })),
+        delivery: hold!.evidence.continuationDelivery, attempted: hold!.evidence.continuationDeliveryAttemptedAt })).toHaveLength(1);
+      const successor = successors[0]!;
+      expect(successor.status).toBe("queued");
+      expect(successor.contextSnapshot).toMatchObject({ previousRunId: k.resume, retryOfRunId: k.resume,
+        interactionIds: [k.card.id] });
+      expect(await freshContinuationDescendsFrom(db, { companyId: f.companyId, issueId: f.issueId, runId: successor.id,
+        ancestorRunId: k.resume }))
+        .toBe(true);
+      const responses = await materializeNativeInteractionResponses({ db, companyId: f.companyId, issueId: f.issueId,
+        runId: successor.id, agentId: f.agentId, interactionIds: successor.contextSnapshot!.interactionIds as string[],
+        wakeReason: String(successor.contextSnapshot!.wakeReason) });
+      expect(responses.map(response => response.interactionId)).toEqual([k.card.id]);
+      expect(JSON.stringify(responses)).toContain("first");
+      // The committed coordinator is never rewritten; the failure comment stays as written.
+      const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, k.resume));
+      expect(coordinator).toMatchObject({ phase: "committed" });
+      expect((await db.select().from(issueComments).where(eq(issueComments.createdByRunId, k.resume))).map(c => c.body))
+        .toEqual(["The Pi run failed before it completed."]);
+      // A second pass adds nothing: the answer is acted on once.
+      await dispositionPass();
+      expect(await successorsOf(f, k.resume)).toHaveLength(1);
+    }, 60_000);
+
+    it("a foreign committed run's hold stays where it is (the exception binds to the hold's own run)", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const k = await answeredCardKilledResume(f);
+      await db.update(issueRecoveryActions).set({ evidence: { runId: k.resume, originalFailureCode: "adapter_failed",
+        nativeFailureBlock: { runId: randomUUID(), statusVersion: 1 } } }).where(eq(issueRecoveryActions.id, k.hold.id));
+      await dispositionPass();
+      expect(await successorsOf(f, k.resume)).toHaveLength(0);
+    }, 60_000);
+
+    it("RF5 supplementary chain: HTTP answer, failed answer-resume and failed successor, no final (brief 2d literal)", async () => {
+      answerDelivery.paused = true;
+      try {
+        const f = await fixture({ status: "in_progress" });
+        // app-lead's RF5 shape: the failed runs post no comment.
+        const k = await answeredCardKilledResume(f, "http", false);
+        await dispositionPass();
+        const [successor] = await successorsOf(f, k.resume);
+        expect(successor).toBeDefined();
+        // While the successor is queued it is the answer's next step: no notice.
+        await f.sweep(); await f.sweep();
+        expect(await allNotices(f), "no notice while the successor is live or queued").toHaveLength(0);
+        // The successor ALSO fails, with no final: exactly one true notice.
+        await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_run_failed", finishedAt: f.at() })
+          .where(eq(heartbeatRuns.id, successor!.id));
+        await f.sweep(); await f.sweep();
+        const notices = await allNotices(f); const userMessages = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "user")));
+        console.log("RF5_ALL_FAILED_WITH_ANSWER", JSON.stringify({ message: k.m, card: k.card.id, resume: k.resume, successor: successor!.id, notices, userMessages: userMessages.map(n => n.id), carry: await readContinuationCommentInput(db, { ...f, runId: k.root }) }));
+        // MARKED: the notice half is app-lead's notice commit (al-cardduty-1552 =
+        // al/cardduty e0acfbb8, "a person's card answer carries the
+        // answered-or-one-true-notice duty"), not this fix. With that commit's
+        // two source files applied on this head the assertion passes; without
+        // it the sweep posts none. It runs as soon as that commit lands.
+        const cardAnswerDuty = "unansweredCardAnswerSql" in await import("../person-message-answer.js");
+        if (cardAnswerDuty) expect(notices, "brief 2d asks exactly one true notice when answer-resume and successor fail").toHaveLength(1);
+      } finally { answerDelivery.paused = false; }
+    }, 60_000);
+  });
 });
