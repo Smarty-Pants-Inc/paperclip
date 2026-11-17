@@ -630,6 +630,9 @@ describe("persistent agent directories", () => {
         // The sibling's note is readable in the remote folder chat A is using.
         expect(await fs.readFile(path.join(turn2.executionRoot, note), "utf8")).toBe("NOTE-FACT: Kate takes the SMA-612 handover.\n");
         expect(await onDisk(turn2.executionRoot).then(files => files.filter(name => !name.startsWith(".paperclip-runtime/")))).toEqual([...before, note].sort());
+        // No upload or capture scratch is left in the remote root or on the host.
+        expect((await fs.readdir(path.join(turn2.executionRoot, ".paperclip-runtime"))).filter(name => /^(notes|checkpoint)-/.test(name))).toEqual([]);
+        expect((await fs.readdir(path.dirname(turn2.localRoot))).filter(name => /^(notes|checkpoint)-/.test(name))).toEqual([]);
         // The refreshed tree is the new checkpoint baseline: an idle turn saves nothing.
         expect((await copies.checkpointWarm({ companyId, runId: turn2.runId, target: boat.executionTarget }))).toMatchObject({ state: "warm_saved", receipt: { checkpointState: "unchanged" } });
 
