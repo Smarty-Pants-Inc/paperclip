@@ -346,7 +346,7 @@ export async function settleUnansweredPersonMessage(
     if (decision.retireCommentId) {
       const publications: ActivityPublication[] = [];
       await db.transaction(async tx => {
-        const [current] = await tx.select().from(issues)
+        const [current] = await tx.select(DECISION_ISSUE_FIELDS).from(issues)
           .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
         if (!current) return;
         const fenced = await decideUnansweredMessage(tx as unknown as Db, current, now, input.nativeBlockedRepairApplies);
@@ -382,7 +382,7 @@ export async function settleUnansweredPersonMessage(
     // under it: an answer (prose or the turn's own card), a held notice, a
     // newer message, a run or a wake that committed while this sweep waited
     // means no notice.
-    const [current] = await tx.select().from(issues)
+    const [current] = await tx.select(DECISION_ISSUE_FIELDS).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
     if (!current) return null;
     const fenced = await decideUnansweredMessage(tx as unknown as Db, current, now, input.nativeBlockedRepairApplies);
@@ -405,6 +405,9 @@ export async function settleUnansweredPersonMessage(
   });
   return commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" };
 }
+
+const DECISION_ISSUE_FIELDS = { id: issues.id, companyId: issues.companyId, status: issues.status, hiddenAt: issues.hiddenAt,
+  assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, projectId: issues.projectId };
 
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null; projectId: string | null };
