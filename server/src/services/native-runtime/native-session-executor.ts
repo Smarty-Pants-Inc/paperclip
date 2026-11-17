@@ -6829,6 +6829,30 @@ function acknowledgedUserStopRequestedAt(run: typeof heartbeatRuns.$inferSelect)
   return times.length > 0 ? Math.min(...times) : null;
 }
 
+/** S095 (rf-3): the person's Stop of this exact run is requested but its
+ * acknowledgement has not landed yet. The run is cancelled by a user, its
+ * executionCancellation is still "requested" and its own run-scoped native
+ * Stop intent is still dispatchState "pending". Until the acknowledgement is
+ * written, acknowledgedUserStopRequestedAt and
+ * pendingLifecycleCommandsIssuedByStop cannot match, so no retirement refusal
+ * of this owner can be judged yet. */
+function personStopAwaitingAcknowledgement(run: typeof heartbeatRuns.$inferSelect): boolean {
+  const result = record(run.resultJson);
+  const intent = record(result.nativeCancellation);
+  return run.status === "cancelled" && result.cancelledByActorType === "user"
+    && typeof result.cancelledByUserId === "string" && result.cancelledByUserId.length > 0
+    && record(result.executionCancellation).state === "requested"
+    && intent.schema === "paperclip.native-cancellation.v1" && intent.runId === run.id && intent.companyId === run.companyId
+    && intent.scope === "run" && intent.dispatchState === "pending";
+}
+
+async function ownerStopAwaitingAcknowledgement(db: Db, identity: { runId?: unknown }, companyId: string): Promise<boolean> {
+  if (typeof identity.runId !== "string") return false;
+  const [run] = await db.select().from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id, identity.runId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+  return run !== undefined && personStopAwaitingAcknowledgement(run);
+}
+
 /** The finished owner's journal is unsettled only by Runner lifecycle commands
  * (suspend, drain, shutdown) that its person's acknowledged Stop issued: each
  * is still pending and was journaled at or after that Stop. Any other
@@ -6948,6 +6972,24 @@ async function closedStopOwnerFrozenJournal(db: Db, root: string, identity: Reco
 async function retireAfterStopIssuedLifecycleCommands(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0],
   refused: string): Promise<{ retired: true } | { retired: false; refused: string }> {
   const companyId = input.execution.binding.companyId;
+  // S095 (rf-3): never quarantine an owner whose person's Stop is still
+  // waiting for its acknowledgement. Wait for it with the same helper and the
+  // successor's one deadline, then re-read and recompute; the s6409 wait and
+  // exemption below then judge the acknowledged Stop. At the bound, defer
+  // through the typed recovery wait.
+  if (await ownerStopAwaitingAcknowledgement(input.db, input.identity, companyId)) {
+    const deadline = predecessorSettleDeadline(input.execution.binding.runId);
+    await input.onLog?.("stderr", `[paperclip-runner] waiting for the acknowledgement of the person's Stop of run ${String(input.identity.runId)}\n`);
+    await awaitPredecessorSettle(nativeSessionScopeKey(input.execution), deadline, {
+      pending: () => ownerStopAwaitingAcknowledgement(input.db, input.identity, companyId),
+    });
+    if (await ownerStopAwaitingAcknowledgement(input.db, input.identity, companyId)) {
+      throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs));
+    }
+    const retirement = await retireFinishedPerTurnRunnerdOwner(input);
+    if (retirement.retired) return retirement;
+    refused = retirement.refused;
+  }
   if (!refused.startsWith("journal_commands_unsettled(")
     || !await pendingLifecycleCommandsIssuedByStop(input.db, input.root, input.identity, companyId)) {
     return { retired: false, refused };
