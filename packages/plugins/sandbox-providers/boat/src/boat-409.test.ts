@@ -40,6 +40,7 @@ function fakeBoat(script: { commands?: Reply[]; files?: Reply[]; resume?: Reply[
     }
     if (method === "GET" && route === `/sandboxes/${id}`) return reply(ok({ sandbox: { id, state, expiresAt: "2030-01-01T00:00:00Z", ...(state === "archived" ? { stop: { id: "stop", status: "completed" } } : {}) } }));
     if (method === "POST" && route === `/sandboxes/${id}/stop`) { state = "archived"; return reply(ok({ operation: { id: "stop" } })); }
+    if (method === "GET" && route === `/sandboxes/${id}/command-history`) return reply(ok({ commands: [] }));
     if (method === "POST" && route === `/sandboxes/${id}/commands`) return reply(queues.commands.shift() ?? ok({ exitCode: 0, stdout: "ran", stderr: "", timedOut: false }));
     if (method === "PUT" && route === `/sandboxes/${id}/files`) return reply(queues.files.shift() ?? ok({ ok: true }));
     if (method === "DELETE" && route === `/sandboxes/${id}/files`) return reply(ok({ ok: true }));
@@ -58,6 +59,73 @@ function assertClosed(error: Error) {
     expect(value?.includes(config.apiKey)).toBe(false);
   }
 }
+// Keep #20974's data-safety boundary: an arbitrary non-idempotent command
+// needs documented not-run evidence or a separate GET proving refusal.
+async function assertReplacementRecovery(first: Reply, stale = false, unknown = false) {
+  for (const terminal of [false, true]) {
+    id = `bx_${String(++boxes).padStart(8, "0")}`;
+    const boat = fakeBoat({ commands: terminal ? [first, first] : [first] });
+    if (stale) {
+      await resume();
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockReturnValue(now + 6 * 60_000);
+    }
+    boat.setState("archived");
+    const before = boat.calls.length;
+    try {
+      const result = await execute({ command: "charge-once" }).catch(e => e);
+      if (terminal) {
+        expect(result).toBeInstanceOf(Error);
+        expect(result).toMatchObject({ status: 409, code: "boat_sandbox_state_transition", boatCode: unknown ? "other" : "machine_not_running" });
+        expect(result.boatState).toBe(unknown ? undefined : "archived");
+        expect(result.boatRetryable).toBe(unknown ? undefined : false);
+        assertClosed(result);
+      } else {
+        expect(result).toMatchObject({ exitCode: 0, stdout: "ran" });
+      }
+      expect(boat.count("POST", "/resume")).toBe(stale ? 2 : 1);
+      expect(boat.count("POST", "/commands")).toBe(2);
+      const order = boat.calls.slice(before).map(c => `${c.method} ${c.route}`);
+      const recovery = order.indexOf(`POST /sandboxes/${id}/resume`);
+      expect(recovery).toBeGreaterThan(0);
+      // The fake only reports ready after resume; this GET must precede resend.
+      expect(order.slice(recovery)).toEqual([
+        `POST /sandboxes/${id}/resume`, `GET /sandboxes/${id}`, `POST /sandboxes/${id}/commands`,
+      ]);
+      if (unknown) expect(order.slice(0, recovery)).toEqual([
+        `POST /sandboxes/${id}/commands`, `GET /sandboxes/${id}`,
+      ]);
+      const bodies = boat.fetch.mock.calls
+        .filter(([url]) => new URL(String(url)).pathname.endsWith("/commands"))
+        .map(([, init]) => JSON.parse(init.body));
+      expect(bodies).toHaveLength(2);
+      // Each send has its own attempt nonce; both carry the same user command.
+      for (const body of bodies) expect(body.command).toContain("charge-once");
+      expect(bodies[1].timeoutSeconds).toBe(bodies[0].timeoutSeconds);
+    } finally { vi.restoreAllMocks(); }
+  }
+}
+async function assertNoBlindResend(stale = false) {
+  id = `bx_${String(++boxes).padStart(8, "0")}`;
+  const boat = fakeBoat({ commands: [conflict("unlisted", { state: "archived", retryable: true })] });
+  if (stale) {
+    await resume();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + 6 * 60_000);
+  }
+  boat.setState("ready");
+  const before = boat.calls.length;
+  try {
+    const error = await execute({ command: "charge-once" }).catch(e => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({ httpStatus: 409, code: "boat_command_possibly_ran", evidence: "unknown", reason: "http_409" });
+    expect(boat.count("POST", "/commands")).toBe(1);
+    expect(boat.count("POST", "/resume")).toBe(stale ? 1 : 0);
+    expect(boat.calls.slice(before).filter(c => c.route === `/sandboxes/${id}`)
+      .map(c => c.method)).toEqual(["GET"]);
+    assertClosed(error);
+  } finally { vi.restoreAllMocks(); }
+}
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 beforeEach(async () => { id = `bx_${String(++boxes).padStart(8, "0")}`; await plugin.definition.setup({ logger } as any); vi.clearAllMocks(); });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
@@ -74,18 +142,10 @@ describe("#20974 (a) a Boat 409 keeps only its closed code, state and retryable"
     expect(boat.count("POST", "/resume")).toBe(1);
     assertClosed(error);
   });
-  it("409-A reads the fields nested under error too, and drops unknown or non-closed values", async () => {
-    fakeBoat({ commands: [{ status: 409, body: { error: { code: "machine_not_running", state: "archived", retryable: false, message: canary } } }] });
-    const nested = await execute().catch(e => e);
-    expect(nested).toMatchObject({ status: 409, boatCode: "machine_not_running", boatState: "archived", boatRetryable: false });
-    assertClosed(nested);
-    fakeBoat({ commands: [{ status: 409, body: { code: `${canary}_code`, state: `${canary} state`, retryable: "yes", message: canary } }] });
-    const odd = await execute().catch(e => e);
-    expect(odd).toMatchObject({ status: 409, boatCode: "other" });
-    expect(odd.boatState).toBeUndefined();
-    expect(odd.boatRetryable).toBeUndefined();
-    expect(odd.message).toBe(`Boat POST /sandboxes/${id}/commands failed (409): http_error [boat 409 code=other]`);
-    assertClosed(odd);
+  it("(superseded by replacement: frozen8 F-04D documented not-run recovery, Boat readiness.md:31, rf2 record) 409-A nested/unknown fields recover safely once and remain closed on a second 409", async () => {
+    await assertReplacementRecovery({ status: 409, body: { error: { code: "machine_not_running", state: "archived", retryable: false, message: canary } } });
+    await assertReplacementRecovery({ status: 409, body: { code: `${canary}_code`, state: `${canary} state`, retryable: "yes", message: canary } }, false, true);
+    await assertNoBlindResend();
   });
 });
 
@@ -146,21 +206,12 @@ describe("#20974 (b) documented 409 handling inside the call's bounded budget", 
     expect(boat.count("POST", "/commands")).toBe(3);
     assertClosed(first);
   });
-  it("409-B machine_not_running with no resume of ours, or long after it, is surfaced without a resume", async () => {
+  it("(superseded by replacement: frozen8 F-04D documented not-run recovery, Boat readiness.md:31, rf2 record) 409-B no/stale OUR resume still recovers safely once, with a named error on a second 409", async () => {
     const notRunning = conflict("machine_not_running", { state: "archived", retryable: false });
-    let boat = fakeBoat({ commands: [notRunning] });
-    const unowned = await execute().catch(e => e);
-    expect(unowned).toMatchObject({ status: 409, boatCode: "machine_not_running" });
-    expect(boat.count("POST", "/resume")).toBe(0);
-    expect(boat.count("POST", "/commands")).toBe(1);
-    boat = fakeBoat({ commands: [notRunning] });
-    const now = Date.now();
-    await resume();
-    vi.spyOn(Date, "now").mockReturnValue(now + 6 * 60_000);
-    const stale = await execute().catch(e => e);
-    expect(stale).toMatchObject({ status: 409, boatCode: "machine_not_running" });
-    expect(boat.count("POST", "/resume")).toBe(1);
-    expect(boat.count("POST", "/commands")).toBe(1);
+    for (const stale of [false, true]) {
+      await assertReplacementRecovery(notRunning, stale);
+      await assertNoBlindResend(stale);
+    }
   });
   it("409-B after OUR stop of the box, nothing wakes it: the call is refused before any Boat request", async () => {
     // The lease gate refuses the call; the stop also forgets our resume (defense in depth).
