@@ -714,6 +714,59 @@ suite("fresh-continuation fallback", () => {
       evidence: { runId: run.id, nativeFailureBlock: { runId: run.id, statusVersion: Number(task!.statusVersion) } } });
   }
 
+  // Keep: failure path reproduced by the K=2 policy; no provider is needed to
+  // prove the recovery sweep and durable wake admission boundary.
+  it("step 1 RED: a third system-owned failure starts a third continuation without person input", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await settleUnrecoverableExecutions(db);
+    let source = await expectOneFreshSuccessor(f);
+    for (let attempt = 2; attempt <= 3; attempt++) {
+      await refuseContinuation(source, "temporary_runner_transport_unavailable");
+      await finishFailedWake(source);
+      const result = await ensureFreshContinuation(db, { companyId, runId: source.id, trigger: "recovery_refused" });
+      expect(result, `system-owned continuation ${attempt}`).toMatchObject({ kind: "continued" });
+      await deliver();
+      const next = await successors(source.id);
+      expect(next).toHaveLength(1);
+      source = next[0]!;
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, source.wakeupRequestId!));
+      expect(wake).toMatchObject({ requestedByActorType: "system", reason: "issue_recovery_action_restored" });
+    }
+  }, 60_000);
+
+  it("step 1 loop: the same deterministic refusal backs off at upstream's rolling-hour brake", async () => {
+    const failure = "temporary_runner_transport_unavailable";
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation", error: failure });
+    await occupySlot();
+    let sourceId = f.runId;
+    for (let attempt = 1; attempt <= FRESH_CONTINUATIONS_PER_HOUR; attempt++) {
+      expect(await ensureFreshContinuation(db, { companyId, runId: sourceId, trigger: "recovery_refused" }),
+        `deterministic failure ${attempt}`).toMatchObject({ kind: "continued" });
+      await deliver();
+      const next = await successors(sourceId);
+      expect(next).toHaveLength(1);
+      sourceId = next[0]!.id;
+      await refuseContinuation(next[0]!, failure);
+      await finishFailedWake(next[0]!);
+    }
+    const now = new Date();
+    expect(await ensureFreshContinuation(db, { companyId, runId: sourceId, trigger: "recovery_refused", now }))
+      .toMatchObject({ kind: "backoff", retryAt: expect.any(Date) });
+    await settleUnrecoverableExecutions(db);
+    await continueHeldExecutions(db);
+    await deliver();
+    expect(await successors(sourceId)).toHaveLength(0);
+    const records = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, f.issueId),
+      sql`${issueRecoveryActions.evidence}->'freshContinuation' is not null`));
+    expect(records).toHaveLength(FRESH_CONTINUATIONS_PER_HOUR);
+    expect(records.every(record => !/Send a new message|tried to continue this task twice/.test(record.nextAction))).toBe(true);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+    // Upstream schedules another check instead of handing this failure to a
+    // person. Retry is intentionally absent while that check is scheduled.
+    expect(await taskInterruptionPresentation(db, await issue(f.issueId)))
+      .toMatchObject({ state: "retry_scheduled", canRetry: false, nextRetryAt: expect.any(String) });
+  }, 60_000);
+
   // follow-Paperclip Cut B R1/R5: preserve the unproven retained source, not the removed stop-before-fresh upgrade.
   async function retainClass2Source(f: { runId: string; issueId: string }) {
     const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId, issueId: f.issueId,
