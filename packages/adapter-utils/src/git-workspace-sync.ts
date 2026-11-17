@@ -725,7 +725,10 @@ export async function fetchGitBundleIntoLocalRef(input: {
   baseSha: string;
   /** Shallow boundaries accompanying a full bundle, which cannot encode them. */
   shallowPath?: string;
+  /** The owner's abort signal: checked before each write to the host repository. */
+  signal?: AbortSignal;
 }): Promise<string> {
+  const guard = () => input.signal?.throwIfAborted();
   const bundleSize = (await fs.stat(input.bundlePath).catch(() => null))?.size ?? 0;
   if (bundleSize === 0) {
     return input.baseSha;
@@ -808,6 +811,7 @@ export async function fetchGitBundleIntoLocalRef(input: {
       deadline += Date.now() - probeStarted;
       if (retainedBoundaries.length) await fs.writeFile(path.join(staging, "shallow"), `${[...new Set(retainedBoundaries)].join("\n")}\n`);
       await importGit(staging, ["update-ref", input.exportRef, head]);
+      guard();
       await importGit(input.localDir, ["fetch", "--force", "--update-shallow", staging, `${input.exportRef}:${input.importedRef}`], {
         timeout: 60_000, maxBuffer: 1024 * 1024,
       });
@@ -815,6 +819,7 @@ export async function fetchGitBundleIntoLocalRef(input: {
       await fs.rm(staging, { recursive: true, force: true });
     }
   } else {
+    guard();
     await runLocalGit(input.localDir, ["fetch", "--force", input.bundlePath, `${input.exportRef}:${input.importedRef}`], {
       timeout: 60_000,
       maxBuffer: 1024 * 1024,
@@ -1063,7 +1068,10 @@ export async function integrateImportedGitHead(input: {
   importedHead: string;
   /** The host Git identity captured before staging this run. */
   baseline?: Pick<GitWorkspaceSnapshot, "headCommit" | "branchName">;
+  /** The owner's abort signal: checked before each host HEAD/worktree update. */
+  signal?: AbortSignal;
 }): Promise<void> {
+  const guard = () => input.signal?.throwIfAborted();
   const isConcurrentRefUpdateError = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     return message.includes("cannot lock ref") && message.includes("expected");
@@ -1105,6 +1113,7 @@ export async function integrateImportedGitHead(input: {
     // retry against its new tip and use the normal concurrent-history path.
     if (mergeBaseHead === currentHead || (mergeBaseHead && currentHead === input.baseline?.headCommit)) {
       try {
+        guard();
         await updateLocalGitHead({
           localDir: input.localDir, newHead: input.importedHead, oldHead: currentHead, branchName: snapshot.branchName,
         });
@@ -1133,6 +1142,7 @@ export async function integrateImportedGitHead(input: {
         syncLabel: "Paperclip remote git sync",
       });
       try {
+        guard();
         await updateLocalGitHead({
           localDir: input.localDir, newHead: graftCommit, oldHead: currentHead, branchName: snapshot.branchName,
         });
@@ -1179,6 +1189,7 @@ export async function integrateImportedGitHead(input: {
       },
     );
     try {
+      guard();
       await updateLocalGitHead({
         localDir: input.localDir, newHead: mergeCommit.stdout.trim(), oldHead: currentHead, branchName: snapshot.branchName,
       });

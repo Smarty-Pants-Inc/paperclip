@@ -2229,6 +2229,7 @@ export async function prepareSandboxManagedRuntime(input: {
                       importedRef: importedRef!,
                       baseSha: gitSnapshot.headCommit,
                       shallowPath: forceFullBundle ? localShallowPath : undefined,
+                      signal: restoreSignal,
                     }));
                   });
 
@@ -2388,6 +2389,7 @@ export async function prepareSandboxManagedRuntime(input: {
                           localDir: input.workspaceLocalDir,
                           importedHead: gitHeadToIntegrate,
                           baseline: gitSnapshot ?? undefined,
+                          signal: restoreSignal,
                         }));
                       },
                       afterApply: gitSnapshot
@@ -2429,9 +2431,16 @@ export async function prepareSandboxManagedRuntime(input: {
             "asset",
             () => runStepSpan(`restore.asset.${assetKey}`, async () => {
               await withTempDir("paperclip-sandbox-restore-", async (tempDir) => {
+                beforeHostWrite();
                 await withWorkspaceRestoreStep("asset_restore", () => assetRestore({
                   assetDir: path.posix.join(runtimeRootDir, assetKey),
-                  readFile: async (remotePath) => toBuffer(await input.client.readFile(remotePath)),
+                  // The asset writes its host target after each awaited read:
+                  // an aborted owner gets no bytes to write.
+                  readFile: async (remotePath) => {
+                    const bytes = toBuffer(await input.client.readFile(remotePath));
+                    beforeHostWrite();
+                    return bytes;
+                  },
                   tempDir,
                 }));
               });
