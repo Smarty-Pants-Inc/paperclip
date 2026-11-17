@@ -49,7 +49,7 @@ describe("issuesApi.list", () => {
   it.each([
     { queueId: null, targetRunId: null, revision: "empty", entries: [] },
     { queueId: "queue-1", targetRunId: "new-run", revision: "changed", entries: [{ comment: { id: "waiting" } }] },
-  ])("rejects a changed or empty queue before interruption", async queue => {
+  ])("supersedes(0f78249c): upstream copy: rejects a changed or empty queue before interruption", async queue => {
     mockApi.get.mockResolvedValueOnce(queue);
     await expect(issuesApi.interruptLatestQueuedComments("issue-1", "old-run")).rejects.toThrow(queue.entries.length ? "The queued messages changed. Refresh and try again." : "Nothing is waiting.");
     expect(mockApi.post).not.toHaveBeenCalled();
@@ -61,7 +61,7 @@ describe("issuesApi.list", () => {
     expect(mockApi.post).not.toHaveBeenCalled();
   });
 
-  it("does not interrupt a different run when a selected row survives a queue change", async () => {
+  it("supersedes(0f78249c): upstream copy: does not interrupt a different run when a selected row survives a queue change", async () => {
     mockApi.get.mockResolvedValueOnce({ queueId: "queue-1", targetRunId: "new-run", revision: "changed", entries: [{ comment: { id: "waiting" } }] });
     await expect(issuesApi.interruptLatestQueuedComments("issue-1", "old-run", "waiting")).rejects.toThrow("The queued messages changed. Refresh and try again.");
     expect(mockApi.post).not.toHaveBeenCalled();
