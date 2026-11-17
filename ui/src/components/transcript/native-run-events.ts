@@ -3,7 +3,7 @@ import type { TranscriptEntry } from "@/adapters";
 
 type TranscriptToolDetail = NonNullable<Extract<TranscriptEntry, { kind: "tool_call" }>["detail"]>;
 import { isRunLogOnlyProviderEvent } from "./run-log-only-events";
-import { workspaceChangeEntry } from "@/adapters/paperclip-runner";
+import { runnerSnapshotText, workspaceChangeEntry } from "@/adapters/paperclip-runner";
 import { createUnifiedDiffClassifier } from "@/components/task-chat/diff-lines";
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -923,6 +923,9 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       fileChangesByExecutionId.set(executionId, payload.fileChanges);
     }
   }
+  // Completions normally supersede deltas below. Keep their full streamed
+  // text available when the durable completion is only a capped prefix.
+  const streamedTextById = new Map<string, string>();
   for (const event of orderedEvents) {
     if (!isItemIdentityEvent(event.eventType)) continue;
     const envelope = record(event.payload?.prpEvent);
@@ -961,6 +964,9 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       completionItemIdentityById.get(itemId),
     );
     if (identity.kind) completionItemIdentityById.set(itemId, identity);
+    if (event.eventType === "item.delta" && (identity.kind === "reasoning" || isAssistantItemKind(identity.kind))) {
+      streamedTextById.set(itemId, (streamedTextById.get(itemId) ?? "") + (normalizedItemText(payload) ?? ""));
+    }
     if (event.eventType !== "item.completed") continue;
     const kind = identity.kind;
     if (isAssistantItemKind(kind) && itemId && normalizedItemText(payload)) {
@@ -1057,7 +1063,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
 
     if (event.eventType === "item.completed" && isAssistantItemKind(itemKind)) {
       // A `<proposed_plan>` block is shown by its plan proposal card instead.
-      const raw = normalizedItemText(payload) ?? "";
+      const raw = runnerSnapshotText(normalizedItemText(payload) ?? "", itemId ? streamedTextById.get(itemId) : undefined, "response");
       const value = itemId && proposedMessageIds.has(itemId) ? withoutProposedPlanBlock(raw) : raw;
       if (!value) continue;
       const channel = itemIdentity.assistantChannel;
@@ -1081,7 +1087,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     }
 
     if (event.eventType === "item.completed" && itemKind === "reasoning") {
-      const value = normalizedItemText(payload);
+      const value = runnerSnapshotText(normalizedItemText(payload) ?? "", itemId ? streamedTextById.get(itemId) : undefined, "thinking");
       if (!value) continue;
       entries.push({
         kind: "thinking",
