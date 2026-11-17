@@ -1456,22 +1456,46 @@ describe("dl-n5-cont a failed turn's streamed answer is posted first; the contin
 
   // dl-n5-cont3 F3 (judge rf-2 3x5): only the LAST streamed agentMessage item
   // was rebuilt; a failed turn with two answer items dropped the first.
-  it("F3 RED: a failed turn with two answer items posts BOTH, in seq order", () => {
+  // dl-n5-cont5 (RFL ruling 17:47Z): the answer items are the text blocks of
+  // the LAST assistant message; F3's two items are two blocks of it.
+  const withSecondItem = (secondItemId: string, toolStep: boolean) => {
     const first = streamedUpTo(40), second = Array.from({ length: 30 }, (_, i) => item(i + 41)).join("");
     const rows = failedRunRows(first, "pi_output_truncated");
     const failed = rows.pop()!;
-    rows.push({ seq: 5_000, payload: { prpEvent: { eventType: "item.started", itemId: `${turnId}:tool:1`, turnId,
+    if (toolStep) rows.push({ seq: 5_000, payload: { prpEvent: { eventType: "item.started", itemId: `${turnId}:tool:1`, turnId,
       payload: { kind: "toolCall" } } } });
     let seq = 5_001;
     for (let offset = 0; offset < second.length; offset += 61) rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta",
-      itemId: `${turnId}:pi-message:4:block:0`, turnId, payload: { kind: "agentMessage", channel: "progress", text: second.slice(offset, offset + 61) } } } });
+      itemId: secondItemId, turnId, payload: { kind: "agentMessage", channel: "progress", text: second.slice(offset, offset + 61) } } } });
     rows.push({ ...failed, seq: seq++ });
-    const cut = readFailedTurnStreamedAnswer(rows)!;
+    return { rows, first, second };
+  };
+  it("F3 RED: a failed turn with two answer items (blocks of its last message) posts BOTH, in block order", () => {
+    const cut = readFailedTurnStreamedAnswer(withSecondItem(`${turnId}:pi-message:2:block:1`, false).rows)!;
     expect(cut.text.indexOf(item(1))).toBe(0);
     expect(cut.text.indexOf(item(40))).toBeLessThan(cut.text.indexOf(item(41)));
     for (let n = 1; n <= 70; n++) expect(cut.text.split(item(n)).length - 1).toBe(1);
     expect(cut.text.endsWith(item(70))).toBe(true);
     expect(cut.candidate.text.startsWith(cut.text)).toBe(true);
+  });
+
+  it("dl-n5-cont5 (iii): commentary in an EARLIER message before a tool step is not the reply; only the last message is", () => {
+    const { rows, second } = withSecondItem(`${turnId}:pi-message:4:block:0`, true);
+    const cut = readFailedTurnStreamedAnswer(rows)!;
+    expect(cut.text).toBe(second);
+    expect(cut.text).not.toContain(item(1));
+  });
+
+  it("dl-n5-cont5 (a): the completed selector posts every text block of the last message, in block order", () => {
+    const candidates = [
+      { seq: 3, text: "Commentary before a tool step.", sourceEventId: null, channel: "final" as const, itemId: `${turnId}:pi-message:1:block:0` },
+      { seq: 9, text: "Block one of the answer.", sourceEventId: null, channel: "final" as const, itemId: `${turnId}:pi-message:3:block:0` },
+      { seq: 11, text: "Block two of the answer.", sourceEventId: "e-11", channel: "final" as const, itemId: `${turnId}:pi-message:3:block:1` },
+    ];
+    const selected = selectHeartbeatRunFinalAgentMessage({ candidates })!;
+    expect(selected.text).toBe("Block one of the answer.\n\nBlock two of the answer.");
+    expect(selected.seq).toBe(11);
+    expect(selected.sourceEventId).toBe("e-11");
   });
 
   it("(rule 3) a cut answer that was NOT posted is restarted whole, and the continuation says so plainly", () => {
