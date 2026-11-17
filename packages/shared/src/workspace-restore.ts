@@ -28,6 +28,16 @@ export const WORKSPACE_RESTORE_RECOVERING_TEXT = "Recovering your saved work; yo
 export function isWorkspaceRestorePending(result: Record<string, unknown> | null | undefined): boolean {
   return hasWorkspaceRestoreFailure(result) && result?.[WORKSPACE_RESTORE_PENDING_KEY] === true;
 }
+/** Read-only projection key: the run's owed files were saved by the recovery
+ * worker (its hold's workspaceRecovery.status is 'recovered'). Never stored. */
+export const WORKSPACE_RESTORE_RECOVERED_KEY = "workspaceRestoreRecovered";
+/** The one wording for saved work the recovery worker recovered. */
+export const WORKSPACE_RESTORE_RECOVERED_TEXT = "Saved work recovered.";
+
+/** True only when the restore marker is set and the server projected the owed files as recovered. */
+export function isWorkspaceRestoreRecovered(result: Record<string, unknown> | null | undefined): boolean {
+  return hasWorkspaceRestoreFailure(result) && result?.[WORKSPACE_RESTORE_RECOVERED_KEY] === true;
+}
 
 /** Display only ordinary repository paths, never targets, host paths or temp IDs. */
 export function safeWorkspaceRestorePath(value: unknown): string | null {
