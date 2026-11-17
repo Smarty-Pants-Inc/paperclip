@@ -18,6 +18,15 @@ function realProjection() {
 const final = (extra: Record<string, unknown> = {}) => ({ type: "message_end", message: { role: "assistant", provider: "neutral", model: "model", timestamp: 1, responseId: "reply-1", stopReason: "stop", content: [{ type: "text", text: "final" }], ...extra } });
 const update = (type: string, extra: Record<string, unknown> = {}) => ({ type: "message_update", assistantMessageEvent: { type, contentIndex: 0, ...extra } });
 const usage = { input: 11, output: 3, cacheRead: 2, cacheWrite: 0, reasoning: 2, cost: { total: 0.02, totalFromProvider: false } };
+// No person-visible cut: none of these markers may appear in a projection.
+const CUT_MARKERS = ["[Pi tool output truncated]", "[Pi projection truncated]", "...for display", "for display]", "…[truncated]"];
+const expectNoCutMarker = (value: unknown) => { const json = JSON.stringify(value); for (const marker of CUT_MARKERS) expect(json).not.toContain(marker); };
+/** Reads the spill file a projection references; the reference names the whole text. */
+const spilled = (shown: unknown): string => {
+  const path = /\[Full (?:input|output|text|answer): (\/[^\s\]]+)/u.exec(String(shown))?.[1];
+  expect(path, String(shown).slice(-300)).toBeTruthy();
+  return readFileSync(path!, "utf8");
+};
 const envelope = (event: PiProjectedEvent, index: number): PrpEvent => ({
   schema: "paperclip.prp.event.v1", sourceEventId: `pi-event-${index + 1}`, sourceSeq: index + 1,
   sourceInstanceId: "pi-capture", sourceKind: "runner", normalizedSessionId: "pi-session", schemaVersion: 1, priority: 1,
@@ -198,18 +207,31 @@ describe("large native tool output projection (synthetic incident regression)", 
     const serialized = JSON.stringify(input);
     const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
     const events = projector.project(input);
-    expect(events[0]).toMatchObject({ eventType: "item.started", payload: { toolName: "bash", input: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+    // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was input: stringContaining("[Pi projection truncated]").
+    // The 256 KiB frame bound holds by spilling: the whole input is in the referenced file.
+    expect(events[0]).toMatchObject({ eventType: "item.started", payload: { toolName: "bash", input: expect.stringMatching(/\[Full (?:input|text): \//u) }, debug: { piProjection: { truncated: true } } });
+    expect(spilled(events[0].payload.input)).toContain(args.command);
+    expectNoCutMarker(events);
     for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
     expect(JSON.stringify(input)).toBe(serialized);
     expect(projector.project({ type: "tool_execution_end", toolCallId: "typed", toolName: "bash", result: {} })[0].eventType).toBe("item.completed");
-    expect(projector.project(final({ content: [{ type: "text", text: "semantic".repeat(100000) }] }))[0]).toMatchObject({ eventType: "item.completed", payload: { text: expect.stringContaining("[Pi projection truncated]") } });
+    // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was text: stringContaining("[Pi projection truncated]").
+    // An 800 KB answer cannot fit one 256 KiB record: it is spilled whole and referenced, never cut.
+    const huge = projector.project(final({ content: [{ type: "text", text: "semantic".repeat(100000) }] }))[0];
+    expect(huge).toMatchObject({ eventType: "item.completed", payload: { channel: "final", text: expect.stringMatching(/\[Full (?:answer|text): \//u) } });
+    expect(spilled(huge.payload.text)).toBe("semantic".repeat(100000));
+    expectNoCutMarker(huge);
+    expect(Buffer.byteLength(JSON.stringify(envelope(huge, 0)))).toBeLessThan(256 * 1024);
     expect(() => projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: "receipt", toolName: "bash", content: [], usage: { opaque: "receipt".repeat(100000) } } })).not.toThrow();
   });
   it("projects an accumulated >4MiB tool update without copying full native output", () => {
     const input = { type: "tool_execution_update", toolCallId: "streamed", toolName: "bash", partialResult: { content: [{ type: "text", text: "x".repeat(4 * 1024 * 1024 + 1) }] } };
     const serialized = JSON.stringify(input);
     const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project(input);
-    expect(events.at(-1)).toMatchObject({ payload: { output: expect.stringMatching(/^\[Pi tool output truncated/) }, debug: { piProjection: { truncated: true, recordSha256: createHash("sha256").update(serialized).digest("hex") } } });
+    // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was output: stringMatching(/^\[Pi tool output truncated/).
+    // A live partial update is a labelled preview; the whole output arrives with the result.
+    expect(events.at(-1)).toMatchObject({ payload: { output: expect.stringContaining("Live output") }, debug: { piProjection: { truncated: true, recordSha256: createHash("sha256").update(serialized).digest("hex") } } });
+    expectNoCutMarker(events);
     for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
     expect(JSON.stringify(input)).toBe(serialized);
   });
@@ -306,7 +328,10 @@ describe("P0-1 large records are display-only", () => {
     // K4 adds consumed user receipts; they must be bounded, not discarded.
     const projected = projector.project(input);
     if (input.type === "message_end" && input.message?.role === "user") {
-      expect(projected).toMatchObject([{ eventType: "item.completed", payload: { kind: "userMessage", text: expect.stringContaining("[Pi projection truncated]") } }]);
+      // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was text: stringContaining("[Pi projection truncated]").
+      expect(projected).toMatchObject([{ eventType: "item.completed", payload: { kind: "userMessage", text: expect.stringMatching(/\[Full text: \//u) } }]);
+      expect(spilled(projected[0].payload.text)).toBe("x".repeat(300_000));
+      expectNoCutMarker(projected);
       expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThan(256 * 1024);
     } else expect(projected).toEqual([]);
     expect(projector.project(final())[0].eventType).toBe("item.completed");
@@ -337,7 +362,11 @@ describe("P0-3 bounded display text and arguments", () => {
       : { type, toolCallId: "write-large", toolName: "write", args };
     const before = JSON.stringify(input);
     const events = projector.project(input);
-    expect(events[0]).toMatchObject({ eventType: "item.started", payload: { toolName: "write", input: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+    // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was input: stringContaining("[Pi projection truncated]").
+    // 70 KB of arguments fit one record: shown whole, structured and exact.
+    expect(events[0]).toMatchObject({ eventType: "item.started", payload: { toolName: "write", input: JSON.stringify(args), item: { input: args, arguments: args } } });
+    expect(events[0].debug).toBeUndefined();
+    expectNoCutMarker(events);
     for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
     const end = projector.project({ type: "tool_execution_end", toolCallId: "write-large", toolName: "write", result: { content: [{ type: "text", text: "ok" }] } });
     expect(end[0]).toMatchObject({ eventType: "item.completed", itemId: events[0].itemId, payload: { toolName: "write", output: "ok" } });
@@ -347,18 +376,31 @@ describe("P0-3 bounded display text and arguments", () => {
     const input = final({ content: [{ type: "text", text: alphabet.repeat(70_000 / alphabet.length) }] });
     const before = JSON.stringify(input);
     const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project(input);
-    expect(events[0]).toMatchObject({ eventType: "item.completed", payload: { text: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+    // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was text: stringContaining("[Pi projection truncated]").
+    // A 70 KB final answer (past the old 64 KiB budget) is shown whole, byte-equal.
+    const answer = alphabet.repeat(70_000 / alphabet.length);
+    expect(events[0]).toMatchObject({ eventType: "item.completed", payload: { channel: "final", text: answer } });
+    expect(Buffer.from(String(events[0].payload.text)).equals(Buffer.from(answer))).toBe(true);
+    expect(events[0].debug).toBeUndefined();
+    expectNoCutMarker(events);
     expect(Buffer.byteLength(JSON.stringify(envelope(events[0], 0)))).toBeLessThan(256 * 1024);
     expect(JSON.stringify(input)).toBe(before);
   });
-  it("bounds cumulative streamed text and emits the truncation marker only once", () => {
+  // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): replaces "bounds cumulative streamed text and
+  // emits the truncation marker only once" (streamed text cut at 64 KiB with a marker; a 200,000-character
+  // final answer cut). Every streamed delta and the whole final answer reach the person, each record bounded.
+  it("streams 200,000 characters whole and shows a 200,000-character final answer whole", () => {
     const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
     const events = Array.from({ length: 100 }, () => projector.project(update("text_delta", { delta: "x".repeat(2000) }))).flat();
     const streamed = events.filter(event => event.eventType === "item.delta").map(event => event.payload.text).join("");
-    expect(streamed).toContain("[Pi projection truncated]");
-    expect(streamed.match(/\[Pi projection truncated\]/g)).toHaveLength(1);
-    expect(Buffer.byteLength(JSON.stringify(streamed))).toBeLessThanOrEqual(64 * 1024);
-    expect(projector.project(final({ content: [{ type: "text", text: "x".repeat(200_000) }] }))[0]).toMatchObject({ eventType: "item.completed", payload: { text: expect.stringContaining("[Pi projection truncated]") } });
+    expect(streamed).toBe("x".repeat(200_000));
+    expectNoCutMarker(events);
+    const big = projector.project(update("text_delta", { delta: "😀\\\"\n".repeat(150_000) }));
+    expect(big.map(event => event.payload.text).join("")).toBe("😀\\\"\n".repeat(150_000));
+    for (const event of big) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
+    const answer = projector.project(final({ content: [{ type: "text", text: "x".repeat(200_000) }] }))[0];
+    expect(answer).toMatchObject({ eventType: "item.completed", payload: { channel: "final", text: "x".repeat(200_000) } });
+    expect(Buffer.byteLength(JSON.stringify(envelope(answer, 0)))).toBeLessThan(256 * 1024);
   });
 });
 
