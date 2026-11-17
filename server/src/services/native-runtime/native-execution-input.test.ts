@@ -155,7 +155,7 @@ describe("native execution input external-chat framing", () => {
       expect(input.task.prompt).toContain("Amber");
       expect(input.task.prompt).not.toContain("## Questions that need a user response");
       expect(input.task.prompt).toContain(
-        "semantic completion summary is the user-visible final answer",
+        "is the user-visible final answer; Paperclip delivers it whole at any length",
       );
       expect(input.task.prompt).not.toContain(
         "including marking the task done",
