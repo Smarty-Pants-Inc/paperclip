@@ -168,7 +168,7 @@ for(const mode of (CASE==='all'?['within','outlast','absent']:[CASE])) {
   const observed={failure,once,pendingAtArchive,finalRunState,exit45,launches,calls,diagnostics,events};
   const checks=mode==='absent'?ronceChecks(observed):null;
   const requestAdmission=mode==='absent'?{verdict:turnError?'FAIL':'PASS',error:turnError,result:turnResult}:null;
-  const pass=!failure&&!!authenticatedAnswer&&(mode==='absent'?roncePass(observed):monitorSuccessAfterResume>=2);
+  const pass=!failure&&!!authenticatedAnswer&&(mode==='absent'?roncePass(observed)&&requestAdmission.verdict==='PASS':monitorSuccessAfterResume>=2);
   calls.push({at:at(),event:'case-verdict',verdict:pass?'PASS':'FAIL'});
   result={mode,verdict:pass?'PASS':'FAIL',observedAtMs:at(),failure,resumes,launches,monitorRuns,monitorSuccessAfterResume,exit45,monitorError,pendingAtArchive,once,checks,requestAdmission,finalRunState,authenticatedAnswer,evidence,diagnostics,calls,events,
    endLine:failure?'packages/paperclip-runner/src/live/runnerd-codex-transport.ts:8743-8748':mode==='absent'?'packages/paperclip-runner/src/live/runnerd-codex-transport.ts:8896-8898':'server/src/services/native-runtime/native-session-executor.ts:14980-14984'};

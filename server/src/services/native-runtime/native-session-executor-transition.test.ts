@@ -3,12 +3,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
-import { createRemoteRunnerProcessLauncher } from "./native-session-executor.js";
+import {
+  createRemoteRunnerProcessLauncher, nativeSessionFailureSourceCode, nativeSessionFailureDisposition,
+  REMOTE_RUNNER_OBSERVATION_EXHAUSTED, REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION,
+} from "./native-session-executor.js";
+import { NativeProviderTerminalFailure } from "../../vendor/paperclip-runner/index.js";
 import { createSandboxRunnerSupervision, type SandboxRunnerSupervision } from "./sandbox-runner-retention.js";
 
 const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: "2026-11-17T00:00:00Z" };
 const transition = () => Object.assign(new Error("Boat POST /sandboxes/box/commands failed (409): http_error (state change in progress)"), { code: "boat_sandbox_state_transition" });
-const rpcTransition = () => new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: transition().message });
+const rpcTransition = () => new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: `boat_sandbox_state_transition: ${transition().message}` });
 const fixtures: { finish(): void; supervision?: SandboxRunnerSupervision; completion: Promise<void> }[] = [];
 
 function launch(observe: () => Promise<typeof ok> | typeof ok, supervision?: SandboxRunnerSupervision) {
@@ -55,6 +59,20 @@ afterEach(async () => {
 });
 
 describe("sandbox transition monitor", () => {
+  it.each([false, true])("preserves the one closed exhausted outcome through server failure policy (notification=%s)", notification => {
+    const message = `${REMOTE_RUNNER_OBSERVATION_EXHAUSTED}: ${REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION}`;
+    const error = notification
+      ? new NativeProviderTerminalFailure("notification_transport_failed", false, `Notification transport failed closed: ${message}`)
+      : Object.assign(new Error(message), { code: REMOTE_RUNNER_OBSERVATION_EXHAUSTED });
+    const code = nativeSessionFailureSourceCode(error);
+    expect(code).toBe("runner_process_observation_budget_exhausted");
+    expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
+      phase: "terminal_failure", failureCode: code, nextAttemptAt: null,
+    });
+    expect(error.message).toContain(REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION);
+    expect(error.message).not.toContain("runner_process_termination_unconfirmed");
+  });
+
   it.each([
     ["closed code", transition], ["real RPC form", rpcTransition],
     ["wrapped cause", () => new Error("remote execute failed", { cause: transition() })],
@@ -83,6 +101,9 @@ describe("sandbox transition monitor", () => {
     ["lookalike code", () => Object.assign(transition(), { code: "boat_sandbox_state_transition_other" })],
     ["different RPC code", () => new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.TIMEOUT, message: transition().message })],
     ["ambiguous RPC", () => new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: "connection lost after command send" })],
+    ["worker readiness failure", () => new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: "Daytona sandbox is still failed at its start deadline" })],
+    ["worker phrase lookalike", () => new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: "EACCES: not a Boat refusal; state change in progress" })],
+    ["worker code lookalike", () => new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: "boat_sandbox_state_transition_other: state change in progress" })],
   ] as const)("rethrows %s without an exit receipt", async (_name, error) => {
     const refusal = error(); const f = launch(() => { throw refusal; });
     await vi.advanceTimersByTimeAsync(31_000);
@@ -130,12 +151,19 @@ describe("sandbox transition monitor", () => {
     expect(f.handle.isExitConfirmed?.()).toBe(true);
   });
 
-  it("exhausts the total ten-minute retained-transition budget without confirming exit", async () => {
+  it("exhausts the total ten-minute retained-transition budget with one actionable outcome, without confirming exit", async () => {
     const refusal = transition(); const f = launch(() => { throw refusal; });
     await vi.advanceTimersByTimeAsync(599_000);
     expect(f.outcome.kind).toBe("pending");
     await vi.advanceTimersByTimeAsync(1_001);
-    expect(f.outcome).toEqual({ kind: "rejected", error: refusal });
+    expect(f.outcome).toMatchObject({ kind: "rejected", error: { code: "runner_process_observation_budget_exhausted" } });
+    if (f.outcome.kind === "rejected") {
+      expect((f.outcome.error as Error).message).toMatch(/Wait for.*archiv.*finish.*recovery/i);
+      expect((f.outcome.error as Error).message).not.toContain("runner_process_termination_unconfirmed");
+    }
+    const probes = f.probes;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(f.probes).toBe(probes);
     expect(f.handle.isExitConfirmed?.()).toBe(false); expect(f.launches).toBe(1);
   });
 
@@ -148,7 +176,7 @@ describe("sandbox transition monitor", () => {
     });
     await vi.advanceTimersByTimeAsync(750_000);
     expect(f.healthy).toBeGreaterThan(0);
-    expect(f.outcome).toEqual({ kind: "rejected", error: refusal });
+    expect(f.outcome).toMatchObject({ kind: "rejected", error: { code: "runner_process_observation_budget_exhausted" } });
     expect(f.handle.isExitConfirmed?.()).toBe(false);
   });
 
