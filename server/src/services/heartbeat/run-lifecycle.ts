@@ -1,4 +1,5 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { readRunAnswerEvents, readThinkingCapStop, thinkingCapStopCandidate } from "../thinking-cap-stop.js";
 import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
 import { isContextCompactionRun } from "../context-compaction.js";
@@ -2540,24 +2541,14 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     // failed (pi_output_truncated at the output cap, a provider EOF) has no
     // completed answer. Its streamed prefix, rebuilt from the stored deltas,
     // is posted first, with one true note; the continuation picks up at its end.
-    const streamedRows = await db
-      .select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
-      .from(heartbeatRunEvents)
-      .where(
-        and(
-          eq(heartbeatRunEvents.companyId, companyId),
-          eq(heartbeatRunEvents.runId, runId),
-          or(
-            inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]),
-            and(
-              inArray(heartbeatRunEvents.eventType, ["item.delta", "item.completed"]),
-              sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`,
-            ),
-          ),
-        ),
-      )
-      .orderBy(heartbeatRunEvents.seq);
-    return readFailedTurnStreamedAnswer(streamedRows)?.candidate ?? null;
+    const streamedRows = await readRunAnswerEvents(db, companyId, runId);
+    const cut = readFailedTurnStreamedAnswer(streamedRows);
+    if (cut) return cut.candidate;
+    // dl-n5-cont2 item 3: the turn stopped at the output cap having streamed
+    // no answer text. The person gets ONE true note (with Retry when the one
+    // automatic continuation stopped the same way), never a resend notice.
+    const capStop = await readThinkingCapStop(db, { companyId, runId });
+    return capStop ? thinkingCapStopCandidate(capStop) : null;
   }
 
   async function refreshContinuationSummaryForRun(

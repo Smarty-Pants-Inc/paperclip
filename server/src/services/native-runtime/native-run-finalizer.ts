@@ -105,6 +105,7 @@ import {
   readAcceptedTaskContinuationSummary,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
+  readCompletedOrTruncatedFinalCandidate,
   readTruncatedCompletedAgentMessageItemId,
   readTruncatedCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
@@ -1014,6 +1015,17 @@ export async function recoverCommittedNativeChatResponse(
   return withRunResponsePresentationTiming(input.runId, () => recoverCommittedNativeChatResponseInScope(db, input));
 }
 
+/** The stored live deltas of one agent message item of a run, in order (dl-n5-66k / dl-n5-cont2 C2). */
+function loadAgentMessageDeltaRows(tx: Pick<Db, "select">, companyId: string, runId: string, itemId: string) {
+  return tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, companyId),
+      eq(heartbeatRunEvents.runId, runId),
+      eq(heartbeatRunEvents.eventType, "item.delta"),
+      sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' = ${itemId}`,
+    )).orderBy(heartbeatRunEvents.seq);
+}
+
 async function recoverCommittedNativeChatResponseInScope(
   db: Db,
   input: { companyId: string; issueId: string; runId: string; onlyWhenDue?: boolean },
@@ -1273,13 +1285,7 @@ async function recoverCommittedNativeChatResponseInScope(
           const prpEvent = record(row.payload).prpEvent;
           const itemId = readTruncatedCompletedAgentMessageItemId(prpEvent);
           if (!itemId) continue;
-          const deltaRows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
-            .from(heartbeatRunEvents).where(and(
-              eq(heartbeatRunEvents.companyId, input.companyId),
-              eq(heartbeatRunEvents.runId, run.id),
-              eq(heartbeatRunEvents.eventType, "item.delta"),
-              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' = ${itemId}`,
-            )).orderBy(heartbeatRunEvents.seq);
+          const deltaRows = await loadAgentMessageDeltaRows(tx, input.companyId, run.id, itemId);
           const rebuilt = readTruncatedCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent, deltaRows });
           if (rebuilt) rebuiltCandidates.push(rebuilt);
         }
@@ -1371,21 +1377,27 @@ async function recoverCommittedNativeChatResponseInScope(
       const replyEventId = (Array.isArray(result.evidence) ? result.evidence : [])
         .map((entry) => record(entry).ref).find((ref): ref is string => typeof ref === "string" && ref.startsWith("run-event:"))
         ?.slice("run-event:".length);
-      const [replyRow] = replyEventId ? await tx.select({ payload: heartbeatRunEvents.payload })
+      const [replyRow] = replyEventId ? await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
         .from(heartbeatRunEvents).where(and(
           eq(heartbeatRunEvents.companyId, input.companyId),
           eq(heartbeatRunEvents.runId, run.id),
           eq(heartbeatRunEvents.sourceEventId, replyEventId),
         )).limit(1) : [];
-      const replyPayload = record(record(record(replyRow?.payload).prpEvent).payload);
+      // dl-n5-cont2 C2: a reply whose completed event was stored truncated is
+      // rebuilt from its deltas (the same helper as the internal branch), or
+      // gets the plain undeliverable line; the summary never stands in for it.
+      const replyCandidate = replyEventId && replyRow ? await readCompletedOrTruncatedFinalCandidate({
+        seq: replyRow.seq, prpEvent: record(replyRow.payload).prpEvent,
+        loadDeltaRows: (itemId) => loadAgentMessageDeltaRows(tx, input.companyId, run.id, itemId),
+      }) : null;
       const resolved = resolveHeartbeatRunResponse({
         resultJson: {
           nativeResult: result,
           finalizationPhase: "committed",
           finalizationReasonCode: decision.reasonCode,
         },
-        finalAgentMessage: replyEventId && replyPayload.kind === "agentMessage" && replyPayload.channel === "final"
-          && typeof replyPayload.text === "string" ? { text: replyPayload.text, sourceEventId: replyEventId, channel: "final" } : null,
+        finalAgentMessage: replyEventId && replyCandidate?.channel === "final"
+          ? { ...replyCandidate, sourceEventId: replyEventId, channel: "final" } : null,
         preferFinalResponseOverExistingComment: true,
         externalChatResponseWakeSummaryAuthorized: true,
         externalChatCommittedResponseWakeSummaryAuthorized: true,

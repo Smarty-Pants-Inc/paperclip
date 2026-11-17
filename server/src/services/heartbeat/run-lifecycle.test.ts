@@ -274,7 +274,10 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
     expect(final?.text).not.toMatch(/wasn't answered|Sending it again is safe|are in that reply/u);
   });
 
-  it("dl-n5-cont NEGATIVE: a failed turn that streamed only thinking has no reply (the true notice applies)", async () => {
+  // dl-n5-cont2 item 3 changes 484ba17f's thinking-only negative: a cap stop
+  // with only thinking now gets ONE true note. A failed turn with no streamed
+  // text and NO cap stop keeps no reply here (the existing true notice applies).
+  it("dl-n5-cont NEGATIVE: a failed turn that streamed only thinking, without a cap stop, has no reply (the true notice applies)", async () => {
     const { run, agent } = await fixture({ status: "failed", finishedAt: new Date() });
     const turnId = `runner-1:${run.id}:turn-1`;
     const base = { companyId: run.companyId, runId: run.id, agentId: agent.id, stream: "system", level: "info", message: "e" };
@@ -282,9 +285,64 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
       { ...base, seq: 1, eventType: "item.delta", payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`,
         turnId, payload: { kind: "reasoning", text: "thinking only ".repeat(500) } } } },
       { ...base, seq: 2, eventType: "turn.failed", payload: { prpEvent: { eventType: "turn.failed", turnId,
-        payload: { status: "failed", error: { code: "pi_output_truncated" } } } } },
+        payload: { status: "failed", error: { code: "pi_provider_error" } } } } },
     ]);
     expect(await createHeartbeatLifecycle(db, callbacks(db)).findLatestCompletedFinalAgentMessage(run.id, run.companyId)).toBeNull();
+  });
+
+  // dl-n5-cont2 item 3: the runner reports pi_output_truncated with NO answer
+  // text (pi-rpc-driver.ts :1689-1696); the person got only a notice.
+  const thinkingCapStop = async (patch: Partial<typeof heartbeatRuns.$inferInsert> = {}, existing?: { companyId: string; agentId: string }) => {
+    const ids = existing ?? await (async () => { const f = await fixture({ status: "failed", finishedAt: new Date() });
+      return { companyId: f.run.companyId, agentId: f.agent.id }; })();
+    const [run] = existing ? await db.insert(heartbeatRuns).values({ companyId: ids.companyId, agentId: ids.agentId, status: "failed",
+      runtimeMode: "native", finishedAt: new Date(), ...patch }).returning() : await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, ids.companyId));
+    if (!existing && Object.keys(patch).length) await db.update(heartbeatRuns).set(patch).where(eq(heartbeatRuns.id, run!.id));
+    const turnId = `runner-1:${run!.id}:turn-1`;
+    const base = { companyId: ids.companyId, runId: run!.id, agentId: ids.agentId, stream: "system", level: "info", message: "e" };
+    await db.insert(heartbeatRunEvents).values([
+      { ...base, seq: 1, eventType: "item.delta", payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`,
+        turnId, payload: { kind: "reasoning", text: "thinking only ".repeat(500) } } } },
+      { ...base, seq: 2, eventType: "turn.failed", payload: { prpEvent: { eventType: "turn.failed", turnId,
+        payload: { status: "failed", error: { code: "pi_output_truncated", recoverable: false } } } } },
+    ]);
+    return { ...ids, runId: run!.id };
+  };
+
+  it("dl-n5-cont2 item 3 RED: a thinking-only cap stop gets ONE true note, then its continuation's cap stop ONE note with Retry", async () => {
+    const first = await thinkingCapStop();
+    const lifecycle = createHeartbeatLifecycle(db, callbacks(db));
+    const note = await lifecycle.findLatestCompletedFinalAgentMessage(first.runId, first.companyId);
+    expect(note?.text).toBe("The model used its whole output budget thinking; continuing with the answer.");
+    expect(note?.channel).toBe("final");
+    const second = await thinkingCapStop({ retryOfRunId: first.runId,
+      contextSnapshot: { previousRunId: first.runId, wakeReason: "issue_recovery_action_restored" } }, first);
+    const again = await lifecycle.findLatestCompletedFinalAgentMessage(second.runId, second.companyId);
+    expect(again?.text).toBe("The model ran out of output budget again before answering. Press Retry to try once more.");
+    for (const text of [note?.text, again?.text]) expect(text).not.toMatch(/wasn't answered|Sending it again is safe/u);
+    // A person's Retry is a new ask: its own cap stop gets the first note again.
+    const retried = await thinkingCapStop({ contextSnapshot: { previousRunId: second.runId, wakeReason: "task_retry" } }, first);
+    expect((await lifecycle.findLatestCompletedFinalAgentMessage(retried.runId, retried.companyId))?.text)
+      .toBe("The model used its whole output budget thinking; continuing with the answer.");
+  });
+
+  // dl-n5-cont2 C1 (rf-2 2x4) on the live completion path.
+  it("dl-n5-cont2 C1 RED: a truncated completed final whose deltas include a cut piece is the plain line, not null (the summary)", async () => {
+    const { run, agent } = await fixture({ status: "succeeded", finishedAt: new Date() });
+    const turnId = `runner-1:${run.id}:turn-1`, itemId = `${turnId}:pi-message:2:block:0`;
+    const base = { companyId: run.companyId, runId: run.id, agentId: agent.id, stream: "system", level: "info", message: "e" };
+    await db.insert(heartbeatRunEvents).values([
+      { ...base, seq: 1, eventType: "item.delta", payload: { prpEvent: { eventType: "item.delta", itemId, turnId,
+        payload: { kind: "agentMessage", channel: "progress", text: "The first part. " } } } },
+      { ...base, seq: 2, eventType: "item.delta", payload: { prpEvent: { eventType: "item.delta", itemId, turnId,
+        payload: { truncated: true, byteSize: 70000 } } } },
+      { ...base, seq: 3, eventType: "item.completed", payload: { prpEvent: { eventType: "item.completed", itemId, turnId,
+        payload: { truncated: true, byteSize: 90000 } } } },
+    ]);
+    const final = await createHeartbeatLifecycle(db, callbacks(db)).findLatestCompletedFinalAgentMessage(run.id, run.companyId);
+    expect(final?.text).toBe("The answer couldn't be delivered whole here; it's kept in the conversation; ask me to show it.");
+    expect(final?.channel).toBe("final");
   });
 
   it("keeps one terminal outcome and reports only the winner of competing writes", async () => {

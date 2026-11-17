@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
-  agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueApprovals,
+  agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRuns, issueApprovals,
   issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolInvocations, type Db,
 } from "@paperclipai/db";
 import {
@@ -32,7 +32,9 @@ import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runti
 import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.js";
 import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuesAutomaticallySql, isPersonOwnedFailureCode } from "./continuation-cause.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
-import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, type CutAnswerCause } from "./heartbeat-run-summary.js";
+import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, readThinkingOnlyCapStop,
+  THINKING_CAP_STOP_CONTINUATION_INSTRUCTION, type CutAnswerCause } from "./heartbeat-run-summary.js";
+import { readRunAnswerEvents, readThinkingCapStop } from "./thinking-cap-stop.js";
 
 export { AUTOMATIC_CONTINUATION_WAKE_REASONS, PERSON_OWNED_FAILURE_CODES, isPersonOwnedFailureCode, isRecoveryRun } from "./continuation-cause.js";
 
@@ -222,7 +224,7 @@ async function createdObjects(tx: Db, run: typeof heartbeatRuns.$inferSelect): P
 export function freshContinuationNote(input: { runId: string; unverified: string[]; workspace: "restored_last_save" | "kept";
   created?: FreshContinuationCreatedObjects;
   /** dl-n5-cont: the run's answer was cut after streaming text; where to pick it up. */
-  cutAnswer?: { text: string; cause: CutAnswerCause; posted: boolean } | null }) {
+  cutAnswer?: { text: string; cause: CutAnswerCause; posted: boolean } | { thinkingOnlyCapStop: true } | null }) {
   const actions = input.unverified.length
     ? `These actions of that run have unverified outcomes: ${input.unverified.join(", ")}. For each one, first check whether it took effect.`
     : "No action of that run is recorded with an unknown outcome; check the task's recent history before repeating any side effect.";
@@ -249,7 +251,9 @@ export function freshContinuationNote(input: { runId: string; unverified: string
       created.documents.length ? `saved documents ${created.documents.join(", ")}` : null,
     ].filter(Boolean).join("; ")}. Do not create or post them again; read them and continue from where they leave off.`
     : "";
-  const answer = input.cutAnswer ? ` ${cutAnswerContinuationInstruction(input.cutAnswer)}` : "";
+  const answer = !input.cutAnswer ? ""
+    : "thinkingOnlyCapStop" in input.cutAnswer ? ` ${THINKING_CAP_STOP_CONTINUATION_INSTRUCTION}`
+    : ` ${cutAnswerContinuationInstruction(input.cutAnswer)}`;
   return `The previous attempt (run ${input.runId}) was cut off before it finished. ${files}${read}${edited}${existing} ${actions} ${guidance}${answer}`;
 }
 
@@ -257,15 +261,14 @@ export function freshContinuationNote(input: { runId: string; unverified: string
  * dl-n5-cont: the streamed answer of the source run's failed turn, and whether
  * the run posted it (run completion posts it first). Null when it streamed none.
  */
-export async function readSourceRunCutAnswer(tx: Pick<Db, "select">, run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">) {
-  const rows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
-    .where(and(eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id), or(
-      inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]),
-      and(inArray(heartbeatRunEvents.eventType, ["item.delta", "item.completed"]),
-        sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`))))
-    .orderBy(heartbeatRunEvents.seq);
+export async function readSourceRunCutAnswer(tx: Pick<Db, "select">, run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">):
+  Promise<{ text: string; cause: CutAnswerCause; posted: boolean } | { thinkingOnlyCapStop: true } | null> {
+  const rows = await readRunAnswerEvents(tx, run.companyId, run.id);
   const cut = readFailedTurnStreamedAnswer(rows);
-  if (!cut) return null;
+  // dl-n5-cont2 item 3: a pi_output_truncated turn that streamed no answer
+  // text spent its whole output budget thinking; the continuation is told to
+  // write the answer now (the agent's thinking level is not changed).
+  if (!cut) return readThinkingOnlyCapStop(rows) ? { thinkingOnlyCapStop: true } : null;
   const [posted] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, run.companyId), eq(issueComments.createdByRunId, run.id), isNull(issueComments.deletedAt),
     eq(issueComments.body, cut.candidate.text))).limit(1);
@@ -638,6 +641,11 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   const chain = await freshContinuationChain(tx, { companyId, issueId: issue.id, runId: run.id });
   if (chain.attempts >= FRESH_CONTINUATIONS_PER_CHAIN)
     return { kind: "not_applicable", reason: "fresh_continuation_chain_exhausted" };
+  // dl-n5-cont2 item 3 COST GUARD: at most ONE automatic continuation per ask
+  // after a thinking-only output-cap stop. When that continuation stopped the
+  // same way, its reply is one note with Retry; nothing runs again by itself.
+  if ((await readThinkingCapStop(tx, { companyId, runId: run.id }))?.repeated)
+    return { kind: "person_owned", reason: "output_budget_exhausted_again" };
 
   // The holds this decision owns: reconciliation holds that still block the
   // task. Workspace restore/repair holds stay with workspace recovery, and

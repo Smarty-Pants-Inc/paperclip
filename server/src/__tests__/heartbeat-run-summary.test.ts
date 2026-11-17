@@ -1465,3 +1465,84 @@ describe("dl-n5-cont a failed turn's streamed answer is posted first; the contin
     expect(readFailedTurnStreamedAnswer(blank)).toBeNull();
   });
 });
+
+// dl-n5-cont2 (rf-2 C1 2x4, C2 3x3): a truncated completed final whose stored
+// deltas include a cut piece cannot be rebuilt; the resolver silently posted
+// the semantic summary. And the EXTERNAL response-wake branch read only an
+// intact completed payload, so a truncated reply there lost to the summary.
+describe("dl-n5-cont2 a truncated completed final never yields to the summary", () => {
+  const module = runSummary as Record<string, unknown>;
+  const PLAIN = "The answer couldn't be delivered whole here; it's kept in the conversation; ask me to show it.";
+  const itemId = "runner-1:run-1:turn-1:pi-message:2:block:0";
+  const summary = "S".repeat(238);
+  const answer = "Line \"quoted\" 🦀 naïve\n".repeat(400);
+  const deltasOf = (text: string) => {
+    const rows: { seq: number; payload: unknown }[] = [];
+    let seq = 100;
+    for (let offset = 0; offset < text.length; offset += 27) rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta",
+      itemId, payload: { kind: "agentMessage", channel: "progress", text: text.slice(offset, offset + 27) } } } });
+    return rows;
+  };
+  const withCutPiece = () => {
+    const rows = deltasOf(answer);
+    (rows[3]!.payload as { prpEvent: { payload: Record<string, unknown> } }).prpEvent.payload = { truncated: true, byteSize: 70000 };
+    return rows;
+  };
+  const completed = { eventType: "item.completed", itemId, sourceEventId: "completed-2667", payload: { byteSize: 66220, truncated: true } };
+  // The base build's candidate read (no truncated rebuild on the external branch).
+  const readCandidate = (module.readCompletedOrTruncatedFinalCandidate ?? (async (input: { seq: number; prpEvent: unknown }) =>
+    readCompletedAssistantMessageCandidate(input))) as (input: { seq: number; prpEvent: unknown;
+      loadDeltaRows: (itemId: string) => Promise<{ seq: number; payload: unknown }[]> }) => Promise<ReturnType<typeof readCompletedAssistantMessageCandidate>>;
+
+  it("C1 RED: a truncated final with a cut delta posts the one plain line, never the summary", async () => {
+    const candidate = await readCandidate({ seq: 9000, prpEvent: completed, loadDeltaRows: async () => withCutPiece() });
+    const finalAgentMessage = selectHeartbeatRunFinalAgentMessage({ candidates: candidate ? [candidate] : [] });
+    const resolved = resolveHeartbeatRunResponse({ resultJson: { nativeResult: { schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "done", summary } }, nativeConversationFinalResponse: true, conversationTurnFinished: true, finalAgentMessage });
+    expect(resolved.text).toBe(PLAIN);
+    expect(resolved.text).not.toContain(summary);
+    expect(resolved.decision.chosenSource).toBe("final_agent_message");
+    // The ordinary (non-conversation) completion path too.
+    const ordinary = resolveHeartbeatRunResponse({ resultJson: { nativeResult: { schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "done", summary } }, finalAgentMessage });
+    expect(ordinary.text).toBe(PLAIN);
+  });
+
+  // The exact resolver inputs of native-run-finalizer.ts's external response-wake branch.
+  const externalResolve = (finalAgentMessage: Parameters<typeof resolveHeartbeatRunResponse>[0]["finalAgentMessage"]) =>
+    resolveHeartbeatRunResponse({
+      resultJson: { nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "yielded", summary,
+        continuation: { kind: "response_wake", summary: "Wait for the next message", idempotencyKey: "k" } },
+        finalizationPhase: "committed", finalizationReasonCode: "external_chat_response_waiting" },
+      finalAgentMessage, preferFinalResponseOverExistingComment: true,
+      externalChatResponseWakeSummaryAuthorized: true, externalChatCommittedResponseWakeSummaryAuthorized: true });
+
+  it("C2 RED: an external response wake whose completed final is stored truncated posts the answer whole", async () => {
+    const candidate = await readCandidate({ seq: 9000, prpEvent: completed, loadDeltaRows: async () => deltasOf(answer) });
+    const resolved = externalResolve(candidate?.channel === "final" ? { ...candidate, sourceEventId: "completed-2667", channel: "final" } : null);
+    expect(resolved.text).toBe(answer);
+    expect(resolved.text).not.toBe(summary);
+  });
+
+  it("C2 + C1: an external response wake whose truncated final has a cut delta posts the plain line", async () => {
+    const candidate = await readCandidate({ seq: 9000, prpEvent: completed, loadDeltaRows: async () => withCutPiece() });
+    expect(externalResolve(candidate?.channel === "final" ? { ...candidate, sourceEventId: "c", channel: "final" } : null).text).toBe(PLAIN);
+  });
+
+  it("NEGATIVE: an intact external reply that begins with the summary still posts whole, once (no delta load)", async () => {
+    const whole = `${summary} and the rest of the answer.`;
+    let loads = 0;
+    const candidate = await readCandidate({ seq: 1, prpEvent: { eventType: "item.completed", itemId, payload: { kind: "agentMessage",
+      channel: "final", text: whole } }, loadDeltaRows: async () => { loads++; return []; } });
+    expect(externalResolve({ ...candidate!, sourceEventId: "c", channel: "final" }).text).toBe(whole);
+    expect(loads).toBe(0);
+  });
+
+  it("NEGATIVE: a normal completed answer posts once, as itself", () => {
+    const candidate = readCompletedAssistantMessageCandidate({ seq: 5, prpEvent: { eventType: "item.completed", itemId,
+      payload: { kind: "agentMessage", channel: "final", text: "The answer." } } });
+    const resolved = resolveHeartbeatRunResponse({ resultJson: { nativeResult: { schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "done", summary } }, finalAgentMessage: selectHeartbeatRunFinalAgentMessage({ candidates: [candidate!] }) });
+    expect(resolved).toMatchObject({ text: "The answer.", decision: { commentAction: "create", chosenSource: "final_agent_message" } });
+  });
+});

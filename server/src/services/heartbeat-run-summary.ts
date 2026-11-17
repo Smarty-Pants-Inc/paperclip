@@ -206,6 +206,12 @@ export interface CompletedFinalAgentMessageCandidate {
   channel: "final" | "unknown";
   /** The run log kept only a display preview of this message. */
   bounded?: boolean;
+  /**
+   * dl-n5-cont2 C1: built from a completed final stored truncated. Its text
+   * (the rebuilt answer, or the plain undeliverable line) always outranks a
+   * semantic summary.
+   */
+  truncatedFinal?: boolean;
 }
 
 /**
@@ -407,13 +413,39 @@ export function readTruncatedCompletedAssistantMessageCandidate(input: {
   const itemId = readTruncatedCompletedAgentMessageItemId(input.prpEvent);
   if (!itemId) return null;
   const whole = reassembleAgentMessageFromDeltas(input.deltaRows, itemId);
-  if (!whole) return null;
+  // dl-n5-cont2 C1: a truncated final exists but cannot be rebuilt whole (a
+  // stored delta is itself cut). The summary never stands in for it: the
+  // person gets ONE plain, true line.
   return {
     seq: input.seq,
-    text: presentFinalAnswerText(whole),
+    text: whole ? presentFinalAnswerText(whole) : TRUNCATED_FINAL_UNDELIVERABLE_TEXT,
     sourceEventId: readCommentText(record(input.prpEvent).sourceEventId),
     channel: "final",
+    truncatedFinal: true,
   };
+}
+
+/** dl-n5-cont2 C1: the one line posted when a truncated final cannot be rebuilt whole. */
+export const TRUNCATED_FINAL_UNDELIVERABLE_TEXT =
+  "The answer couldn't be delivered whole here; it's kept in the conversation; ask me to show it.";
+
+/**
+ * dl-n5-cont2 C2: the final-answer candidate for one completed agent message
+ * event, intact or stored truncated. A truncated one is rebuilt from its
+ * stored deltas (loaded only then), else the plain undeliverable line.
+ */
+export async function readCompletedOrTruncatedFinalCandidate(input: {
+  seq: number;
+  prpEvent: unknown;
+  proposedItemIds?: ReadonlySet<string>;
+  loadDeltaRows: (itemId: string) => Promise<readonly { seq: number; payload: unknown }[]>;
+}): Promise<CompletedFinalAgentMessageCandidate | null> {
+  const intact = readCompletedAssistantMessageCandidate(input);
+  if (intact) return intact;
+  const itemId = readTruncatedCompletedAgentMessageItemId(input.prpEvent);
+  if (!itemId) return null;
+  return readTruncatedCompletedAssistantMessageCandidate({ seq: input.seq, prpEvent: input.prpEvent,
+    deltaRows: await input.loadDeltaRows(itemId) });
 }
 
 /** Why a turn stopped after streaming answer text (dl-n5-cont). */
@@ -492,6 +524,50 @@ export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; paylo
       reasonCode: "failed_turn_streamed_answer_prefix",
     },
   };
+}
+
+/** dl-n5-cont2 item 3: the one note when a turn spent its whole output budget thinking. */
+export const THINKING_CAP_STOP_NOTE = "The model used its whole output budget thinking; continuing with the answer.";
+/** dl-n5-cont2 item 3: the one note when the single automatic continuation also stopped at the cap. */
+export const THINKING_CAP_STOP_AGAIN_NOTE =
+  "The model ran out of output budget again before answering. Press Retry to try once more.";
+/** dl-n5-cont2 item 3: the continuation's opening instruction after a thinking-only cap stop. */
+export const THINKING_CAP_STOP_CONTINUATION_INSTRUCTION =
+  "Write the answer now; keep further thinking short. The person has not seen any answer yet.";
+
+/**
+ * dl-n5-cont2 item 3: the run's last turn failed at the output cap
+ * (`pi_output_truncated`) and streamed no answer text at all: the model used
+ * its whole output budget thinking. Null otherwise (a turn with streamed text
+ * is `readFailedTurnStreamedAnswer`'s).
+ */
+export function readThinkingOnlyCapStop(rows: readonly { seq: number; payload: unknown }[]): {
+  seq: number;
+  sourceEventId: string | null;
+} | null {
+  const ordered = [...rows].sort((a, b) => a.seq - b.seq);
+  const eventOf = (row: { payload: unknown }) => record(record(row.payload).prpEvent);
+  let last: { seq: number; event: Record<string, unknown> } | null = null;
+  for (const row of ordered) {
+    const event = eventOf(row);
+    if (typeof event.eventType === "string" && /^turn\.(completed|failed|cancelled|interrupted)$/u.test(event.eventType)) {
+      last = { seq: row.seq, event };
+    }
+  }
+  if (!last || last.event.eventType !== "turn.failed") return null;
+  if (record(record(last.event.payload).error).code !== "pi_output_truncated") return null;
+  const turnId = typeof last.event.turnId === "string" ? last.event.turnId : null;
+  const answered = ordered.some((row) => {
+    if (row.seq > last!.seq) return false;
+    const event = eventOf(row);
+    if (turnId && typeof event.turnId === "string" && event.turnId !== turnId) return false;
+    if (event.eventType !== "item.delta" && event.eventType !== "item.completed") return false;
+    const payload = record(event.payload);
+    return (payload.kind === "agentMessage" || payload.kind === "assistant_message")
+      && ((typeof payload.text === "string" && payload.text.trim().length > 0) || payload.truncated === true);
+  });
+  if (answered) return null;
+  return { seq: last.seq, sourceEventId: readCommentText(last.event.sourceEventId) };
 }
 
 const CUT_ANSWER_TAIL_CHARS = 600;
@@ -686,6 +762,7 @@ export function resolveHeartbeatRunResponse(input: {
     channel: "final" | "unknown";
     reasonCode?: string;
     bounded?: boolean;
+    truncatedFinal?: boolean;
   } | null;
 }): ResolvedHeartbeatRunResponse {
   const resultJson = record(input.resultJson);
@@ -712,6 +789,9 @@ export function resolveHeartbeatRunResponse(input: {
   // is the leading part of the run's complete final answer, the person gets the
   // whole answer, never the cut preview (pack-n5 (i), Paul NOTE 5).
   const wholeAnswer = (summary: string): string => {
+    // dl-n5-cont2 C1/C2: a truncated completed final exists; its rebuilt text
+    // or its plain undeliverable line is the reply, never the summary.
+    if (input.finalAgentMessage?.truncatedFinal === true && rawFinalAgentText) return rawFinalAgentText;
     const whole = input.finalAgentMessage?.channel === "final" && input.finalAgentMessage.bounded !== true
       && rawFinalAgentText && !isBoundedRunEventText(rawFinalAgentText) ? rawFinalAgentText : null;
     return whole && whole.length > summary.length && whole.startsWith(summary) ? whole : summary;
