@@ -228,6 +228,47 @@ export interface CompletedFinalAgentMessageCandidate {
    * semantic summary.
    */
   truncatedFinal?: boolean;
+  /** dl-n5-cont5: the answer item's id ('<turn>:pi-message:N:block:M' for Pi). */
+  itemId?: string | null;
+}
+
+/** The assistant agent-message kinds, both spellings (PRP v1 `assistant_message`, current `agentMessage`). */
+export function isAgentMessageKind(kind: unknown): boolean {
+  return kind === "agentMessage" || kind === "assistant_message";
+}
+
+/**
+ * dl-n5-cont5: Pi gives every text block its own item, '<turn>:pi-message:N:block:M'.
+ * The message is '<turn>:pi-message:N'; an id of another shape is its own message.
+ */
+function answerItemPosition(itemId: string | null | undefined): { message: string; n: number; block: number } | null {
+  if (!itemId) return null;
+  const match = /^(.*:pi-message:(\d+)):block:(\d+)$/u.exec(itemId);
+  return match ? { message: match[1]!, n: Number(match[2]), block: Number(match[3]) } : null;
+}
+
+/**
+ * dl-n5-cont5 (RFL ruling 17:47Z): THE ANSWER of a turn is ALL text blocks of
+ * its LAST assistant message (the highest N; the message of the latest block),
+ * in block order (M), completed or streamed, the cut tail included. Earlier
+ * assistant messages (commentary before a tool step) are not the reply; they
+ * stay in the transcript. The ONE function both the completed selector and
+ * the failed-turn assembly use. `seq` orders blocks whose ids are not Pi's.
+ */
+export function lastAssistantMessageAnswer<T extends { itemId?: string | null; seq: number; text: string }>(
+  blocks: readonly T[],
+): { blocks: T[]; pieces: string[]; text: string } | null {
+  const withText = blocks.filter((block) => block.text.trim().length > 0);
+  if (withText.length === 0) return null;
+  const latest = withText.reduce((last, block) => (block.seq > last.seq ? block : last));
+  const position = answerItemPosition(latest.itemId);
+  const message = position
+    ? withText.filter((block) => answerItemPosition(block.itemId)?.message === position.message)
+    : [latest];
+  const ordered = [...message].sort((a, b) =>
+    (answerItemPosition(a.itemId)?.block ?? 0) - (answerItemPosition(b.itemId)?.block ?? 0) || a.seq - b.seq);
+  const pieces = ordered.map((block) => block.text);
+  return { blocks: ordered, pieces, text: joinAnswerPieces(pieces) };
 }
 
 /**
@@ -249,11 +290,22 @@ export function selectHeartbeatRunFinalAgentMessage(input: {
       ? candidates.filter((candidate) => candidate.seq < boundary)
       : [];
   const eligible = preRecovery.length > 0 ? preRecovery : candidates;
-  const selected =
+  const latest =
     eligible.find((candidate) => candidate.channel === "final") ??
     eligible.find((candidate) => candidate.channel === "unknown");
-  if (!selected) return null;
-  const beforeRecovery = preRecovery.includes(selected);
+  if (!latest) return null;
+  const beforeRecovery = preRecovery.includes(latest);
+  // dl-n5-cont5: the answer is every text block of the latest block's message.
+  const answer = lastAssistantMessageAnswer(eligible.filter((candidate) => candidate.channel === latest.channel
+    && candidate.seq <= latest.seq));
+  const blocks = answer?.blocks ?? [latest];
+  const undeliverable = blocks.length > 1 && blocks.some((block) => block.text === TRUNCATED_FINAL_UNDELIVERABLE_TEXT);
+  const selected: CompletedFinalAgentMessageCandidate = blocks.length > 1 ? {
+    ...latest,
+    text: undeliverable ? TRUNCATED_FINAL_UNDELIVERABLE_TEXT : answer!.text,
+    ...(blocks.some((block) => block.bounded) ? { bounded: true } : {}),
+    ...(blocks.some((block) => block.truncatedFinal) ? { truncatedFinal: true } : {}),
+  } : latest;
   return {
     ...selected,
     reasonCode:
@@ -368,6 +420,7 @@ export function readCompletedAssistantMessageCandidate(input: {
     text,
     sourceEventId: readCommentText(prpEvent.sourceEventId),
     channel: payload.channel,
+    ...(itemId !== null ? { itemId } : {}),
     ...(isBoundedRunEventText(payload.text) ? { bounded: true } : {}),
   };
 }
@@ -467,7 +520,7 @@ export function reassembleAgentMessageFromDeltas(
     const event = record(record(row.payload).prpEvent);
     if (event.eventType !== "item.delta" || event.itemId !== itemId) continue;
     const payload = record(event.payload);
-    if (payload.truncated === true || payload.kind !== "agentMessage" || typeof payload.text !== "string"
+    if (payload.truncated === true || !isAgentMessageKind(payload.kind) || typeof payload.text !== "string"
       || isBoundedRunEventText(payload.text)) return null;
     parts.push({ seq: row.seq, text: payload.text });
   }
@@ -502,6 +555,7 @@ export function readTruncatedCompletedAssistantMessageCandidate(input: {
     sourceEventId: readCommentText(record(input.prpEvent).sourceEventId),
     channel: "final",
     truncatedFinal: true,
+    itemId,
   };
 }
 
@@ -556,15 +610,19 @@ export function joinAnswerPieces(pieces: readonly string[]): string {
  */
 export function shownCutAnswer(cut: { pieces: readonly string[]; text: string; candidate: { text: string } },
   postedBodies: readonly string[]): { text: string; whole: boolean } | null {
-  if (postedBodies.includes(cut.candidate.text)) return { text: cut.text, whole: true };
-  const posted = postedBodies.join("\n");
+  // dl-n5-cont5 (c): an ending that differs only by trailing whitespace (a
+  // trailing newline) was shown; compare with trailing whitespace normalised.
+  const bodies = postedBodies.map((body) => body.trimEnd());
+  if (bodies.includes(cut.candidate.text.trimEnd())) return { text: cut.text, whole: true };
+  const posted = bodies.join("\n");
   let from = 0;
   const shown: string[] = [];
   for (const piece of cut.pieces) {
-    const at = posted.indexOf(piece, from);
+    const needle = piece.trimEnd();
+    const at = posted.indexOf(needle, from);
     if (at < 0) break;
     shown.push(piece);
-    from = at + piece.length;
+    from = at + needle.length;
   }
   if (shown.length === 0) return null;
   return { text: joinAnswerPieces(shown), whole: shown.length === cut.pieces.length };
@@ -577,9 +635,10 @@ export function shownCutAnswer(cut: { pieces: readonly string[]; text: string; c
  * first and once. Returns the streamed prefix of ALL the failed turn's agent
  * message items in order (dl-n5-cont3 F3), each rebuilt with
  * `reassembleAgentMessageFromDeltas`, and the candidate to post: the WHOLE
- * prefix (dl-n5-cont3 F1: never an excerpt) and ONE true note. Null when the
- * last turn did not fail, when its last item completed with text (the
- * completed path posts it), or when no answer text was streamed.
+ * prefix (dl-n5-cont3 F1: never an excerpt) and ONE true note. dl-n5-cont5:
+ * the items are THE ANSWER's, the text blocks of the turn's last assistant
+ * message (`lastAssistantMessageAnswer`), completed or streamed. Null when the
+ * last turn did not fail or when no answer text was streamed.
  */
 export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; payload: unknown }[]): {
   itemId: string;
@@ -609,20 +668,18 @@ export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; paylo
   // order its first delta arrived; never only the last one. dl-n5-cont4: an
   // item that COMPLETED is one of the turn's answer items too (even with no
   // stored delta), in the order it first appeared.
-  const itemIds: string[] = [];
-  let startSeq: number | null = null;
+  const firstSeq = new Map<string, number>();
   for (const row of ordered) {
     if (row.seq > lastTerminal.seq) break;
     const event = eventOf(row);
     if ((event.eventType !== "item.delta" && event.eventType !== "item.completed") || typeof event.itemId !== "string") continue;
     if (failedTurnId && typeof event.turnId === "string" ? event.turnId !== failedTurnId : row.seq <= previousTerminalSeq) continue;
     const payload = record(event.payload);
-    if (payload.kind !== "agentMessage" && payload.kind !== "assistant_message") continue;
+    if (!isAgentMessageKind(payload.kind)) continue;
     if (event.eventType === "item.completed" && !(typeof payload.text === "string" && payload.text.trim())) continue;
-    if (!itemIds.includes(event.itemId)) itemIds.push(event.itemId);
-    startSeq ??= row.seq;
+    if (!firstSeq.has(event.itemId)) firstSeq.set(event.itemId, row.seq);
   }
-  if (itemIds.length === 0 || startSeq === null) return null;
+  if (firstSeq.size === 0) return null;
   const completedText = (id: string) => {
     for (const row of ordered) {
       const event = eventOf(row);
@@ -632,18 +689,25 @@ export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; paylo
     }
     return null;
   };
-  // The answer completed (the completed path posts it): not a cut answer.
-  if (completedText(itemIds[itemIds.length - 1]!) !== null) return null;
+  // dl-n5-cont5 (RFL ruling): the reply is THE ANSWER, every text block of
+  // the turn's LAST assistant message (completed or streamed, the cut tail
+  // included), through the same function as the completed selector. Earlier
+  // messages stay in the transcript and are not posted. A failed turn whose
+  // last message completed still posts it here, whole, with the one note.
   const upToTerminal = ordered.filter((row) => row.seq <= lastTerminal!.seq);
-  const pieces: string[] = [];
-  for (const id of itemIds) {
-    const piece = completedText(id) ?? reassembleAgentMessageFromDeltas(upToTerminal, id);
+  const blocks: { itemId: string; seq: number; text: string }[] = [];
+  for (const [id, seq] of firstSeq) {
+    const text = completedText(id) ?? reassembleAgentMessageFromDeltas(upToTerminal, id);
     // A partial rebuild is never presented as the answer.
-    if (piece === null) return null;
-    if (piece.trim()) pieces.push(piece);
+    blocks.push({ itemId: id, seq, text: text ?? UNREBUILT_BLOCK });
   }
-  if (pieces.length === 0) return null;
-  const text = joinAnswerPieces(pieces);
+  const answer = lastAssistantMessageAnswer(blocks);
+  if (!answer || answer.pieces.includes(UNREBUILT_BLOCK)) return null;
+  const { pieces, text } = answer;
+  const itemIds = answer.blocks.map((block) => block.itemId);
+  // The failed turn's first answer event (any message): a completed item of
+  // this turn, even an earlier message's, never outranks the turn's answer.
+  const startSeq = Math.min(...firstSeq.values());
   const itemId = itemIds[itemIds.length - 1]!;
   const cause = cutAnswerCause(record(record(lastTerminal.event.payload).error).code);
   return {
@@ -665,6 +729,9 @@ export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; paylo
     },
   };
 }
+
+/** Marks a block of the failed turn whose stored deltas cannot be rebuilt whole. */
+const UNREBUILT_BLOCK = "\u0000unrebuilt";
 
 /** dl-n5-cont2 item 3: the one note when a turn spent its whole output budget thinking. */
 export const THINKING_CAP_STOP_NOTE = "The model used its whole output budget thinking; continuing with the answer.";

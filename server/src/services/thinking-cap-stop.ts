@@ -21,7 +21,8 @@ export function readRunAnswerEvents(tx: Pick<Db, "select">, companyId: string, r
     .where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, runId), or(
       inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]),
       and(inArray(heartbeatRunEvents.eventType, ["item.delta", "item.completed"]),
-        sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`))))
+        // dl-n5-cont5 (b): both agent-message spellings, as the readers accept.
+        sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' in ('agentMessage', 'assistant_message')`))))
     .orderBy(heartbeatRunEvents.seq);
 }
 

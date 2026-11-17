@@ -861,7 +861,9 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   // first, so item B was lost, and the recovery opening then said none of the
   // answer was shown. The run's events are real DB rows; the posted comments
   // are read back from the DB.
-  type AnswerItem = { text: string; completed: boolean };
+  // dl-n5-cont5: `message`/`block` place the item at '<turn>:pi-message:N:block:M'
+  // (default: message index+1, block 0); `kind` is its agent-message spelling.
+  type AnswerItem = { text: string; completed: boolean; message?: number; block?: number; kind?: "agentMessage" | "assistant_message" };
   async function failedTurnRealCompletion(items: AnswerItem[], terminal: "turn.failed" | "turn.completed" = "turn.failed") {
     const f = await fixture({ runtimeMode: "native" }, `CF${randomUUID().slice(0, 5)}`, true);
     const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Chat with CEO",
@@ -882,13 +884,14 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     let seq = 1 + Number((await db.select({ max: sql<number>`coalesce(max(${heartbeatRunEvents.seq}), 0)` }).from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, f.run.id)))[0]!.max);
     items.forEach((item, index) => {
-      const itemId = `${turnId}:pi-message:${index + 1}:block:0`;
+      const itemId = `${turnId}:pi-message:${item.message ?? index + 1}:block:${item.block ?? 0}`;
+      const kind = item.kind ?? "agentMessage";
       for (let offset = 0; offset < item.text.length; offset += 1_009) events.push({ ...base, seq: seq++, eventType: "item.delta",
         payload: { prpEvent: { eventType: "item.delta", itemId, turnId,
-          payload: { kind: "agentMessage", channel: "final", text: item.text.slice(offset, offset + 1_009) } } } });
+          payload: { kind, channel: "final", text: item.text.slice(offset, offset + 1_009) } } } });
       if (item.completed) events.push({ ...base, seq: seq++, eventType: "item.completed",
         payload: { prpEvent: { eventType: "item.completed", itemId, turnId,
-          payload: { kind: "agentMessage", channel: "final", text: item.text } } } });
+          payload: { kind, channel: "final", text: item.text } } } });
     });
     events.push({ ...base, seq: seq++, eventType: terminal, payload: { prpEvent: { eventType: terminal, turnId,
       payload: terminal === "turn.failed" ? { error: { code: "pi_output_truncated" } } : {} } } });
@@ -922,7 +925,9 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
 
   it("dl-n5-cont4 RED (JUDGE real DB completion D-completed-first): A completed + B streamed, the turn failed: A then B posted whole, each once; the opening quotes the real posted ending", async () => {
     const A = answerItem("A", 2 * 1024), B = answerItem("B", 20 * 1024);
-    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true }, { text: B, completed: false }]);
+    // dl-n5-cont5 (RFL ruling 17:47Z): A and B are text blocks of the LAST message.
+    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true, message: 2, block: 0 },
+      { text: B, completed: false, message: 2, block: 1 }]);
     expect((await read(f.run.id)).status).toBe("failed");
     const bodies = posted.map(comment => comment.body);
     const all = bodies.join("");
@@ -944,7 +949,8 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
 
   it("dl-n5-cont4 (2): when only item A was really posted, the opening says A was shown, quotes A's posted ending, never 'none of it was shown'", async () => {
     const A = answerItem("A", 2 * 1024), B = answerItem("B", 20 * 1024);
-    const { f, issue, posted } = await failedTurnRealCompletion([{ text: A, completed: true }, { text: B, completed: false }]);
+    const { f, issue, posted } = await failedTurnRealCompletion([{ text: A, completed: true, message: 2, block: 0 },
+      { text: B, completed: false, message: 2, block: 1 }]);
     // What an older server (073f4a4f) really posted for this turn: item A alone.
     await db.delete(issueComments).where(eq(issueComments.issueId, issue.id));
     await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: issue.id, authorAgentId: f.agent.id,
@@ -982,8 +988,8 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
 
   it("dl-n5-cont4 control: two completed items plus a third streamed: all three posted, in order, each once", async () => {
     const A = answerItem("A", 2 * 1024), A2 = answerItem("A2", 4 * 1024), C = answerItem("C", 12 * 1024);
-    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true }, { text: A2, completed: true },
-      { text: C, completed: false }]);
+    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true, message: 2, block: 0 },
+      { text: A2, completed: true, message: 2, block: 1 }, { text: C, completed: false, message: 2, block: 2 }]);
     expect(posted).toHaveLength(1);
     const shown = posted[0]!.body.replace(CUT_NOTE, "\n");
     expect(shown).toBe(`${A}\n${A2}\n${C}`);
@@ -992,6 +998,68 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(cut.posted).toBe(true);
     const quoted = /<<<END OF POSTED TEXT\n([\s\S]*)\nEND OF POSTED TEXT>>>/u.exec(opening)![1]!;
     expect(shown.endsWith(quoted)).toBe(true);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  // dl-n5-cont5 (rf-2 cont4 verdict; RFL ruling 17:47Z): THE ANSWER is every
+  // text block of the LAST assistant message, in block order, completed or
+  // streamed, posted whole once, on the completed AND the failed path.
+  const lastBlock = "Short closing block of the same final message, 53 B.\n";
+  it("dl-n5-cont5 (i) RED: last message with 2 completed text blocks, turn COMPLETED: both blocks posted, in order", async () => {
+    const A = answerItem("A", 2_072);
+    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true, message: 2, block: 0 },
+      { text: lastBlock, completed: true, message: 2, block: 1 }], "turn.completed");
+    expect((await read(f.run.id)).status).toBe("succeeded");
+    expect(posted.map(comment => comment.body)).toEqual([`${A}\n${lastBlock}`]);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it.each([false, true])("dl-n5-cont5 (ii) RED: the same, turn FAILED: both blocks posted, the cut tail (streamed tail: %s), ONE true note", async (tail) => {
+    const A = answerItem("A", 2_072), C = answerItem("C", 6 * 1024);
+    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true, message: 2, block: 0 },
+      { text: lastBlock, completed: true, message: 2, block: 1 }, ...(tail ? [{ text: C, completed: false, message: 2, block: 2 }] : [])]);
+    expect((await read(f.run.id)).status).toBe("failed");
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toMatch(CUT_NOTE);
+    expect(occurrences(posted[0]!.body, "— The answer stopped here")).toBe(1);
+    expect(posted[0]!.body.replace(CUT_NOTE, "\n")).toBe(tail ? `${A}\n${lastBlock}\n${C}` : `${A}\n${lastBlock}`);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it.each([true, false])("dl-n5-cont5 (iii) RED: 2 items in DIFFERENT messages (last completed: %s), turn failed: only the last message is posted, with ONE note; the earlier one stays in the transcript", async (lastCompleted) => {
+    const commentary = answerItem("Commentary", 2_072), B = answerItem("B", 3 * 1024);
+    const { f, posted } = await failedTurnRealCompletion([{ text: commentary, completed: true, message: 1, block: 0 },
+      { text: B, completed: lastCompleted, message: 3, block: 0 }]);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toMatch(CUT_NOTE);
+    expect(posted[0]!.body.replace(CUT_NOTE, "\n")).toBe(B);
+    expect(occurrences(posted[0]!.body, commentary)).toBe(0);
+    const transcript = (await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.run.id),
+      eq(heartbeatRunEvents.eventType, "item.completed")))).map(row => (row.payload as { prpEvent: { payload: { text: string } } }).prpEvent.payload.text);
+    expect(transcript).toContain(commentary);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("dl-n5-cont5 (iv) RED: a streamed 'assistant_message' item is rebuilt and posted", async () => {
+    const B = answerItem("B", 8 * 1024);
+    const { posted } = await failedTurnRealCompletion([{ text: B, completed: false, kind: "assistant_message" }]);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toMatch(CUT_NOTE);
+    expect(posted[0]!.body.replace(CUT_NOTE, "\n")).toBe(B);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it.each(["one block", "two blocks"] as const)("dl-n5-cont5 (v) RED: a posted ending that differs only by a trailing newline is recognised as shown (%s)", async (shape) => {
+    const A = answerItem("A", 2 * 1024), B = answerItem("B", 6 * 1024);
+    const items = shape === "one block" ? [{ text: B, completed: false }]
+      : [{ text: A, completed: true, message: 2, block: 0 }, { text: B, completed: false, message: 2, block: 1 }];
+    const { f, issue } = await failedTurnRealCompletion(items);
+    const answer = shape === "one block" ? B : `${A}\n${B}`;
+    // What was really posted: the answer whose trailing newline was dropped.
+    await db.delete(issueComments).where(eq(issueComments.issueId, issue.id));
+    await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: issue.id, authorAgentId: f.agent.id,
+      authorType: "agent", createdByRunId: f.run.id, body: answer.trimEnd() });
+    const { cut, opening } = await recoveryOpening(f.run.id, f.run.companyId);
+    expect(cut.posted).toBe(true);
+    expect(cut.partial).toBeUndefined();
+    expect(cut.text).toBe(answer);
+    expect(opening).not.toMatch(/none of it was shown|starting the answer again|Only the first part/u);
+    expect(opening).toContain("was posted to the person as your reply, exactly as written");
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   // Gate 3, run f5c33c68 (stack-lane/): the native result was accepted at
