@@ -24,6 +24,8 @@ import type {
   TaskBrowser,
 } from "@paperclipai/shared";
 import { heartbeatsApi } from "@/api/heartbeats";
+import { issuesApi } from "@/api/issues";
+import { AgentChatReadProvider } from "@/hooks/useAgentChatRead";
 import { nativeRunEventsToTranscript } from "./transcript/native-run-events";
 import * as nativeTranscriptTransport from "./transcript/useNativeRunTranscripts";
 import { genericPendingRequestConfirmationInteraction, pendingConnectionIntentInteraction } from "@/fixtures/issueThreadInteractionFixtures";
@@ -5923,6 +5925,46 @@ describe("TaskChatThread live transcript", () => {
     expect(
       container.querySelector('[data-testid="task-chat-turn-status-island"]'),
     ).toBeNull();
+  });
+
+  it.each(["running", "queued", "failed", "queued-message", "unfocused", "scrolled-up", "unseen-saved-reply"])("marks a seen persisted chat reply read while its runner bubble owns the response (%s)", async scenario => {
+    const commentId = "11111111-1111-4111-8111-111111111111";
+    const body = "Completed the requested streaming test.";
+    const markRead = vi.spyOn(issuesApi, "markRead").mockResolvedValue({} as never);
+    vi.spyOn(document, "hasFocus").mockReturnValue(scenario !== "unfocused");
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(scenario === "scrolled-up" ? 300 : 100);
+    vi.spyOn(HTMLElement.prototype, "scrollTop", "get").mockReturnValue(0);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(100);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ top: 0, bottom: 100, height: 100, left: 0, right: 100, width: 100, x: 0, y: 0, toJSON() {} });
+    nativeTranscriptState.transcriptByRun.set("run-runner", [
+      { kind: "assistant", ts: "2026-08-21T15:44:20.000Z", text: body, channel: "final", delta: true },
+    ]);
+    render(<AgentChatReadProvider issueId="issue-1" companyId="company-1" userId="owner-a">
+      <TaskChatThread issueId="issue-1" conversationMode conversationOwnerId="owner-a" currentUserId="owner-a"
+        comments={[{ id: commentId, companyId: "company-1", issueId: "issue-1", authorType: "agent", authorAgentId: "agent-1", authorUserId: null,
+          body: scenario === "unseen-saved-reply" ? "A different saved reply not yet shown." : body,
+          presentation: null, metadata: null, runId: scenario === "unseen-saved-reply" ? "run-runner" : null,
+          createdAt: new Date("2026-08-21T15:44:22.000Z"), updatedAt: new Date("2026-08-21T15:44:22.000Z") },
+          ...(scenario === "queued-message" ? [{ id: "22222222-2222-4222-8222-222222222222", companyId: "company-1", issueId: "issue-1",
+            authorType: "user" as const, authorAgentId: null, authorUserId: "owner-a", body: "Follow up when ready.",
+            presentation: null, metadata: null, queueState: "queued" as const,
+            createdAt: new Date("2026-08-21T15:44:23.000Z"), updatedAt: new Date("2026-08-21T15:44:23.000Z") }] : [])]}
+        onAdd={async () => {}} issueStatus="in_progress"
+        activeRun={{ id: "run-runner", status: scenario === "failed" ? "failed" : scenario === "queued" ? "queued" : "running", invocationSource: "issue", triggerDetail: null,
+          startedAt: "2026-08-21T15:44:00.000Z", finishedAt: scenario === "failed" ? "2026-08-21T15:44:24.000Z" : null, createdAt: "2026-08-21T15:44:00.000Z",
+          agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner", runtimeMode: "native" }} />
+    </AgentChatReadProvider>);
+    await settleThreadLayout();
+    await act(async () => { window.dispatchEvent(new Event("focus")); });
+    expect(container.textContent).toContain(body);
+    if (scenario !== "failed") {
+      expect(container.textContent?.match(/Completed the requested streaming test\./g)).toHaveLength(1);
+      expect(container.querySelector('[data-testid="task-chat-live-transcript"]')).not.toBeNull();
+    }
+    if (scenario === "unfocused" || scenario === "scrolled-up" || scenario === "unseen-saved-reply") expect(markRead).not.toHaveBeenCalled();
+    else expect(markRead).toHaveBeenCalledWith("issue-1", commentId);
+    expect(markRead.mock.calls.every(([, id]) => id === commentId)).toBe(true);
   });
 
   it("keeps an unlinked persisted runner reply hidden while the live turn still owns that response", () => {
