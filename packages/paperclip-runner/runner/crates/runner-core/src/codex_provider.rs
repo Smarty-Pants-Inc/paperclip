@@ -1806,13 +1806,28 @@ impl CodexProvider {
     ) -> (Vec<(String, Value)>, Result<(), LocalRunnerError>) {
         let mut accounting = Vec::new();
         let result = (|| {
-            let Some(completed_turn_id) = self
+            let completed_turn_id = self
                 .completed_turn_authority
                 .as_ref()
-                .map(|authority| authority.provider_turn_id.clone())
-            else {
+                .map(|authority| authority.provider_turn_id.clone());
+            // A successful in-place attach (run.prepare's rebind) clears the
+            // authority, but frames Pi emitted while answering that run.attach
+            // request (its idle attach timing, diagnostics) stay buffered. With
+            // no live turn they are the same settled tail: drain them under
+            // the settled-turn identities instead of refusing the next attach.
+            // Only buffered notifications qualify; a buffered provider request
+            // (e.g. a tool callback) is left for the blockers to refuse.
+            let buffer_only = completed_turn_id.is_none();
+            if buffer_only
+                && (self.pending_messages.is_empty()
+                    || self.ambiguous_turn_start_pending
+                    || self
+                        .pending_messages
+                        .iter()
+                        .any(|message| message.value.get("id").is_some()))
+            {
                 return Ok(());
-            };
+            }
             if self.active_provider_turn_id.is_some() {
                 return Ok(());
             }
@@ -1829,6 +1844,9 @@ impl CodexProvider {
             let mut quiet_since: Option<std::time::Instant> = None;
             let mut drained = 0usize;
             loop {
+                if buffer_only && self.pending_messages.is_empty() {
+                    return Ok(());
+                }
                 if std::time::Instant::now() >= deadline {
                     return Err(LocalRunnerError::invalid(
                         "Codex warm run attachment tail did not become quiescent",
@@ -1843,8 +1861,13 @@ impl CodexProvider {
                                 "Codex warm run attachment tail exceeded its bounded frame limit",
                             ));
                         }
-                        let names_other_turn = notification_turn_id(&params)
-                            .is_some_and(|turn_id| turn_id != completed_turn_id);
+                        let names_other_turn =
+                            notification_turn_id(&params).is_some_and(|turn_id| {
+                                match completed_turn_id.as_deref() {
+                                    Some(completed) => turn_id != completed,
+                                    None => !self.settled_provider_turn_ids.contains(turn_id),
+                                }
+                            });
                         // A notification about the settled turn is history. Only
                         // a new turn means something is live; a provider request
                         // or process exit has its own fail-closed arm below.
