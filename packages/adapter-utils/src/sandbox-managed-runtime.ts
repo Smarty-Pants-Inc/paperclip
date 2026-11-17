@@ -56,6 +56,7 @@ import {
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
+import { hostCleanup, hostMutation } from "./host-mutation-drain.js";
 import {
   scheduleSyncOperations,
   SYNC_OPERATION_CONCURRENCY_LIMIT,
@@ -857,11 +858,11 @@ export function sandboxExecutionSessionMatches(saved: unknown, current: SandboxR
 }
 
 async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const dir = await hostMutation(() => fs.mkdtemp(path.join(os.tmpdir(), prefix)));
   try {
     return await fn(dir);
   } finally {
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    await hostCleanup(() => fs.rm(dir, { recursive: true, force: true }).catch(() => undefined));
   }
 }
 
@@ -923,13 +924,13 @@ async function persistDurableSeedArchive(input: {
 }
 
 async function execTar(args: string[]): Promise<void> {
-  await execFile("tar", args, {
+  await hostMutation(() => execFile("tar", args, {
     env: {
       ...process.env,
       COPYFILE_DISABLE: "1",
     },
     maxBuffer: 32 * 1024 * 1024,
-  });
+  }));
 }
 
 export async function createTarballFromDirectory(input: {
@@ -996,7 +997,7 @@ async function extractTarballToDirectory(input: {
   localDir: string;
   exclude?: string[];
 }): Promise<void> {
-  await fs.mkdir(input.localDir, { recursive: true });
+  await hostMutation(() => fs.mkdir(input.localDir, { recursive: true }));
   await execTar([...(input.exclude ?? []).map(entry => `--exclude=${escapeTarExcludeLiteral(entry)}`), "-xf", input.archivePath, "-C", input.localDir]);
 }
 
@@ -1024,7 +1025,7 @@ async function confineFullWorkspaceExport(root: string, rejectExternalSymlinks =
         const resolved = path.resolve(directory, target);
         if (path.isAbsolute(target) || (resolved !== canonicalRoot && !resolved.startsWith(`${canonicalRoot}${path.sep}`))) {
           if (rejectExternalSymlinks) throw unsafe();
-          await fs.unlink(entryPath);
+          await hostMutation(() => fs.unlink(entryPath));
         }
         if (rejectExternalSymlinks) {
           const canonicalTarget = await fs.realpath(entryPath).catch(() => { throw unsafe(); });
@@ -2182,7 +2183,7 @@ export async function prepareSandboxManagedRuntime(input: {
                       const bundleBytes = await input.client.readFile(remoteGitBundle, gitExport.options);
                       const bundleBuffer = toBuffer(bundleBytes);
                       await gitExport.finish(bundleBuffer.byteLength, bundleBuffer.byteLength);
-                      await fs.writeFile(localBundlePath, bundleBuffer);
+                      await hostMutation(() => fs.writeFile(localBundlePath, bundleBuffer));
                     }
                     await input.client.remove(remoteGitBundle).catch(() => undefined);
                     if (forceFullBundle) {
@@ -2194,7 +2195,7 @@ export async function prepareSandboxManagedRuntime(input: {
                         },
                       }));
                       if (shallow.byteLength > GIT_SHALLOW_MAX_BYTES) throw new GitShallowMetadataError(`Git shallow metadata exceeds its byte limit (${shallow.byteLength} > ${GIT_SHALLOW_MAX_BYTES})`);
-                      await fs.writeFile(localShallowPath, shallow);
+                      await hostMutation(() => fs.writeFile(localShallowPath, shallow));
                       await input.client.remove(remoteShallowPath).catch(() => undefined);
                     }
                     if (!forceFullBundle) {
@@ -2238,8 +2239,8 @@ export async function prepareSandboxManagedRuntime(input: {
                   try {
                     const inputManifest = path.join(tempDir, "checkpoint-baseline.sqlite");
                     const helper = path.join(tempDir, "checkpoint.mjs");
-                    await writeCheckpointBaseline(checkpointBaseline, inputManifest);
-                    await fs.writeFile(helper, workspaceCheckpointScript());
+                    await hostMutation(() => writeCheckpointBaseline(checkpointBaseline, inputManifest));
+                    await hostMutation(() => fs.writeFile(helper, workspaceCheckpointScript()));
                     const remoteRoot = path.posix.join(runtimeRootDir, `checkpoint-${randomUUID()}`);
                     const remoteManifest = path.posix.join(remoteRoot, "baseline.sqlite");
                     const remoteHelper = path.posix.join(remoteRoot, "checkpoint.mjs");
@@ -2269,7 +2270,7 @@ export async function prepareSandboxManagedRuntime(input: {
                         assertSyncOperationsConfined(outbound, { sourceRoots: [runtimeRootDir], targetRoots: [tempDir] });
                         await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(outbound));
                         checkpointSnapshot = readCheckpointSnapshot(path.join(output, "manifest.sqlite"), checkpointBaseline);
-                        await fs.rename(path.join(output, "payload"), extractedDir);
+                        await hostMutation(() => fs.rename(path.join(output, "payload"), extractedDir));
                         const metrics = await validateCheckpointPayload({ baseline: checkpointBaseline, snapshot: checkpointSnapshot, payload: extractedDir });
                         await input.onWorkspaceCheckpoint?.(metrics).catch(() => undefined);
                       }
@@ -2300,7 +2301,7 @@ export async function prepareSandboxManagedRuntime(input: {
                     sourceRoots: [workspaceRemoteDir],
                     targetRoots: [extractedDir],
                   });
-                  await fs.mkdir(extractedDir, { recursive: true });
+                  await hostMutation(() => fs.mkdir(extractedDir, { recursive: true }));
                   const workspaceRestore = makeTransferProgress(
                     restoreSink,
                     "Restoring",
@@ -2334,7 +2335,7 @@ export async function prepareSandboxManagedRuntime(input: {
                   await input.client.remove(remoteWorkspaceTar).catch(() => undefined);
                   const localArchivePath = path.join(tempDir, "workspace.tar");
                   await withWorkspaceRestoreStep("workspace_extract", async () => {
-                    await fs.writeFile(localArchivePath, archiveBuffer);
+                    await hostMutation(() => fs.writeFile(localArchivePath, archiveBuffer));
                     await extractTarballToDirectory({
                       archivePath: localArchivePath,
                       localDir: extractedDir,
@@ -2400,11 +2401,13 @@ export async function prepareSandboxManagedRuntime(input: {
             "asset",
             () => runStepSpan(`restore.asset.${assetKey}`, async () => {
               await withTempDir("paperclip-sandbox-restore-", async (tempDir) => {
-                await withWorkspaceRestoreStep("asset_restore", () => assetRestore({
+                // adopt-drain: the asset writes a host target outside this module,
+                // so the whole asset restore is one tracked host mutation.
+                await withWorkspaceRestoreStep("asset_restore", () => hostMutation(() => assetRestore({
                   assetDir: path.posix.join(runtimeRootDir, assetKey),
                   readFile: async (remotePath) => toBuffer(await input.client.readFile(remotePath)),
                   tempDir,
-                }));
+                })));
               });
             }), restoreSink, (diagnostic) => { outboundDiagnostics[taskIndex] = diagnostic; }),
         );
