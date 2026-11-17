@@ -196,32 +196,39 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   // restoreWorkspace swaps the reference to the finalized one on success.
   if (!reason && (sync.reference as { state: string }).state !== "finalized") reason = "export_not_finalized";
 
-  await recordCancelledWarmExportOutcome(input.db, run, reason
+  const markCommitted = await recordCancelledWarmExportOutcome(input.db, run, reason
     ? { reason, detail, timeoutMs, line: deferredLine(reason) } : { reason: null, detail, timeoutMs, line: null });
   if (reason) {
     logger.warn({ runId: input.runId, reason, detail, timeoutMs },
       "Stopped warm turn's workspace export unproven; the box stays a protected export source");
     return { outcome: "unproven", reason };
   }
-  // S048: the finalized mark is committed (no transaction here); wake a message
-  // parked behind this Stop's cleanup by this event, once, not by the re-poll.
-  await wakeAfterCleanupSettled({ companyId: input.companyId, runId: input.runId, event: "export_finalized" });
+  // S048: wake a message parked behind this Stop's cleanup by this event, once,
+  // not by the re-poll, but ONLY when the finalized mark write committed (no
+  // transaction here). A failed mark write wakes nothing: without the mark the
+  // run is not settled, and the re-poll stays the fallback.
+  if (markCommitted) {
+    await wakeAfterCleanupSettled({ companyId: input.companyId, runId: input.runId, event: "export_finalized" });
+  }
   return { outcome: "finalized" };
 }
 
 async function recordCancelledWarmExportOutcome(db: Db, run: typeof heartbeatRuns.$inferSelect, outcome: {
   reason: string | null; detail: string | null; timeoutMs: number | null; line: string | null;
-}): Promise<void> {
+}): Promise<boolean> {
   const { reason, detail, timeoutMs } = outcome;
   const line = outcome.line ?? "";
   const input = { db, runId: run.id, companyId: run.companyId };
   const mark = reason
     ? { state: "unproven", reason, detail, timeoutMs, at: new Date().toISOString() }
     : { state: "finalized", at: new Date().toISOString() };
+  // S048: the wake in finishCancelledWarmWorkspaceExport may fire only once this mark write has committed.
+  let markCommitted = false;
   try {
     await input.db.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
       || ${JSON.stringify({ nativeCancelledWarmExport: mark })}::jsonb` }).where(and(
       eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
+    markCommitted = true;
     await appendHeartbeatRunEvent(input.db, {
       companyId: run.companyId, agentId: run.agentId, runId: run.id,
       eventType: reason ? "workspace_export_deferred" : "workspace_export_finalized",
@@ -251,4 +258,5 @@ async function recordCancelledWarmExportOutcome(db: Db, run: typeof heartbeatRun
   } catch (error) {
     logger.warn({ err: error, runId: input.runId }, "cancelled warm workspace export outcome could not be recorded");
   }
+  return markCommitted;
 }

@@ -4731,7 +4731,7 @@ export function environmentRuntimeService(
               { cleanupStatus: "success" },
             );
             // S048: the retained/success release committed; wake a message
-            // parked behind this run's cleanup now (bounded, once per event).
+            // parked behind this run's cleanup now (bounded, once per settled run).
             if (lease && leaseRow.heartbeatRunId) void wakeAfterCleanupSettled({ companyId: leaseRow.companyId,
               runId: leaseRow.heartbeatRunId, event: "lease_released" });
             if (lease) {
