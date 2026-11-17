@@ -30,7 +30,10 @@ import { buildNativeRuntimeContext } from "../services/native-runtime/runtime-co
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createReusableLeaseHandoff } from "../services/environment-lease-handoff.js";
-import { AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService } from "../services/agent-directory-working-copies.js";
+import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService, agentFileSaveHeld } from "../services/agent-directory-working-copies.js";
+import { agentFileSaveHeldOnLease } from "../services/agent-file-save-hold.js";
+import { collectStoppedInstructionCopyWithRetries } from "../services/agent-instruction-working-copies.js";
+import { HttpError } from "../errors.js";
 import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { heartbeatRunEvents } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -760,6 +763,119 @@ describe("persistent agent directories", () => {
     expect(await inspectAgentFile(root, "boundary.bin")).toMatchObject({ size: MAX_AGENT_FILE_BYTES, bytes: null });
   });
 
+  describe("fail-closed agent-directory saves", () => {
+    afterEach(() => { vi.restoreAllMocks(); });
+    const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+    type Kind = "apply" | "quota" | "authorization" | "timeout";
+    const failureFor = (kind: Kind) => kind === "quota" ? new fileStoreModule.AgentFileLimitError("Agent folder exceeds a storage limit")
+      : kind === "authorization" ? new HttpError(403, "Current permissions do not allow this agent-file save")
+        : kind === "timeout" ? new Error("Remote agent-file capture timed out") : new Error("store.apply failed (EIO)");
+    /** A service instance whose real store fails every apply, as a controller would see. */
+    function failingService(kind: Kind) {
+      const actual = fileStoreModule.agentFileStore;
+      vi.spyOn(fileStoreModule, "agentFileStore").mockImplementation((...args) => {
+        const store = actual(...args);
+        vi.spyOn(store, "apply").mockRejectedValue(failureFor(kind));
+        return store;
+      });
+      const service = agentInstructionWorkingCopyService(db);
+      vi.mocked(fileStoreModule.agentFileStore).mockRestore();
+      return service;
+    }
+    async function holdUnsavedNote(warm: boolean, kind: Kind) {
+      const copy = await run({ warm });
+      const note = `unsaved note ${randomUUID()}`;
+      await fs.writeFile(path.join(copy.localRoot, "unsaved-note.txt"), note);
+      const failing = failingService(kind);
+      // The wrapper's immediate retry helper, then heartbeat teardown, then the cleanup worker.
+      const held = (await collectStoppedInstructionCopyWithRetries(() => failing.collectStopped({ companyId, runId: copy.runId })))!;
+      return { copy, note, failing, held };
+    }
+    async function assertRetained(copy: Awaited<ReturnType<typeof run>>, note: string) {
+      const row = (await copies.get(companyId, copy.runId))!;
+      expect(agentFileSaveHeld(row)).toBe(true);
+      expect(row).toMatchObject({ state: "unavailable", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+      expect(row.processStoppedAt).not.toBeNull();
+      expect(row.nextAttemptAt?.getTime()).toBeGreaterThan(Date.now() - 1);
+      expect(row.receipt?.baseline).toBeTruthy();
+      expect(row.receipt?.cleanupPending).toBeUndefined();
+      expect(sha(await fs.readFile(path.join(copy.localRoot, "unsaved-note.txt")))).toBe(sha(note));
+      if (copy.receipt?.warm === true) expect(JSON.parse(await fs.readFile(path.join(path.dirname(copy.localRoot), "owner.json"), "utf8")).runId).toBe(copy.runId);
+      await expect(fs.stat(path.join(root, "unsaved-note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      return row;
+    }
+    const cases = [false, true].flatMap(warm => (["apply", "quota", "authorization", "timeout"] as const).map(kind => [warm ? "warm" : "cold", kind] as const));
+    it.each(cases)("stopped agent-directory save failure retains exact source and lease across teardown/restart, then retries to a verified save (%s, local, %s)", async (mode, kind) => {
+      const warm = mode === "warm";
+      const { copy, note, failing, held } = await holdUnsavedNote(warm, kind);
+      expect(held).toMatchObject({ state: "unavailable", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
+        errorCode: kind === "quota" ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED" });
+      expect((held.receipt?.savePending as { code?: string }).code).toBe(held.errorCode);
+      // Heartbeat teardown: loss report, instruction cleanup, then the cleanup worker sweep.
+      expect((await failing.reportUnavailable(companyId, copy.runId))?.state).toBe("unavailable");
+      await failing.release(companyId, copy.runId);
+      await failing.recoverCaptured();
+      await assertRetained(copy, note);
+      // The one true instruction is listed for the person/operator.
+      const listed = await copies.list(companyId, agentId, board());
+      expect(listed.find(entry => entry.runId === copy.runId)).toMatchObject({ state: "unavailable", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+      // Restart: a fresh controller service, real store, durable retry is due.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, copy.runId));
+      await db.update(agentInstructionWorkingCopies).set({ nextAttemptAt: new Date(Date.now() - 1000) }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      const restarted = agentInstructionWorkingCopyService(db);
+      expect(await restarted.recoverStopped()).toBeGreaterThan(0);
+      const saved = (await restarted.get(companyId, copy.runId))!;
+      expect(saved.state).toBe("saved");
+      expect(agentFileSaveHeld(saved)).toBe(false);
+      expect(sha(await fs.readFile(path.join(root, "unsaved-note.txt")))).toBe(sha(note));
+      // Only after the verified save may cleanup discard the temporary tree.
+      await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    }, 60_000);
+
+    it("a held save does not block the next message: the next run starts from canonical and the instruction stays visible", async () => {
+      const { copy, note } = await holdUnsavedNote(false, "apply");
+      const next = await run();
+      expect(next.state).toBe("prepared");
+      expect(await fs.readFile(path.join(next.localRoot, entryFile), "utf8")).toBe(initial);
+      await fs.writeFile(path.join(next.localRoot, "next.txt"), "answered");
+      expect((await copies.collectStopped({ companyId, runId: next.runId }))?.state).toBe("saved");
+      expect(await fs.readFile(path.join(root, "next.txt"), "utf8")).toBe("answered");
+      const listed = await copies.list(companyId, agentId, board());
+      expect(listed.find(entry => entry.runId === copy.runId)?.errorMessage).toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
+      await assertRetained(copy, note);
+    });
+
+    it("stopped agent-directory save failure retains exact source and lease across teardown/restart, then retries to a verified save (cold, remote, lease uncertainty)", async () => {
+      const { copy, note, failing } = await holdUnsavedNote(false, "apply");
+      const environmentId = randomUUID(), leaseId = randomUUID(), remoteCwd = "/fixture/held-task";
+      await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: copy.runId,
+        provider: "daytona", providerLeaseId: `held-${leaseId}`, status: "active", metadata: { remoteCwd } });
+      const row = (await copies.get(companyId, copy.runId))!;
+      expect(typeof (row.receipt?.savePending as { mirrorHash?: unknown }).mirrorHash).toBe("string");
+      // The same held tree, recorded as a remote copy whose mirror was retrieved.
+      await db.update(agentInstructionWorkingCopies).set({ location: `remote:${environmentId}`,
+        executionRoot: path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", agentId, copy.runId),
+        receipt: { ...row.receipt, cleanup: { leaseId, remoteCwd } } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      expect(await agentFileSaveHeldOnLease(db, { id: leaseId, companyId, providerLeaseId: `held-${leaseId}` })).toBe(true);
+      // Lease uncertainty: the lease is released mid-hold. No remote rm, no mirror rm.
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() }).where(eq(environmentLeases.id, leaseId));
+      const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand");
+      await failing.release(companyId, copy.runId);
+      await failing.recoverCaptured();
+      expect(shell).not.toHaveBeenCalled();
+      await assertRetained(copy, note);
+      // Restart with no collector: retry from the verified mirror.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, copy.runId));
+      await db.update(agentInstructionWorkingCopies).set({ nextAttemptAt: new Date(Date.now() - 1000) }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      const restarted = agentInstructionWorkingCopyService(db);
+      await restarted.recoverStopped();
+      expect((await restarted.get(companyId, copy.runId))?.state).toBe("saved");
+      expect(sha(await fs.readFile(path.join(root, "unsaved-note.txt")))).toBe(sha(note));
+      expect(await agentFileSaveHeldOnLease(db, { id: leaseId, companyId, providerLeaseId: `held-${leaseId}` })).toBe(false);
+      expect(shell).not.toHaveBeenCalled();
+    }, 60_000);
+  });
   it("checks quota for a small editor save without reading unrelated file bytes", async () => {
     const asset = path.join(root, "large.bin");
     await sparseFile(asset, MAX_AGENT_FILE_BYTES);
@@ -771,20 +887,25 @@ describe("persistent agent directories", () => {
     } finally { open.mockRestore(); }
   });
 
-  it("reports an oversized run file without a partial save and removes its temporary copy", async () => {
+  // SUPERSEDED-BY-FAIL-CLOSED: the old test asserted the temporary copy was deleted
+  // (ENOENT + compacted baseline) after an over-quota save. That discarded the only
+  // copy of "changed instructions". It now asserts retention under a held save.
+  it("SUPERSEDED-BY-FAIL-CLOSED: reports an oversized run file without a partial save and retains its unsaved source", async () => {
     const copy = await run();
     await sparseFile(path.join(copy.localRoot, "too-large.bin"), MAX_AGENT_FILE_BYTES + 1);
     await fs.writeFile(path.join(copy.localRoot, entryFile), "changed instructions");
     const failed = await copies.collectStopped({ companyId, runId: copy.runId });
-    expect(failed).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", candidateHash: null, nextAttemptAt: null, attempts: 1 });
+    expect(failed).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", candidateHash: null, attempts: 1,
+      errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+    expect(failed?.nextAttemptAt?.getTime()).toBeGreaterThan(Date.now());
     expect(failed?.receipt?.storageWarning).toContain("Runs can continue");
-    expect(failed?.errorMessage).toContain('"too-large.bin" exceeds the 256 MiB');
+    expect((failed?.receipt?.savePending as { reason?: string }).reason).toContain('"too-large.bin" exceeds the 256 MiB');
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
     await expect(fs.stat(path.join(root, "too-large.bin"))).rejects.toMatchObject({ code: "ENOENT" });
     expect((await copies.reportUnavailable(companyId, copy.runId))?.errorCode).toBe("AGENT_FILES_LIMIT_EXCEEDED");
     await copies.release(companyId, copy.runId);
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
-    expect((await copies.get(companyId, copy.runId))?.receipt?.baseline).toBeUndefined();
+    expect(await fs.readFile(path.join(copy.localRoot, entryFile), "utf8")).toBe("changed instructions");
+    expect((await copies.get(companyId, copy.runId))?.receipt?.baseline).toBeTruthy();
     const next = await run();
     expect(await fs.readFile(path.join(next.localRoot, entryFile), "utf8")).toBe(initial);
     await fs.writeFile(path.join(next.localRoot, "next-task.txt"), "still working");
@@ -813,15 +934,17 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(next.localRoot, "task-output.txt"), "utf8")).toBe("work continues");
   }, 30_000);
 
-  it("starts successive runs with an already oversized saved file and lets the agent remove it", async () => {
+  // SUPERSEDED-BY-FAIL-CLOSED: the old test asserted ENOENT for the first run's copy after its
+  // stopped save hit the limit. A failed stopped save now holds its source; later runs still start.
+  it("SUPERSEDED-BY-FAIL-CLOSED: starts successive runs with an already oversized saved file and lets the agent remove it", async () => {
     await sparseFile(path.join(root, "old-large.bin"), MAX_AGENT_FILE_BYTES + 1);
     const first = await run();
     expect(first.state).toBe("prepared");
     expect(first.receipt?.storageWarning).toContain("256 MiB");
     expect(await fs.readFile(path.join(first.localRoot, entryFile), "utf8")).toBe(initial);
     const stopped = await copies.collectStopped({ companyId, runId: first.runId });
-    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED" });
-    await expect(fs.stat(first.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+    expect((await fs.stat(first.localRoot)).isDirectory()).toBe(true);
     copies = agentInstructionWorkingCopyService(db);
     const cleanup = await run();
     expect(cleanup.state).toBe("prepared");
@@ -858,8 +981,9 @@ describe("persistent agent directories", () => {
     for (let index = 0; index < 8; index++) await sparseFile(path.join(copy.localRoot, `part-${index}.bin`), MAX_AGENT_FILE_BYTES);
     // The eight allowed files exactly fill the quota; the entry is additional.
     const result = await copies.collectStopped({ companyId, runId: copy.runId });
-    expect(result).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED" });
-    expect(result?.errorMessage).toContain("2 GiB total storage limit");
+    expect(result).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
+    // SUPERSEDED-BY-FAIL-CLOSED: the limit reason moved from errorMessage to the held save receipt.
+    expect((result?.receipt?.savePending as { reason?: string }).reason).toContain("2 GiB total storage limit");
     expect(await fs.readdir(root)).toEqual(["policy"]);
   });
 
@@ -875,13 +999,16 @@ describe("persistent agent directories", () => {
     } finally { readdir.mockRestore(); }
   }, 30_000);
 
-  it("keeps the entry's 1 MiB limit and cleans up failed synchronization", async () => {
+  // SUPERSEDED-BY-FAIL-CLOSED: the old test asserted the failed copy was deleted (ENOENT).
+  // The over-limit entry is the only copy of that edit; it is now retained under a held save.
+  it("SUPERSEDED-BY-FAIL-CLOSED: keeps the entry's 1 MiB limit and retains the unsaved source after failed synchronization", async () => {
     const copy = await run();
     await fs.writeFile(path.join(copy.localRoot, entryFile), "a".repeat(1024 * 1024 + 1));
     const result = await copies.collectStopped({ companyId, runId: copy.runId });
     expect(result?.state).toBe("unavailable");
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
-    expect(result?.errorMessage).toContain("at most 1 MiB");
+    expect((await fs.readFile(path.join(copy.localRoot, entryFile))).length).toBe(1024 * 1024 + 1);
+    expect(result?.errorMessage).toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
+    expect((result?.receipt?.savePending as { reason?: string }).reason).toContain("at most 1 MiB");
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
   });
 
@@ -1166,7 +1293,9 @@ describe("persistent agent directories", () => {
     await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it.each([false, true])("rejects symlinks without saving any part of the tree, preserving an existing full-storage warning: %s", async (full) => {
+  // SUPERSEDED-BY-FAIL-CLOSED: the old test asserted ENOENT for the copy holding "innocent.txt".
+  // That valid unsaved file is now retained; the symlink is still never saved.
+  it.each([false, true])("SUPERSEDED-BY-FAIL-CLOSED: rejects symlinks without saving any part of the tree, preserving an existing full-storage warning: %s", async (full) => {
     if (full) await sparseFile(path.join(root, "full.bin"), MAX_AGENT_FILE_BYTES);
     const copy = await run();
     await fs.writeFile(path.join(copy.localRoot, "innocent.txt"), "changed");
@@ -1176,7 +1305,7 @@ describe("persistent agent directories", () => {
     expect(result?.errorCode).toBe("AGENT_FILES_SAVE_FAILED");
     expect(result?.receipt?.storageWarning).toBe(copy.receipt?.storageWarning);
     if (full) expect(result?.receipt?.storageWarning).toContain("Agent storage is full");
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(path.join(copy.localRoot, "innocent.txt"), "utf8")).toBe("changed");
     await expect(fs.stat(path.join(root, "innocent.txt"))).rejects.toMatchObject({ code: "ENOENT" });
   }, 30_000);
 
@@ -1325,16 +1454,19 @@ describe("persistent agent directories", () => {
     await fs.rm(path.join(copy.localRoot, "escape"));
     expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
   });
-  it("rejects over-quota warm changes without replacing saved bytes, then permits a clean future run", async () => {
+  // SUPERSEDED-BY-FAIL-CLOSED: the old test asserted the warm directory was deleted
+  // (ENOENT) after an over-quota stopped save. It now asserts the source is held.
+  it("SUPERSEDED-BY-FAIL-CLOSED: rejects over-quota warm changes without replacing saved bytes, retains them, then permits a clean future run", async () => {
     const copy = await run({ warm: true });
     const handle = await fs.open(path.join(copy.localRoot, "too-large.bin"), "w");
     await handle.truncate(MAX_AGENT_FILE_BYTES + 1); await handle.close();
     expect((await copies.checkpointWarm({ companyId, runId: copy.runId }))?.errorCode).toBe("AGENT_FILES_CHECKPOINT_UNSTABLE");
     const stopped = (await copies.collectStopped({ companyId, runId: copy.runId }))!;
-    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED" });
+    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
     expect(stopped.receipt?.storageWarning).toContain("Agent storage is full");
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.stat(path.join(copy.localRoot, "too-large.bin"))).size).toBe(MAX_AGENT_FILE_BYTES + 1);
+    expect(agentFileSaveHeld(stopped)).toBe(true);
     expect(await run({ warm: true })).toBeTruthy();
   });
   // RED for smarty-dev#20814 (b13): a low-trust run that changed nothing must not be asked for write authority.
