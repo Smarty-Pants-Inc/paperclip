@@ -1,8 +1,12 @@
 // Person-facing Stop / saved-work copy lives here together. A cancelled run
 // is not itself a held conversation: only the standing prior-owner notice is.
-// Task Retry does not bypass that owner fence, so HELD names only a new task.
-export const HELD_PREDECESSOR_NOTICE = "Your message and saved work are kept, but this conversation cannot continue. Assign this agent a new task to continue.";
-export const HELD_RECOVERED_WORK_MESSAGE = "Saved work recovered, but this conversation cannot continue. Assign this agent a new task to continue.";
+// follow-Paperclip Cut B R8 (PV2, judged): a held notice never withholds
+// Retry; Retry rotates a held conversation onto a fresh thread that carries its
+// history (retry-fresh). The notice names that same single action, never
+// "send a new message" or "assign a new task" beside an offered Retry.
+export const HELD_RETRY_ACTION = "Press Retry to continue in a fresh run with this conversation's history.";
+export const HELD_PREDECESSOR_NOTICE = `Your message and saved work are kept, but the previous run of this conversation did not finish. ${HELD_RETRY_ACTION}`;
+export const HELD_RECOVERED_WORK_MESSAGE = `Saved work recovered, but the previous run of this conversation did not finish. ${HELD_RETRY_ACTION}`;
 export const STOPPED_TASK_RETRY_MESSAGE = "This task was stopped and its saved work is kept. Press Retry to run it again, or assign this agent a new task.";
 // Also used when task Retry's target is closed, unassigned or superseded.
 export const STOPPED_TASK_NEW_TASK_MESSAGE = "This task was stopped and its saved work is kept. Assign this agent a new task to continue.";
