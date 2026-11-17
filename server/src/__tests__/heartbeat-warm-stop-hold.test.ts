@@ -262,9 +262,12 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
       const r = await stopThenMessage({ warm: true, messageDelay });
       // No native-workspace:<run> recovery hold for the stopped warm turn.
       expect.soft(r.hold).toEqual([]);
-      // The warm box is not stopped: the lease is never released stop_and_retain.
-      expect.soft(r.release).not.toHaveBeenCalledWith(expect.objectContaining({ providerResourceDisposition: "stop_and_retain" }));
-      expect.soft(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "keep_running" }));
+      // Upstream's Stop shape (paperclipai/paperclip master run-control.ts:228-234):
+      // a person's Stop is not a warm handoff. The stopped run's own release asks
+      // the provider to stop and retain the box, so the stop receipt comes with
+      // this teardown, not with the warm-window expiry (~444 s).
+      expect.soft(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "stop_and_retain" }));
+      expect.soft(r.release).not.toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "keep_running" }));
       expect.soft(r.lease).not.toMatchObject({ leasePolicy: "retain_on_failure" });
       // Exactly one run for the message, and it reached the executor (one provider turn).
       expect.soft(r.messageRuns).toHaveLength(1);
@@ -294,7 +297,7 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
       expect(r.windowLease).toMatchObject({ status: "active", leasePolicy: "reuse_by_environment" });
       expect.soft(r.windowHold).toEqual([]);
       expect.soft(r.hold).toEqual([]);
-      expect.soft(r.release).not.toHaveBeenCalledWith(expect.objectContaining({ providerResourceDisposition: "stop_and_retain" }));
+      expect.soft(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "stop_and_retain" }));
       expect.soft(r.lease).not.toMatchObject({ leasePolicy: "retain_on_failure" });
       expect.soft(r.messageRuns).toHaveLength(1);
       expect.soft(r.messageRuns[0]?.errorCode).not.toBe("execution_reconciliation_required");
