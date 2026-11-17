@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, PENDING_WAIT_START_BOUND_MS, unansweredCardAnswerSql } from "../person-message-answer.js";
+import { completedPersonMessageAnswerSql, PENDING_WAIT_START_BOUND_MS, unansweredCardAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -209,15 +209,17 @@ export function unansweredMessageCode(run: { status: string; error: string | nul
 const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorizationReason'`;
 
 /**
- * SQL: an agent answer ATTRIBUTED to message m, the Paperclip way: a reply
- * written by a run on the chain carrying m or a later person input. Fresh
- * continuations and answered-interaction resumes need not copy comment ids.
- * A run-less comment, shared session or unrelated later run is not an answer.
+ * SQL: message m is ANSWERED (completedPersonMessageAnswerSql): a COMPLETED
+ * run's final reply, attributed only through that run's OWN pending input
+ * (RFL F2 22:41Z), a card from such a run, or imported history. A failed or
+ * cut run's progress reply is DELIVERED only and owes ONE true notice (RFL F1,
+ * 21:28Z). A run-less comment, shared session or unrelated later run is not an answer.
  */
 function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
   // The ONE shared definition (person-message-answer.ts), so B's notice and the continuation carry never
   // disagree on a message (RFL 20:22Z: run-less agent comments never answer; org 20:29Z: imported history).
-  return answeredPersonMessageSql(m);
+  // No run-status rule of its own here: ANSWERED already requires the completed final answer.
+  return completedPersonMessageAnswerSql(m);
 }
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
@@ -297,7 +299,7 @@ function cardAnswerNoticeAnsweredSql(companyId: SQL, issueId: SQL, reason: SQL):
   return sql`(starts_with(${reason}, ${UNANSWERED_MESSAGE_REASON_PREFIX}) and exists (select 1 from ${issueThreadInteractions} ca
     where ca.company_id = ${companyId} and ca.issue_id = ${issueId} and ca.resolved_at is not null
       and ca.id::text = substr(${reason}, ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-      and ${answeredPersonMessageSql({ id: sql`ca.id`, companyId: sql`ca.company_id`, issueId: sql`ca.issue_id`,
+      and ${completedPersonMessageAnswerSql({ id: sql`ca.id`, companyId: sql`ca.company_id`, issueId: sql`ca.issue_id`,
         createdAt: sql`ca.resolved_at` })}))`;
 }
 
