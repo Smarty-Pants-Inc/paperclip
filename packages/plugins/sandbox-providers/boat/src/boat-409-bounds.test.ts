@@ -31,15 +31,7 @@ function fakeBoat(handle: Handler = () => undefined, initial = "archived") {
     if (method === "POST" && route === `/sandboxes/${id}/resume`) n.resume++;
     if (method === "POST" && route === `/sandboxes/${id}/commands`) n.commands++;
     const scripted = await handle(call, n);
-    if (scripted) {
-      // F-04C: archive recovery verifies GET state before resume, rather than
-      // trusting a command refusal alone. Model that actual provider transition.
-      if (route.endsWith("/commands") && scripted.status === 409) {
-        const refused = await scripted.clone().json();
-        if (refused.state === "archived") state = "archived";
-      }
-      return scripted;
-    }
+    if (scripted) return scripted;
     if (method === "POST" && route === `/sandboxes/${id}/resume`) { state = "ready"; return json({ sandbox: { id, state } }); }
     if (method === "POST" && route === `/sandboxes/${id}/stop`) { state = "archived"; return json({ operation: { id: "stop", status: "completed" } }); }
     if (method === "GET" && route === `/sandboxes/${id}`) return json({ sandbox: { id, state, expiresAt: "2030-01-01T00:00:00Z", ...(state === "archived" ? { stop: { id: "stop", status: "completed" } } : {}) } });
@@ -52,12 +44,8 @@ function fakeBoat(handle: Handler = () => undefined, initial = "archived") {
   return { calls, n, after, setState: (next: string) => { state = next; } };
 }
 const resumeLease = (s = scope) => plugin.definition.onEnvironmentResumeLease!({ ...s, providerLeaseId: id } as any);
-const userExecute = (s = scope) =>
-  plugin.definition.onEnvironmentExecute!({ ...s, lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000 } as any);
-// Explicit repeatable probe; F-04D also recovers general execute after not-run
-// refusals. This probe's signal is 35 s; its call budget remains 30 s.
-const execute = (s = scope) =>
-  plugin.definition.onEnvironmentRealizeWorkspace!({ ...s, lease: { providerLeaseId: id }, workspace: { remotePath: "/home/user/bounds" } } as any);
+const execute = (s = scope, extra: Record<string, unknown> = {}) =>
+  plugin.definition.onEnvironmentExecute!({ ...s, lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000, ...extra } as any);
 const stopHooks = ["onEnvironmentStopLease", "onEnvironmentReleaseLease", "onEnvironmentDestroyLease"] as const;
 const stop = (hook: typeof stopHooks[number], s = scope) => (plugin.definition as any)[hook]({ ...s, providerLeaseId: id, cancelActiveWork: true });
 const conflict = (code: string, state: string, headers: Record<string, string> = {}) => json({ code, state, retryable: code === "sandbox_starting" }, 409, headers);
@@ -180,14 +168,13 @@ describe("F-01 an in-flight 409 recovery never sends after our own completed sto
     expect(outcome).toMatchObject({ status: 409, boatCode: "sandbox_starting" });
   });
   it("STOP-MARK our stop forgets our resume: a later not-ready 409 under another lease scope never wakes the box", async () => {
-    // Only the stop mark (stopSandbox deleting our resume) defends this legacy
-    // error-state recovery: the other scope's admission is open after the stop.
-    // F-04C archive-state user commands never resume at all (new R2).
-    const boat = fakeBoat((call, n) => call.route.endsWith("/commands") && n.commands === 1 ? conflict("machine_not_running", "error") : undefined);
+    // Only the stop mark (stopSandbox deleting our resume) defends this: the other
+    // scope's admission is open and its call starts after the stop.
+    const boat = fakeBoat((call, n) => call.route.endsWith("/commands") && n.commands === 1 ? conflict("machine_not_running", "archived") : undefined);
     await resumeLease();
     await expect(stop("onEnvironmentStopLease")).resolves.toMatchObject({ state: "stopped" });
     const stopped = boat.calls.length;
-    const error = await userExecute(otherScope).catch(e => e);
+    const error = await execute(otherScope).catch(e => e);
     expect(error).toMatchObject({ status: 409, boatCode: "machine_not_running" });
     expect(boat.after(stopped, "POST", "/resume")).toBe(0);
     expect(boat.after(stopped, "POST", "/commands")).toBe(1);
@@ -207,7 +194,7 @@ describe("F-02 the recovery resume is one send inside the call's 3-send cap", ()
     expect(boat.n.resume).toBe(2);
     expect(boat.n.commands).toBe(1);
   });
-  it("F-02 a starting recovery uses resume plus resend: a second 409 cannot resume again", async () => {
+  it("F-02 the recovery resume counts as a send: after a starting resend there is no room for resume plus retry", async () => {
     const boat = fakeBoat((call, n) => {
       if (call.route.endsWith("/commands") && n.commands === 1) return conflict("sandbox_starting", "provisioned");
       if (call.route.endsWith("/commands") && n.commands === 2) return conflict("machine_not_running", "archived");
@@ -216,9 +203,8 @@ describe("F-02 the recovery resume is one send inside the call's 3-send cap", ()
     await resumeLease();
     const error = await execute().catch(e => e);
     expect(error).toMatchObject({ status: 409, boatCode: "machine_not_running" });
-    // One explicit resume + one recovery resume. The command call used all
-    // three sends (command/resume/command), with no room for another recovery.
-    expect(boat.n.resume).toBe(2);
+    // One explicit resume; the command call itself used 2 sends and had no room for 2 more.
+    expect(boat.n.resume).toBe(1);
     expect(boat.n.commands).toBe(2);
   });
 });
@@ -247,7 +233,7 @@ describe("F-03-R no send after a late Boat response crosses the call's 30 s budg
     });
     await resumeLease();
     const start = Date.now(), firstCall = boat.calls.length;
-    const work = execute(scope).catch(e => e);
+    const work = execute(scope, { timeoutMs: 120_000 }).catch(e => e);
     await vi.advanceTimersByTimeAsync(heldMs + 2_100);
     const outcome = await work;
     const sends = boat.calls.slice(firstCall);
@@ -269,14 +255,14 @@ describe("F-03 no wait crosses the call's own budget (min of the 30 s deadline a
       }
       return undefined;
     }, "provisioned");
-    const work = execute(scope).catch(e => e);
+    const work = execute(scope, { timeoutMs: 120_000 }).catch(e => e);
     await vi.advanceTimersByTimeAsync(heldMs + 5_000);
     const outcome = await work;
     expect(boat.n.commands).toBe(1);
     expect(outcome).toMatchObject({ status: 409, boatCode: "sandbox_starting" });
     expect(boat.calls.filter(c => c.at - start > 30_000)).toEqual([]);
   });
-  it("F-03 the recovery's ready wait ends at the call's 30 s budget, not at the probe's 35 s signal", async () => {
+  it("F-03 the recovery's ready wait ends at the call's 30 s budget, not at the longer command signal", async () => {
     // A clock that Boat's answers move forward: the command is held 29 s, and each
     // ready poll then takes 10 s. Nothing may be sent past 30 s after the call began.
     let offset = 0; const realNow = Date.now.bind(Date);
@@ -290,7 +276,7 @@ describe("F-03 no wait crosses the call's own budget (min of the 30 s deadline a
     });
     await resumeLease();
     const start = Date.now();
-    const outcome = await execute(scope).catch(e => e);
+    const outcome = await execute(scope, { timeoutMs: 120_000 }).catch(e => e);
     expect(outcome).toMatchObject({ status: 409, boatCode: "machine_not_running" });
     expect(boat.calls.filter(c => c.at - start > 30_000)).toEqual([]);
     expect(boat.n.commands).toBe(1);
