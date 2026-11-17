@@ -16,6 +16,19 @@ export function hasWorkspaceRestoreFailure(result: Record<string, unknown> | nul
   return WORKSPACE_RESTORE_FAILURE_CODES.some((code) => result?.workspaceRestoreFailure === code);
 }
 
+/** Sibling key the server's restore-hold authority writes beside
+ * workspaceRestoreFailure (run resultJson and hold evidence) while the files are
+ * only owed: no restore has been tried or has failed yet. A recorded real
+ * failure clears it. The raw failure value stays as-is for DB predicates. */
+export const WORKSPACE_RESTORE_PENDING_KEY = "workspaceRestorePending";
+/** The one wording for owed files, shared by the server hold and the UI. */
+export const WORKSPACE_RESTORE_RECOVERING_TEXT = "Recovering your saved work; your message is kept and runs when it's back.";
+
+/** True only when the restore marker is set and the server recorded the files as only owed. */
+export function isWorkspaceRestorePending(result: Record<string, unknown> | null | undefined): boolean {
+  return hasWorkspaceRestoreFailure(result) && result?.[WORKSPACE_RESTORE_PENDING_KEY] === true;
+}
+
 /** Display only ordinary repository paths, never targets, host paths or temp IDs. */
 export function safeWorkspaceRestorePath(value: unknown): string | null {
   if (typeof value !== "string" || value.length > 180) return null;

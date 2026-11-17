@@ -10,7 +10,7 @@ import {
   recordIssueDetailReadiness,
 } from "@/lib/issue-detail-performance";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
-import { workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
+import { workspaceRestoreMarker, workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
 import { credentialAccessNotice } from "@/lib/credential-access-notice";
 import type { ActivityEvent, Issue, IssueQueuedCommentQueue, TaskBrowser } from "@paperclipai/shared";
 import { useProjectCreatedItems } from "@/hooks/useProjectCreatedItems";
@@ -1990,6 +1990,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
             ? "You can retry this message now."
             : "Your message is preserved.";
         const restoreFailed = hasWorkspaceRestoreFailure(meta?.resultJson);
+        const restoreMarker = restoreFailed ? workspaceRestoreMarker(meta?.resultJson) : null;
         const branchUnavailable = (meta?.resultJson?.configurationIncomplete as Record<string, unknown> | undefined)?.reason === "workspace_base_ref_unresolved";
         const savedPlan = Boolean(planDocument && (meta?.resultJson?.savedPlanRevisionId === planDocument.latestRevisionId || interactions?.some((interaction) =>
           interaction.sourceRunId === source.id && interactionTargetsPlanRevision(interaction, planDocument),
@@ -2021,11 +2022,11 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
             id,
             kind: "marker",
             variant: "interrupted",
-            label: branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : source.status === "cancelled" ? (meta?.startedAt ? "Stopped" : "Couldn't start") : "Run failed",
+            label: branchUnavailable ? "Starting branch unavailable" : restoreMarker ? restoreMarker.label : aiRequest?.status === "pending" ? "AI connection needed" : source.status === "cancelled" ? (meta?.startedAt ? "Stopped" : "Couldn't start") : "Run failed",
             runId: source.status === "cancelled" ? undefined : source.id,
             ...(branchUnavailable || aiRequest?.status === "pending" ? { retryable: false } : {}),
             ...(restoreFailed ? {
-              retryable: meta?.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive"
+              retryable: !restoreMarker?.pending && meta?.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive"
                 && meta?.resultJson?.workspaceRestoreFailure !== "restore_invalid_metadata",
               collapsible: true,
               runHref: meta?.agentId ? `/agents/${encodeURIComponent(agentMap?.get(meta.agentId)?.urlKey ?? meta.agentId)}/runs/${encodeURIComponent(source.id)}` : undefined,
@@ -2036,7 +2037,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
               retryable: false,
               runHref: `/agents/${encodeURIComponent(meta?.agentId ?? "")}/runs/${encodeURIComponent(source.id)}`,
             } : {}),
-            tone: source.status === "cancelled" || aiRequest?.status === "pending" ? "neutral" : "error",
+            tone: source.status === "cancelled" || aiRequest?.status === "pending" || restoreMarker?.tone === "neutral" ? "neutral" : "error",
             detail,
           },
         });
