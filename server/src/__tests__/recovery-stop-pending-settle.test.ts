@@ -89,12 +89,15 @@ describeEmbeddedPostgres("Stop-pending settles independently of the claim-releas
     expect(await f.notes()).toHaveLength(0);
   });
 
-  it("a held conversation's settled Stop names only the new-task action, never Retry or a new message", async () => {
+  // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z; follow-Paperclip Cut B R8): a held
+  // conversation never withholds Retry, so its settled Stop says the Retry note.
+  it("supersedes: a held conversation's settled Stop names only the new-task action, never Retry or a new message", async () => {
     const f = await fixture(true);
     await release(f);
     await f.recovery.reconcileActiveRecoveryActions({ companyId: f.companyId });
     expect(await f.notes()).toHaveLength(1);
-    expect((await f.notes())[0].body).toBe(heldNote);
+    expect((await f.notes())[0].body).toBe(retryNote);
+    expect((await f.notes())[0].body).not.toBe(heldNote);
   });
 
   it.each(["done", "cancelled"])("a terminal %s task settles Stop but does not promise a Retry that its route rejects", async status => {

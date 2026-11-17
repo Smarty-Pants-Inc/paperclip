@@ -5,7 +5,7 @@ import { executionBlockerPredicate, NEW_TASK_CONTINUE_ACTION, restoreHoldPredica
 import { WORKSPACE_RESTORE_PENDING_KEY, workspaceRestoreHoldNextAction } from "./legacy-execution-recovery.js";
 import {
   AGENT_PAUSED_ACTION, AGENT_PAUSED_RETRY_MESSAGE, AUTOMATIC_RECOVERY_MESSAGE, HELD_PREDECESSOR_NOTICE,
-  HELD_RECOVERED_WORK_MESSAGE, HELD_RETRY_ACTION, NEW_TASK_ACTION, NO_SAVED_WORK_NEW_TASK_MESSAGE, NO_SAVED_WORK_RETRY_ACTION, NO_SAVED_WORK_RETRY_MESSAGE,
+  HELD_NEW_TASK_MESSAGE, HELD_RECOVERED_NEW_TASK_MESSAGE, HELD_RECOVERED_WORK_MESSAGE, HELD_RETRY_ACTION, NEW_TASK_ACTION, NO_SAVED_WORK_NEW_TASK_MESSAGE, NO_SAVED_WORK_RETRY_ACTION, NO_SAVED_WORK_RETRY_MESSAGE,
   RECOVERED_WORK_CONTINUE_MESSAGE, RECOVERED_WORK_MESSAGE, RECOVERED_WORK_RETRY_ACTION, RECOVERED_WORK_RETRY_MESSAGE,
   RETRY_STOP_UNPROVEN_ACTION, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_WAIT_ACTION, RETRY_STOP_WAIT_MESSAGE, SEND_MESSAGE_ACTION,
   STOPPED_TASK_NEW_TASK_MESSAGE, STOPPED_TASK_RETRY_ACTION, STOPPED_TASK_RETRY_MESSAGE,
@@ -130,6 +130,11 @@ export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority
     if (recovered) return decision("retry", "retry", RECOVERED_WORK_RETRY_MESSAGE, RECOVERED_WORK_RETRY_ACTION);
     return decision("retry", "retry", null, null);
   }
+  // Retry refused for its own reason on a run that is not Retry's source (a
+  // stopped, not failed, run): the held thread's one action is a new task. A
+  // failed run's transcript keeps its status-only words (upstream's projection).
+  if (held && facts.runStatus !== "failed" && facts.runStatus !== "timed_out") return decision("new_task", "conversation_held", facts.stoppedBeforeWork ? NO_SAVED_WORK_NEW_TASK_MESSAGE
+    : facts.stopKind ? STOPPED_TASK_NEW_TASK_MESSAGE : recovered ? HELD_RECOVERED_NEW_TASK_MESSAGE : HELD_NEW_TASK_MESSAGE, NEW_TASK_ACTION);
   if (facts.stoppedBeforeWork) return decision("new_task", "retry_unavailable", NO_SAVED_WORK_NEW_TASK_MESSAGE, NEW_TASK_ACTION);
   if (facts.stopKind) return decision("new_task", "retry_unavailable", STOPPED_TASK_NEW_TASK_MESSAGE, NEW_TASK_ACTION);
   if (recovered) return facts.runStatus === "failed" || facts.runStatus === "timed_out"
