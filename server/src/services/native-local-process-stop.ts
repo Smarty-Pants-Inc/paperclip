@@ -13,11 +13,8 @@ import { currentProcessSpaceHash, UNKNOWN_PROCESS_SPACE } from "./controller-pro
 import { NATIVE_SESSION_PROVIDER_EVENT_TYPES } from "./native-runtime/native-session-resume.js";
 import { proveOwnerGone } from "./owner-proof.js";
 
-import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-process-start-events.js";
-export { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED };
-/** Server-authored: the runner-state fence refused this run before it asked for
- * a runner, because a prior run's saved state could not be proven finished. */
-export const PRIOR_OWNER_FENCE_REFUSED = "native.prior_owner_fence_refused";
+import { PRIOR_OWNER_FENCE_REFUSED, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-process-start-events.js";
+export { PRIOR_OWNER_FENCE_REFUSED, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED };
 const LOCAL_PROCESS_STOPPED = "native.local_process_stopped";
 const SETTLED_RUN_STATUSES = ["failed", "cancelled", "timed_out", "interrupted"];
 const SETTLED_COORDINATOR_PHASES = ["committed", "terminal_failure"];

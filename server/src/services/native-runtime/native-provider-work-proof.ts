@@ -4,6 +4,7 @@ import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/com
 import type { EnvironmentRuntimeService, EnvironmentDriverExecuteInput } from "../environment-runtime.js";
 import { hasNativeExecutionStartEvidence } from "./native-restart-recovery.js";
 import { hasNativePreDispatchFailureRecord } from "../heartbeat/run-failure-cause.js";
+import { PRIOR_OWNER_FENCE_REFUSED } from "../native-process-start-events.js";
 /** Durable run events that prove a provider session did work in a run. */
 export const NATIVE_PROVIDER_DURABLE_EVENT_TYPES = new Set([
   "harness.ready", "session.started", "session.resumed", "session.updated",
@@ -69,6 +70,42 @@ export async function canBypassFailedNativePredecessor(db: ProofDb, input: {
   if (!row.owner || row.owner.phase !== "terminal_failure" || row.owner.leaseOwner !== null || row.owner.leaseExpiresAt !== null) return false;
   return (FAILED_PREDECESSOR_P1_ENABLED && await predecessorGenerationLost(db, row.run, input.predecessorEnvironmentRuntime))
     || await terminalCompleteWithoutExecutionStart(db, row.run); // P1 OR P2
+}
+
+/** The runner-state fence refused THIS attempt before it asked for, or attached
+ * to, any runner: both writers of PRIOR_OWNER_FENCE_REFUSED
+ * (native-session-executor recordPriorOwnerFenceRefusal) throw right after it.
+ * Unlike P2 this is affirmative evidence about this attempt, written by the
+ * fence itself, so a carried run's process cannot have been adopted by it, and
+ * the attempt never owned a controller checkpoint or recovery pointer. Any own
+ * process identity, launch/identity/sourced/tool-start event, provider work,
+ * controller checkpoint, result, coordinator claim or live lease contradicts
+ * it and keeps the run held. Reads only; writes nothing. */
+export async function refusedAtPriorOwnerFenceBeforeLaunch(db: ProofDb, input: {
+  companyId: string; runId: string;
+}): Promise<boolean> {
+  const [row] = await db.select({ run: heartbeatRuns, owner: nativeRunFinalizations })
+    .from(heartbeatRuns).leftJoin(nativeRunFinalizations, and(
+      eq(nativeRunFinalizations.runId, heartbeatRuns.id)))
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
+  if (!row || !row.owner || row.run.runtimeMode !== "native" || row.run.status !== "failed" || !row.run.finishedAt
+    || row.run.processPid !== null || row.run.processGroupId !== null || row.run.processStartedAt !== null
+    || row.owner.companyId !== row.run.companyId || row.owner.issueId !== row.run.nativeIssueId
+    || row.owner.phase !== "terminal_failure" || row.owner.leaseOwner !== null || row.owner.leaseExpiresAt !== null
+    || row.owner.resultId !== null || row.owner.controllerPid !== null || row.owner.controllerBootId !== null) return false;
+  const profile = row.run.runnerProfileJson as Record<string, unknown> | null;
+  const recovery = row.run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
+  if (profile?.nativeControllerRecovery != null || recovery?.providerWorkStarted === true) return false;
+  const [evidence] = await db.select({
+    fenced: sql<boolean>`exists (select 1 from ${heartbeatRunEvents} event where event.company_id = ${row.run.companyId}
+      and event.run_id = ${row.run.id} and event.event_type = ${PRIOR_OWNER_FENCE_REFUSED}
+      and event.source_event_id is null and event.source_instance_id is null)`,
+    checkpoint: sql<boolean>`exists (select 1 from ${nativeRunnerCheckpoints} checkpoint
+      where checkpoint.company_id = ${row.run.companyId} and checkpoint.run_id = ${row.run.id})`,
+  }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, row.run.companyId), eq(heartbeatRuns.id, row.run.id)));
+  if (!evidence?.fenced || evidence.checkpoint) return false;
+  if (await hasNativeExecutionStartEvidence(db, row.run)) return false;
+  return provesNoNativeRunProviderWork(db, { companyId: row.run.companyId, runId: row.run.id });
 }
 
 /** The failure owner records this only when its dispatch gate was explicitly

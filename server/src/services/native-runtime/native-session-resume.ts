@@ -9,7 +9,7 @@ import type {
   PersistedNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
 import { canonicalNativeRuntimeContextDigest, parseNativeExecutionInput, type NativeRuntimeContextSnapshot } from "../../vendor/paperclip-runner/index.js";
-import { canBypassFailedNativePredecessor, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
+import { canBypassFailedNativePredecessor, refusedAtPriorOwnerFenceBeforeLaunch, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 
 export type NativeToolExecutionTargetKind = "local" | "remote";
 
@@ -334,8 +334,13 @@ async function isUnstartedInheritedFollowUp(
       evidence.controllerCheckpoint || evidence.result || evidence.processStart) return false;
   const bootstrap = noProcess && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false && evidence.controllerPid === null;
   if (!bootstrap && !(piRecovery && (noProcess || evidence.inheritedProcess))) return false;
-  return canBypassFailedNativePredecessor(db, { companyId: input.companyId, runId: run.id,
-    predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime });
+  // A run the prior-owner fence refused inherited this checkpoint but never
+  // owned a runner or its recovery pointer: not a progress barrier. The
+  // caller still requires the source it walks back to to cover the same
+  // inherited checkpoint, and stops at the first attempt without either proof.
+  return await canBypassFailedNativePredecessor(db, { companyId: input.companyId, runId: run.id,
+    predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime })
+    || await refusedAtPriorOwnerFenceBeforeLaunch(db, { companyId: input.companyId, runId: run.id });
 }
 
 async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResumeSelection, skippedRunIds: string[]) {
