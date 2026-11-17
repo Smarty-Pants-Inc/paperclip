@@ -1100,8 +1100,29 @@ subscribeRunStartHandoverChanges(() => {
  */
 export const warmSessionReleaseWait = { timeoutMs: 30_000, pollMs: 25 };
 
-async function waitForWarmNativeSessionSettled(scope: string): Promise<void> {
-  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+/** settle-sites: ONE own-predecessor settle deadline per successor run.
+ * Every site where a successor joins its own predecessor's release (the
+ * instruction-directory join in heartbeat preparation, the superseded-owner
+ * wait, the Stop-command wait) reads the deadline the first of them derived,
+ * so sequential waits never exceed warmSessionReleaseWait in total. Memory
+ * only, never inside a database transaction. An entry is dropped one further
+ * bound after it expired, so a later attempt of the same run starts afresh. */
+const ownPredecessorSettleDeadlines = new Map<string, number>();
+export function ownPredecessorSettleDeadline(successorRunId: string): number {
+  const now = Date.now();
+  for (const [runId, expiresAt] of ownPredecessorSettleDeadlines) {
+    if (expiresAt + warmSessionReleaseWait.timeoutMs < now) ownPredecessorSettleDeadlines.delete(runId);
+  }
+  let deadline = ownPredecessorSettleDeadlines.get(successorRunId);
+  if (deadline === undefined) {
+    deadline = now + warmSessionReleaseWait.timeoutMs;
+    ownPredecessorSettleDeadlines.set(successorRunId, deadline);
+  }
+  return deadline;
+}
+
+async function waitForWarmNativeSessionSettled(scope: string,
+  deadline = Date.now() + warmSessionReleaseWait.timeoutMs): Promise<void> {
   // Wait while the owner's turn is over and it is releasing the session, until
   // it has handed every scope back (its execution's final cleanup), so the
   // follow-up's own admission does not meet the old owner's scopes either.
@@ -1120,8 +1141,8 @@ async function waitForWarmNativeSessionSettled(scope: string): Promise<void> {
 /** Waits, within warmSessionReleaseWait, while the previous turn's owner is
  * still releasing (busy without a successor's claim, settling or closing). A
  * session still busy at the deadline fails its caller as before. */
-async function waitForWarmNativeSessionRelease(scope: string, entry: WarmNativeSession): Promise<void> {
-  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+async function waitForWarmNativeSessionRelease(scope: string, entry: WarmNativeSession,
+  deadline = Date.now() + warmSessionReleaseWait.timeoutMs): Promise<void> {
   while (Date.now() < deadline && (settlingNativeSessionScopes.has(scope)
     || (warmNativeSessions.get(scope) === entry && entry.busy && !entry.preparingRunId))) {
     await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
@@ -1223,8 +1244,10 @@ export async function reserveWarmNativeInstructionDirectory(input: {
     // busy until its finishRelease in that run's final cleanup. Wait it out
     // once, bounded like claimWarmNativeInstructionCopy's wait, then re-read.
     // Another run's claim (preparingRunId) is a real concurrent owner.
+    // settle-sites S072: this join spends the successor's one own-predecessor
+    // settle deadline (ownPredecessorSettleDeadline), not a fresh bound.
     if (!releaseWaited && !entry.preparingRunId && (entry.busy || settlingNativeSessionScopes.has(id) || closingWarmNativeSessions.has(id))) {
-      await waitForWarmNativeSessionRelease(id, entry);
+      await waitForWarmNativeSessionRelease(id, entry, ownPredecessorSettleDeadline(input.runId));
       return reserveWarmNativeInstructionDirectory(input, true);
     }
     if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
