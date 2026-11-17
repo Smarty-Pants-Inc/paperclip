@@ -52,6 +52,7 @@ vi.mock("../services/environment-runtime.js", async importOriginal => {
     options: Parameters<typeof actual.environmentRuntimeService>[1]) => actual.environmentRuntimeService(db,
       { ...options, drivers: allocation.drivers ?? options?.drivers }) };
 });
+// legacy, not gated (RFL SUPERSEDE-H5-HELD-PREFIX-1117)
 const enabled = process.env.PAPERCLIP_PI_LEASE_E2E === "1";
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
   ? value as Record<string, unknown> : {};

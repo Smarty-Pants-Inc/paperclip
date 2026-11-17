@@ -56,6 +56,7 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 // heartbeat-warm-lease-failure.test.ts. No production module is mocked.
 // Existing lifecycle: doc/DEVELOPING.md:3129-3137.
 const WARM_IDLE_MS = 4_000;
+// legacy, not gated (RFL SUPERSEDE-H5-HELD-PREFIX-1117)
 const enabled = process.env.PAPERCLIP_PI_LEASE_E2E === "1";
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
   ? value as Record<string, unknown> : {};
