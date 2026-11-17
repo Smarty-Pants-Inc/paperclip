@@ -1,5 +1,5 @@
 import { sql, type SQL } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues } from "@paperclipai/db";
 import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
@@ -9,10 +9,14 @@ export const COMPANY_IMPORTED_ACTION = "company.imported";
 
 type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
 
+// A person input is a typed message (a comment id) or a person's answer to an
+// agent's card (the interaction id): its answer-resume run carries it as
+// context.interactionId (routes/issues.ts wake contexts). Ids never collide.
 function carriesCommentSql(alias: string, commentId: SQL): SQL {
   const context = sql`${sql.identifier(alias)}.context_snapshot`;
   return sql`(${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
     or ${context}->>'conversationReplyBoundaryCommentId' = ${commentId}::text
+    or ${context}->>'interactionId' = ${commentId}::text
     or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
     or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text)`;
 }
@@ -51,10 +55,13 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
     join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
     where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
       and a.created_at > ${m.createdAt}
-      and exists (select 1 from ${issueComments} b
+      and (exists (select 1 from ${issueComments} b
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
           and (b.id = ${m.id} or b.created_at > ${m.createdAt})
-          and ${chainCarriesCommentSql("r", sql`b.id`, m)}))
+          and ${chainCarriesCommentSql("r", sql`b.id`, m)})
+        -- A card answer is an input with no comment row: its own chain carries it.
+        or (not exists (select 1 from ${issueComments} own where own.id::text = ${m.id}::text)
+          and ${chainCarriesCommentSql("r", m.id, m)})))
     or exists (select 1 from ${issueThreadInteractions} q
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
       where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId}
@@ -66,6 +73,30 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
         -- A card answers only inputs carried on its chain, never queued inputs by time.
         and ${chainCarriesCommentSql("r", m.id, m)})
     or ${importedPersonHistorySql(m)})`;
+}
+
+/** Card statuses a person's own answer leaves; administrative ends (withdraw,
+ * cancel, expiry) are not an answer and create no duty. */
+const CARD_ANSWER_STATUSES = ["answered", "accepted", "rejected"] as const;
+
+/** SQL over an issue_thread_interactions alias: a person's answer to an
+ * agent's card that started an answer-resume run and that no agent answered
+ * yet (a reply or a new card on that run's chain, after the answer). The SAME
+ * rule as a typed message (answeredPersonMessageSql), keyed by the card id and
+ * its answer time. It is an owed person input like a typed message. */
+export function unansweredCardAnswerSql(alias: string): SQL {
+  const q = sql.identifier(alias);
+  return sql`(${q}.resolved_by_user_id is not null and ${q}.resolved_at is not null
+    and ${q}.status in (${sql.join(CARD_ANSWER_STATUSES.map(status => sql`${status}`), sql`, `)})
+    and exists (select 1 from ${heartbeatRuns} resume where resume.company_id = ${q}.company_id
+      and (resume.native_issue_id = ${q}.issue_id or resume.context_snapshot->>'issueId' = ${q}.issue_id::text)
+      and resume.context_snapshot->>'interactionId' = ${q}.id::text)
+    -- An answer still being delivered to the agent is a pending attempt, not a silent one.
+    and not exists (select 1 from ${issueQuestionResponseDeliveries} delivery
+      where delivery.company_id = ${q}.company_id and delivery.interaction_id = ${q}.id
+        and delivery.status in ('pending', 'delivering'))
+    and not ${answeredPersonMessageSql({ id: sql`${q}.id`, companyId: sql`${q}.company_id`,
+      issueId: sql`${q}.issue_id`, createdAt: sql`${q}.resolved_at` })})`;
 }
 
 /** SQL: message m is a PERSON comment that arrived by a company import (see answeredPersonMessageSql). */

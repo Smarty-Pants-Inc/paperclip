@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, unansweredCardAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -8,6 +8,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -236,13 +237,41 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
           and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
+    or ${owedCardAnswerSql(sql`${companyId}`, sql`${issueId}`, since)}
     or exists (select 1 from ${issueComments} n
       join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and ${answeredSql(rawMessage("m"))}))`;
+      and ${answeredSql(rawMessage("m"))})
+    or exists (select 1 from ${issueComments} n
+      where n.company_id = ${companyId} and n.issue_id = ${issueId}
+      and n.author_type = 'system' and n.deleted_at is null
+      and ${cardAnswerNoticeAnsweredSql(sql`n.company_id`, sql`n.issue_id`, sql`n.metadata->>'authorizationReason'`)}))`;
+}
+
+/** SQL: the task has a person's card answer (unansweredCardAnswerSql) in the
+ * lookback, given after every typed message, that has no failure notice yet. */
+function owedCardAnswerSql(companyId: SQL, issueId: SQL, since: string): SQL {
+  return sql`exists (select 1 from ${issueThreadInteractions} ca
+    where ca.company_id = ${companyId} and ca.issue_id = ${issueId} and ca.resolved_at > ${since}::timestamptz
+      and not exists (select 1 from ${issueComments} later where later.company_id = ca.company_id
+        and later.issue_id = ca.issue_id and later.author_type = 'user' and later.deleted_at is null
+        and later.created_at > ca.resolved_at)
+      and ${unansweredCardAnswerSql("ca")}
+      and not exists (select 1 from ${issueComments} n where n.company_id = ca.company_id and n.issue_id = ca.issue_id
+        and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ca.id::text
+        and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))`;
+}
+
+/** SQL: a notice keyed by a card answer whose answer an agent has since given. */
+function cardAnswerNoticeAnsweredSql(companyId: SQL, issueId: SQL, reason: SQL): SQL {
+  return sql`(starts_with(${reason}, ${UNANSWERED_MESSAGE_REASON_PREFIX}) and exists (select 1 from ${issueThreadInteractions} ca
+    where ca.company_id = ${companyId} and ca.issue_id = ${issueId} and ca.resolved_at is not null
+      and ca.id::text = substr(${reason}, ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
+      and ${answeredPersonMessageSql({ id: sql`ca.id`, companyId: sql`ca.company_id`, issueId: sql`ca.issue_id`,
+        createdAt: sql`ca.resolved_at` })}))`;
 }
 
 /**
@@ -262,12 +291,16 @@ export function unansweredPersonMessageCommentCondition(): SQL {
         and n.issue_id = ${issueComments.issueId}
         and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
         and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
+    or (${issueComments.authorType} = 'user' and ${issueComments.deletedAt} is null
+      and ${owedCardAnswerSql(sql`${issueComments.companyId}`, sql`${issueComments.issueId}`, since)})
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and exists (select 1 from ${issueComments} m
+      and (exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-          and ${answeredSql(rawMessage("m"))})))`;
+          and ${answeredSql(rawMessage("m"))})
+        or ${cardAnswerNoticeAnsweredSql(sql`${issueComments.companyId}`, sql`${issueComments.issueId}`,
+          sql`${issueComments.metadata}->>'authorizationReason'`)})))`;
 }
 
 export type UnansweredMessageOutcome =
@@ -285,6 +318,8 @@ function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean
     ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
     ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : []),
     context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
+    // A card answer's answer-resume run (person-message-answer.ts carriesCommentSql).
+    context.interactionId,
   ];
   return ids.includes(messageId);
 }
@@ -336,9 +371,10 @@ export async function settleUnansweredPersonMessage(
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
-      and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
+      and (exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
-        and ${answeredSql(rawMessage("m"))})`);
+        and ${answeredSql(rawMessage("m"))})
+        or ${cardAnswerNoticeAnsweredSql(sql`n.company_id`, sql`n.issue_id`, sql`n.metadata->>'authorizationReason'`)})`);
   });
 
   const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
@@ -418,17 +454,31 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
 
-  const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
+  const [latestMessage] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
   // No age cut here: discovery (inScopeSql) decides which messages are in
   // scope, so an open obligation is never dropped silently by age.
-  if (!message) return { kind: "none" };
+  if (!latestMessage) return { kind: "none" };
+  let message = latestMessage;
   const [answer] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.id, message.id), answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
-  if (answer) return { kind: "answered" };
+  // The person's card answer after that message is their latest input, with
+  // the same duty (org 15:22Z option A): the same rule keyed by the card id and
+  // its answer time (unansweredCardAnswerSql), on the answer-resume chain.
+  let cardAnswer = false;
+  if (answer) {
+    const [owed] = await q.select({ id: issueThreadInteractions.id, createdAt: sql<Date>`${issueThreadInteractions.resolvedAt}` })
+      .from(issueThreadInteractions).where(and(eq(issueThreadInteractions.companyId, issue.companyId),
+        eq(issueThreadInteractions.issueId, issue.id), gt(issueThreadInteractions.resolvedAt, latestMessage.createdAt),
+        unansweredCardAnswerSql("issue_thread_interactions")))
+      .orderBy(desc(issueThreadInteractions.resolvedAt)).limit(1);
+    if (!owed) return { kind: "answered" };
+    message = { id: owed.id, createdAt: new Date(owed.createdAt) };
+    cardAnswer = true;
+  }
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await q.select({ id: issueComments.id,
     waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)`,
@@ -473,6 +523,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     && ["failed", "timed_out", "interrupted", "cancelled"].includes(latest.status)
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
       runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
+  // A card answer's duty is its answer-resume chain ending with every run
+  // failed. A chain that ended otherwise is outside this rule.
+  if (cardAnswer && run && run.status === "succeeded") return { kind: "answered" };
 
   // Every wait for a further attempt is BOUNDED, except a turn in progress:
   // T0 is recorded ONCE (durably, PENDING_WAIT_ACTION, keyed by the message
