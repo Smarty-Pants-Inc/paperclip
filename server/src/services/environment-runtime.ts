@@ -3930,11 +3930,12 @@ function createPluginEnvironmentDriver(
       driverKey, companyId: lease.companyId, environmentId, issueId: lease.issueId,
       config: driverConfig, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata ?? undefined,
     });
-    // Every recorded plugin destroy (also with the environment gone) and every
-    // pending teardown retry takes the destroy claim: refused (throws) before
-    // provider IO while a save hold, a collection pin or another destroy
-    // protects the allocation.
-    const receipt = destroying || claimDestroy ? await withLeaseDestroyClaim(db, lease, call) : await call();
+    // Every recorded plugin destroy (also with the environment gone), pending
+    // teardown retry and non-reusable release takes the destroy claim: release
+    // can erase the allocation too. Refuse (throw) before provider IO while a
+    // save hold, a collection pin or another destroy protects the allocation.
+    const receipt = destroying || claimDestroy || lease.leasePolicy !== "reuse_by_environment"
+      ? await withLeaseDestroyClaim(db, lease, call) : await call();
     const taskStopped = settled !== false ||
       (lease.metadata?.runnerTaskLease === true && lease.metadata?.runnerTaskDispatched !== true && !lease.metadata?.runnerTaskStartup && !lease.metadata?.runnerTaskStartupCleanup);
     return remoteTerminationReceipt(lease, receipt) ? receipt
