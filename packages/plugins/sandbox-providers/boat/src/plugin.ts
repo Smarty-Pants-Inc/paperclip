@@ -91,8 +91,11 @@ function activityKey(config: Config, id: string): string { return createHash("sh
 // '### `409 snapshot_data_expired`' (copy read 11-17, lines 17-23): "boat deleted
 // this sandbox's data after it had been stopped for at least 14 days. Resume, fork
 // and a saved snapshot save of this sandbox fail. You cannot get the data back."
+// R8(c): boat-errors-table.md:9 (Boat llms-full:2103) also names resume_failed,
+// sandbox_securing and sandbox_resuming. Naming a code does not grant retries.
 const BOAT_409_CODES: ReadonlySet<string> = new Set([
   "sandbox_starting", "sandbox_not_ready", "machine_not_running", "sandbox_stopping", "snapshot_data_expired",
+  "resume_failed", "sandbox_securing", "sandbox_resuming",
 ]);
 // API states (readiness.md:15-23) plus the stopping/stopped the 409 texts name.
 const BOAT_STATES: ReadonlySet<string> = new Set([
@@ -422,6 +425,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
   let signal: AbortSignal | undefined;
   let boat409: Boat409Fields | undefined;
   let archivingCommandConflict = false;
+  let resumeStateConflict = false;
   // F-04 (boat-commands-table.md lines 12-18; boat-command-history.md line 18):
   // a POST /commands whose send was under way when it failed, or that Boat
   // answered with a 5xx other than 'did not run', possibly ran. It is never sent
@@ -514,6 +518,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       httpStatus = null;
       boat409 = undefined;
       archivingCommandConflict = false;
+      resumeStateConflict = false;
       direct = undefined;
       // F-04: this send's own nonce, a shell no-op at the START of the command text
       // (Boat's history keeps the first 64 KiB of it: boat-command-history.md line 41).
@@ -551,6 +556,9 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       if (response.status === 409) {
         category = "http_error";
         boat409 = boat409Fields(await response.clone().json().catch(() => null));
+        // R8(c): boat-errors-table.md:9 / Boat llms-full:2103: these resume
+        // conflicts are still changing. Keep frozen8's usable Retry-After wait.
+        resumeStateConflict = resumeCall && boatResumeStateTransition(boat409.boatCode, response.headers.get("Retry-After"), deadline - Date.now());
         // F-04D: http_error is OUR fallback, not a documented Boat refusal.
         // Unknown/unparsed command 409s require a separate readiness GET. Only
         // archiving/archived proves not-run (readiness.md:21-22); otherwise an
@@ -672,7 +680,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     const code = httpStatus !== null && httpStatus >= 400 ? undefined
       : isOwnDeadline(error, signal) ? "ETIMEDOUT" : closedTransportCode(error);
     const failure = requestError(config, init.method ?? "GET", path, httpStatus, category, code, boat409, direct);
-    if (archivingCommandConflict) {
+    if (archivingCommandConflict || resumeStateConflict) {
       // A documented or state-confirmed refusal, including a second 409 after
       // recovery, gets ONE named transient across the real RPC text predicate.
       failure.message = `boat_sandbox_state_transition: ${failure.message} (state change in progress)`;
@@ -898,22 +906,49 @@ function q(v: string): string { return `'${v.replace(/'/g, `'"'"'`)}'`; }
 function validEnv(env: Record<string, string> = {}): void {
   for (const k of Object.keys(env)) if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`Invalid environment variable: ${k}`);
 }
+/** Match the host's sandboxStateTransitionFailure predicate; never emit raw state text. */
+export function boatStartDeadlineMessage(id: string, state: unknown): string {
+  const token = typeof state === "string" && state.length > 0 && !/[^a-z_]/.test(state) ? state : "unknown";
+  return `Boat sandbox ${id} is still ${token} at its start deadline`;
+}
+/** Boat llms-full:2103 (boat-errors-table.md:9): only these resume conflicts settle. */
+export function boatResumeStateTransition(code: string | undefined, retryAfter: string | null, remainingMs: number): boolean {
+  if (code === "sandbox_resuming") return true;
+  if (code !== "sandbox_stopping") return false;
+  // Same numeric grammar and inclusive budget as frozen8's boat409Resend.
+  const seconds = retryAfter === null ? null : /^\s*(\d+(?:\.\d+)?)\s*$/.exec(retryAfter);
+  const waitMs = seconds ? Number(seconds[1]) * 1_000 : NaN;
+  return !Number.isFinite(waitMs) || waitMs > remainingMs;
+}
 async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal; deadline?: number; sendGuard?: () => void } = {}): Promise<any> {
   // A bounded caller (a 409 recovery) never waits past its call budget, and its
   // admission and lifecycle check runs before every poll (frozen8 F-01/F-03).
   const until = Math.min(Date.now() + 120_000, bound.deadline ?? Number.POSITIVE_INFINITY);
   const options: RequestOptions = { ...(bound.deadline !== undefined ? { deadline: bound.deadline } : {}), ...(bound.sendGuard ? { sendGuard: bound.sendGuard } : {}) };
+  let lastObservedState: unknown;
   while (Date.now() < until) {
-    const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, bound.signal ? { signal: bound.signal } : {}, false, options);
+    let result: any;
+    try { result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, bound.signal ? { signal: bound.signal } : {}, false, options); }
+    catch (error) {
+      // A caller's timeout signal can fire during the poll, not only between polls.
+      // A definite HTTP refusal must not become transient just because it was late.
+      if (bound.signal?.aborted && isOwnDeadline(error, bound.signal) && closedTransportCode(error) === "ETIMEDOUT") break;
+      throw error;
+    }
     const s = result.sandbox ?? result;
     assertSandboxId(s, id);
     if (["ready", "idle", "running"].includes(s.state)) return s;
     if (s.state === "error" || (!allowArchived && s.state === "archived")) throw new Error(`Boat sandbox ${id} entered ${s.state}`);
+    lastObservedState = s.state;
     // Bounded transition observation only; no idle worker poller. Ready webhook
     // delivery belongs to the host; this acquisition has no callback endpoint.
-    await delay(Math.min(500, Math.max(0, until - Date.now())), undefined, bound.signal ? { signal: bound.signal } : undefined);
+    try { await delay(Math.min(500, Math.max(0, until - Date.now())), undefined, bound.signal ? { signal: bound.signal } : undefined); }
+    catch (error) {
+      if (bound.signal?.aborted && isOwnDeadline(error, bound.signal)) break;
+      throw error;
+    }
   }
-  throw new Error(`Boat sandbox ${id} readiness timed out`);
+  throw new Error(boatStartDeadlineMessage(id, lastObservedState));
 }
 async function waitSetup(config: Config, id: string): Promise<any> {
   const until = Date.now() + config.setupTimeoutSeconds * 1000;

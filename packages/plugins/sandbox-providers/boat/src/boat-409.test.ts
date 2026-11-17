@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { environmentResumeErrorData } from "@paperclipai/plugin-sdk";
-import plugin from "./plugin.js";
+import plugin, { boatResumeStateTransition, boatStartDeadlineMessage } from "./plugin.js";
 
 // Keep: smarty-dev#20974 (gate 1 C1: files PUT then commands POST answered 409
 // about 21 s after our resume of an archived box). Boat's own docs, read 11-17:
@@ -130,6 +130,35 @@ const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 beforeEach(async () => { id = `bx_${String(++boxes).padStart(8, "0")}`; await plugin.definition.setup({ logger } as any); vi.clearAllMocks(); });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
+// Unit tests agreed in the R8(c) brief: two pure message/shape checks only;
+// the proof remains cluster-lead's LIVE gate row, not this synthetic fixture.
+describe("R8(c) resume transition message and shape", () => {
+  it("names only a regex-safe last state at the start deadline", () => {
+    for (const state of ["provisioned", "cloning", "starting", "archived", "custom_state"]) {
+      const message = boatStartDeadlineMessage(id, state);
+      expect(message).toBe(`Boat sandbox ${id} is still ${state} at its start deadline`);
+      expect(/\bis still [a-z_]+ at its start deadline\b/i.test(message)).toBe(true);
+    }
+    for (const state of [undefined, null, 1, {}, "", "STARTING", "starting-now", "starting2", "starting\n", canary]) {
+      expect(boatStartDeadlineMessage(id, state)).toBe(`Boat sandbox ${id} is still unknown at its start deadline`);
+    }
+  });
+  it("marks only resuming or stopping without an in-budget numeric Retry-After as transient", () => {
+    for (const retryAfter of [null, "invalid", "Wed, 17 Nov 2026 18:00:00 GMT", "-1", "Infinity", "31", "9".repeat(400)]) {
+      expect(boatResumeStateTransition("sandbox_stopping", retryAfter, 30_000)).toBe(true);
+      expect(boatResumeStateTransition("sandbox_resuming", retryAfter, 30_000)).toBe(true);
+    }
+    for (const retryAfter of ["0", " 2 ", "0.5", "30"]) {
+      expect(boatResumeStateTransition("sandbox_stopping", retryAfter, 30_000)).toBe(false);
+      expect(boatResumeStateTransition("sandbox_resuming", retryAfter, 30_000)).toBe(true);
+    }
+    expect(boatResumeStateTransition("sandbox_stopping", "0.5", 499)).toBe(true);
+    for (const code of [undefined, "resume_failed", "sandbox_securing", "snapshot_data_expired", "other"]) {
+      expect(boatResumeStateTransition(code, null, 30_000)).toBe(false);
+    }
+  });
+});
+
 describe("#20974 (a) a Boat 409 keeps only its closed code, state and retryable", () => {
   it("409-A snapshot_data_expired on resume is surfaced as is, with its closed fields and no raw body", async () => {
     const boat = fakeBoat({ resume: [conflict("snapshot_data_expired", { state: "archived", retryable: false, error: { message: canary } })] });
@@ -234,14 +263,15 @@ describe("#20974 (b) documented 409 handling inside the call's bounded budget", 
     await expect(pending).resolves.toMatchObject({ providerLeaseId: id });
     expect(boat.count("POST", "/resume")).toBe(2);
   });
-  it("409-B sandbox_stopping without Retry-After, or with one past the budget, is surfaced as is", async () => {
+  it("409-B sandbox_stopping without Retry-After, or with one past the budget, retains its 409 fields as a state transition", async () => {
     let boat = fakeBoat({ resume: [conflict("sandbox_stopping", { state: "archiving" })] });
     const bare = await resume().catch(e => e);
-    expect(bare).toMatchObject({ status: 409, boatCode: "sandbox_stopping", boatState: "archiving" });
+    expect(bare).toMatchObject({ status: 409, code: "boat_sandbox_state_transition", boatCode: "sandbox_stopping", boatState: "archiving" });
+    expect(bare.message).toBe(`boat_sandbox_state_transition: Boat POST /sandboxes/${id}/resume failed (409): http_error [boat 409 code=sandbox_stopping state=archiving] (state change in progress)`);
     expect(boat.count("POST", "/resume")).toBe(1);
     boat = fakeBoat({ resume: [conflict("sandbox_stopping", { state: "archiving" }, { "Retry-After": "31" })] });
     const long = await resume().catch(e => e);
-    expect(long).toMatchObject({ status: 409, boatCode: "sandbox_stopping" });
+    expect(long).toMatchObject({ status: 409, code: "boat_sandbox_state_transition", boatCode: "sandbox_stopping" });
     expect(boat.count("POST", "/resume")).toBe(1);
     assertClosed(long);
   });
