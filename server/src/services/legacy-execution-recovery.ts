@@ -286,6 +286,8 @@ export async function terminalizeLegacyExecution(input: {
         wakePolicy: null, monitorPolicy: null,
       };
       const values = { ...holdValues, nextAction: workspaceRestoreHoldNextAction(evidence) };
+      // Every producer of an owed hold wakes the worker that adopts and runs it.
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.workspaceRecovery);
       if (existing) await tx.update(issueRecoveryActions).set(values).where(eq(issueRecoveryActions.id, existing.id));
       else await tx.insert(issueRecoveryActions).values({ ...values, companyId: run.companyId,
         sourceIssueId: task.id, kind: "active_run_watchdog",
