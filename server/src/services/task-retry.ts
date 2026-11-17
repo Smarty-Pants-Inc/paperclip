@@ -11,9 +11,9 @@ import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, chatActions, chatConversations, chatEndpoints, heartbeatRuns, issues, issueComments, runIdentityContexts, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { conflict, forbidden, notFound, HttpError } from "../errors.js";
 import { RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON } from "./task-retry-stop-gate.js";
-import { retryRefusedBeforeAdmission } from "./task-retry-eligibility.js";
+import { RESTORE_STOP_WAIT_REASON, retryRefusedBeforeAdmission, type RetryAuthority } from "./task-retry-eligibility.js";
 import { persistActivity } from "./activity-log.js";
-import { createSystemRecovery, exhaustedStopWait, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
+import { createSystemRecovery, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
 import { adoptSystemRecovery, updateSystemRecovery } from "./system-recovery.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { notifyChatActionWork } from "./chat-work-notifications.js";
@@ -302,11 +302,20 @@ export async function requestTaskRetry(input: TaskRetryRequest) {
  * one authority decides (task-retry-eligibility.ts retryRefusedBeforeAdmission). */
 async function refuseRetryTheCardDoesNotOffer(db: Db, issue: { companyId: string; id: string }, sourceRunId: string | null, repeat = false) {
   const authority = await retryRefusedBeforeAdmission(db, { companyId: issue.companyId, issueId: issue.id, sourceRunId, repeat });
+  // restore-card7's exhausted stop wait keeps its answer shape (not accepted,
+  // waitingOnStop), now with the authority's words; the caller returns it.
+  if (authority?.reason === RESTORE_STOP_WAIT_REASON) return authority;
   // An expired unproven Stop keeps the Stop gate's established refusal shape.
   if (authority?.reason === RETRY_STOP_UNPROVEN_REASON)
     throw conflict(RETRY_STOP_UNPROVEN_MESSAGE, { code: RETRY_STOP_UNPROVEN_REASON, reason: "stop_unproven" });
   if (authority) throw conflict(authority.cardText!, { code: "retry_not_available", reason: authority.reason,
     userAction: authority.userAction, nextAction: authority.nextAction });
+}
+
+/** restore-card7's not-accepted answer for a Retry its exhausted stop wait refuses. */
+function stopWaitAnswer(authority: RetryAuthority, observedRunId: string | null) {
+  return { requestId: null, accepted: false as const, stale: false, waitingOnStop: true as const, observedRunId,
+    chatActionId: undefined, refused: { reason: authority.reason, message: authority.cardText! } };
 }
 
 function admitTaskRetry(input: TaskRetryRequest) {
@@ -326,7 +335,9 @@ function admitTaskRetry(input: TaskRetryRequest) {
       // repeat of one that has no run reads the same authority as a new click,
       // with its own source run (rf-3 finding A: an expired Stop is refused).
       const intent = readTaskRetryIntent(sameRequest.payload);
-      if (!sameRequest.runId) await refuseRetryTheCardDoesNotOffer(db, issue, intent?.sourceRunId ?? null, true);
+      const repeatWait = !sameRequest.runId
+        ? await refuseRetryTheCardDoesNotOffer(db, issue, intent?.sourceRunId ?? null, true) : null;
+      if (repeatWait) return stopWaitAnswer(repeatWait, intent?.sourceRunId ?? null);
       const [coalescedRun] = sameRequest.status === "coalesced" && sameRequest.runId
         ? await tx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sameRequest.runId)))
@@ -345,7 +356,11 @@ function admitTaskRetry(input: TaskRetryRequest) {
     }
     // Same authority as admission and the card: past the bound an unproven
     // Stop refuses Retry with its reason instead of accepting a dead end.
-    await refuseRetryTheCardDoesNotOffer(db, issue, latest.id);
+    // One decision (restore-card7 folded in): the exhausted stop wait is a fact
+    // of this authority, decided here, before preservation and adoption, which
+    // never create an exhausted systemRecovery (see readRestoreStopWait).
+    const stopWait = await refuseRetryTheCardDoesNotOffer(db, issue, latest.id);
+    if (stopWait) return stopWaitAnswer(stopWait, latest.id);
     if (input.retryAction === "move_forward" && !["queued", "running"].includes(latest.status) &&
         !(await undeliveredContinuation(tx, { companyId: issue.companyId, issueId: issue.id })))
       return { requestId: null, accepted: false, stale: false, alreadyMovedOn: true, observedRunId: latest.id, chatActionId: undefined };
@@ -418,11 +433,6 @@ function admitTaskRetry(input: TaskRetryRequest) {
         runId: String(action.evidence.runId), actionId: action.id });
       [records[index]] = await tx.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
     }
-    // rf-3 15:30Z (3): the run's hold waits on an unconfirmed stop. A Retry
-    // cannot release it, so admission refuses it, as the card and chat show.
-    if (!busy && records.some(action => action.evidence.runId === latest.id
-        && exhaustedStopWait(readSystemRecovery(action.evidence), action.evidence)))
-      return { requestId: null, accepted: false, stale: false, waitingOnStop: true, observedRunId: latest.id, chatActionId: undefined };
     // An unadmitted request can outlive its exhausted repair. A new deliberate
     // click replaces that generation; a replay of the same key returned above.
     if (active && !busy && !active.runId && records.some(action => {

@@ -23,7 +23,8 @@ import { canonicalExecutionUuid } from "./execution-identity.js";
 import { chatActionDeadline } from "./chat-action-work.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { isAcknowledgedLegacyUserStop, isQueuedDependencyWait, runStopPresentationJson } from "./run-cancellation.js";
-import { decideRetryAuthority, heldConversationNoticeText, heldRetryOffersRetry, readRestoreHoldEvidence, readRetryAuthorityFacts } from "./task-retry-eligibility.js";
+import { decideRetryAuthority, heldConversationNoticeText, heldRetryOffersRetry, readRestoreHoldEvidence, readRetryAuthorityFacts,
+  restoreStopWaitFact } from "./task-retry-eligibility.js";
 import { readRetryStopGate, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON, RETRY_STOP_WAIT_MESSAGE } from "./task-retry-stop-gate.js";
 import { exhaustedNativeFinalizationCondition, savedResultRetryPendingCondition } from "./native-runtime/exhausted-finalization-retry.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
@@ -927,7 +928,9 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       const hold = held.find(row => row.issueId === issueId);
       if (!presentation.retryWait && hold && blocker.workspaceRecovery && blocker.workspaceRecovery.status !== "recovered")
         presentation.retryWait = { reason: "workspace_repair_required",
-          message: decideRetryAuthority({ restoreHold: hold.evidence }).cardText! };
+          // restore-card7: a hold exhausted on an unconfirmed stop is the
+          // authority's restoreStopWait fact (card7's shared waiting words).
+          message: decideRetryAuthority({ restoreHold: hold.evidence, restoreStopWait: restoreStopWaitFact(hold.evidence) }).cardText! };
       else if (!presentation.retryWait && blocker.workspaceRecovery && blocker.workspaceRecovery.status !== "recovered")
         presentation.retryWait = { reason: "workspace_repair_required", message: retryWaitMessages.workspace_repair_required! };
     }
