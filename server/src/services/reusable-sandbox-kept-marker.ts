@@ -1,5 +1,5 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
+import { environmentLeases, executionWorkspaces, executionWorkspaceSnapshots, heartbeatRuns, type Db } from "@paperclipai/db";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 
@@ -82,12 +82,22 @@ function restoreCaptureFenceActiveSql() {
         AND ${heartbeatRuns.status} IN ('queued', 'scheduled_retry', 'running'))))`;
 }
 
-/** Fence the old box at capture. Only a released or retained lease is fenced. */
+/** Exact workspace state read by the retire plan, not a fresh read at the fence. */
+export type ReusableSandboxRestoreCapture = {
+  workspaceMetadata: Record<string, unknown> | null;
+  snapshotId: string;
+};
+
+/** One compare-and-swap: fence only if every captured safety condition still
+ * holds. Never overwrite another capture, even one whose run has ended. The
+ * caller must refuse/re-plan on zero rows, before creating a replacement. */
 export async function fenceReusableSandboxAtRestoreCapture(db: Db, input: {
-  lease: Pick<EnvironmentLease, "id" | "companyId" | "providerLeaseId">;
+  lease: EnvironmentLease;
   heartbeatRunId: string;
+  capture: ReusableSandboxRestoreCapture;
 }): Promise<boolean> {
-  if (!input.lease.providerLeaseId) return false;
+  const { lease, capture } = input;
+  if (!lease.providerLeaseId || !lease.executionWorkspaceId) return false;
   const fence: ReusableSandboxRestoreCaptureFence = { runId: input.heartbeatRunId, capturedAt: new Date().toISOString() };
   const [fenced] = await db.update(environmentLeases).set({
     metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
@@ -95,8 +105,32 @@ export async function fenceReusableSandboxAtRestoreCapture(db: Db, input: {
   }).where(and(
     eq(environmentLeases.id, input.lease.id),
     eq(environmentLeases.companyId, input.lease.companyId),
-    eq(environmentLeases.providerLeaseId, input.lease.providerLeaseId),
+    eq(environmentLeases.providerLeaseId, lease.providerLeaseId),
     inArray(environmentLeases.status, ["released", "retained"]),
+    eq(environmentLeases.status, lease.status),
+    sql`${environmentLeases.environmentId} IS NOT DISTINCT FROM ${lease.environmentId}::uuid`,
+    eq(environmentLeases.leasePolicy, lease.leasePolicy),
+    sql`${environmentLeases.heartbeatRunId} IS NOT DISTINCT FROM ${lease.heartbeatRunId}::uuid`,
+    eq(environmentLeases.executionWorkspaceId, lease.executionWorkspaceId),
+    sql`${environmentLeases.issueId} IS NOT DISTINCT FROM ${lease.issueId}::uuid`,
+    sql`${environmentLeases.metadata} IS NOT DISTINCT FROM ${lease.metadata === null ? null : JSON.stringify(lease.metadata)}::jsonb`,
+    sql`not coalesce(${environmentLeases.metadata} ? ${REUSABLE_SANDBOX_RESTORE_CAPTURE_FENCE_KEY}, false)`,
+    reusableSandboxNotKeptAfterReplacementSql(),
+    // Re-check the plan's idle-owner predicate in this same statement.
+    sql`NOT EXISTS (SELECT 1 FROM ${heartbeatRuns}
+      WHERE ${heartbeatRuns.companyId} = ${lease.companyId}
+        AND ${heartbeatRuns.id} = ${environmentLeases.heartbeatRunId}
+        AND ${heartbeatRuns.id} <> ${input.heartbeatRunId}::uuid
+        AND ${heartbeatRuns.status} IN ('queued', 'scheduled_retry', 'running'))`,
+    sql`EXISTS (SELECT 1 FROM ${executionWorkspaces}
+      WHERE ${executionWorkspaces.companyId} = ${lease.companyId}
+        AND ${executionWorkspaces.id} = ${lease.executionWorkspaceId}::uuid
+        AND ${executionWorkspaces.metadata} IS NOT DISTINCT FROM ${capture.workspaceMetadata === null ? null : JSON.stringify(capture.workspaceMetadata)}::jsonb)`,
+    sql`EXISTS (SELECT 1 FROM ${executionWorkspaceSnapshots}
+      WHERE ${executionWorkspaceSnapshots.companyId} = ${lease.companyId}
+        AND ${executionWorkspaceSnapshots.executionWorkspaceId} = ${lease.executionWorkspaceId}::uuid
+        AND ${executionWorkspaceSnapshots.id} = ${capture.snapshotId}::uuid
+        AND ${executionWorkspaceSnapshots.status} = 'committed')`,
   )).returning({ id: environmentLeases.id });
   return Boolean(fenced);
 }

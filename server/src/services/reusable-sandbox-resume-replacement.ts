@@ -13,7 +13,7 @@ import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-ba
 import { nativeHarnessBackupHasLaterProviderWork } from "./native-runtime/native-retired-backup-source.js";
 import { sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { liftRestoreCaptureFence, REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY, type ReusableSandboxKeptMarker,
-  type ReusableSandboxKeptReason } from "./reusable-sandbox-kept-marker.js";
+  type ReusableSandboxKeptReason, type ReusableSandboxRestoreCapture } from "./reusable-sandbox-kept-marker.js";
 import { nativeHarnessBackupFailureReason, ReusableSandboxBackupUnrestorableError,
   type ReusableSandboxBackupFailure } from "./reusable-sandbox-resume-error.js";
 
@@ -125,6 +125,8 @@ export async function reusableSandboxReplacementPlan(input: {
   adapterType: string | null | undefined;
   cause: unknown;
   providerCannotStart?: boolean;
+  /** Pass the exact read to a caller that will CAS the retire capture. No DB write here. */
+  onRetireCapture?: (capture: ReusableSandboxRestoreCapture) => void;
 }): Promise<ReusableSandboxReplacementPlan | null> {
   const { db, lease } = input;
   if (!lease.providerLeaseId || !await reusableSandboxLeaseIsIdle(input)) return null;
@@ -164,6 +166,7 @@ export async function reusableSandboxReplacementPlan(input: {
     return input.providerCannotStart === true ? "keep" : null;
   }
 
+  input.onRetireCapture?.({ workspaceMetadata: workspace!.metadata, snapshotId: snapshot.id });
   return "retire";
 }
 

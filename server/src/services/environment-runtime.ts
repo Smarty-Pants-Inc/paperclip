@@ -27,7 +27,7 @@ import {
   sandboxStateTransitionFailure,
 } from "./reusable-sandbox-resume-replacement.js";
 import { assertSandboxNotKeptAfterReplacement, fenceReusableSandboxAtRestoreCapture, KEPT_SANDBOX_CLEARED_BY_OPERATOR_KEY,
-  liftRestoreCaptureFence } from "./reusable-sandbox-kept-marker.js";
+  liftRestoreCaptureFence, type ReusableSandboxRestoreCapture } from "./reusable-sandbox-kept-marker.js";
 import { admittedSandboxLeaseConfig, sandboxLeaseIdentityConfig, sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import { HttpError } from "../errors.js";
@@ -2199,6 +2199,8 @@ function createSandboxEnvironmentDriver(
         let providerLease: PluginEnvironmentLease | null = null;
         let replacingUnretiredOwner = false;
         let replacementPlan: ReusableSandboxReplacementPlan | null = null;
+        let replacementCapture: ReusableSandboxRestoreCapture | undefined;
+        const onRetireCapture = (capture: ReusableSandboxRestoreCapture) => { replacementCapture = capture; };
         let replacementReason:
           | "not_found"
           | "expired"
@@ -2232,7 +2234,7 @@ function createSandboxEnvironmentDriver(
             ? await reusableSandboxReplacementPlan({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
               executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, adapterType: input.adapterType,
-              cause: new Error(NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE),
+              cause: new Error(NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE), onRetireCapture,
             }).catch(error => { throw typedNativeHarnessBackupFailure(error, reusableLease.providerLeaseId!); }) : null;
           replacingUnretiredOwner = unretiredOwnerPlan !== null;
           let idleStartWaitSpent = false;
@@ -2325,7 +2327,7 @@ function createSandboxEnvironmentDriver(
             replacementPlan = await reusableSandboxReplacementPlan({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
               executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, adapterType: input.adapterType, cause: error,
-              providerCannotStart: idleStartWaitSpent,
+              providerCannotStart: idleStartWaitSpent, onRetireCapture,
             }).catch(planError => { throw typedNativeHarnessBackupFailure(planError, reusableLease.providerLeaseId!); });
             if (!replacementPlan) {
               // A broken saved backup is the true reason, not the provider's
@@ -2373,10 +2375,18 @@ function createSandboxEnvironmentDriver(
         // restore and retires it, the old box is fenced like a kept box
         // (assertSandboxNotKeptAfterReplacement). Any failure before the
         // replacement is recorded lifts the fence, so the old box stays usable.
-        const restoreCaptureFenced = replacementReason === "resume_failed" && replacementPlan === "retire"
-          && reusableLease && input.heartbeatRunId
-          ? await fenceReusableSandboxAtRestoreCapture(db, { lease: reusableLease, heartbeatRunId: input.heartbeatRunId })
-          : false;
+        let restoreCaptureFenced = false;
+        if (replacementReason === "resume_failed" && replacementPlan === "retire") {
+          restoreCaptureFenced = Boolean(reusableLease && input.heartbeatRunId && replacementCapture)
+            && await fenceReusableSandboxAtRestoreCapture(db, {
+              lease: reusableLease!, heartbeatRunId: input.heartbeatRunId!, capture: replacementCapture!,
+            });
+          if (!restoreCaptureFenced) {
+            throw new ReusableSandboxResumeError({ provider: parsed.config.provider,
+              providerLeaseId: reusableLease?.providerLeaseId ?? "unknown",
+              cause: new Error("Reusable sandbox replacement capture changed; re-plan required") });
+          }
+        }
         const liftCaptureFenceAndRethrow = async (error: unknown): Promise<never> => {
           if (restoreCaptureFenced && reusableLease && input.heartbeatRunId) {
             await liftRestoreCaptureFence(db, { companyId: input.companyId, leaseId: reusableLease.id,

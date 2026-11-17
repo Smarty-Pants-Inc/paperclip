@@ -22,6 +22,7 @@ import { environmentService } from "../services/environments.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 import { liftRestoreCaptureFenceAfterFailedRestore, retireReplacedReusableSandboxLeaseAfterRestore } from "../services/reusable-sandbox-resume-replacement.ts";
 import { ReusableSandboxKeptFencedError } from "../services/reusable-sandbox-kept-marker.ts";
+import * as keptMarker from "../services/reusable-sandbox-kept-marker.ts";
 
 // Durable harness-backup verification has its own tests. Here it is a boundary:
 // a lease-bound stamp verifies, a missing stamp (an older release's lease) does not.
@@ -277,6 +278,79 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       replaceBeforeReuse: { schema: "paperclip.replace-before-reuse.v1", runId: randomUUID(), predecessorRunId: randomUUID(),
         recordedAt: new Date().toISOString() } });
   }
+
+  // Data-safety race: pause the real acquisition after the plan's reads and
+  // before its fence UPDATE. A separate connection changes the captured state.
+  // The SQL must update zero rows; a stale plan must never create a new box.
+  it.each(["status", "providerLeaseId", "heartbeatRunId", "executionWorkspaceId", "metadata",
+    "another fence", "workspace authority", "snapshot status", "live owner"])(
+    "refuses a stale replacement capture when a concurrent writer changes %s", async (changed) => {
+      const seeded = await seed();
+      await markReplaceBeforeReuse(seeded);
+      const { call, runtime } = worker(seeded, async () => ({ providerLeaseId: seeded.providerLeaseId }));
+      const fence = keptMarker.fenceReusableSandboxAtRestoreCapture;
+      let fenced: boolean | undefined;
+      let changedLease: unknown;
+      const racingDb = createDb(connectionString);
+      try {
+        vi.spyOn(keptMarker, "fenceReusableSandboxAtRestoreCapture").mockImplementationOnce(async (...args) => {
+          const lease = (await environmentService(racingDb).getLeaseById(seeded.lease.id))!;
+          if (changed === "status") {
+            // Both statuses are idle: an IN ('released', 'retained') is not CAS.
+            await racingDb.update(environmentLeases).set({ status: "released" }).where(eq(environmentLeases.id, lease.id));
+          } else if (changed === "providerLeaseId") {
+            await racingDb.update(environmentLeases).set({ providerLeaseId: "concurrently-rebound" }).where(eq(environmentLeases.id, lease.id));
+          } else if (changed === "heartbeatRunId") {
+            await racingDb.update(environmentLeases).set({ heartbeatRunId: seeded.runId }).where(eq(environmentLeases.id, lease.id));
+          } else if (changed === "executionWorkspaceId") {
+            await racingDb.update(environmentLeases).set({ executionWorkspaceId: null }).where(eq(environmentLeases.id, lease.id));
+          } else if (changed === "metadata" || changed === "another fence") {
+            await environmentService(racingDb).updateLeaseMetadata(lease.id, { ...lease.metadata,
+              ...(changed === "metadata" ? { nativeHarnessBackup: { changedAfterCapture: true } }
+                : { reusableSandboxRestoreCaptureFence: { runId: randomUUID(), capturedAt: new Date().toISOString() } }) });
+          } else if (changed === "workspace authority") {
+            const [workspace] = await racingDb.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+            await racingDb.update(executionWorkspaces).set({ metadata: { ...workspace!.metadata,
+              remoteWorkspace: { ...(workspace!.metadata!.remoteWorkspace as Record<string, unknown>), dirty: true } } })
+              .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+          } else if (changed === "snapshot status") {
+            await racingDb.update(executionWorkspaceSnapshots).set({ status: "pending" })
+              .where(eq(executionWorkspaceSnapshots.executionWorkspaceId, seeded.executionWorkspaceId));
+          } else {
+            await racingDb.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, lease.heartbeatRunId!));
+          }
+          changedLease = await environmentService(racingDb).getLeaseById(lease.id);
+          fenced = await fence(...args);
+          return fenced;
+        });
+        const result = await acquire(seeded, runtime).then(value => ({ value, error: null }),
+          (error: unknown) => ({ value: null, error }));
+        expect(fenced, "the real conditional UPDATE must return zero rows").toBe(false);
+        expect(result.error).toMatchObject({ code: "reusable_sandbox_resume_failed",
+          cause: { message: "Reusable sandbox replacement capture changed; re-plan required" } });
+        expect(result.value).toBeNull();
+        expect(call.mock.calls.filter(([, method]) => method === "environmentAcquireLease")).toEqual([]);
+        expect(call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toEqual([]);
+        expect(await environmentService(db).getLeaseById(seeded.lease.id)).toEqual(changedLease);
+        expect(await environmentService(db).listLeases(seeded.environment.id)).toHaveLength(1);
+      } finally {
+        await racingDb.$client.end({ timeout: 1 });
+      }
+    });
+
+  it("refuses to overwrite a fence already present in the plan's lease read", async () => {
+    const seeded = await seed();
+    await markReplaceBeforeReuse(seeded);
+    const lease = (await environmentService(db).getLeaseById(seeded.lease.id))!;
+    const existingFence = { runId: randomUUID(), capturedAt: new Date().toISOString() };
+    await environmentService(db).updateLeaseMetadata(lease.id, { ...lease.metadata,
+      reusableSandboxRestoreCaptureFence: existingFence });
+    const { call, runtime } = worker(seeded, async () => ({ providerLeaseId: seeded.providerLeaseId }));
+    await expect(acquire(seeded, runtime)).rejects.toMatchObject({ code: "reusable_sandbox_resume_failed" });
+    expect(call.mock.calls.filter(([, method]) => method === "environmentAcquireLease")).toEqual([]);
+    expect((await environmentService(db).getLeaseById(lease.id))?.metadata?.reusableSandboxRestoreCaptureFence).toEqual(existingFence);
+    expect(await environmentService(db).listLeases(seeded.environment.id)).toHaveLength(1);
+  });
 
   it("replaces a resumable sandbox whose previous Runner could not be retired, without resuming it", async () => {
     const seeded = await seed();
