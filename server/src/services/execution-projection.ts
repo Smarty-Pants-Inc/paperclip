@@ -18,6 +18,7 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { readWorkspaceRecovery, recoveredWorkMessage, stoppedBeforeWorkWasSaved, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
 import { readUnsupersededHeldConversationNotices } from "./native-runtime/pi-session-recovery-notice.js";
+import { decideRetryAuthority } from "./task-retry-eligibility.js";
 import { readTaskDrain } from "./task-admission.js";
 import { getStartupRecoveryState, startupQueuedRunPassOutstanding } from "../startup-recovery-state.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "./execution-blocker.js";
@@ -460,7 +461,7 @@ export function projectExecution(
     // the task continues through that record.
     if (recoveryAction.evidence.continuationDelivery === "coalesced") {
       projection.cause = null;
-      projection.nextAction = "Paperclip continues the task in a fresh run from its saved work.";
+      projection.nextAction = decideRetryAuthority({ automaticRecovery: true }).transcriptNotice;
       return set("queued", "Continuing automatically");
     }
     const reconciliation = recoveryAction.evidence.executionReconciliation;
@@ -490,7 +491,7 @@ export function projectExecution(
     projection.nextAction = deliveredRunId
       ? null
       : recoveryAction.evidence.freshContinuationSettlement
-        ? "Paperclip continues the task in a fresh run from its saved work."
+        ? decideRetryAuthority({ automaticRecovery: true }).transcriptNotice
         : "The previous execution is reconciled. Its continuation is queued for delivery.";
     return set(
       deliveredRunId ? "completed" : "queued",
