@@ -44,3 +44,18 @@ it("says recovering is taking longer, with Retry, once the owed hold is past the
     .toBe("Recovering your saved work is taking longer than expected. You can Retry to continue from the last saved version.");
   expect(workspaceRestoreMarker(result)).toMatchObject({ pending: false, label: "Recovering saved work", tone: "neutral" });
 });
+
+// restore-card7 (rf-3 15:30Z (3)): a hold exhausted on an unconfirmed stop is a
+// wait. The server projects workspaceRestoreStopWait (the failure code); the chat
+// says the card's words and is pending, so TaskChatThread offers no Retry.
+it.each([
+  ["copyback_stop_unconfirmed", "Recovery of saved work is waiting for the previous server's file copy to stop. "
+    + "Recovery resumes once Paperclip can confirm that it stopped. No provider turn is submitted."],
+  ["agent_stop_unconfirmed", "Recovery of saved work is waiting to confirm that the previous run stopped. "
+    + "Paperclip tries again automatically, and the agent will not repeat its work."],
+])("says the card's waiting words, with no Retry, for an exhausted %s", async (code, words) => {
+  const { workspaceRestoreMarker } = await import("./workspace-restore-marker");
+  const result = { workspaceRestoreFailure: "restore_failed", workspaceRestoreStopWait: code };
+  expect(workspaceRestoreMarker(result)).toMatchObject({ pending: true, tone: "neutral" });
+  expect(workspaceRestoreMarkerDetail({ result, savedPlan: false, hasResponse: true })).toBe(words);
+});
