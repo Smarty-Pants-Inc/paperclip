@@ -11,7 +11,7 @@ import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, chatActions, chatConversations, chatEndpoints, heartbeatRuns, issues, issueComments, runIdentityContexts, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { conflict, forbidden, notFound, HttpError } from "../errors.js";
 import { RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON } from "./task-retry-stop-gate.js";
-import { readRetryAdmissionAuthority, RESTORE_STOP_WAIT_REASON, retryRefusedBeforeAdmissionReason, type RetryAuthority } from "./task-retry-eligibility.js";
+import { PERSON_MESSAGE_ANSWERED_REASON, readRetryAdmissionAuthority, RESTORE_STOP_WAIT_REASON, retryRefusedBeforeAdmissionReason, type RetryAuthority } from "./task-retry-eligibility.js";
 import { persistActivity } from "./activity-log.js";
 import { createSystemRecovery, readSystemRecovery, savedFilesUnrecoverable } from "./system-recovery-state.js";
 import { adoptSystemRecovery, updateSystemRecovery } from "./system-recovery.js";
@@ -309,6 +309,9 @@ async function refuseRetryTheCardDoesNotOffer(db: Db, issue: { companyId: string
   // restore-card7's exhausted stop wait keeps its answer shape (not accepted,
   // waitingOnStop), now with the authority's words; the caller returns it.
   if (authority?.reason === RESTORE_STOP_WAIT_REASON) return authority;
+  // fam-retry3 (RFL 20:33Z): the person message is already answered above: a
+  // no-op, not accepted, with the authority's one line; nothing is saved or woken.
+  if (authority?.reason === PERSON_MESSAGE_ANSWERED_REASON) return authority;
   // An expired unproven Stop keeps the Stop gate's established refusal shape.
   if (authority?.reason === RETRY_STOP_UNPROVEN_REASON)
     throw conflict(RETRY_STOP_UNPROVEN_MESSAGE, { code: RETRY_STOP_UNPROVEN_REASON, reason: "stop_unproven" });
@@ -323,6 +326,8 @@ function heldAnswer(authority: RetryAuthority | null | undefined) {
 
 /** restore-card7's not-accepted answer for a Retry its exhausted stop wait refuses. */
 function stopWaitAnswer(authority: RetryAuthority, observedRunId: string | null) {
+  if (authority.reason === PERSON_MESSAGE_ANSWERED_REASON) return { requestId: null, accepted: false as const, stale: false,
+    alreadyAnswered: true as const, observedRunId, chatActionId: undefined, refused: { reason: authority.reason, message: authority.cardText! } };
   return { requestId: null, accepted: false as const, stale: false, waitingOnStop: true as const, observedRunId,
     chatActionId: undefined, refused: { reason: authority.reason, message: authority.cardText! } };
 }

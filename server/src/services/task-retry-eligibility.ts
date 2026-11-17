@@ -1,6 +1,8 @@
 import { and, desc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
 import { WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT, WORKSPACE_RESTORE_COPYBACK_STOP_WAIT_TEXT } from "@paperclipai/shared";
-import { agents, agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { agents, agentWakeupRequests, heartbeatRuns, issueComments, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
+import { answeredPersonMessageSql } from "./person-message-answer.js";
 import { executionBlockerPredicate, NEW_TASK_CONTINUE_ACTION, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate,
   withoutUnavailableRetry } from "./execution-blocker.js";
 import { WORKSPACE_RESTORE_PENDING_KEY, workspaceRestoreHoldNextAction } from "./legacy-execution-recovery.js";
@@ -57,6 +59,11 @@ export type RetryUserAction = "retry" | "message" | "resume" | "new_task" | "wai
  * offers Retry or tells a person what to do next reads them through
  * decideRetryAuthority, so the button and the words cannot disagree. */
 export type RetryAuthorityFacts = {
+  /** fam-retry3 (RFL 20:33Z): every person message Retry's source run carried
+   * already has an answer (person-message-answer.ts answeredPersonMessageSql,
+   * the predicate the unanswered-person-message notice and the continuation
+   * carry use): a Retry would only answer it again. */
+  personMessageAnswered?: boolean;
   /** The assignee (or its project / company) is paused: only Resume continues. */
   agentPaused?: boolean;
   /** Paperclip is continuing this conversation by itself (a recovery successor is pending). */
@@ -118,6 +125,9 @@ function decision(userAction: RetryUserAction, reason: string, text: string | nu
  * chooses the words, which name Retry's real effect (a fresh run with history).
  */
 export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority {
+  // fam-retry3: the message is answered above; a Retry is a no-op that says so.
+  if (facts.personMessageAnswered)
+    return decision("message", PERSON_MESSAGE_ANSWERED_REASON, PERSON_MESSAGE_ANSWERED_MESSAGE, null);
   if (facts.agentPaused) return decision("resume", "agent_paused", AGENT_PAUSED_RETRY_MESSAGE, AGENT_PAUSED_ACTION);
   if (facts.automaticRecovery) return decision("wait", "automatic_recovery", AUTOMATIC_RECOVERY_MESSAGE, null);
   if (facts.stopGate === "waiting") return decision("wait", "execution_settling", RETRY_STOP_WAIT_MESSAGE, RETRY_STOP_WAIT_ACTION);
@@ -170,17 +180,44 @@ export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority
  * notice, and the deferred Retry's refusal. One read per task; callers add
  * what only they know. A run's own refusal text is not authority (follow-
  * Paperclip Cut B R4): the executor's durable HELD notice is. */
-export async function readRetryAuthorityFacts(db: Db, input: { companyId: string; issueId: string }) {
+export async function readRetryAuthorityFacts(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
   const { readUnsupersededHeldConversationNotice } = await import("./native-runtime/pi-session-recovery-notice.js");
-  const [[assignee], notice, refusals, restoreStopWait] = await Promise.all([
+  const [[assignee], notice, refusals, restoreStopWait, personMessageAnswered] = await Promise.all([
     db.select({ status: agents.status }).from(issues).innerJoin(agents, and(eq(agents.companyId, issues.companyId),
       eq(agents.id, issues.assigneeAgentId))).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).limit(1),
     readUnsupersededHeldConversationNotice(db, { companyId: input.companyId, issueId: input.issueId }),
     heldTaskRetryRefusals(db, input.companyId, [input.issueId]),
     readRestoreStopWait(db, input),
+    readPersonMessageAnswered(db, input),
   ]);
   return { agentPaused: assignee?.status === "paused", heldConversation: Boolean(notice),
-    heldRefusal: refusals.get(input.issueId) ?? null, restoreStopWait } satisfies RetryAuthorityFacts;
+    heldRefusal: refusals.get(input.issueId) ?? null, restoreStopWait, personMessageAnswered } satisfies RetryAuthorityFacts;
+}
+
+export const PERSON_MESSAGE_ANSWERED_REASON = "person_message_already_answered";
+export const PERSON_MESSAGE_ANSWERED_MESSAGE = "Already answered above.";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** fam-retry3: the personMessageAnswered fact. Retry's source run (the given
+ * run, else the task's latest run, as readRestoreStopWait reads it) carried
+ * person messages (carryContinuationCommentInput, the continuation seam), and
+ * every one of them is answered by the ONE shared predicate
+ * (answeredPersonMessageSql). A run that carried no person message, or a
+ * message with no published answer (a cancelled or partial run posted
+ * nothing), keeps its Retry. */
+async function readPersonMessageAnswered(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
+  const [source] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), input.sourceRunId ? eq(heartbeatRuns.id, input.sourceRunId) : or(
+      eq(heartbeatRuns.issueId, input.issueId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`)))
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  const carried = ((carryContinuationCommentInput(source?.contextSnapshot).wakeCommentIds as string[] | undefined) ?? [])
+    .filter(id => UUID.test(id));
+  if (!carried.length) return false;
+  const rows = await db.select({ id: issueComments.id, answered: sql<boolean>`${answeredPersonMessageSql({ id: sql`${issueComments.id}`,
+    companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}` })
+    .from(issueComments).where(and(eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+      inArray(issueComments.id, carried), eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)));
+  return rows.length > 0 && rows.every(row => row.answered === true);
 }
 
 /** fam-retry2: a restore hold behind which upstream accepts and holds a Retry
@@ -255,8 +292,10 @@ export async function readRestoreHoldEvidence(db: Db, input: { companyId: string
 //   Stop gate); a waiting Stop is not refused (admission defers it visibly).
 // - workspace_restore_stop_wait (restore-card7): the hold waits on an unconfirmed
 //   stop; a repeat refuses too (the fact does not depend on the click).
+// - person_message_already_answered (fam-retry3): the source run's person message
+//   has an answer above; a Retry, a repeat included, runs nothing.
 const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["agent_paused", "workspace_repair_required", "execution_stop_unproven",
-  RESTORE_STOP_WAIT_REASON]);
+  RESTORE_STOP_WAIT_REASON, PERSON_MESSAGE_ANSWERED_REASON]);
 // fam-retry2: a restore hold Paperclip can still release is an accept-held
 // outcome (canRetry, admission "held"), not a refusal, for a new click and for
 // an idempotent repeat alike (the repeat returns the same held acceptance; no
@@ -269,7 +308,8 @@ export async function readRetryAdmissionAuthority(db: Db, input: { companyId: st
   const restoreHold = hold && (await getExecutionBlocker(db, input.companyId, input.issueId))?.canRetry === false ? hold : null;
   const gate = input.sourceRunId
     ? (await readRetryStopGate(db, { companyId: input.companyId, issueId: input.issueId, sourceRunId: input.sourceRunId }))?.state : null;
-  return decideRetryAuthority({ ...await readRetryAuthorityFacts(db, input), restoreHold,
+  return decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId: input.companyId, issueId: input.issueId,
+    sourceRunId: input.sourceRunId }), restoreHold,
     stopGate: gate === "expired" ? "expired" : null, retrySource: true });
 }
 export function retryRefusedBeforeAdmissionReason(reason: string) { return REFUSED_BEFORE_ADMISSION.has(reason); }
