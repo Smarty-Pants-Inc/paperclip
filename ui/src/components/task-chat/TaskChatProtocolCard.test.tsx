@@ -464,7 +464,7 @@ describe("TaskChatProtocolCard", () => {
       patchArtifactRef: null,
     });
     expect(container.textContent).toContain("40 files changed");
-    expect(container.querySelector('[data-testid="task-chat-workspace-change-omitted"]')?.textContent).toContain("39 more files changed.");
+    expect(container.querySelector('[data-testid="task-chat-workspace-change-omitted"]')?.textContent).toContain("The runner reported 39 additional files without file details.");
   });
 
   it("lists the turn's changed files and opens each diff in place", async () => {

@@ -75,11 +75,9 @@ describe("formatIssueChangeValue", () => {
     expect(formatIssueChangeValue([{ a: 1 }])).toBe("1 items");
   });
 
-  it("truncates long free text", () => {
+  it("preserves long free text", () => {
     const long = "x".repeat(200);
-    const formatted = formatIssueChangeValue(long);
-    expect(formatted.endsWith("…")).toBe(true);
-    expect(formatted.length).toBeLessThan(long.length);
+    expect(formatIssueChangeValue(long)).toBe(long);
   });
 
   it("reports structural objects as 'updated'", () => {

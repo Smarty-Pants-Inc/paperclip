@@ -758,7 +758,7 @@ describe("transcriptToTaskChatItems protocol surfaces", () => {
     });
   });
 
-  it("bounds provider output and workspace previews to 8 KiB", () => {
+  it("preserves full provider output and workspace previews above 8 KiB", () => {
     const oversized = "x".repeat(9 * 1024);
     const items = transcriptToTaskChatItems(
       [
@@ -798,20 +798,20 @@ describe("transcriptToTaskChatItems protocol surfaces", () => {
     );
     expect(
       provider && provider.surface === "provider_activity"
-        ? provider.output?.length
-        : 0,
-    ).toBe(8 * 1024);
+        ? provider.output
+        : "",
+    ).toBe(oversized);
     expect(
       provider && provider.surface === "provider_activity"
         ? provider.outputTruncated
-        : false,
-    ).toBe(true);
+        : true,
+    ).toBe(false);
     expect(
-      file && file.surface === "workspace_file" ? file.preview?.length : 0,
-    ).toBe(8 * 1024);
+      file && file.surface === "workspace_file" ? file.preview : "",
+    ).toBe(oversized);
     expect(
-      file && file.surface === "workspace_file" ? file.previewTruncated : false,
-    ).toBe(true);
+      file && file.surface === "workspace_file" ? file.previewTruncated : true,
+    ).toBe(false);
   });
 
   it("turns canonical research sources into safe links and exposes notice metadata", () => {
