@@ -382,7 +382,19 @@ export const FINAL_ANSWER_COMMENT_MAX_BYTES = 250 * 1024;
  * Only those synthetic fence wrappers and the part labels are added.
  */
 export function splitFinalAnswerComments(text: string): string[] {
-  if (Buffer.byteLength(text) <= FINAL_ANSWER_COMMENT_MAX_BYTES) return [text];
+  return splitFinalAnswerParts(text).map(part => part.body);
+}
+
+/** H5 round 2: one part of a multipart answer, with exactly what was added around its content. */
+export type FinalAnswerPart = { body: string; label: string; prefix: string; suffix: string };
+
+/**
+ * The splitter with its additions recorded: `body` is `label + prefix +
+ * content + suffix`, where `prefix`/`suffix` are the synthetic fence wrappers.
+ * A single part (under the limit) is the text itself with nothing added.
+ */
+export function splitFinalAnswerParts(text: string): FinalAnswerPart[] {
+  if (Buffer.byteLength(text) <= FINAL_ANSWER_COMMENT_MAX_BYTES) return [{ body: text, label: "", prefix: "", suffix: "" }];
   type Fence = { marker: string; opening: string };
   const breaks: { end: number; fence: Fence | null }[] = [];
   let fence: Fence | null = null;
@@ -402,7 +414,7 @@ export function splitFinalAnswerComments(text: string): string[] {
   // Reserve enough for even the largest possible part numbers in a JS string.
   const labelBudget = Buffer.byteLength(`part ${text.length} of ${text.length}\n`);
   const fenceBudget = breaks.reduce((max, entry) => Math.max(max, entry.fence ? Buffer.byteLength(entry.fence.marker) + 1 : 0), 0);
-  const parts: string[] = [];
+  const parts: { prefix: string; content: string; suffix: string }[] = [];
   let start = 0, breakIndex = 0;
   let startFence: Fence | null = null;
   while (start < text.length) {
@@ -431,11 +443,81 @@ export function splitFinalAnswerComments(text: string): string[] {
     if (preferred && preferred.end > start) end = preferred.end;
     while (breakIndex < breaks.length && breaks[breakIndex]!.end <= end) endFence = breaks[breakIndex++]!.fence;
     const suffix = end < text.length && endFence ? `\n${endFence.marker}` : "";
-    parts.push(`${prefix}${text.slice(start, end)}${suffix}`);
+    parts.push({ prefix, content: text.slice(start, end), suffix });
     start = end;
     startFence = endFence;
   }
-  return parts.map((part, index) => `part ${index + 1} of ${parts.length}\n${part}`);
+  return parts.map((part, index) => {
+    const label = `part ${index + 1} of ${parts.length}\n`;
+    return { body: `${label}${part.prefix}${part.content}${part.suffix}`, label, prefix: part.prefix, suffix: part.suffix };
+  });
+}
+
+/** H5 round 2: the part metadata addComment records on every part of one logical answer. */
+export type AnswerPartMetadata = { answerId: string; index: number; count: number; label: string; prefix: string; suffix: string };
+
+export function readAnswerPartMetadata(metadata: unknown): AnswerPartMetadata | null {
+  const part = record(record(metadata).answerPart);
+  return typeof part.answerId === "string" && Number.isInteger(part.index) && Number.isInteger(part.count)
+    && typeof part.label === "string" && typeof part.prefix === "string" && typeof part.suffix === "string"
+    ? part as AnswerPartMetadata : null;
+}
+
+/** One part's content: its body without the recorded label and fence wrappers (null when they do not match). */
+export function answerPartContent(body: string, part: AnswerPartMetadata): string | null {
+  const head = `${part.label}${part.prefix}`;
+  if (!body.startsWith(head) || !body.endsWith(part.suffix) || body.length < head.length + part.suffix.length) return null;
+  return body.slice(head.length, body.length - part.suffix.length);
+}
+
+/**
+ * H5 round 2: the WHOLE logical answer `anchor` belongs to, assembled from all
+ * its parts in `comments` in part order (label-stripped, fence-unwrapped), so
+ * it is byte-equal to the source. Null when `anchor` is not a part or a part is
+ * missing or does not match its recorded additions.
+ */
+export function assembleAnswerParts<T extends { id: string; body?: string | null; metadata?: unknown }>(
+  anchor: T, comments: readonly T[]): { text: string; partIds: string[]; first: T } | null {
+  const anchorPart = readAnswerPartMetadata(anchor.metadata);
+  if (!anchorPart) return null;
+  const byIndex = new Map<number, { comment: T; content: string }>();
+  for (const comment of comments) {
+    const part = readAnswerPartMetadata(comment.metadata);
+    if (!part || part.answerId !== anchorPart.answerId || part.count !== anchorPart.count) continue;
+    const content = typeof comment.body === "string" ? answerPartContent(comment.body, part) : null;
+    if (content === null) return null;
+    byIndex.set(part.index, { comment, content });
+  }
+  const ordered = [];
+  for (let index = 1; index <= anchorPart.count; index++) {
+    const entry = byIndex.get(index);
+    if (!entry) return null;
+    ordered.push(entry);
+  }
+  return { text: ordered.map(entry => entry.content).join(""), partIds: ordered.map(entry => entry.comment.id), first: ordered[0]!.comment };
+}
+
+/**
+ * H5 round 2: posted comment bodies (in posting order) as logical responses:
+ * every multipart answer becomes ONE whole body, other comments are unchanged.
+ */
+export function logicalCommentBodies(comments: readonly { id: string; body: string; metadata?: unknown }[]): string[] {
+  const bodies: string[] = [];
+  const seen = new Set<string>();
+  for (const comment of comments) {
+    const part = readAnswerPartMetadata(comment.metadata);
+    if (!part) { bodies.push(comment.body); continue; }
+    if (seen.has(part.answerId)) continue;
+    seen.add(part.answerId);
+    const whole = assembleAnswerParts(comment, comments);
+    if (whole) { bodies.push(whole.text); continue; }
+    // Incomplete: what each posted part really showed, without its additions.
+    for (const other of comments) {
+      const otherPart = readAnswerPartMetadata(other.metadata);
+      if (otherPart?.answerId === part.answerId) bodies.push(answerPartContent(other.body, otherPart) ?? other.body);
+    }
+  }
+  return bodies;
 }
 
 /**
@@ -1168,7 +1250,23 @@ export function buildHeartbeatRunIssueComment(
   return resolveHeartbeatRunResponse({ resultJson }).text;
 }
 
-export function findHeartbeatRunCompletionComment<T extends { id: string; presentation?: unknown }>(
+/**
+ * The run's completion comment as ONE logical response (H5 round 2): when the
+ * latest answer was posted in ordered parts, ALL its parts are assembled in
+ * order into the whole answer (byte-equal to the source), identified by its
+ * first part (the acknowledged reply) with every part id in order.
+ */
+export function findHeartbeatRunCompletionComment<T extends { id: string; presentation?: unknown; body?: string | null; metadata?: unknown }>(
+  comments: T[],
+  resultJson: Record<string, unknown> | null | undefined,
+): (T & { answerPartCommentIds?: string[] }) | null {
+  const found = findHeartbeatRunCompletionCommentRow(comments, resultJson);
+  if (!found) return null;
+  const whole = assembleAnswerParts(found, comments);
+  return whole ? { ...whole.first, body: whole.text, answerPartCommentIds: whole.partIds } : found;
+}
+
+function findHeartbeatRunCompletionCommentRow<T extends { id: string; presentation?: unknown }>(
   comments: T[],
   resultJson: Record<string, unknown> | null | undefined,
 ): T | null {

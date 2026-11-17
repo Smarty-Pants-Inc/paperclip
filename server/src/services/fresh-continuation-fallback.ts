@@ -34,7 +34,7 @@ import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.
 import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuationCauseIsSystemOwnedSql, continuesAutomaticallySql,
   isPersonOwnedFailureCode } from "./continuation-cause.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
-import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, readThinkingOnlyCapStop, shownCutAnswer,
+import { cutAnswerContinuationInstruction, logicalCommentBodies, readFailedTurnStreamedAnswer, readThinkingOnlyCapStop, shownCutAnswer,
   THINKING_CAP_STOP_CONTINUATION_INSTRUCTION, type CutAnswerCause } from "./heartbeat-run-summary.js";
 import { readRunAnswerEvents, readThinkingCapStop } from "./thinking-cap-stop.js";
 
@@ -295,9 +295,12 @@ export async function readSourceRunCutAnswer(tx: Pick<Db, "select">,
   // dl-n5-cont4: compared with what the run REALLY posted (its comments in the
   // DB), item by item: the opening quotes the ending the person was shown and
   // never says none was shown when some was.
-  const postedBodies = (await tx.select({ body: issueComments.body }).from(issueComments).where(and(
+  // H5 round 2: a prefix posted in ordered parts is ONE logical response; its
+  // part labels and fence wrappers (recorded on each part) are removed first.
+  const postedBodies = logicalCommentBodies(await tx.select({ id: issueComments.id, body: issueComments.body,
+    metadata: issueComments.metadata }).from(issueComments).where(and(
     eq(issueComments.companyId, run.companyId), eq(issueComments.createdByRunId, run.id), isNull(issueComments.deletedAt)))
-    .orderBy(asc(issueComments.createdAt), asc(issueComments.id))).map(row => row.body);
+    .orderBy(asc(issueComments.createdAt), asc(issueComments.id)));
   const shown = shownCutAnswer(cut, postedBodies);
   if (!shown) return { text: cut.text, cause: cut.cause, posted: false };
   return { text: shown.text, cause: cut.cause, posted: true, ...(shown.whole ? {} : { partial: true }) };

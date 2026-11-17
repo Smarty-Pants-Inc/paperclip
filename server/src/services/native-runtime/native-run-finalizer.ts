@@ -1307,7 +1307,8 @@ async function recoverCommittedNativeChatResponseInScope(
           }), ...rebuiltCandidates],
         });
         if (!finalAgentMessage && !blockedTaskReply) return false;
-        const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation })
+        const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation,
+          metadata: issueComments.metadata })
           .from(issueComments).where(and(
             eq(issueComments.companyId, input.companyId),
             eq(issueComments.issueId, input.issueId),

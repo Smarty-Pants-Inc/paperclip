@@ -2430,6 +2430,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         id: issueComments.id,
         body: issueComments.body,
         presentation: issueComments.presentation,
+        // H5 round 2: part metadata, so a multipart answer is read back whole.
+        metadata: issueComments.metadata,
       })
       .from(issueComments)
       .where(
