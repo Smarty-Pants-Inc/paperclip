@@ -9,6 +9,7 @@ import {
 } from "@paperclipai/db";
 import { providerResourceDispositionForTerminalRun } from "./runner-environment-lifecycle.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { agentExecutionStopBlocker } from "./agent-execution-stop.js";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
 
 // adopt-stopu: no handed-off lease. The stopped run's lease is released as its
@@ -148,4 +149,13 @@ const support = await getEmbeddedPostgresTestSupport();
     // The pre-Stop held messages are not started by the automatic pass (Send-only).
     expect((await wakeOf(f.queueId)).status).toBe("deferred_issue_execution");
   }, 60_000);
+  // adopt-stopu PAUSE row (unit): after a Stop + a successor, the agent's pause is not
+  // held by remote_stop_unconfirmed (agent-execution-stop.ts executionStopBlocker): the
+  // stop_and_retain release wrote the receipt. RED at c1x (the warm handoff has none).
+  it("PAUSE: after a Stop + a successor, no remote_stop_unconfirmed blocker holds the agent's pause", async () => {
+    const f = await seed();
+    await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "native", status: "succeeded", contextSnapshot: { issueId: f.issueId }, finishedAt: new Date() });
+    expect(await agentExecutionStopBlocker(db, [f.agentId])).not.toBe("remote_stop_unconfirmed");
+  });
 });
