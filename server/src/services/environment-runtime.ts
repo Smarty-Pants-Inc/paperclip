@@ -1853,6 +1853,7 @@ function createSandboxEnvironmentDriver(
 
   async function cleanupObsoleteReusableSandboxLeases(input: {
     environment: Environment;
+    providerConfigForLease: Record<string, unknown>;
     leases: EnvironmentLease[];
     reusableLeases: EnvironmentLease[];
     adapterType: string | null;
@@ -1885,7 +1886,7 @@ function createSandboxEnvironmentDriver(
       // Harness custody excludes workspace writes after finalize: a changed
       // source must stop and keep even with a verified backup or non-native adapter.
       // Boat keeps stopped disks >=14 days, without compute: https://docs.boat.dev/limits
-      if (!sandboxLeaseSourceMatches(input.environment.config, lease.metadata ?? {})
+      if (!sandboxLeaseSourceMatches(input.providerConfigForLease, lease.metadata ?? {})
         || (!knownNonNative
           && (!lease.providerLeaseId || !await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
             stamp: await obsoleteLeaseCustodyStamp(lease), providerLeaseId: lease.providerLeaseId })))) {
@@ -2151,6 +2152,7 @@ function createSandboxEnvironmentDriver(
         if (reusableCandidateLeases.length > reusableExistingLeases.length || closedActiveTips.length > 0) {
           await cleanupObsoleteReusableSandboxLeases({
             environment: input.environment,
+            providerConfigForLease,
             leases: reusableCandidateLeases,
             reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
             adapterType: input.adapterType ?? null,
@@ -2590,6 +2592,7 @@ function createSandboxEnvironmentDriver(
       if (reusableCandidateLeases.length > reusableExistingLeases.length || closedActiveTips.length > 0) {
         await cleanupObsoleteReusableSandboxLeases({
           environment: input.environment,
+          providerConfigForLease,
           leases: reusableCandidateLeases,
           reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
           adapterType: input.adapterType ?? null,
