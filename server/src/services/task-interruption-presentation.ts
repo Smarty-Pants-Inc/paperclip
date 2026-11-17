@@ -24,6 +24,7 @@ import { chatActionDeadline } from "./chat-action-work.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { isAcknowledgedLegacyUserStop, isQueuedDependencyWait, runStopPresentationJson } from "./run-cancellation.js";
 import { heldRetryOffersRetry } from "./task-retry-eligibility.js";
+import { readRetryStopGate, RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_REASON } from "./task-retry-stop-gate.js";
 import { exhaustedNativeFinalizationCondition, savedResultRetryPendingCondition } from "./native-runtime/exhausted-finalization-retry.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON } from "../modules/run-dispatch/index.js";
@@ -96,6 +97,8 @@ type ProjectionState = {
   approval: boolean;
   /** A board-owned workspace-owner fence on this run that no automatic proof has released. */
   ownerStopRequired?: boolean;
+  /** The previous run's Stop stayed unproven past the Retry bound (task-retry-stop-gate). */
+  retryStopUnproven?: boolean;
   unidentifiedLaunchConfirmable?: boolean;
   /** The latest wake for a task with no run yet, when admission refused it. */
   admissionWait?: { id: string; status: string; reason: string | null; agentId: string };
@@ -270,6 +273,9 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   // The previous controller cannot confirm its own stop. Name the one board
   // action instead of showing the fenced run as working (RC-47).
   if (input.ownerStopRequired) return { ...base, responsibility: "user", state: "waiting_for_user", userAction: "confirm_owner_stop" };
+  // Same predicate as admission and the Retry API: no Retry, one instruction.
+  if (input.retryStopUnproven) return { ...base, state: "failed", canRetry: false,
+    retryWait: { reason: RETRY_STOP_UNPROVEN_REASON, message: RETRY_STOP_UNPROVEN_MESSAGE } };
   // The task's existing dependency UI owns this wait. Keep actual recovery and
   // Retry preparation failures authoritative; this does not change admission.
   if (!action && !retryWait?.preparationStatus && isQueuedDependencyWait(run)) return base;
@@ -807,6 +813,11 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     [...runMap].flatMap(([issueId, run]) => run.errorCode === NATIVE_SESSION_CLEANUP_QUARANTINED ? [{ issueId, run }] : []));
   const confirmableLaunches = new Set(launchWaits.filter(entry => launchRefusals.get(entry.run.id) === null).map(entry => entry.issueId));
   const now = Date.now();
+  const retryStopUnproven = new Set<string>();
+  for (const [issueId, run] of runMap) {
+    if (run.runtimeMode === "native" && run.finishedAt && (await readRetryStopGate(db, { companyId, issueId, sourceRunId: run.id, now }))?.state === "expired")
+      retryStopUnproven.add(issueId);
+  }
   for (const issue of selected) {
     const required = requirements.get(issue.id);
     const denied = required?.projectIds.filter(projectId => currentAccess.get(`${issue.assigneeAgentId}:${projectId}`) !== true);
@@ -824,6 +835,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       agent: agentMap.get(issue.assigneeAgentId ?? ""), project: projectMap.get(issue.projectId ?? ""),
       company: companyRows[0], paused: pauses.has(issue.id), approval: approvalsSet.has(issue.id),
       ownerStopRequired: ownerStopRequired.has(`${issue.id}:${facts.run?.id}`),
+      retryStopUnproven: retryStopUnproven.has(issue.id),
       unidentifiedLaunchConfirmable: confirmableLaunches.has(issue.id),
       admissionWait: admissionWaitMap.get(issue.id),
       retryDependencies: retryDependencyMap.get(issue.id),
