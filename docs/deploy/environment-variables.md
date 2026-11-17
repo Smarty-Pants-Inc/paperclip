@@ -36,6 +36,7 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_BOARD_CHAT_MAX_CONCURRENT` | `3` | Maximum concurrent board concierge chats per server. Only absence uses the default; malformed values stop startup (see cap configuration below). |
 | `PAPERCLIP_STATUS_CARD_AGENT_MAX_CARDS` | `20` | Maximum status cards authored by one agent over its lifetime, including archived cards. Applies to every agent on the server. Only absence uses the default; malformed values stop startup (see cap configuration below). |
 | `PAPERCLIP_FRESH_CONTINUATIONS_PER_CHAIN` | `2` | Maximum automatic fresh continuations per source-run chain, counted durably across restarts; the separate 6-per-task hourly limit still applies. Only absence uses the default; malformed values stop startup (see cap configuration below). |
+| `PAPERCLIP_DEFAULT_MAX_REVIEW_ROUNDS` | `3` | Default number of consecutive agent changes-requested review rounds before escalation to the responsible human, when an issue has no `executionPolicy.maxReviewRounds`. The issue's own value still wins and its validator maximum remains 50; the server default can exceed 50. Only absence uses the default; malformed values stop startup (see cap configuration below). |
 
 Daytona connectivity for `paperclip_runner` uses authenticated provider
 WebSocket ingress and follows the instance experimental setting

@@ -6,6 +6,7 @@ const CAP_ENVIRONMENT_VARIABLES = [
   "PAPERCLIP_BOARD_CHAT_MAX_CONCURRENT",
   "PAPERCLIP_STATUS_CARD_AGENT_MAX_CARDS",
   "PAPERCLIP_FRESH_CONTINUATIONS_PER_CHAIN",
+  "PAPERCLIP_DEFAULT_MAX_REVIEW_ROUNDS",
 ] as const;
 
 /** Only absence selects the owner's default; a typo must never restore a cap. */
