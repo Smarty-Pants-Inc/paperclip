@@ -3,6 +3,7 @@ import { agentFileHoldWriteCondition, pinLeaseForCollection, unpinLeaseForCollec
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { randomUUID } from "node:crypto";
 import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { agents, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
@@ -52,6 +53,10 @@ function settled(row: Copy): boolean {
 export const AGENT_FILE_UNCHANGED_OBSERVATION_TIMEOUT_MS = 15_000;
 /** The stopped-collection worker's awaitingStop text (agent-instruction-working-copies.ts). */
 const AWAITING_STOP_MESSAGE = "The provider's stop has not been confirmed. Instruction collection is pending; no save is claimed.";
+/** Row 23l: why a worker-flipped copy was written back to warm_saved. */
+export const STOP_FLIP_RESTORE_REASON = "proven_unchanged_after_stop_unconfirmed_flip";
+export type AgentFileStopFlipRestore = { reason: typeof STOP_FLIP_RESTORE_REASON; proofId: string; baselineHash: string;
+  flippedErrorCode: "INSTRUCTION_STOP_UNCONFIRMED"; observedDigest: string; materializationIdentity: string; provenAt: string };
 const SAVE_RETRY_MS = 30_000;
 const SAVE_MAX_RETRY_MS = 6 * 60 * 60_000;
 function saveRetryAt(since: Date, now = Date.now()) {
@@ -388,10 +393,21 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Agent directory observation timed out")), timeoutMs); }),
       ]);
       if (observed.identity !== row.receipt.materializationIdentity || observed.digest !== expected) return null;
+      // 23k: ONE short CAS transaction (tryPatch), no network inside it, guarded
+      // on the worker's flip and on the SAME row the hash was proven against:
+      // its baseline (baseHash), its materialization, and its last write
+      // (updatedAt, as the worker's own claim). Anything else writes nothing.
+      // 23l: the restore carries its audit record; only our own proof counts.
+      const proof: AgentFileStopFlipRestore = { reason: STOP_FLIP_RESTORE_REASON, proofId: randomUUID(), baselineHash: row.baseHash,
+        flippedErrorCode: "INSTRUCTION_STOP_UNCONFIRMED", observedDigest: observed.digest, materializationIdentity: observed.identity, provenAt: new Date().toISOString() };
       const restored = await patch(row, { state: "warm_saved", errorCode: null, errorMessage: null, nextAttemptAt: null, attempts: 0,
-        receipt: { ...row.receipt, checkpointState: "unchanged" } },
-      and(isNull(copies.processStoppedAt), eq(copies.errorCode, "INSTRUCTION_STOP_UNCONFIRMED")));
-      return restored.state === "warm_saved" && restored.errorCode === null && restored.baseHash === row.baseHash ? restored : null;
+        receipt: { ...row.receipt, checkpointState: "unchanged", stopFlipRestore: proof } },
+      and(eq(copies.state, "pending_collection"), eq(copies.errorCode, "INSTRUCTION_STOP_UNCONFIRMED"), eq(copies.baseHash, row.baseHash),
+        isNull(copies.processStoppedAt), sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'savePending')`,
+        sql`${copies.receipt}->>'materializationIdentity' = ${row.receipt.materializationIdentity}`,
+        sql`date_trunc('milliseconds', ${copies.updatedAt}) = ${row.updatedAt.toISOString()}::timestamptz`));
+      const applied = (restored.receipt?.stopFlipRestore as AgentFileStopFlipRestore | undefined)?.proofId === proof.proofId;
+      return applied && restored.state === "warm_saved" && restored.errorCode === null && restored.baseHash === row.baseHash ? restored : null;
     } catch (error) {
       logger.warn({ err: error, runId: row.runId }, "Agent directory unchanged observation failed; counted as changed");
       return null;
