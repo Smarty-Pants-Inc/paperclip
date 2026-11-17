@@ -50,6 +50,7 @@ import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_CARD_ANSWER_TEXT,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
 import * as sweepModule from "./unanswered-person-message.js";
+import { completedPersonMessageAnswerSql, answeredPersonMessageSql, unansweredCardAnswerSql } from "../person-message-answer.js";
 import * as pendingModule from "./automatic-recovery-pending.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
@@ -164,6 +165,42 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     };
     return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, at, nativeSuccessor };
   }
+  // The run's OWN pending input, as the continuation carry writes it (readContinuationCommentInput; a card answer as
+  // interactionIds/interactionId). RFL F2 (22:41Z) attributes an answer only through it.
+  const carryInto = async (runId: string, input: Record<string, unknown>) => {
+    const [row] = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...(row!.context as Record<string, unknown> ?? {}), ...input } })
+      .where(eq(heartbeatRuns.id, runId));
+  };
+
+  it("JUDGE never-OK: a failed run's progress reply neither answers nor removes pending input", async () => {
+    const f = await fixture();
+    const m = await f.message("Finish the real requested work, not merely progress.");
+    const r = await f.run({ commentId: m, status: "failed", errorCode: "adapter_failed" });
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: "Progress only; not the final answer.",
+      authorType: "agent", authorAgentId: f.agentId, createdByRunId: r, createdAt: f.at() });
+    const carry = await readContinuationCommentInput(db, { ...f, runId: r });
+    const decision = await settleUnansweredPersonMessage(db, f);
+    await f.sweep(); await f.sweep();
+    const notes = await f.visible();
+    console.log("JUDGE_FAILED_PROGRESS", JSON.stringify({ messageId: m, failedRunId: r, carry, decision, notices: notes.map(n => ({ id: n.id, body: n.body })) }));
+    expect((carry.wakeCommentIds as string[] | undefined) ?? [], "failed partial is NOT ANSWERED: input must survive").toContain(m);
+  });
+
+  it("JUDGE never-OK: ancestry-only M1 is not answered by a succeeded run carrying only M2", async () => {
+    const f = await fixture();
+    const m1 = await f.message("M1 still needs its answer.");
+    const root = await f.run({ commentId: m1, status: "failed", errorCode: "adapter_failed" });
+    const m2 = await f.message("M2 is different work.");
+    const successor = await f.run({ commentId: m2, status: "succeeded", retryOfRunId: root });
+    await f.reply(successor);
+    const carry = await readContinuationCommentInput(db, { ...f, runId: root });
+    const decision = await settleUnansweredPersonMessage(db, f);
+    await f.sweep(); await f.sweep();
+    const notes = await f.visible();
+    console.log("JUDGE_ANCESTRY_ONLY", JSON.stringify({ m1, root, m2, succeededRun: successor, carry, decision, notices: notes.map(n => ({ id: n.id, body: n.body })) }));
+    expect((carry.wakeCommentIds as string[] | undefined) ?? [], "only answering run's OWN pending input counts").toContain(m1);
+  });
 
   const codeOf = (comment: { metadata: unknown }) => {
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
@@ -618,6 +655,98 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
+  // ANSWERED vs DELIVERED (RFL 21:28Z/21:29Z): only a completed run's FINAL answer answers a message.
+  const messageState = async (f: { companyId: string; issueId: string }, id: string) => {
+    const m = { id: sql`${id}::uuid`, companyId: sql`${f.companyId}::uuid`, issueId: sql`${f.issueId}::uuid`,
+      createdAt: sql`(select created_at from issue_comments where id = ${id}::uuid)` };
+    const [row] = await db.select({ delivered: answeredPersonMessageSql(m), answered: completedPersonMessageAnswerSql(m) })
+      .from(issues).where(eq(issues.id, f.issueId));
+    return row!;
+  };
+  const progress = async (f: { companyId: string; issueId: string; agentId: string; at: () => Date }, runId: string,
+    body = "Working on it: reading the files now.") => {
+    const [row] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: runId, createdAt: f.at() }).returning();
+    return row!.id;
+  };
+
+  it("RED ANSWERED: a run that posted a progress comment and then FAILED -> delivered, not answered: exactly one notice; a completed run's final answer then supersedes it", async () => {
+    const f = await fixture();
+    const commentId = await f.message("Please fix the build.");
+    const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    await progress(f, failed);
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: false });
+    await f.sweep(); await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    // The carry still carries it (continuation-comment-input.ts reads the same ANSWERED).
+    expect(await readContinuationCommentInput(db, { ...f, runId: failed })).toMatchObject({ wakeCommentIds: [commentId] });
+    // A completed run's final answer (its presentation decision names it) answers it: the notice is superseded.
+    const retry = await f.run({ commentId, status: "succeeded", retryOfRunId: failed });
+    const finalId = await progress(f, retry, "Fixed: the build is green.");
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "create", commentId: finalId } } })
+      .where(eq(heartbeatRuns.id, retry));
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: true });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    expect(await readContinuationCommentInput(db, { ...f, runId: failed })).toEqual({});
+  });
+
+  it.each(["cancelled", "timed_out", "interrupted"] as const)(
+    "RED ANSWERED: a %s run's partial reply is delivered, never answered", async status => {
+      const f = await fixture();
+      const commentId = await f.message();
+      await f.reply(await f.run({ commentId, status, errorCode: status === "cancelled" ? "cancelled" : status }));
+      expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: false });
+    });
+
+  it("RED ANSWERED: a SUCCEEDED run's progress comment is not its final answer when its presentation decision names another", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const done = await f.run({ commentId, status: "succeeded" });
+    // The presentation decision (native-run-finalizer.ts presentationDecision.commentId) names a different comment as
+    // the final answer -> the earlier progress comment is not it.
+    const early = await progress(f, done, "Still checking.");
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "create", commentId: randomUUID() } } })
+      .where(eq(heartbeatRuns.id, done));
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: false });
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "reuse", commentId: early } } })
+      .where(eq(heartbeatRuns.id, done));
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: true });
+  });
+
+  it("RED card point (1): an OPEN card asked by the carrying run that then FAILED holds the duty (no notice); once answered, the card-answer duty takes over", async () => {
+    const f = await fixture();
+    const commentId = await f.message("Ship it; ask me which region first.");
+    const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    await progress(f, failed);
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "ask_user_questions",
+      status: "pending", createdByAgentId: f.agentId, sourceRunId: failed, addresseeUserId: f.userId,
+      payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
+        options: [{ id: "eu", label: "EU" }] }] } as never, createdAt: f.at() }).returning();
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: true });
+    await f.sweep(); await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    // The person answers; its answer-resume run fails after a progress comment: the CARD ANSWER is now the owed input.
+    const resolvedAt = f.at();
+    await db.update(issueThreadInteractions).set({ status: "answered", resolvedByUserId: f.userId, resolvedAt })
+      .where(eq(issueThreadInteractions.id, card!.id));
+    const resume = await f.run({ status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, interactionId: card!.id,
+      interactionStatus: "answered", source: "issue.interaction.respond" } }).where(eq(heartbeatRuns.id, resume));
+    await progress(f, resume, "On it: deploying to EU.");
+    const owed = async () => (await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions)
+      .where(and(eq(issueThreadInteractions.id, card!.id), unansweredCardAnswerSql("issue_thread_interactions", new Date())))).length;
+    expect(await owed()).toBe(1);
+    expect(await messageState(f, commentId)).toEqual({ delivered: true, answered: true });
+    await f.sweep(); await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card!.id}`);
+  });
+
   it("no false notice: a task with no person message (an agent or timer wake failed) adds none", async () => {
     const f = await fixture();
     await f.run({ commentId: null, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost", wakeReason: "heartbeat_timer" });
@@ -625,7 +754,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
-  it.each(["retry", "native-status"])("supersedes(D10 row 12): ordered chain rule: PV2b chain: a comment-less %s continuation supersedes its ancestor's notice", async kind => {
+  it.each(["retry", "native-status"])("supersedes(RFL F2 pending-only attribution, 22:41Z): supersedes(D10 row 12): ordered chain rule: PV2b chain: a comment-less %s continuation does not; one carrying the message supersedes its ancestor's notice", async kind => {
+    // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
+    // Was: the comment-less continuation's reply answered the ancestor's message through retry/native-status ancestry.
     const f = await fixture();
     const commentId = await f.message("What about my follow-up?");
     const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_workspace_required" });
@@ -636,6 +767,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const continuation = kind === "native-status" ? await f.nativeSuccessor(failed)
       : await f.run({ commentId: null, status: "succeeded", retryOfRunId: failed, wakeReason: "issue_continuation_needed" });
     await f.reply(continuation);
+    expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId }), "ancestry is not attribution")
+      .toEqual({ kind: "noticed_before" });
+    expect(await f.visible()).toHaveLength(1);
+    await carryInto(continuation, { wakeCommentIds: [commentId] });
     const outcome = await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
     expect(outcome).toEqual({ kind: "answered" });
     expect(await f.visible()).toHaveLength(0);
@@ -1609,7 +1744,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.sweep();
       expect((await f.visible())[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
     }
+    // supersedes(RFL 21:28Z ANSWERED): the paused (cancelled) run's own late reply is delivered, not an answer: the stop note stays.
     await f.reply(stopped);
+    await f.sweep();
+    expect((await f.visible()).map(n => n.body)).toEqual(["Managed Pi was paused before it answered your message. Send it again to continue."]);
+    // A COMPLETED run carrying the message publishes its final answer: that supersedes the note.
+    await f.reply(await f.run({ commentId, status: "succeeded" }));
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
@@ -1766,9 +1906,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await f.owed()).toEqual([f.m14]);
     });
 
-    it("R-ONCE chain guard: the retry successor of M0014's OWN carrying run answers it, though its wake names only M0015", async () => {
+    it("supersedes(RFL F2 pending-only attribution, 22:41Z): R-ONCE chain guard: the retry successor of M0014's OWN carrying run does NOT answer it when its own input names only M0015", async () => {
+      // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
+      // Was: the retry successor answered M0014 through retryOfRunId ancestry (the judge's ancestry-only never-OK).
       const f = await liveCase((_m14, m15) => ({ wakeCommentId: m15 }));
       await db.update(heartbeatRuns).set({ retryOfRunId: f.carrying }).where(eq(heartbeatRuns.id, f.answering));
+      expect(await f.owed()).toEqual([f.m14]);
+      expect(await readContinuationCommentInput(db, { ...f, runId: f.carrying })).toMatchObject({ wakeCommentIds: [f.m14] });
+      await carryInto(f.answering, { wakeCommentIds: [f.m14, f.m15] });
       expect(await f.owed()).toEqual([]);
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
       expect(await readContinuationCommentInput(db, { ...f, runId: f.carrying })).toEqual({});
@@ -1813,12 +1958,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   it.each([
     ["carrying", "context"], ["continuation", "context"], ["carrying", "delivery"], ["continuation", "delivery"],
   ] as const)(
-    "PV2b chain: message -> %s card -> answer-resume (%s) fails -> successor final never gets a resend notice", async (cardSource, answerLink) => {
+    "supersedes(RFL F2 pending-only attribution, 22:41Z): PV2b chain: message -> %s card -> answer-resume (%s) fails -> successor final never gets a resend notice", async (cardSource, answerLink) => {
+    // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
+      // Was: the continuation run that presented the card answered M through ancestry alone; it now carries M as its own
+      // pending input, as the retry continuation's carry writes it (recovery/service.ts readContinuationCommentInput).
       const f = await fixture({ status: "in_review" });
       const messageId = await f.message("Build Sol; ask me for the name first.");
       const carryingRunId = await f.run({ commentId: messageId, status: "succeeded" });
       const sourceRunId = cardSource === "carrying" ? carryingRunId
-        : await f.run({ status: "succeeded", retryOfRunId: carryingRunId });
+        : await f.run({ commentId: messageId, status: "succeeded", retryOfRunId: carryingRunId });
       const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
         kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId,
         addresseeUserId: f.userId, continuationPolicy: "wake_assignee", createdAt: f.at(),
@@ -1856,7 +2004,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect((await db.select().from(issueComments).where(eq(issueComments.id, stale!.id)))[0]!.deletedAt).not.toBeNull();
     });
 
-  it("PV2b chain: a final after multiple failed ancestors answers without copied input ids or a card", async () => {
+  it("supersedes(RFL F2 pending-only attribution, 22:41Z): PV2b chain: a final after multiple failed ancestors answers only with the input in its own pending input", async () => {
+    // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
+    // Was: the final answered with no copied input ids, through previousRunId/retryOfRunId ancestry.
     const f = await fixture();
     const messageId = await f.message();
     const root = await f.run({ commentId: messageId, status: "failed", errorCode: "native_run_failed" });
@@ -1865,6 +2015,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, previousRunId: resume,
       wakeReason: "native_status_decision" } }).where(eq(heartbeatRuns.id, final));
     await f.reply(final);
+    expect(await settleUnansweredPersonMessage(db, f), "no copied input: ancestry is not attribution").toMatchObject({ kind: "noticed" });
+    expect(await readContinuationCommentInput(db, { ...f, runId: root })).toMatchObject({ wakeCommentIds: [messageId] });
+    await carryInto(final, { wakeCommentIds: [messageId] });
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
@@ -1912,9 +2065,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
     });
 
-  it("PV2b chain: a pending output-cap continuation never asks for a resend; its final answers the chain", async () => {
+  it("supersedes(RFL F2 pending-only attribution, 22:41Z): PV2b chain: a pending output-cap continuation never asks for a resend; its final answers M only with M in its own pending input", async () => {
+    // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
+    // Was: the comment-less native-status successor's final answered M through ancestry.
     const f = await fixture();
-    const root = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_run_failed" });
+    const messageId = await f.message();
+    const root = await f.run({ commentId: messageId, status: "failed", errorCode: "native_run_failed" });
     // The sweep observes the durable continuation, not a provider-specific
     // output-cap string. No input ids need to be copied into its context.
     const successor = await f.nativeSuccessor(root, "queued");
@@ -1934,6 +2090,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect((await f.visible()).every(note => !note.body.includes("Sending it again"))).toBe(true);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, successor));
     await f.reply(successor);
+    expect((await settleUnansweredPersonMessage(db, f)).kind, "no own input: not answered").not.toBe("answered");
+    expect(await readContinuationCommentInput(db, { ...f, runId: root })).toMatchObject({ wakeCommentIds: [messageId] });
+    await carryInto(successor, { wakeCommentIds: [messageId] });
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     expect(await f.visible()).toHaveLength(0);
   });
@@ -2573,6 +2732,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     }
     const resume = async (f: Awaited<ReturnType<typeof fixture>>, cardId: string, status: string, retryOfRunId?: string) => {
       const id = await f.run({ status, retryOfRunId, errorCode: ["failed"].includes(status) ? "native_run_failed" : null });
+      // RFL F2 (22:41Z): a successor answers the card only when the card answer is its OWN pending input (the card carry's
+      // interactionIds/interactionId), never through retryOfRunId ancestry.
+      if (retryOfRunId) await carryInto(id, { interactionIds: [cardId], interactionId: cardId });
       if (!retryOfRunId) {
         await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, interactionId: cardId,
           interactionStatus: "answered", source: "issue.interaction.respond" } }).where(eq(heartbeatRuns.id, id));
@@ -2583,7 +2745,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       return id;
     };
 
-    it("RED (rf5 RF5_ALL_FAILED_WITH_ANSWER): answer, failed answer-resume, failed successor: ONE true notice for the answer", async () => {
+    it("supersedes(RFL F2 pending-only attribution, 22:41Z): RED (rf5 RF5_ALL_FAILED_WITH_ANSWER): answer, failed answer-resume, failed successor: ONE true notice for the answer", async () => {
+      // RFL F2: the successor carries the answer in its own pending input (resume helper); was ancestry-only.
       const f = await fixture({ status: "in_progress" });
       const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
       const card = await answeredCard(f, root);
@@ -2631,7 +2794,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     });
 
-    it("guard: answer, answer-resume fails, successor answers: no notice", async () => {
+    it("supersedes(RFL F2 pending-only attribution, 22:41Z): guard: answer, answer-resume fails, successor answers: no notice", async () => {
+      // RFL F2: the successor carries the answer in its own pending input (resume helper); was ancestry-only.
       const f = await fixture({ status: "in_progress" });
       const root = await f.run({ commentId: await f.message(), status: "succeeded" });
       const card = await answeredCard(f, root);
@@ -2641,7 +2805,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await cardNotices(f)).toHaveLength(0);
     });
 
-    it("guard: answer, answer-resume fails, successor answers with a new card: no notice", async () => {
+    it("supersedes(RFL F2 pending-only attribution, 22:41Z): guard: answer, answer-resume fails, successor answers with a new card: no notice", async () => {
+      // RFL F2: the successor carries the answer in its own pending input (resume helper); was ancestry-only.
       const f = await fixture({ status: "in_progress" });
       const root = await f.run({ commentId: await f.message(), status: "succeeded" });
       const card = await answeredCard(f, root);
@@ -2843,12 +3008,16 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         expect(await cardNotices(c)).toHaveLength(0);
       });
 
-      it("guard: a later reply on the chain supersedes the stopped chain's notice", async () => {
+      it("supersedes(RFL F2 pending-only attribution, 22:41Z): guard: a later reply on the chain from a run carrying the answer supersedes the stopped chain's notice", async () => {
+        // RFL F2: the replying run must hold the card answer as its OWN pending input; was ancestry-only.
         const c = await stoppedChain();
         const end = c.lastRun.finishedAt!.getTime();
         await settleUnansweredPersonMessage(db, { companyId: c.companyId, issueId: c.issueId, now: new Date(end + 60_000) });
         expect(await c.visible()).toHaveLength(1);
         await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, c.last));
+        await c.reply(c.last); await c.sweep(); await c.sweep();
+        expect(await c.visible(), "ancestry alone does not answer the card").toHaveLength(1);
+        await carryInto(c.last, { interactionIds: [c.card.id], interactionId: c.card.id });
         await c.reply(c.last); await c.sweep(); await c.sweep();
         expect(await c.visible()).toHaveLength(0);
         expect(await cardNotices(c)).toHaveLength(1);
@@ -2942,6 +3111,16 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await f.visible()).toHaveLength(0);
     });
 
+    it("RED card point (2): the sender-stopped run's PARTIAL reply stays under the person-stop exclusion: not answered, no notice", async () => {
+      const f = await stopCase(f => stopFields(f.userId));
+      await f.reply(f.runId);
+      expect(await messageState(f, f.commentId)).toEqual({ delivered: true, answered: false });
+      expect((await f.sweepAt(2 * 60_000)).kind).toBe("person_stopped");
+      expect((await f.sweepAt(11 * 60_000)).kind).toBe("person_stopped");
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+    });
+
     it("RED: the sender's Interrupt (operator_interrupted) of the run that started answering -> no resend notice", async () => {
       const f = await stopCase(f => interruptFields(f.userId, f.issueId), { errorCode: "operator_interrupted" });
       expect((await f.sweepAt(2 * 60_000)).kind).toBe("person_stopped");
@@ -2966,8 +3145,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
     it("RED scope: the run's own message that the model had NOT read yet (no userMessage item) -> its notice stays", async () => {
       const f = await stopCase(f => stopFields(f.userId), { read: false });
+      const pending = await readContinuationCommentInput(db, { ...f, runId: f.runId });
+      console.log("JUDGE_UNREAD_STOP", JSON.stringify({ commentId: f.commentId, stoppedRunId: f.runId, pending }));
+      expect.soft(pending.wakeCommentIds ?? [], "sender stopped but run never started answering: whole exclusion must not apply").toContain(f.commentId);
       await f.sweep();
-      expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+      const visible = await f.visible();
+      console.log("JUDGE_UNREAD_STOP_NOTICE", JSON.stringify({ notices: visible.map(n => ({ id: n.id, body: n.body })) }));
+      expect(visible.map(note => note.body)).toEqual([NOT_ANSWERED]);
     });
 
     it("scope: an unread message the stop carried on into the next turn (held, deferred) -> no resend notice", async () => {
@@ -3078,7 +3262,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // Keep: rf5-famnotices-independent RF5_HELD_RESULT / RF5_LEGACY_HELD_RESULT:
   // the real Stop route leaves M2 in the held list, but the sweep invited a duplicate.
   describe("person-stopped held list (RF5)", () => {
-    async function heldChatCase(mode: "native" | "legacy") {
+    async function heldChatCase(mode: "native" | "legacy", opts: { assistantStarted?: boolean } = {}) {
       const f = await fixture();
       await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: f.userId,
         principalType: "user", membershipRole: "owner", status: "active" });
@@ -3102,7 +3286,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
             claimedAt: startedAt.toISOString() } } }).where(eq(heartbeatRuns.id, runId));
       await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, f.issueId));
       await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId, phase: "observed" });
-      for (const [i, kind] of ["userMessage", "agentMessage"].entries()) {
+      for (const [i, kind] of (opts.assistantStarted === false ? ["userMessage"] : ["userMessage", "agentMessage"]).entries()) {
         await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId,
           seq: await allocateHeartbeatRunEventSeq(db, runId), eventType: "item.started", sourceEventId: `rf5-${randomUUID()}`, payload: { prpEvent: {
             eventType: "item.started", turnId: `turn-${runId}`, itemId: `item-${i}`, payload: { kind, item: { type: kind } } } } });
@@ -3180,6 +3364,42 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         .toHaveLength(0);
     });
 
+    // After Send, the successor answers M2 only; R-ONCE leaves M1 not answered. Which earlier message is owed
+    // applies the person-stop exclusion WHOLE (stoppedBySender AND runStartedAnswering).
+    async function sendAndAnswerM2(f: Awaited<ReturnType<typeof heldChatCase>>, mode: "native" | "legacy") {
+      const queue = await f.queue();
+      await request(f.client).post(`${f.path}/interrupt`).send({ queueId: queue.queueId,
+        revision: queue.revision, targetRunId: null }).expect(200);
+      const successor = await f.run({ commentId: f.m2, status: "succeeded" });
+      await db.update(heartbeatRuns).set({ runtimeMode: mode, wakeupRequestId: f.wakeId })
+        .where(eq(heartbeatRuns.id, successor));
+      await db.update(agentWakeupRequests).set({ status: "coalesced", runId: successor })
+        .where(eq(agentWakeupRequests.id, f.wakeId));
+      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "agent", authorAgentId: f.agentId, createdByRunId: successor, body: "Deployed; here is the receipt." });
+    }
+
+    it.each(["native", "legacy"] as const)("RF5 %s control: after the same sequence, an UNSTOPPED unanswered M1 keeps its ONE notice", async mode => {
+      const f = await heldChatCase(mode);
+      await sendAndAnswerM2(f, mode);
+      // M1's run ended without the sender's Stop (an adapter failure): M1 is owed.
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", resultJson: null })
+        .where(eq(heartbeatRuns.id, f.runId));
+      await f.sweep(12); await f.sweep(13);
+      const notes = await f.notes();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.m1}`);
+    });
+
+    it.each(["native", "legacy"] as const)("RF5 %s control: the sender stopped M1's run BEFORE any assistant item, so M1 owes ONE notice", async mode => {
+      const f = await heldChatCase(mode, { assistantStarted: false });
+      await sendAndAnswerM2(f, mode);
+      await f.sweep(12); await f.sweep(13);
+      const notes = await f.notes();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.m1}`);
+    });
+
     it.each(["native", "legacy"] as const)("RF5 %s: a sent message that fails is no longer silenced by the held list", async mode => {
       const f = await heldChatCase(mode);
       const queue = await f.queue();
@@ -3225,6 +3445,102 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await f.notes()).toHaveLength(0);
       await f.sweep(11);
       expect(await f.notes()).toHaveLength(0);
+    });
+  });
+
+  // Keep: independent held-writer judge caught false waiting/resend copy past the failed run's END bound.
+  // These rows exercise only the sweep; executor-writer removal belongs to its separate repair.
+  describe("held END-bound notice selection", () => {
+    const AUTO_CODE = "native_continuation_requires_reconciliation";
+    const REFUSAL = "runner_state_identity_mismatch: prior_owner_scope_mismatch";
+    const RESEND_ADVICE = /send a new message|send it again|sending it again|try again/i;
+
+    async function conversation(held = true) {
+      const f = await fixture({ chat: false, status: "in_progress" });
+      const end = Date.now();
+      const sessionId = randomUUID();
+      const prior = await f.run({ status: "failed" });
+      await db.update(heartbeatRuns).set({ nativeSessionId: sessionId, createdAt: new Date(end - 14_000),
+        startedAt: new Date(end - 14_000), finishedAt: new Date(end - 13_000) }).where(eq(heartbeatRuns.id, prior));
+      const messageId = await f.message("Continue from the saved conversation; do not repeat stopped work.");
+      await db.update(issueComments).set({ createdAt: new Date(end - 12_000) }).where(eq(issueComments.id, messageId));
+      const refused = await f.run({ commentId: messageId, status: "failed", errorCode: AUTO_CODE,
+        error: held ? REFUSAL : "native_session_supervisor_busy" });
+      await db.update(heartbeatRuns).set({ nativeSessionId: sessionId, createdAt: new Date(end - 11_000),
+        startedAt: new Date(end - 10_000), finishedAt: new Date(end) }).where(eq(heartbeatRuns.id, refused));
+      await db.insert(nativeRunFinalizations).values([prior, refused].map(runId => ({ companyId: f.companyId,
+        issueId: f.issueId, runId, phase: "terminal_failure", failureCode: AUTO_CODE, resultId: null, leaseOwner: null })));
+      return { ...f, messageId, refused, end };
+    }
+    type Conversation = Awaited<ReturnType<typeof conversation>>;
+    const sweep = (f: Conversation, elapsed: number) => settleUnansweredPersonMessage(db,
+      { companyId: f.companyId, issueId: f.issueId, now: new Date(f.end + elapsed) });
+    async function pendingRecovery(f: Conversation) {
+      const now = new Date(f.end + 66);
+      const [action] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "workspace_recovery", status: "resolved", outcome: "restored", ownerType: "system", returnOwnerAgentId: f.agentId,
+        cause: AUTO_CODE, fingerprint: `native-continuation:${f.refused}`, createdAt: now, resolvedAt: new Date(f.end + 115),
+        nextAction: "Continuing automatically from saved work. No action needed.",
+        evidence: { runId: f.refused, continuationDelivery: "pending", executionReconciliation: { runId: f.refused,
+          providerStopped: true, actionOutcome: "mixed", outcomeEvidence: "Saved history retained; unknown actions will not be replayed.",
+          workspaceRepairEvidence: "Continuation starts from saved work in a fresh workspace.",
+          actorId: "execution-recovery", recordedAt: now.toISOString() } } }).returning();
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+        triggerDetail: "system", reason: "issue_recovery_action_restored", status: "deferred_issue_execution",
+        requestedByActorType: "system", requestedByActorId: "execution-recovery", idempotencyKey: `execution-reconciliation:${action!.id}`,
+        payload: { issueId: f.issueId, recoveryActionId: action!.id, commentId: f.messageId,
+          executionWait: { recoveryActionId: action!.id, reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." },
+          _paperclipWakeContext: { issueId: f.issueId, taskId: f.issueId, recoveryActionId: action!.id,
+            commentId: f.messageId, wakeCommentId: f.messageId, wakeCommentIds: [f.messageId], previousRunId: f.refused,
+            retryOfRunId: f.refused, forceFreshSession: true, wakeReason: "issue_recovery_action_restored", source: "execution.reconciled" } } });
+    }
+    async function oneSweepNotice(f: Conversation) {
+      const notes = await f.visible();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.messageId}`);
+      return notes[0]!;
+    }
+
+    it("deferred continuation never starts: at END+10 min the same waiting note becomes the true held notice", async () => {
+      const f = await conversation();
+      await pendingRecovery(f);
+      await sweep(f, 20_000);
+      await db.update(activityLog).set({ createdAt: new Date(f.end + 20_000) }).where(and(
+        eq(activityLog.entityId, f.issueId), eq(activityLog.action, PENDING_WAIT_ACTION)));
+      for (const elapsed of [60_000, 9 * 60_000]) {
+        await sweep(f, elapsed);
+        expect((await f.visible()).map(n => n.body).join("\n")).not.toMatch(RESEND_ADVICE);
+      }
+      const waiting = await oneSweepNotice(f);
+      expect(waiting.body).toBe(WAITING);
+      await sweep(f, PENDING_WAIT_START_BOUND_MS);
+      await sweep(f, PENDING_WAIT_START_BOUND_MS + 1_000);
+      const note = await oneSweepNotice(f);
+      expect(note.id).toBe(waiting.id);
+      expect(note.body).toBe(HELD);
+      expect(codeOf(note)).toBe("runner_state_identity_mismatch");
+      expect(JSON.stringify(note.metadata)).not.toContain("No action is needed; it will start by itself.");
+    });
+
+    it("a first sweep at END+11 min cannot restart the automatic recovery clock or advise resending held input", async () => {
+      const f = await conversation();
+      await pendingRecovery(f);
+      await sweep(f, 11 * 60_000);
+      const first = await oneSweepNotice(f);
+      expect(first.body).toBe(HELD);
+      await sweep(f, 12 * 60_000);
+      expect((await oneSweepNotice(f)).id).toBe(first.id);
+      expect(codeOf(first)).toBe("runner_state_identity_mismatch");
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+        eq(activityLog.action, PENDING_WAIT_ACTION)))).toHaveLength(0);
+    });
+
+    it("guard: a NON-held message past END keeps today's no-run notice", async () => {
+      const f = await conversation(false);
+      await pendingRecovery(f);
+      await sweep(f, 11 * 60_000);
+      await sweep(f, 12 * 60_000);
+      expect((await oneSweepNotice(f)).body).toBe(NO_RUN);
     });
   });
 

@@ -74,6 +74,54 @@ function runResult(summary: string): Record<string, unknown> {
 }
 
 describe("cut native text snapshots", () => {
+  it.each((["reasoning", "agentMessage"] as const).flatMap(kind => [
+    { kind, shape: "ASCII", whole: "r".repeat(4354) },
+    { kind, shape: "multibyte", whole: "😀é" + "r".repeat(4348) },
+  ]))("keeps all 4,354 streamed bytes for bounded_text $shape $kind snapshots", ({ kind, whole }) => {
+    const body = Array.from(whole).slice(0, 3988).join("");
+    const payload = { kind, channel: kind === "reasoning" ? "detail" : "final" };
+    const completion = itemEvent(3, "item.completed", "bounded-1", { ...payload, text: body + "…[truncated]" });
+    const entries = nativeRunEventsToTranscript([
+      itemEvent(1, "item.delta", "bounded-1", { ...payload, text: whole.slice(0, 2000) }),
+      itemEvent(2, "item.delta", "bounded-1", { ...payload, text: whole.slice(2000) }), completion,
+    ]);
+    const items = transcriptToTaskChatItems(entries, { runId: RUN_ID, running: false });
+    const rendered = items.map(item => item.kind === "thinking" ? item.lines.join("\n") : item.kind === "message" ? item.text : "").join("");
+    expect(Buffer.byteLength(rendered)).toBe(4354);
+    expect(rendered).toBe(whole);
+    expect(JSON.stringify(entries)).not.toContain("[truncated]");
+    expect(nativeRunEventsToTranscript([completion])[0]).toMatchObject({ text: body +
+      `\n\nThe full ${kind === "reasoning" ? "thinking" : "response"} is kept in the run log.` });
+  });
+
+  it.each(["reasoning", "agentMessage"] as const)("preserves literal terminal markers outside both runner cut windows for %s, including reload", kind => {
+    const payload = { kind, channel: kind === "reasoning" ? "detail" : "final" };
+    for (const body of ["The literal marker is ", "r".repeat(3987), "r".repeat(3989), "é".repeat(3987), "é".repeat(3989), "😀".repeat(1994), "r".repeat(4092), "r".repeat(4097), "é".repeat(4093)]) {
+      const value = body + "…[truncated]";
+      const completion = itemEvent(2, "item.completed", "literal-1", { ...payload, text: value });
+      for (const deltas of [[], [itemEvent(1, "item.delta", "literal-1", { ...payload, text: "An earlier draft" })]]) {
+        const entries = nativeRunEventsToTranscript([...deltas, completion]);
+        expect(entries[0]).toMatchObject({ text: value });
+        expect(JSON.stringify(entries)).not.toContain("is kept in the run log");
+      }
+    }
+  });
+
+  it.each(["reasoning", "agentMessage"] as const)("recognizes every UTF-8 cap boundary for %s by bytes, not string length", kind => {
+    const payload = { kind, channel: kind === "reasoning" ? "detail" : "final" };
+    for (const bytes of [4093, 4094, 4095, 4096]) {
+      const body = "é".repeat(2046) + "r".repeat(bytes - 4092);
+      const whole = body + "😀" + "tail".repeat(65);
+      const completion = itemEvent(2, "item.completed", "boundary-1", { ...payload, text: body + "…[truncated]" });
+      expect(Buffer.byteLength(body)).toBe(bytes);
+      expect(nativeRunEventsToTranscript([
+        itemEvent(1, "item.delta", "boundary-1", { ...payload, text: whole }), completion,
+      ])[0]).toMatchObject({ text: whole });
+      expect(nativeRunEventsToTranscript([completion])[0]).toMatchObject({ text: body +
+        `\n\nThe full ${kind === "reasoning" ? "thinking" : "response"} is kept in the run log.` });
+    }
+  });
+
   it.each(["reasoning", "agentMessage"] as const)("preserves streamed %s instead of preferring a cut completion", kind => {
     const whole = "é" + "r".repeat(4352);
     const cut = Buffer.from(whole).subarray(0, 4096).toString() + "…[truncated]";
@@ -266,7 +314,8 @@ describe("native proposed-plan presentation", () => {
     ]);
     expect(transcript[0]).toMatchObject({ kind: "assistant", text: "Plan ready." });
 
-    const fenced = "Format:\n```\n<proposed_plan>\n# Plan…[truncated]";
+    const fencedBody = "Format:\n```\n<proposed_plan>\n# Plan".padEnd(4096, "r");
+    const fenced = fencedBody + "…[truncated]";
     const fencedTranscript = nativeRunEventsToTranscript([
       itemEvent(1, "item.completed", "msg-2", { kind: "agentMessage", channel: "final", text: fenced }),
       event(2, "plan.proposed", {
@@ -274,7 +323,7 @@ describe("native proposed-plan presentation", () => {
         markdown: "# Other", source: "codex_plan_item",
       }),
     ]);
-    expect(fencedTranscript[0]).toMatchObject({ kind: "assistant", text: "Format:\n```\n<proposed_plan>\n# Plan\n\nThe full response is kept in the run log." });
+    expect(fencedTranscript[0]).toMatchObject({ kind: "assistant", text: fencedBody + "\n\nThe full response is kept in the run log." });
     expect(JSON.stringify(fencedTranscript)).not.toContain("[truncated]");
   });
 

@@ -175,11 +175,51 @@ describe("paperclip runner transcript projection", () => {
     if (kind === "reasoning") expect(items[0]).toMatchObject({ streaming: false });
   });
 
+  it.each((["reasoning", "agentMessage"] as const).flatMap(kind => [
+    { kind, shape: "ASCII", whole: "r".repeat(4354) },
+    { kind, shape: "multibyte", whole: "😀é" + "r".repeat(4348) },
+  ]))("keeps all 4,354 streamed bytes for bounded_text $shape $kind snapshots", ({ kind, whole }) => {
+    // provider_events.rs bounded_text: 4,000 Rust chars minus the 12-char marker.
+    const body = Array.from(whole).slice(0, 3988).join("");
+    const cut = body + "…[truncated]";
+    expect(Buffer.byteLength(whole)).toBe(4354);
+    expect(Array.from(body)).toHaveLength(3988);
+    expect(Buffer.byteLength(body)).toBeLessThan(4093);
+    const entries = normalizeTranscript(projectText(kind, [whole.slice(0, 2000), whole.slice(2000)], cut), false);
+    expect(entries[0]).toMatchObject({ text: whole });
+    expect(JSON.stringify(entries)).not.toContain("[truncated]");
+    expect(projectText(kind, [], cut)[0]).toMatchObject({ text: body +
+      `\n\nThe full ${kind === "reasoning" ? "thinking" : "response"} is kept in the run log.` });
+  });
+
   it.each(["reasoning", "agentMessage"] as const)("shows the %s body and a truthful log notice without a stream", kind => {
     const entries = projectText(kind, [], cutThinking);
     expect(entries[0]).toMatchObject({ text: cutThinking.slice(0, -"…[truncated]".length) +
       `\n\nThe full ${kind === "reasoning" ? "thinking" : "response"} is kept in the run log.` });
     expect(JSON.stringify(entries)).not.toContain("[truncated]");
+  });
+
+  it.each(["reasoning", "agentMessage"] as const)("preserves literal terminal markers outside both runner cut windows for %s, including reload", kind => {
+    for (const body of ["The literal marker is ", "r".repeat(3987), "r".repeat(3989), "é".repeat(3987), "é".repeat(3989), "😀".repeat(1994), "r".repeat(4092), "r".repeat(4097), "é".repeat(4093)]) {
+      const value = body + "…[truncated]";
+      for (const chunks of [[], ["An earlier draft"]]) {
+        const entries = normalizeTranscript(projectText(kind, chunks, value), false);
+        expect(entries[0]).toMatchObject({ text: value });
+        expect(JSON.stringify(entries)).not.toContain("is kept in the run log");
+      }
+    }
+  });
+
+  it.each(["reasoning", "agentMessage"] as const)("recognizes every UTF-8 cap boundary for %s by bytes, not string length", kind => {
+    for (const bytes of [4093, 4094, 4095, 4096]) {
+      const body = "é".repeat(2046) + "r".repeat(bytes - 4092);
+      const whole = body + "😀" + "tail".repeat(65);
+      const cut = body + "…[truncated]";
+      expect(Buffer.byteLength(body)).toBe(bytes);
+      expect(normalizeTranscript(projectText(kind, [whole], cut), false)[0]).toMatchObject({ text: whole });
+      expect(projectText(kind, [], cut)[0]).toMatchObject({ text: body +
+        `\n\nThe full ${kind === "reasoning" ? "thinking" : "response"} is kept in the run log.` });
+    }
   });
 
   it.each(["reasoning", "agentMessage"] as const)("keeps ordinary equal and legitimately different %s completions authoritative", kind => {

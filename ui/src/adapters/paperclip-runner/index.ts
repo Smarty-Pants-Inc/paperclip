@@ -78,6 +78,12 @@ export function runnerSnapshotText(value: string, previous: string | undefined, 
   const marker = "…[truncated]";
   if (!value.endsWith(marker)) return value;
   const body = value.slice(0, -marker.length);
+  // state.rs redact_text cuts at a UTF-8 boundary at or below 4,096 bytes
+  // (at most three bytes back). provider_events.rs bounded_text instead keeps
+  // 4,000 minus the marker's 12 Unicode code points, matching Rust chars().
+  // A marker outside both cut shapes is literal content, not a runner snapshot.
+  const bodyBytes = new TextEncoder().encode(body).byteLength;
+  if ((bodyBytes < 4_093 || bodyBytes > 4_096) && Array.from(body).length !== 3_988) return value;
   if (previous && previous.startsWith(body)) return previous;
   return `${body}\n\nThe full ${kind} is kept in the run log.`;
 }

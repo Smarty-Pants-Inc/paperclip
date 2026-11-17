@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "./continuation-comment-input.js";
@@ -9,6 +9,7 @@ import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/p
 import { requestTaskRetry } from "./task-retry.js";
 import { heartbeatService } from "./heartbeat.js";
 import { deliverReconciledExecutions } from "./execution-recovery-resolution.js";
+import { answeredPersonMessageSql, completedPersonMessageAnswerSql } from "./person-message-answer.js";
 
 // DREA-31 / data safety: exercise persisted input and answer attribution, not SQL text.
 const support = await getEmbeddedPostgresTestSupport();
@@ -52,8 +53,11 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
       createdByRunId: earlierRun.id, body: "Answer to the earlier one" });
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
-      createdByRunId: f.run.id, body: "COBALT" });
-    // RFL ruling (1), 20:06Z: the parent's OWN published reply answers the comment (carrying it would answer it twice).
+      createdByRunId: f.run.id, body: "Looking into COBALT..." });
+    // RFL 21:28Z (ANSWERED): the parent FAILED, so its own progress comment is delivered, not answered: the carry still carries it.
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
+    // RFL ruling (1), 20:06Z, as ANSWERED: a COMPLETED parent's own final answer answers the comment (carrying it would answer it twice).
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
   });
 
@@ -95,12 +99,83 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     }
   });
 
+  // RFL 21:5xZ (one answered-test): the carry reads ANSWERED alone. The duplicate shape H3 fenced by "the seeding run
+  // SUCCEEDED" is green by itself: a card answer whose answer-resume run COMPLETED its final answer is answered; the
+  // same run's progress comment before it FAILED is only delivered.
+  it("a card answer is ANSWERED only by its answer-resume run's completed final answer, not a failed run's progress", async () => {
+    const f = await fixture();
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, sourceRunId: f.run.id,
+      resolvedByUserId: "board", resolvedAt: new Date(), idempotencyKey: randomUUID(),
+      payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", selectionMode: "single", options: [{ id: "yes", label: "YES" }] }] },
+      result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }] } } as never).returning();
+    const [resume] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      status: "failed", contextSnapshot: { issueId: f.issueId, interactionId: card.id } }).returning();
+    const [reply] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: resume.id, body: "Continuing with YES...", createdAt: new Date(Date.now() + 1_000) }).returning();
+    const state = async () => {
+      const m = { id: sql`${card.id}::uuid`, companyId: sql`${f.companyId}::uuid`, issueId: sql`${f.issueId}::uuid`,
+        createdAt: sql`${card.resolvedAt!.toISOString()}::timestamptz` };
+      const [row] = await db.select({ delivered: answeredPersonMessageSql(m), answered: completedPersonMessageAnswerSql(m) })
+        .from(issues).where(eq(issues.id, f.issueId));
+      return row;
+    };
+    expect(await state()).toEqual({ delivered: true, answered: false });
+    await db.update(heartbeatRuns).set({ status: "succeeded", resultJson: { presentationDecision: { commentAction: "create", commentId: reply.id } } })
+      .where(eq(heartbeatRuns.id, resume.id));
+    expect(await state()).toEqual({ delivered: true, answered: true });
+  });
+
+  // RFL F2 (22:41Z): ANSWERED is attributed through the answering run's OWN pending input only (comment ids AND card
+  // interaction ids). Continuation ancestry collects candidates; it never attributes an answer.
+  it("RFL F2: a completed successor whose own input is only M2 answers neither the comment nor the card its failed ancestors carried", async () => {
+    const f = await fixture();
+    const t0 = f.message.createdAt.getTime();
+    // The card's asking run carries no person input, so the presented card answers nothing here (card point 1 stays).
+    const [asker] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      status: "succeeded", contextSnapshot: { issueId: f.issueId } }).returning();
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, sourceRunId: asker.id,
+      resolvedByUserId: "board", resolvedAt: new Date(t0 + 1_000), idempotencyKey: randomUUID(),
+      payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", selectionMode: "single", options: [{ id: "yes", label: "YES" }] }] },
+      result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }] } } as never).returning();
+    const [resume] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      status: "failed", retryOfRunId: f.run.id, contextSnapshot: { issueId: f.issueId, interactionId: card.id } }).returning();
+    const [m2] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: "board", body: "M2 is different work", createdAt: new Date(t0 + 2_000) }).returning();
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      status: "succeeded", retryOfRunId: resume.id, contextSnapshot: { issueId: f.issueId, wakeCommentId: m2.id } }).returning();
+    const [reply] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: successor.id, body: "Done with M2.", createdAt: new Date(t0 + 3_000) }).returning();
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "create", commentId: reply.id } } })
+      .where(eq(heartbeatRuns.id, successor.id));
+    const answered = async (id: string, createdAt: Date) => {
+      const m = { id: sql`${id}::uuid`, companyId: sql`${f.companyId}::uuid`, issueId: sql`${f.issueId}::uuid`,
+        createdAt: sql`${createdAt.toISOString()}::timestamptz` };
+      const [row] = await db.select({ delivered: answeredPersonMessageSql(m), answered: completedPersonMessageAnswerSql(m) })
+        .from(issues).where(eq(issues.id, f.issueId));
+      return row;
+    };
+    expect(await answered(m2.id, m2.createdAt), "M2 is the successor's own input").toEqual({ delivered: true, answered: true });
+    expect(await answered(f.message.id, f.message.createdAt), "M1 only through ancestry").toEqual({ delivered: false, answered: false });
+    expect(await answered(card.id, card.resolvedAt!), "card only through ancestry").toEqual({ delivered: false, answered: false });
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id }), "M1 still rides").toMatchObject({ wakeCommentIds: [f.message.id] });
+    // Control: once the completed run's OWN pending input holds M1 and the card, its final answer answers both.
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentIds: [f.message.id, m2.id],
+      wakeCommentId: m2.id, interactionId: card.id } }).where(eq(heartbeatRuns.id, successor.id));
+    expect(await answered(f.message.id, f.message.createdAt)).toEqual({ delivered: true, answered: true });
+    expect(await answered(card.id, card.resolvedAt!)).toEqual({ delivered: true, answered: true });
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
+  });
+
   it("never re-carries the sender-stopped input while the next message is carried and answered", async () => {
     const f = await fixture();
     const [next] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
       authorType: "user", authorUserId: "board", body: "Next message", createdAt: new Date(f.message.createdAt.getTime() + 100) }).returning();
     await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled",
-      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } }).where(eq(heartbeatRuns.id, f.run.id));
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board",
+        // RFL F5 (22:41Z): the carry reads the WHOLE stop helper, so the fixture records a real Stop request.
+        executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, f.run.id));
     await db.insert(heartbeatRunEvents).values(["userMessage", "agentMessage"].map((kind, i) => ({
       companyId: f.companyId, agentId: f.agentId, runId: f.run.id, seq: i + 1, eventType: "item.started",
       sourceEventId: randomUUID(), payload: { prpEvent: { turnId: "first", itemId: `item-${i}`, payload: { kind } } },
@@ -121,7 +196,14 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
   it("a held list plus Send carries once into its own live first turn, then blocks a second wake", async () => {
     const f = await fixture();
     await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled",
-      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } }).where(eq(heartbeatRuns.id, f.run.id));
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board",
+        // RFL F5 (22:41Z): the carry reads the WHOLE stop helper, so the fixture records a real Stop request.
+        executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, f.run.id));
+    // The stopped run had STARTED answering M (read it, began an assistant item): the whole exclusion applies.
+    await db.insert(heartbeatRunEvents).values(["userMessage", "agentMessage"].map((kind, i) => ({
+      companyId: f.companyId, agentId: f.agentId, runId: f.run.id, seq: i + 1, eventType: "item.started",
+      sourceEventId: randomUUID(), payload: { prpEvent: { turnId: "first", itemId: `item-${i}`, payload: { kind } } },
+    })));
     const held = await db.insert(issueComments).values(["A", "B", "C"].map((body, i) => ({ companyId: f.companyId,
       issueId: f.issueId, authorType: "user" as const, authorUserId: "board", body,
       createdAt: new Date(f.message.createdAt.getTime() + 100 + i * 100),
@@ -178,7 +260,9 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     const at = (n: number) => new Date(t0 + n * 100);
     const generation = { conversationSessionGeneration: 1 };
     await db.update(issueComments).set({ body: "M12", createdAt: at(0) }).where(eq(issueComments.id, f.message.id));
-    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId, createdAt: at(1), finishedAt: at(2),
+    // supersedes(RFL F1, 22:41Z): a FAILED run's ACK is DELIVERED, not ANSWERED, so M12 is answered here by a
+    // COMPLETED run's final reply; the row still proves an answered M12 is never restored.
+    await db.update(heartbeatRuns).set({ status: "succeeded", nativeSessionId: sessionId, createdAt: at(1), finishedAt: at(2),
       contextSnapshot: { ...f.run.contextSnapshot, ...generation } }).where(eq(heartbeatRuns.id, f.run.id));
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
       authorAgentId: f.agentId, createdByRunId: f.run.id, body: "ACK M12", createdAt: at(3) });
@@ -235,6 +319,9 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     console.log("H3_CARRY_SEALED", JSON.stringify({ runId: successor.id, receipt: sealed.contextSnapshot?.firstTurnQueuedInput }));
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
       authorAgentId: f.agentId, createdByRunId: successor.id, body: "ACK M13, M14, M15" });
+    // supersedes(RFL F1): a RUNNING run's reply is DELIVERED only; the reply answers once that run COMPLETES.
+    expect((await readContinuationCommentInput(db, { ...f, runId: successor.id })).wakeCommentIds).toEqual(expected);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, successor.id));
     expect(await readContinuationCommentInput(db, { ...f, runId: successor.id })).toEqual({});
   });
 
