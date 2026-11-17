@@ -2546,6 +2546,13 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           for (const id of ids) next.delete(id);
           return next;
         });
+        // S8q: a press with nothing left to send is an answer, not a failure.
+        if (error instanceof ApiError && error.status === 409 &&
+            (error.body as { details?: { reason?: string } } | undefined)?.details?.reason === "nothing_waiting") {
+          await queryClient.invalidateQueries({ queryKey: queryKeys.issues.queuedComments(issueId) });
+          setClassicQueuedDeliveryError("Nothing is waiting.");
+          return;
+        }
         if (classicTaskInterfaceEnabled) {
           setClassicQueuedDeliveryError("Couldn’t interrupt. Message is still queued.");
           return;
@@ -2561,6 +2568,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       storeQueuedCommentQueue,
       refreshQueueAfterConflict,
       classicTaskInterfaceEnabled,
+      queryClient,
+      issueId,
     ],
   );
 

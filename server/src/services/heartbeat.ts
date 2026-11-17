@@ -1363,6 +1363,7 @@ export function heartbeatService(
     resumeExecutionWaitComments,
     getWorktreeExecutionCutoff,
     resumeQueuedCommentInterrupt,
+    queuedCommentInterruptTargetStopped,
     resumeSavedLegacyComments,
     cancelActiveForAgentInternal,
     listCompanyAgentOrgRows,
@@ -1589,6 +1590,10 @@ export function heartbeatService(
 
   function resumeQueuedCommentInterrupt(...args: Parameters<typeof runControl.resumeQueuedCommentInterrupt>) {
     return runControl.resumeQueuedCommentInterrupt(...args);
+  }
+
+  function queuedCommentInterruptTargetStopped(...args: Parameters<typeof runControl.queuedCommentInterruptTargetStopped>) {
+    return runControl.queuedCommentInterruptTargetStopped(...args);
   }
 
   function resumeSavedLegacyComments(...args: Parameters<typeof runControl.resumeSavedLegacyComments>) {
@@ -4728,6 +4733,7 @@ export function heartbeatService(
     registerDeferredReceiptWork: (coordinator: Parameters<typeof registerDeferredReceiptWork>[1], canRun: () => boolean) =>
       registerDeferredReceiptWork(db, coordinator, {
         resume: scope => heartbeatQueue.resumeDeferredExecutionReceipts(scope),
+        interruptTargetStopped: scope => queuedCommentInterruptTargetStopped(scope.companyId, scope.requestId!),
         settleTaskChat: scope => reconcileTaskChatRetryReceipts(db, { ...scope, settleOnly: true }),
         createNativeBatch: heartbeatQueue.createNativeStatusWakeBatch,
         schedulingSuppressed: async () => (await getSchedulingSuppression(true)).suppressed,

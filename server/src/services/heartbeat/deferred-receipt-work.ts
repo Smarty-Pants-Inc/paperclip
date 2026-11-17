@@ -18,6 +18,8 @@ export function registerDeferredReceiptWork(
   coordinator: ReturnType<typeof createDeliveryWorkCoordinator>,
   owner: {
     resume(scope: DeferredReceiptRecoveryOptions): Promise<unknown>;
+    /** S8q: the native run an Interrupt stopped has proven it can no longer write. */
+    interruptTargetStopped?(scope: Required<DeferredExecutionScope>): Promise<boolean>;
     settleTaskChat(scope: DeferredExecutionScope): Promise<unknown>;
     createNativeBatch(): (scope: NativeIntentOptions) => Promise<unknown>;
     schedulingSuppressed(): Promise<boolean>;
@@ -25,6 +27,14 @@ export function registerDeferredReceiptWork(
   },
   canRun: () => boolean,
 ) {
+  // Outer columns are written fully qualified: inside a select list Drizzle
+  // renders them bare, and the subquery's own tables would capture them.
+  const interruptedNativeReleased = sql<boolean>`exists (select 1 from heartbeat_runs r
+    join native_run_finalizations f on f.company_id = r.company_id and f.run_id = r.id
+    where r.company_id = agent_wakeup_requests.company_id and r.agent_id = agent_wakeup_requests.agent_id
+      and r.runtime_mode = 'native' and r.status = 'cancelled'
+      and r.result_json->>'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text
+      and f.lease_owner is null and f.phase in ('terminal_failure', 'applied'))`;
   let unsubscribeRefresh: (() => void) | undefined;
   function releaseRefresh() {
     unsubscribeRefresh?.();
@@ -39,7 +49,9 @@ export function registerDeferredReceiptWork(
     return registerScopedDeadlineWork<Entry, DeferredExecutionScope>(coordinator, {
       queue,
       batchSize: kind === "native" ? 100 : undefined,
-      reconstructionIntervalMs: 30_000,
+      // An exact one-wake hint is a single-row read. It must not wait out the
+      // interval that bounds company and instance scans (S8q).
+      reconstructionIntervalMs: scope => kind === "deferred" && scope?.requestId ? 0 : 30_000,
       beforePass: async () => {
         enabled = !(await owner.schedulingSuppressed());
         if (kind === "native") dispatchNative = owner.createNativeBatch();
@@ -69,6 +81,9 @@ export function registerDeferredReceiptWork(
             where r.company_id = ${agentWakeupRequests.companyId} and r.agent_id = ${agentWakeupRequests.agentId}
               and r.runtime_mode = 'legacy' and r.status = 'cancelled'
               and r.result_json->>'queuedCommentInterruptQueueId' = ${agentWakeupRequests.id}::text)`,
+          // Cheap hint only: the run's controller released its native session.
+          // check() requires the full stop proof before skipping the age gate.
+          interruptedNative: owner.interruptTargetStopped ? interruptedNativeReleased : sql<boolean>`false`,
         };
         const eligible = and(
           scope ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
@@ -115,7 +130,8 @@ export function registerDeferredReceiptWork(
         return { rows: [...prioritized, ...rows].map(row => {
           const deadline = kind === "native" && row.status === "claimed" && row.claimedAt ? row.claimedAt.getTime() + 60_000
             : kind === "native" && row.error ? row.updatedAt.getTime() + 30_000
-            : kind === "deferred" && row.delayed && !row.interruptedLegacy ? row.updatedAt.getTime() + 30_000
+            : kind === "deferred" && row.delayed && !row.interruptedLegacy && !row.interruptedNative
+              ? row.updatedAt.getTime() + 30_000
             : null;
           const immediate = deadline === null || deadline <= now;
           return { id: row.id, companyId: row.companyId, dueAt: immediate ? now : deadline, immediate,
@@ -140,7 +156,10 @@ export function registerDeferredReceiptWork(
               : kind === "deferred" && current.status === "deferred_issue_execution" && !current.interruptedLegacy
                 && (current.payload?.queuedCommentInterrupt || current.payload?.executionWait)
                 ? current.updatedAt.getTime() + 30_000 : null;
-          if (due !== null && due > Date.now()) return { ...entry, dueAt: due, immediate: false };
+          const stoppedInterrupt = kind === "deferred" && due !== null && due > Date.now() &&
+            Boolean(current.payload?.queuedCommentInterrupt) && owner.interruptTargetStopped &&
+            await owner.interruptTargetStopped({ companyId: entry.companyId, requestId: entry.id });
+          if (due !== null && due > Date.now() && !stoppedInterrupt) return { ...entry, dueAt: due, immediate: false };
         }
         const errors: unknown[] = [];
         let next: number | null = null;

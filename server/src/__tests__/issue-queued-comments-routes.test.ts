@@ -37,6 +37,8 @@ import { remoteTerminationReceipt } from "../services/remote-execution-terminati
 import { initializeRunIdentity, reconcileSteeredIdentity } from "../services/run-identity.js";
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import { claimFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../services/deferred-execution-notifications.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -992,6 +994,89 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       expect(await db.select().from(heartbeatRuns)).toHaveLength(3);
     },
   );
+
+  // S8q: Interrupt on a native turn. The successor must start when the stopped
+  // run's teardown ends (its end-of-teardown hint), never while it can write,
+  // and not after the 30 s fallback age gate.
+  it("starts one successor for an interrupted native turn as soon as its teardown ends", async () => {
+    const seeded = await seedQueue();
+    await db.update(heartbeatRuns).set({ nativeIssueId: seeded.issueId, responsibleUserId: "queue-owner" })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: seeded.companyId,
+      issueId: seeded.issueId, runId: seeded.runId, phase: "observed" });
+    // Hold the successor in the ordinary queue without launching a provider.
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, seeded.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
+      status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const successors = async () => (await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, seeded.companyId)))
+      .filter(run => run.id !== seeded.runId && run.contextSnapshot?.issueId === seeded.issueId);
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    const work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true);
+    try {
+      await work.ready;
+      const client = app(seeded.companyId);
+      const queue = await request(client).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+      const pressedAt = Date.now();
+      const pressed = await request(client).post(`/api/issues/${seeded.issueId}/queued-comments/interrupt`).send({
+        queueId: seeded.wakeId, targetRunId: seeded.runId, revision: queue.body.revision,
+      });
+      expect(pressed.status, JSON.stringify(pressed.body)).toBe(200);
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+      expect(stopped.status).toBe("cancelled");
+      expect(stopped.resultJson).toMatchObject({ queuedCommentInterruptQueueId: seeded.wakeId, cancelledByUserId: "queue-owner" });
+      // The runner acknowledged the Stop, but its teardown (checkpoint + force
+      // stop) still owns the session: the coordinator lease is held.
+      // The provider child (modelled by this live process) can still write.
+      await db.update(heartbeatRuns).set({ processPid: process.pid, processGroupId: null, resultJson: { ...stopped.resultJson,
+        nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: seeded.runId,
+          companyId: seeded.companyId, issueId: seeded.issueId, scope: "run", reasonCode: "cancellation_run_only",
+          dispatchState: "acknowledged", dispatched: true, intentAuditId: "intent", acknowledgementAuditId: "ack" } },
+      }).where(eq(heartbeatRuns.id, seeded.runId));
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: "teardown-owner" })
+        .where(eq(nativeRunFinalizations.runId, seeded.runId));
+      await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: seeded.companyId }));
+      await new Promise(resolve => setTimeout(resolve, 750));
+      // (i) Nothing starts while the old run can still write.
+      expect(await successors()).toEqual([]);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].status)
+        .toBe("deferred_issue_execution");
+      // Teardown ends: the controller releases the session and the runner
+      // records the provider's stop; that release emits the deferred-work hint.
+      const teardownEndedAt = Date.now();
+      await db.transaction(async tx => {
+        await tx.update(nativeRunFinalizations).set({ leaseOwner: null }).where(eq(nativeRunFinalizations.runId, seeded.runId));
+        await tx.update(heartbeatRuns).set({ processPid: 999_999_999 }).where(eq(heartbeatRuns.id, seeded.runId));
+        // The release emitters' company hint plus their exact per-wake hints.
+        await notifyDeferredExecutionWork(tx, { companyId: seeded.companyId });
+        await notifyDeferredWakesForIssue(tx, { companyId: seeded.companyId, issueId: seeded.issueId });
+      });
+      // (ii) The successor exists within seconds of teardown end, well inside
+      // the 30 s fallback age gate that the press just reset.
+      await vi.waitFor(async () => {
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)))[0].status)
+          .toBe("coalesced");
+      }, { timeout: 5_000, interval: 50 });
+      expect(Date.now() - teardownEndedAt).toBeLessThan(5_000);
+      expect(Date.now() - pressedAt).toBeLessThan(10_000);
+      // (iii) Exactly one successor carries the queued messages, once.
+      await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: seeded.companyId, requestId: seeded.wakeId }));
+      await heartbeatService(db).resumeQueuedCommentInterrupt(seeded.companyId, seeded.wakeId);
+      const [successor, ...extra] = await successors();
+      expect(extra).toEqual([]);
+      expect(successor.contextSnapshot?.wakeCommentIds).toEqual(seeded.commentIds);
+      // (iv) A second press with nothing to target answers plainly.
+      const after = await request(client).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+      const second = await request(client).post(`/api/issues/${seeded.issueId}/queued-comments/interrupt`).send({
+        queueId: seeded.wakeId, targetRunId: null, revision: after.body.revision,
+      });
+      expect(second.status, JSON.stringify(second.body)).toBe(409);
+      expect(second.body).toMatchObject({ error: "Nothing is waiting.", code: "queued_comment_not_pending",
+        details: { reason: "nothing_waiting" } });
+      expect(await successors()).toHaveLength(1);
+    } finally { await work.stop(); }
+  });
 
   async function seedFirstTurnQueue(runtime: "preparing" | "native", queueStartedBy: "user" | "system" = "user") {
     const seeded = await seedQueue();
