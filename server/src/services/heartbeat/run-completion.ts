@@ -16,6 +16,7 @@ import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js"
 import { measureRunPhase } from "../execution-preparation-timing.js";
 import { PROJECT_ACCESS_DENIED, ProjectAccessDeniedError } from "../project-access-denial.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
+import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { NON_RETRYABLE_PREFLIGHT_FAILURE_CODES, isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { ChatControlRecoveryUnresolvedError } from "./queue.js";
 import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspacePreparationCode } from "./retries.js";
@@ -402,6 +403,16 @@ export async function recordRunPresentationDecision(db: Db, input: {
 }
 
 export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunCompletionDependencies) {
+  const { settleAgentAfterCommittedRun } = createHeartbeatAgentStatus(db);
+  // A native run's terminal status can be committed by its finalizer, which
+  // never settles the agent. When this live owner then loses the
+  // compare-and-set it must still settle the agent (smarty-dev#21005).
+  const settleAgentOfCommittedNativeRun = async (committed: typeof heartbeatRuns.$inferSelect | null) => {
+    if (!committed || committed.runtimeMode !== "native" || !isHeartbeatRunTerminalStatus(committed.status)) return;
+    await settleAgentAfterCommittedRun(committed).catch((err) => {
+      logger.warn({ err, runId: committed.id }, "could not settle the agent of a committed native run; stranded-agent recovery will retry");
+    });
+  };
   const {
     getRun,
     getAgent,
@@ -770,6 +781,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           },
           "skipping late run finalization because the run already left running state",
         );
+        await settleAgentOfCommittedNativeRun(persistedRunWrite.run);
         return;
       }
     }
@@ -1457,6 +1469,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         },
         "skipping late adapter failure finalization because the run already left running state",
       );
+      await settleAgentOfCommittedNativeRun(failedRunWrite.run);
       return;
     }
 
