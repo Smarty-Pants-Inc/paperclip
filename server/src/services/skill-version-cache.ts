@@ -17,13 +17,28 @@ import { noRetainedExecutionPredicate } from "./pre-dispatch-execution-evidence.
 import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
 
 export const SKILL_VERSION_CACHE_IDLE_MS = 60 * 60 * 1000;
-const locks = new AsyncLocalStorage<Array<{ db: Db; companyId: string }>>();
+const locks = new AsyncLocalStorage<Array<{ db: Db; companyId: string; lost?: AbortSignal }>>();
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 export class SkillCacheBusy extends Error {}
+/** pl/keepalive5: the skill-cache lock session died (failed keepalive ping); another owner may hold the lock. */
+export class SkillVersionCacheLockLostError extends Error {
+  override name = "SkillVersionCacheLockLostError";
+  constructor(cause?: unknown) { super("skill_version_cache_lock_lost", { cause }); }
+}
+/** The held company cache lock's lost signal, for cache-file writes deep in the action. */
+export function skillVersionCacheLockSignal(companyId: string): AbortSignal | undefined {
+  return locks.getStore()?.find(lock => lock.companyId === companyId)?.lost;
+}
 /** Hold through publication AND durable run pinning, not just file creation. */
-export async function withSkillVersionCacheLock<T>(db: Db, companyId: string, action: () => Promise<T>, tryOnly = false): Promise<T> {
+export async function withSkillVersionCacheLock<T>(db: Db, companyId: string, action: (signal?: AbortSignal) => Promise<T>, tryOnly = false): Promise<T> {
   const held = locks.getStore() ?? [];
-  if (held.some(lock => lock.db === db && lock.companyId === companyId)) return action();
+  const joined = held.find(lock => lock.db === db && lock.companyId === companyId);
+  if (joined) {
+    joined.lost?.throwIfAborted();
+    const result = await action(joined.lost);
+    joined.lost?.throwIfAborted();
+    return result;
+  }
   // Preparation uses the ordinary pool for version/pin writes. Borrowing a pool
   // connection for this lock would deadlock installations with a one-slot pool.
   const acquired = beginRunPhase("skills.cache.acquire");
@@ -39,8 +54,13 @@ export async function withSkillVersionCacheLock<T>(db: Db, companyId: string, ac
     const settings = await tx.execute<{ idle_timeout_ms: string }>(
       sql`select setting::bigint as idle_timeout_ms from pg_settings where name = 'idle_in_transaction_session_timeout'`,
     );
-    return withWorkspaceLockKeepalive(tx, Number(settings[0]?.idle_timeout_ms),
-      () => locks.run([...held, { db, companyId }], action));
+    // pl/keepalive5: a failed ping aborts the action's signal; a lost lock is a failure, never a success.
+    const lost = new AbortController();
+    const result = await withWorkspaceLockKeepalive(tx, Number(settings[0]?.idle_timeout_ms),
+      () => locks.run([...held, { db, companyId, lost: lost.signal }], () => action(lost.signal)),
+      { onLost: cause => lost.abort(new SkillVersionCacheLockLostError(cause)) });
+    lost.signal.throwIfAborted();
+    return result;
   })).catch(error => {
     acquired(true);
     throw error;
@@ -76,10 +96,15 @@ export async function ensureSkillCacheDirectory(directory: string, create = fals
 
 export async function touchSkillVersionCache(companyId: string, skillId: string, versionId: string, now = Date.now()) {
   const { access, directory } = skillVersionCachePaths(companyId, skillId, versionId);
+  // pl/keepalive5: under a held company cache lock, no cache write once its lock session died.
+  const lost = skillVersionCacheLockSignal(companyId);
+  lost?.throwIfAborted();
   await ensureSkillCacheDirectory(path.dirname(access), true);
   const temporary = `${access}.${randomUUID()}.tmp`;
   try {
+    lost?.throwIfAborted();
     await fs.writeFile(temporary, JSON.stringify({ version: 1, lastUsedAt: now }), { flag: "wx", mode: 0o600 });
+    lost?.throwIfAborted();
     await fs.rename(temporary, access);
     noteSkillVersionCacheChange(directory, { source: "access", occurredAt: now });
   } finally { await fs.rm(temporary, { force: true }); }
