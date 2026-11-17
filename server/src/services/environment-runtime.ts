@@ -1167,20 +1167,14 @@ function reusableLeaseCanBeResumed(input: {
 }
 
 const OBSOLETE_SOURCE_ENDED_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
-/** Paul/Kate hold-outs use configured full IDs. Prefixes are a fail-closed
- * fallback until both full identities are configured (RFL step-6 bar, item 5). */
-const OBSOLETE_SOURCE_DESTROY_EXCLUDED_AGENT_ID_PREFIXES = ["29b216c4", "46a1dae4"] as const;
-
-function obsoleteSourceAgentIsExcluded(agentId: string): boolean {
-  // Full production identities are deployment config, not prefix identities.
-  // An absent, partial or malformed list must never release either hold-out.
+/** Deployment supplies full UUIDs for both hold-outs (and any additional ones).
+ * Missing, partial or malformed config refuses ALL destroys, including dry runs. */
+function obsoleteSourceExcludedAgentIds(): string[] | null {
   const ids = (process.env.PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS ?? "")
-    .split(",").map(id => id.trim().toLowerCase()).filter(Boolean);
-  const configured = ids.every(id => /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(id))
-    && OBSOLETE_SOURCE_DESTROY_EXCLUDED_AGENT_ID_PREFIXES.every(prefix => ids.some(id => id.startsWith(`${prefix}-`)));
-  const normalized = agentId.toLowerCase();
-  return configured ? ids.includes(normalized)
-    : OBSOLETE_SOURCE_DESTROY_EXCLUDED_AGENT_ID_PREFIXES.some(prefix => normalized.startsWith(prefix));
+    .split(",").map(id => id.trim().toLowerCase());
+  return new Set(ids).size >= 2
+    && ids.every(id => /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(id))
+    ? ids : null;
 }
 /** The named idle time: an obsolete box's row and run must be idle this long. */
 const OBSOLETE_SOURCE_DESTROY_IDLE_MS = 30 * 60_000;
@@ -1723,8 +1717,10 @@ function createSandboxEnvironmentDriver(
   async function obsoleteSourceDestroyRefusal(lease: EnvironmentLease, input: {
     adapterType: string | null; heartbeatRunId: string | null;
   }): Promise<{ reason: string } | { reason: null; manifestSha256: string | null; rule: string }> {
+    const excludedAgentIds = obsoleteSourceExcludedAgentIds();
+    if (!excludedAgentIds) return { reason: "excluded_agent_ids_unconfigured" };
     const agentId = typeof lease.metadata?.agentId === "string" ? lease.metadata.agentId : "";
-    if (obsoleteSourceAgentIsExcluded(agentId)) {
+    if (excludedAgentIds.includes(agentId.toLowerCase())) {
       return { reason: "agent_excluded_until_paul_says" };
     }
     if (!reusableLeaseCanBeCleanedUp(lease) || reusableSandboxKeptAfterReplacement(lease)) return { reason: "lease_not_obsolete_source" };

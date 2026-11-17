@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns,
   issueComments, issueRecoveryActions, issues, nativeRunFinalizations, plugins,
@@ -57,6 +57,9 @@ const TYPED = "runner_remote_state_unavailable";
 // reached. "Press Retry" only where the task view proves a Retry control in that state, so the ruled default applies.
 const BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, and both attempts failed. "
   + "Your message and the saved work are kept. Send a new message to try again.";
+// Synthetic fixture identities, NOT production hold-outs. Full IDs are deployment config.
+const paulId = "29b216c4-0000-4000-8000-000000000001", kateId = "46a1dae4-0000-4000-8000-000000000001";
+const fullIds = `${paulId},${kateId}`;
 
 suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
   let db!: ReturnType<typeof createDb>;
@@ -68,6 +71,9 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-follow-paperclip-");
     db = createDb(temporary.connectionString);
   }, 60_000);
+  beforeEach(() => {
+    vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS", fullIds);
+  });
   afterEach(async () => {
     vi.useRealTimers();
     vi.unstubAllEnvs();
@@ -176,6 +182,10 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
       { variant: "destroyed", custody: "workspace_unverified" },
       { variant: "destroyed", custody: "no_custody" },
       { variant: "destroyed", custody: "dry_run" },
+      { variant: "destroyed", custody: "unconfigured_destroy" },
+      { variant: "destroyed", custody: "unconfigured_dry_run" },
+      { variant: "destroyed", custody: "malformed_destroy" },
+      { variant: "destroyed", custody: "malformed_dry_run" },
     ] as const)("$variant / $custody", async ({ variant, custody }) => {
       await company();
       expect(isFreshThreadRefusal({ errorCode: TYPED })).toBe(true);
@@ -196,7 +206,9 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
       await db.insert(heartbeatRuns).values({ id: oldRunId, companyId, agentId, issueId, nativeIssueId: issueId, runtimeMode: "native",
         status: "succeeded", createdAt: t0, startedAt: t0, finishedAt: new Date(t0.getTime() + 60_000), contextSnapshot: { issueId } });
       const releasedAt = new Date(t0.getTime() + 61_000), providerLeaseId = `bx-old-${oldLeaseId.slice(0, 8)}`;
-      vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY", custody === "dry_run" ? "" : "destroy");
+      vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY", custody === "dry_run" || custody.endsWith("_dry_run") ? "" : "destroy");
+      if (custody.startsWith("unconfigured_")) vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS", undefined);
+      if (custody.startsWith("malformed_")) vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS", `${fullIds},bad-id`);
       if (custody !== "workspace_unverified") vi.mocked(obsoleteWorkspaceCustodyRefusal).mockResolvedValue(null);
       const backup = custody === "no_custody" ? null : await custodyFixture({ issueId, runId: oldRunId,
         providerLeaseId, completedAt: releasedAt }, custody !== "no_durable");
@@ -244,9 +256,13 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
         expect.soft(destroys, "unverified copy/workspace or dry-run -> no destroy").toEqual([]);
         expect.soft(oldAfter, "the box and its stop receipt are kept unchanged").toEqual(oldBefore);
         if (custody === "dry_run") expect.soft(decision?.action).toBe("environment.lease.obsolete_would_destroy");
-        else expect.soft(decision?.details).toMatchObject({ reason: custody === "no_custody" ? "no_custody_stamp"
-          : custody === "no_durable" ? "durable_custody_copy_unverified"
-          : custody === "no_local" ? "local_custody_copy_unverified" : "workspace_custody_unverified" });
+        else {
+          expect.soft(decision?.action).toBe("environment.lease.obsolete_destroy_refused");
+          expect.soft(decision?.details).toMatchObject({ reason: custody.startsWith("unconfigured_") || custody.startsWith("malformed_")
+            ? "excluded_agent_ids_unconfigured" : custody === "no_custody" ? "no_custody_stamp"
+            : custody === "no_durable" ? "durable_custody_copy_unverified"
+            : custody === "no_local" ? "local_custody_copy_unverified" : "workspace_custody_unverified" });
+        }
       } else {
         expect.soft(destroys).toEqual([providerLeaseId]);
         expect.soft(decision?.action).toBe(variant === "destroyed" ? "environment.lease.obsolete_destroyed" : "environment.lease.obsolete_destroy_pending");
@@ -294,22 +310,28 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
   });
 
   // Every adapter is guarded; full-id config distinguishes prefix collisions.
-  // These are synthetic fixture identities, NOT the production Paul/Kate IDs.
-  const paulId = "29b216c4-0000-4000-8000-000000000001", kateId = "46a1dae4-0000-4000-8000-000000000001";
-  const fullIds = `${paulId},${kateId}`;
   it.each([
-    { name: "pre-metadata adapter", adapterType: null, id: undefined, ids: "", reason: "no_custody_stamp" },
-    { name: "known non-native adapter", adapterType: "claude_local", id: undefined, ids: "", reason: "no_custody_stamp" },
+    { name: "pre-metadata adapter", adapterType: null, id: undefined, ids: fullIds, reason: "no_custody_stamp" },
+    { name: "known non-native adapter", adapterType: "claude_local", id: undefined, ids: fullIds, reason: "no_custody_stamp" },
     { name: "Paul full id", adapterType: null, id: paulId, ids: fullIds, reason: "agent_excluded_until_paul_says" },
     { name: "Kate full id", adapterType: null, id: kateId, ids: fullIds, reason: "agent_excluded_until_paul_says" },
     { name: "different agent sharing Paul prefix", adapterType: null, id: "29b216c4-0000-4000-8000-000000000002", ids: fullIds, reason: "no_custody_stamp" },
     { name: "different agent sharing Kate prefix", adapterType: null, id: "46a1dae4-0000-4000-8000-000000000002", ids: fullIds, reason: "no_custody_stamp" },
-    { name: "unconfigured prefix fail-closed", adapterType: null, id: paulId, ids: "", reason: "agent_excluded_until_paul_says" },
-    { name: "partial config fail-closed", adapterType: null, id: kateId, ids: paulId, reason: "agent_excluded_until_paul_says" },
-    { name: "malformed config fail-closed", adapterType: null, id: paulId, ids: `${fullIds},29b216c4`, reason: "agent_excluded_until_paul_says" },
-  ])("fail closed: $name", async ({ adapterType, id, ids, reason }) => {
+    { name: "absent config, unrelated agent", adapterType: null, id: undefined, ids: undefined, reason: "excluded_agent_ids_unconfigured" },
+    { name: "empty config, unrelated agent", adapterType: null, id: undefined, ids: "", reason: "excluded_agent_ids_unconfigured" },
+    { name: "empty config, prefix agent", adapterType: null, id: paulId, ids: "", reason: "excluded_agent_ids_unconfigured" },
+    { name: "whitespace config", adapterType: null, id: undefined, ids: "  ", reason: "excluded_agent_ids_unconfigured" },
+    { name: "partial config", adapterType: null, id: kateId, ids: paulId, reason: "excluded_agent_ids_unconfigured" },
+    { name: "duplicate-only config", adapterType: null, id: undefined, ids: `${paulId},${paulId}`, reason: "excluded_agent_ids_unconfigured" },
+    { name: "malformed config", adapterType: null, id: undefined, ids: `${fullIds},29b216c4`, reason: "excluded_agent_ids_unconfigured" },
+    { name: "empty list element", adapterType: null, id: undefined, ids: `${fullIds},`, reason: "excluded_agent_ids_unconfigured" },
+    { name: "arbitrary full-id hold-out", adapterType: null, id: "aaaaaaaa-1111-4111-8111-111111111111",
+      ids: "aaaaaaaa-1111-4111-8111-111111111111,bbbbbbbb-2222-4222-8222-222222222222", reason: "agent_excluded_until_paul_says" },
+    { name: "arbitrary full-id list, unrelated agent", adapterType: null, id: undefined,
+      ids: "aaaaaaaa-1111-4111-8111-111111111111,bbbbbbbb-2222-4222-8222-222222222222", reason: "no_custody_stamp" },
+  ].flatMap(row => ["destroy", "dry_run"].map(mode => ({ ...row, mode }))))("fail closed: $name / $mode", async ({ adapterType, id, ids, reason, mode }) => {
     await company(id);
-    vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY", "destroy");
+    vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY", mode === "destroy" ? "destroy" : "");
     vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS", ids);
     const issueId = randomUUID(), oldRunId = randomUUID(), followUpId = randomUUID();
     const environmentId = randomUUID(), pluginId = randomUUID(), oldLeaseId = randomUUID();
