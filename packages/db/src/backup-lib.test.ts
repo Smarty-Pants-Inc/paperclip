@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
-import { afterEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { applyPendingMigrations, ensurePostgresDatabase, inspectMigrations } from "./client.js";
@@ -15,6 +16,8 @@ import {
 const cleanups: Array<() => Promise<void> | void> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const testPsqlPath = process.env.PAPERCLIP_TEST_PSQL_PATH ?? process.env.PAPERCLIP_PSQL_PATH ?? "psql";
+const psqlAvailable = spawnSync(testPsqlPath, ["--version"]).status === 0;
 
 function createTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -83,6 +86,14 @@ function recordSchemaCatalogs(name: string, source: unknown, restored: unknown) 
   fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, `${name}-source.json`), JSON.stringify(source, null, 2));
   fs.writeFileSync(path.join(directory, `${name}-restored.json`), JSON.stringify(restored, null, 2));
+}
+
+function recordRestoreArtifacts(name: string, backupFile: string, reportFile: string | null) {
+  const directory = process.env.BACKUP_FIDELITY_EVIDENCE_DIR;
+  if (!directory) return;
+  fs.mkdirSync(directory, { recursive: true });
+  fs.copyFileSync(backupFile, path.join(directory, `${name}.sql.gz`));
+  if (reportFile) fs.copyFileSync(reportFile, path.join(directory, `${name}-report.json`));
 }
 
 afterEach(async () => {
@@ -162,7 +173,8 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       const backup = await runDatabaseBackup({ connectionString: source,
         backupDir: createTempDir("constraint-fidelity-"), backupEngine: "javascript",
         retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
-      await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      const result = await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      expect(result).toMatchObject({ constraintViolations: [] });
       const sourceCatalog = await readSchemaCatalog(sourceSql);
       const restoredCatalog = await readSchemaCatalog(targetSql);
       recordSchemaCatalogs("constraints", sourceCatalog, restoredCatalog);
@@ -211,7 +223,16 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
     }
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
-  it("rejects and rolls back a restore when transformed data violates a validated CHECK", async () => {
+  it.for(["javascript", "psql"])("restores transformed CHECK violations loudly through %s", { timeout: EMBEDDED_POSTGRES_TEST_TIMEOUT_MS }, async (engine, context) => {
+    if (engine === "psql" && !psqlAvailable) context.skip();
+    const warnings = vi.spyOn(console, "warn");
+    cleanups.push(() => warnings.mockRestore());
+    const previousPsql = process.env.PAPERCLIP_PSQL_PATH;
+    process.env.PAPERCLIP_PSQL_PATH = engine === "psql" ? testPsqlPath : "/bin/false";
+    cleanups.push(() => {
+      if (previousPsql === undefined) delete process.env.PAPERCLIP_PSQL_PATH;
+      else process.env.PAPERCLIP_PSQL_PATH = previousPsql;
+    });
     const cluster = await createTempDatabase();
     const source = await createSiblingDatabase(cluster, "invalid_check_source");
     const target = await createSiblingDatabase(cluster, "invalid_check_restore");
@@ -219,16 +240,123 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
     const targetSql = postgres(target, { max: 1, onnotice: () => {} });
     try {
       await sourceSql.unsafe(`
-        CREATE TABLE public.records (value text CONSTRAINT required_value CHECK (value IS NOT NULL));
-        INSERT INTO public.records VALUES ('present');
+        CREATE TABLE public.records (key integer PRIMARY KEY, value text CONSTRAINT required_value CHECK (value IS NOT NULL));
+        INSERT INTO public.records SELECT key, 'present' FROM generate_series(1, 8) key;
       `);
       const backup = await runDatabaseBackup({ connectionString: source,
         backupDir: createTempDir("invalid-check-"), backupEngine: "javascript",
         nullifyColumns: { records: ["value"] },
         retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
-      await expect(runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile }))
-        .rejects.toThrow('required_value');
-      expect(await targetSql`SELECT to_regclass('public.records') AS table_name`).toEqual([{ table_name: null }]);
+      if (engine === "psql") {
+        const dump = gunzipSync(fs.readFileSync(backup.backupFile)).toString("utf8");
+        fs.writeFileSync(backup.backupFile, gzipSync(dump.replaceAll(/^-- paperclip statement breakpoint .*$/gm, "")));
+      }
+      const result = await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      expect(result).toMatchObject({ constraintViolations: [{
+        schema: "public", table: "records", constraint: "required_value",
+        definition: "CHECK ((value IS NOT NULL))", action: "not_valid", count: 8,
+        samplePrimaryKeys: [{ key: 1 }, { key: 2 }, { key: 3 }, { key: 4 }, { key: 5 }],
+      }] });
+      expect(result.summary).toBe(`restored with 1 constraint violations: see ${result.violationReportFile}`);
+      expect(JSON.parse(fs.readFileSync(result.violationReportFile!, "utf8"))).toEqual(result);
+      expect(fs.statSync(result.violationReportFile!).mode & 0o777).toBe(0o600);
+      expect(await targetSql`SELECT key, value FROM public.records ORDER BY key`).toEqual(
+        Array.from({ length: 8 }, (_, index) => ({ key: index + 1, value: null })));
+      expect(await targetSql`SELECT convalidated FROM pg_constraint WHERE conname = 'required_value'`).toEqual([{ convalidated: false }]);
+      await expect(targetSql`INSERT INTO public.records VALUES (9, NULL)`).rejects.toThrow("required_value");
+      expect(warnings).toHaveBeenCalledWith(`Restore constraint violation: ${JSON.stringify(result.constraintViolations[0])}`);
+      expect(warnings).toHaveBeenCalledWith(result.summary);
+      recordSchemaCatalogs(`invalid-check-${engine}`, { expectedCount: 8, sampleLimit: 5 }, { ...result, warnings: warnings.mock.calls });
+      recordRestoreArtifacts(`invalid-check-${engine}`, backup.backupFile, result.violationReportFile);
+    } finally {
+      await sourceSql.end();
+      await targetSql.end();
+    }
+  });
+
+  it.for(["javascript", "psql"])("skips violated EXCLUDE and UNIQUE constraints loudly through %s", { timeout: EMBEDDED_POSTGRES_TEST_TIMEOUT_MS }, async (engine, context) => {
+    if (engine === "psql" && !psqlAvailable) context.skip();
+    const previousPsql = process.env.PAPERCLIP_PSQL_PATH;
+    process.env.PAPERCLIP_PSQL_PATH = engine === "psql" ? testPsqlPath : "/bin/false";
+    cleanups.push(() => {
+      if (previousPsql === undefined) delete process.env.PAPERCLIP_PSQL_PATH;
+      else process.env.PAPERCLIP_PSQL_PATH = previousPsql;
+    });
+    const cluster = await createTempDatabase();
+    const source = await createSiblingDatabase(cluster, "invalid_exclusion_source");
+    const target = await createSiblingDatabase(cluster, "invalid_exclusion_restore");
+    const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+    const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+    try {
+      await sourceSql.unsafe(`
+        CREATE TABLE public.bookings (id integer PRIMARY KEY, slot text, span int4range,
+          CONSTRAINT no_overlap EXCLUDE USING gist (span WITH &&) DEFERRABLE INITIALLY DEFERRED,
+          CONSTRAINT unique_slot UNIQUE NULLS NOT DISTINCT (slot) DEFERRABLE INITIALLY DEFERRED);
+        INSERT INTO public.bookings VALUES (1, 'first', '[1,3)'), (2, 'second', '[3,5)');
+      `);
+      const definitions = await sourceSql`SELECT conname, pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint WHERE conname IN ('no_overlap', 'unique_slot') ORDER BY conname`;
+      const backup = await runDatabaseBackup({ connectionString: source,
+        backupDir: createTempDir("invalid-exclusion-"), backupEngine: "javascript",
+        nullifyColumns: { bookings: ["slot"] },
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      const dump = gunzipSync(fs.readFileSync(backup.backupFile)).toString("utf8");
+      expect(dump).toContain("[3,5)");
+      const invalidDump = dump.replace("[3,5)", "[2,4)");
+      fs.writeFileSync(backup.backupFile, gzipSync(engine === "psql"
+        ? invalidDump.replaceAll(/^-- paperclip statement breakpoint .*$/gm, "") : invalidDump));
+      const result = await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      expect(result.constraintViolations).toHaveLength(2);
+      for (const definition of definitions) {
+        expect(result.constraintViolations).toContainEqual({ schema: "public", table: "bookings",
+          constraint: definition.conname, definition: definition.definition, action: "skipped", count: 2,
+          samplePrimaryKeys: [{ id: 1 }, { id: 2 }],
+        });
+      }
+      expect(await targetSql`SELECT id FROM public.bookings ORDER BY id`).toEqual([{ id: 1 }, { id: 2 }]);
+      expect(await targetSql`SELECT conname FROM pg_constraint WHERE conname IN ('no_overlap', 'unique_slot')`).toEqual([]);
+      recordSchemaCatalogs(`invalid-exclusion-${engine}`, [...definitions], result);
+      recordRestoreArtifacts(`invalid-exclusion-${engine}`, backup.backupFile, result.violationReportFile);
+    } finally {
+      await sourceSql.end();
+      await targetSql.end();
+    }
+  });
+
+  it("restores a skipped UNIQUE and reports its dependent foreign key instead of aborting", async () => {
+    const cluster = await createTempDatabase();
+    const source = await createSiblingDatabase(cluster, "dependent_unique_source");
+    const target = await createSiblingDatabase(cluster, "dependent_unique_restore");
+    const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+    const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+    try {
+      await sourceSql.unsafe(`
+        CREATE TABLE public.parents (id integer PRIMARY KEY, code integer CONSTRAINT unique_code UNIQUE);
+        CREATE TABLE public.children (id integer PRIMARY KEY, code integer CONSTRAINT parent_code REFERENCES public.parents(code));
+        INSERT INTO public.parents VALUES (1, 1), (2, 2);
+        INSERT INTO public.children VALUES (3, 1);
+      `);
+      const backup = await runDatabaseBackup({ connectionString: source,
+        backupDir: createTempDir("dependent-unique-"), backupEngine: "javascript",
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      const dump = gunzipSync(fs.readFileSync(backup.backupFile)).toString("utf8");
+      expect(dump).toContain('INSERT INTO "public"."parents" ("id", "code") VALUES (2, 2);');
+      fs.writeFileSync(backup.backupFile, gzipSync(dump.replace(
+        'INSERT INTO "public"."parents" ("id", "code") VALUES (2, 2);',
+        'INSERT INTO "public"."parents" ("id", "code") VALUES (2, 1);')));
+      const result = await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      expect(result.constraintViolations).toHaveLength(2);
+      expect(result.constraintViolations).toContainEqual({ schema: "public", table: "parents",
+        constraint: "unique_code", definition: "UNIQUE (code)", action: "skipped", count: 2,
+        samplePrimaryKeys: [{ id: 1 }, { id: 2 }],
+      });
+      expect(result.constraintViolations).toContainEqual({ schema: "public", table: "children",
+        constraint: "parent_code", definition: "FOREIGN KEY (code) REFERENCES public.parents(code)", action: "skipped", count: 0,
+        samplePrimaryKeys: [],
+      });
+      expect(await targetSql`SELECT id, code FROM public.children`).toEqual([{ id: 3, code: 1 }]);
+      recordSchemaCatalogs("dependent-unique", { expectedRows: 3 }, result);
+      recordRestoreArtifacts("dependent-unique", backup.backupFile, result.violationReportFile);
     } finally {
       await sourceSql.end();
       await targetSql.end();
@@ -251,7 +379,8 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       const backup = await runDatabaseBackup({ connectionString: source,
         backupDir: createTempDir("migrated-fidelity-"), backupEngine: "javascript",
         retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
-      await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      const result = await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      expect(result).toMatchObject({ constraintViolations: [] });
       const restoredCatalog = await readSchemaCatalog(targetSql);
       recordSchemaCatalogs("migrated", sourceCatalog, restoredCatalog);
       expect(restoredCatalog).toEqual(sourceCatalog);
