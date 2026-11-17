@@ -24,3 +24,13 @@ it("says recovering, not failed, for files that are only owed", () => {
   expect(workspaceRestoreMarkerDetail({ result: { workspaceRestoreFailure: "restore_failed" }, savedPlan: false, hasResponse: true }))
     .toBe("Workspace restore failed. Workspace files need recovery.");
 });
+
+// restore-card4: the server projects workspaceRestoreRecovered once the worker
+// saved the owed files; the marker then says recovered, with no failure words.
+it("says recovered, neither recovering nor failed, once the owed files were saved", () => {
+  const detail = workspaceRestoreMarkerDetail({ result: { workspaceRestoreFailure: "restore_failed", workspaceRestoreRecovered: true },
+    savedPlan: false, hasResponse: true });
+  expect(detail).toBe("Saved work recovered.");
+  expect(detail.toLowerCase()).not.toContain("failed");
+  expect(detail).not.toContain("Recovering");
+});
