@@ -1003,6 +1003,44 @@ suite("fresh-continuation fallback", () => {
     }
   }, 120_000);
 
+  // rf-3 (d) the multi-slot dead chat: on a 2-slot agent with one slot FREE, another slot's turn
+  // finishing every 5 min must not restart the start clock. The dispatcher never takes the message:
+  // at enqueue + 10 min the card is failed + Retry (red when every finish restarts the clock).
+  it("D168 multi-slot: another slot's finishes beside a free slot do not hold the card at working", async () => {
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } } }).where(eq(agents.id, agentId));
+    const t = new Date(Date.now() - 1_200_000);
+    const at = (offset: number) => new Date(t.getTime() + offset);
+    try {
+      const [task] = await db.insert(issues).values({ companyId, title: "D168 multi-slot", status: "in_progress", assigneeAgentId: agentId,
+        conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: at(-300_000) }).returning();
+      const issueId = task!.id;
+      const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+        body: "Ping?", clientRequestId: randomUUID(), createdAt: at(-1_000) }).returning();
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
+        requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${message!.id}`,
+        payload: { issueId, commentId: message!.id }, createdAt: at(0), requestedAt: at(0) }).returning();
+      const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
+        createdAt: at(0), responsibleUserId: userId, wakeupRequestId: wake!.id,
+        contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } }).returning();
+      await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id));
+      const [other] = await db.insert(issues).values({ companyId, title: "Other slot", status: "in_progress", assigneeAgentId: agentId }).returning();
+      // The other slot: one turn at a time, each finishing 5 min after it started, the next starting 1 s later.
+      for (const start of [-60_000, 241_000, 542_000]) await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: other!.id,
+        status: start === 542_000 ? "running" : "succeeded", createdAt: at(start), startedAt: at(start),
+        finishedAt: start === 542_000 ? null : at(start + 300_000), contextSnapshot: { issueId: other!.id } });
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(at(599_999));
+      expect((await taskInterruptionPresentation(db, await issue(issueId)))?.state, "inside the bound: working").toBe("working");
+      vi.setSystemTime(at(600_000));
+      const card = await taskInterruptionPresentation(db, await issue(issueId));
+      console.info(JSON.stringify({ d168MultiSlot: { card: card && { state: card.state, canRetry: card.canRetry, observedRunId: card.observedRunId } } }));
+      expect(card, "enqueue + 10 min with a free slot: failed + Retry").toMatchObject({ state: "failed", canRetry: true, observedRunId: queued!.id });
+    } finally {
+      vi.useRealTimers();
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, agentId));
+    }
+  }, 60_000);
+
   it.each(["queued", "succeeded", "older_answer"])("RFL F1 checks %s before any stop or note", async shape => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     const sessionId = randomUUID();

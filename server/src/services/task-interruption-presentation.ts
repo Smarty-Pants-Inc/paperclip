@@ -769,26 +769,35 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   //   agent's running count against parseHeartbeatPolicy(agent).maxConcurrentRuns.
   //   A busy agent has no startable time, so the card stays working.
   // - otherwise startable since = the latest heartbeat_runs.finished_at of the
-  //   agent's other runs that ended after this run was queued (the busy turn that
-  //   freed the slot, whether it succeeded or failed); with no such run (no
-  //   previous run, or the slot was already free), startable since enqueue
-  //   (heartbeat_runs.created_at).
+  //   agent's other runs that ended after this run was queued AND ended with the
+  //   agent at capacity just before (runs started by then and not yet finished,
+  //   itself included, >= maxConcurrentRuns): only such a finish freed the slot
+  //   this run waited for, whether it succeeded or failed. A finish beside a
+  //   free slot restarts nothing (rf-3 (d): on a multi-slot agent another
+  //   slot's turns must not hold the card at working forever). With no such
+  //   finish (no previous run, or a slot was already free), startable since
+  //   enqueue (heartbeat_runs.created_at).
   const queuedRunStartableSince = new Map<string, number>();
   const personQueued = runs.filter(run => personQueuedRunIds.has(run.id) && run.createdAt);
   if (personQueued.length) {
     const agentIds = [...new Set(personQueued.map(run => run.agentId))];
-    const [agentRows, runningRows, endRows] = await Promise.all([
-      db.select().from(agents).where(and(eq(agents.companyId, companyId), inArray(agents.id, agentIds))),
+    const { parseHeartbeatPolicy } = await import("./heartbeat/timer-policy.js");
+    const agentRows = await db.select().from(agents).where(and(eq(agents.companyId, companyId), inArray(agents.id, agentIds)));
+    const maxRuns = new Map(agentRows.map(agent => [agent.id, parseHeartbeatPolicy(agent).maxConcurrentRuns]));
+    const [runningRows, endRows] = await Promise.all([
       db.select({ agentId: heartbeatRuns.agentId, count: sql<number>`count(*)::int` }).from(heartbeatRuns)
         .where(and(inArray(heartbeatRuns.agentId, agentIds), eq(heartbeatRuns.status, "running"))).groupBy(heartbeatRuns.agentId),
       Promise.all(personQueued.map(async run => {
         const [row] = await db.select({ endedAt: sql<string | null>`max(${heartbeatRuns.finishedAt})` }).from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.agentId, run.agentId), sql`${heartbeatRuns.id} <> ${run.id}`,
-            sql`${heartbeatRuns.finishedAt} > ${run.createdAt!.toISOString()}::timestamptz`));
+            sql`${heartbeatRuns.finishedAt} > ${run.createdAt!.toISOString()}::timestamptz`,
+            sql`(select count(*) from heartbeat_runs at_end where at_end.agent_id = ${heartbeatRuns.agentId}
+              and at_end.id <> ${run.id} and (at_end.started_at is not null or at_end.status = 'running')
+              and coalesce(at_end.started_at, at_end.created_at) <= ${heartbeatRuns.finishedAt}
+              and (at_end.finished_at is null or at_end.finished_at >= ${heartbeatRuns.finishedAt})) >= ${maxRuns.get(run.agentId) ?? 1}`));
         return { runId: run.id, endedAt: row?.endedAt ? new Date(row.endedAt).getTime() : null };
       })),
     ]);
-    const { parseHeartbeatPolicy } = await import("./heartbeat/timer-policy.js");
     const running = new Map(runningRows.map(row => [row.agentId, Number(row.count)]));
     const busy = new Set(agentRows.filter(agent => (running.get(agent.id) ?? 0) >= parseHeartbeatPolicy(agent).maxConcurrentRuns)
       .map(agent => agent.id));
