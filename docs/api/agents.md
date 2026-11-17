@@ -34,6 +34,28 @@ configuration is redacted. This field does not contain driver configuration,
 environment variables, or credentials. An agent with no default inherits the
 instance default.
 
+## Discard one unsaved agent-file hold
+
+```
+POST /api/companies/{companyId}/agent-file-holds/{runId}/discard
+{"reason": "Permanent storage failure; discard this unsaved copy"}
+```
+
+This destructive operator action uses the same authority as environment deletion:
+local implicit board access or a signed-in instance administrator with access to
+this company. Agents and ordinary board members cannot discard saves. `reason`
+is required (1–1000 characters after trimming).
+
+Only the named run's stopped held save is resolved. The server records the actor,
+reason and timestamp atomically in the activity log (`agent_files.save_discarded`)
+and the copy's `receipt.discard`. It does **not** claim a save or change canonical
+files. The response is the current working-copy row with
+`errorCode: "AGENT_FILES_SAVE_DISCARDED"`. Cleanup uses the existing directory and
+environment recovery workers; `receipt.cleanupPending` can remain true if the
+remote collector is unavailable. Other holds on the allocation still block its
+destruction. Missing copies return 404; an already settled or non-held copy
+returns 409. No bulk discard is supported.
+
 ## Get Current Agent
 
 ```

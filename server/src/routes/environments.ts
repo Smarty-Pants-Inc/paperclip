@@ -60,7 +60,8 @@ import {
   assertAgentsReadyForEnvironmentChange,
 } from "../services/plugin-environment-driver.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { assertBoard, assertBoardOrgAccess, boardAccessRequired, getActorInfo } from "./authz.js";
+import { assertBoard, assertBoardOrgAccess, assertCompanyAccess, boardAccessRequired, getActorInfo } from "./authz.js";
+import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "../services/environment-custom-image-runtime.js";
@@ -1183,6 +1184,19 @@ export function environmentRoutes(
       status: req.query.status as string | undefined,
     });
     res.json(leases.map(redactEnvironmentLeaseForResponse));
+  });
+
+  // No existing per-box discard surface: use the environment DELETE authority.
+  router.post("/companies/:companyId/agent-file-holds/:runId/discard", async (req, res) => {
+    assertCanAccessInstanceEnvironments(req); // agent-file discard authority
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+    if (!reason || reason.length > 1000) throw unprocessable("A discard reason of 1–1000 characters is required");
+    const actor = getActorInfo(req);
+    const discarded = await agentInstructionWorkingCopyService(db).discardHeld({ companyId,
+      runId: req.params.runId as string, actorId: actor.actorId, reason });
+    res.json(discarded);
   });
 
   router.get("/environment-leases/:leaseId", async (req, res) => {

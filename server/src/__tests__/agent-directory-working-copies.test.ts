@@ -1,3 +1,8 @@
+import express from "express";
+import request from "supertest";
+import { environmentRoutes } from "../routes/environments.js";
+import { errorHandler } from "../middleware/index.js";
+import { activityLog } from "@paperclipai/db";
 import { gitExclusionRetryContract } from "./helpers/git-exclusion-retry-contract.js";
 import { queueGitExclusionNextTry } from "./helpers/git-exclusion-next-try.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -1054,6 +1059,69 @@ describe("persistent agent directories", () => {
       await expect(fs.stat(copy.executionRoot)).rejects.toMatchObject({ code: "ENOENT" });
       expect(await agentFileSaveHeldOnLease(db, { id: leaseId, companyId })).toBe(false);
     }, 60_000);
+
+    function operatorApp(actor: Express.Request["actor"]) {
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = actor; next(); });
+      app.use("/api", environmentRoutes(db)); app.use(errorHandler); return app;
+    }
+    const discardUrl = (runId: string) => `/api/companies/${companyId}/agent-file-holds/${runId}/discard`;
+    it("operator discard removes exactly one held save and atomically records who why and when", async () => {
+      const first = await holdUnsavedNote(true, "quota"), second = await holdUnsavedNote(false, "authorization");
+      const before = Date.now();
+      const response = await request(operatorApp({ type: "board", source: "session", userId, isInstanceAdmin: true, companyIds: [companyId] }))
+        .post(discardUrl(first.copy.runId)).send({ reason: "Permanent quota failure; operator accepts losing this unsaved copy" });
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ state: "resolved", errorCode: "AGENT_FILES_SAVE_DISCARDED" });
+      expect(agentFileSaveHeld((await copies.get(companyId, first.copy.runId))!)).toBe(false);
+      await expect(fs.stat(first.copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      await assertRetained(second.copy, second.note);
+      await expect(fs.stat(path.join(root, "unsaved-note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      const records = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+      const discarded = records.filter(row => row.action === "agent_files.save_discarded");
+      expect(discarded).toHaveLength(1);
+      expect(discarded[0]).toMatchObject({ actorType: "user", actorId: userId, runId: first.copy.runId,
+        details: { reason: "Permanent quota failure; operator accepts losing this unsaved copy", discardedAt: expect.any(String) } });
+      expect(new Date(String(discarded[0]!.details?.discardedAt)).getTime()).toBeGreaterThanOrEqual(before);
+      expect((await copies.get(companyId, first.copy.runId))?.receipt?.discard).toMatchObject({ actorId: userId });
+      // Repeating cannot silently discard any other copy or fabricate another activity.
+      expect((await request(operatorApp({ type: "board", source: "local_implicit", userId }))
+        .post(discardUrl(first.copy.runId)).send({ reason: "repeat" })).status).toBe(409);
+      await assertRetained(second.copy, second.note);
+    });
+    it("operator discard unblocks normal provider destruction only for the selected allocation", async () => {
+      const first = await boundLeaseFixture(), second = await boundLeaseFixture();
+      for (const fx of [first, second]) {
+        expect(agentFileSaveHeld(await copies.collectStopped({ companyId, runId: fx.copy.runId }))).toBe(true);
+        await fx.runtime.destroyRunLease({ environment: fx.environment, lease: await fx.lease() });
+        expect(fx.call).not.toHaveBeenCalled();
+      }
+      const response = await request(operatorApp({ type: "board", source: "local_implicit", userId }))
+        .post(discardUrl(first.copy.runId)).send({ reason: "Release this permanently over-quota allocation" });
+      expect(response.status).toBe(200);
+      await first.runtime.destroyRunLease({ environment: first.environment, lease: await first.lease() });
+      await second.runtime.destroyRunLease({ environment: second.environment, lease: await second.lease() });
+      expect(await first.surviving()).toBe("MISSING:ENOENT");
+      expect(first.call.mock.calls.map(call => call[1])).toEqual(["environmentDestroyLease"]);
+      expect(await second.surviving()).toBe(second.note);
+      expect(second.call).not.toHaveBeenCalled();
+      expect(agentFileSaveHeld(await copies.get(companyId, second.copy.runId))).toBe(true);
+      console.log("OPERATOR_DISCARD_PROVIDER", JSON.stringify({ discardedRun: first.copy.runId, retainedRun: second.copy.runId,
+        firstSurviving: await first.surviving(), secondSurviving: await second.surviving(),
+        firstProviderCalls: first.call.mock.calls.map(call => call[1]), secondProviderCalls: second.call.mock.calls.map(call => call[1]) }));
+    });
+
+    it.each(["agent", "member", "anonymous"] as const)("operator discard refuses unauthorized %s caller without touching the hold", async kind => {
+      const { copy, note } = await holdUnsavedNote(false, "apply");
+      const caller: Express.Request["actor"] = kind === "agent" ? { type: "agent", companyId, agentId, source: "agent_key" }
+        : kind === "member" ? { type: "board", userId, source: "session", companyIds: [companyId], isInstanceAdmin: false }
+          : { type: "none" };
+      const response = await request(operatorApp(caller)).post(discardUrl(copy.runId)).send({ reason: "unauthorized loss" });
+      expect([401, 403]).toContain(response.status);
+      await assertRetained(copy, note);
+      const records = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+      expect(records.filter(row => row.action === "agent_files.save_discarded")).toHaveLength(0);
+    });
 
     it("a held save does not block the next message: the next run starts from canonical and the instruction stays visible", async () => {
       const { copy, note } = await holdUnsavedNote(false, "apply");

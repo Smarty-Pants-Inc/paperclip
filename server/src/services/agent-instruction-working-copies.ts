@@ -703,5 +703,5 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     }
     return row;
   }
-  return { registerStoppedCollectionWork, registerDirectoryCleanupWork, registerCapturedCommitWork, prepare, checkpointWarm, canReuseWarm: directories.canReuse, adopt, reportRetirementUnconfirmed, get, hasChanges, acknowledgeExplicitSave, collectStopped, recoverCaptured, recoverStopped, list, resolve, reportUnavailable, release };
+  return { discardHeld: directories.discardHeld, registerStoppedCollectionWork, registerDirectoryCleanupWork, registerCapturedCommitWork, prepare, checkpointWarm, canReuseWarm: directories.canReuse, adopt, reportRetirementUnconfirmed, get, hasChanges, acknowledgeExplicitSave, collectStopped, recoverCaptured, recoverStopped, list, resolve, reportUnavailable, release };
 }

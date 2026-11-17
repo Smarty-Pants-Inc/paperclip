@@ -1,5 +1,8 @@
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
 import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
+import { notifyDirectoryCleanup } from "./directory-cleanup-notifications.js";
+import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
+import { persistActivity, publishActivity } from "./activity-log.js";
 import { agentFileHoldWriteCondition, pinLeaseForCollection, unpinLeaseForCollection } from "./agent-file-save-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -605,6 +608,38 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (pin !== "unbound") await unpinLeaseForCollection(db, leaseId, copyKey, pin);
     return collected;
   }
+  /** Called only by the instance-operator route: an explicit loss, never a save.
+   * Serialize with collection and commit the receipt and attribution together
+   * before giving cleanup permission to remove any bytes. */
+  async function discardHeld(input: { companyId: string; runId: string; actorId: string; reason: string }) {
+    const row = await get(input.companyId, input.runId);
+    if (!row || !isAgentDirectoryCopy(row)) throw notFound("Agent-file hold not found");
+    return serial(row, async current => {
+      if (!agentFileSaveHeld(current) || !current.processStoppedAt || current.receipt?.retainedByRunId)
+        throw conflict("Only this run's stopped held save can be discarded");
+      const discardedAt = new Date().toISOString();
+      const discard = { actorId: input.actorId, reason: input.reason, discardedAt };
+      const committed = await db.transaction(async tx => {
+        await notifyDirectoryCleanup(tx, { companyId: current.companyId, runId: current.runId });
+        const leaseId = (current.receipt?.cleanup as { leaseId?: string } | undefined)?.leaseId;
+        if (leaseId) await notifyEnvironmentCleanup(tx, { companyId: current.companyId, runId: current.runId, leaseId });
+        const [updated] = await tx.update(copies).set({ state: "resolved", nextAttemptAt: new Date(),
+          errorCode: "AGENT_FILES_SAVE_DISCARDED", errorMessage: "An operator discarded this unsaved agent-file copy. No save is claimed.",
+          receipt: { ...withoutSaveHold(current.receipt), discard, cleanupPending: true }, updatedAt: new Date() })
+          .where(and(eq(copies.companyId, current.companyId), eq(copies.runId, current.runId),
+            eq(copies.state, current.state), sql`${copies.receipt} IS NOT DISTINCT FROM ${JSON.stringify(current.receipt)}::jsonb`)).returning();
+        if (!updated) throw conflict("The held save changed before discard");
+        const { publication } = await persistActivity(tx as unknown as Db, { companyId: current.companyId,
+          actorType: "user", actorId: input.actorId, action: "agent_files.save_discarded", entityType: "agent", entityId: current.agentId,
+          agentId: current.agentId, runId: current.runId, details: { ...discard, previousErrorCode: current.errorCode } });
+        return { updated, publication };
+      });
+      publishActivity(committed.publication);
+      // The discard is durable even if cleanup needs its existing recovery worker.
+      await release(committed.updated).catch(error => logger.warn({ err: error, runId: current.runId }, "Discarded agent-file cleanup deferred"));
+      return (await get(current.companyId, current.runId))!;
+    }, "agent_directory_release");
+  }
   function releaseIsNoop(row: Copy) {
     return row.state === "superseded" || !row.processStoppedAt ||
       settled(row) && row.receipt?.cleanupPending === false;
@@ -661,6 +696,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         return;
       }
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
+        ...(row.receipt?.discard ? { discard: row.receipt.discard } : {}),
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
         ...(row.receipt?.directoryRunId ? { directoryRunId: row.receipt.directoryRunId } : {}),
         ...(cleanupPending ? { cleanup: row.receipt?.cleanup, ...(destroyedOnly ? { cleanupDestroyedOnly: true } : {}) } : {}) },
@@ -775,7 +811,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       return withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), run);
     }));
   }
-  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable,
+  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable, discardHeld,
     /** Exact-allocation destruction proof (the only loss that ends a hold without a save). */
     destroyedRemote: (row: Copy) => destroyedRemoteCopy(row),
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),
