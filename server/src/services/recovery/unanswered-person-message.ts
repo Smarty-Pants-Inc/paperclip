@@ -183,11 +183,9 @@ const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorization
 
 /**
  * SQL: an agent answer ATTRIBUTED to message m, the Paperclip way: a reply
- * written by a run whose input carried m or a later person message (the native
- * conversation finalizer's reply boundary, agent-conversations.ts:406-437:
- * messages after a run's boundary stay actionable), via any carrying key. An
- * agent comment with no run counts by time. A later reply to ANOTHER message
- * never answers m.
+ * written by a run on the chain carrying m or a later person input. Fresh
+ * continuations and answered-interaction resumes need not copy comment ids.
+ * A run-less comment, shared session or unrelated later run is not an answer.
  */
 function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
   // The ONE shared definition (person-message-answer.ts), so B's notice and the continuation carry never
@@ -535,10 +533,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     }
   }
   let waitingToStart = false;
+  let continuationWaiting = false;
   if (liveRuns.length && !agentPaused) {
     const wait = await bounded(now.getTime() + 30_000);
     if (wait) return wait;
-    waitingToStart = liveRuns.some(candidate => runCarriesMessage(candidate.contextSnapshot, message.id));
+    for (const candidate of liveRuns) {
+      // A queued successor (including an output-cap continuation) is still
+      // this message's attempt even when its context no longer copies m.
+      // Keep the ordinary start bound, but a proven successor is waiting
+      // work, not a reason to resend its predecessor's input.
+      const descendant = Boolean(messageRun && candidate.id !== messageRun.id
+        && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
+          runId: candidate.id, ancestorRunId: messageRun.id, includeAnswerLineage: true }));
+      if (runCarriesMessage(candidate.contextSnapshot, message.id) || descendant) waitingToStart = true;
+      if (descendant) { continuationWaiting = true; break; }
+    }
   }
 
   // A board-owned hold means nothing moves by itself: queued wakes behind it
@@ -563,11 +572,14 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   } else if (waitingToStart) {
-    // Still true only until T0 + PENDING_WAIT_START_BOUND_MS; after that the
-    // carrying run has not started (a dead claim, a stuck queue): failure text.
+    // The ordinary carrying-run start bound is unchanged. A known queued
+    // continuation keeps the waiting note until it starts or terminates;
+    // asking for duplicate input while it remains pending is false.
     const startDeadline = (waitT0 ?? now.getTime()) + PENDING_WAIT_START_BOUND_MS;
-    if (startDeadline > now.getTime()) {
-      if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_WAITING_CODE) return { kind: "pending", recheckAt: startDeadline };
+    if (continuationWaiting || startDeadline > now.getTime()) {
+      if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_WAITING_CODE) {
+        return { kind: "pending", recheckAt: continuationWaiting ? now.getTime() + 30_000 : startDeadline };
+      }
       code = UNANSWERED_MESSAGE_WAITING_CODE;
     } else {
       code = UNANSWERED_MESSAGE_NO_RUN_CODE;

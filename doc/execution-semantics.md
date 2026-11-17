@@ -3067,6 +3067,21 @@ present the turn, so its answer is still posted. Background presentation recover
 restart between the status commit and the live presentation posts the held
 turn's answer once, or records that its card presented the turn.
 
+The unanswered-person-message sweep and continuation input selection share one
+answer rule. A published agent reply after the person's message answers input
+carried by that run or an ancestor on its continuation chain. A pending or
+answered card on that chain also answers its carried input; answering the card
+does not reopen the original message. An answer-resume links back through its
+answered interaction or durable question-response delivery. A native status
+continuation links through its applied decision's materialized continuation or
+retry effect and the wake bound to the successor. These links stay company- and
+task-scoped. A shared session, an unrelated later run, provider
+acceptance without a published response, or a run-less comment is not an answer.
+A later chain answer supersedes an existing unanswered-message notice, even if
+an intermediate run failed. A proven pending continuation keeps a waiting note,
+not resend text, until it starts or terminates. This attribution does not change
+automatic retry budgets or the ordinary first-start bounds.
+
 A delegated-task completion callback can finish native execution before its
 accepted final reply is saved. The completion outbox must retain that callback's
 queued target and attempt while the existing presentation selector finds pending
