@@ -10,9 +10,26 @@ box with the existing `PATCH /sandboxes/{id}` `{ttlSeconds}` path every
 now to the environment's effective TTL, including existing warm/reconnect floors.
 It never disables auto-stop, creates a sandbox, or resumes one.
 
-Only one RUN renewal may be in flight per account/box. Failures emit a closed
-`Boat run lease TTL refresh` warning and retry at the next tick. Release, stop,
-destroy, shutdown, or a missing/terminal box ends renewal and drains active work.
+There is one renewal deadline timer per account/box, not per lease object or
+acquisition, and at most one renewal in flight. Before PATCH, a scoped uncached
+GET must observe the exact box. An `archiving`, `archived`, `stopping`, `stopped`,
+or `cancelled` observation (including the PATCH response or its closed 409 state)
+ends renewal without any recovery resume. The F-01 admission/lifecycle fences
+apply before every send; a late reply cannot re-arm a cancelled timer.
+
+The environment setting `runLeaseRenewCapSeconds` (integer 1–2592000, default
+**7800**) is an absolute renewal budget from acquire/resume entry, not a sliding
+idle window. The plugin SDK's acquire/resume/lease and runner-ingress contracts
+do not expose the RUN's timeout. The fallback default is 7200 seconds plus a
+600-second allowance; configure it to your RUN timeout plus one renewal cadence
+and a small margin. Duplicate same-RUN warm handoffs preserve the original cap;
+a new RUN may get a new budget. At the cap, even a never-released lease loses its
+refresher and the box expires on its last finite TTL (not necessarily at the cap).
+The cap is not a provider-side absolute expiry or a promise of zero charges.
+
+Transient failures emit a closed `Boat run lease TTL refresh` warning and retry
+at the next tick within the cap. Release, stop, destroy, shutdown, or a missing/
+terminal box ends renewal and drains active work.
 The existing release policy still performs confirmed stop-and-retain immediately;
 it does not leave a released box running until TTL. If the worker disappears,
 Boat's last finite TTL remains the fallback. Legacy warm handoffs without
