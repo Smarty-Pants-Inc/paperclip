@@ -1339,7 +1339,13 @@ export function findHeartbeatRunCompletionComment<T extends { id: string; presen
   const found = findHeartbeatRunCompletionCommentRow(comments, resultJson);
   if (!found) return null;
   const whole = assembleAnswerParts(found, comments);
-  return whole ? { ...whole.first, body: whole.text, answerPartCommentIds: whole.partIds } : found;
+  if (whole) return { ...whole.first, body: whole.text, answerPartCommentIds: whole.partIds };
+  // A missing or damaged part makes the logical answer unavailable, not a
+  // single physical part the answer. Use the same C1 line as other finals
+  // that cannot be delivered whole, including when part metadata is invalid.
+  return "answerPart" in record(found.metadata)
+    ? { ...found, body: TRUNCATED_FINAL_UNDELIVERABLE_TEXT }
+    : found;
 }
 
 function findHeartbeatRunCompletionCommentRow<T extends { id: string; presentation?: unknown }>(

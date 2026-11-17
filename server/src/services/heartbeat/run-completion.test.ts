@@ -1006,6 +1006,32 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   );
 
+  it.each(["missing", "duplicate", "soft-deleted", "invalid index"])(
+    "rf-2: a %s answer part resolves to C1, never one physical part", async (damage) => {
+      const { post, reply, rows } = await chatRunForReply();
+      await post(probeAnswer(300 * 1024));
+      const posted = await rows();
+      expect(posted).toHaveLength(2);
+      const first = posted[0]!;
+      if (damage === "missing") {
+        await db.delete(issueComments).where(eq(issueComments.id, first.id));
+      } else if (damage === "soft-deleted") {
+        await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, first.id));
+      } else {
+        const metadata = first.metadata!;
+        await db.update(issueComments).set({ metadata: { ...metadata,
+          answerPart: { ...metadata.answerPart!, index: damage === "duplicate" ? 2 : 0 },
+        } }).where(eq(issueComments.id, first.id));
+      }
+      const { comment, resolved } = await reply();
+      const { TRUNCATED_FINAL_UNDELIVERABLE_TEXT } = await import("../heartbeat-run-summary.js");
+      expect(comment!.body).toBe(TRUNCATED_FINAL_UNDELIVERABLE_TEXT);
+      expect(resolved.text).toBe(TRUNCATED_FINAL_UNDELIVERABLE_TEXT);
+      expect(comment).not.toHaveProperty("answerPartCommentIds");
+      expect(resolved.text).not.toBe(posted[1]!.body);
+    }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
   it("F3: with the recorded wrappers, a fence spanning a boundary strips back to the source, byte-equal", async () => {
     const answer = `\`\`\`ts\n${probeAnswer(300 * 1024)}\`\`\`\ntail\n`;
     const { post, rows } = await chatRunForReply();
