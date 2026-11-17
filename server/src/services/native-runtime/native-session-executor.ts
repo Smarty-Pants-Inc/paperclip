@@ -1028,21 +1028,6 @@ subscribeRunStartHandoverChanges(() => {
   }
 });
 
-export const WARM_HANDOFF_CLOSE_DELAY_MS = 1_000;
-
-function warmIdleCloseDelay(idleTimeoutMs: number): number {
-  return isLeavingRunStartsToReplacement() ? Math.min(idleTimeoutMs, WARM_HANDOFF_CLOSE_DELAY_MS) : idleTimeoutMs;
-}
-
-subscribeRunStartHandoverChanges(() => {
-  if (!isLeavingRunStartsToReplacement()) return;
-  for (const [sessionId, entry] of warmNativeSessions) {
-    if (entry.busy || entry.idleTimer === null) continue;
-    clearTimeout(entry.idleTimer);
-    armWarmNativeSessionIdleTimer(sessionId, entry, WARM_HANDOFF_CLOSE_DELAY_MS);
-  }
-});
-
 /**
  * How long a new run's admission waits for the warm session to stop being busy.
  * A follow-up comment can wake the next run within milliseconds of the previous
