@@ -339,6 +339,83 @@ export function readCompletedAssistantMessageCandidate(input: {
   };
 }
 
+/** n5e's answer line (pi-event-projector.ts MAX_ANSWER_BYTES): above it the person gets the plain line and an excerpt. */
+export const FINAL_ANSWER_INLINE_MAX_BYTES = 250 * 1024;
+const FINAL_ANSWER_EXCERPT_BYTES = 16 * 1024;
+
+/**
+ * A completed agent message whose stored payload lost its text to a generic
+ * retention bound (`{truncated: true, byteSize}`, dl-n5-66k run 5184ca23).
+ * Its identity survives on the PRP envelope; its text survives in the stored
+ * live deltas of the same item.
+ */
+export function readTruncatedCompletedAgentMessageItemId(prpEvent: unknown): string | null {
+  const event = record(prpEvent);
+  const payload = record(event.payload);
+  if (payload.truncated !== true || typeof payload.text === "string") return null;
+  if (payload.kind !== undefined && payload.kind !== "agentMessage" && payload.kind !== "assistant_message") return null;
+  if (payload.channel !== undefined && payload.channel !== "final") return null;
+  return typeof event.itemId === "string" && event.itemId.length > 0 ? event.itemId : null;
+}
+
+/**
+ * The whole text of one agent message rebuilt from its stored live deltas, in
+ * order. Null when any delta of the item is itself cut or not text: a partial
+ * rebuild is never presented as the answer.
+ */
+export function reassembleAgentMessageFromDeltas(
+  rows: readonly { seq: number; payload: unknown }[],
+  itemId: string,
+): string | null {
+  const parts: { seq: number; text: string }[] = [];
+  for (const row of rows) {
+    const event = record(record(row.payload).prpEvent);
+    if (event.eventType !== "item.delta" || event.itemId !== itemId) continue;
+    const payload = record(event.payload);
+    if (payload.truncated === true || payload.kind !== "agentMessage" || typeof payload.text !== "string"
+      || isBoundedRunEventText(payload.text)) return null;
+    parts.push({ seq: row.seq, text: payload.text });
+  }
+  if (parts.length === 0) return null;
+  const text = parts.sort((a, b) => a.seq - b.seq).map((part) => part.text).join("");
+  return text.trim() ? text : null;
+}
+
+/** The person's text for a final answer: whole up to n5e's line, else n5e's plain line and a labelled excerpt. */
+export function presentFinalAnswerText(text: string): string {
+  const bytes = Buffer.byteLength(JSON.stringify(text));
+  if (bytes <= FINAL_ANSWER_INLINE_MAX_BYTES) return text;
+  let low = 0, high = Math.min(text.length, FINAL_ANSWER_EXCERPT_BYTES);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(JSON.stringify(text.slice(0, middle))) <= FINAL_ANSWER_EXCERPT_BYTES) low = middle;
+    else high = middle - 1;
+  }
+  if (low > 0 && /[\uD800-\uDBFF]/u.test(text[low - 1]!)) low--;
+  return `This answer is longer than one message (${Math.ceil(Buffer.byteLength(text) / 1000)} KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n${text.slice(0, low)}`;
+}
+
+/**
+ * A final answer whose completed event was stored without text, rebuilt from
+ * its deltas, so the semantic summary never wins over it (dl-n5-66k).
+ */
+export function readTruncatedCompletedAssistantMessageCandidate(input: {
+  seq: number;
+  prpEvent: unknown;
+  deltaRows: readonly { seq: number; payload: unknown }[];
+}): CompletedFinalAgentMessageCandidate | null {
+  const itemId = readTruncatedCompletedAgentMessageItemId(input.prpEvent);
+  if (!itemId) return null;
+  const whole = reassembleAgentMessageFromDeltas(input.deltaRows, itemId);
+  if (!whole) return null;
+  return {
+    seq: input.seq,
+    text: presentFinalAnswerText(whole),
+    sourceEventId: readCommentText(record(input.prpEvent).sourceEventId),
+    channel: "final",
+  };
+}
+
 function readAcceptedSemanticSummary(resultJson: Record<string, unknown>) {
   const candidates = semanticResultCandidates(resultJson);
   for (const candidate of candidates) {

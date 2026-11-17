@@ -105,6 +105,8 @@ import {
   readAcceptedTaskContinuationSummary,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
+  readTruncatedCompletedAgentMessageItemId,
+  readTruncatedCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
 } from "../heartbeat-run-summary.js";
@@ -1255,11 +1257,37 @@ async function recoverCommittedNativeChatResponseInScope(
             eq(heartbeatRunEvents.runId, run.id),
             eq(heartbeatRunEvents.eventType, "plan.proposed"),
           )).limit(200));
+        // dl-n5-66k: a completed answer stored as {truncated, byteSize} (no
+        // kind, channel or text) is rebuilt from its stored deltas, so the
+        // semantic summary never replaces it.
+        const truncatedRows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+          .from(heartbeatRunEvents).where(and(
+            eq(heartbeatRunEvents.companyId, input.companyId),
+            eq(heartbeatRunEvents.runId, run.id),
+            eq(heartbeatRunEvents.eventType, "item.completed"),
+            sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${accepted.turnId}`,
+            sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,truncated}' = 'true'`,
+          )).orderBy(desc(heartbeatRunEvents.seq)).limit(20);
+        const rebuiltCandidates = [];
+        for (const row of truncatedRows) {
+          const prpEvent = record(row.payload).prpEvent;
+          const itemId = readTruncatedCompletedAgentMessageItemId(prpEvent);
+          if (!itemId) continue;
+          const deltaRows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+            .from(heartbeatRunEvents).where(and(
+              eq(heartbeatRunEvents.companyId, input.companyId),
+              eq(heartbeatRunEvents.runId, run.id),
+              eq(heartbeatRunEvents.eventType, "item.delta"),
+              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' = ${itemId}`,
+            )).orderBy(heartbeatRunEvents.seq);
+          const rebuilt = readTruncatedCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent, deltaRows });
+          if (rebuilt) rebuiltCandidates.push(rebuilt);
+        }
         const finalAgentMessage = selectHeartbeatRunFinalAgentMessage({
-          candidates: rows.flatMap((row) => {
+          candidates: [...rows.flatMap((row) => {
             const candidate = readCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent: record(row.payload).prpEvent, proposedItemIds });
             return candidate ? [candidate] : [];
-          }),
+          }), ...rebuiltCandidates],
         });
         if (!finalAgentMessage && !blockedTaskReply) return false;
         const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation })
