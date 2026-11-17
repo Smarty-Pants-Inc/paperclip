@@ -995,6 +995,66 @@ describe("persistent agent directories", () => {
       expect(await fs.readFile(path.join(copy.localRoot, "unsaved-note.txt"), "utf8")).toContain("unsaved note");
     });
 
+    it.each(["apply", "quota", "authorization", "timeout"] as const)("warm-remote stopped failure retains the actual remote tree and retries (%s)", async kind => {
+      const runId = randomUUID(), environmentId = randomUUID(), leaseId = randomUUID();
+      const remoteCwd = await fs.mkdtemp(path.join(home, "warm-remote-"));
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+      await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: runId,
+        provider: "boat", providerLeaseId: leaseId, status: "active", metadata: { remoteCwd } });
+      const remote = { kind: "remote" as const, transport: "sandbox" as const, environmentId, leaseId, remoteCwd, runner: { execute: vi.fn() } };
+      // Only the transport boundary is local: execute the production remote checkpoint
+      // program against a separate provider tree and transfer its real payloads.
+      vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async options => {
+        const assetDirs: Record<string, string> = {};
+        for (const asset of options.assets ?? []) {
+          const destination = path.join(remoteCwd, "assets", randomUUID(), asset.key);
+          await fs.mkdir(path.dirname(destination), { recursive: true });
+          await fs.cp(asset.localDir, destination, { recursive: true }); assetDirs[asset.key] = destination;
+        }
+        if (options.syncWorkspace && options.workspaceInboundMode !== "adopt_remote") {
+          await fs.mkdir(options.workspaceRemoteDir!, { recursive: true });
+          await fs.cp(options.workspaceLocalDir, options.workspaceRemoteDir!, { recursive: true });
+        }
+        return { target: remote, workspaceRemoteDir: options.workspaceRemoteDir!, runtimeRootDir: options.runtimeRootDir ?? null, assetDirs,
+          additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
+          restoreWorkspace: async () => { await fs.cp(options.workspaceRemoteDir!, options.workspaceLocalDir, { recursive: true }); } };
+      });
+      let timeout = false;
+      vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand").mockImplementation(async (_runId, _target, command) => {
+        if (timeout && command.includes("--checkpoint")) {
+          await execFile("sh", ["-c", "sleep 1"], { timeout: 20 }).catch(() => undefined);
+          return { exitCode: null, signal: "SIGTERM", timedOut: true, stdout: "", stderr: "checkpoint deadline", pid: null, startedAt: null };
+        }
+        const result = await execFile("sh", ["-c", command], { cwd: remoteCwd, maxBuffer: 16 * 1024 * 1024 });
+        return { ...result, exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: null };
+      });
+      const service = kind === "apply" ? failingService(kind) : copies;
+      const copy = (await service.prepare({ ...target(), runId, cwd: home, warm: true, target: remote }))!;
+      expect(copy.location).toBe(`remote:${environmentId}`);
+      expect(copy.executionRoot).not.toBe(copy.localRoot);
+      const note = `remote-only-${randomUUID()}`;
+      await fs.writeFile(path.join(copy.executionRoot, "unsaved-note.txt"), note);
+      if (kind === "quota") await sparseFile(path.join(copy.executionRoot, "oversized.bin"), MAX_AGENT_FILE_BYTES + 1);
+      if (kind === "authorization") await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId));
+      timeout = kind === "timeout";
+      const held = (await service.collectStopped({ companyId, runId, target: remote }))!;
+      expect(agentFileSaveHeld(held)).toBe(true);
+      expect(held.errorMessage).toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
+      await service.release(companyId, runId);
+      expect(await fs.readFile(path.join(copy.executionRoot, "unsaved-note.txt"), "utf8")).toBe(note);
+      await expect(fs.stat(path.join(root, "unsaved-note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await agentFileSaveHeldOnLease(db, { id: leaseId, companyId })).toBe(true);
+      timeout = false;
+      if (kind === "quota") await fs.rm(path.join(copy.executionRoot, "oversized.bin"));
+      if (kind === "authorization") await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: userId,
+        permissionKey: "agents:configure", scope: { agentIds: [agentId] } });
+      expect((await copies.collectStopped({ companyId, runId, target: remote }))?.state).toBe("saved");
+      expect(await fs.readFile(path.join(root, "unsaved-note.txt"), "utf8")).toBe(note);
+      await expect(fs.stat(copy.executionRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await agentFileSaveHeldOnLease(db, { id: leaseId, companyId })).toBe(false);
+    }, 60_000);
+
     it("a held save does not block the next message: the next run starts from canonical and the instruction stays visible", async () => {
       const { copy, note } = await holdUnsavedNote(false, "apply");
       const next = await run();
