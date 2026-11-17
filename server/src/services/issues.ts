@@ -7135,13 +7135,27 @@ async function lockIssueForCommentMutation(tx: DbTransaction, commentId: string)
   return Boolean(issue);
 }
 
+/** The runner's completion-summary cap, counted in Unicode code points as the
+ * runner counts it (runner-core provider_bridge.rs MAX_COMPLETION_SUMMARY_CHARS,
+ * `summary.chars().count()`), not UTF-16 units. */
+export const COMPLETION_SUMMARY_CAP_CODE_POINTS = 12_000;
+/** How far under the cap a verbatim opening may stop and still authorize the
+ * whole answer. The runner's over-cap refusal and the chat contract ask for an
+ * opening of 11,000 to 12,000 characters (dl-finish-cap2, H5). */
+export const COMPLETION_SUMMARY_OPENING_MARGIN_CODE_POINTS = 1_000;
+
 /** The posted body is the accepted summary, or the whole answer that the
- * schema-capped (12,000-character) summary previews. An answer over the cap
- * can never be its own summary; its summary is its verbatim opening, which
- * the chat contract keeps under the cap (dl-finish-cap, H5). */
+ * schema-capped summary previews. An answer over the cap can never be its own
+ * summary; its summary is its verbatim opening. That opening must reach the
+ * cap less a small margin, so a short summary (one character) never
+ * authorizes a long, different body (RFL FAIL on 9a75d258). */
 export function presentsAcceptedSummary(summary: unknown, body: string): boolean {
-  return typeof summary === "string" && (summary === body
-    || (summary.length > 0 && body.length > 12_000 && body.startsWith(summary)));
+  if (typeof summary !== "string") return false;
+  if (summary === body) return true;
+  const floor = COMPLETION_SUMMARY_CAP_CODE_POINTS - COMPLETION_SUMMARY_OPENING_MARGIN_CODE_POINTS;
+  return body.startsWith(summary)
+    && Array.from(body).length > COMPLETION_SUMMARY_CAP_CODE_POINTS
+    && Array.from(summary).length >= floor;
 }
 
 export function issueService(db: Db) {

@@ -44,7 +44,7 @@ function followContract(prompt: string, whole: string) {
   if (prompt.includes("The semantic completion summary is the user-visible final answer")) {
     return { summary: whole, finalResponse: whole };
   }
-  expect(prompt).toContain("the summary is only the answer's opening, copied verbatim and under 12,000 characters");
+  expect(prompt).toContain("the summary is only the answer's opening, copied verbatim, between 11,000 and 12,000 characters long");
   return { summary: Array.from(whole).slice(0, RUNNER_SUMMARY_CAP - 1).join(""), finalResponse: whole };
 }
 
