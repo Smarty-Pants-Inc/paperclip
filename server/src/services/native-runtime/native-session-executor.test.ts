@@ -9346,6 +9346,65 @@ describe("native startup restart detachment", () => {
     }
   });
 
+  it("detaches five published runs concurrently under one shutdown deadline, never reporting an expired detach as detached", async () => {
+    // Five in-flight runs whose controller detach takes 6 s each. A serial sweep
+    // needs 30 s; the shared pre-drain budget leaves 20 s. A sixth detach never
+    // settles: it must stay pending, not be reported detached because the
+    // deadline expired.
+    const inputs = ["a", "b", "c", "d", "e", "stuck"].map(label => {
+      const input = structuredClone(execution);
+      input.binding.runId = `restart-concurrent-detach-${label}`;
+      input.binding.agentId = `restart-concurrent-detach-agent-${label}`;
+      input.binding.issueId = `restart-concurrent-detach-issue-${label}`;
+      input.binding.executionWorkspaceId = `restart-concurrent-detach-workspace-${label}`;
+      input.session.normalizedSessionId = `restart-concurrent-detach-session-${label}`;
+      input.workspace.cwd = `/tmp/paperclip-native-concurrent-detach-${label}`;
+      return input;
+    });
+    const releases: Array<() => void> = [];
+    const published: Array<Promise<void>> = [];
+    let unstick: (() => void) | undefined, stuckReleased = false;
+    const detaches = inputs.map((_input, index) => vi.fn(() => index === inputs.length - 1
+      ? new Promise<void>(resolve => { unstick = resolve; if (stuckReleased) resolve(); })
+      : new Promise<void>(resolve => { setTimeout(resolve, 6_000); })));
+    state.execute.mockReset();
+    for (const detach of detaches) {
+      let announce!: () => void;
+      published.push(new Promise<void>(resolve => { announce = resolve; }));
+      const parked = new Promise<void>(resolve => { releases.push(resolve); });
+      state.execute.mockImplementationOnce(async options => {
+        await options.onSession({ detachControllerForRestart: detach });
+        announce(); await parked;
+        await options.onSession(null);
+        throw new Error("concurrent detach fixture released");
+      });
+    }
+    const outcomes = inputs.map(input => executePaperclipNativeSession({
+      db: leaseDb(input), execution: input, runnerInstanceId: "runner",
+    }).catch(error => error));
+    await Promise.all(published);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const runIds = inputs.map(input => input.binding.runId);
+    const finished = vi.fn();
+    const abort = new AbortController();
+    const shutdown = detachNativeSessionsForRestart(runIds, undefined, { signal: abort.signal, reportFailures: true })
+      .then(finished);
+    try {
+      await vi.advanceTimersByTimeAsync(6_000);
+      for (const detach of detaches) expect(detach).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(14_000);
+      abort.abort(new Error("shutdown step hot_restart_prepare timed out"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(finished).toHaveBeenCalledWith({ detachedRunIds: runIds.slice(0, 5), inactiveRunIds: [],
+        unsupportedRunIds: [], pendingRunIds: [runIds[5]] });
+    } finally {
+      stuckReleased = true; unstick?.(); abort.abort();
+      await vi.runAllTimersAsync();
+      vi.useRealTimers(); releases.forEach(release => release());
+      await Promise.all(outcomes); await shutdown;
+    }
+  });
+
   it.each(["authority", "questions"])("keeps a post-publication Stop owner through %s attachment and restart", async (seam) => {
     const restarting = structuredClone(execution);
     restarting.binding.runId = `restart-stop-after-publication-${seam}`;
