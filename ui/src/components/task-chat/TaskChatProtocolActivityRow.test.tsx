@@ -117,7 +117,10 @@ describe("TaskChatProtocolActivityRow", () => {
     expect(row?.textContent).toContain("Edited files");
     act(() => row?.click());
     expect(container.textContent).toContain("ui/src/file-1.tsx");
-    expect(container.textContent).toContain("2 more files not shown");
+    expect(container.textContent).toContain("Show 2 more files");
+    const showFiles = [...container.querySelectorAll("button")].find(button => button.textContent === "Show 2 more files");
+    act(() => showFiles?.click());
+    expect(container.textContent).toContain("ui/src/file-10.tsx");
     expect(container.textContent).not.toContain("new-1");
     expect(container.querySelector('[data-testid="task-chat-workspace-change-details"] pre')).toBeNull();
   });

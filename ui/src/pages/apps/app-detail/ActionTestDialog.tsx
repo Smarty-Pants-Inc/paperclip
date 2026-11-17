@@ -906,8 +906,8 @@ function AllowedResult({
 function PrettyPreview({ value }: { value: unknown }) {
   const rows = asRows(value);
   if (rows) {
-    const columns = Array.from(new Set(rows.flatMap((r) => Object.keys(r)))).slice(0, 6);
-    const shown = rows.slice(0, 6);
+    const columns = Array.from(new Set(rows.flatMap((r) => Object.keys(r))));
+    const shown = rows;
     const needsCards = columns.length > 4 || shown.some((row) =>
       columns.some((column) => cellText(row[column]).length > 80)
     );
@@ -915,9 +915,7 @@ function PrettyPreview({ value }: { value: unknown }) {
       return (
         <div className="space-y-2">
           {shown.map((row, index) => <PreviewRowCard key={index} row={row} index={index} />)}
-          {rows.length > shown.length && (
-            <p className="text-(length:--text-micro) text-muted-foreground">… {rows.length - shown.length} more rows in the raw response</p>
-          )}
+
         </div>
       );
     }
@@ -941,9 +939,7 @@ function PrettyPreview({ value }: { value: unknown }) {
             ))}
           </tbody>
         </table>
-        {rows.length > shown.length && (
-          <p className="px-2.5 py-1.5 text-(length:--text-micro) text-muted-foreground">… {rows.length - shown.length} more rows</p>
-        )}
+
       </div>
     );
   }
@@ -956,7 +952,7 @@ function PrettyPreview({ value }: { value: unknown }) {
         {Object.entries(value as Record<string, unknown>).map(([key, field]) => (
           <div key={key} className="grid grid-cols-3 gap-3 px-3 py-2">
             <dt className="min-w-0 break-words text-muted-foreground">{key}</dt>
-            <dd className="col-span-2 min-w-0 break-words whitespace-pre-wrap text-foreground">{typeof field === "object" && field !== null ? safeStringify(collapseDeep(field, 2)) : cellText(field)}</dd>
+            <dd className="col-span-2 min-w-0 break-words whitespace-pre-wrap text-foreground">{typeof field === "object" && field !== null ? safeStringify(field) : cellText(field)}</dd>
           </div>
         ))}
       </dl>
@@ -964,7 +960,7 @@ function PrettyPreview({ value }: { value: unknown }) {
   }
   return (
     <pre className="max-h-64 overflow-auto rounded-md border border-border bg-background p-3 text-xs text-foreground">
-      {safeStringify(collapseDeep(value, 2))}
+      {safeStringify(value)}
     </pre>
   );
 }
@@ -989,10 +985,10 @@ function PreviewRowCard({ row, index }: { row: Record<string, unknown>; index: n
         </p>
         {url && <a className="shrink-0 text-primary hover:underline" href={url} target="_blank" rel="noopener noreferrer">Open link</a>}
       </div>
-      {summaryKey && <p className="mt-1 line-clamp-2 break-words text-muted-foreground">{cellText(row[summaryKey]).replace(/\*\*(.*?)\*\*/g, "$1")}</p>}
+      {summaryKey && <p className="mt-1 break-words text-muted-foreground">{cellText(row[summaryKey]).replace(/\*\*(.*?)\*\*/g, "$1")}</p>}
       {details.length > 0 && (
         <dl className="mt-2 space-y-1">
-          {details.slice(0, 3).map(([key, field]) => (
+          {details.map(([key, field]) => (
             <div key={key} className="grid grid-cols-3 gap-2">
               <dt className="min-w-0 break-words text-muted-foreground">{key}</dt>
               <dd className="col-span-2 min-w-0 break-all text-foreground">{cellText(field)}</dd>
@@ -1000,27 +996,15 @@ function PreviewRowCard({ row, index }: { row: Record<string, unknown>; index: n
           ))}
         </dl>
       )}
-      {details.length > 3 && <p className="mt-2 text-muted-foreground">{details.length - 3} more {details.length === 4 ? "field" : "fields"} in the raw response</p>}
+
     </div>
   );
 }
 
 function cellText(value: unknown): string {
   if (value === null || value === undefined) return "—";
-  if (typeof value === "object") return Array.isArray(value) ? `[${value.length}]` : "{…}";
+  if (typeof value === "object") return safeStringify(value);
   return String(value);
-}
-
-/** Replace objects deeper than `maxDepth` with a placeholder so the tree stays readable. */
-function collapseDeep(value: unknown, maxDepth: number, depth = 0): unknown {
-  if (value === null || typeof value !== "object") return value;
-  if (depth >= maxDepth) return Array.isArray(value) ? "[…]" : "{…}";
-  if (Array.isArray(value)) return value.map((v) => collapseDeep(v, maxDepth, depth + 1));
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    out[k] = collapseDeep(v, maxDepth, depth + 1);
-  }
-  return out;
 }
 
 function RawResponseDisclosure({ value, initiallyOpen = false }: { value: unknown; initiallyOpen?: boolean }) {

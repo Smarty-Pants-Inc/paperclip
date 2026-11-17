@@ -337,7 +337,7 @@ describe("issue activity event routes", () => {
     });
   });
 
-  it("truncates long text receipt values to 200 characters and marks them updated", async () => {
+  it("retains complete old and new receipt values without claiming a producer omission", async () => {
     const issue = {
       ...makeIssue(),
       title: "a".repeat(240),
@@ -353,8 +353,8 @@ describe("issue activity event routes", () => {
 
     expect(response.status).toBe(200);
     expect(response.body.changes).toEqual({
-      title: { from: "a".repeat(200), to: "c".repeat(200), updated: true },
-      description: { from: "b".repeat(200), to: "d".repeat(200), updated: true },
+      title: { from: "a".repeat(240), to: "c".repeat(240) },
+      description: { from: "b".repeat(240), to: "d".repeat(240), updated: true },
     });
   });
 

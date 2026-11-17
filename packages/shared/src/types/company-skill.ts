@@ -363,6 +363,8 @@ export interface CompanySkillProjectBrowseRequest {
   projectId: string;
   workspaceId: string;
   path?: string | null;
+  limit?: number;
+  offset?: number;
 }
 
 export interface CompanySkillProjectBrowseEntry {
@@ -379,6 +381,8 @@ export interface CompanySkillProjectBrowseResult {
   path: string;
   parentPath: string | null;
   entries: CompanySkillProjectBrowseEntry[];
+  /** Offset of the next reachable page; null when the directory is exhausted. */
+  nextOffset: number | null;
   truncated: boolean;
 }
 

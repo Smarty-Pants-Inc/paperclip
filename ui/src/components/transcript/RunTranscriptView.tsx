@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { SavedOutputNotice } from "../task-chat/SavedOutputNotice";
+import { savedOutputForDisplay } from "../task-chat/saved-output";
 import type { TranscriptEntry } from "../../adapters";
 import type { ToolRunDecision } from "@paperclipai/shared";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "../MarkdownBody";
@@ -31,6 +33,7 @@ const RAW_INITIAL_ROWS = 180;
 
 interface RunTranscriptViewProps {
   entries: TranscriptEntry[];
+  runLogHref?: string;
   toolDecisions?: readonly ToolRunDecision[];
   mode?: TranscriptMode;
   density?: TranscriptDensity;
@@ -75,6 +78,7 @@ type TranscriptBlock =
       actionRequestId?: string;
       input: unknown;
       result?: string;
+      outputTruncated?: boolean;
       isError?: boolean;
       status: "running" | "completed" | "error";
     }
@@ -98,6 +102,7 @@ type TranscriptBlock =
         actionRequestId?: string;
         input: unknown;
         result?: string;
+        outputTruncated?: boolean;
         isError?: boolean;
         status: "running" | "completed" | "error";
       }>;
@@ -115,6 +120,7 @@ type TranscriptBlock =
         actionRequestId?: string;
         input: unknown;
         result?: string;
+        outputTruncated?: boolean;
         isError?: boolean;
         status: "running" | "completed" | "error";
       }>;
@@ -163,6 +169,7 @@ type TranscriptBlock =
       hunks: Array<{
         changeType: "add" | "remove" | "context" | "hunk" | "file_header" | "truncation";
         text: string;
+        runLogHref?: string;
       }>;
     };
 
@@ -173,10 +180,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function compactWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
-}
-
-function truncate(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, Math.max(0, max - 1))}…` : value;
 }
 
 function humanizeLabel(value: string): string {
@@ -237,7 +240,7 @@ function summarizeRecord(record: Record<string, unknown>, keys: string[]): strin
   for (const key of keys) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) {
-      return truncate(compactWhitespace(value), 120);
+      return compactWhitespace(value);
     }
   }
   return null;
@@ -259,15 +262,14 @@ function mergeToolInput(previous: unknown, incoming: unknown): unknown {
 }
 
 function summarizeToolInput(name: string, input: unknown, density: TranscriptDensity): string {
-  const compactMax = density === "compact" ? 72 : 120;
   if (typeof input === "string") {
     const normalized = isCommandTool(name, input) ? stripWrappedShell(input) : compactWhitespace(input);
-    return truncate(normalized, compactMax);
+    return normalized;
   }
   const record = asRecord(input);
   if (!record) {
     const serialized = compactWhitespace(formatUnknown(input));
-    return serialized ? truncate(serialized, compactMax) : `Inspect ${name} input`;
+    return serialized ? serialized : `Inspect ${name} input`;
   }
 
   const command = typeof record.command === "string"
@@ -276,26 +278,26 @@ function summarizeToolInput(name: string, input: unknown, density: TranscriptDen
       ? record.cmd
       : null;
   if (command && isCommandTool(name, record)) {
-    return truncate(stripWrappedShell(command), compactMax);
+    return stripWrappedShell(command);
   }
 
   const direct =
     summarizeRecord(record, ["command", "cmd", "path", "filePath", "file_path", "query", "url", "prompt", "message"])
     ?? summarizeRecord(record, ["pattern", "name", "title", "target", "tool", "text"])
     ?? null;
-  if (direct) return truncate(direct, compactMax);
+  if (direct) return direct;
 
   if (Array.isArray(record.paths) && record.paths.length > 0) {
     const first = record.paths.find((value): value is string => typeof value === "string" && value.trim().length > 0);
     if (first) {
-      return truncate(`${record.paths.length} paths, starting with ${first}`, compactMax);
+      return `${record.paths.length} paths, starting with ${first}`;
     }
   }
 
   const keys = Object.keys(record);
   if (keys.length === 0) return `No ${name} input`;
-  if (keys.length === 1) return truncate(`${keys[0]} payload`, compactMax);
-  return truncate(`${keys.length} fields: ${keys.slice(0, 3).join(", ")}`, compactMax);
+  if (keys.length === 1) return `${keys[0]} payload`;
+  return `${keys.length} fields: ${keys.join(", ")}`;
 }
 
 function parseStructuredToolResult(result: string | undefined) {
@@ -346,7 +348,7 @@ function summarizeToolResult(result: string | undefined, isError: boolean | unde
   const structured = parseStructuredToolResult(result);
   if (structured) {
     if (structured.body) {
-      return truncate(structured.body.split("\n")[0] ?? structured.body, density === "compact" ? 84 : 140);
+      return structured.body.split("\n")[0] ?? structured.body;
     }
     if (structured.status === "completed") return "Completed";
     if (structured.status === "failed" || structured.status === "error") {
@@ -358,7 +360,7 @@ function summarizeToolResult(result: string | undefined, isError: boolean | unde
     .map((line) => compactWhitespace(line))
     .filter(Boolean);
   const firstLine = lines[0] ?? result;
-  return truncate(firstLine, density === "compact" ? 84 : 140);
+  return firstLine;
 }
 
 type ToolDecisionRefs = {
@@ -492,6 +494,7 @@ function groupCommandBlocks(blocks: TranscriptBlock[]): TranscriptBlock[] {
         actionRequestId: block.actionRequestId,
         input: block.input,
         result: block.result,
+        outputTruncated: block.outputTruncated,
         isError: block.isError,
         status: block.status,
       });
@@ -539,6 +542,7 @@ function groupToolBlocks(blocks: TranscriptBlock[]): TranscriptBlock[] {
         actionRequestId: block.actionRequestId,
         input: block.input,
         result: block.result,
+        outputTruncated: block.outputTruncated,
         isError: block.isError,
         status: block.status,
       });
@@ -689,6 +693,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
 
       if (matched) {
         matched.result = entry.content;
+        matched.outputTruncated = entry.outputTruncated;
         matched.isError = entry.isError;
         matched.status = entry.isError ? "error" : "completed";
         matched.endTs = entry.ts;
@@ -702,6 +707,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
           toolUseId: entry.toolUseId,
           input: null,
           result: entry.content,
+          outputTruncated: entry.outputTruncated,
           isError: entry.isError,
           status: entry.isError ? "error" : "completed",
         });
@@ -819,7 +825,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
           // New file in the same diff block — update filePath
           prev.filePath = entry.text;
         }
-        prev.hunks.push({ changeType: entry.changeType, text: entry.text });
+        prev.hunks.push({ changeType: entry.changeType, text: entry.text, ...(entry.runLogHref ? { runLogHref: entry.runLogHref } : {}) });
         prev.endTs = entry.ts;
       } else {
         blocks.push({
@@ -827,7 +833,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
           ts: entry.ts,
           endTs: entry.ts,
           filePath: entry.changeType === "file_header" ? entry.text : undefined,
-          hunks: [{ changeType: entry.changeType, text: entry.text }],
+          hunks: [{ changeType: entry.changeType, text: entry.text, ...(entry.runLogHref ? { runLogHref: entry.runLogHref } : {}) }],
         });
       }
       continue;
@@ -885,12 +891,12 @@ function transcriptBlockIdentity(block: TranscriptBlock): string {
   }
 }
 
-function TranscriptProviderActivity({ block, density }: { block: Extract<TranscriptBlock, { type: "provider_activity" }>; density: TranscriptDensity }) {
+function TranscriptProviderActivity({ block, density, runLogHref }: { block: Extract<TranscriptBlock, { type: "provider_activity" }>; density: TranscriptDensity; runLogHref?: string }) {
   const [open, setOpen] = useState(block.status === "running");
   const steps = Array.isArray(block.payload.steps) ? block.payload.steps.map(asRecord).filter((value): value is Record<string, unknown> => value !== null) : [];
   const children = Array.isArray(block.payload.children) ? block.payload.children.map(asRecord).filter((value): value is Record<string, unknown> => value !== null) : [];
   const sources = Array.isArray(block.payload.sources) ? block.payload.sources.map(asRecord).filter((value): value is Record<string, unknown> => value !== null) : [];
-  const output = typeof block.payload.output === "string" ? block.payload.output.slice(-(8 * 1024)) : "";
+  const output = typeof block.payload.output === "string" ? block.payload.output : "";
   return <div className={cn("rounded-xl border p-2", block.status === "failed" ? "border-red-500/30 bg-red-500/[0.05]" : "border-border/70 bg-muted/20")} data-provider-family={block.family}>
     <button type="button" className="flex min-h-8 w-full items-center gap-2 text-left" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
       <span aria-hidden="true">{block.status === "running" ? "⏳" : block.status === "failed" ? "✕" : block.status === "interrupted" ? "■" : "✓"}</span>
@@ -899,11 +905,13 @@ function TranscriptProviderActivity({ block, density }: { block: Extract<Transcr
       {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
     </button>
     {open ? <div className="mt-2 space-y-2 border-l border-border pl-5 text-xs">
+      {block.summary ? <p className="whitespace-pre-wrap break-words">{block.summary}</p> : null}
       {steps.length > 0 ? <ol className="space-y-1">{steps.map((step, index) => <li key={String(step.stepId ?? index)}><span className="mr-2" aria-hidden="true">{step.status === "completed" ? "✓" : step.status === "blocked" ? "!" : "○"}</span>{String(step.body ?? "")}</li>)}</ol> : null}
       {children.length > 0 ? <ul className="space-y-1">{children.map((child, index) => <li key={String(child.childId ?? index)}><strong>{String(child.role ?? "Child agent")}</strong> · {String(child.status ?? "unknown")}<div className="text-muted-foreground">{String(child.summary ?? "")}</div></li>)}</ul> : null}
       {sources.length > 0 ? <ul className="space-y-1">{sources.map((source, index) => { const url = typeof source.url === "string" && /^https?:\/\//.test(source.url) ? source.url : null; return <li key={String(source.sourceId ?? index)}>{url ? <a className="underline" href={url} target="_blank" rel="noreferrer">{String(source.title ?? url)}</a> : String(source.title ?? "Unavailable source")} <span className="text-muted-foreground">Provider-reported</span></li>; })}</ul> : null}
       {output ? <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-background p-2 font-mono">{output}</pre> : null}
-      {block.family === "provider_notice" && Array.isArray(block.payload.details) ? <dl className="space-y-1">{block.payload.details.slice(0, 64).map((value, index) => { const detail = asRecord(value); return detail && typeof detail.name === "string" && typeof detail.value === "string" ? <div key={index}><dt className="text-muted-foreground">{detail.name}</dt><dd className="whitespace-pre-wrap break-words">{detail.value}</dd></div> : null; })}</dl> : null}
+      {block.payload.outputTruncated === true ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
+      {block.family === "provider_notice" && Array.isArray(block.payload.details) ? <dl className="space-y-1">{block.payload.details.map((value, index) => { const detail = asRecord(value); return detail && typeof detail.name === "string" && typeof detail.value === "string" ? <div key={index}><dt className="text-muted-foreground">{detail.name}</dt><dd className="whitespace-pre-wrap break-words">{detail.value}</dd></div> : null; })}</dl> : null}
       {block.family === "model_identity" ? <div><span className="text-muted-foreground">Requested</span> {String(block.payload.requestedModel ?? "—")} · <span className="text-muted-foreground">Effective</span> {String(block.payload.effectiveModel ?? "—")}</div> : null}
     </div> : null}
   </div>;
@@ -1053,10 +1061,12 @@ function TranscriptToolCard({
   block,
   density,
   decision,
+  runLogHref,
 }: {
   block: Extract<TranscriptBlock, { type: "tool" }>;
   density: TranscriptDensity;
   decision: ToolRunDecision | null;
+  runLogHref?: string;
 }) {
   const [open, setOpen] = useState(block.status === "error" || Boolean(decision?.pendingAction || decision?.denialReason));
   const compact = density === "compact";
@@ -1088,7 +1098,7 @@ function TranscriptToolCard({
   const summary = block.status === "running"
     ? summarizeToolInput(block.name, block.input, density)
     : block.status === "completed" && parsedResult?.body
-      ? truncate(parsedResult.body.split("\n")[0] ?? parsedResult.body, compact ? 84 : 140)
+      ? parsedResult.body.split("\n")[0] ?? parsedResult.body
       : summarizeToolResult(block.result, block.isError, density);
 
   return (
@@ -1145,10 +1155,11 @@ function TranscriptToolCard({
                   "overflow-x-auto whitespace-pre-wrap break-words font-mono text-(length:--text-micro)",
                   block.status === "error" ? "text-red-700 dark:text-red-300" : "text-foreground/80",
                 )}>
-                  {block.result ? formatToolPayload(block.result) : "Waiting for result..."}
+                  {block.result ? (block.outputTruncated ? block.result : formatToolPayload(block.result)) : "Waiting for result..."}
                 </pre>
               </div>
             </div>
+            {block.outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
             <ToolDecisionDetails decision={decision} compact={compact} />
           </div>
         </div>
@@ -1166,10 +1177,12 @@ function TranscriptCommandGroup({
   block,
   density,
   toolDecisionMaps,
+  runLogHref,
 }: {
   block: Extract<TranscriptBlock, { type: "command_group" }>;
   density: TranscriptDensity;
   toolDecisionMaps: ToolDecisionMaps;
+  runLogHref?: string;
 }) {
   const [open, setOpen] = useState(false);
   const compact = density === "compact";
@@ -1290,9 +1303,10 @@ function TranscriptCommandGroup({
                   "overflow-x-auto whitespace-pre-wrap break-words font-mono text-(length:--text-micro)",
                   item.status === "error" ? "text-red-700 dark:text-red-300" : "text-foreground/80",
                 )}>
-                  {formatToolPayload(item.result)}
+                  {item.outputTruncated ? item.result : formatToolPayload(item.result)}
                 </pre>
               )}
+              {item.outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
               <ToolDecisionDetails decision={findToolDecision(toolDecisionMaps, item)} compact={compact} />
             </div>
           ))}
@@ -1306,10 +1320,12 @@ function TranscriptToolGroup({
   block,
   density,
   toolDecisionMaps,
+  runLogHref,
 }: {
   block: Extract<TranscriptBlock, { type: "tool_group" }>;
   density: TranscriptDensity;
   toolDecisionMaps: ToolDecisionMaps;
+  runLogHref?: string;
 }) {
   const [open, setOpen] = useState(false);
   const compact = density === "compact";
@@ -1438,11 +1454,12 @@ function TranscriptToolGroup({
                       "overflow-x-auto whitespace-pre-wrap break-words font-mono text-(length:--text-micro)",
                       item.status === "error" ? "text-red-700 dark:text-red-300" : "text-foreground/80",
                     )}>
-                      {formatToolPayload(item.result)}
+                      {item.outputTruncated ? item.result : formatToolPayload(item.result)}
                     </pre>
                   </div>
                 )}
               </div>
+              {item.outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
               <div className="pl-7">
                 <ToolDecisionDetails decision={findToolDecision(toolDecisionMaps, item)} compact={compact} />
               </div>
@@ -1543,9 +1560,11 @@ function TranscriptEventRow({
 function TranscriptDiffGroup({
   block,
   density,
+  runLogHref,
 }: {
   block: Extract<TranscriptBlock, { type: "diff_group" }>;
   density: TranscriptDensity;
+  runLogHref?: string;
 }) {
   const [open, setOpen] = useState(false);
   const compact = density === "compact";
@@ -1614,12 +1633,7 @@ function TranscriptDiffGroup({
                   </span>
                 );
               case "truncation":
-                return (
-                  <span key={key} className="block text-muted-foreground italic mt-1">
-                    {hunk.text}
-                    {"\n"}
-                  </span>
-                );
+                return null; // The shared producer notice follows the patch, outside <pre>.
               case "context":
               default:
                 return (
@@ -1633,6 +1647,9 @@ function TranscriptDiffGroup({
           })}
         </pre>
       )}
+      {open && block.hunks.some((hunk) => hunk.changeType === "truncation") ? (
+        <SavedOutputNotice kind="patch" runLogHref={runLogHref ?? block.hunks.find(hunk => hunk.changeType === "truncation")?.runLogHref} />
+      ) : null}
     </div>
   );
 }
@@ -1774,7 +1791,7 @@ function rawEntryContent(entry: TranscriptEntry): string {
     return `${entry.name}\n${formatToolPayload(entry.input)}`;
   }
   if (entry.kind === "tool_result") {
-    return formatToolPayload(entry.content);
+    return entry.outputTruncated ? entry.content : formatToolPayload(entry.content);
   }
   if (entry.kind === "result") {
     return `${entry.text}\n${usageDetail(entry)}`;
@@ -1793,9 +1810,11 @@ function rawEntryContent(entry: TranscriptEntry): string {
 function RawTranscriptView({
   entries,
   density,
+  runLogHref,
 }: {
   entries: TranscriptEntry[];
   density: TranscriptDensity;
+  runLogHref?: string;
 }) {
   const compact = density === "compact";
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -1866,6 +1885,7 @@ function RawTranscriptView({
           <pre className="min-w-0 whitespace-pre-wrap break-words text-foreground/80">
             {rawEntryContent(entry)}
           </pre>
+          {(entry.kind === "tool_result" && entry.outputTruncated) || (entry.kind === "provider_activity" && entry.payload.outputTruncated === true) ? <div className="col-start-2"><SavedOutputNotice fullTextKept runLogHref={runLogHref} /></div> : null}
         </div>
       ))}
       {bottomSpacer > 0 && <div aria-hidden="true" style={{ height: bottomSpacer }} />}
@@ -1874,7 +1894,8 @@ function RawTranscriptView({
 }
 
 export function RunTranscriptView({
-  entries,
+  entries: rawEntries,
+  runLogHref,
   toolDecisions,
   mode = "nice",
   density = "comfortable",
@@ -1886,14 +1907,26 @@ export function RunTranscriptView({
   thinkingClassName,
   externalReferences,
 }: RunTranscriptViewProps) {
+  const entries = useMemo(() => rawEntries.map((entry): TranscriptEntry => {
+    if (entry.kind === "tool_result") {
+      const displayed = savedOutputForDisplay(entry.content, entry.outputTruncated);
+      return { ...entry, content: displayed.output ?? "", outputTruncated: displayed.outputTruncated };
+    }
+    if (entry.kind === "provider_activity") {
+      const displayed = savedOutputForDisplay(typeof entry.payload.output === "string" ? entry.payload.output : undefined, entry.payload.outputTruncated === true);
+      return { ...entry, summary: savedOutputForDisplay(entry.summary).output ?? "", payload: { ...entry.payload, ...displayed } };
+    }
+    return entry;
+  }), [rawEntries]);
   const toolDecisionMaps = useMemo(() => buildToolDecisionMaps(toolDecisions), [toolDecisions]);
   const blocks = useMemo(
     () => (mode === "raw" ? [] : normalizeTranscript(entries, streaming)),
     [entries, mode, streaming],
   );
-  const visibleBlocks = limit ? blocks.slice(-limit) : blocks;
+  const [showAllHistory, setShowAllHistory] = useState(false);
+  const hiddenBlocks = !showAllHistory && limit ? Math.max(0, blocks.length - limit) : 0;
+  const visibleBlocks = hiddenBlocks > 0 ? blocks.slice(hiddenBlocks) : blocks;
   const keyedBlocks = useMemo(() => keyTranscriptBlocks(visibleBlocks), [visibleBlocks]);
-  const visibleEntries = limit ? entries.slice(-limit) : entries;
 
   if (entries.length === 0) {
     return (
@@ -1906,13 +1939,18 @@ export function RunTranscriptView({
   if (mode === "raw") {
     return (
       <div className={className}>
-        <RawTranscriptView entries={visibleEntries} density={density} />
+        <RawTranscriptView entries={entries} density={density} runLogHref={runLogHref} />
       </div>
     );
   }
 
   return (
     <div className={cn("space-y-3", className)}>
+      {hiddenBlocks > 0 ? (
+        <button type="button" className="text-sm text-foreground underline underline-offset-4" onClick={() => setShowAllHistory(true)}>
+          Show {hiddenBlocks} earlier {hiddenBlocks === 1 ? "block" : "blocks"}
+        </button>
+      ) : null}
       {keyedBlocks.map(({ block, key }, index) => (
         <div
           key={key}
@@ -1938,15 +1976,16 @@ export function RunTranscriptView({
               block={block}
               density={density}
               decision={findToolDecision(toolDecisionMaps, block)}
+              runLogHref={runLogHref}
             />
           )}
           {block.type === "command_group" && (
-            <TranscriptCommandGroup block={block} density={density} toolDecisionMaps={toolDecisionMaps} />
+            <TranscriptCommandGroup block={block} density={density} toolDecisionMaps={toolDecisionMaps} runLogHref={runLogHref} />
           )}
           {block.type === "tool_group" && (
-            <TranscriptToolGroup block={block} density={density} toolDecisionMaps={toolDecisionMaps} />
+            <TranscriptToolGroup block={block} density={density} toolDecisionMaps={toolDecisionMaps} runLogHref={runLogHref} />
           )}
-          {block.type === "diff_group" && <TranscriptDiffGroup block={block} density={density} />}
+          {block.type === "diff_group" && <TranscriptDiffGroup block={block} density={density} runLogHref={runLogHref} />}
           {block.type === "stderr_group" && <TranscriptStderrGroup block={block} density={density} />}
           {block.type === "system_group" && <TranscriptSystemGroup block={block} density={density} />}
           {block.type === "stdout" && (
@@ -1960,7 +1999,7 @@ export function RunTranscriptView({
               externalReferences={externalReferences}
             />
           )}
-          {block.type === "provider_activity" && <TranscriptProviderActivity block={block} density={density} />}
+          {block.type === "provider_activity" && <TranscriptProviderActivity block={block} density={density} runLogHref={runLogHref} />}
         </div>
       ))}
     </div>

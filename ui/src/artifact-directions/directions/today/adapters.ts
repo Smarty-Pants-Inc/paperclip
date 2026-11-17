@@ -133,7 +133,7 @@ function previewText(text: string | undefined): string | null {
     .replace(/[#>*_\-~|`]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return flat.length > 280 ? `${flat.slice(0, 277).trimEnd()}...` : flat;
+  return flat;
 }
 
 /**

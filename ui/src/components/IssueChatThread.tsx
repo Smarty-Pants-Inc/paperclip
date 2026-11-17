@@ -1,4 +1,6 @@
 import { createUuid } from "@/lib/uuid";
+import { SavedOutputNotice } from "./task-chat/SavedOutputNotice";
+import { savedOutputForDisplay } from "./task-chat/saved-output";
 import { useCurrentAccountGuard } from "../hooks/useAccountBoundMutation";
 import { resolveIssueChatHumanAuthor } from "@/lib/issue-chat-human-author";
 import { useCurrentWorkspaceRetry, useWorkspaceBaseRefRecovery, useWorkspaceRetry } from "./WorkspaceBaseRefRecovery";
@@ -1281,6 +1283,9 @@ function IssueChatChainOfThought({
   const authorAgentId =
     typeof custom.authorAgentId === "string" ? custom.authorAgentId : null;
   const agentId = authorAgentId ?? runAgentId;
+  const runLogHref = agentId && typeof custom.runId === "string"
+    ? `/agents/${encodeURIComponent(agentMap?.get(agentId)?.urlKey ?? agentId)}/runs/${encodeURIComponent(custom.runId)}`
+    : undefined;
   const agentIcon = agentId ? agentMap?.get(agentId)?.icon : undefined;
   // Adapters whose backends overwhelm the one-line reasoning ticker declare
   // a scrollable live reasoning view via their UI adapter module
@@ -1405,6 +1410,7 @@ function IssueChatChainOfThought({
               ) : null}
               {toolParts.map((tool) => (
                 <IssueChatToolPart
+                  runLogHref={runLogHref}
                   key={tool.toolCallId}
                   toolName={tool.toolName}
                   args={tool.args}
@@ -1430,6 +1436,7 @@ function IssueChatChainOfThought({
               ) : null}
               {toolParts.map((tool) => (
                 <IssueChatToolPart
+                  runLogHref={runLogHref}
                   key={tool.toolCallId}
                   toolName={tool.toolName}
                   args={tool.args}
@@ -1661,12 +1668,14 @@ function getToolIcon(
 }
 
 function IssueChatToolPart({
+  runLogHref,
   toolName,
   args,
   argsText,
   result,
   isError,
 }: {
+  runLogHref?: string;
   toolName: string;
   args?: unknown;
   argsText?: string;
@@ -1677,6 +1686,7 @@ function IssueChatToolPart({
   if (toolName === "paperclip_provider_activity") {
     return (
       <IssueChatProviderActivity
+        runLogHref={runLogHref}
         args={args}
         running={result === undefined}
         open={open}
@@ -1686,12 +1696,13 @@ function IssueChatToolPart({
   }
   const rawArgsText = argsText ?? "";
   const parsedArgs = args ?? parseToolPayload(rawArgsText);
-  const resultText =
+  const rawResultText =
     typeof result === "string"
       ? result
       : result === undefined
         ? ""
         : formatToolPayload(result);
+  const { output: resultText = "", outputTruncated } = savedOutputForDisplay(rawResultText);
   const inputDetails = describeToolInput(toolName, parsedArgs);
   const displayName = displayToolName(toolName, parsedArgs);
   const isCommand = isCommandTool(toolName, parsedArgs);
@@ -1782,6 +1793,7 @@ function IssueChatToolPart({
                 </CopyablePreBlock>
               </div>
             ) : null}
+            {outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
           </div>
         ) : null}
       </div>
@@ -1790,11 +1802,13 @@ function IssueChatToolPart({
 }
 
 function IssueChatProviderActivity({
+  runLogHref,
   args,
   running,
   open,
   onToggle,
 }: {
+  runLogHref?: string;
   args: unknown;
   running: boolean;
   open: boolean;
@@ -1812,16 +1826,17 @@ function IssueChatProviderActivity({
       : {};
   const title =
     typeof value.title === "string" ? value.title : "Provider activity";
-  const summary = typeof value.summary === "string" ? value.summary : "";
-  const steps = Array.isArray(payload.steps) ? payload.steps.slice(0, 256) : [];
+  const summary = savedOutputForDisplay(typeof value.summary === "string" ? value.summary : "").output ?? "";
+  const steps = Array.isArray(payload.steps) ? payload.steps : [];
   const children = Array.isArray(payload.children)
-    ? payload.children.slice(0, 64)
+    ? payload.children
     : [];
   const sources = Array.isArray(payload.sources)
-    ? payload.sources.slice(0, 64)
+    ? payload.sources
     : [];
-  const output =
-    typeof payload.output === "string" ? payload.output.slice(-(8 * 1024)) : "";
+  const { output = "", outputTruncated } = savedOutputForDisplay(
+    typeof payload.output === "string" ? payload.output : "", payload.outputTruncated === true,
+  );
   const effectiveModel =
     typeof payload.effectiveModel === "string" ? payload.effectiveModel : null;
   const requestedModel =
@@ -1831,6 +1846,8 @@ function IssueChatProviderActivity({
     children.length > 0 ||
     sources.length > 0 ||
     output.length > 0 ||
+    summary.length > 0 ||
+    outputTruncated ||
     effectiveModel !== null;
   return (
     <div
@@ -1867,6 +1884,8 @@ function IssueChatProviderActivity({
         </button>
         {open && hasDetails ? (
           <div className="mt-1 space-y-2 rounded-md border border-border/50 bg-accent/15 p-2 text-xs">
+            {summary ? <p className="whitespace-pre-wrap break-words">{summary}</p> : null}
+            {outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
             {steps.map((entry, index) => {
               const step =
                 typeof entry === "object" && entry !== null

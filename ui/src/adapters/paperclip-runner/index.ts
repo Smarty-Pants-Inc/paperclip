@@ -365,7 +365,6 @@ export function workspaceChangeEntry(payload: JsonRecord, ts: string): Transcrip
   const files = (Array.isArray(payload.files) ? payload.files : [])
     .map(record)
     .filter((file) => SAFE_WORKSPACE_PATH.test(text(file.path)))
-    .slice(0, 2000)
     .map((file) => {
       const rawOperation = text(file.operation);
       const operation: "create" | "modify" | "delete" | "rename" | "mode_change" = rawOperation === "create" || rawOperation === "delete" || rawOperation === "rename" || rawOperation === "mode_change"
@@ -461,8 +460,7 @@ function runtimeRequestEntry(
   const explicitChoices = (Array.isArray(request.choices) ? request.choices : [])
     .map(record)
     .map((choice) => ({ key: text(choice.key), label: text(choice.label) }))
-    .filter((choice) => choice.key && choice.label)
-    .slice(0, 32);
+    .filter((choice) => choice.key && choice.label);
   const actionLabels: Record<string, string> = {
     accept: "Allow once",
     accept_for_session: "Allow for session",
@@ -493,11 +491,10 @@ function runtimeRequestEntry(
     .map(record)
     .map((field, index) => ({
       name: text(field.name, `answer_${index + 1}`).slice(0, 160),
-      label: text(field.label, text(field.name, `Answer ${index + 1}`)).slice(0, 240),
-      placeholder: nullableText(field.placeholder)?.slice(0, 500) ?? null,
+      label: text(field.label, text(field.name, `Answer ${index + 1}`)),
+      placeholder: nullableText(field.placeholder),
     }))
-    .filter((field) => field.name && field.label)
-    .slice(0, 16);
+    .filter((field) => field.name && field.label);
   const questionSet = parseQuestionSet(request.input) ?? previous?.questionSet ?? null;
   const response = parseQuestionResponse(request.response ?? payload.response)
     ?? previous?.response
@@ -526,14 +523,13 @@ function parseQuestionResponse(value: unknown): PaperclipQuestionResponse | null
   if (response.schema !== "paperclip.question_response.v1") return null;
   const rawAnswers = record(response.answers);
   const answers: PaperclipQuestionResponse["answers"] = {};
-  for (const [questionId, rawAnswer] of Object.entries(rawAnswers).slice(0, 64)) {
+  for (const [questionId, rawAnswer] of Object.entries(rawAnswers)) {
     const answer = record(rawAnswer);
     const selectedOptionIds = (Array.isArray(answer.selectedOptionIds) ? answer.selectedOptionIds : [])
       .filter((optionId): optionId is string => typeof optionId === "string")
-      .slice(0, 128)
       .map((optionId) => optionId.slice(0, 160));
-    const textAnswer = nullableText(answer.text)?.slice(0, 12_000);
-    const customText = nullableText(answer.customText)?.slice(0, 12_000);
+    const textAnswer = nullableText(answer.text);
+    const customText = nullableText(answer.customText);
     answers[questionId.slice(0, 160)] = {
       ...(selectedOptionIds.length > 0 ? { selectedOptionIds } : {}),
       ...(textAnswer != null ? { text: textAnswer } : {}),
@@ -553,12 +549,12 @@ function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
   if (input.schema !== undefined
     && input.schema !== "paperclip.question_set.v1"
     && input.schema !== "***REDACTED***") return null;
-  const questions = input.questions.map(record).slice(0, 64).map((question, questionIndex): PaperclipQuestion => {
+  const questions = input.questions.map(record).map((question, questionIndex): PaperclipQuestion => {
     const answerMode: PaperclipQuestion["answerMode"] = question.answerMode === "single_select" || question.answerMode === "multi_select" ? question.answerMode : "text";
-    const options = (Array.isArray(question.options) ? question.options : []).map(record).slice(0, 128).map((option, optionIndex) => ({
+    const options = (Array.isArray(question.options) ? question.options : []).map(record).map((option, optionIndex) => ({
       id: text(option.id, `option-${optionIndex + 1}`).slice(0, 160),
-      label: text(option.label, `Option ${optionIndex + 1}`).slice(0, 1_000),
-      ...(nullableText(option.description) ? { description: text(option.description).slice(0, 4_000) } : {}),
+      label: text(option.label, `Option ${optionIndex + 1}`),
+      ...(nullableText(option.description) ? { description: text(option.description) } : {}),
     }));
     const customAnswer = record(question.customAnswer);
     const validation = record(question.textValidation);
@@ -568,16 +564,16 @@ function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
         : undefined;
     const parsedQuestion: PaperclipQuestion = {
       id: text(question.id, `question-${questionIndex + 1}`).slice(0, 160),
-      ...(nullableText(question.header) ? { header: text(question.header).slice(0, 1_000) } : {}),
-      prompt: text(question.prompt, `Question ${questionIndex + 1}`).slice(0, 4_000),
-      ...(nullableText(question.helpText) ? { helpText: text(question.helpText).slice(0, 4_000) } : {}),
+      ...(nullableText(question.header) ? { header: text(question.header) } : {}),
+      prompt: text(question.prompt, `Question ${questionIndex + 1}`),
+      ...(nullableText(question.helpText) ? { helpText: text(question.helpText) } : {}),
       required: question.required === true,
       answerMode,
       ...(answerMode !== "text" ? { options } : {}),
       ...(customAnswer.enabled === true ? { customAnswer: {
         enabled: true as const,
-        ...(nullableText(customAnswer.label) ? { label: text(customAnswer.label).slice(0, 1_000) } : {}),
-        ...(nullableText(customAnswer.placeholder) ? { placeholder: text(customAnswer.placeholder).slice(0, 1_000) } : {}),
+        ...(nullableText(customAnswer.label) ? { label: text(customAnswer.label) } : {}),
+        ...(nullableText(customAnswer.placeholder) ? { placeholder: text(customAnswer.placeholder) } : {}),
       } } : {}),
       ...(Object.keys(validation).length > 0 ? { textValidation: {
         ...(typeof validation.minLength === "number" ? { minLength: validation.minLength } : {}),
@@ -592,11 +588,11 @@ function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
   });
   return {
     schema: "paperclip.question_set.v1",
-    ...(nullableText(input.title) ? { title: text(input.title).slice(0, 1_000) } : {}),
+    ...(nullableText(input.title) ? { title: text(input.title) } : {}),
     // Native plan decisions bind to the complete canonical question context.
     // The event boundary rejects oversized context rather than approving a slice.
     ...(nullableText(input.description) ? { description: text(input.description) } : {}),
-    ...(nullableText(input.submitLabel) ? { submitLabel: text(input.submitLabel).slice(0, 200) } : {}),
+    ...(nullableText(input.submitLabel) ? { submitLabel: text(input.submitLabel) } : {}),
     questions,
   };
 }
@@ -614,13 +610,13 @@ function runResultEntry(payload: JsonRecord, ts: string): Extract<TranscriptEntr
     disposition,
     summary: text(payload.summary, "Run completed"),
     objectiveSatisfied: typeof completion.objectiveSatisfied === "boolean" ? completion.objectiveSatisfied : null,
-    verification: (Array.isArray(payload.verification) ? payload.verification : []).map(record).slice(0, 64).map((item) => ({
+    verification: (Array.isArray(payload.verification) ? payload.verification : []).map(record).map((item) => ({
       commandOrCheck: text(item.commandOrCheck, "Verification"),
       status: item.status === "passed" || item.status === "failed" ? item.status : "not_run",
       detail: nullableText(item.detail) ?? undefined,
       artifactRef: nullableText(item.artifactRef) ?? undefined,
     })),
-    remainingWork: (Array.isArray(completion.remainingWork) ? completion.remainingWork : []).map(record).slice(0, 64).map((item) => ({
+    remainingWork: (Array.isArray(completion.remainingWork) ? completion.remainingWork : []).map(record).map((item) => ({
       description: text(item.description, "Remaining work"),
       blocksCompletion: item.blocksCompletion === true,
     })),
@@ -629,7 +625,7 @@ function runResultEntry(payload: JsonRecord, ts: string): Extract<TranscriptEntr
       unblockAction: text(blocker.unblockAction, "Resolve the blocker to continue."),
       scope: blocker.scope === "task_wide" ? "task_wide" : "current_track",
     } : null,
-    artifacts: (Array.isArray(payload.artifacts) ? payload.artifacts : []).map(record).slice(0, 64).map((item) => ({
+    artifacts: (Array.isArray(payload.artifacts) ? payload.artifacts : []).map(record).map((item) => ({
       kind: text(item.kind, "artifact"),
       ref: text(item.ref),
       title: nullableText(item.title) ?? undefined,

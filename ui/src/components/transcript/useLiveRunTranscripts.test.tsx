@@ -132,7 +132,7 @@ describe("useLiveRunTranscripts", () => {
     }
   });
 
-  it("expands a compact log tail without hiding or duplicating the latest output", async () => {
+  it("changes log page size without hiding or duplicating already loaded output", async () => {
     let truncatedRunIds: ReadonlySet<string> = new Set();
     const row = (seq: number, chunk: string) => JSON.stringify({ seq, chunk, ts: `2026-10-24T00:00:0${seq}Z`, stream: "stdout" });
     const result = (content: string) => ({ runId: "run-1", store: "memory", logRef: "log-1", content, nextOffset: 100_000 });
@@ -152,8 +152,8 @@ describe("useLiveRunTranscripts", () => {
     const chunks = () => buildTranscriptMock.mock.calls.at(-1)?.[0];
     try {
       await act(async () => root.render(<Harness limit={32_000} />));
-      expect(logMock).toHaveBeenNthCalledWith(1, "run-1", 68_000, 32_000, expect.objectContaining({ alignStartToRecord: true }));
-      expect(truncatedRunIds.has("run-1")).toBe(true);
+      expect(logMock).toHaveBeenNthCalledWith(1, "run-1", 0, 32_000, expect.not.objectContaining({ alignStartToRecord: true }));
+      expect(truncatedRunIds.has("run-1")).toBe(false);
       expect(chunks()).toEqual([expect.objectContaining({ chunk: "Latest answer" })]);
       await act(async () => root.render(<Harness limit={256_000} />));
       expect(logMock).toHaveBeenLastCalledWith("run-1", 0, 256_000, expect.anything());
@@ -197,7 +197,7 @@ describe("useLiveRunTranscripts", () => {
     } finally { await act(async () => root.unmount()); }
   });
 
-  it("keeps record alignment pending when an expanded log read needs retry", async () => {
+  it("retries failed history reloads from byte zero without losing prior output", async () => {
     const row = (seq: number, chunk: string) => JSON.stringify({ seq, chunk, ts: `2026-10-24T00:00:0${seq}Z`, stream: "stdout" });
     const result = (content: string) => ({ runId: "run-1", store: "memory", logRef: "log-1", content, nextOffset: 500_000 });
     const earlier = row(1, "Earlier activity");
@@ -205,10 +205,7 @@ describe("useLiveRunTranscripts", () => {
     logMock.mockResolvedValueOnce(result(`${recent}\n`));
     logMock.mockResolvedValueOnce(result(""));
     logMock.mockRejectedValueOnce(new Error("Temporary storage failure"));
-    logMock.mockImplementationOnce(async (...args: unknown[]) => {
-      const options = args[3] as { alignStartToRecord?: boolean };
-      return result(`${options.alignStartToRecord ? earlier : earlier.slice(15)}\n${recent}\n`);
-    });
+    logMock.mockImplementationOnce(async () => result(`${earlier}\n${recent}\n`));
     let latest!: ReturnType<typeof useLiveRunTranscripts>;
     function Harness({ limit, bytes = 500_000 }: { limit: number; bytes?: number }) {
       latest = useLiveRunTranscripts({
@@ -230,7 +227,7 @@ describe("useLiveRunTranscripts", () => {
         expect.objectContaining({ chunk: "Earlier activity" }),
         expect.objectContaining({ chunk: "Latest answer" }),
       ]);
-      expect(logMock).toHaveBeenCalledWith("run-1", 244_000, 256_000, expect.objectContaining({ alignStartToRecord: true }));
+      expect(logMock).toHaveBeenCalledWith("run-1", 0, 256_000, expect.not.objectContaining({ alignStartToRecord: true }));
       expect(latest.errorsByRun.size).toBe(0);
       await act(async () => root.render(<Harness limit={256_000} bytes={520_000} />));
       expect(logMock).toHaveBeenLastCalledWith("run-1", 500_000, 256_000, expect.not.objectContaining({ alignStartToRecord: true }));
@@ -458,7 +455,7 @@ describe("useLiveRunTranscripts", () => {
     container.remove();
   });
 
-  it("starts persisted-log hydration from the newest bytes when the visible window is truncated", async () => {
+  it("hydrates persisted logs from byte zero even when the log exceeds one page", async () => {
     function Harness() {
       useLiveRunTranscripts({
         companyId: "company-1",
@@ -478,7 +475,7 @@ describe("useLiveRunTranscripts", () => {
       await Promise.resolve();
     });
 
-    expect(logMock).toHaveBeenCalledWith("run-1", 36_000, 64_000, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(logMock).toHaveBeenCalledWith("run-1", 0, 64_000, expect.objectContaining({ signal: expect.any(AbortSignal) }));
 
     act(() => {
       root.unmount();
@@ -741,6 +738,24 @@ describe("useLiveRunTranscripts", () => {
       root.unmount();
     });
     container.remove();
+  });
+
+  it("retains full task scrollback beyond the former 2 MB budget", async () => {
+    const ts = "2026-11-17T00:00:00Z";
+    const first = "FIRST_RETAINED_BYTE" + "x".repeat(2_000_001);
+    const content = [{ ts, stream: "stdout", seq: 1, chunk: first }, { ts, stream: "stdout", seq: 2, chunk: "LAST_RETAINED_BYTE" }].map(row => JSON.stringify(row)).join("\n") + "\n";
+    logMock.mockResolvedValueOnce({ runId: "run-1", store: "memory", logRef: "log-1", content, nextOffset: content.length });
+    function Harness() {
+      useLiveRunTranscripts({ runs: [{ id: "run-1", status: "succeeded", adapterType: "codex_local" }], enableRealtimeUpdates: false });
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    try {
+      await act(async () => root.render(<Harness />));
+      const chunks = buildTranscriptMock.mock.calls.at(-1)?.[0] as Array<{ chunk: string }>;
+      expect(chunks.some(chunk => chunk.chunk.startsWith("FIRST_RETAINED_BYTE"))).toBe(true);
+      expect(chunks.some(chunk => chunk.chunk === "LAST_RETAINED_BYTE")).toBe(true);
+    } finally { act(() => root.unmount()); }
   });
 
   it("prunes a buffer once a run stays absent past the grace window (PAP-462 B3)", async () => {

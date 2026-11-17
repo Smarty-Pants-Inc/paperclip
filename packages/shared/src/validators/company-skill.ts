@@ -297,6 +297,8 @@ export const companySkillProjectBrowseRequestSchema = z.object({
   projectId: z.string().guid(),
   workspaceId: z.string().guid(),
   path: z.string().nullable().optional(),
+  limit: z.number().int().min(1).max(250).optional(),
+  offset: z.number().int().min(0).optional(),
 });
 
 export const companySkillProjectBrowseEntrySchema = z.object({
@@ -313,6 +315,7 @@ export const companySkillProjectBrowseResultSchema = z.object({
   path: z.string().min(1),
   parentPath: z.string().nullable(),
   entries: z.array(companySkillProjectBrowseEntrySchema),
+  nextOffset: z.number().int().min(0).nullable(),
   truncated: z.boolean(),
 });
 

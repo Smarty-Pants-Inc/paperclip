@@ -39,11 +39,6 @@ export function appendTranscriptEntries(entries: TranscriptEntry[], incoming: Tr
   }
 }
 
-function truncateTranscriptLine(line: string, maxLength = 160) {
-  if (line.length <= maxLength) return line;
-  return `${line.slice(0, maxLength - 3)}...`;
-}
-
 function formatTranscriptParserError(error: unknown) {
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === "string" && error) return error;
@@ -61,7 +56,7 @@ function createTranscriptParseErrorEntry(
   redactionOptions: RedactionOptions,
 ): TranscriptEntry {
   const errorText = formatTranscriptParserError(error) || "unknown parser error";
-  const preview = truncateTranscriptLine(line);
+  const preview = line;
   return {
     kind: "result",
     ts,

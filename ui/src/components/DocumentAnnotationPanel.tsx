@@ -247,8 +247,8 @@ export function AnnotationPanelBody(props: AnnotationPanelProps) {
       </div>
       {props.pendingAnchor ? (
         <div className="border-t border-border bg-popover px-3 py-2">
-          <blockquote className="mb-2 line-clamp-2 overflow-hidden rounded-none bg-muted px-2 py-1 text-xs italic leading-5 text-muted-foreground [overflow-wrap:anywhere]">
-            {truncate(props.pendingAnchor.selectedText, 160)}
+          <blockquote className="mb-2 rounded-none bg-muted px-2 py-1 text-xs italic leading-5 text-muted-foreground [overflow-wrap:anywhere]">
+            {props.pendingAnchor.selectedText}
           </blockquote>
           <div className="mb-1.5 flex items-center gap-1.5">
             <Avatar size="xs" className="shrink-0">
@@ -351,11 +351,11 @@ export function ThreadCard(props: {
         <blockquote
           id={`thread-quote-${thread.id}`}
           className={cn(
-            "mx-3 mt-2 line-clamp-2 overflow-hidden rounded-none bg-muted px-2 py-1 text-xs italic leading-5 text-muted-foreground [overflow-wrap:anywhere]",
+            "mx-3 mt-2 rounded-none bg-muted px-2 py-1 text-xs italic leading-5 text-muted-foreground [overflow-wrap:anywhere]",
             (thread.anchorState === "stale" || thread.status === "resolved") && "bg-muted",
           )}
         >
-          {truncate(thread.selectedText, 120)}
+          {thread.selectedText}
         </blockquote>
         {props.expanded ? (
           <div className="space-y-2 px-3 py-2">
@@ -444,7 +444,7 @@ export function ThreadCard(props: {
             <span className="font-medium text-foreground">
               {thread.comments.length} comment{thread.comments.length === 1 ? "" : "s"}
             </span>
-            {latestComment ? <span className="ml-1">· {truncate(latestComment.body, 120)}</span> : null}
+            {latestComment ? <span className="ml-1">· {latestComment.body}</span> : null}
           </p>
         )}
       </article>
@@ -522,11 +522,6 @@ function resolveAuthor(
     };
   }
   return { name: comment.authorType === "agent" ? "Agent" : "Board", role: comment.authorType === "agent" ? "agent" : "board" };
-}
-
-export function truncate(value: string, limit: number) {
-  if (value.length <= limit) return value;
-  return `${value.slice(0, limit - 1)}…`;
 }
 
 /**

@@ -315,7 +315,8 @@ export async function previewGitHubSkillFile(input: SkillSourcePreviewRequest, r
   const manifest = (input.packageMode === 'repository' ? scan.repositoryPackage?.files : skill.inspection?.files)?.find(file => file.path === input.filePath);
   if (!file || !manifest) throw notFound('File is not included in this skill package.');
   const bytes = skillFileBytes(file);
-  const limit = 64 * 1024;
-  return { file: manifest, content: manifest.encoding === 'base64' ? null : bytes.subarray(0, limit).toString('utf8'),
-    truncated: manifest.encoding !== 'base64' && bytes.length > limit, commitSha: scan.commitSha };
+  // The package scan already enforces file/package admission limits. Return the
+  // complete admitted file; slicing bytes here can also split a UTF-8 character.
+  return { file: manifest, content: manifest.encoding === 'base64' ? null : bytes.toString('utf8'),
+    truncated: false, commitSha: scan.commitSha };
 }
