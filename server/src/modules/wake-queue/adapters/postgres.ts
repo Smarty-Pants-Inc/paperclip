@@ -16,7 +16,8 @@ import { instanceSettingsService } from "../../../services/instance-settings.js"
 import { currentConversationCommentCondition, isConversationReset } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../../../services/native-runtime/native-runner-ownership.js";
-import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { readUnreadSteeredMessages } from "../../../services/native-runtime/unread-steered-messages.js";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
 import { agentRunSupersededByFreshContinuation } from "../../../agent-run-cancellation.js";
@@ -33,6 +34,7 @@ import {
   plugins,
   pluginCompanySettings,
   chatActions,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -929,9 +931,81 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
  * with all of them (or with those left after a delete). Chat messages are
  * otherwise saved one wake each (no coalescing behind a running turn).
  */
+function isPersonStoppedChatRun(run: ReleaseRun, issue: IssueRow): boolean {
+  return run.status === "cancelled" && issue.conversationAgentId === run.agentId && issue.assigneeAgentId === run.agentId &&
+    !issue.assigneeUserId && parseObject(run.resultJson).cancelledByActorType === "user";
+}
+
+/**
+ * Agent Chat, a person's Stop (S10 C1, never-OK): Stop clears the provider's
+ * steering queue before it aborts (Pi `clear_queue`), so a message the provider
+ * acknowledged as steered but the model never read would be in neither the
+ * turn nor the queue. The run log tells read from unread, as restart recovery
+ * reads it: the steering_acknowledgement item, then the userMessage item the
+ * provider emits when the message enters the conversation. Each unread steer
+ * goes back to the stopped queue at its place (the head of the wake it was
+ * steered from, or that wake reopened when the steer emptied it), and the
+ * stopped run no longer counts as carrying it. A steer the model read stays
+ * with the stopped turn: sending it again would answer it twice.
+ */
+async function restorePersonStoppedUnreadSteers(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date): Promise<void> {
+  if (!isPersonStoppedChatRun(run, issue)) return;
+  const [current] = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot, resultJson: heartbeatRuns.resultJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).for("update");
+  if (!current) return;
+  const result = parseObject(current.resultJson);
+  const restoredBefore = Array.isArray(result.stopRestoredSteeredCommentIds) ? result.stopRestoredSteeredCommentIds : [];
+  const acknowledged = Object.entries(parseObject(result.queuedSteeringAcknowledgements))
+    .map(([id, value]) => ({ id, ack: parseObject(value) }))
+    .filter(({ id, ack }) => ack.status === "acknowledged" && typeof ack.queueId === "string" && !restoredBefore.includes(id))
+    .sort((a, b) => String(a.ack.acknowledgedAt ?? "").localeCompare(String(b.ack.acknowledgedAt ?? "")));
+  if (acknowledged.length === 0) return;
+  const unread = new Set((await readUnreadSteeredMessages(tx, { companyId: run.companyId, runId: run.id, issueId: issue.id }))
+    .map((message) => message.id));
+  // An acknowledgement the run log never recorded cannot be proven read either:
+  // a person's message is never dropped on a missing receipt.
+  const logged = new Set((await tx.select({ itemId: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId'` })
+    .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+      isNotNull(heartbeatRunEvents.sourceEventId), eq(heartbeatRunEvents.eventType, "item.completed"),
+      sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'steering_acknowledgement'`)))
+    .flatMap((row) => /:steer:(.+)$/.exec(row.itemId ?? "")?.[1] ?? []));
+  const unlogged = acknowledged.filter(({ id }) => !logged.has(id)).map(({ id }) => id);
+  const unloggedComments = new Set(unlogged.length ? (await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, unlogged),
+    isNull(issueComments.deletedAt)))).map((row) => row.id) : []);
+  const restore = acknowledged.filter(({ id }) => unread.has(id) || unloggedComments.has(id));
+  if (restore.length === 0) return;
+  const byWake = new Map<string, string[]>();
+  for (const { id, ack } of restore) byWake.set(ack.queueId as string, [...(byWake.get(ack.queueId as string) ?? []), id]);
+  for (const [wakeId, ids] of byWake) {
+    const [wake] = await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, run.companyId),
+      eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.id, wakeId),
+      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`)).for("update");
+    if (!wake) continue;
+    const waiting = wake.status === DEFERRED_WAKE_STATUS
+      ? queuedCommentIdsFromWakePayload(wake.payload).filter((id) => !ids.includes(id)) : [];
+    const payload = withQueuedCommentIdsInWakePayload(wake.payload, [...ids, ...waiting]);
+    if (wake.status === DEFERRED_WAKE_STATUS || (wake.status === "cancelled" && !wake.runId)) {
+      await tx.update(agentWakeupRequests).set({ status: DEFERRED_WAKE_STATUS, payload, finishedAt: null, updatedAt: now })
+        .where(and(eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, wake.id)));
+    } else {
+      const { id: _id, createdAt: _createdAt, updatedAt: _updatedAt, ...copy } = wake;
+      await tx.insert(agentWakeupRequests).values({ ...copy, status: DEFERRED_WAKE_STATUS, payload, runId: null,
+        finishedAt: null, claimedAt: null, error: null, idempotencyKey: null, coalescedCount: 0, updatedAt: now });
+    }
+  }
+  const ids = restore.map(({ id }) => id);
+  const context = parseObject(current.contextSnapshot);
+  const without = (value: unknown) => Array.isArray(value) ? value.filter((id) => !ids.includes(id as string)) : value;
+  await tx.update(heartbeatRuns).set({
+    contextSnapshot: { ...context, wakeCommentIds: without(context.wakeCommentIds), steeredCommentIds: without(context.steeredCommentIds) },
+    resultJson: { ...result, stopRestoredSteeredCommentIds: [...restoredBefore, ...ids] },
+    updatedAt: now,
+  }).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+}
+
 async function gatherPersonStoppedChatMessages(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date): Promise<void> {
-  if (run.status !== "cancelled" || issue.conversationAgentId !== run.agentId || issue.assigneeAgentId !== run.agentId ||
-      issue.assigneeUserId || parseObject(run.resultJson).cancelledByActorType !== "user") return;
+  if (!isPersonStoppedChatRun(run, issue)) return;
   const waiting = await tx.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
     eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS), eq(agentWakeupRequests.requestedByActorType, "user"),
@@ -1556,7 +1630,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // Stop means stop (org 11-17): an Agent Chat's person Stop sends
           // nothing either. Its waiting messages are gathered for the
           // owner's Send, which starts their one turn.
-          if (releasedOnlyByStop && issueRow) await gatherPersonStoppedChatMessages(tx, run, issueRow, input.now);
+          if (releasedOnlyByStop && issueRow) {
+            await restorePersonStoppedUnreadSteers(tx, run, issueRow, input.now);
+            await gatherPersonStoppedChatMessages(tx, run, issueRow, input.now);
+          }
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
