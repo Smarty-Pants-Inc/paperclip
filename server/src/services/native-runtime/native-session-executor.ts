@@ -514,37 +514,66 @@ async function waitForNativeSessionStartup(
   }
 }
 
+/** Independent active runs detach concurrently; one slow runner must not
+ * consume the shutdown budget of every other in-flight run. */
+const NATIVE_RESTART_DETACH_CONCURRENCY = 8;
+
+type NativeRestartDetachOutcome = "detached" | "inactive" | "unsupported" | "pending" | "failed";
+
+export type NativeRestartDetachOptions = {
+  /** The remaining shutdown deadline. When it aborts, every run whose detach
+   * has not settled is reported pending; an expired wait is never success. */
+  signal?: AbortSignal;
+  /** Report a failed detach per run instead of rejecting the whole sweep. */
+  reportFailures?: boolean;
+};
+
+/** Resolves true when the work settles first, false when the deadline or the
+ * shutdown signal wins. A rejection from the work propagates. */
+async function settlesBeforeRestartDeadline(work: Promise<unknown>, deadline: number, signal?: AbortSignal) {
+  if (signal?.aborted) return false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      work.then(() => true),
+      new Promise<false>(resolve => {
+        if (Number.isFinite(deadline)) timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now()));
+        onAbort = () => resolve(false);
+        signal?.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 export async function detachNativeSessionsForRestart(
   runIds: readonly string[],
   leaseOwner?: string,
+  options?: NativeRestartDetachOptions,
 ): Promise<{
   detachedRunIds: string[];
   inactiveRunIds: string[];
   unsupportedRunIds: string[];
   pendingRunIds: string[];
+  failedRunIds?: string[];
 }> {
-  const detachedRunIds: string[] = [];
-  const inactiveRunIds: string[] = [];
-  const unsupportedRunIds: string[] = [];
-  const pendingRunIds: string[] = [];
   const restartDeadline = Date.now() + 30_000;
   const settlementDeadline = Date.now() + 20_000;
-  for (const runId of new Set(runIds)) {
+  const signal = options?.signal;
+  const errors: unknown[] = [];
+  const detachOne = async (runId: string): Promise<NativeRestartDetachOutcome> => {
     // A governed stop already revoked new work and is collecting terminal
     // accounting. Give that exact owner a bounded chance to persist it before
     // fencing callbacks and relinquishing the runner. Timeout is not success.
     const settling = nativeSessionStartups.get(runId);
     if (settling?.governedWait) {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        await Promise.race([settling.settled, new Promise<void>(resolve => {
-          timer = setTimeout(resolve, Math.max(0, settlementDeadline - Date.now()));
-        })]);
-      } finally { clearTimeout(timer); }
+      await settlesBeforeRestartDeadline(settling.settled, settlementDeadline, signal);
     }
     if (leaseOwner !== undefined && nativeSessionStartups.get(runId)?.leaseOwner !== leaseOwner) {
-      inactiveRunIds.push(runId);
-      continue;
+      return "inactive";
     }
     nativeRunsDetachingForRestart.set(runId, Symbol("native controller detach"));
     try { nativeRunRecoveryFlushers.get(runId)?.(); } catch { /* Diagnostics cannot change detach. */ }
@@ -554,50 +583,65 @@ export async function detachNativeSessionsForRestart(
       // admission. It must publish its exact session for detachment; writes and
       // new turns remain revoked, including after the bounded wait expires.
       const startup = nativeSessionStartups.get(runId);
-      if (startup && Date.now() >= restartDeadline) {
-        pendingRunIds.push(runId);
-        continue;
-      }
+      if (startup && (Date.now() >= restartDeadline || signal?.aborted)) return "pending";
       if (startup) startup.restartAdmissionPending = true;
       try {
-        active = await waitForNativeSessionStartup(runId, undefined, Math.max(0, restartDeadline - Date.now())) ?? undefined;
+        const published = waitForNativeSessionStartup(runId, undefined, Math.max(0, restartDeadline - Date.now()));
+        published.catch(() => undefined);
+        if (startup && !await settlesBeforeRestartDeadline(published, restartDeadline, signal)) return "pending";
+        active = await published ?? undefined;
       } catch (error) {
         if (!(error instanceof Error) || error.message !== "native_restart_startup_not_ready") throw error;
-        pendingRunIds.push(runId);
-        continue;
+        return "pending";
       } finally {
         if (startup) startup.restartAdmissionPending = false;
       }
     }
-    if (!active) {
-      inactiveRunIds.push(runId);
-      continue;
-    }
+    if (!active) return "inactive";
     const stopping = nativeSessionStartups.get(runId);
     if (stopping?.stopRequested || active.cancelRequested) {
       // Stop owns cancellation and final cleanup, including after publication.
       // A deadline leaves this run pending; it must not abort healthy adoption
       // or claim that the transport/cleanup owner has settled.
-      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settled = stopping ? await settlesBeforeRestartDeadline(stopping.settled, restartDeadline, signal) : false;
+      return settled ? "inactive" : "pending";
+    }
+    if (active.session.detachControllerForRestart === undefined) return "unsupported";
+    // The memoized detach keeps running past the deadline; a later drain joins
+    // the same operation. Only its own settlement may report this run detached.
+    const detaching = detachActiveNativeSessionForRestart(active);
+    if (!signal) {
+      await detaching;
+      return "detached";
+    }
+    detaching.catch(() => undefined);
+    return await settlesBeforeRestartDeadline(detaching, Number.POSITIVE_INFINITY, signal) ? "detached" : "pending";
+  };
+  const unique = [...new Set(runIds)];
+  const outcomes = new Map<string, NativeRestartDetachOutcome>();
+  let next = 0;
+  const worker = async () => {
+    for (let index = next++; index < unique.length; index = next++) {
+      const runId = unique[index]!;
       try {
-        const settled = stopping && await Promise.race([
-          stopping.settled.then(() => true),
-          new Promise<false>(resolve => {
-            timer = setTimeout(() => resolve(false), Math.max(0, restartDeadline - Date.now()));
-          }),
-        ]);
-        (settled ? inactiveRunIds : pendingRunIds).push(runId);
-      } finally { clearTimeout(timer); }
-      continue;
+        outcomes.set(runId, await detachOne(runId));
+      } catch (error) {
+        errors.push(error);
+        outcomes.set(runId, "failed");
+      }
     }
-    if (active.session.detachControllerForRestart === undefined) {
-      unsupportedRunIds.push(runId);
-      continue;
-    }
-    await detachActiveNativeSessionForRestart(active);
-    detachedRunIds.push(runId);
-  }
-  return { detachedRunIds, inactiveRunIds, unsupportedRunIds, pendingRunIds };
+  };
+  await Promise.all(Array.from({ length: Math.min(NATIVE_RESTART_DETACH_CONCURRENCY, unique.length) }, worker));
+  if (errors.length > 0 && !options?.reportFailures) throw errors[0];
+  const select = (outcome: NativeRestartDetachOutcome) => unique.filter(runId => outcomes.get(runId) === outcome);
+  return {
+    detachedRunIds: select("detached"),
+    inactiveRunIds: select("inactive"),
+    unsupportedRunIds: select("unsupported"),
+    pendingRunIds: select("pending"),
+    // Present only when a run failed, so the sweep shape stays unchanged otherwise.
+    ...(options?.reportFailures && errors.length > 0 ? { failedRunIds: select("failed") } : {}),
+  };
 }
 const MAX_REMOTE_CHECKPOINT_ARCHIVE_BYTES = 64 * 1024 * 1024;
 const MAX_REMOTE_CHECKPOINT_EXPANDED_BYTES = 64 * 1024 * 1024;

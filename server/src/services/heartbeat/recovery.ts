@@ -625,8 +625,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       .map(({ run }) => run.id);
     abort?.throwIfAborted();
     for (const runId of nativeRunIds) markHandedOffByThisController(runId);
+    // One remaining shutdown deadline (the step's abort) bounds the whole
+    // concurrent batch; a run still detaching at that deadline is pending.
     const detachedNativeSessions =
-      await detachNativeSessionsForRestart(nativeRunIds);
+      await detachNativeSessionsForRestart(nativeRunIds, undefined, { signal: abort, reportFailures: true });
 
     logger.info(
       {
