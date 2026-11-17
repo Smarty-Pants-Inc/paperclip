@@ -526,6 +526,14 @@ export function resolveHeartbeatRunResponse(input: {
     };
   }
   const rawFinalAgentText = readCommentText(input.finalAgentMessage?.text);
+  // The result summary is a schema-capped preview (12,000 characters). When it
+  // is the leading part of the run's complete final answer, the person gets the
+  // whole answer, never the cut preview (pack-n5 (i), Paul NOTE 5).
+  const wholeAnswer = (summary: string): string => {
+    const whole = input.finalAgentMessage?.channel === "final" && input.finalAgentMessage.bounded !== true
+      && rawFinalAgentText && !isBoundedRunEventText(rawFinalAgentText) ? rawFinalAgentText : null;
+    return whole && whole.length > summary.length && whole.startsWith(summary) ? whole : summary;
+  };
   // A run-log preview is an incomplete copy of the agent's message. It never
   // outranks a complete source; it is posted only when no complete text exists.
   const boundedFinalAgentText =
@@ -588,7 +596,7 @@ export function resolveHeartbeatRunResponse(input: {
     const semanticSummary = readAcceptedSemanticSummary(resultJson);
     if (semanticSummary) {
       return {
-        text: semanticSummary,
+        text: wholeAnswer(semanticSummary),
         decision: decision("semantic_result_summary", {
           commentAction: "create",
           reasonCodes: boundedFinalAgentText
@@ -638,7 +646,7 @@ export function resolveHeartbeatRunResponse(input: {
           : null;
       if (responseWakeSummary) {
         return {
-          text: responseWakeSummary,
+          text: wholeAnswer(responseWakeSummary),
           decision: decision("semantic_result_summary", {
             commentAction: "create",
             reasonCodes: [
