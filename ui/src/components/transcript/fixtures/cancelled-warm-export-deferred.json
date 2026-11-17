@@ -18,7 +18,7 @@
       "stream": "system",
       "level": "warn",
       "color": null,
-      "message": "Stopped turn's workspace export could not be confirmed in time (export_failed); its files may or may not be on the host yet, and the warm box stays protected, so nothing on it is lost. To copy them back, use Recover saved files on the task.",
+      "message": "Stopped turn's workspace export could not be confirmed in time (export_failed); its files may or may not be on the host yet. The box is kept, so nothing on it is lost.",
       "payload": {
         "detail": "<per-run box command detail>",
         "reason": "export_failed",
@@ -36,15 +36,15 @@
       "stream": "system",
       "level": "warn",
       "color": null,
-      "message": "Stopped turn's workspace export could not be confirmed in time (export_failed); its files may or may not be on the host yet, and the warm box stays protected, so nothing on it is lost. To copy them back, use Recover saved files on the task.",
+      "message": "Stopped turn's workspace export could not be confirmed in time (export_failed); its files may or may not be on the host yet. The box is kept, so nothing on it is lost.",
       "payload": {
         "prpEvent": {
           "runId": "f05af367-3d4a-4f7d-bd66-0b47edfd3b25",
           "schema": "paperclip.prp.event.v1",
           "payload": {
             "schema": "paperclip.provider.notice.v1",
-            "message": "Stopped turn's workspace export could not be confirmed in time (export_failed); its files may or may not be on the host yet, and the warm box stays protected, so nothing on it is lost. To copy them back, use Recover saved files on the task.",
-            "summary": "Stopped turn's workspace export could not be confirmed in time (export_failed); its files may or may not be on the host yet, and the warm box stays protected, so nothing on it is lost. To copy them back, use Recover saved files on the task.",
+            "message": "Stopped turn's workspace export could not be confirmed in time (export_failed); its files may or may not be on the host yet. The box is kept, so nothing on it is lost.",
+            "summary": "Stopped turn's workspace export could not be confirmed in time (export_failed); its files may or may not be on the host yet. The box is kept, so nothing on it is lost.",
             "category": "workspace_export_deferred",
             "severity": "warning"
           },
