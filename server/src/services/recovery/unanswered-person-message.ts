@@ -1,5 +1,5 @@
-import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, unansweredCardAnswerSql } from "../person-message-answer.js";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
+import { answeredPersonMessageSql, PENDING_WAIT_START_BOUND_MS, unansweredCardAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -70,8 +70,9 @@ export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
 /** The run that carries the message is queued or scheduled and has not started. */
 export const UNANSWERED_MESSAGE_WAITING_CODE = "waiting_to_start";
 /** A waiting note stays true only this long: if the carrying run still has not
- * started by T0 + this bound, the SAME note becomes the failure text. */
-export const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
+ * started by T0 + this bound, the SAME note becomes the failure text. For the
+ * system's own automatic recovery the bound runs from the failed run's END. */
+export { PENDING_WAIT_START_BOUND_MS };
 /** The non-failure marker row of a waiting note (no "Failure code" row). */
 const WAITING_ROW_LABEL = "Waiting code";
 const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] }]);
@@ -276,7 +277,7 @@ function owedCardAnswerSql(companyId: SQL, issueId: SQL, since: string): SQL {
       and not exists (select 1 from ${issueComments} later where later.company_id = ca.company_id
         and later.issue_id = ca.issue_id and later.author_type = 'user' and later.deleted_at is null
         and later.created_at > ca.resolved_at)
-      and ${unansweredCardAnswerSql("ca")}
+      and ${unansweredCardAnswerSql("ca", new Date())}
       and not exists (select 1 from ${issueComments} n where n.company_id = ca.company_id and n.issue_id = ca.issue_id
         and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ca.id::text
         and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))`;
@@ -506,7 +507,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     const [owed] = await q.select({ id: issueThreadInteractions.id, createdAt: sql<Date>`${issueThreadInteractions.resolvedAt}` })
       .from(issueThreadInteractions).where(and(eq(issueThreadInteractions.companyId, issue.companyId),
         eq(issueThreadInteractions.issueId, issue.id), gt(issueThreadInteractions.resolvedAt, latestMessage.createdAt),
-        unansweredCardAnswerSql("issue_thread_interactions")))
+        unansweredCardAnswerSql("issue_thread_interactions", now)))
       .orderBy(desc(issueThreadInteractions.resolvedAt)).limit(1);
     if (!owed) return { kind: "answered" };
     message = { id: owed.id, createdAt: new Date(owed.createdAt) };
@@ -589,7 +590,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // the fenced writer posts the one notice; a later answer supersedes it.
   let waitT0: number | null | undefined;
   let setupWaitRecord: WaitRecord | undefined;
-  const bounded = async (recheckAt: number, setup = false): Promise<Decision | null> => {
+  // `deadline`: a fixed durable end that caps this wait (the failed run's end
+  // + PENDING_WAIT_START_BOUND_MS for the system's own automatic recovery).
+  // Past it, never start or continue a wait.
+  const bounded = async (recheckAt: number, setup = false, deadline: number | null = null): Promise<Decision | null> => {
+    if (deadline !== null && deadline <= now.getTime()) return null;
     if (waitT0 === undefined) {
       const [wait] = await q.select({ at: sql<Date>`min(${activityLog.createdAt})` }).from(activityLog).where(and(
         eq(activityLog.companyId, issue.companyId), eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issue.id),
@@ -602,7 +607,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // Keep its record separate so it cannot consume a later retry's bound.
     if (setup && waitT0 === null) setupWaitRecord = { messageId: message.id, runId: messageRun?.id ?? null,
       waitKind: "setup", startedAt: message.createdAt.toISOString(), boundMs: SETUP_WAIT_BOUND_MS };
-    const bound = setup ? message.createdAt.getTime() + SETUP_WAIT_BOUND_MS : (waitT0 ?? now.getTime()) + PENDING_WAIT_BOUND_MS;
+    const bound = Math.min(setup ? message.createdAt.getTime() + SETUP_WAIT_BOUND_MS : (waitT0 ?? now.getTime()) + PENDING_WAIT_BOUND_MS,
+      deadline ?? Number.POSITIVE_INFINITY);
     if (bound <= now.getTime()) return null;
     return { kind: "pending", recheckAt: Math.min(recheckAt, bound),
       ...(waitT0 === null ? { recordWait: setupWaitRecord ?? { messageId: message.id, runId: messageRun?.id ?? null } } : {}) };
@@ -692,6 +698,24 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     inArray(issueRecoveryActions.status, ["active", "escalated"])))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
+  // The system's own automatic recovery of the message's failed run
+  // (automaticRecoveryPending) is bounded from that run's END: its finishedAt,
+  // or its coordinator's terminal failure when that came earlier. Never from
+  // the first sweep, so a late first sweep cannot start a new wait.
+  let recoveryDeadline: number | null | undefined;
+  const automaticRecoveryDeadline = async (): Promise<number | null> => {
+    if (recoveryDeadline !== undefined) return recoveryDeadline;
+    recoveryDeadline = null;
+    if (run && TERMINAL.includes(run.status) && run.status !== "succeeded" && !boardHold
+      && await automaticRecoveryPending(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) {
+      const [terminal] = await q.select({ at: nativeRunFinalizations.updatedAt }).from(nativeRunFinalizations).where(and(
+        eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id),
+        eq(nativeRunFinalizations.phase, "terminal_failure"), isNotNull(nativeRunFinalizations.failureCode)));
+      const end = Math.min((run.finishedAt ?? run.updatedAt).getTime(), terminal?.at?.getTime() ?? Number.POSITIVE_INFINITY);
+      recoveryDeadline = end + PENDING_WAIT_START_BOUND_MS;
+    }
+    return recoveryDeadline;
+  };
   if (!boardHold && !agentPaused && !settingUp) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
       .from(agentWakeupRequests).where(and(
@@ -704,8 +728,13 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     const pendingExecutionWait = wakes.some(wake => ["deferred", "deferred_issue_execution"].includes(wake.status)
       && isWellFormedExecutionWait(wake.payload?.executionWait)
       && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
-    if (pendingExecutionWait || wakes.some(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id))) {
-      const wait = await bounded(now.getTime() + 30_000);
+    const issueWakes = wakes.filter(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id));
+    if (pendingExecutionWait || issueWakes.length) {
+      // Only the restored wakes of the run's own automatic recovery: that
+      // recovery's run-end deadline caps the wait.
+      const recoveryWakesOnly = !pendingExecutionWait
+        && issueWakes.every(wake => typeof ((wake.payload ?? {}) as Record<string, unknown>).recoveryActionId === "string");
+      const wait = await bounded(now.getTime() + 30_000, false, recoveryWakesOnly ? await automaticRecoveryDeadline() : null);
       if (wait) return wait;
       // After the short pending grace, use the existing waiting note and its
       // start bound below instead of telling the person to duplicate input.
@@ -752,11 +781,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // The system's own automatic recovery of this run is on its way: no
     // resend advice. The same short grace, then the true waiting note, and
     // the existing start bound: past it, today's notice below.
-    if (run.status !== "succeeded" && !boardHold
-      && await automaticRecoveryPending(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) {
-      const wait = await bounded(now.getTime() + 30_000);
+    // Its bound runs from the failed run's END (automaticRecoveryDeadline).
+    const startDeadline = await automaticRecoveryDeadline();
+    if (startDeadline !== null) {
+      const wait = await bounded(now.getTime() + 30_000, false, startDeadline);
       if (wait) return wait;
-      const startDeadline = (waitT0 ?? now.getTime()) + PENDING_WAIT_START_BOUND_MS;
       if (startDeadline > now.getTime()) {
         if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_RECOVERING_CODE) {
           return { kind: "pending", recheckAt: startDeadline };

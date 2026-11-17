@@ -314,7 +314,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   // Keep: recorded D10 F0 catch. One continuation must not abort the ordinary conversations behind it.
-  it("supersedes(RFL round4 F0; /srv/scratch/paul/rfl-verdicts/SUPERSEDE-RFL-ROUND4-F0-1117.md): RFL round4 F0 sweeps a continued conversation with five ordinary unanswered ones without throwing", async () => {
+  // Reason (rf5 autorec F1, run-end bound): the held run ended on the fixture clock 15 min ago, past the
+  // 10-min bound from its END, so its never-delivered continuation now gets ONE true notice, stable across passes.
+  it("supersedes(rf5 autorec F1, run-end bound): supersedes(RFL round4 F0; /srv/scratch/paul/rfl-verdicts/SUPERSEDE-RFL-ROUND4-F0-1117.md): RFL round4 F0 sweeps a continued conversation with five ordinary unanswered ones without throwing", async () => {
     const held = await fixture();
     const heldRunId = await held.run({ commentId: await held.message(), status: "failed", errorCode: "runner_remote_state_unavailable" });
     await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, heldRunId));
@@ -330,6 +332,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed" });
       ordinary.push(f);
     }
+    let heldNoteId: string | undefined;
     for (let pass = 0; pass < 3; pass++) {
       await expect(heartbeatService(db).reconcileStrandedAssignedIssues()).resolves.toBeDefined();
       for (const f of ordinary) {
@@ -338,9 +341,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         expect(notices[0]!.body).toBe(NOT_ANSWERED);
       }
       // RFL 17:18Z: its fresh continuation is recorded and its delivery is
-      // pending (automaticRecoveryPending (b)), so no resend advice for it;
-      // the sweep's own bound still posts one note if it never delivers.
-      expect(await held.visible()).toHaveLength(0);
+      // pending (automaticRecoveryPending (b)); the bound runs from the held
+      // run's END (15 min ago), so the sweep posts ONE true notice, never a second.
+      const heldNotes = await held.visible();
+      expect(heldNotes.map(note => note.body)).toEqual([NOT_ANSWERED]);
+      heldNoteId ??= heldNotes[0]!.id;
+      expect(heldNotes[0]!.id).toBe(heldNoteId);
     }
   });
 
@@ -1961,15 +1967,42 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect((await settleUnansweredPersonMessage(db, f)).kind).toBe("pending");
     });
 
-    it("guard: an answer still being delivered (pending delivery) is a pending attempt: no notice yet", async () => {
+    // Reason: rf5 C1, a pending delivery is a further attempt only within PENDING_WAIT_START_BOUND_MS of the
+    // answer's resolvedAt; this fixture's clock is 15 min in the past, so the guard now sweeps inside that bound.
+    it("supersedes(rf5 autorec F1, run-end bound): guard: an answer still being delivered (pending delivery) is a pending attempt: no notice yet", async () => {
       const f = await fixture({ status: "in_progress" });
       const root = await f.run({ commentId: await f.message(), status: "succeeded" });
       const card = await answeredCard(f, root);
       const first = await resume(f, card.id, "failed");
       await resume(f, card.id, "failed", first);
       await db.update(issueQuestionResponseDeliveries).set({ status: "pending" }).where(eq(issueQuestionResponseDeliveries.interactionId, card.id));
-      await f.sweep(); await f.sweep();
+      const [row] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card.id));
+      for (const ms of [60_000, PENDING_WAIT_START_BOUND_MS - 60_000]) {
+        expect((await settleUnansweredPersonMessage(db, { ...f, now: new Date(row!.resolvedAt!.getTime() + ms) })).kind).not.toBe("noticed");
+      }
       expect(await cardNotices(f)).toHaveLength(0);
+    });
+
+    it("RED (rf5 C1, card-answer delivery bound): the delivery stays pending forever (dead worker) -> none at +9 min from resolvedAt, ONE true notice at +10, never a second", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      await resume(f, card.id, "failed", first);
+      await db.update(issueQuestionResponseDeliveries).set({ status: "pending" }).where(eq(issueQuestionResponseDeliveries.interactionId, card.id));
+      const [row] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card.id));
+      const settle = (ms: number) => settleUnansweredPersonMessage(db, { ...f, now: new Date(row!.resolvedAt!.getTime() + ms) });
+      await settle(60_000);
+      await settle(9 * 60_000);
+      expect(await cardNotices(f), "+9 min: delivery still pending inside the bound").toHaveLength(0);
+      expect((await settle(10 * 60_000)).kind).toBe("noticed");
+      let notices = await cardNotices(f);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
+      expect(notices[0]!.body).toBe("Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.");
+      await settle(11 * 60_000); await settle(30 * 60_000);
+      notices = await cardNotices(f);
+      expect(notices).toHaveLength(1);
     });
 
     it.each(["agent-withdraw", "system-expiry"] as const)("guard: an agent/system-resolved card (%s) creates no duty", async how => {
@@ -2336,7 +2369,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
     // Keep: gate 3 s1 refusal (adca2f56), with the held writer's notice removed (#21066).
     // If its automatic recovery never delivers, the SWEEP alone must own the bound and the one notice.
-    it("gate 3 bound: refused message, no held-writer notice, recovery never delivers -> one true notice at ten minutes, never a second", async () => {
+    // Reason: rf5 autorec F1 (RFL 17:27Z, binding): the ten minutes run from the failed run's END (finishedAt),
+    // not from the sweep's first durable wait record; the record is still written once and never reset.
+    it("supersedes(rf5 autorec F1, run-end bound): gate 3 bound: refused message, no held-writer notice, recovery never delivers -> one true notice at ten minutes, never a second", async () => {
       const f = await fixture();
       const base = Date.now() - 90_000;
       const messageId = await f.message("Please continue.");
@@ -2360,15 +2395,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const recorded = await waits();
       expect(recorded).toHaveLength(1);
       expect(recorded[0]!.details).toMatchObject({ messageId, runId });
-      // The writer stamps T0 with the database clock, not the injected decision clock.
-      // Read that durable start so +10 min is EXACTLY the bound, without a timing cushion.
-      const t0 = recorded[0]!.createdAt.getTime() - base;
+      // The bound runs from the failed run's END (finishedAt = base + 5 885 ms), so +10 min is EXACTLY the bound.
+      const t0 = 5_885;
       let waitingId: string | undefined;
-      for (const minutes of [1, 5, 9]) {
+      for (const minutes of [2, 5, 9]) {
         await at(g, t0 + minutes * 60_000);
         const notes = await systemNotes();
         expect(notes.map(note => note.body).join(" ")).not.toMatch(/send(?:ing)? it again/i);
-        if (minutes === 1) {
+        if (minutes === 2) {
           expect(notes).toHaveLength(0); // Still inside the short grace.
         } else {
           expect((await g.visible()).map(note => note.body)).toEqual([recoveringText()]);
@@ -2393,6 +2427,54 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect((await waits()).map(wait => ({ id: wait.id, createdAt: wait.createdAt })))
         .toEqual(recorded.map(wait => ({ id: wait.id, createdAt: wait.createdAt })));
     });
+
+    // rf5 autorec F1 (binding, RFL 17:27Z): the bound runs from the failed run's END for all three pending shapes:
+    // (a) no action yet, (b) restored with no delivery, (c) a deferred restored wake. Adapted from rf5's BOUND rows.
+    const endShapes = ["a-no-action", "b-restored-no-delivery", "c-deferred-wake"] as const;
+    const END = 5_885; // gate1's failed run finishedAt, relative to base
+    async function endShape(shape: (typeof endShapes)[number], firstSweepMs: number) {
+      const g = await gate1(firstSweepMs); // the real (database) clock is at the first sweep
+      if (shape !== "a-no-action") {
+        const actionId = await restoredNoDelivery(g, shape === "c-deferred-wake" ? { continuationDelivery: "delegated" } : {});
+        if (shape === "c-deferred-wake") {
+          await db.insert(agentWakeupRequests).values({ companyId: g.companyId, agentId: g.agentId, source: "automation",
+            reason: "issue_recovery_action_restored", status: "deferred_issue_execution", requestedByActorType: "system",
+            requestedByActorId: "execution-recovery", payload: { issueId: g.issueId, recoveryActionId: actionId } });
+        }
+      }
+      expect(await pending(g, g.runId)).toBe(true);
+      return g;
+    }
+    const systemNotesOf = (g: G) => db.select().from(issueComments).where(and(eq(issueComments.issueId, g.issueId),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
+    const waitsOf = (g: G) => db.select().from(activityLog).where(and(eq(activityLog.entityId, g.issueId),
+      eq(activityLog.action, PENDING_WAIT_ACTION)));
+    for (const shape of endShapes) {
+      it(`RED (rf5 autorec F1, run-end bound) ${shape}: first sweep at END+1 min; END+9 no failure notice; END+10 ONE true failure notice (the same comment)`, async () => {
+        const g = await endShape(shape, END + 60_000);
+        await at(g, END + 60_000);
+        expect(await systemNotesOf(g)).toHaveLength(0);
+        const firstWaits = await waitsOf(g);
+        await at(g, END + 9 * 60_000);
+        const nine = await systemNotesOf(g);
+        expect(nine.filter(note => note.body === NOT_ANSWERED || codeOf(note) !== undefined), "+9 min: no failure notice").toEqual([]);
+        expect(nine.map(note => note.body).join(" ")).not.toMatch(/send(?:ing)? it again/i);
+        for (const note of nine) expect(note.body).toBe(recoveringText()); // the true waiting note may stand
+        expect(await at(g, END + 10 * 60_000)).toMatchObject({ kind: "noticed", code: "native_session_supervisor_busy" });
+        const ten = await systemNotesOf(g);
+        expect(ten.map(note => note.body)).toEqual([NOT_ANSWERED]);
+        if (nine[0]) expect(ten[0]!.id).toBe(nine[0].id);
+        await at(g, END + 11 * 60_000);
+        expect((await systemNotesOf(g)).map(note => note.id)).toEqual(ten.map(note => note.id));
+        expect((await waitsOf(g)).map(wait => wait.id)).toEqual(firstWaits.map(wait => wait.id));
+      });
+      it(`RED (rf5 autorec F1, run-end bound) ${shape}: a delayed FIRST sweep at END+11 min -> ONE true failure notice at once, no new wait`, async () => {
+        const g = await endShape(shape, END + 11 * 60_000);
+        expect(await at(g, END + 11 * 60_000)).toMatchObject({ kind: "noticed" });
+        expect((await systemNotesOf(g)).map(note => note.body)).toEqual([NOT_ANSWERED]);
+        expect(await waitsOf(g)).toHaveLength(0);
+      });
+    }
 
     // Keep: gate 3 s1, chat 253cb37f: run adca2f56 failed native_continuation_requires_reconciliation; the held
     // writer's notice 21d735a4 (16:42:17.115) came 66 ms BEFORE hold cbfe9c96 existed (16:42:17.181). The only

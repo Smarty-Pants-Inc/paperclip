@@ -9,6 +9,11 @@ export const COMPANY_IMPORTED_ACTION = "company.imported";
 
 type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
 
+/** A wait for a further attempt stays true only this long from its fixed
+ * durable start (a failed run's end, a card's answer time): past it, ONE true
+ * notice. Shared by the unanswered-message sweep and the card-answer duty. */
+export const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
+
 // A person input is a typed message (a comment id) or a person's answer to an
 // agent's card (the interaction id): its answer-resume run carries it as
 // context.interactionId (routes/issues.ts wake contexts). Ids never collide.
@@ -83,18 +88,23 @@ const CARD_ANSWER_STATUSES = ["answered", "accepted", "rejected"] as const;
  * agent's card that started an answer-resume run and that no agent answered
  * yet (a reply or a new card on that run's chain, after the answer). The SAME
  * rule as a typed message (answeredPersonMessageSql), keyed by the card id and
- * its answer time. It is an owed person input like a typed message. */
-export function unansweredCardAnswerSql(alias: string): SQL {
+ * its answer time. It is an owed person input like a typed message.
+ * A response delivery still pending or delivering is a further attempt only
+ * within PENDING_WAIT_START_BOUND_MS of the answer (resolvedAt): a dead
+ * delivery worker never leaves the answer silent. */
+export function unansweredCardAnswerSql(alias: string, now: Date = new Date()): SQL {
   const q = sql.identifier(alias);
+  const deliveryCutoff = new Date(now.getTime() - PENDING_WAIT_START_BOUND_MS).toISOString();
   return sql`(${q}.resolved_by_user_id is not null and ${q}.resolved_at is not null
     and ${q}.status in (${sql.join(CARD_ANSWER_STATUSES.map(status => sql`${status}`), sql`, `)})
     and exists (select 1 from ${heartbeatRuns} resume where resume.company_id = ${q}.company_id
       and (resume.native_issue_id = ${q}.issue_id or resume.context_snapshot->>'issueId' = ${q}.issue_id::text)
       and resume.context_snapshot->>'interactionId' = ${q}.id::text)
-    -- An answer still being delivered to the agent is a pending attempt, not a silent one.
-    and not exists (select 1 from ${issueQuestionResponseDeliveries} delivery
+    -- An answer still being delivered to the agent is a pending attempt, not a
+    -- silent one, until the bound from its answer time.
+    and (${q}.resolved_at <= ${deliveryCutoff}::timestamptz or not exists (select 1 from ${issueQuestionResponseDeliveries} delivery
       where delivery.company_id = ${q}.company_id and delivery.interaction_id = ${q}.id
-        and delivery.status in ('pending', 'delivering'))
+        and delivery.status in ('pending', 'delivering')))
     and not ${answeredPersonMessageSql({ id: sql`${q}.id`, companyId: sql`${q}.company_id`,
       issueId: sql`${q}.issue_id`, createdAt: sql`${q}.resolved_at` })})`;
 }
