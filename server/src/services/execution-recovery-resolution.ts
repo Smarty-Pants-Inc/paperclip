@@ -653,6 +653,35 @@ function supersedingNativeWorkspaceHold(db: Db, input: {
   ));
 }
 
+/**
+ * The native terminal hold (wake-queue postgres.ts recordNativeTerminalRecoveryIfNeeded)
+ * promises the fresh-continuation fallback, but when the run's coordinator had
+ * already committed its failed result (a Pi killed mid-turn: adapter_failed with
+ * a committed result) the hold's own coordinator move to terminal_failure is a
+ * no-op. A committed failed result leaves the finalizer nothing to own, so the
+ * disposition pass takes exactly that hold, for exactly that run. The committed
+ * coordinator is never rewritten.
+ */
+function committedFailedNativeContinuationHold() {
+  return and(
+    eq(issueRecoveryActions.cause, "native_continuation_requires_reconciliation"),
+    sql`${issueRecoveryActions.evidence}->'nativeFailureBlock'->>'runId' = ${heartbeatRuns.id}::text`,
+    eq(heartbeatRuns.runtimeMode, "native"),
+    eq(heartbeatRuns.nativePhase, "committed"),
+    eq(nativeRunFinalizations.phase, "committed"),
+  );
+}
+
+function isCommittedFailedNativeContinuationHold(
+  action: typeof issueRecoveryActions.$inferSelect,
+  run: typeof heartbeatRuns.$inferSelect,
+  coordinator: typeof nativeRunFinalizations.$inferSelect | undefined,
+) {
+  const block = action.evidence.nativeFailureBlock as Record<string, unknown> | undefined;
+  return action.cause === "native_continuation_requires_reconciliation" && block?.runId === run.id
+    && run.runtimeMode === "native" && run.nativePhase === "committed" && coordinator?.phase === "committed";
+}
+
 export function unresolvedExecutionDispositions(db: Db, limit: number) {
   return db
     .select({ action: issueRecoveryActions })
@@ -698,10 +727,15 @@ export function unresolvedExecutionDispositions(db: Db, limit: number) {
           "cancelled",
         ]),
         isNull(nativeRunFinalizations.leaseOwner),
-        isNull(nativeRunFinalizations.resultId),
         or(
-          isNull(nativeRunFinalizations.runId),
-          eq(nativeRunFinalizations.phase, "terminal_failure"),
+          and(
+            isNull(nativeRunFinalizations.resultId),
+            or(
+              isNull(nativeRunFinalizations.runId),
+              eq(nativeRunFinalizations.phase, "terminal_failure"),
+            ),
+          ),
+          committedFailedNativeContinuationHold(),
         ),
         sql`coalesce(${nativeRunFinalizations.failureDetail}->>'successorRunId', '') = ''`,
         sql`(${heartbeatRuns.runtimeMode} <> 'native' or coalesce(${nativeRunFinalizations.failureCode}, '') <> 'native_provider_terminal_failed'
@@ -867,11 +901,12 @@ export async function settleUnrecoverableExecutions(
         if (readSystemRecovery(action.evidence)) return;
         // Give durable native recovery its chance; never preempt a resume,
         // replacement, result finalizer, or still-owned execution.
+        const committedFailed = isCommittedFailedNativeContinuationHold(action, run, coordinator);
         if (
           coordinator?.leaseOwner ||
-          coordinator?.resultId ||
+          (coordinator?.resultId && !committedFailed) ||
           coordinator?.failureDetail?.successorRunId ||
-          (coordinator && coordinator.phase !== "terminal_failure") ||
+          (coordinator && coordinator.phase !== "terminal_failure" && !committedFailed) ||
           (run.runtimeMode === "native" &&
             coordinator?.failureCode === "native_provider_terminal_failed" &&
             !coordinator.failureDetail?.replacementDenied)
