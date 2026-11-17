@@ -209,6 +209,41 @@ describe("F-02 the recovery resume is one send inside the call's 3-send cap", ()
   });
 });
 
+// Keep: review-fleet-2 delta re-judge of 61566016, F-03-R. Port of the
+// judge's dist-late-ready.mjs (late-ready and late-conflict modes): Boat's
+// response itself can cross the deadline even when every wait is bounded.
+// Exercise the public plugin hooks and transport boundary; never live Boat.
+describe("F-03-R no send after a late Boat response crosses the call's 30 s budget", () => {
+  it.each([
+    { mode: "JUDGE-LATE-READY", heldMs: 29_000, expectedResumes: 2 },
+    { mode: "JUDGE-LATE-CONFLICT", heldMs: 31_000, expectedResumes: 1 },
+  ])("$mode: command held $heldMs ms permits 0 sends at or after the deadline", async ({ heldMs, expectedResumes }) => {
+    vi.useFakeTimers();
+    const boat = fakeBoat(async (call, n) => {
+      if (call.route.endsWith("/commands") && n.commands === 1) {
+        await new Promise(resolve => setTimeout(resolve, heldMs));
+        return conflict("machine_not_running", "archived");
+      }
+      // As in the dist probe, the recovery resume is accepted immediately,
+      // but its ready observation arrives 2.1 s later (31.1 s in late-ready).
+      if (call.method === "GET" && n.resume === 2) {
+        await new Promise(resolve => setTimeout(resolve, 2_100));
+      }
+      return undefined;
+    });
+    await resumeLease();
+    const start = Date.now(), firstCall = boat.calls.length;
+    const work = execute(scope, { timeoutMs: 120_000 }).catch(e => e);
+    await vi.advanceTimersByTimeAsync(heldMs + 2_100);
+    const outcome = await work;
+    const sends = boat.calls.slice(firstCall);
+    expect(sends.filter(c => c.at - start >= 30_000)).toEqual([]);
+    expect(boat.n.commands).toBe(1);
+    expect(boat.n.resume).toBe(expectedResumes);
+    expect(outcome).toMatchObject({ status: 409, boatCode: "machine_not_running" });
+  });
+});
+
 describe("F-03 no wait crosses the call's own budget (min of the 30 s deadline and its signal)", () => {
   it.each([31_000, 29_500])("JUDGE-BUDGET a command Boat held %d ms then answered sandbox_starting is not sent again past 30 s", async heldMs => {
     vi.useFakeTimers();
