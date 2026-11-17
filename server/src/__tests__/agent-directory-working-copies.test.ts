@@ -475,27 +475,24 @@ describe("persistent agent directories", () => {
         return out.sort();
       }
 
-      it("keeps chat A warm on its SAME directory after a sibling saves a memory note; a NEW chat sees the note and DECISIONS", async () => {
+      it("LOCAL root never delivers a sibling note in place: it retires and restores fresh; a NEW chat sees the note and DECISIONS", async () => {
         await paulBundle();
         const chatA = await run({ warm: true });
         expect((await copies.checkpointWarm({ companyId, runId: chatA.runId }))?.state).toBe("warm_saved");
         const before = await onDisk(root);
         await siblingSaves(note, "NOTE-FACT: Kate takes the SMA-612 handover.\n");
 
-        // Warm chat A: its FIRST next turn reuses the same materialization (no retirement, no fresh restore).
-        expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(true);
-        const turn2 = await run({ warm: true, reuseRunId: chatA.runId });
-        expect(turn2.localRoot).toBe(chatA.localRoot);
-        expect(turn2.executionRoot).toBe(chatA.executionRoot);
-        expect(await copies.get(companyId, chatA.runId)).toMatchObject({ state: "superseded", receipt: { successorRunId: turn2.runId } });
-        // The runner's 'instructions' for the warm turn are unchanged (no refresh_required).
-        const contextFor = async (copy: typeof chatA) => buildNativeRuntimeContext({ db, agent: { id: agentId, companyId, name: "Target",
-          adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } },
-          runId: copy.runId, runtimeConfig: {}, runtimeSkillEntries: [], instructionWorkingCopy: { rootPath: copy.executionRoot, entryPath: "AGENTS.md", kind: "agent_files" } });
-        const [contextA, context2] = [await contextFor(chatA), await contextFor(turn2)];
-        expect(context2.instructions).toEqual(contextA.instructions);
-        expect(context2.aggregateDigest).toBe(contextA.aggregateDigest);
-        // ...and still sees the sibling's note on disk.
+        // RFL round 2: a LOCAL root has no aside/compare/no-replace fence, so it
+        // NEVER takes delivery in place. It keeps the existing retire + fresh restore.
+        expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(false);
+        const nextId = await nextRun();
+        await expect(copies.prepare({ ...target(), runId: nextId, cwd: home, warm: true, reuseRunId: chatA.runId }))
+          .rejects.toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        await expect(fs.stat(path.join(chatA.localRoot, note))).rejects.toMatchObject({ code: "ENOENT" });
+        expect((await copies.get(companyId, chatA.runId))?.state).toBe("warm_saved");
+        await copies.collectStopped({ companyId, runId: chatA.runId });
+        const turn2 = (await copies.prepare({ ...target(), runId: nextId, cwd: home, warm: true }))!;
+        expect(turn2.localRoot).not.toBe(chatA.localRoot);
         expect(await fs.readFile(path.join(turn2.localRoot, note), "utf8")).toBe("NOTE-FACT: Kate takes the SMA-612 handover.\n");
 
         // A NEW chat started after the note restores the whole folder: the note and DECISIONS.md facts.
@@ -529,20 +526,46 @@ describe("persistent agent directories", () => {
         expect(await fs.readFile(path.join(fresh.localRoot, edited), "utf8")).toBe(`# ${edited} edited\n`);
       }, 20_000);
 
-      it("adopts a retained session after a sibling note without retirement; the note is on disk", async () => {
+      it("LOCAL adoption refuses a retained session after a sibling note (no in-place delivery); the old copy is collected", async () => {
         await paulBundle();
         const first = await run();
         expect(await copies.hasChanges({ companyId, runId: first.runId })).toBe(false);
         await siblingSaves(note, "NOTE-FACT adopt\n");
         const secondId = await nextRun();
-        const second = await copies.adopt({ companyId, agentId, runId: secondId, previousRunId: first.runId, cwd: home });
-        expect(second).toMatchObject({ runId: secondId, localRoot: first.localRoot });
-        expect(second?.receipt?.retirementRequired).toBeUndefined();
-        expect(await fs.readFile(path.join(first.localRoot, note), "utf8")).toBe("NOTE-FACT adopt\n");
-        expect(await copies.hasChanges({ companyId, runId: secondId })).toBe(false);
-        await copies.collectStopped({ companyId, runId: secondId });
+        expect(await copies.adopt({ companyId, agentId, runId: secondId, previousRunId: first.runId, cwd: home })).toBeNull();
+        await expect(fs.stat(path.join(first.localRoot, note))).rejects.toMatchObject({ code: "ENOENT" });
+        await copies.collectStopped({ companyId, runId: first.runId });
         expect(await fs.readFile(path.join(root, note), "utf8")).toBe("NOTE-FACT adopt\n");
-        await copies.release(companyId, first.runId);
+      }, 20_000);
+
+      it("JUDGE local-race-proof: a LOCAL write injected right before the in-place copy is never replaced by the sibling", async () => {
+        await paulBundle();
+        const f = "memory/local-race.md";
+        await fs.writeFile(path.join(root, f), "C\n");
+        const chatA = await run({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId }))?.state).toBe("warm_saved");
+        await siblingSaves(f, "B-SIBLING\n");
+        // The judge's injection: chat A writes F immediately before the real fs.cp onto its live tree.
+        const actualCp = fs.cp;
+        let injected = false;
+        const cp = vi.spyOn(fs, "cp").mockImplementation(async (from, to, options) => {
+          if (typeof to === "string" && to === path.join(chatA.localRoot, f)) { await fs.writeFile(to, "A-LOCAL\n"); injected = true; }
+          return actualCp(from, to, options);
+        });
+        const nextId = await nextRun();
+        let error: unknown;
+        try {
+          await copies.prepare({ ...target(), runId: nextId, cwd: home, warm: true, reuseRunId: chatA.runId }).catch(e => { error = e; });
+        } finally { cp.mockRestore(); }
+        const actual = await fs.readFile(path.join(chatA.localRoot, f), "utf8");
+        expect({ actual, refused: error instanceof AgentDirectoryReuseInvalidatedError },
+          "LOCAL delivery is never in place: refused, and A's bytes (or the untouched baseline) stay").toEqual({ actual: injected ? "A-LOCAL\n" : "C\n", refused: true });
+        expect(cp.mock.calls.filter(([, to]) => typeof to === "string" && to.startsWith(`${chatA.localRoot}/`))).toEqual([]);
+        // Retire + fresh restore: the sibling's B reaches the next message.
+        await copies.collectStopped({ companyId, runId: chatA.runId });
+        const fresh = (await copies.prepare({ ...target(), runId: nextId, cwd: home, warm: true }))!;
+        expect(await fs.readFile(path.join(fresh.localRoot, f), "utf8")).toBe("B-SIBLING\n");
+        await copies.collectStopped({ companyId, runId: nextId });
       }, 20_000);
 
       it("adoption still refuses a retained session after a DECISIONS.md edit", async () => {
@@ -590,6 +613,15 @@ describe("persistent agent directories", () => {
         let waiting: ((pid: number) => void) | null = null;
         runnerd.stdout!.setEncoding("utf8").on("data", (chunk: string) => { for (const line of chunk.split("\n").filter(Boolean)) { childPids.push(Number(line)); waiting?.(Number(line)); } });
         onTestFinished(() => { runnerd.kill("SIGTERM"); });
+        // Fixture isolation: retire THIS fixture's remote owners when the test
+        // ends, so a later test's unscoped recovery/cleanup sweep (with its own
+        // runtime mock) never reaches into this Boat sandbox and runs rm -rf.
+        const fixtureCompanyId = companyId;
+        onTestFinished(async () => {
+          await db.update(agentInstructionWorkingCopies).set({ state: "saved", processStoppedAt: new Date(), nextAttemptAt: null,
+            receipt: { schema: "paperclip.agent-files.v1", cleanupPending: false } }).where(eq(agentInstructionWorkingCopies.companyId, fixtureCompanyId));
+          await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() }).where(eq(environmentLeases.companyId, fixtureCompanyId));
+        });
         const nextChild = () => new Promise<number>(resolve => { waiting = pid => { waiting = null; resolve(pid); }; });
         const providerPid = childPids[0] ?? await nextChild();
         void providerPid;
@@ -940,21 +972,192 @@ describe("persistent agent directories", () => {
         const f = "memory/eexist.md", baselineBytes = "baseline\n", agentBytes = "agent recreated\n", sibling = "sibling\n";
         await fs.mkdir(path.join(warmRoot, "memory"), { recursive: true });
         await fs.mkdir(path.join(source, "memory"), { recursive: true });
-        await fs.writeFile(path.join(warmRoot, f), baselineBytes);
+        await fs.writeFile(path.join(warmRoot, f), baselineBytes, { mode: 0o600 });
+        await fs.chmod(path.join(warmRoot, f), 0o600);
         await fs.writeFile(path.join(source, f), sibling);
         const preload = path.join(boat.executionTarget.remoteCwd, "eexist-preload.cjs");
         await fs.writeFile(preload, `const fs = require("node:fs"); const link = fs.linkSync; let once = false;
           fs.linkSync = (from, to) => { if (!once) { once = true; fs.writeFileSync(to, ${JSON.stringify(agentBytes)}); } return link(from, to); };`);
         const sha = (text: string) => createHash("sha256").update(text).digest("hex");
         const plan = { root: warmRoot, source, aside: path.join(warmRoot, ".paperclip-runtime", "notes-x", "aside"),
-          remove: [], dirs: [], files: [[f, 0o600, { "": sha(baselineBytes) }, sha(sibling)]] };
+          remove: [], dirs: [], files: [[f, 0o600, { "": `${sha(baselineBytes)}:600` }, sha(sibling)]] };
         const result = await execFile(process.execPath, ["-r", preload, "-e", applyWarmNotesProgram, JSON.stringify(plan)]).then(() => null, error => error as { code: number; stderr: string });
         expect(result?.code).not.toBe(0);
         expect(result?.stderr).toContain("EEXIST");
-        // The agent's recreated bytes stay in the tree; the moved-aside original is kept, never deleted.
+        // The agent's recreated bytes stay in the tree; the moved-aside original
+        // is never deleted and never left unmanifested in runtime scratch: its
+        // path is taken, so it is placed beside it as a visible <name>.aside-<epoch>.
         expect(await fs.readFile(path.join(warmRoot, f), "utf8")).toBe(agentBytes);
-        expect(result?.stderr).toContain("agent bytes kept aside");
-        expect(await fs.readFile(path.join(plan.aside, "0"), "utf8")).toBe(baselineBytes);
+        expect(result?.stderr).toContain("agent bytes placed beside");
+        const beside = (await fs.readdir(path.join(warmRoot, "memory"))).filter(name => name.startsWith("eexist.md.aside-"));
+        expect(beside).toHaveLength(1);
+        expect(await fs.readFile(path.join(warmRoot, "memory", beside[0]!), "utf8")).toBe(baselineBytes);
+        await expect(fs.stat(path.join(plan.aside, "0"))).rejects.toMatchObject({ code: "ENOENT" });
+      }, 30_000);
+
+      // RFL round 2 (JUDGE proofs): the old run is retired before another
+      // checkpoint and collected with its EXACT owner lease (so release really
+      // removes the remote root). A's fd, held across delivery, writes after it.
+      async function textsContaining(dir: string, needle: string) {
+        const found: string[] = [];
+        for (const name of await onDisk(dir)) if ((await fs.readFile(path.join(dir, name), "utf8")).includes(needle)) found.push(name);
+        return found;
+      }
+      it.each(["path-taken", "visible-name-taken"] as const)("JUDGE retirement-failed-placement (%s): a refused placement's original inode and its late fd bytes are collected before cleanup", async shape => {
+        await paulBundle();
+        const f = "memory/held-placement.md";
+        await fs.writeFile(path.join(root, f), "checkpoint baseline\n");
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        const ownerTarget = { ...boat.executionTarget };
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: ownerTarget }))?.state).toBe("warm_saved");
+        const handle = await fs.open(path.join(chatA.executionRoot, f), "a");
+        try {
+          await boat.siblingSavesRemote(f, "sibling F'\n");
+          // The agent recreates F between the move-aside and link(2): EEXIST.
+          // visible-name-taken: every <name>.aside-<epoch> is taken as well, so
+          // the original can only stay in scratch, listed by the manifest.
+          const preload = path.join(boat.executionTarget.remoteCwd, `placement-${shape}.cjs`);
+          await fs.writeFile(preload, `const fs = require("node:fs"); const link = fs.linkSync; let once = false;
+            fs.linkSync = (from, to) => { ${shape === "visible-name-taken" ? `if (String(to).includes(".aside-")) { const e = new Error("EEXIST: name taken"); e.code = "EEXIST"; throw e; }` : ""}
+              if (!once) { once = true; fs.writeFileSync(to, "AGENT RECREATED\\n"); } return link(from, to); };`);
+          const actualShell = executionTargetTools.runAdapterExecutionTargetShellCommand;
+          const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand").mockImplementation((runId, t, command, options) =>
+            actualShell(runId, t, command.includes(applyWarmNotesProgram) ? command.replace(/^node -e /, `node -r '${preload}' -e `) : command, options));
+          let handoffError: unknown;
+          try { await boat.prepare({ warm: true, reuseRunId: chatA.runId }).catch(error => { handoffError = error; }); }
+          finally { shell.mockRestore(); }
+          expect(handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+          expect((handoffError as Error).message).toBe("Warm agent directory note refresh failed");
+          expect(await fs.readFile(path.join(chatA.executionRoot, f), "utf8")).toBe("AGENT RECREATED\n");
+          // After the refusal, A's held fd writes into the original inode.
+          await handle.write("LATE-FD\n");
+          await handle.sync();
+          expect(await textsContaining(chatA.executionRoot, "LATE-FD")).toHaveLength(1);
+          expect((await copies.collectStopped({ companyId, runId: chatA.runId, target: ownerTarget }))?.state).toBe("saved");
+          const found = await textsContaining(root, "LATE-FD");
+          expect(found.length, `${shape}: held-inode bytes must be collected before cleanup`).toBe(1);
+          expect(found[0]!.startsWith(`${f}.aside-`)).toBe(true);
+          expect(await fs.readFile(path.join(root, found[0]!), "utf8")).toBe("checkpoint baseline\nLATE-FD\n");
+          expect(await fs.readFile(path.join(root, f), "utf8")).toBe("AGENT RECREATED\n");
+          await expect(fs.stat(chatA.executionRoot)).rejects.toMatchObject({ code: "ENOENT" });
+        } finally { await handle.close(); }
+      }, 90_000);
+
+      it.each(["transient", "persistent"] as const)("JUDGE retirement-failed-surface (%s): a failed surfacing fails CLOSED; retained bytes are never released unsurfaced", async shape => {
+        await paulBundle();
+        const f = "memory/held-surface.md";
+        await fs.writeFile(path.join(root, f), "checkpoint baseline\n");
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        const handle = await fs.open(path.join(chatA.executionRoot, f), "a");
+        try {
+          await boat.siblingSavesRemote(f, "sibling F'\n");
+          const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+          const ownerTarget = { ...boat.executionTarget };
+          expect(turn2.executionRoot).toBe(chatA.executionRoot);
+          expect(await copies.get(companyId, turn2.runId)).toMatchObject({ receipt: { notesAside: true } });
+          await handle.write("LATE-FD\n");
+          await handle.sync();
+          const asideRoot = path.join(turn2.executionRoot, ".paperclip-runtime", "notes-aside");
+          const [epoch] = await fs.readdir(asideRoot);
+          expect(await fs.readFile(path.join(asideRoot, epoch!, "0"), "utf8")).toBe("checkpoint baseline\nLATE-FD\n");
+          let failures = 0;
+          const actualShell = executionTargetTools.runAdapterExecutionTargetShellCommand;
+          const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand").mockImplementation((runId, t, command, options) => {
+            if (command.endsWith(" surface") && (shape === "persistent" || failures === 0)) {
+              failures++;
+              return Promise.resolve({ exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "JUDGE injected surface error" } as never);
+            }
+            return actualShell(runId, t, command, options);
+          });
+          let stoppedRow: Awaited<ReturnType<typeof copies.collectStopped>>;
+          try { stoppedRow = await copies.collectStopped({ companyId, runId: turn2.runId, target: ownerTarget }); }
+          finally { shell.mockRestore(); }
+          if (shape === "persistent") {
+            // Retried, then CLOSED: no checkpoint cleanup and no release; one true instruction.
+            expect(failures).toBe(3);
+            expect(stoppedRow).toMatchObject({ state: "pending_collection", errorCode: "AGENT_FILES_ASIDE_UNSURFACED" });
+            expect(stoppedRow?.errorMessage).toContain(`copy ${path.posix.join(turn2.executionRoot, ".paperclip-runtime", "notes-aside")} from the sandbox`);
+            expect(stoppedRow?.nextAttemptAt).toBeInstanceOf(Date);
+            expect(await fs.readFile(path.join(asideRoot, epoch!, "0"), "utf8")).toBe("checkpoint baseline\nLATE-FD\n");
+            expect(await textsContaining(root, "LATE-FD")).toEqual([]);
+            // The retry (the sweep works again) surfaces and collects, then releases.
+            stoppedRow = await copies.collectStopped({ companyId, runId: turn2.runId, target: ownerTarget });
+          } else expect(failures).toBe(1);
+          expect(stoppedRow?.state).toBe("saved");
+          const found = await textsContaining(root, "LATE-FD");
+          expect(found, `${shape}: held-inode bytes must be collected before cleanup`).toEqual([`${f}.aside-${epoch}`]);
+          expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
+          await expect(fs.stat(turn2.executionRoot)).rejects.toMatchObject({ code: "ENOENT" });
+        } finally { await handle.close(); }
+      }, 90_000);
+
+      it("JUDGE modeRace: a concurrent mode change during delivery is compared like content and refused; the agent's mode is kept", async () => {
+        const f = "memory/mode-race.md";
+        const result = await raceDuringDelivery({ baseline: { [f]: "checkpoint baseline\n" },
+          sibling: boat => boat.siblingSavesRemote(f, "sibling F'\n"), race: async warm => fs.chmod(path.join(warm, f), 0o711) });
+        expect(result.raced).toBe(true);
+        expect(result.applies).toBe(1);
+        expect(result.handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        expect((result.handoffError as Error).message).toBe("Warm agent directory note refresh failed");
+        const live = await fs.stat(path.join(result.chatA.executionRoot, f));
+        expect({ mode: live.mode & 0o777, bytes: await fs.readFile(path.join(result.chatA.executionRoot, f), "utf8") })
+          .toEqual({ mode: 0o711, bytes: "checkpoint baseline\n" });
+        expect((await copies.collectStopped({ companyId, runId: result.chatA.runId, target: result.boat.executionTarget }))?.state).toBe("saved");
+      }, 60_000);
+
+      it("JUDGE modeRace (aside compare): a mode change on the retained copy after the swap is surfaced, not removed as unchanged", async () => {
+        await paulBundle();
+        const f = "memory/mode-aside.md";
+        await fs.writeFile(path.join(root, f), "checkpoint baseline\n");
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        const handle = await fs.open(path.join(chatA.executionRoot, f), "r");
+        try {
+          await boat.siblingSavesRemote(f, "sibling F'\n");
+          const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+          await handle.chmod(0o711);
+          const asideRoot = path.join(turn2.executionRoot, ".paperclip-runtime", "notes-aside");
+          const [epoch] = await fs.readdir(asideRoot);
+          expect(await copies.checkpointWarm({ companyId, runId: turn2.runId, target: boat.executionTarget }))
+            .toMatchObject({ state: "warm_saved", receipt: { checkpointState: "saved", notesAside: false } });
+          expect(await fs.readFile(path.join(root, `${f}.aside-${epoch}`), "utf8")).toBe("checkpoint baseline\n");
+          await copies.collectStopped({ companyId, runId: turn2.runId, target: boat.executionTarget });
+        } finally { await handle.close(); }
+      }, 60_000);
+
+      it("JUDGE program-probes modeRace: the real delivery program refuses a chmod that lands before the move-aside", async () => {
+        const boat = await sandbox();
+        const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+        const fixture = async (name: string) => {
+          const warmRoot = path.join(boat.executionTarget.remoteCwd, name), staging = path.join(warmRoot, ".paperclip-runtime", "notes-x");
+          const source = path.join(staging, "files"), note = "memory/f.md";
+          await fs.mkdir(path.join(warmRoot, "memory"), { recursive: true });
+          await fs.mkdir(path.join(source, "memory"), { recursive: true });
+          await fs.writeFile(path.join(warmRoot, note), "C\n");
+          await fs.chmod(path.join(warmRoot, note), 0o600);
+          await fs.writeFile(path.join(source, note), "B\n");
+          const plan = { root: warmRoot, source, aside: path.join(staging, "aside"), remove: [], dirs: [],
+            files: [[note, 0o600, { "": `${sha("C\n")}:600` }, sha("B\n")]] };
+          return { warmRoot, note, plan };
+        };
+        // Control: the same plan without the race delivers.
+        const control = await fixture("control");
+        await execFile(process.execPath, ["-e", applyWarmNotesProgram, JSON.stringify(control.plan)]);
+        expect(await fs.readFile(path.join(control.warmRoot, control.note), "utf8")).toBe("B\n");
+        // The judge's preload: chmod 0600 -> 0711 immediately before the move-aside rename.
+        const raced = await fixture("raced");
+        const preload = path.join(boat.executionTarget.remoteCwd, "chmod-race.cjs");
+        await fs.writeFile(preload, `const fs=require('node:fs');const rename=fs.renameSync;let once=false;fs.renameSync=(a,b)=>{if(!once){once=true;fs.chmodSync(a,0o711);}return rename(a,b);};`);
+        const applied = await execFile(process.execPath, ["-r", preload, "-e", applyWarmNotesProgram, JSON.stringify(raced.plan)])
+          .then(() => ({ code: 0, stderr: "" }), error => error as { code: number; stderr: string });
+        expect(applied.code).not.toBe(0);
+        expect(applied.stderr).toContain("warm note changed during delivery");
+        const live = await fs.stat(path.join(raced.warmRoot, raced.note));
+        expect({ mode: live.mode & 0o777, bytes: await fs.readFile(path.join(raced.warmRoot, raced.note), "utf8") }).toEqual({ mode: 0o711, bytes: "C\n" });
       }, 30_000);
 
       it("REMOTE sandbox never-OK: chat A's unsynced write survives a sibling note (no refresh over a dirty tree)", async () => {
