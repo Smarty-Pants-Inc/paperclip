@@ -38,7 +38,8 @@ function fakeBoat(script: { commands?: Reply[]; files?: Reply[]; resume?: Reply[
       state = "ready";
       return reply({ status: 202, body: { sandbox: { id, state: "provisioned" } } });
     }
-    if (method === "GET" && route === `/sandboxes/${id}`) return reply(ok({ sandbox: { id, state, expiresAt: "2030-01-01T00:00:00Z" } }));
+    if (method === "GET" && route === `/sandboxes/${id}`) return reply(ok({ sandbox: { id, state, expiresAt: "2030-01-01T00:00:00Z", ...(state === "archived" ? { stop: { id: "stop", status: "completed" } } : {}) } }));
+    if (method === "POST" && route === `/sandboxes/${id}/stop`) { state = "archived"; return reply(ok({ operation: { id: "stop" } })); }
     if (method === "POST" && route === `/sandboxes/${id}/commands`) return reply(queues.commands.shift() ?? ok({ exitCode: 0, stdout: "ran", stderr: "", timedOut: false }));
     if (method === "PUT" && route === `/sandboxes/${id}/files`) return reply(queues.files.shift() ?? ok({ ok: true }));
     if (method === "DELETE" && route === `/sandboxes/${id}/files`) return reply(ok({ ok: true }));
@@ -160,6 +161,17 @@ describe("#20974 (b) documented 409 handling inside the call's bounded budget", 
     expect(stale).toMatchObject({ status: 409, boatCode: "machine_not_running" });
     expect(boat.count("POST", "/resume")).toBe(1);
     expect(boat.count("POST", "/commands")).toBe(1);
+  });
+  it("409-B after OUR stop of the box, nothing wakes it: the call is refused before any Boat request", async () => {
+    // The lease gate refuses the call; the stop also forgets our resume (defense in depth).
+    const boat = fakeBoat({ commands: [conflict("machine_not_running", { state: "archived", retryable: false })] });
+    await resume();
+    await plugin.definition.onEnvironmentStopLease!({ ...scope, providerLeaseId: id } as any);
+    expect(boat.count("POST", "/stop")).toBe(1);
+    const error = await execute().catch(e => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(boat.count("POST", "/resume")).toBe(1);
+    expect(boat.count("POST", "/commands")).toBe(0);
   });
   it("409-B sandbox_stopping on resume with Retry-After waits that long, then runs the same resume again", async () => {
     vi.useFakeTimers();
