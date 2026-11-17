@@ -43,6 +43,15 @@ export const AGENT_FILES_SAVE_PENDING_INSTRUCTION = "Agent-file changes are not 
 export function agentFileSaveHeld(row: Pick<Copy, "state" | "receipt"> | null | undefined): boolean {
   return Boolean(row && row.receipt?.schema === AGENT_FILES_CONTRACT && row.receipt?.savePending != null && !completed.has(row.state));
 }
+/** Hold code for retained note-delivery aside copies that could not be surfaced. */
+export const AGENT_FILES_ASIDE_UNSURFACED = "AGENT_FILES_ASIDE_UNSURFACED";
+/** The one operator instruction for a held stopped copy, keyed on the hold's
+ * own code (receipt.savePending.code), not on the row's last error. */
+export function agentFileHoldInstruction(row: Pick<Copy, "receipt" | "executionRoot" | "location"> | null | undefined): string {
+  if ((row?.receipt?.savePending as { code?: unknown } | undefined)?.code !== AGENT_FILES_ASIDE_UNSURFACED) return AGENT_FILES_SAVE_PENDING_INSTRUCTION;
+  const asideRoot = path.posix.join(row!.executionRoot, ".paperclip-runtime", "notes-aside");
+  return `Agent note copies retained during note delivery could not be checked, so this agent directory was not released. To keep them, copy ${asideRoot} from the sandbox (${row!.location}) into the agent's folder.`;
+}
 /** Cleanup authority. An unavailable receipt settles only when no save is held:
  * preparation failed before provider use, or exact destruction was proven. */
 function settled(row: Copy): boolean {

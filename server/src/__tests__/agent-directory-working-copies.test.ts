@@ -35,7 +35,7 @@ import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createReusableLeaseHandoff } from "../services/environment-lease-handoff.js";
-import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService, agentFileSaveHeld, applyWarmNotesProgram } from "../services/agent-directory-working-copies.js";
+import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService, agentFileHoldInstruction, agentFileSaveHeld, applyWarmNotesProgram } from "../services/agent-directory-working-copies.js";
 import { agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim } from "../services/agent-file-save-hold.js";
 import * as checkpointsModule from "../services/agent-file-checkpoints.js";
 import { collectStoppedInstructionCopyWithRetries } from "../services/agent-instruction-working-copies.js";
@@ -1133,6 +1133,114 @@ describe("persistent agent directories", () => {
           expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
           await expect(fs.stat(turn2.executionRoot)).rejects.toMatchObject({ code: "ENOENT" });
         } finally { await handle.close(); }
+      }, 90_000);
+
+      // A stopped copy whose aside surfacing failed: the shared fixture for the
+      // unsurfaced-hold tests below. failFirstCapture first fails the stopped
+      // save itself (a real held save), so the next collection's verified save
+      // has to end that earlier hold before the unsurfaced retain is written.
+      async function unsurfacedStoppedCopy(f: string, options: { failFirstCapture?: boolean } = {}) {
+        await paulBundle();
+        await fs.writeFile(path.join(root, f), "checkpoint baseline\n");
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        const handle = await fs.open(path.join(chatA.executionRoot, f), "a");
+        onTestFinished(() => handle.close().catch(() => undefined));
+        await boat.siblingSavesRemote(f, "sibling F'\n");
+        const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+        const ownerTarget = { ...boat.executionTarget };
+        expect(await copies.get(companyId, turn2.runId)).toMatchObject({ receipt: { notesAside: true } });
+        await handle.write("LATE-FD\n");
+        await handle.sync();
+        const asideRoot = path.join(turn2.executionRoot, ".paperclip-runtime", "notes-aside");
+        const [epoch] = await fs.readdir(asideRoot);
+        const asideBytes = () => fs.readFile(path.join(asideRoot, epoch!, "0"), "utf8").catch(error => `MISSING:${error.code}`);
+        expect(await asideBytes()).toBe("checkpoint baseline\nLATE-FD\n");
+        let earlier: Awaited<ReturnType<typeof copies.collectStopped>> = null;
+        if (options.failFirstCapture) {
+          const capture = vi.spyOn(checkpointsModule, "captureAgentFileCheckpoint").mockRejectedValue(new Error("injected stopped capture failure (EIO)"));
+          try { earlier = await copies.collectStopped({ companyId, runId: turn2.runId, target: ownerTarget }); }
+          finally { capture.mockRestore(); }
+          expect(earlier).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_FAILED", receipt: { savePending: { code: "AGENT_FILES_SAVE_FAILED", failures: 1 } } });
+        }
+        const actualShell = executionTargetTools.runAdapterExecutionTargetShellCommand;
+        const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand").mockImplementation((runId, t, command, opts) =>
+          command.endsWith(" surface") ? Promise.resolve({ exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "injected surface error" } as never)
+            : actualShell(runId, t, command, opts));
+        let stoppedRow: Awaited<ReturnType<typeof copies.collectStopped>>;
+        try { stoppedRow = await copies.collectStopped({ companyId, runId: turn2.runId, target: ownerTarget }); }
+        finally { shell.mockRestore(); }
+        expect(stoppedRow).toMatchObject({ state: "pending_collection", errorCode: "AGENT_FILES_ASIDE_UNSURFACED" });
+        return { boat, turn2, ownerTarget, asideRoot, epoch: epoch!, asideBytes, stoppedRow: stoppedRow!, earlier };
+      }
+
+      it("NEVER-OK unsurfaced hold: lease destroy and expiry never destroy the sandbox holding unsurfaced aside copies (same savePending hold + F2 claim)", async () => {
+        const f = "memory/held-destroy.md";
+        const fx = await unsurfacedStoppedCopy(f);
+        // The bound lease becomes a real plugin sandbox lease, as on Daytona.
+        const leaseId = (fx.stoppedRow.receipt?.cleanup as { leaseId?: string } | undefined)?.leaseId;
+        expect(leaseId).toEqual(expect.any(String));
+        const pluginId = randomUUID(), provider = `judge-boat-${pluginId}`;
+        await db.insert(plugins).values({ id: pluginId, pluginKey: provider, packageName: provider, version: "1.0.0", apiVersion: 1,
+          categories: ["automation"], status: "ready", manifestJson: { id: provider, apiVersion: 1, version: "1.0.0", displayName: "Judge Boat", description: "Controlled judge provider", author: "Judge", categories: ["automation"], capabilities: ["environment.drivers.register"], entrypoints: { worker: "dist/worker.js" }, environmentDrivers: [{ driverKey: provider, kind: "sandbox_provider", displayName: "Judge Boat", supportsReusableLeases: true, configSchema: { type: "object" } }] } } as any);
+        await db.update(environments).set({ config: { provider, reuseLease: true } }).where(eq(environments.id, fx.boat.executionTarget.environmentId));
+        await db.update(environmentLeases).set({ provider, providerLeaseId: `held-${leaseId}`, leasePolicy: "reuse_by_environment", status: "released",
+          metadata: { driver: "sandbox", sandboxProviderPlugin: true, pluginId, provider, reuseLease: true, remoteCwd: fx.boat.executionTarget.remoteCwd } })
+          .where(eq(environmentLeases.id, leaseId!));
+        const call = vi.fn(async (_plugin: string, method: string, input: any) => {
+          if (method !== "environmentDestroyLease") throw new Error(`Unexpected ${method}`);
+          await fs.rm(fx.asideRoot, { recursive: true, force: true }); // the sandbox (and its aside copies) is gone
+          return { providerLeaseId: input.providerLeaseId, state: "destroyed" };
+        });
+        const runtime = environmentRuntimeService(db, { pluginWorkerManager: { isRunning: () => true, call,
+          getWorker: () => ({ supportedMethods: ["environmentDestroyLease"] }) } as any });
+        const envs = environmentService(db);
+        const environment = (await envs.getById(fx.boat.executionTarget.environmentId))!;
+        const lease = async () => (await envs.getLeaseById(leaseId!))!;
+        // Expiry and teardown read the hold; destroy takes the F2 claim.
+        const heldForExpiry = await agentFileSaveHeldOnLease(db, await lease());
+        await runtime.destroyRunLease({ environment, lease: await lease() });
+        const evidence = { savePending: fx.stoppedRow.receipt?.savePending ?? null, heldForExpiry,
+          providerCalls: call.mock.calls.map(c => c[1]), aside: await fx.asideBytes() };
+        console.log("UNSURFACED_HOLD_DESTROY", JSON.stringify(evidence));
+        expect.soft(call).not.toHaveBeenCalled();
+        expect.soft(evidence.aside).toBe("checkpoint baseline\nLATE-FD\n");
+        expect(heldForExpiry).toBe(true);
+        expect(fx.stoppedRow.receipt?.savePending).toMatchObject({ code: "AGENT_FILES_ASIDE_UNSURFACED", failures: 1 });
+        expect(agentFileSaveHeld(fx.stoppedRow)).toBe(true);
+        expect(await claimLeaseForDestroyUnlessHeld(db, await lease())).toBeNull();
+        // The operator sees the aside instruction, never the failed-save one.
+        expect(agentFileHoldInstruction(fx.stoppedRow)).toContain(`copy ${path.posix.join(fx.turn2.executionRoot, ".paperclip-runtime", "notes-aside")} from the sandbox`);
+        // The retry surfaces and saves; that verified save ends the hold.
+        const retried = await copies.collectStopped({ companyId, runId: fx.turn2.runId, target: fx.ownerTarget });
+        expect(retried?.state).toBe("saved");
+        expect(retried?.receipt?.savePending).toBeUndefined();
+        expect(await agentFileSaveHeldOnLease(db, await lease())).toBe(false);
+        expect(await textsContaining(root, "LATE-FD")).toEqual([`${f}.aside-${fx.epoch}`]);
+        expect(call).not.toHaveBeenCalled();
+      }, 90_000);
+
+      it("a verified warm stopped save ends an earlier failed save's hold, so a later unsurfaced retain is its own hold, not a failed save", async () => {
+        const f = "memory/stale-hold.md";
+        const before = Date.now();
+        const fx = await unsurfacedStoppedCopy(f, { failFirstCapture: true });
+        const earlierSince = (fx.earlier?.receipt?.savePending as { since: string }).since;
+        const pending = fx.stoppedRow.receipt?.savePending as { code?: string; failures?: number; since?: string; reason?: string; mirrorHash?: string };
+        // Not the earlier failed save carried forward: a fresh aside hold.
+        expect(pending).toMatchObject({ code: "AGENT_FILES_ASIDE_UNSURFACED", failures: 1 });
+        expect(pending.reason).not.toContain("injected stopped capture failure");
+        expect(pending.mirrorHash).toBeUndefined();
+        expect(new Date(pending.since!).getTime()).toBeGreaterThan(new Date(earlierSince).getTime());
+        expect(new Date(earlierSince).getTime()).toBeGreaterThanOrEqual(before - 1000);
+        expect(fx.stoppedRow.errorMessage).toBe(agentFileHoldInstruction(fx.stoppedRow));
+        expect(agentFileHoldInstruction(fx.stoppedRow)).not.toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
+        // The save itself verified: the earlier capture failure's bytes are saved.
+        expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
+        const retried = await copies.collectStopped({ companyId, runId: fx.turn2.runId, target: fx.ownerTarget });
+        expect(retried).toMatchObject({ state: "saved", errorCode: null });
+        expect(retried?.receipt?.savePending).toBeUndefined();
+        expect(await textsContaining(root, "LATE-FD")).toEqual([`${f}.aside-${fx.epoch}`]);
       }, 90_000);
 
       it("JUDGE modeRace: a concurrent mode change during delivery is compared like content and refused; the agent's mode is kept", async () => {
