@@ -301,6 +301,14 @@ describe("a never-connected run.prepare whose real failed open queued its cleanu
       return saved;
     };
     const mutations: Array<[string, (records: Records) => void]> = [
+      ["delivered cleanup command", records => {
+        const command = [...records].filter(([key]) => key.startsWith("command:")).map(([,value]) => JSON.parse(value)).find(command => command.type === "runner.suspend");
+        editJson(records, "header", header => { header.state.commandDeliveryCounts[command.commandId] = 1; });
+      }],
+      ["non-empty cleanup payload", records => {
+        const key = [...records.keys()].find(candidate => candidate.startsWith("command:") && JSON.parse(records.get(candidate)!).type === "runner.suspend")!;
+        editJson(records, key, command => { command.payload = { reason: "judge nonempty guard" }; });
+      }],
       ["authenticated connection", records => editJson(records, "header", header => { header.state.connectionCount = 1; })],
       ["used ticket", records => editJson(records, "header", header => {
         for (const ticket of Object.values<Record<string, unknown>>(header.state.tickets)) ticket.usedAt = new Date().toISOString();
