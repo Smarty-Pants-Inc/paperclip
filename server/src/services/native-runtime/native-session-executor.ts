@@ -1131,7 +1131,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
   companyId: string; agentId: string; previousRunId: string; runId: string; target?: AdapterExecutionTarget | null;
   observabilityCompatibilityKey?: string;
   canReuse: () => Promise<boolean>;
-}): Promise<{ reuseRunId: string; runnerStateDirectory?: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
+}): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
     if (await forgetUnretiredOwnerOnOtherSandbox(id, entry, input.target)) return null;
@@ -1159,13 +1159,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
       }
     }
     if (!reusable) return null;
-    // The parked sandbox runner's own state directory (the same layout that
-    // readStoppedRemotePiSource reads): its process-lineage journal is the
-    // session's process table for note-delivery quiescence.
-    const remoteCwd = entry.sandboxRunner?.remoteCwd ?? (input.target?.kind === "remote" ? input.target.remoteCwd : undefined);
-    const runnerStateDirectory = remoteCwd ? posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner", "sessions",
-      createHash("sha256").update(entry.normalizedSessionId).digest("hex"), "runner") : undefined;
-    return { reuseRunId: input.previousRunId, runnerStateDirectory, adopt: (root, collectStopped) => {
+    return { reuseRunId: input.previousRunId, adopt: (root, collectStopped) => {
       entry.instructionCopy = { runId: input.runId, root, targetIdentity: instructionTargetIdentity(input.target), collectStopped };
     }, release: async () => {
       if (warmNativeSessions.get(id) === entry && entry.preparingRunId === input.runId) {
