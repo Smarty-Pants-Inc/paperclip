@@ -10,7 +10,7 @@ import type { RunForIssue } from "../api/activity";
 /** A stale Send/Interrupt is a neutral queue update, not a failed delivery. */
 export class QueuedMessagesChangedError extends Error {
   constructor(readonly queue: IssueQueuedCommentQueue) {
-    super(queue.entries.length ? "The queue changed. Review it and try again." : "Nothing is waiting.");
+    super(queue.entries.length ? "The queued messages changed. Refresh and try again." : "Nothing is waiting.");
     this.name = "QueuedMessagesChangedError";
   }
 }

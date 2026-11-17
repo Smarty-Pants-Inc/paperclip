@@ -586,7 +586,7 @@ describe("TaskChatQueuedMessages", () => {
     const onInterrupt = vi.fn().mockRejectedValue(new QueuedMessagesChangedError(latest));
     render({ queue: { ...queue, targetRunId: null }, onInterrupt });
     await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-interrupt-comment-1"]')!.click(); });
-    expect(container.textContent).toContain(empty ? "Nothing is waiting." : "The queue changed. Review it and try again.");
+    expect(container.textContent).toContain(empty ? "Nothing is waiting." : "The queued messages changed. Refresh and try again.");
     expect(container.textContent).not.toContain("Couldn’t");
     expect(container.querySelector('[data-testid="task-chat-queued-message-comment-1"]')).toBeNull();
     expect(container.querySelector('[role="status"].text-destructive')).toBeNull();

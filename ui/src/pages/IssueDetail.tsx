@@ -5171,7 +5171,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         assertCurrentAccount();
         queryClient.setQueryData(queryKeys.issues.detail(writableIssueId), updated);
       }
-      return issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid(), deliveryIntent);
+      const commentArgs = [writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid()] as const;
+      return deliveryIntent === undefined
+        ? issuesApi.addComment(...commentArgs)
+        : issuesApi.addComment(...commentArgs, deliveryIntent);
     },
     onMutate: async ({ body, reopen, interrupt }) => {
       // Start cache cancellation immediately but do not put it in front of the
