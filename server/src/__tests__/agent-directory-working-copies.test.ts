@@ -1235,10 +1235,12 @@ describe("persistent agent directories", () => {
         expect(new Date(earlierSince).getTime()).toBeGreaterThanOrEqual(before - 1000);
         expect(fx.stoppedRow.errorMessage).toBe(agentFileHoldInstruction(fx.stoppedRow));
         expect(agentFileHoldInstruction(fx.stoppedRow)).not.toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
-        // The save itself verified: the earlier capture failure's bytes are saved.
+        // The save itself verified (the copy surfaced by the failed attempt is
+        // already saved); the sibling's version stays at the path.
         expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
+        expect(await textsContaining(root, "LATE-FD")).toEqual([`${f}.aside-${fx.epoch}`]);
         const retried = await copies.collectStopped({ companyId, runId: fx.turn2.runId, target: fx.ownerTarget });
-        expect(retried).toMatchObject({ state: "saved", errorCode: null });
+        expect(retried).toMatchObject({ state: "unchanged", errorCode: null });
         expect(retried?.receipt?.savePending).toBeUndefined();
         expect(await textsContaining(root, "LATE-FD")).toEqual([`${f}.aside-${fx.epoch}`]);
       }, 90_000);
@@ -2777,25 +2779,43 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(root, "memory/x.md"), "utf8")).toBe("B");
     expect(await fs.readFile(path.join(root, copyPath), "utf8")).toBe("A");
   });
-  it("refreshes a still-warm conflicted tree and its baseline before same-root reuse, with a next-turn notice", async () => {
+  // SUPERSEDED-BY-PART2 (was same-note's "refreshes a still-warm conflicted tree
+  // and its baseline before same-root reuse"): a LOCAL root never takes a
+  // sibling's notes in place. The conflict copy is still made in canonical; the
+  // live tree is left as the run wrote it; the session retires and the next
+  // turn restores fresh (sibling's version + conflict copy) with the notice.
+  it("a still-warm LOCAL conflicted tree is never refreshed in place: the conflict copy is made, the session retires and restores fresh, with a next-turn notice", async () => {
     await fs.mkdir(path.join(root, "memory"));
     await fs.writeFile(path.join(root, "memory/x.md"), "C");
     const first = await run({ warm: true });
     await fs.writeFile(path.join(first.localRoot, "memory/x.md"), "A");
     await fs.writeFile(path.join(root, "memory/x.md"), "B");
+    const liveFiles = async () => (await fs.readdir(first.localRoot, { recursive: true })).map(String).sort();
+    const liveBefore = await liveFiles();
+    const cp = vi.spyOn(fs, "cp");
     const saved = (await copies.checkpointWarm({ companyId, runId: first.runId }))!;
     const [item] = saved.receipt!.conflicts as Array<{ conflictCopy: string }>;
-    expect(await fs.readFile(path.join(first.localRoot, "memory/x.md"), "utf8")).toBe("B");
-    expect(await fs.readFile(path.join(first.localRoot, item!.conflictCopy), "utf8")).toBe("A");
-    expect(saved.receipt?.checkpointManifest).toMatchObject({ entries: expect.arrayContaining([
-      ["memory/x.md", expect.objectContaining({ hash: fileHash(Buffer.from("B")) })],
-    ]) });
-    expect(await copies.canReuseWarm(companyId, agentId, first.runId)).toBe(true);
-    const repeated = (await copies.checkpointWarm({ companyId, runId: first.runId }))!;
-    expect(repeated.receipt?.checkpointState).toBe("unchanged");
-    expect(repeated.receipt?.conflicts).toEqual([]);
-    const next = await run({ warm: true, reuseRunId: first.runId });
-    expect(next.localRoot).toBe(first.localRoot);
+    // The save recorded the conflict: sibling's B kept, the run's A as the named copy.
+    expect(saved).toMatchObject({ state: "warm_saved", errorCode: null });
+    expect(await fs.readFile(path.join(root, "memory/x.md"), "utf8")).toBe("B");
+    expect(await fs.readFile(path.join(root, item!.conflictCopy), "utf8")).toBe("A");
+    // Nothing was written into the live local tree.
+    expect(cp.mock.calls.filter(([, to]) => typeof to === "string" && to.startsWith(`${first.localRoot}/`))).toEqual([]);
+    cp.mockRestore();
+    expect(await liveFiles()).toEqual(liveBefore);
+    expect(await fs.readFile(path.join(first.localRoot, "memory/x.md"), "utf8")).toBe("A");
+    await expect(fs.stat(path.join(first.localRoot, item!.conflictCopy))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await copies.canReuseWarm(companyId, agentId, first.runId)).toBe(false);
+    let refused: unknown;
+    await run({ warm: true, reuseRunId: first.runId }).catch(error => { refused = error; });
+    expect(refused).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+    expect(await fs.readFile(path.join(first.localRoot, "memory/x.md"), "utf8")).toBe("A");
+    // Retire (no change since the save) and restore fresh.
+    expect((await copies.collectStopped({ companyId, runId: first.runId }))?.state).toBe("unchanged");
+    const next = await run({ warm: true });
+    expect(next.localRoot).not.toBe(first.localRoot);
+    expect(await fs.readFile(path.join(next.localRoot, "memory/x.md"), "utf8")).toBe("B");
+    expect(await fs.readFile(path.join(next.localRoot, item!.conflictCopy), "utf8")).toBe("A");
     const context: Record<string, unknown> = {};
     await heartbeatCopy(next, undefined, { previousRunId: first.runId, context });
     const notice = context.paperclipAgentFileConflictNotice;
@@ -2840,7 +2860,11 @@ describe("persistent agent directories", () => {
     expect(context.paperclipAgentFileConflictNotice).toContain("that version was not kept");
     expect(context.paperclipAgentFileConflictNotice).not.toContain("that version was kept");
   });
-  it("retires instead of overwriting a post-capture edit when refreshing a warm conflict", async () => {
+  // SUPERSEDED-BY-PART2 (was same-note's "retires instead of overwriting a
+  // post-capture edit when refreshing a warm conflict"): with no in-place
+  // refresh on a LOCAL root there is nothing to overwrite. The post-capture
+  // edit stays in the live tree and is saved by the retirement collection.
+  it("keeps a post-capture edit after a LOCAL warm conflict save (no in-place refresh) and saves it at retirement", async () => {
     await fs.mkdir(path.join(root, "memory"));
     await fs.writeFile(path.join(root, "memory/x.md"), "C");
     const first = await run({ warm: true });
@@ -2860,16 +2884,20 @@ describe("persistent agent directories", () => {
     try {
       copies = agentInstructionWorkingCopyService(db);
       const saved = (await copies.checkpointWarm({ companyId, runId: first.runId }))!;
-      expect(saved).toMatchObject({ state: "warm_saved", errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE" });
-      expect(saved.errorMessage).toContain("conflict save succeeded");
+      expect(saved).toMatchObject({ state: "warm_saved", errorCode: null });
       expect(await copies.canReuseWarm(companyId, agentId, first.runId)).toBe(false);
       expect(await fs.readFile(path.join(first.localRoot, "memory/x.md"), "utf8")).toBe("A2");
       expect(await fs.readFile(path.join(root, "memory/x.md"), "utf8")).toBe("B");
       const files = (await fs.readdir(path.join(root, "memory"))).filter(name => name.includes(".conflict-"));
-      expect(files).toHaveLength(1); // A committed save was not replayed on refresh failure.
+      expect(files).toHaveLength(1); // One committed save, never replayed.
       expect(await fs.readFile(path.join(root, "memory", files[0]!), "utf8")).toBe("A");
     } finally { factory.mockRestore(); copies = agentInstructionWorkingCopyService(db); }
-    await copies.collectStopped({ companyId, runId: first.runId });
+    // Retirement saves the post-capture edit: the sibling's B stays, A2 is its own conflict copy.
+    expect((await copies.collectStopped({ companyId, runId: first.runId }))?.state).toBe("saved");
+    expect(await fs.readFile(path.join(root, "memory/x.md"), "utf8")).toBe("B");
+    const copiesAfter = (await fs.readdir(path.join(root, "memory"))).filter(name => name.includes(".conflict-"));
+    const bodies = await Promise.all(copiesAfter.map(name => fs.readFile(path.join(root, "memory", name), "utf8")));
+    expect(bodies.sort()).toEqual(["A", "A2"]);
   });
   it("adds no next-turn notice after an ordinary save", async () => {
     const first = await run();

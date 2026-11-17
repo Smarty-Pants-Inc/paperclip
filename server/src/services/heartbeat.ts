@@ -1,5 +1,5 @@
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
-import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, agentFileSaveHeld } from "./agent-directory-working-copies.js";
+import { agentFileHoldInstruction, agentFileSaveHeld } from "./agent-directory-working-copies.js";
 import { registerCompletedTurnCleanupResumer } from "./native-runtime/completed-turn-cleanup-hold-settlement.js";
 import { endStorageOutageWaitOn, reportStorageOutageWaitsTo, runInOwnStorageScope } from "../storage/storage-unavailable.js";
 import { createStorageWaitNotice } from "./heartbeat/storage-wait-notice.js";
@@ -4192,7 +4192,8 @@ export function heartbeatService(
           if (agentFileSaveHeld(heldInstructions)) {
             providerResourceDispositionForRun = "stop_and_retain";
             await appendRunEvent(run, { eventType: "instruction_save", stream: "system", level: "warn",
-              message: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
+              // The hold's own instruction: a failed save, or unsurfaced aside copies.
+              message: agentFileHoldInstruction(heldInstructions),
               payload: { state: "pending_collection", savePending: true, code: heldInstructions?.errorCode ?? null } });
           }
           await withAdapterExecutionPhase(executionPhaseContext, "lease_release", () => releaseEnvironmentLeasesForRun({

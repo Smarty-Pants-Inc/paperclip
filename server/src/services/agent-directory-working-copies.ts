@@ -7,7 +7,7 @@ import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { agents, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
-import { withDirectoryMergeLock, mergeDirectoryWithBaseline, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation, type DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation, type DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { createHash, randomUUID } from "node:crypto";
 import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory, type AgentFileConflict } from "./agent-file-store.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
@@ -752,16 +752,20 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
   }
   /** Fail CLOSED: retained copies that could not be surfaced (or are still
-   * unsurfaced after the capture) block the stopped copy's release. The remote
-   * root stays; the recovery sweep retries; the operator gets one instruction. */
+   * unsurfaced after the capture) block the stopped copy's release. It is the
+   * SAME durable hold a failed save writes (holdUnsaved: receipt.savePending,
+   * written under the destroy-claim lease row lock), so lease expiry, teardown
+   * and destroy (agentFileSaveHeldOnLease / claimLeaseForDestroyUnlessHeld)
+   * never destroy the sandbox holding the aside copies. The state stays
+   * pending_collection; the recovery sweep retries; the operator gets the one
+   * aside instruction (agentFileHoldInstruction). Only a later verified save
+   * with the copies surfaced and cleaned ends the hold. */
   async function retainUnsurfaced(row: Copy): Promise<Copy> {
     const asideRoot = path.posix.join(row.executionRoot, ".paperclip-runtime", "notes-aside");
-    const instruction = `To keep them, copy ${asideRoot} from the sandbox (${row.location}) into the agent's folder.`;
     logger.error({ companyId: row.companyId, agentId: row.agentId, runId: row.runId, asideRoot },
-      `Retained agent note copies could not be surfaced; the remote agent directory is kept and not released. ${instruction}`);
-    return patch(row, { state: "pending_collection", processStoppedAt: row.processStoppedAt ?? new Date(), errorCode: "AGENT_FILES_ASIDE_UNSURFACED",
-      errorMessage: `Agent note copies retained during note delivery could not be checked, so this agent directory was not released. ${instruction}`,
-      nextAttemptAt: new Date(Date.now() + 30_000) });
+      `Retained agent note copies could not be surfaced; the remote agent directory is kept and not released. To keep them, copy ${asideRoot} from the sandbox (${row.location}) into the agent's folder.`);
+    return holdUnsaved(row, AGENT_FILES_ASIDE_UNSURFACED, "Retained note-delivery aside copies could not be surfaced",
+      (row.receipt?.storageWarning as string | null | undefined) ?? null, undefined, "pending_collection");
   }
   async function checkpoint(row: Copy, target?: AdapterExecutionTarget | null, stopped = false): Promise<Copy> {
     if (!await owns(row) || row.state === "superseded") return row;
@@ -795,7 +799,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
-          receipt: { ...row.receipt, baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
+          // A verified save ends any earlier failed save's hold (both stopped
+          // paths strip it; collectStopped's cold path does the same).
+          receipt: { ...withoutSaveHold(row.receipt), baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
             checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning, conflicts,
             pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
         if (aside && !unsurfaced) {
@@ -806,28 +812,15 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           else unsurfaced = true;
         }
         if (stopped && unsurfaced) return retainUnsurfaced(row);
-        if (!stopped && row.location === "local" && conflicts.length && conflicts.every(item => item.currentKept !== false)) {
-          // A successful save is already recorded above. Refresh only at this
-          // idle turn boundary, under the canonical writer lock, and reject any
-          // post-capture edit instead of overwriting it. A failed refresh retires
-          // the session; never replay a committed save just to retry a refresh.
-          try {
-            row = await store.locked(row.companyId, row.agentId, actor(row), false, async (_tx, _agent, canonical) => {
-              const current = (await inspectAgentDirectory(canonical, false)).snapshot;
-              await mergeDirectoryWithBaseline({ sourceDir: canonical, targetDir: row.localRoot, baseline: snapshot,
-                conflictPolicy: "reject", snapshots: { source: current } });
-              return patch(row, { baseHash: directorySnapshotSha256(current), receipt: { ...row.receipt,
-                baseline: serializeDirectorySnapshot(current), checkpointManifest: checkpointBaseline(current) } });
-            });
-          } catch (error) {
-            logger.warn({ err: error, runId: row.runId }, "Agent file conflict refresh requires retirement");
-            return patch(row, { errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE",
-              errorMessage: "The conflict save succeeded, but the live directory changed before refresh; collect after provider stop.", nextAttemptAt: null });
-          }
-        }
-        // Remote copies are not rewritten through a full-tree upload while the
-        // provider lives. Their canonical/baseline mismatch refuses warm reuse;
-        // stopped collection and fresh preparation restore the kept version.
+        // A same-note conflict leaves the live tree as the run wrote it: the
+        // sibling's version stays canonical and this run's bytes are already
+        // saved as the named conflict copy. Nothing is written into a live tree
+        // here. canReuse decides the next turn: a LOCAL root never takes the
+        // sibling's notes in place (canonical != baseHash, so it retires and
+        // restores fresh, conflict copy included); a REMOTE root takes them
+        // only through refreshWarmNotes at the next idle handoff (notes only,
+        // tree proven unchanged first); a declared-instruction change refuses
+        // warm reuse and the stopped collection + fresh preparation restore it.
         return row;
       } catch (error) {
         failure = error;
@@ -847,15 +840,21 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     return holdUnsaved(row, storageLimit ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED", failure,
       storageLimit ? agentStorageWarning(failure instanceof AgentFileLimitError ? failure.message : "Agent folder exceeds a storage limit") : null);
   }
-  function holdUnsaved(row: Copy, errorCode: string, failure: unknown, storageWarning: string | null, mirrorHash?: string) {
+  /** The one durable stopped-copy hold (receipt.savePending): a failed save
+   * (state unavailable) and unsurfaced aside copies (state pending_collection,
+   * code AGENT_FILES_ASIDE_UNSURFACED) both write it here. */
+  function holdUnsaved(row: Copy, errorCode: string, failure: unknown, storageWarning: string | null, mirrorHash?: string,
+    state: "unavailable" | "pending_collection" = "unavailable") {
     const stoppedAt = row.processStoppedAt ?? new Date();
     const previous = row.receipt?.savePending as { since?: string; failures?: number } | undefined;
     const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
     const reason = failure instanceof HttpError || failure instanceof AgentFileLimitError || failure instanceof Error ? failure.message : String(failure);
-    return patch(row, { state: "unavailable", processStoppedAt: stoppedAt, errorCode, errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
+    const savePending = { since: since.toISOString(), code: errorCode, reason: reason.slice(0, 500),
+      failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}) };
+    return patch(row, { state, processStoppedAt: stoppedAt, errorCode,
+      errorMessage: agentFileHoldInstruction({ ...row, receipt: { ...row.receipt, savePending } }),
       nextAttemptAt: saveRetryAt(since),
-      receipt: { ...row.receipt, storageWarning, savePending: { since: since.toISOString(), code: errorCode, reason: reason.slice(0, 500),
-        failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}) } } },
+      receipt: { ...row.receipt, storageWarning, savePending } },
       // Same lease row lock as every destroy claim; refused once a destroy is claimed.
       agentFileHoldWriteCondition);
   }
