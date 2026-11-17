@@ -1,5 +1,5 @@
 import { isCrossSiteOAuthCallbackNavigation, oauthCallbackInterstitialHtml } from "../lib/oauth-browser-return.js";
-import { aiConnectionRouterPluginKey } from "@paperclipai/shared";
+import { aiConnectionRouterPluginKey, isUuidLike } from "@paperclipai/shared";
 import { aiConnectionRouterService } from "../services/ai-connection-router.js";
 import { composioAppSetupSchema, composioAppsRefreshSchema, composioAppsSyncSchema, composioAppAccountSchema } from "@paperclipai/shared";
 import { aggregatorAppsSyncSchema, aggregatorAppsRefreshSchema, arcadeDiscoverySetupSchema } from "@paperclipai/shared/aggregator-apps";
@@ -63,6 +63,7 @@ import { assertAgentConnectionInstallAccess, connectionManagementService } from 
 import { validate } from "../middleware/validate.js";
 import { getActorInfo, assertBoard, assertBoardOrAgent, assertCompanyAccess, assertInstanceAdmin, getAccessibleResource, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { assertProjectOwnedConnectionDetailsReadable, projectOwnedConnectionReadView, type ProjectOwnedConnectionReader } from "../services/project-owned-connection-guard.js";
 import { accessService, logActivity, toolAccessPolicyService, toolAccessService, vercelConnectIntegrationStatus } from "../services/index.js";
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
 import { authorizationService } from "../services/authorization.js";
@@ -540,6 +541,28 @@ function connectorEnrollmentPrincipal(req: Request): string {
 
   const access = accessService(db);
   const managementGuard = connectionManagementGuard(db, "tool");
+
+  // Shared owned-resource read authorisation (#20717 RFL finding 1): one
+  // decision, project-owned-connection-guard.ts canReadProjectOwnedConnectionDetails.
+  // The collection and GET-by-ID redact an owned row for everyone outside its
+  // team/company owner/board; every other per-connection route refuses them.
+  const ownedConnectionReader = (req: Request): ProjectOwnedConnectionReader =>
+    req.actor.type === "agent" ? { type: "agent", agentId: req.actor.agentId } : { type: "board" };
+  const ownedConnectionReadView = <T extends { id: string; companyId: string; projectId?: string | null; config?: unknown; transportConfig?: unknown; name?: string; status?: string; ownership?: string }>(req: Request, connection: T) =>
+    projectOwnedConnectionReadView(db, connection, ownedConnectionReader(req));
+  router.param("connectionId", async (req, _res, next, connectionId) => {
+    try {
+      if (req.actor?.type !== "agent" || typeof connectionId !== "string" || !isUuidLike(connectionId)) return next();
+      if (req.method === "GET" && req.route?.path === "/tool-connections/:connectionId") return next();
+      const [row] = await db.select({ id: toolConnections.id, companyId: toolConnections.companyId, projectId: toolConnections.projectId,
+        config: toolConnections.config, transportConfig: toolConnections.transportConfig }).from(toolConnections)
+        .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, req.actor.companyId ?? "")));
+      if (row) await assertProjectOwnedConnectionDetailsReadable(db, row, ownedConnectionReader(req));
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
 
   async function assertBoardToolPermission(req: Request, companyId: string, permissionKey: PermissionKey) {
     if (req.actor.type === "agent") {
@@ -1573,7 +1596,8 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const result = await svc.listAppsNeedingAttention(companyId);
-    const apps = await filterConnectionManagementRows(db, req, "connections:read", result.apps, row => ({ connectionId: row.connection.id }));
+    const apps = await Promise.all((await filterConnectionManagementRows(db, req, "connections:read", result.apps, row => ({ connectionId: row.connection.id })))
+      .map(async app => ({ ...app, connection: await ownedConnectionReadView(req, app.connection) })));
     res.json({ ...result, apps, totals: {
       connections: apps.length, health: apps.filter(app => app.healthNeedsAttention).length,
       quarantinedCatalogEntries: apps.reduce((sum, app) => sum + app.quarantinedCatalogEntryCount, 0),
@@ -1721,7 +1745,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
       }, { mutation: false, readContext: connectionRequestContext(req) })));
       visible = visible.filter((_, index) => allowed[index].allowed);
     }
-    res.json({ connections: visible });
+    res.json({ connections: await Promise.all(visible.map(connection => ownedConnectionReadView(req, connection))) });
   });
 
   router.post("/companies/:companyId/tools/connections", managementGuard("connections:configure", "POST /companies/:companyId/tools/connections", { personal: true }), validate(createToolConnectionSchema), async (req, res) => {
@@ -1758,7 +1782,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
       "Tool connection not found",
     );
     if (!connection) return;
-    res.json(connection);
+    res.json(await ownedConnectionReadView(req, connection));
   });
 
   router.post("/tool-connections/:connectionId/railway/ssh", managementGuard("connections:configure", "POST /tool-connections/:connectionId/railway/ssh", { personal: true }), validate(configureRailwaySshSchema), async (req, res) => {

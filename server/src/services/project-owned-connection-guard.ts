@@ -1,7 +1,7 @@
 import { and, eq, sql, type SQL } from "drizzle-orm";
 import { projects, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
 import { forbidden, HttpError } from "../errors.js";
-import { assertProjectConnectionAdmission, assertProjectConnectionRecipients } from "./project-connection-admission.js";
+import { assertProjectConnectionAdmission, assertProjectConnectionRecipients, currentAuthority } from "./project-connection-admission.js";
 import type { DbTransaction } from "./tool-access/types.js";
 
 /**
@@ -128,6 +128,47 @@ export async function filterProjectOwnedConnectionsForAgent<T extends OwnedShape
     kept.push(row);
   }
   return kept;
+}
+
+/**
+ * Shared owned-resource READ authorisation (smarty-dev#20717 RFL finding 1).
+ * A project-owned row's config and secret references are readable ONLY by its
+ * own project's team, the company owner (the board session, or the owner's
+ * current company primary agent, which is the only other agent the writer
+ * lets manage the row) and the board. A broad `tools:manage_connections`
+ * grant, delegation to the owner, or a company install never widens it.
+ * Ordinary company rows are unchanged. An envelope without `project_id` has
+ * no team, so only the board reads its details.
+ */
+export type ProjectOwnedConnectionReader = { type: "board" } | { type: "agent"; agentId: string | null | undefined };
+
+export async function canReadProjectOwnedConnectionDetails(db: Database, connection: OwnedShape & { companyId: string }, reader: ProjectOwnedConnectionReader): Promise<boolean> {
+  if (!isProjectOwnedToolConnection(connection)) return true;
+  if (reader.type === "board") return true;
+  if (!connection.projectId || !reader.agentId) return false;
+  if (await isAgentInOwningProjectTeam(db, { companyId: connection.companyId, projectId: connection.projectId }, reader.agentId)) return true;
+  const authority = await currentAuthority(db, connection.companyId, connection.projectId).catch((error: unknown) => {
+    if (error instanceof HttpError && error.status === 404) return null;
+    throw error;
+  });
+  return Boolean(authority?.primary && authority.primary.id === reader.agentId);
+}
+
+/** What everyone else sees of an owned row: identity, status and ownership only. */
+export function redactedProjectOwnedConnection<T extends OwnedShape & { id: string; companyId: string; name?: string; status?: string; ownership?: string }>(connection: T) {
+  return { id: connection.id, companyId: connection.companyId, projectId: connection.projectId ?? null,
+    name: connection.name, status: connection.status, ownership: connection.ownership, detailsRedacted: true as const };
+}
+
+export async function projectOwnedConnectionReadView<T extends OwnedShape & { id: string; companyId: string; name?: string; status?: string; ownership?: string }>(
+  db: Database, connection: T, reader: ProjectOwnedConnectionReader,
+): Promise<T | ReturnType<typeof redactedProjectOwnedConnection<T>>> {
+  return await canReadProjectOwnedConnectionDetails(db, connection, reader) ? connection : redactedProjectOwnedConnection(connection);
+}
+
+/** Related per-connection reads (grants, installs, catalog, usage, ...) refuse instead of redacting. */
+export async function assertProjectOwnedConnectionDetailsReadable(db: Database, connection: OwnedShape & { id: string; companyId: string }, reader: ProjectOwnedConnectionReader) {
+  if (!await canReadProjectOwnedConnectionDetails(db, connection, reader)) throw projectOwnedConnectionError(connection.id);
 }
 
 /**

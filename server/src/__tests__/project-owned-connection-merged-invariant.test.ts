@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
-  agents, companyMemberships, connectionGrants, createDb, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolPolicies,
+  agents, companyMemberships, connectionGrants, createDb, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolPolicies, userCompanyPreferences,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { projectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
@@ -198,5 +198,114 @@ describe("merged #20717 reader+writer: a project-owned connection is never compa
     const [row] = await db.select().from(toolConnections).where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, f.companyId)));
     const [current] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection.id));
     await expect(resolveGitHubAppCredential(db, row!, current!, false, false, f.outsider.id)).rejects.toMatchObject({ details: { code: OWNED_CODE } });
+  });
+
+  // RFL #20717 N1 (judge stale-admission probes, adopted): full admission is
+  // the only guard that sees a changed primary approval at these two seams.
+  it("N1 token full admission (github-app-credentials.ts S1): a stale primary approval is refused before any key read or provider acquisition", async () => {
+    const { f, connection, grant } = await owned({ strayCompanyReach: false });
+    await db.update(userCompanyPreferences).set({ primaryAgentId: f.leadB.id })
+      .where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
+    await expect(resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id)).rejects.toBeDefined();
+    expect(provider.secret).not.toHaveBeenCalled();
+    expect(provider.acquire).not.toHaveBeenCalled();
+  });
+
+  it("N1 policy full admission (tool-access-policy.ts S4): an own-team installed agent with a stale primary approval gets no allowed decision", async () => {
+    const { f, connection, entry } = await owned({ strayCompanyReach: false });
+    const run = await f.run(f.a, f.leadA.id);
+    await db.update(userCompanyPreferences).set({ primaryAgentId: f.leadB.id })
+      .where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
+    const decided = await toolAccessPolicyService(db).decide({ companyId: f.companyId, actor: { actorType: "agent", actorId: f.leadA.id, agentId: f.leadA.id },
+      runContext: { heartbeatRunId: run.run.id, issueId: run.issue.id },
+      request: { connectionId: connection.id, catalogEntryId: entry.id, toolName: "list_repos", arguments: {} } }).catch((error: unknown) => error);
+    // The seam either returns a denied decision or throws its typed 403; never an allowed decision.
+    if (decided instanceof Error) expect(decided).toMatchObject({ status: 403 });
+    else expect(decided).toMatchObject({ allowed: false });
+  });
+
+  it("N1 policy run match (tool-access-policy.ts S4): A's installed, admitted lead is denied in a run bound to project B", async () => {
+    const { f, connection, entry } = await owned({ strayCompanyReach: false });
+    const otherRun = await f.run(f.b, f.leadA.id);
+    const denied = await toolAccessPolicyService(db).decide({ companyId: f.companyId, actor: { actorType: "agent", actorId: f.leadA.id, agentId: f.leadA.id },
+      runContext: { heartbeatRunId: otherRun.run.id, issueId: otherRun.issue.id },
+      request: { connectionId: connection.id, catalogEntryId: entry.id, toolName: "list_repos", arguments: {} } });
+    expect(denied).toMatchObject({ allowed: false, reasonCode: "deny_run_context_mismatch" });
+  });
+
+  it("N1 policy explicit install (tool-access-policy.ts S4): A's own-team worker in an A run is denied without an explicit agent install, despite a company install", async () => {
+    const { f, connection, entry } = await owned();
+    const run = await f.run(f.a, f.worker.id);
+    const denied = await toolAccessPolicyService(db).decide({ companyId: f.companyId, actor: { actorType: "agent", actorId: f.worker.id, agentId: f.worker.id },
+      runContext: { heartbeatRunId: run.run.id, issueId: run.issue.id },
+      request: { connectionId: connection.id, catalogEntryId: entry.id, toolName: "list_repos", arguments: {} } });
+    expect(denied).toMatchObject({ allowed: false, reasonCode: "deny_not_installed_for_agent" });
+  });
+
+  it("N1 Git envelope (git-credentials.ts S2): a row carrying a project envelope but no project_id is never a run identity, even with an agent install", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(null);
+    await db.update(toolConnections).set({ config: { ...connection.config, projectScope: f.scope(f.a) } }).where(eq(toolConnections.id, connection.id));
+    const selected = await resolveManagedGitHubIdentitySelection(db, f.companyId, { agentId: f.leadA.id, responsibleUserId: f.human });
+    expect(selected.connection?.id).not.toBe(connection.id);
+    expect(selected.grant?.connectionId).not.toBe(connection.id);
+  });
+
+  it("N1 Git full admission (git-credentials.ts S2): A's installed lead in an A run gets no identity once the primary approval is stale", async () => {
+    const { f, connection } = await owned({ strayCompanyReach: false });
+    const run = await f.run(f.a, f.leadA.id);
+    await db.update(userCompanyPreferences).set({ primaryAgentId: f.leadB.id })
+      .where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
+    const selected = await resolveManagedGitHubIdentitySelection(db, f.companyId, { agentId: f.leadA.id, responsibleUserId: f.human, heartbeatRunId: run.run.id, issueId: run.issue.id });
+    expect(selected.connection?.id).not.toBe(connection.id);
+    expect(selected.grant?.connectionId).not.toBe(connection.id);
+    expect(selected.error).toMatch(/^project_connection_use_denied/);
+  });
+
+  /** Hold the owning project's lifecycle lock, start `write`, wait until it is
+   * BLOCKED on that lock (so its pre-lock admission already passed), make the
+   * primary approval stale, release. Only the in-transaction recheck can refuse. */
+  async function staleWhileBlocked<T>(f: Awaited<ReturnType<typeof owned>>["f"], write: () => Promise<T>) {
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let locked!: () => void;
+    const lockHeld = new Promise<void>(resolve => { locked = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.execute(sql`SELECT id FROM projects WHERE id = ${f.a.id} FOR UPDATE`);
+      locked();
+      await released;
+      await tx.update(userCompanyPreferences).set({ primaryAgentId: f.leadB.id })
+        .where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
+    });
+    await lockHeld;
+    const outcome = write().then(value => ({ value }), (error: unknown) => ({ error }));
+    let blocked = false;
+    for (let attempt = 0; attempt < 100 && !blocked; attempt++) {
+      const [row] = await db.execute(sql`SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()`);
+      blocked = Number((row as { n: number }).n) > 0;
+      if (!blocked) await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    release();
+    await holder;
+    expect(blocked).toBe(true);
+    return outcome;
+  }
+
+  it("N1 install race (installs.ts S6 transaction admission): approval made stale while the install waits for the project lock is refused; no install is written", async () => {
+    const { f, connection } = await owned({ strayCompanyReach: false });
+    const outcome = await staleWhileBlocked(f, () => f.service.putConnectionInstalls(connection.id,
+      { installs: [{ targetType: "agent", targetId: f.leadA.id }, { targetType: "agent", targetId: f.worker.id }] }, f.actor(f.leadA.id)));
+    expect(outcome).toMatchObject({ error: { status: 403 } });
+    const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id));
+    expect(installs.map(install => install.targetId)).toEqual([f.leadA.id]);
+  });
+
+  it("N1 update race (tool-access.ts update transaction admission): approval made stale while the update waits for the project lock is refused; the row is unchanged", async () => {
+    const { f, connection } = await owned({ strayCompanyReach: false });
+    const context = await f.management(connection.id, f.leadA.id);
+    const outcome = await staleWhileBlocked(f, () => f.service.updateConnection(connection.id, { name: `renamed-${randomUUID()}` }, context));
+    expect(outcome).toMatchObject({ error: { status: 403 } });
+    const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+    expect(row!.name).toBe(connection.name);
   });
 });

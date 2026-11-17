@@ -57,7 +57,7 @@ export async function approveProjectFixture(db: Db, f: Fixture, project = f.a, i
   const source = await request(sessionApp(db, f)).post(`/api/companies/${f.companyId}/tools/connections`).send(input);
   if (source.status !== 201) throw new Error(`Genuine source creation failed: ${source.status} ${JSON.stringify(source.body)}`);
   const approval = await request(sessionApp(db, f)).post(`/api/companies/${f.companyId}/tools/connections/${source.body.id}/project-app-approval`)
-    .set("Origin", "http://127.0.0.1").send({ action: "approve", projectId: project.id });
+    .set("Host", "127.0.0.1").set("Origin", "http://127.0.0.1").send({ action: "approve", projectId: project.id });
   if (approval.status !== 200) throw new Error(`Genuine H-session approval failed: ${approval.status} ${JSON.stringify(approval.body)}`);
   return { sourceId: source.body.id as string, applicationId: source.body.applicationId as string };
 }
@@ -67,7 +67,7 @@ export async function approveProjectFixture(db: Db, f: Fixture, project = f.a, i
 export async function approveExistingProjectFixture(db: Db, f: Fixture, sourceId: string, project = f.a) {
   await configureProjectFixture(db, f);
   const approval = await request(sessionApp(db, f)).post(`/api/companies/${f.companyId}/tools/connections/${sourceId}/project-app-approval`)
-    .set("Origin", "http://127.0.0.1").send({ action: "approve", projectId: project.id });
+    .set("Host", "127.0.0.1").set("Origin", "http://127.0.0.1").send({ action: "approve", projectId: project.id });
   if (approval.status !== 200) throw new Error(`Genuine existing-source H-session approval failed: ${approval.status} ${JSON.stringify(approval.body)}`);
 }
 

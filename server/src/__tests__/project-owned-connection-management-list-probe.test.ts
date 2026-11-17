@@ -1,0 +1,20 @@
+import './helpers/project-connections-approval-http.js';
+import {afterAll,beforeAll,expect,it} from 'vitest';
+import request from 'supertest';
+import {createDb,toolConnections} from '@paperclipai/db';
+import {eq} from 'drizzle-orm';
+import {startEmbeddedPostgresTestDatabase} from './helpers/embedded-postgres.js';
+import {projectConnectionFixture} from './helpers/project-connections-approved-fixture.js';
+let database:Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;let db:ReturnType<typeof createDb>;
+beforeAll(async()=>{database=await startEmbeddedPostgresTestDatabase('judge-management-list-');db=createDb(database.connectionString)},60000);
+afterAll(async()=>{await db?.$client.end({timeout:1});await database?.cleanup()},60000);
+it('independent N2 probe: another project team must not receive owned connection config in management listings',async()=>{
+ const f=await projectConnectionFixture(db);const {connection}=await f.seedConnection(f.a);
+ await db.update(toolConnections).set({config:{...connection.config,judgeConfigMarker:'synthetic-private-config-marker'}}).where(eq(toolConnections.id,connection.id));
+ const listing=await request(f.route(f.leadB.id)).get(`/api/companies/${f.companyId}/tools/connections`);
+ const row=listing.body.connections?.find((r:{id:string})=>r.id===connection.id);
+ const single=await request(f.route(f.leadB.id)).get(`/api/tool-connections/${connection.id}`);
+ const observed={listingStatus:listing.status,otherProjectListed:!!row,configPresent:!!row?.config,privateConfigMarkerExposed:row?.config?.judgeConfigMarker==='synthetic-private-config-marker',vaultReferencePresent:!!row?.credentialSecretRefs?.length,singleStatus:single.status,singleConfigPresent:!!single.body.config};
+ console.log('N2 management probe (booleans only)',JSON.stringify(observed));
+ expect(observed.privateConfigMarkerExposed).toBe(false);
+});

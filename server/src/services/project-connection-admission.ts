@@ -83,7 +83,7 @@ export function projectConnectionActor(managementContext?: ActorInfo["management
     authenticatedActorType: managementContext.actor.type === "agent" ? "agent" : "board" };
 }
 
-async function currentAuthority(db: Database, companyId: string, projectId: string) {
+export async function currentAuthority(db: Database, companyId: string, projectId: string) {
   const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)));
   if (!project) throw notFound("Project not found");
   const [company] = await db.select().from(companies).where(eq(companies.id, companyId));
