@@ -1004,6 +1004,68 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(fresh.lease.id).not.toBe(previous!.id);
   },120_000);
 
+  // fix13 item 2 (RFL 23:00Z): every paid box has an owner AND an expiry; the provider TTL is only an expiry.
+  // The released box whose cleanup failed, and which the worker CANNOT inspect (the GET errors), gets the
+  // same stop-only owner a positive RUNNING GET gets: the owner is recorded, the pending-cleanup sweep sends
+  // ONE stop by that box's provider id, and the read-back shows that box stopped and no other box touched.
+  it("fix13 owner: an un-inspectable released box whose cleanup failed gets the stop-only owner; one stop targets only it", async () => {
+    const seeded = await seedReusablePluginSandboxLease();
+    const freshRunId = randomUUID();
+    await db.update(environmentLeases).set({status:"expired",cleanupStatus:"success",releasedAt:new Date()}).where(eq(environmentLeases.id,seeded.reusableLease.id));
+    await db.insert(heartbeatRuns).values({id:freshRunId,companyId:seeded.companyId,agentId:seeded.agentId,status:"running",contextSnapshot:{replacedQueuedRunId:seeded.runId}});
+    const calls:Array<{method:string;providerLeaseId:unknown;phase:string}>=[];
+    let box=0,phase="predecessor";
+    const runtime=environmentRuntimeService(db,{pluginWorkerManager:{
+      isRunning:()=>true,
+      getWorker:()=>({supportedMethods:["environmentResumeLease","environmentReleaseLease","environmentStopLease","environmentDestroyLease","environmentInspectLease"]}),
+      call:async (_plugin:string,method:string,params:Record<string,unknown>)=>{
+        calls.push({method,providerLeaseId:params?.providerLeaseId ?? null,phase});
+        if(method==="environmentAcquireLease") return {providerLeaseId:`fix13-box-${++box}`,metadata:{remoteCwd:"/workspace"}};
+        if(method==="environmentResumeLease") return {providerLeaseId:params.providerLeaseId,metadata:{remoteCwd:"/workspace"}};
+        if(method==="environmentStopLease") return {providerLeaseId:params.providerLeaseId,state:"stopped"};
+        // The worker cannot inspect the box: the provider GET errors.
+        if(method==="environmentInspectLease") throw new Error("provider GET failed: 503");
+        throw new Error(`Unexpected RPC ${method}`);
+      },
+    } as unknown as PluginWorkerManager});
+    const common={companyId:seeded.companyId,environment:seeded.environment,issueId:null,agentId:seeded.agentId,
+      persistedExecutionWorkspace:{id:seeded.executionWorkspaceId,mode:"shared_workspace" as const}};
+    const first=await runtime.acquireRunLease({...common,heartbeatRunId:seeded.runId});
+    const oldBox=first.lease.providerLeaseId!;
+    await db.update(heartbeatRuns).set({status:"failed",finishedAt:new Date(Date.now()-1_200_000)}).where(eq(heartbeatRuns.id,seeded.runId));
+    await db.update(environmentLeases).set({status:"released",releasedAt:new Date(Date.now()-1_199_000),cleanupStatus:"failed"}).where(eq(environmentLeases.id,first.lease.id));
+    phase="fresh";
+    const fresh=await runtime.acquireRunLease({...common,heartbeatRunId:freshRunId});
+    const freshBox=fresh.lease.providerLeaseId!;
+    const [owned]=await db.select().from(environmentLeases).where(eq(environmentLeases.id,first.lease.id));
+    const inspected=calls.some(c=>c.phase==="fresh"&&c.method==="environmentInspectLease"&&c.providerLeaseId===oldBox);
+    console.info(JSON.stringify({fix13Owner:{oldBox,freshBox,inspected,owned:{status:owned!.status,cleanupStatus:owned!.cleanupStatus,
+      failureReason:owned!.failureReason,stopIntent:owned!.metadata?.sandboxStopAndRetain ?? null}}}));
+    expect(inspected,"the worker tried to inspect the old box and the GET failed").toBe(true);
+    expect(freshBox).not.toBe(oldBox);
+    // The owner is recorded: the existing stop-only owner, bound to exactly the old box.
+    expect(owned,"the un-inspectable failed-cleanup box has an owner").toMatchObject({status:"pending_cleanup",failureReason:"sandbox_stop_pending"});
+    expect(owned!.metadata?.sandboxStopAndRetain).toMatchObject({providerLeaseId:oldBox,leaseId:first.lease.id,runId:seeded.runId});
+    // The owner acts: ONE stop, by the old box's provider id; read back.
+    phase="sweep";
+    await heartbeatService(db,{environmentRuntime:runtime}).sweepPendingCleanupLeases({backoffMs:0});
+    const sweep=calls.filter(c=>c.phase==="sweep");
+    const [after]=await db.select().from(environmentLeases).where(eq(environmentLeases.id,first.lease.id));
+    const [freshAfter]=await db.select().from(environmentLeases).where(eq(environmentLeases.id,fresh.lease.id));
+    console.info(JSON.stringify({fix13OwnerStop:{sweep,after:{status:after!.status,cleanupStatus:after!.cleanupStatus,
+      termination:after!.metadata?.remoteExecutionTermination ?? null,stopIntent:after!.metadata?.sandboxStopAndRetain ?? null},
+      freshAfter:{status:freshAfter!.status,providerLeaseId:freshAfter!.providerLeaseId}}}));
+    expect(sweep.filter(c=>c.method==="environmentStopLease"),"ONE stop, targeting only the old box").toEqual([{method:"environmentStopLease",providerLeaseId:oldBox,phase:"sweep"}]);
+    expect(sweep.filter(c=>c.providerLeaseId!==oldBox),"no other box touched").toEqual([]);
+    expect(sweep.filter(c=>c.method==="environmentDestroyLease"),"never destroyed").toEqual([]);
+    // The owner settles by restoring the exact ended row (its historical cleanupStatus kept) with a bound
+    // stop receipt for that box: no longer pending, never re-stopped (hasBoundRemoteStopReceipt).
+    expect(after!.status,"the old box read back stopped: the ended row is restored").toBe("released");
+    expect(after!.metadata?.remoteExecutionTermination).toMatchObject({providerLeaseId:oldBox,state:"stopped"});
+    expect(after!.metadata).not.toHaveProperty("sandboxStopAndRetain");
+    expect(freshAfter,"the fresh box is untouched").toMatchObject({status:fresh.lease.status,providerLeaseId:freshBox});
+  },120_000);
+
   // Regression: cold workspace/instructions sync must not inherit the 30 s plugin RPC default.
   it.each((["syncIn", "syncOut"] as const).flatMap(method => [
     { timeoutMs: null, expectedRpcTimeoutMs: 120_000 },
