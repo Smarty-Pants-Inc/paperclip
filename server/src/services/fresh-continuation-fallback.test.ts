@@ -37,7 +37,7 @@ import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
-import { settleUnansweredPersonMessages, unansweredPersonMessageCommentCondition, settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT, UNANSWERED_MESSAGE_REASON_PREFIX, UNANSWERED_MESSAGE_TEXT } from "./recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessages, unansweredPersonMessageCondition, unansweredPersonMessageCommentCondition, settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT, UNANSWERED_MESSAGE_REASON_PREFIX, UNANSWERED_MESSAGE_TEXT } from "./recovery/unanswered-person-message.js";
 import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";
 import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
@@ -566,18 +566,49 @@ suite("fresh-continuation fallback", () => {
     await Promise.all([1, 2].map(() => settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now })));
     const notes = await readNotes();
     const current = currentNotices(notes.filter(note => !note.deletedAt), outcome === "failed" ? [unanswered] : []);
-    expect(current).toHaveLength(1);
-    expect(current[0].body).toBe(outcome === "answered" ? FRESH_THREAD_STARTED_NOTE : UNANSWERED_MESSAGE_TEXT);
+    expect(current).toHaveLength(outcome === "answered" ? 0 : 1);
     if (outcome === "answered") {
       expect(notes.find(note => note.id === unanswered.id)?.deletedAt).toBeInstanceOf(Date);
       expect(notes.filter(note => !note.deletedAt).some(note => note.body === UNANSWERED_MESSAGE_TEXT)).toBe(false);
     } else {
+      expect(current[0].body).toBe(UNANSWERED_MESSAGE_TEXT);
       expect(notes).toHaveLength(3);
       expect(current[0].metadata?.sections).toEqual(expect.arrayContaining([
         expect.objectContaining({ rows: expect.arrayContaining([expect.objectContaining({ label: "Failure code", value: "adapter_failed" })]) }),
       ]));
     }
   });
+
+  it.each(["wakeCommentId", "commentId", "conversationReplyBoundaryCommentId", "wakeCommentIds", "firstTurnQueuedInput"] as const)(
+    "retires only the answered fresh-thread notice linked through %s, without a prior unanswered notice", async key => {
+      const f = await unfinishedThread({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+      const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+        body: "Repeat the 3 facts.", createdAt: new Date(Date.now() - 120_000) }).returning();
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" })).toMatchObject({ kind: "continued" });
+      const next = await selectFreshSuccessor(f);
+      const [freshNotice] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+      const [otherIssue] = await db.insert(issues).values({ companyId, title: "Another task", assigneeAgentId: agentId }).returning();
+      const [foreignNotice, unrelatedNotice] = await db.insert(issueComments).values([
+        { companyId, issueId: otherIssue.id, authorType: "system", body: freshNotice.body, metadata: freshNotice.metadata },
+        { companyId, issueId: f.issueId, authorType: "system", body: freshNotice.body,
+          metadata: { version: 1, authorizationReason: `fresh_provider_thread:${randomUUID()}`,
+            sections: [{ rows: [{ type: "run_link", runId: f.runId, agentId, title: "Unrelated run" }] }] } },
+      ]).returning();
+      const carried = key === "wakeCommentIds" ? [message.id] : key === "firstTurnQueuedInput" ? { commentIds: [message.id] } : message.id;
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(),
+        contextSnapshot: { ...next.contextSnapshot, [key]: carried } }).where(eq(heartbeatRuns.id, next.id));
+      await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "agent", authorAgentId: agentId,
+        createdByRunId: next.id, body: "Here are the three facts." });
+      expect(await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, f.issueId),
+        unansweredPersonMessageCondition(issues.id, issues.companyId)))).toHaveLength(1);
+      expect(await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+        unansweredPersonMessageCommentCondition()))).toEqual([{ id: freshNotice.id }]);
+      await settleUnansweredPersonMessages(db, { companyId, issueId: f.issueId });
+      const notes = await db.select().from(issueComments).where(inArray(issueComments.id, [freshNotice.id, foreignNotice.id, unrelatedNotice.id]));
+      expect(notes.find(note => note.id === freshNotice.id)?.deletedAt).toBeInstanceOf(Date);
+      expect(notes.filter(note => note.id !== freshNotice.id).map(note => note.deletedAt)).toEqual([null, null]);
+    },
+  );
 
   it.each([
     ["runner_remote_state_unavailable", undefined],
