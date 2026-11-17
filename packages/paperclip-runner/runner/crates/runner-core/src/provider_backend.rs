@@ -10684,6 +10684,48 @@ done
         assert_eq!(terminal[0].payload["summary"], answer);
     }
 
+    // ROW-4096 (pack-n5): run events showed Pi tool output cut at ~4,096
+    // characters with "…[truncated]". What Pi returned to the model for a
+    // builtin tool (its own <=50 KB page plus Pi's "Full output: PATH" footer)
+    // must reach the run events whole, with no cut marker of ours.
+    #[test]
+    fn row4096_pi_tool_output_reaches_run_events_whole() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let mut output: String = (0..800)
+            .map(|index| format!("out {index} {} é🦀\n", "z".repeat(60)))
+            .collect();
+        output.push_str("\n[Showing lines 1201-2000 of 2000. Full output: /tmp/pi-bash-0123.log]");
+        assert!(output.len() > 50_000 && output.chars().count() < 60_000);
+        let events = normalize_provider_notification(
+            &mut state,
+            "item/completed",
+            &json!({"threadId": "thread-1", "turnId": "turn-1", "itemId": "pi-tool-1",
+                "item": {"id": "pi-tool-1", "type": "builtinToolCall", "tool": "bash",
+                    "status": "completed", "output": output}}),
+        )
+        .unwrap();
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "tool.execution.completed")
+            .expect("tool execution completed");
+        let text = completed.payload["output"].as_str().unwrap();
+        assert!(
+            !text.contains("…[truncated]"),
+            "cut to {} bytes",
+            text.len()
+        );
+        assert_eq!(text.as_bytes(), output.as_bytes());
+        assert_eq!(completed.payload["outputTruncated"], false);
+        for event in &events {
+            assert!(
+                !event.payload.to_string().contains("…[truncated]"),
+                "{} carries a cut marker",
+                event.event_type
+            );
+        }
+    }
+
     #[test]
     fn b7_pi_final_channel_is_bounded_at_12000_characters() {
         let mut state = opencode_result_state();

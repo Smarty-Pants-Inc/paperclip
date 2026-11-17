@@ -13,8 +13,10 @@ export function openCodeProxyToolNotification(input: {
     threadId: input.threadId, turnId: input.turnId, itemId: p.executionId,
     item: { id: p.executionId, type, tool: p.name, server: p.namespace,
       readOnlyHint: p.readOnly, status: p.status, durationMs: p.durationMs, exitCode: p.exitCode,
-      // This is the already bounded provider-visible result, not raw input or a private trace.
-      output: typeof p.output === "string" ? p.output.slice(0, 16_384) : "",
+      // This is the already bounded provider-visible result, not raw input or a
+      // private trace. The driver/projector already bounds it to its record
+      // budget; forward it whole instead of silently slicing it again.
+      output: typeof p.output === "string" ? p.output : "",
     },
   } };
 }
