@@ -11259,6 +11259,20 @@ export function issueService(db: Db) {
           [enriched],
           tx,
         );
+        const placementReceipt = withParentAdjustment(withRelations, parentAdjustment);
+        if (placementReceipt.parentAdjustmentWarning) {
+          await logActivity(tx as unknown as Db, {
+            companyId,
+            actorType: issueData.createdByAgentId ? "agent" : issueData.createdByUserId ? "user" : "system",
+            actorId: issueData.createdByAgentId ?? issueData.createdByUserId ?? "issue-hierarchy",
+            agentId: issueData.createdByAgentId ?? null,
+            runId: actorRunId ?? null,
+            action: "issue.parent_adjusted",
+            entityType: "issue",
+            entityId: issue.id,
+            details: { parentAdjusted: parentAdjustment, warning: placementReceipt.parentAdjustmentWarning },
+          });
+        }
         insertedNewIssue = true;
         return withRelations;
       };

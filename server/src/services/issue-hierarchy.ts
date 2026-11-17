@@ -216,10 +216,16 @@ export async function planIssueParentChange(
   return planParentChange(existing, chain, requestedParentId, Boolean(child), currentParent ?? null, policy);
 }
 
-/** Adds `parentAdjusted` to a create/update result only when the parent was adjusted. */
+/** Adds the structured adjustment and an agent-readable warning when depth placement changed the parent. */
 export function withParentAdjustment<T extends object>(
   issue: T,
   adjustment: IssueParentAdjustment | null,
-): T & { parentAdjusted?: IssueParentAdjustment } {
-  return adjustment ? { ...issue, parentAdjusted: adjustment } : issue;
+): T & { parentAdjusted?: IssueParentAdjustment; parentAdjustmentWarning?: string } {
+  if (!adjustment) return issue;
+  const warning = adjustment.reason === "max_agent_depth" && adjustment.applied
+    ? `Requested parent ${adjustment.requestedParent?.id ?? "unknown"} was not used: the agent task hierarchy depth limit `
+      + `(${AGENT_TASK_HIERARCHY_DEPTH_ENV}) re-parented this task to ${adjustment.effectiveParent?.id ?? "top level"}. `
+      + "Inspect parentAdjusted before delegating further."
+    : undefined;
+  return { ...issue, parentAdjusted: adjustment, ...(warning ? { parentAdjustmentWarning: warning } : {}) };
 }
