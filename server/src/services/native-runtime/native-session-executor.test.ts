@@ -14685,6 +14685,202 @@ describe("native warm session supervision", () => {
       }
     });
 
+    // pl/s3-fence (Paul's s3 gate, PV1: Stop mid-turn, then a message; runs
+    // 619d1f1f and ffb1f837 failed in ~8 s with native_predecessor_retirement_unproven).
+    // The REAL remote checkpoint callback and the REAL s3 storage fence
+    // (native-harness-backup-storage.ts fence(): native_harness_storage_owner_superseded),
+    // the REAL cancelNativeSession Stop and the REAL successor retirement
+    // (retireWarmPredecessor -> closeWarmNativeSession), with the Stop leaving the
+    // Runner UNSETTLED (its durable suspension not proved). Only the sandbox's
+    // remote command boundary is a fake (holder inventory + process check); the
+    // finished-holder status read and the retirement receipt use real PostgreSQL.
+    // Never-OK: the successor answers on its FIRST run only after that exact
+    // Runner is proven exited; a Runner still busy, a missing sandbox runner or
+    // an unverifiable probe stays refused (typed), and no data is touched.
+    describe("pl/s3-fence: unsettled Runner after Stop on s3", () => {
+      let proofDb: Db;
+      let cleanupDb: (() => Promise<void>) | undefined;
+      beforeAll(async () => {
+        const { startRecoveryPostgres } = await import("../../__tests__/helpers/recovery-postgres.js");
+        const { createDb } = await import("@paperclipai/db");
+        const database = await startRecoveryPostgres("pl-s3-fence-");
+        cleanupDb = database.cleanup;
+        proofDb = createDb(database.connectionString);
+      }, 180_000);
+      afterAll(async () => { await proofDb?.$client.end(); await cleanupDb?.(); });
+
+      it.each([
+        { holder: "exits-on-stop", delaySeconds: 0, answered: true },
+        { holder: "exits-on-stop", delaySeconds: 30, answered: true },
+        { holder: "already-exited", delaySeconds: 0, answered: true },
+        { holder: "already-exited", delaySeconds: 30, answered: true },
+        { holder: "owner-running", delaySeconds: 0, answered: false },
+        { holder: "busy", delaySeconds: 0, answered: false },
+        { holder: "busy", delaySeconds: 30, answered: false },
+        { holder: "exit-unproven", delaySeconds: 0, answered: false },
+        { holder: "probe-throws", delaySeconds: 0, answered: false },
+        { holder: "no-sandbox-runner", delaySeconds: 0, answered: false },
+      ] as const)("pl/s3-fence Stop -> message +$delaySeconds s, Runner $holder: answered on the first run = $answered",
+        async ({ holder, delaySeconds, answered }) => {
+          const { companies, agents } = await import("@paperclipai/db");
+          const fixed = fixture(`s3f-${holder}-${delaySeconds}`);
+          const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+          const base = { ...fixed.base, binding: { ...fixed.base.binding, companyId, agentId, issueId, runId: randomUUID() } };
+          const next = { ...fixed.next, binding: { ...fixed.next.binding, companyId, agentId, issueId, runId: randomUUID() } };
+          await proofDb.insert(companies).values({ id: companyId, name: "s3 fence", issuePrefix: `S${companyId.slice(0, 7).toUpperCase()}` });
+          await proofDb.insert(agents).values({ id: agentId, companyId, name: "Boat agent", adapterType: "paperclip_runner" });
+          await proofDb.insert(issues).values({ id: issueId, companyId, title: "Stop then message", status: "in_progress" });
+          // The person's Stop: the predecessor run is terminal `cancelled` (a retirable holder status).
+          await proofDb.insert(heartbeatRuns).values({ id: base.binding.runId, companyId, agentId, issueId,
+            status: holder === "owner-running" ? "running" : "cancelled",
+            runtimeMode: "native", finishedAt: new Date() });
+          const coordinator = { phase: "observed", resultId: null as string | null, leaseOwner: "remote-owner" as string | null,
+            leaseExpiresAt: new Date(Date.now() + 300_000), controllerGeneration: 1, controllerBootId: "s3f-boot" };
+          let taskRunId = base.binding.runId;
+          const db = leaseDb(base), select = db.select.bind(db);
+          const query = (rows: unknown[]) => { const promise = Promise.resolve(rows);
+            const q = { then: promise.then.bind(promise), where: () => q, limit: () => q, for: () => q }; return q; };
+          db.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => {
+            if (table === nativeRunFinalizations) return query([coordinator]);
+            if (table === issues) return query([{ executionRunId: taskRunId, checkoutRunId: null }]);
+            return select(fields as never).from(table as never);
+          } })) as unknown as Db["select"];
+          const fenceTx = { select: db.select, execute: async () => [{ now: new Date() }],
+            $with: () => ({ as: () => ({}) }),
+            with: () => ({ select: () => ({ from: () => query([{ ...coordinator, now: new Date() }]) }) }),
+          };
+          db.transaction = (async operation => operation(fenceTx as never)) as Db["transaction"];
+          const storage = vi.spyOn(harnessStorage, "durableNativeHarnessStorage").mockReturnValue({ provider: "s3" } as never);
+          const validate = vi.spyOn(harnessStorage, "assertNativeHarnessBackupOwner");
+          const backup = vi.spyOn(harnessStorage, "persistNativeHarnessBackup");
+          const checkpointRegistration = vi.spyOn(runnerCheckpoint, "nativeRunnerCheckpointRegistration").mockReturnValue(async () => undefined);
+          onTestFinished(() => { storage.mockRestore(); validate.mockRestore(); backup.mockRestore(); checkpointRegistration.mockRestore(); });
+          // The sandbox's remote command boundary: the Runner the Stop left behind.
+          const remoteCwd = "/workspace";
+          const sessionDirectory = createHash("sha256").update(base.session.normalizedSessionId!).digest("hex");
+          const identityPath = `${remoteCwd}/.paperclip-runtime/paperclip-runner/sessions/${sessionDirectory}/runner/runner-process.identity`;
+          const runnerInstanceId = `runner-${randomUUID()}`;
+          const identity = ["nonce1", "4242", new Date().toISOString(), runnerInstanceId].join("\n");
+          const runnerState = { runId: base.binding.runId, runnerInstanceId, lifecycle: "running",
+            outbox: holder === "busy" ? [{ seq: 7, kind: "provider_delta" }] : [], pendingTerminalDelivery: null };
+          let runnerAlive = holder !== "already-exited";
+          const signals: string[] = [];
+          const remoteCommands: string[] = [];
+          const remoteExecute = vi.fn(async (command: { command?: string; args?: string[] }) => {
+            remoteCommands.push([command.command, ...(command.args ?? [])].join(" "));
+            const label = command.args?.[2];
+            if (label === "paperclip-runner-port-holders") {
+              if (holder === "probe-throws") throw new Error("sandbox command channel closed");
+              const b64 = (text: string) => Buffer.from(text).toString("base64");
+              return { exitCode: 0, timedOut: false, stderr: "",
+                stdout: `${identityPath}\t${b64(identity)}\t${b64(JSON.stringify(runnerState))}\n` };
+            }
+            if (label === "paperclip-runner-port-holder-check" || label === "paperclip-runner-exit-check") {
+              const signal = command.args?.[8];
+              if (signal) { signals.push(signal); if (holder === "exits-on-stop" || holder === "exit-unproven") runnerAlive = false; }
+              return { exitCode: runnerAlive ? 0 : holder === "exit-unproven" ? 47 : 45, timedOut: false, stderr: "", stdout: "" };
+            }
+            return { exitCode: command.args?.[1]?.includes("base64") ? 1 : 0, timedOut: false, stderr: "", stdout:
+              command.args?.[0] === "--build-metadata" ? JSON.stringify({
+                schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner",
+                binaryContractVersion: 2, durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+              }) : command.args?.[0] === "--version" ? "codex-cli 0.160.0" : "" };
+          });
+          const sandboxRunner = { execute: remoteExecute, syncIn: vi.fn(async () => undefined) };
+          const artifact = join(isolatedHome, `s3f-runnerd-${holder}-${delaySeconds}`); await writeFile(artifact, "fixture artifact");
+          await createRunnerdBackend({ db, execution: base, runnerInstanceId: "runner",
+            runnerRemoteBinaryPath: artifact, runnerRemoteCodexPath: artifact,
+            controllerPersistence: { bootId: "s3f-boot" }, runnerIngressAuthorized: true,
+            runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: "s3f-env", leaseId: "s3f-lease",
+              providerKey: "boat", sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "s3f-box" },
+              effectiveCapabilities: { runnerWebSocketIngress: true }, runner: sandboxRunner,
+              getRunnerIngressEndpoint: async () => ({ kind: "authenticated_websocket", websocketUrl: "wss://sandbox.invalid/runner",
+                secretHeaders: [], generation: "1", refresh: vi.fn(), close: vi.fn(async () => undefined) }),
+            } as never });
+          state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+          const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+            controlPlaneRegistration: NonNullable<import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"]>;
+          };
+          const controller = new DurablePrpControlPlane({ stateDirectory: join(options.stateDirectory!, "control-plane"),
+            identity: options.prpIdentity! as ConstructorParameters<typeof DurablePrpControlPlane>[0]["identity"],
+            expectedRunnerVersion: "s3f-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+          controller.queueCommand("run.prepare", {}); controller.queueCommand("session.open", { reuse: "same_session" });
+          const registration = await options.controlPlaneRegistration(controller);
+          // The predecessor's unsynced agent/provider file: written after its last durable backup.
+          const unsynced = join(options.stateDirectory!, "provider", "unsynced-turn.jsonl");
+          await mkdir(dirname(unsynced), { recursive: true });
+          await writeFile(unsynced, `{"turn":"cancelled mid-turn","nonce":"${randomUUID()}"}\n`);
+          const sha = async () => createHash("sha256").update(await readFile(unsynced)).digest("hex");
+          const unsyncedSha = await sha();
+          const collectStopped = vi.fn(async () => undefined), retirementFailed = vi.fn(async () => undefined);
+          let checkpointError: unknown;
+          // The transport contract: checkpoint("unsettled"), force-stop in
+          // finally, rethrow the fence's ORDINARY refusal.
+          const close = vi.fn(async () => { try { await registration.checkpoint!("unsettled"); }
+            catch (error) { checkpointError = error; throw error; } });
+          const cancel = vi.fn(() => ({ cleanup: Promise.resolve() }));
+          const turns = new Map<string, number>();
+          const countTurn = (runId: string) => turns.set(runId, (turns.get(runId) ?? 0) + 1);
+          state.execute.mockReset().mockImplementationOnce(async options => { await options.onSession?.({ close, cancel });
+            countTurn(base.binding.runId);
+            expect(await cancelNativeSession(base.binding.runId, "Stop")).toBe(true);
+            taskRunId = next.binding.runId; coordinator.phase = "terminal_failure"; coordinator.leaseOwner = null;
+            return { ...result, terminal: { runTerminalState: "cancelled" } };
+          }).mockImplementationOnce(async () => { countTurn(next.binding.runId); return result; });
+          const target = holder === "no-sandbox-runner" ? undefined : { kind: "remote" as const, transport: "sandbox" as const,
+            remoteCwd, environmentId: "s3f-env", sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: "s3f-box" },
+            runner: sandboxRunner as never };
+          const runDb = leaseDb(base);
+          try {
+            await executePaperclipNativeSession({ db: runDb, execution: base, runnerInstanceId: "runner",
+              ...(target ? { runnerExecutionTarget: target } : {}),
+              instructionWorkingCopy: { hasChanges: async () => false, collectStopped, retirementFailed } });
+            expect(cancel).toHaveBeenCalledTimes(1);
+            // The retained owner's sandbox lease database reads real rows from here on.
+            Object.assign(runDb, { select: proofDb.select.bind(proofDb), insert: proofDb.insert.bind(proofDb),
+              update: proofDb.update.bind(proofDb), execute: proofDb.execute.bind(proofDb), transaction: proofDb.transaction.bind(proofDb) });
+            collectStopped.mockClear(); signals.length = 0;
+            if (delaySeconds > 0) { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(Date.now() + delaySeconds * 1_000); }
+            const followUp = { ...next, session: base.session };
+            const attempt = executePaperclipNativeSession({ db: leaseDb(followUp), execution: followUp, runnerInstanceId: "runner",
+              refreshTools: true, ...(target ? { runnerExecutionTarget: target } : {}) });
+            if (answered) {
+              // On the base this is the live failure: retirement unproven, the
+              // fence's superseded refusal of an unsettled Runner as its cause.
+              expect(await attempt.then(() => "answered", (error: Error & { code?: string }) =>
+                `${error.code ?? error.name}: ${String(error.cause)}`)).toBe("answered");
+              expect(String(checkpointError)).toContain("native_harness_storage_owner_superseded");
+              // ONE run answers on its first wake; the predecessor ran once.
+              expect(Object.fromEntries(turns)).toEqual({ [base.binding.runId]: 1, [next.binding.runId]: 1 });
+              expect(collectStopped).toHaveBeenCalled();
+              expect(signals).toEqual(holder === "exits-on-stop" ? ["TERM"] : []);
+              // A live holder is stopped only after its run's terminal status
+              // was read from PostgreSQL (`owner-running` below is refused).
+              expect((state.persistActivity.mock.calls as unknown as Array<[unknown, { action?: string; details?: Record<string, unknown> }]>)
+                .filter(([, receipt]) => receipt?.details?.holderRunId === base.binding.runId).map(([, receipt]) => receipt.action))
+                .toEqual(holder === "exits-on-stop" ? ["native.runner_port_holder_retired"] : []);
+            } else {
+              await expect(attempt).rejects.toMatchObject({ code: "native_predecessor_retirement_unproven" });
+              expect(turns.get(next.binding.runId) ?? 0).toBe(0);
+              expect(collectStopped).not.toHaveBeenCalled();
+              expect(retirementFailed).toHaveBeenCalled();
+              // A Runner still delivering is never signalled; KILL is never sent.
+              if (holder !== "exit-unproven") expect(signals).toEqual([]);
+            }
+            // No data touched: nothing copied over the last durable backup, the
+            // unsynced file is byte-for-byte unchanged, nothing removed remotely.
+            expect(validate).toHaveBeenCalled(); expect(backup).not.toHaveBeenCalled();
+            expect(await sha()).toBe(unsyncedSha);
+            expect(remoteCommands.filter(command => /\brm\b|rmdir|unlink/.test(command))).toEqual([]);
+            expect(signals).not.toContain("KILL");
+          } finally {
+            vi.useRealTimers();
+            close.mockResolvedValue(undefined); await closeIdleWarmNativeSessionsForRestart();
+            await registration.release(); await controller.stop();
+          }
+        });
+    });
+
     // Paul's SMA-4 (b34f4ecb, fd8621d4): a person's Stop or the queued-message
     // Interrupt cancels the turn; the next message's run retires the warm
     // predecessor through the configuration-changed path. Its close checkpoint
