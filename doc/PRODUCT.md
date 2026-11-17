@@ -474,15 +474,21 @@ filters by name, title, or role; **+** starts or reopens a conversation.
 Selecting an agent opens their persistent conversation; it does not reset history
 or create a task until the existing first-write flow requires one.
 
-On an agent's chat page, **Mine | All members** switches between your conversation
-and a paginated list of that agent's shared conversations, with each owner's name
-and last activity. Only active company members who can read the agent may list
-these conversations. Private conversations (including inherited task/project
-privacy) stay out of this list, even for their owner or an instance administrator.
-Opening someone else's conversation is read-only: the composer says who can send,
-owner-only question/decision/handoff projections are not requested, and the
-conversation owner's read markers are untouched. Existing task read permissions
-and all owner-only chat write guards remain in force.
+Opening another active member's primary agent shows only that member's shared
+chat with it, titled **<Name>'s chat with <Agent>**, read-only and without a
+composer or member toggle. If no shared chat exists, the page says
+**<Name> hasn't chatted with <Agent> yet**. Your own primary, and agents that are
+nobody's primary, keep your interactive chat. If an agent is primary for you and
+another member, your own interactive chat takes precedence.
+
+The board-only `GET /companies/:companyId/primary-agents` read returns active
+members' primary assignments (`userId`, `agentId`) for agents the viewer may read.
+Only active company members who can read the agent may list shared conversations.
+Private conversations (including inherited task/project privacy) stay out of this
+list, even for their owner or an instance administrator. Owner-only
+question/decision/handoff projections are not requested in another member's chat,
+and the conversation owner's read markers are untouched. Existing task read
+permissions and all owner-only chat write guards remain in force.
 
 The opt-in API is `GET /companies/:companyId/chats?agentId=<uuid>&members=all`,
 with `limit` (1–100, default 50) and `offset` (default 0). Omitting `members=all`
