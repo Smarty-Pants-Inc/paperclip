@@ -82,7 +82,6 @@ describe("heartbeat warm sandbox failure settlement", () => {
   it.each([
     { status: "failed", errorCode: "adapter_failed" },
     { status: "failed", errorCode: "native_session_interrupted" },
-    { status: "cancelled", errorCode: "cancelled" },
     { status: "interrupted", errorCode: null },
     { status: "succeeded", errorCode: null },
   ] as const)("hands off a warm sandbox after $status/$errorCode without stopping or physically resuming it", async ({ status, errorCode }) => {
@@ -166,9 +165,20 @@ describe("heartbeat warm sandbox failure settlement", () => {
     expect(f.call.mock.calls.some(call => call[1] === "environmentStopLease")).toBe(false);
   });
 
+  // adopt-stopu: a person's Stop (cancelled/cancelled) is not kept warm; as upstream
+  // run-control, the non-succeeded run stops and retains its box at its own release.
+  it("a person's Stop (cancelled/cancelled) on a warm sandbox stops and retains it, released with its stop", async () => {
+    const f = await seed();
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", finishedAt: new Date(),
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-operator" } }).where(eq(heartbeatRuns.id, f.runId));
+    await f.heartbeat.releaseEnvironmentLeasesForRun({ runId: f.runId, companyId: f.companyId,
+      agentId: f.agentId, status: "cancelled", providerResourceDisposition: "keep_running" });
+    expect(await environmentService(db).getLeaseById(f.acquired.lease.id)).toMatchObject({ status: "released" });
+    expect(f.state()).toMatchObject({ running: false });
+  });
+
   it.each([
     { status: "failed", errorCode: "native_session_interrupted" },
-    { status: "cancelled", errorCode: "cancelled" },
     { status: "interrupted", errorCode: null },
   ] as const)("also counts ordinary $status/$errorCode as the second non-successful turn", async ({ status, errorCode }) => {
     const f = await seed();

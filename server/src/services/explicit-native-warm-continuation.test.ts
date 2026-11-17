@@ -117,7 +117,7 @@ describe.skipIf(!support.supported)("explicit continuation after a warm preparat
   });
 
   it.each([
-    { status: "cancelled", errorCode: "cancelled", providerWorkStarted: false },
+    // adopt-stopu: cancelled/cancelled (a person's Stop) stops and retains (runner-environment-lifecycle.test.ts).
     { status: "interrupted", errorCode: "native_session_interrupted", providerWorkStarted: false },
     { status: "failed", errorCode: "adapter_failed", providerWorkStarted: true },
     { status: "failed", errorCode: "adapter_failed", providerWorkStarted: undefined },
