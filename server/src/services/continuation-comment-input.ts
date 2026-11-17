@@ -106,7 +106,7 @@ async function pendingPersonCommentInput(db: Pick<Db, "select">, input: {
  * runtime selection revalidates them through the existing materializer
  * (materializeNativeInteractionResponses), so the person's answer is its input. */
 export async function pendingContinuationInteractionInput(db: Pick<Db, "select">, input: {
-  companyId: string; issueId: string; agentId: string; contextSnapshot: unknown;
+  companyId: string; issueId: string; agentId: string; runId?: string; contextSnapshot: unknown;
 }): Promise<Record<string, unknown>> {
   const context = input.contextSnapshot && typeof input.contextSnapshot === "object" && !Array.isArray(input.contextSnapshot)
     ? input.contextSnapshot as Record<string, unknown> : {};
@@ -118,10 +118,14 @@ export async function pendingContinuationInteractionInput(db: Pick<Db, "select">
     inArray(issueThreadInteractions.id, candidates), eq(issueThreadInteractions.createdByAgentId, input.agentId),
     sql`${issueThreadInteractions.resolvedByUserId} is not null`, isNull(issueThreadInteractions.resolvedByAgentId),
     inArray(issueThreadInteractions.status, ["answered", "accepted", "rejected"]),
-    // Carry once (h3-combine 5a): a card answer some run already answered (the shared predicate,
-    // keyed by the card and its answer time, as unansweredCardAnswerSql reads it) is not pending input.
-    sql`not ${answeredPersonMessageSql({ id: sql`${issueThreadInteractions.id}`, companyId: sql`${issueThreadInteractions.companyId}`,
-      issueId: sql`${issueThreadInteractions.issueId}`, createdAt: sql`${issueThreadInteractions.resolvedAt}` })}`,
+    // Carry once (h3-combine 5a): when the predecessor itself SUCCEEDED and the card is answered (the
+    // shared predicate, keyed by the card and its answer time, as unansweredCardAnswerSql reads it), the
+    // answer was acted on: it is not pending input again. A FAILED predecessor's successor still carries
+    // it (H3 (iv) answer-first), even when that run's settlement comment exists.
+    ...(input.runId && UUID.test(input.runId) ? [sql`not (exists (select 1 from ${heartbeatRuns} done
+      where done.company_id = ${input.companyId} and done.id = ${input.runId} and done.status = 'succeeded')
+      and ${answeredPersonMessageSql({ id: sql`${issueThreadInteractions.id}`, companyId: sql`${issueThreadInteractions.companyId}`,
+        issueId: sql`${issueThreadInteractions.issueId}`, createdAt: sql`${issueThreadInteractions.resolvedAt}` })})`] : []),
   )).orderBy(asc(issueThreadInteractions.resolvedAt), asc(issueThreadInteractions.id));
   const interactionIds = rows.map(row => row.id);
   return interactionIds.length ? { interactionIds, interactionId: interactionIds.at(-1) } : {};
