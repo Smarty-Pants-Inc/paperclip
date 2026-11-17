@@ -9,6 +9,7 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueComments,
+  heartbeatRunEvents,
   issueRecoveryActions,
   issueThreadInteractions,
   issueQuestionResponseDeliveries,
@@ -1998,4 +1999,210 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${later}`);
     });
   });
+
+  // Keep: BRIEF-person-stop-notice, gate 1 'without' 951a0225 (S1 +30 no-file):
+  // the person sent a4e89873, its run a33cd4db started answering, the SAME
+  // person pressed Stop at +30 s, and the sweep posted "Your message wasn't
+  // answered. Sending it again is safe" with the cancelled run as its source.
+  describe("the sender's own Stop or Interrupt (person-stop notice)", () => {
+    // The fields routes/agents.ts POST /heartbeat-runs/:runId/cancel records for a
+    // board user through run-control.ts cancelRun (live run a33cd4db, evidence record 75).
+    const stopFields = (userId: string) => ({ stopReason: "cancelled",
+      cancellation: { reason: "Cancelled by a board operator", source: "operator", expected: true,
+        initiator: { id: userId, type: "user" }, recordedAt: new Date().toISOString() },
+      cancelledByActorType: "user", cancelledByUserId: userId,
+      executionCancellation: { state: "requested", requestedAt: new Date().toISOString() },
+      startupCancellation: { errorCode: "cancelled", requestedAt: new Date().toISOString(), beforeNativeSelection: false } });
+    // routes/issues.ts operatorInterruptCancelOptions for a board user, through cancelRun.
+    const interruptFields = (userId: string, issueId: string) => ({ ...stopFields(userId),
+      cancellation: { reason: "Interrupted to send queued messages", source: "operator", expected: true,
+        initiator: { id: userId, type: "user" }, recordedAt: new Date().toISOString() },
+      operatorInterrupted: true, interruptionSource: "issue_comment_interrupt", interruptedIssueId: issueId,
+      interruptedByActorType: "user", interruptedByActorId: userId,
+      startupCancellation: { errorCode: "operator_interrupted", requestedAt: new Date().toISOString(), beforeNativeSelection: false } });
+
+    let seq = 0;
+    const event = (f: { companyId: string; agentId: string }, runId: string, eventType: string, kind?: string, itemId?: string) =>
+      db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId, seq: ++seq, eventType,
+        sourceEventId: `src-${randomUUID()}`, payload: { prpEvent: { turnId: `turn-${runId}`, itemId: itemId ?? `item-${seq}`,
+          eventType, payload: kind ? { kind, item: { type: kind } } : { status: "inProgress" } } } });
+
+    /** The message's own run (wakeCommentId/wakeCommentIds, an empty first-turn
+     * input, as a33cd4db), ended with the given record; read = it logged the
+     * first-turn userMessage and an assistant item after it. */
+    async function stoppedRun(f: Awaited<ReturnType<typeof fixture>>, commentId: string, r: { status?: string;
+      errorCode?: string | null; resultJson?: Record<string, unknown> | null; read?: boolean; finishedAt: Date }) {
+      const [row] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        status: r.status ?? "cancelled", runtimeMode: "native", nativeIssueId: f.issueId,
+        contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: commentId, commentId,
+          wakeCommentIds: [commentId], firstTurnQueuedInput: { schema: "paperclip.first-turn-queued-input.v1", commentIds: [] } },
+        errorCode: r.errorCode === undefined ? "cancelled" : r.errorCode, error: null, resultJson: r.resultJson ?? null,
+        createdAt: new Date(r.finishedAt.getTime() - 30_000), startedAt: new Date(r.finishedAt.getTime() - 30_000),
+        finishedAt: r.finishedAt }).returning();
+      await event(f, row!.id, "turn.started");
+      if (r.read ?? true) {
+        await event(f, row!.id, "item.started", "userMessage", `turn:pi-user:${commentId}`);
+        await event(f, row!.id, "item.started", "reasoning");
+        await event(f, row!.id, "item.started", "agentMessage");
+      }
+      await event(f, row!.id, "turn.cancelled");
+      return row!.id;
+    }
+
+    /** A message at T, its run stopped at T + 30 s (as gate 1). */
+    async function stopCase(resultJson: (f: Awaited<ReturnType<typeof fixture>>) => Record<string, unknown> | null,
+      opts: { errorCode?: string | null; status?: string; read?: boolean } = {}) {
+      const f = await fixture();
+      const commentId = await f.message("Please write the file.");
+      const t = new Date(Date.now() - 3 * 60_000);
+      await db.update(issueComments).set({ createdAt: t }).where(eq(issueComments.id, commentId));
+      const runId = await stoppedRun(f, commentId, { ...opts, resultJson: resultJson(f), finishedAt: new Date(t.getTime() + 30_000) });
+      // Later fixture rows come after the Stop.
+      f.at(t.getTime() + 31_000 - f.at(0).getTime());
+      const sweepAt = (ms: number) => settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId,
+        now: new Date(t.getTime() + ms) });
+      return { ...f, commentId, runId, t, sweepAt };
+    }
+
+    it("RED: the sender's Stop of the run that started answering -> no resend notice at +2 min, +11 min or a later sweep", async () => {
+      const f = await stopCase(f => stopFields(f.userId));
+      expect((await f.sweepAt(2 * 60_000)).kind).toBe("person_stopped");
+      expect((await f.sweepAt(11 * 60_000)).kind).toBe("person_stopped");
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+    });
+
+    it("RED: the sender's Interrupt (operator_interrupted) of the run that started answering -> no resend notice", async () => {
+      const f = await stopCase(f => interruptFields(f.userId, f.issueId), { errorCode: "operator_interrupted" });
+      expect((await f.sweepAt(2 * 60_000)).kind).toBe("person_stopped");
+      expect((await f.sweepAt(11 * 60_000)).kind).toBe("person_stopped");
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+    });
+
+    it("RED scope: a message the stopped run carried but had NOT read (acked, unread steer), neither carried on nor held -> its notice stays", async () => {
+      const f = await stopCase(f => stopFields(f.userId));
+      const steer = await f.message("Also add a test.");
+      const t = new Date(f.t.getTime() + 20_000);
+      await db.update(issueComments).set({ createdAt: t }).where(eq(issueComments.id, steer));
+      // The provider acknowledged the steer; no later userMessage read it before the cut.
+      await event(f, f.runId, "item.completed", "steering_acknowledgement", `turn:steer:${steer}`);
+      await f.sweep();
+      const notes = await f.visible();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${steer}`);
+      expect(notes[0]!.body).toBe(NO_RUN);
+    });
+
+    it("RED scope: the run's own message that the model had NOT read yet (no userMessage item) -> its notice stays", async () => {
+      const f = await stopCase(f => stopFields(f.userId), { read: false });
+      await f.sweep();
+      expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+    });
+
+    it("scope: an unread message the stop carried on into the next turn (held, deferred) -> no resend notice", async () => {
+      const f = await stopCase(f => stopFields(f.userId));
+      const queued = await f.message("And then deploy.");
+      // gatherPersonStoppedChatMessages: the held list, one deferred queue after the Stop.
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+        reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedByActorType: "user",
+        requestedByActorId: f.userId, payload: { issueId: f.issueId, commentId: queued,
+          executionWait: { reason: "person_stopped", message: "Held after your Stop." } } });
+      await f.sweep();
+      expect((await f.visible()).filter(note => note.body !== WAITING)).toHaveLength(0);
+    });
+
+    it("RED Interrupt -> its successor FAILS -> exactly one true notice (the successor's own)", async () => {
+      const f = await stopCase(f => interruptFields(f.userId, f.issueId), { errorCode: "operator_interrupted" });
+      const interrupting = await f.message("Stop that, do this instead.");
+      const successor = await f.run({ commentId: interrupting, status: "failed", errorCode: "adapter_failed" });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented",
+        wakeCommentId: interrupting, wakeCommentIds: [f.commentId, interrupting] } }).where(eq(heartbeatRuns.id, successor));
+      await f.sweep();
+      await f.sweep();
+      const notes = await f.visible();
+      expect(notes.map(note => note.body)).toEqual([NOT_ANSWERED]);
+      expect(notes[0]!.metadata).toMatchObject({ authorizationReason: `unanswered_message:${interrupting}`, sourceRunId: successor });
+    });
+
+    it("RED Interrupt -> its successor NEVER STARTS -> one true notice within the existing bound", async () => {
+      const f = await stopCase(f => interruptFields(f.userId, f.issueId), { errorCode: "operator_interrupted" });
+      const interrupting = await f.message("Stop that, do this instead.");
+      await db.update(issueComments).set({ createdAt: new Date(f.t.getTime() + 31_000) }).where(eq(issueComments.id, interrupting));
+      const successor = await f.run({ commentId: interrupting, status: "queued" });
+      await db.update(heartbeatRuns).set({ createdAt: new Date(f.t.getTime() + 32_000) }).where(eq(heartbeatRuns.id, successor));
+      // The existing bounds run from the durable T0 the first deferral records.
+      expect((await settleAt(f, 0)).kind).toBe("pending");
+      expect((await settleAt(f, PENDING_WAIT_BOUND_MS + 1_000)).kind).toBe("noticed");
+      expect((await f.visible()).map(note => note.body)).toEqual([WAITING]);
+      await settleAt(f, PENDING_WAIT_START_BOUND_MS + 1_000);
+      await settleAt(f, PENDING_WAIT_START_BOUND_MS + 3 * 60_000);
+      const notes = await f.visible();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toBe(NO_RUN);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${interrupting}`);
+    });
+
+    it("guard: another board user's Stop keeps the notice", async () => {
+      const f = await stopCase(() => stopFields(`user-${randomUUID()}`));
+      await f.sweep();
+      expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+    });
+
+    it("guard: a managing agent's Stop keeps the notice", async () => {
+      const f = await stopCase(f => ({ cancelledByActorType: "agent", cancelledByAgentId: f.agentId,
+        executionCancellation: { state: "requested" } }), { errorCode: "operator_interrupted" });
+      await f.sweep();
+      expect((await f.visible())).toHaveLength(1);
+    });
+
+    it.each([["system cancel", null], ["watchdog", { cancellation: { source: "control_plane", expected: true,
+      initiator: { type: "system", id: "active-run-watchdog" } }, executionCancellation: { state: "requested" } }]])(
+      "guard: a %s keeps the notice", async (_name, resultJson) => {
+        const f = await stopCase(() => resultJson as Record<string, unknown> | null);
+        await f.sweep();
+        expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+      });
+
+    it("guard: a converted stop (unconfirmed -> recovery -> failed) keeps a true line", async () => {
+      const f = await stopCase(f => stopFields(f.userId), { status: "failed", errorCode: "runner_process_termination_unconfirmed" });
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(1);
+    });
+
+    it("guard: an agent pause keeps the true pause note", async () => {
+      const f = await stopCase(f => stopFields(f.userId), { errorCode: "agent_paused" });
+      await f.sweep();
+      const notes = await f.visible();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
+    });
+
+    it("guard: after the Stop, a NEW message whose run fails gets its own notice", async () => {
+      const f = await stopCase(f => stopFields(f.userId));
+      const again = await f.message("Try again please.");
+      await f.run({ commentId: again, status: "failed", errorCode: "adapter_failed" });
+      await f.sweep();
+      const notes = await f.visible();
+      expect(notes.map(note => note.body)).toEqual([NOT_ANSWERED]);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${again}`);
+    });
+
+    it("a pre-existing resend notice for the stopped message is superseded by the sweep", async () => {
+      const f = await stopCase(() => null);
+      await f.sweep();
+      expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+      // The run's recorded fields are the person's Stop (as at gate 1, where the
+      // notice was posted from the cancelled run before this rule existed).
+      await db.update(heartbeatRuns).set({ resultJson: stopFields(f.userId) }).where(eq(heartbeatRuns.id, f.runId));
+      const [flagged] = await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+        unansweredPersonMessageCommentCondition()));
+      expect(flagged).toBeDefined();
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+    });
+  });
+
 });
