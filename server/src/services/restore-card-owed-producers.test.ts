@@ -6,7 +6,8 @@ import { agents, companies, createDb, environmentLeases, environments, execution
 import { recoveryPostgresSupport, startRecoveryPostgres } from "../__tests__/helpers/recovery-postgres.js";
 import { preserveRemoteWorkspacePreparationFailure } from "./native-runtime/native-workspace-finalization-state.js";
 import { allowLegacyShutdownWorkspaceCleanup } from "./legacy-shutdown-workspace-settlement.js";
-import { recordLegacyWorkspaceRestoreFailure, terminalizeLegacyExecution, UNRESTORED_FILES_NEXT_ACTION } from "./legacy-execution-recovery.js";
+import { recordLegacyWorkspaceRestoreFailure, recordRequiredWorkspaceRestoreFailure, terminalizeLegacyExecution,
+  UNRESTORED_FILES_NEXT_ACTION } from "./legacy-execution-recovery.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 
 // Literal on purpose: the words the person reads while files are only owed.
@@ -81,10 +82,12 @@ const RECOVERING_TEXT = "Recovering your saved work; your message is kept and ru
     "workspaceRestoreFailure", "workspaceRestoreRecovery"];
   const evidenceKeys = (evidence: Record<string, unknown>) =>
     Object.keys(evidence).filter(key => evidence[key] !== undefined && key !== "workspaceRestorePending").sort();
-  const expectOwedHold = async (f: Awaited<ReturnType<typeof seed>>) => {
-    // Run row: exactly today's marker, nothing new (DB index keys on it).
+  const expectOwedHold = async (f: Awaited<ReturnType<typeof seed>>, pending = false) => {
+    // Run row: today's marker unchanged (DB index keys on it); restore-card3
+    // adds only the sibling owed fact, set with the hold, absent for a failure.
     expect(await runResult(f.runId)).toEqual({ workspaceRestoreFailure: "restore_failed",
-      workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [f.leaseId] } });
+      workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [f.leaseId] },
+      ...(pending ? { workspaceRestorePending: true } : {}) });
     const action = await hold(f.companyId);
     expect(action).toMatchObject({ status: "resolved", outcome: "blocked", cause: "legacy_execution_requires_reconciliation",
       evidence: { runId: f.runId, workspaceRestoreFailure: "restore_failed", automaticRecovery: { replay: "blocked" } } });
@@ -96,7 +99,7 @@ const RECOVERING_TEXT = "Recovering your saved work; your message is kept and ru
   it("(2) a legacy prepared remote workspace after a failure (files owed) says recovering", async () => {
     const f = await seed();
     expect(await preserveRemoteWorkspacePreparationFailure(db, f.lease)).not.toBeNull();
-    const action = await expectOwedHold(f);
+    const action = await expectOwedHold(f, true);
     expect(action.evidence.workspaceRestorePending).toBe(true);
     expect(action.nextAction).toBe(RECOVERING_TEXT);
     expect((await getExecutionBlocker(db, f.companyId, f.issueId))!.nextAction).not.toContain("could not be put back");
@@ -105,7 +108,7 @@ const RECOVERING_TEXT = "Recovering your saved work; your message is kept and ru
   it("(3) a legacy shutdown whose export deadline passed (files owed) says recovering", async () => {
     const f = await seed({ status: "interrupted", shutdownMarker: true });
     expect(await allowLegacyShutdownWorkspaceCleanup(db, f.lease)).toBe(true);
-    const action = await expectOwedHold(f);
+    const action = await expectOwedHold(f, true);
     expect(action.evidence.workspaceRestorePending).toBe(true);
     expect(action.nextAction).toBe(RECOVERING_TEXT);
     expect((await getExecutionBlocker(db, f.companyId, f.issueId))!.nextAction).not.toContain("could not be put back");
@@ -144,5 +147,39 @@ const RECOVERING_TEXT = "Recovering your saved work; your message is kept and ru
     expect(action.evidence).toMatchObject({ workspaceRestoreFailure: "restore_failed" });
     expect(action.evidence).not.toHaveProperty("workspaceRestorePending");
     expect(action.nextAction).toBe(UNRESTORED_FILES_NEXT_ACTION);
+  }, 120_000);
+  // restore-card3 (B): the legacy reconciliation card (upsertSourceScoped) reads
+  // the owed fact the hold authority recorded, not the raw failure marker.
+  it("(B) the reconciliation card for owed files says recovering", async () => {
+    const f = await seed({ status: "running", lease: false });
+    await recordRequiredWorkspaceRestoreFailure(db, f.run, { workspaceRestoreFailure: "restore_failed" }, undefined,
+      { restorePending: true });
+    const [owed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(owed.resultJson).toEqual({ workspaceRestoreFailure: "restore_failed", workspaceRestorePending: true });
+    await terminalizeLegacyExecution({ db, run: owed, status: "failed" });
+    const action = await hold(f.companyId);
+    expect(action.cause).toBe("legacy_execution_requires_reconciliation");
+    expect(action.evidence).toMatchObject({ workspaceRestoreFailure: "restore_failed", workspaceRestorePending: true });
+    expect(action.nextAction).toBe(RECOVERING_TEXT);
+  }, 120_000);
+
+  // restore-card3 (C): the run's owed fact is written with the hold and cleared
+  // when a real copy-back failure is recorded; the hold then ends failed + Retry.
+  it("(C) a pending hold that later really fails ends failed with the Retry words", async () => {
+    const f = await seed();
+    expect(await preserveRemoteWorkspacePreparationFailure(db, f.lease)).not.toBeNull();
+    const pending = await expectOwedHold(f, true);
+    expect(pending.nextAction).toBe(RECOVERING_TEXT);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await recordLegacyWorkspaceRestoreFailure(db, run, { workspaceRestoreFailure: "restore_failed" }, f.lease);
+    const action = await expectOwedHold(f, false);
+    expect(action.evidence).not.toHaveProperty("workspaceRestorePending");
+    expect(action.nextAction).toBe(UNRESTORED_FILES_NEXT_ACTION);
+    expect(action.nextAction).toContain("Press Retry");
+    // The blocker shows the same failure words; execution-blocker (unchanged)
+    // only swaps the Retry sentence while the legacy hold disables Retry.
+    const blocker = (await getExecutionBlocker(db, f.companyId, f.issueId))!;
+    expect(blocker.nextAction).toContain("could not be put back");
+    expect(blocker.nextAction).not.toContain("Recovering");
   }, 120_000);
 });

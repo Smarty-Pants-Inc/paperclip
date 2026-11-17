@@ -14,3 +14,13 @@ it("separates explicit missing-response evidence from the restore failure", () =
 it.each(["/host/secret", "../escape", "file -> /secret", "C:\\host\\secret", "tmp/private-clone/file"])("omits diagnostic path %s", (workspaceRestorePath) => {
   expect(workspaceRestoreMarkerDetail({ result: { workspaceRestorePath }, savedPlan: false, hasResponse: true })).not.toContain("Affected path");
 });
+
+// restore-card3: owed files (the server's workspaceRestorePending fact) never say failed.
+it("says recovering, not failed, for files that are only owed", () => {
+  const detail = workspaceRestoreMarkerDetail({ result: { workspaceRestoreFailure: "restore_failed", workspaceRestorePending: true },
+    savedPlan: false, hasResponse: true });
+  expect(detail).toContain("Recovering your saved work");
+  expect(detail.toLowerCase()).not.toContain("failed");
+  expect(workspaceRestoreMarkerDetail({ result: { workspaceRestoreFailure: "restore_failed" }, savedPlan: false, hasResponse: true }))
+    .toBe("Workspace restore failed. Workspace files need recovery.");
+});
