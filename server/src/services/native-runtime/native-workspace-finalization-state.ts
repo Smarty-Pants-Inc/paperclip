@@ -6,6 +6,7 @@ import { recordRequiredWorkspaceRestoreFailure, workspaceRestoreOnlyOwed } from 
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import { abandonedWorkspaceFilesHeldOnLease } from "../remote-workspace-abandoned-files-hold.js";
 import { matchPreparedRemoteWorkspaceSource, preparedRemoteWorkspaceSource, type WorkspaceSourceLease } from "../remote-workspace-lifecycle.js";
+import { handedOffWarmLeaseOwedToSuccessor } from "./warm-handoff-successor.js";
 
 /** File-only recovery for setup that never reached native admission. The live
  * preparer must still own its controller; orphan repair accepts terminal runs
@@ -104,7 +105,12 @@ export async function nativeWorkspaceExportPendingForLease(db: Db, lease: Worksp
   return await held();
 }
 
-export async function nativeWorkspaceExportPendingForResource(db: Db, lease: WorkspaceSourceLease, resumingRunId: string | null) {
+export async function nativeWorkspaceExportPendingForResource(db: Db, lease: WorkspaceSourceLease, resumingRunId: string | null,
+  options: {
+    /** pl/warm-reuse-owed: the acquiring run. A handed-off warm predecessor's
+     * pending export on THIS candidate lease is owed to its direct successor. */
+    handoffSuccessorRunId?: string | null;
+  } = {}) {
   if (!lease.provider || !lease.providerLeaseId || lease.provider === "local") return false;
   const sources = await db.select({ lease: { id: environmentLeases.id, companyId: environmentLeases.companyId,
     heartbeatRunId: environmentLeases.heartbeatRunId, provider: environmentLeases.provider, providerLeaseId: environmentLeases.providerLeaseId,
@@ -123,7 +129,12 @@ export async function nativeWorkspaceExportPendingForResource(db: Db, lease: Wor
     const remote = matchPreparedRemoteWorkspaceSource({ lease: source.lease, run: { ...source.run,
       issueId: source.run.nativeIssueId ?? source.run.issueId ?? source.run.contextIssueId,
       reference: source.run.remoteReference, legacyReference: source.run.reference } }, source.workspace);
-    if (remote || nativeWorkspaceSourcePending(source.run, source.lease)) return true;
+    if (!remote && !nativeWorkspaceSourcePending(source.run, source.lease)) continue;
+    // Per SOURCE ROW: only the candidate lease's own predecessor run, never another allocation on the box.
+    if (options.handoffSuccessorRunId && source.lease.id === lease.id && source.run.id === source.lease.heartbeatRunId
+      && await handedOffWarmLeaseOwedToSuccessor(db, { companyId: source.lease.companyId, leaseId: source.lease.id,
+        successorRunId: options.handoffSuccessorRunId })) continue;
+    return true;
   }
   return false;
 }
