@@ -149,6 +149,38 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(outcome).toEqual({ kind: "explained" });
   });
 
+  // Keep: review-fleet-5 caught the stale-card NEGATIVE remedy matching /retry/.
+  // Same run, live notice and linked action: only the positive remedy covers it.
+  it("one-note4: do not retry from this older card does not suppress the same-run resend note", async () => {
+    const f = await setupFailureWithRetryNotice({
+      nextAction: "The latest run changed; do not retry from this older card. Paperclip is refreshing recovery for the current run.",
+    });
+    expect((await f.notes())[0]!.metadata?.sourceRunId).toBe(f.runId);
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
+    expect(await f.notes()).toHaveLength(2);
+    const visible = await f.visible();
+    expect(visible).toHaveLength(1);
+    expect(visible[0]!.body).toBe(NOT_ANSWERED);
+    expect(codeOf(visible[0]!)).toBe("setup_failed");
+    expect(visible[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.messageId}`);
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
+    expect(await f.notes()).toHaveLength(2);
+  });
+
+  it.each([
+    "Press Retry to start it.",
+    "This attempt could not be finished. Press Retry to start it again from the saved work.",
+  ])("one-note4: positive same-run remedy still suppresses the resend note: %s", async nextAction => {
+    const f = await setupFailureWithRetryNotice({ nextAction });
+    expect((await f.notes())[0]!.metadata?.sourceRunId).toBe(f.runId);
+    for (let pass = 0; pass < 2; pass++) {
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "explained" });
+      const notes = await f.notes();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.id).toBe(f.commentId);
+    }
+  });
+
   it("one-note: a second failure keeps after 2 tries without a second remedy", async () => {
     const f = await setupFailureWithRetryNotice({ attempts: 2 });
     const outcome = await settleUnansweredPersonMessage(db, f);

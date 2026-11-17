@@ -93,6 +93,24 @@ describe("humanizeSystemNotice", () => {
     })).toEqual({ title: "Automatic recovery blocked", tone: "danger" });
   });
 
+  // Keep: all default/classified titles emitted by stranded-notice.ts must
+  // survive, while the same single-attempt bodies still work without one.
+  it.each([
+    "Automatic recovery blocked",
+    "Error: usage limit reached",
+    "Error: not logged in to Claude",
+    "Error: agent login required",
+  ].flatMap(title => [
+    "Paperclip could not start this task. Press Retry to start it.",
+    "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
+  ].map(body => ({ title, body }))))("one-note4: humanizes $title / $body", ({ title, body }) => {
+    expect(humanizeSystemNotice({
+      body,
+      presentation: { kind: "system_notice", title, tone: "danger", detailsDefaultOpen: false },
+    })).toEqual({ title, tone: "danger" });
+    expect(humanizeSystemNotice({ body })).toEqual({ title: "Task could not continue", tone: "warning" });
+  });
+
   it.each([
     // CONTINUATION_REFUSED_NOTICE in server/src/services/recovery/service.ts.
     "Paperclip could not continue this task on its own. The earlier Retry or message no longer matches the task, "
