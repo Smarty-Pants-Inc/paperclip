@@ -36,7 +36,9 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
       queuedCommentSourceWakeIds: [wakeId], firstTurnQueuedInput: null, commentContinuation: true });
   });
 
-  it("carries the parent's comment ids as-is; a later reply does not erase them", async () => {
+  it("supersedes(ANSWERED blob, RFL 21:28Z/22:41Z): carries the parent's comment ids as-is; a later reply does not erase them", async () => {
+    // Reason: the carry reads ANSWERED (completedPersonMessageAnswerSql). The FAILED parent's own reply is a
+    // progress reply, DELIVERED only, so the comment is still carried (RFL F1); a completed run's final answer ends it.
     const f = await fixture();
     const [other] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, contextSnapshot: { issueId: f.issueId } }).returning();
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
@@ -51,8 +53,14 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
       createdByRunId: earlierRun.id, body: "Answer to the earlier one" });
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
-      createdByRunId: f.run.id, body: "COBALT" });
-    // RFL ruling (1), 20:06Z: the parent's OWN published reply answers the comment (carrying it would answer it twice).
+      createdByRunId: f.run.id, body: "COBALT (progress)" });
+    // RFL F1 21:28Z: the FAILED parent's own reply is DELIVERED, not ANSWERED: the carry still carries the comment.
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
+    const [done] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      status: "succeeded", contextSnapshot: { issueId: f.issueId, wakeCommentIds: [f.message.id] } }).returning();
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: done.id, body: "COBALT" });
+    // A completed run that carried the comment as its OWN input published the final answer: ANSWERED, never carried again.
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
   });
 
