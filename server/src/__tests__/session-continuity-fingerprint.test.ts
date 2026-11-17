@@ -49,10 +49,10 @@ function withEnvironmentConfig(patch: Record<string, unknown>, revisionAt?: stri
 }
 
 describe("session config fingerprint: non-identity saves keep the session (#20853 PART 1)", () => {
-  it("(R1, a) an agent idleTimeoutMs-only change keeps the fingerprint", async () => {
+  it("(superseded by replacement: upstream #21862 fingerprint includes idle-timeout, RFL record 03:56Z) (R1, a) an agent idleTimeoutMs-only change changes the fingerprint", async () => {
     const changed = base();
     changed.effectiveAdapterConfig = { ...changed.effectiveAdapterConfig, idleTimeoutMs: 300_000 };
-    expect(await fingerprint(changed)).toBe(await fingerprint(base()));
+    expect(await fingerprint(changed)).not.toBe(await fingerprint(base()));
   });
 
   it("(R2, b) a new config revision row (new id, time, changed keys) with the same content keeps the fingerprint", async () => {
@@ -65,9 +65,9 @@ describe("session config fingerprint: non-identity saves keep the session (#2085
     expect(await fingerprint(withEnvironmentConfig({}, "2026-11-16T06:28:00.000Z"))).toBe(await fingerprint(base()));
   });
 
-  it("(R5, f) environment lifecycle timing (runnerIdleTimeoutMs, ttlSeconds, runnerReconnectGraceMs) keeps the fingerprint", async () => {
+  it("(superseded by replacement: upstream #21862 fingerprint includes idle-timeout, RFL record 03:56Z) (R5, f) environment lifecycle timing (runnerIdleTimeoutMs, ttlSeconds, runnerReconnectGraceMs) changes the fingerprint", async () => {
     for (const patch of [{ runnerIdleTimeoutMs: 300_000 }, { ttlSeconds: 7_200 }, { runnerReconnectGraceMs: 60_000 }]) {
-      expect(await fingerprint(withEnvironmentConfig(patch, "2026-11-16T06:28:00.000Z"))).toBe(await fingerprint(base()));
+      expect(await fingerprint(withEnvironmentConfig(patch, "2026-11-16T06:28:00.000Z"))).not.toBe(await fingerprint(base()));
     }
   });
 });

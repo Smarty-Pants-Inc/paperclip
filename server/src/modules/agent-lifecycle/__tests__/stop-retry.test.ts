@@ -153,7 +153,7 @@ describe("bounded lifecycle Stop recovery", () => {
   });
   // Keep reason: #20807 (c), failure path spanning the real Stop worker,
   // durable task ownership, the public lifecycle read/Retry and Resume commands.
-  it("makes exhausted unconfirmed Stop actionable without releasing its task until proof arrives", async () => {
+  it("(superseded by replacement: upstream #21788 never-park, RFL 02:24Z) keeps an unconfirmed Stop retrying without releasing its task until proof arrives", async () => {
     const agent = await fixture("pausing");
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",
       invocationSource: "on_demand", runtimeMode: "legacy", executionStage: "dispatching",
@@ -169,15 +169,12 @@ describe("bounded lifecycle Stop recovery", () => {
     const currentTask = async () => (await db.select().from(issues).where(eq(issues.id, task.id)))[0]!;
     try {
       for (let attempt = 0; attempt < 5; attempt++) { await due(agent.id); await worker.process(agent.id); }
-      // This is the public lifecycle read used by the existing Retry surface,
-      // not just an internal log or worker counter.
-      expect((await commands.get(agent.id))?.lifecycleError).toContain("lifecycle_stop_retry_required");
-      expect((await commands.get(agent.id))?.lifecycleError).toContain(`invocation ${run.id}`);
-      expect((await current(agent.id)).lifecycleOperation?.retryRequired).toBe(true);
+      // Upstream #21788: an unconfirmed Stop keeps retrying with its recorded
+      // blocker; it never parks itself and never invents Stop proof.
+      expect((await current(agent.id)).lifecycleOperation?.retryRequired).toBeUndefined();
+      expect((await current(agent.id)).lifecycleOperation).toMatchObject({ pendingReason: "legacy_stop_unproven", pendingPasses: 5 });
       expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(0);
       expect(await currentTask()).toEqual(task);
-      // Retry is not permission to invent Stop proof, or remove a manual hold.
-      await commands.retry(agent.id); await worker.process(agent.id);
       expect((await current(agent.id)).lifecycleState).toBe("pausing");
       expect((await current(agent.id)).lifecycleHolds).toEqual(["manual"]);
       expect(await currentTask()).toEqual(task);
