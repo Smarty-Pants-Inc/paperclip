@@ -318,6 +318,30 @@ export function boundedCodexPayload(
   return record(boundedCodexValue(value));
 }
 
+/**
+ * Completed prose is the answer, not a diagnostic preview. Retain it once,
+ * redacted before any bounding, while keeping provider metadata under the
+ * existing retained-payload limits. Pi already pages streamed text and applies
+ * its whole-answer/spill contract before the facade reaches this boundary.
+ */
+export function boundedCodexCompletedPayload(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  if (value.kind !== "agentMessage" && value.kind !== "reasoning") {
+    return boundedCodexPayload(value);
+  }
+  const item = { ...record(value.item) };
+  delete item.text;
+  if (value.kind === "reasoning") delete item.summary;
+  const { text: answer, ...metadata } = value;
+  const retained = boundedCodexPayload({ ...metadata, item });
+  // Oversized metadata must not replace the answer's whole payload either.
+  const safeMetadata = retained.truncated === true
+    ? { kind: value.kind, channel: value.channel, item: retained }
+    : retained;
+  return { ...safeMetadata, text: redactCodexDiagnostic(typeof answer === "string" ? answer : "") };
+}
+
 export function isRetainableCodexPayload(value: unknown): boolean {
   try {
     return (
