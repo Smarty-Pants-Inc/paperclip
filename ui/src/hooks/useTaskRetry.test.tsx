@@ -44,9 +44,7 @@ describe("optimistic task Retry", () => {
     ["a Retry that admission refused", { requestId: "retry", accepted: false, stale: false,
       refused: { reason: "previous_execution_unverified", message: "Retry can't continue because Paperclip can't confirm that the previous attempt stopped before it started work." } },
       "can't confirm that the previous attempt stopped"],
-    ["a Retry accepted and held behind a restore hold", { requestId: "retry", accepted: true, stale: false,
-      held: { reason: "workspace_repair_required", message: "Recovering your saved work; your message is kept and runs when it's back." } },
-      "your message is kept and runs when it's back"],
+    // fam-retry4: an accepted, held Retry is the held state, not an error (test below).
     ["a scheduled retry held by a gate", { requestId: "retry", accepted: true, stale: false,
       scheduledRetry: { outcome: "gate_suppressed" as const, message: "The company budget is paused." } }, "The company budget is paused."],
     ["a scheduled retry still waiting", { requestId: "retry", accepted: true, stale: false,
@@ -62,6 +60,35 @@ describe("optimistic task Retry", () => {
     expect(container.textContent).not.toContain("Thinking");
     await render({ ...waiting, interruption: { ...presentation, state: "working", canRetry: false } } as Issue);
     expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+  // fam-retry4 (rf-3 J6): the one Retry authority's accept-held state renders the
+  // same before and after an accepted held click: the hold's words, no Retry
+  // button, no error (the chat offers none either: TaskChatThread.test.tsx).
+  it("fam-retry4: an accept-held restore hold is one held state before and after the click", async () => {
+    const words = "Recovering your saved work; your message is kept and runs when it's back.";
+    const held = { intentId: "intent", responsibility: "system" as const, state: "failed" as const, canRetry: false,
+      retryAdmission: "held" as const, retryWait: { reason: "workspace_repair_required", message: words },
+      nextRetryAt: null, userAction: null, sourceRunIds: ["failed-run"], observedRunId: "failed-run" };
+    function Card({ task }: { task: Issue }) {
+      const retry = useTaskRetry(task);
+      return <><button data-testid="trigger" onClick={retry.retry}>click</button>
+        <ExecutionBlockerNotice presentation={task.interruption} canRetry onRetry={retry.retry}
+          optimistic={retry.optimistic} error={retry.error} {...({ held: (retry as { held?: string | null }).held } as object)} /></>;
+    }
+    const task = { ...issue, interruption: held } as Issue;
+    await act(async () => root.render(<QueryClientProvider client={client}><Card task={task} /></QueryClientProvider>));
+    const snapshot = () => ({ held: container.querySelector('[data-testid="task-execution-held"]')?.textContent ?? null,
+      retry: Boolean(container.querySelector('[data-testid="task-execution-retry"]')),
+      alert: Boolean(container.querySelector('[role="alert"]')), failure: Boolean(container.querySelector(".bg-destructive\\/10")) });
+    console.log("DOM fam-retry4 before:", container.innerHTML);
+    expect.soft(snapshot()).toEqual({ held: words, retry: false, alert: false, failure: false });
+    const after = { ...held, state: "retry_scheduled" as const };
+    vi.mocked(issuesApi.retryTask).mockResolvedValue({ requestId: "retry", accepted: true, stale: false,
+      held: { reason: "workspace_repair_required", message: words }, presentation: after } as Awaited<ReturnType<typeof issuesApi.retryTask>>);
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="trigger"]')!.click());
+    await act(async () => root.render(<QueryClientProvider client={client}><Card task={{ ...task, interruption: after } as Issue} /></QueryClientProvider>));
+    console.log("DOM fam-retry4 after:", container.innerHTML);
+    expect.soft(snapshot()).toEqual({ held: words, retry: false, alert: false, failure: false });
   });
   it("sends the move-forward intent from the offer and says plainly when the task already moved on", async () => {
     const presentation = { intentId: null, responsibility: "system" as const, state: "working" as const, canRetry: true,

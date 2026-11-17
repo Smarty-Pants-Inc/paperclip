@@ -1770,6 +1770,28 @@ describe("fam-retry4 held note", () => {
   });
 });
 
+// fam-retry4 (rf-3 J6): the chat consumes the card's accept-held authority:
+// no chat Retry for the held run (the card says the hold's words).
+describe("fam-retry4 accept-held chat", () => {
+  it("offers no chat Retry under the authority's held state", () => {
+    const onRetryFailedRun = vi.fn();
+    const linkedRuns = [{ runId: "held-run", runtimeMode: "legacy" as const, status: "failed", errorCode: "adapter_failed",
+      agentId: "agent-1", agentName: "Runner", adapterType: "grok_local",
+      createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z", finishedAt: "2026-08-25T18:00:02.000Z" }];
+    const held = { intentId: "intent", responsibility: "system" as const, state: "failed" as const, canRetry: false,
+      retryAdmission: "held" as const, retryWait: { reason: "workspace_repair_required", message: "Recovering your saved work; your message is kept and runs when it's back." },
+      nextRetryAt: null, userAction: null, sourceRunIds: ["held-run"], observedRunId: "held-run" };
+    for (const interruption of [held, { ...held, state: "retry_scheduled" as const }]) {
+      renderThread({ issueId: "issue-1", comments: [], onAdd: async () => {}, issueStatus: "in_progress", onRetryFailedRun,
+        interruption: interruption as never, linkedRuns: linkedRuns as never });
+      console.log("DOM fam-retry4 chat", interruption.state, container.textContent);
+      expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+      expect(container.textContent).not.toContain("You can retry this message now");
+    }
+    expect(onRetryFailedRun).not.toHaveBeenCalled();
+  });
+});
+
 describe("TaskChatThread draft pass-through", () => {
   it.each(["original", "changed"])("groups PAP-2525 native image uploads with %s receipt wording", async (wording) => {
     const comment = (id: string, body: string, runId?: string) => ({
