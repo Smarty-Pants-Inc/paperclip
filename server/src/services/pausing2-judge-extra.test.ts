@@ -38,7 +38,8 @@ vi.mock("./native-runtime/native-session-executor.js", async importOriginal => (
 const { heartbeatService } = await import("./heartbeat.js");
 const { environmentService } = await import("./environments.js");
 const { createAgentLifecycle, configureAgentLifecycle } = await import("./agent-lifecycle.js");
-const { createLifecycleDriver } = await import("./agent-lifecycle-driver.js");
+const { createLifecycleDriver, pauseProofBound, pauseBoundExport, PAUSE_STOP_UNCONFIRMED_ERROR, PAUSE_EXPORT_KEPT_ERROR } = await import("./agent-lifecycle-driver.js");
+const { remoteTerminationReceipt } = await import("./remote-execution-termination.js");
 const { agentExecutionStopBlocker } = await import("./agent-execution-stop.js");
 const { HANDED_OFF_WARM_EXIT_KEY, HANDED_OFF_WARM_STOP_KEY, handedOffWarmProofTimeout } = await import("./native-runtime/handed-off-warm-lease.js");
 
@@ -347,21 +348,170 @@ const support = await getEmbeddedPostgresTestSupport();
     } finally { proof.busy = false; await work.stop(); }
   }, 90000);
 
-  it.each(['502', 'hang'])('AUDIT P3 persistent %s must escape pausing into paused or an actionable failure', async mode => {
+  // (rf-4 ruling 22:32Z: P3 replaced) The documented stop_and_retain at the
+  // bound is OK, through the export-before-stop guard. Fake clock: Date only
+  // (timers stay real); each pass moves the clock past the lifecycle's retryAt,
+  // so the bound and the receipt bound are reached inside the test window.
+  async function clockedUntil(work: Awaited<ReturnType<typeof pause>>, f: { agentId: string; leaseId: string },
+    done: (agent: typeof agents.$inferSelect) => boolean, stepMs = 20_000, maxSteps = 30,
+    onPass?: (agent: typeof agents.$inferSelect, lease: typeof environmentLeases.$inferSelect) => void) {
+    let agent = (await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]!;
+    for (let step = 0; step < maxSteps && !done(agent); step++) {
+      await work.process(f.agentId).catch(() => undefined);
+      agent = (await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]!;
+      onPass?.(agent, (await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]!);
+      if (!done(agent)) vi.setSystemTime(Date.now() + stepMs);
+    }
+    return agent;
+  }
+  const errored = (agent: typeof agents.$inferSelect) => agent.lifecycleState === "paused"
+    || (agent.lifecycleError != null && agent.lifecycleOperation?.retryRequired === true);
+  /** The provider's stop-and-retain receipt (as settleStopOnlyCleanup writes it). */
+  async function receiptArrives(f: Awaited<ReturnType<typeof seedStoppedWarmTurn>>) {
+    const lease = await noSendLease(f);
+    const { sandboxStopAndRetain: intent, ...rest } = lease.metadata as Record<string, any>;
+    const now = new Date();
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", failureReason: null, releasedAt: now,
+      metadata: { ...rest, pendingCleanupInFlight: false,
+        remoteExecutionTermination: remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "stopped" }),
+        sandboxStopAndRetainReceipt: { schema: "paperclip.sandbox-stop-and-retain-receipt.v1", requestId: intent.requestId,
+          companyId: lease.companyId, runId: lease.heartbeatRunId, leaseId: lease.id, provider: lease.provider,
+          providerLeaseId: lease.providerLeaseId, pluginId: intent.pluginId, method: "environmentStopLease", confirmedAt: now.toISOString() } } })
+      .where(eq(environmentLeases.id, f.leaseId));
+  }
+
+  it.each(['502', 'hang'])("(rf-4 ruling 22:32Z: P3 replaced) persistent %s: bound <= 2 min (fake clock), stop intent only with no prepared descriptor, no receipt -> lifecycleError + retryRequired + 'Retry now'; Retry opens a NEW receipt window", async mode => {
     const f = await seedStoppedWarmTurn();
     const saved = handedOffWarmProofTimeout.ms;
     handedOffWarmProofTimeout.ms = 100;
     proof.calls = 0; proof.fail = mode === '502'; proof.hang = mode === 'hang';
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
     const work = await pause(f.agentId);
     try {
-      const agent = await processUntil(work, f.agentId, 'paused', 6500);
+      const start = Date.now();
+      let intentAt: number | null = null;
+      const agent = await clockedUntil(work, f, errored, 20_000, 30, (_agent, lease) => {
+        if (intentAt === null && lease.metadata?.sandboxStopAndRetain) intentAt = Date.now();
+      });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+      const a = await noSendLease(f);
       console.log('AUDIT_P3', JSON.stringify({ mode, calls: proof.calls, state: agent.lifecycleState, error: agent.lifecycleError,
-        operation: agent.lifecycleOperation, blocker: await agentExecutionStopBlocker(db, [f.agentId]) }));
+        boundMs: intentAt === null ? null : intentAt - start, errorMs: Date.now() - start, operation: agent.lifecycleOperation }));
       expect(proof.calls).toBeGreaterThan(1);
-      expect((await noSendLease(f)).metadata?.sandboxStopAndRetain).toBeUndefined();
-      expect(agent.lifecycleState === 'paused' || (agent.lifecycleError != null && agent.lifecycleOperation?.retryRequired === true)).toBe(true);
-    } finally { proof.fail = false; proof.hang = false; handedOffWarmProofTimeout.ms = saved; await work.stop(); }
-  }, 30000);
+      // The bound is reached within 2 min of the fake clock.
+      expect(intentAt).not.toBeNull();
+      expect(intentAt! - start).toBeLessThanOrEqual(pauseProofBound.ms);
+      // The stop intent was written with no prepared descriptor (export-before-stop guard).
+      expect((run.runnerProfileJson as Record<string, any>)?.remoteWorkspace?.state).not.toBe("prepared");
+      expect(a.metadata?.sandboxStopAndRetain).toMatchObject({ [HANDED_OFF_WARM_STOP_KEY]: true });
+      expect(a.metadata?.sandboxStopAndRetainReceipt).toBeUndefined();
+      // No receipt: never 'pausing' forever; a TRUE line with "Retry now".
+      expect(agent).toMatchObject({ lifecycleState: "pausing", lifecycleError: PAUSE_STOP_UNCONFIRMED_ERROR });
+      expect(agent.lifecycleOperation?.retryRequired).toBe(true);
+      expect(agent.lifecycleError).toContain("Retry now");
+      const firstWindow = (a.metadata?.handedOffWarmPauseProof as { stopRequestedAt: string }).stopRequestedAt;
+      // Retry now opens a NEW receipt window: the record's stopRequestedAt is reset, no error until the new bound.
+      vi.setSystemTime(Date.now() + 1_000);
+      await createAgentLifecycle(db).retry(f.agentId);
+      const retried = await clockedUntil(work, f, () => false, 20_000, 2);
+      const reset = (await noSendLease(f)).metadata?.handedOffWarmPauseProof as { stopRequestedAt: string };
+      expect(Date.parse(reset.stopRequestedAt)).toBeGreaterThan(Date.parse(firstWindow));
+      expect(retried).toMatchObject({ lifecycleState: "pausing", lifecycleError: null });
+      const again = await clockedUntil(work, f, errored);
+      expect(again.lifecycleError).toBe(PAUSE_STOP_UNCONFIRMED_ERROR);
+    } finally { vi.useRealTimers(); proof.fail = false; proof.hang = false; handedOffWarmProofTimeout.ms = saved; await work.stop(); }
+  }, 60000);
+
+  it("pausing4: the stop's receipt arrives after the bound's intent -> 'paused' (box stopped and kept)", async () => {
+    const f = await seedStoppedWarmTurn();
+    const saved = handedOffWarmProofTimeout.ms;
+    handedOffWarmProofTimeout.ms = 100;
+    proof.fail = true;
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
+    const work = await pause(f.agentId);
+    try {
+      await clockedUntil(work, f, () => false, 5_000, 3);
+      expect((await noSendLease(f)).metadata?.sandboxStopAndRetain).toBeTruthy();
+      await receiptArrives(f);
+      const agent = await clockedUntil(work, f, a => a.lifecycleState === "paused", 2_000, 5);
+      expect(agent).toMatchObject({ status: "paused", lifecycleState: "paused", lifecycleError: null });
+      expect(await noSendLease(f)).toMatchObject({ status: "released", cleanupStatus: "success", providerLeaseId: f.providerLeaseId });
+    } finally { vi.useRealTimers(); proof.fail = false; handedOffWarmProofTimeout.ms = saved; await work.stop(); }
+  }, 60000);
+
+  it("pausing4: a busy owner at the bound -> no stop, no TERM; stays 'pausing' with its true state (remote_stop_unconfirmed)", async () => {
+    const f = await seedStoppedWarmTurn();
+    const saved = handedOffWarmProofTimeout.ms;
+    handedOffWarmProofTimeout.ms = 100;
+    proof.calls = 0; proof.fail = true;
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
+    const work = await pause(f.agentId);
+    try {
+      await clockedUntil(work, f, () => false, 20_000, 2);
+      const callsBeforeBusy = proof.calls;
+      proof.busy = true;
+      // Past both bounds (attempts and 2 min) while the owner is busy.
+      const agent = await clockedUntil(work, f, () => false, 60_000, 4);
+      expect(proof.calls).toBe(callsBeforeBusy);
+      expect(agent).toMatchObject({ lifecycleState: "pausing", lifecycleError: null });
+      expect(agent.lifecycleOperation).toMatchObject({ pendingReason: "remote_stop_unconfirmed" });
+      expect(await agentExecutionStopBlocker(db, [f.agentId])).toBe("remote_stop_unconfirmed");
+      const a = await noSendLease(f);
+      expect(a.metadata?.sandboxStopAndRetain).toBeUndefined();
+      expect(a).toMatchObject({ status: "retained", cleanupStatus: "success", releasedAt: null });
+    } finally { vi.useRealTimers(); proof.busy = false; proof.fail = false; handedOffWarmProofTimeout.ms = saved; await work.stop(); }
+  }, 60000);
+
+  async function markPrepared(f: Awaited<ReturnType<typeof seedStoppedWarmTurn>>) {
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeResourceDisposition: "keep_running",
+      remoteWorkspace: { state: "prepared", leaseId: f.leaseId, providerLeaseId: f.providerLeaseId } } }).where(eq(heartbeatRuns.id, f.sourceRunId));
+  }
+
+  it("pausing4: a 'prepared' turn at the bound whose export can't finish -> KEPT (no stop intent) + a true line + Retry now", async () => {
+    const f = await seedStoppedWarmTurn();
+    await markPrepared(f);
+    const saved = handedOffWarmProofTimeout.ms;
+    handedOffWarmProofTimeout.ms = 100;
+    proof.fail = true;
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
+    const work = await pause(f.agentId);
+    try {
+      const agent = await clockedUntil(work, f, errored);
+      expect(agent).toMatchObject({ lifecycleState: "pausing", lifecycleError: PAUSE_EXPORT_KEPT_ERROR });
+      expect(agent.lifecycleOperation?.retryRequired).toBe(true);
+      const a = await noSendLease(f);
+      expect(a.metadata?.sandboxStopAndRetain).toBeUndefined();
+      expect(a).toMatchObject({ status: "retained", cleanupStatus: "success", releasedAt: null });
+    } finally { vi.useRealTimers(); proof.fail = false; handedOffWarmProofTimeout.ms = saved; await work.stop(); }
+  }, 60000);
+
+  it("pausing4: a 'prepared' turn at the bound is exported first (finalized), THEN the stop intent; receipt -> 'paused'", async () => {
+    const f = await seedStoppedWarmTurn();
+    await markPrepared(f);
+    const saved = handedOffWarmProofTimeout.ms, savedFinish = pauseBoundExport.finish;
+    handedOffWarmProofTimeout.ms = 100;
+    proof.fail = true;
+    const order: string[] = [];
+    // Stand-in for the cancel-finalize export owner (its real export is
+    // cancel-finalize-warm-stop.test.ts): it finalizes the descriptor.
+    pauseBoundExport.finish = async (database, run) => {
+      const [lease] = await database.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+      order.push(lease.metadata?.sandboxStopAndRetain ? "stop-before-export" : "export");
+      await database.update(heartbeatRuns).set({ runnerProfileJson: { nativeResourceDisposition: "keep_running",
+        remoteWorkspace: { state: "finalized", leaseId: f.leaseId, providerLeaseId: f.providerLeaseId } } }).where(eq(heartbeatRuns.id, run.id));
+      return { outcome: "finalized" };
+    };
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
+    const work = await pause(f.agentId);
+    try {
+      await clockedUntil(work, f, () => false, 5_000, 3);
+      expect(order).toEqual(["export"]);
+      expect((await noSendLease(f)).metadata?.sandboxStopAndRetain).toBeTruthy();
+      await receiptArrives(f);
+      const agent = await clockedUntil(work, f, a => a.lifecycleState === "paused", 2_000, 5);
+      expect(agent).toMatchObject({ lifecycleState: "paused", lifecycleError: null });
+    } finally { vi.useRealTimers(); pauseBoundExport.finish = savedFinish; proof.fail = false; handedOffWarmProofTimeout.ms = saved; await work.stop(); }
+  }, 60000);
 
   it("pausing2 NEG: proof timeout -> 'pausing' (no stamp, no stop intent); the next attempt proves -> 'paused'", async () => {
     const f = await seedStoppedWarmTurn();
