@@ -419,6 +419,30 @@ suite("fresh-continuation fallback", () => {
     expect(counts).toEqual({ silent: [1, 1, 1, 1], answered: 0, grace: 0 });
   }, 120_000);
 
+  // F3 D126 (stack135 fix7): an agent answer committed while the sweep waits on
+  // the conversation fence (the `conversation-delivery:<issue>` lock the outbox
+  // and the redelivery share) prevents the redelivery, and the next tick too.
+  it("R-SILENT: an answer committed while the sweep waits on the conversation fence prevents the redelivery, including next tick", async () => {
+    const f = await silentConversationTurn(new Date(Date.now() - 200_000));
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    let settled = false;
+    let sweep: Promise<unknown> | undefined;
+    await db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"conversation-delivery:" + f.issueId}, 0))`);
+      sweep = heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId }).finally(() => { settled = true; });
+      await new Promise(resolve => setTimeout(resolve, 1_500));
+      // The sweep saw the message unanswered and is now waiting on the fence.
+      expect(settled, "the sweep waits on the conversation fence").toBe(false);
+      await tx.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "agent", authorAgentId: agentId,
+        body: "Here is the answer, now delivered.", createdAt: sql`statement_timestamp()` });
+    });
+    await sweep;
+    expect(await f.redeliveries()).toHaveLength(0);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    expect(await f.redeliveries()).toHaveLength(0);
+  }, 120_000);
+
   // RFL DESIGN-F1 condition 2 (the clock), on a fake clock: the run ends at t,
   // nothing happens before t+90 s, ONE wake lands by t+120 s, and a second
   // recovery pass is a no-op (wake idempotency key).

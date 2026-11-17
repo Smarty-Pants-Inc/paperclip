@@ -16877,6 +16877,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       (await heartbeat.reconcileStrandedAssignedIssues()).continuationRequeued,
     ).toBe(0);
     expect(mockAdapterExecute).not.toHaveBeenCalled();
+    // F3 D121 (stack135 fix7): across both sweeps the repair publishes its
+    // unblock request exactly once, with no rival notice and no redelivery wake.
+    const systemComments = await db.select().from(issueComments).where(and(
+      eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
+    expect(systemComments.map(comment => comment.body)).toEqual([
+      expect.stringContaining(`Unblock request: ${unblockAction}`)]);
+    expect(await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(1);
   });
 
   it.each([
