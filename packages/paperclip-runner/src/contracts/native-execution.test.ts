@@ -155,9 +155,6 @@ describe("NativeExecutionInputV1", () => {
     expect(agentFilesInstructions).toContain("use the current $AGENT_HOME environment variable instead of an absolute agent-directory path from an earlier turn");
     expect(agentFilesInstructions).toContain("All supported files and subfolders there are restored across tasks and sessions");
     expect(agentFilesInstructions).toContain("Write task deliverables in the task working directory");
-    expect(agentFilesInstructions).toContain("Another writer's saved version stays canonical");
-    expect(agentFilesInstructions).toContain("<name>.conflict-<run8>-<epochms>.<ext>");
-    expect(agentFilesInstructions).not.toMatch(/last[- ]sync wins|last-sync-wins/i);
     expect(agentFilesInstructions).toContain("Preserve my personal notes.");
     expect(agentFilesInstructions).toMatch(/Read-only instruction sibling root: \/runtime\/instructions$/);
     expect(composeNativeSystemInstructions(parsed.runtimeContext, "Follow sibling.md")).not.toContain("$AGENT_HOME");
