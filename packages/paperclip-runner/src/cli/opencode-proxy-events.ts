@@ -47,10 +47,14 @@ export function openCodeProxyItemNotification(input: {
   payload: Record<string, unknown>;
 }): { method: string; params: Record<string, unknown> } {
   const assistantText = openCodeProxyAssistantText(input.payload);
+  const reasoningText = input.payload.kind === "reasoning" && typeof input.payload.text === "string"
+    ? input.payload.text : null;
   const method =
     input.eventType === "item.delta" && assistantText !== null
       ? "item/agentMessage/delta"
-      : input.eventType.replace(".", "/");
+      : input.eventType === "item.delta" && reasoningText !== null
+        ? "item/reasoning/textDelta"
+        : input.eventType.replace(".", "/");
   const providerItem = record(input.payload.item);
   const item =
     assistantText === null
@@ -74,6 +78,7 @@ export function openCodeProxyItemNotification(input: {
       ...input.payload,
       item,
       ...(method === "item/agentMessage/delta" ? { delta: assistantText } : {}),
+      ...(method === "item/reasoning/textDelta" ? { delta: reasoningText } : {}),
     },
   };
 }
