@@ -14,6 +14,7 @@
  * plus the unrelated MCP / wake / usage boundaries (as warm-rebind-recovery-policy.test.ts).
  */
 import { execFile } from "node:child_process";
+import { assertDrainAdmissionReplacement } from "./drain-admission.test-fixture.js";
 import { promises as auditFs } from 'node:fs';
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -493,44 +494,11 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await readFile(join(f.box, "task.txt"), "utf8")).toBe(EDIT);
   }, 60_000);
 
-  it('AUDIT A1 actual deadline during symlink parent mkdir must not overwrite the next owner', async () => {
+  it.each(['deadline', 'lock-session-kill'] as const)('(superseded by replacement: next owner waits for the drain, RFL record SUPERSEDE-U-DRAIN-ADMISSION-1117) AUDIT A1 actual deadline during symlink parent mkdir must not overwrite the next owner (%s)', async (cause) => {
     const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
     await settleLater(f);
-    await auditFs.rm(join(f.box, 'task.txt'));
-    await auditFs.symlink('zzz-stopped-target', join(f.box, 'task.txt'));
-    await auditFs.writeFile(join(f.box, 'zzz-stopped-target'), EDIT);
-    let release!: () => void, arrived!: () => void;
-    const held = new Promise<void>(r => { release = r; });
-    const reached = new Promise<void>(r => { arrived = r; });
-    const originalMkdir = auditFs.mkdir.bind(auditFs);
-    const spy = vi.spyOn(auditFs, 'mkdir').mockImplementation(async (...args: Parameters<typeof auditFs.mkdir>) => {
-      if (String(args[0]) === f.host) { arrived(); await held; }
-      return originalMkdir(...args);
-    });
-    let exportPromise: Promise<void> | undefined;
-    const originalRestore = f.sync.restoreWorkspace.bind(f.sync);
-    vi.spyOn(f.sync, 'restoreWorkspace').mockImplementation((...args) => (exportPromise = originalRestore(...args)));
-    const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
-      nativeWorkspaceSync: f.sync, timeoutMs: 3_000 });
-    try {
-      await Promise.race([reached, new Promise((_, reject) => setTimeout(() => reject(new Error('never reached symlink mkdir')), 15_000))]);
-      expect(await work).toEqual({ outcome: 'unproven', reason: 'timed_out' });
-      const next = await withNativeWorkspaceFinalizationOwnership({ db, companyId: f.companyId, runId: f.runId }, async () => {
-        await auditFs.writeFile(join(f.host, 'task.txt'), 'NEXT OWNER');
-        return 'next owner wrote';
-      });
-      expect(next).toMatchObject({ acquired: true });
-      release();
-      const error = await exportPromise!.then(() => null, error => String(error));
-      const entry = await auditFs.lstat(join(f.host, 'task.txt'));
-      const actual = entry.isSymbolicLink() ? `SYMLINK:${await auditFs.readlink(join(f.host, 'task.txt'))}` : await auditFs.readFile(join(f.host, 'task.txt'), 'utf8');
-      console.log('AUDIT_A1_DEADLINE_SYMLINK', JSON.stringify({ next, error, actual }));
-      await writeFile(join(process.env.TASK_OUT!, 'deadline-symlink-result.json'), JSON.stringify({ next, error, actual }, null, 2));
-      expect(actual).toBe('NEXT OWNER');
-    } finally {
-      release(); await work; await exportPromise?.catch(() => undefined); spy.mockRestore();
-    }
-  }, 45_000);
+    await assertDrainAdmissionReplacement({ db, connectionString: database.connectionString, f, branch: 'symlink-parent-mkdir', cause });
+  }, 60_000);
 
   it("AUDIT Q3 a local merge waiting past deadline must not write HOST after ownership release", async () => {
     const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
