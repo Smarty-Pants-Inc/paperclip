@@ -5,7 +5,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
-import { mergePendingIssueQueuedComments } from "@/lib/issue-queued-comment-queue";
+import { mergePendingIssueQueuedComments, QueuedMessagesChangedError } from "@/lib/issue-queued-comment-queue";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { MemoryRouter } from "@/lib/router";
 import {
@@ -186,6 +186,19 @@ describe("TaskChatQueuedMessages", () => {
     await act(async () => { container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-interrupt-comment-1"]`)!.click(); });
     expect(props.onSteer).not.toHaveBeenCalled();
     expect(props.onInterrupt).toHaveBeenCalledOnce();
+  });
+
+  it("labels a saved card answer with its actual question, not the generic card title or receipt", () => {
+    const receipt = { kind: "ask_user_questions", status: "answered", payload: {
+      title: "Deployment choices", questions: [{ id: "env", prompt: "Which environment should I use?" }],
+    }, result: { answers: { env: "Staging" } } };
+    const entry = { ...queue.entries[0], canEdit: false, canDiscard: false,
+      source: { kind: "interaction" as const, interactionId: "answer-1", interactionKind: "ask_user_questions", summary: "Answered: Deployment choices" },
+      comment: { ...queue.entries[0].comment, body: `Answered: Deployment choices\n\n${JSON.stringify(receipt)}` } };
+    render({ queue: { ...queue, entries: [entry] } });
+    expect(container.textContent).toContain("Your answer to: Which environment should I use?");
+    expect(container.textContent).not.toContain("Deployment choices");
+    expect(container.textContent).not.toContain('"answers"');
   });
 
   it("shows a declined connection request as readable text, never its raw JSON receipt (BUG-08)", () => {
@@ -529,6 +542,31 @@ describe("TaskChatQueuedMessages", () => {
       ),
     ).toBeNull();
   });
+  it.each([true, false])("shows a neutral queue update, not a delivery error, when Send has no current target (empty=%s)", async empty => {
+    const latest = { ...queue, targetRunId: null, entries: empty ? [] : queue.entries.slice(1) };
+    const onInterrupt = vi.fn().mockRejectedValue(new QueuedMessagesChangedError(latest));
+    render({ queue: { ...queue, targetRunId: null }, onInterrupt });
+    await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-interrupt-comment-1"]')!.click(); });
+    expect(container.textContent).toContain(empty ? "Nothing is waiting." : "The queue changed. Review it and try again.");
+    expect(container.textContent).not.toContain("Couldn’t");
+    expect(container.querySelector('[data-testid="task-chat-queued-message-comment-1"]')).toBeNull();
+    expect(container.querySelector('[role="status"].text-destructive')).toBeNull();
+  });
+
+  it("blocks a second Send while the first is pending and removes its controls on success", async () => {
+    const delivery = deferred<void>();
+    const onInterrupt = vi.fn().mockReturnValue(delivery.promise);
+    render({ queue: { ...queue, targetRunId: null }, onInterrupt });
+    await act(async () => {
+      const send = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-interrupt-comment-1"]')!;
+      send.click(); send.click();
+    });
+    expect(onInterrupt).toHaveBeenCalledOnce();
+    expect(container.querySelector('[data-testid^="task-chat-queued-interrupt-"]')).toBeNull();
+    await act(async () => { delivery.resolve(); await delivery.promise; });
+    expect(onInterrupt).toHaveBeenCalledOnce();
+  });
+
   it("keeps deferred sends visible and explains their current wait", async () => {
     const saved = { ...queue, targetRunId: null, executionWait: { reason: "decision_pending", message: "Resolve the pending approval before sending." } };
     const onInterrupt = vi.fn().mockResolvedValue(saved);

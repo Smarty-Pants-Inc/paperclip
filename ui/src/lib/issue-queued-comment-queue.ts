@@ -7,6 +7,14 @@ import type {
 } from "@paperclipai/shared";
 import type { RunForIssue } from "../api/activity";
 
+/** A stale Send/Interrupt is a neutral queue update, not a failed delivery. */
+export class QueuedMessagesChangedError extends Error {
+  constructor(readonly queue: IssueQueuedCommentQueue) {
+    super(queue.entries.length ? "The queue changed. Review it and try again." : "Nothing is waiting.");
+    this.name = "QueuedMessagesChangedError";
+  }
+}
+
 /** Presentation only. Admission has accepted these inputs, but has not consumed them. */
 export function startingQueuedCommentIds(
   queue: IssueQueuedCommentQueue | null | undefined,
@@ -73,7 +81,12 @@ export function normalizeIssueQueuedCommentQueue(
               kind: "interaction" as const, interactionId: response.interactionId,
               interactionKind: response.interactionKind,
               requiresFreshSession: response.requiresFreshSession === true,
+              ...(typeof response.summary === "string" ? { summary: response.summary } : {}),
             } } : {}),
+          ...(entry?.deliveryIntent === "steer" || entry?.deliveryIntent === "queue" ? { deliveryIntent: entry.deliveryIntent as "steer" | "queue" } : {}),
+          ...(entry?.behindReset === true ? { behindReset: true } : {}),
+          ...(typeof entry?.queueId === "string" ? { queueId: entry.queueId } : {}),
+          ...(typeof entry?.queueRevision === "string" ? { queueRevision: entry.queueRevision } : {}),
           canEdit: entry?.canEdit === true,
           canDiscard: entry?.canDiscard === true,
         },

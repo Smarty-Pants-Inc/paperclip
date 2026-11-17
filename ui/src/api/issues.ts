@@ -53,6 +53,7 @@ import { api, ApiError, detachInflightGet, type RequestOptions } from "./client"
 import { CommentSubmissionUnknownError } from "../lib/comment-submit-result";
 import { classifySendFailure } from "../lib/pending-send";
 import { interactionResolutionErrorCode } from "../lib/interaction-resolution-error";
+import { QueuedMessagesChangedError } from "../lib/issue-queued-comment-queue";
 
 function hasCommentReceipt(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -593,9 +594,12 @@ export const issuesApi = {
     const queue = await issuesApi.getQueuedComments(id);
     const entry = commentId ? queue.entries.find((candidate) => candidate.comment.id === commentId) : undefined;
     const queueId = entry?.queueId ?? queue.queueId;
-    if (!queueId || (queue.targetRunId && !commentId && queue.targetRunId !== expectedTargetRunId) ||
+    if (!queue.entries.length || !queueId ||
+        (queue.targetRunId && queue.targetRunId !== expectedTargetRunId && (!commentId || expectedTargetRunId !== null)) ||
         (commentId && !entry)) {
-      throw new Error("The queued messages changed. Refresh and try again.");
+      // A wake can outlive its last message. Never POST a no-target/no-input
+      // interrupt and mistake a successful HTTP response for a new run.
+      throw new QueuedMessagesChangedError(queue);
     }
     return issuesApi.interruptQueuedComments(id, {
       queueId, revision: entry?.queueRevision ?? queue.revision, targetRunId: queue.targetRunId,

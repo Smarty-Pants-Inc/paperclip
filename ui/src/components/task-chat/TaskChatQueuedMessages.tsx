@@ -17,11 +17,13 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
+  ArrowLeftRight,
   CornerDownRight,
   GripVertical,
   Loader2,
   Pencil,
   Trash2,
+  Zap,
 } from "lucide-react";
 import type {
   IssueQueuedCommentEntry,
@@ -36,7 +38,7 @@ import {
   queuedMessageAutoSteerEligible,
   queuedMessageAutoSteerKey,
 } from "./queued-message-auto-steer";
-import { isQueuedInterruptHandoff } from "@/lib/issue-queued-comment-queue";
+import { isQueuedInterruptHandoff, QueuedMessagesChangedError } from "@/lib/issue-queued-comment-queue";
 
 type QueueAction = "steer" | "interrupt" | "discard" | "intent" | null;
 
@@ -61,8 +63,21 @@ export function reorderQueuedMessageEntries(
  */
 export function queuedMessageLabel(entry: IssueQueuedCommentEntry): string {
   if (entry.source?.kind !== "interaction") return entry.comment.body;
-  const summary = entry.source.summary?.trim();
-  return summary || entry.comment.body.split("\n")[0] || "Saved response";
+  const summary = entry.source.summary?.trim() || entry.comment.body.split("\n")[0] || "Saved response";
+  if (entry.source.interactionKind !== "ask_user_questions") return summary;
+  // The durable receipt carries the actual prompts, whereas its heading may
+  // only be a generic card title (for example "Deployment choices"). Never
+  // render the receipt itself, even if an older/malformed receipt cannot parse.
+  try {
+    const receipt = JSON.parse(entry.comment.body.slice(entry.comment.body.indexOf("\n\n") + 2));
+    const questions = receipt?.payload?.questionSet?.questions ?? receipt?.payload?.questions;
+    const prompts = Array.isArray(questions) ? questions.flatMap((question: unknown) => {
+      const prompt = question && typeof question === "object" ? (question as { prompt?: unknown }).prompt : null;
+      return typeof prompt === "string" && prompt.trim() ? [prompt.trim()] : [];
+    }) : [];
+    if (prompts.length) return `Your answer to: ${prompts.join("; ")}`;
+  } catch { /* Older summaries still identify the card without exposing JSON. */ }
+  return `Your answer to: ${summary.replace(/^Answered:\s*/, "")}`;
 }
 
 function queueActionErrorCode(error: unknown): string | null {
@@ -122,7 +137,7 @@ export function steeringCount(entries: IssueQueuedCommentEntry[]): number {
   return count;
 }
 
-const ROW_BUTTON = "flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45 max-sm:h-11 max-sm:min-w-11 max-sm:justify-center";
+const ROW_BUTTON = "flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2 text-xs font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-45 max-sm:h-11 max-sm:min-w-11 max-sm:justify-center";
 
 function SortableQueuedMessage({
   entry,
@@ -184,7 +199,8 @@ function SortableQueuedMessage({
   const toggleReason = !canSetIntent ? "Changing the mode is unavailable here"
     : toTarget === "steer" && behindReset ? BEHIND_RESET_STEER_REASON
       : toTarget === "steer" && immutableResponse ? "A saved response waits for this turn"
-        : null;
+        : toTarget === "steer" && !steeringAvailable ? "This runner can't take messages mid-turn"
+          : null;
   const idleQueue = !queue.targetRunId;
   const interruptReason = !onInterrupt ? "Interrupt is unavailable here"
     : reset ? RESET_INTERRUPT_REASON
@@ -229,6 +245,7 @@ function SortableQueuedMessage({
           mediaMode="omit"
         >{label}</MarkdownBody> : null}
         {reset ? <span className="text-xs text-muted-foreground" data-testid={`task-chat-queued-reset-caption-${entry.comment.id}`}>{RESET_ROW_CAPTION}</span> : null}
+        {behindReset ? <span className="text-xs text-muted-foreground" data-testid={`task-chat-queued-behind-reset-caption-${entry.comment.id}`}>Behind /new: can't steer</span> : null}
         {images.length ? <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1" role="group" aria-label="Queued images">
           {images.slice(0, 3).map(image => <img
             key={image.url} src={image.url} alt={image.name} loading="lazy"
@@ -263,7 +280,7 @@ function SortableQueuedMessage({
             className={ROW_BUTTON}
             data-testid={`task-chat-queued-mode-${entry.comment.id}`}
           >
-            {action === "intent" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
+            {action === "intent" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <ArrowLeftRight className="h-3.5 w-3.5" aria-hidden />}
             {toTarget === "steer" ? "Steer" : "Queue"}
           </button>
         )}
@@ -276,7 +293,7 @@ function SortableQueuedMessage({
           className={ROW_BUTTON}
           data-testid={`task-chat-queued-interrupt-${entry.comment.id}`}
         >
-          {action === "interrupt" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <CornerDownRight className="h-3.5 w-3.5" aria-hidden />}
+          {action === "interrupt" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : idleQueue ? <CornerDownRight className="h-3.5 w-3.5" aria-hidden /> : <Zap className="h-3.5 w-3.5" aria-hidden />}
           {idleQueue ? "Send" : "Interrupt now"}
         </button>
         <button
@@ -285,18 +302,17 @@ function SortableQueuedMessage({
           disabled={Boolean(editReason)}
           title={editReason ?? (autoSteerSecondsLeft !== null ? "Edit before it is sent (pauses the countdown)" : "Edit message")}
           aria-label={`Edit queued message: ${label}`}
-          className={ROW_BUTTON}
+          className={cn(ROW_BUTTON, "w-7 justify-center px-0")}
           data-testid={`task-chat-queued-edit-${entry.comment.id}`}
         >
           <Pencil className="h-3.5 w-3.5" aria-hidden />
-          <span className="max-sm:sr-only">Edit</span>
         </button>
         <button
           type="button"
           onClick={onDiscard}
           disabled={busy || Boolean(discardReason)}
           title={discardReason ?? "Delete queued message"}
-          aria-label={`Discard queued message: ${label}`}
+          aria-label={`Delete queued message: ${label}`}
           className={cn(ROW_BUTTON, "w-7 justify-center px-0 hover:bg-destructive/10 hover:text-destructive")}
           data-testid={`task-chat-queued-discard-${entry.comment.id}`}
         >
@@ -346,6 +362,7 @@ export function TaskChatQueuedMessages({
   const [reordering, setReordering] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const [visibleError, setVisibleError] = useState<string | null>(null);
+  const [deliveryNotice, setDeliveryNotice] = useState<string | null>(null);
   const [deferredStatus, setDeferredStatus] = useState<{ queueId: string | null; message: string } | null>(null);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -542,6 +559,12 @@ export function TaskChatQueuedMessages({
       return;
     }
     const target = entries.find((entry) => entry.comment.id === commentId);
+    if (action === "interrupt" && (optimisticDeliveryIds.current.has(commentId)
+      || !latestQueue.current.entries.some((entry) => entry.comment.id === commentId))) {
+      setDeliveryNotice("Nothing is waiting.");
+      return;
+    }
+    setDeliveryNotice(null);
     // Interrupt now sends this one message first; with no running turn, Send sends them all.
     const oneMessageInterrupt = action === "interrupt" && Boolean(queue.targetRunId);
     if (action === "intent") return void changeIntent(commentId);
@@ -601,6 +624,11 @@ export function TaskChatQueuedMessages({
         ));
       }
       setAnnouncement("");
+      if (error instanceof QueuedMessagesChangedError) {
+        setEntries(error.queue.entries);
+        setDeliveryNotice(error.message);
+        return;
+      }
       const code = queueActionErrorCode(error);
       setVisibleError(
         code === "queued_comment_already_dispatching"
@@ -625,7 +653,7 @@ export function TaskChatQueuedMessages({
     ?? (queue.state === "deferred" && !queue.queueId && !queue.targetRunId && entries.length > 0
       ? queue.executionWait?.message ?? null : null);
 
-  if (entries.length === 0 && !visibleError && !statusMessage) return null;
+  if (entries.length === 0 && !visibleError && !statusMessage && !deliveryNotice) return null;
   const steeringRows = steeringCount(entries);
 
   return (
@@ -656,15 +684,20 @@ export function TaskChatQueuedMessages({
                 className={cn("flex flex-col gap-0.5 px-1.5 py-1", section === "queued" && "mt-px")}
               >
                 {section === "queued" ? <div aria-hidden className="mx-1 mb-1 h-px bg-border/70" /> : null}
-                <h3 className="flex items-baseline gap-1.5 px-1.5 pt-0.5 text-xs font-medium text-muted-foreground">
-                  <span>{section === "steering" ? "Steering" : "Queued"}</span>
+                <h3 className="flex flex-wrap items-baseline gap-x-1.5 gap-y-1 px-1.5 pt-0.5 text-xs text-muted-foreground">
+                  <span className="font-semibold text-foreground">{section === "steering" ? "Steering" : "Queued"}</span>
                   <span className="tabular-nums" data-testid={`task-chat-queued-count-${section}`}>{rows.length}</span>
-                  {paused ? <span className="font-normal" data-testid="task-chat-queued-steering-paused">· {STEERING_PAUSED}</span> : null}
+                  {paused ? <span className="rounded-md bg-muted px-2 py-0.5 font-medium text-foreground" data-testid="task-chat-queued-steering-paused">{STEERING_PAUSED}</span>
+                    : section === "queued" || rows.length > 0 ? <span className="font-normal max-sm:basis-full">{section === "steering"
+                      ? "Always first. Delivered at the agent's next step, top first"
+                      : "Sent after the agent finishes this turn, top first"}</span> : null}
                 </h3>
                 {rows.length === 0 ? (
                   <p className="px-1.5 pb-1 text-xs text-muted-foreground">
                     {section === "steering"
-                      ? readOnly ? "Nothing steering." : "Nothing steering. Drag a message here, or press Steer on it."
+                      ? queue.steeringDisposition !== "available"
+                        ? "This runner can't take messages mid-turn, so everything waits in the queue. Use Interrupt now to send one first."
+                        : readOnly ? "Nothing steering." : "Nothing steering. Drag a message here, or press Steer on it."
                       : "Nothing queued."}
                   </p>
                 ) : rows.map((entry) => {
@@ -705,6 +738,7 @@ export function TaskChatQueuedMessages({
         </SortableContext>
       </DndContext>
       {statusMessage ? <p role="status" className="px-3 py-1.5 text-xs text-muted-foreground">{statusMessage}</p> : null}
+      {deliveryNotice ? <p role="status" className="px-3 py-1.5 text-xs text-muted-foreground">{deliveryNotice}</p> : null}
       {visibleError ? (
         <div
           role="status"
