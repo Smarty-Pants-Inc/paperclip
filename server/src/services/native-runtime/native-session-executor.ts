@@ -1484,6 +1484,9 @@ async function closeIdleWarmNativeSessions(input: {
   let failed = 0;
   const failures: WarmNativeSessionCloseFailure[] = [];
   const retryIdleCloseAfterSweep: [string, WarmNativeSession][] = [];
+  // custody-gaps (a): settles of owners whose retries are exhausted; the
+  // retries_exhausted marker is written after the sweep (armWarmIdleCloseRetry).
+  const deferredCustody: (() => void)[] = [];
   let stopped = false;
   const closeEntry = async (sessionId: string, entry: WarmNativeSession) => {
     if (entry.busy || entry.preparingRunId || executingRunnerdSessionScopes.has(sessionId)
@@ -1511,6 +1514,12 @@ async function closeIdleWarmNativeSessions(input: {
       } : undefined),
     );
     closingWarmNativeSessions.set(sessionId, closing);
+    // custody-gaps (a): a sandbox release waits for this owner's close AND its
+    // failure handling, so an "owner gone" / retries-exhausted marker commits
+    // before any destroy claim of the box can be taken.
+    let settleCustody: (() => void) | undefined;
+    if (!detach) void trackWarmOwnerSandboxClose(entry.providerLeaseId, new Promise<void>(resolve => { settleCustody = resolve; }));
+    let custodyDeferred = false;
     try {
       await closing;
       forgetWarmNativeSession(sessionId, entry);
@@ -1532,12 +1541,19 @@ async function closeIdleWarmNativeSessions(input: {
         return;
       }
       failed += 1;
-      if (!detach && entry.idleCloseRetries !== undefined) retryIdleCloseAfterSweep.push([sessionId, entry]);
+      if (!detach && entry.idleCloseRetries !== undefined) {
+        retryIdleCloseAfterSweep.push([sessionId, entry]);
+        if (settleCustody && entry.idleCloseRetries >= WARM_IDLE_CLOSE_MAX_RETRIES) {
+          deferredCustody.push(settleCustody);
+          custodyDeferred = true;
+        }
+      }
       const forced = forcedStopFailure === undefined ? "" : `; forced Runner stop failed: ${describeWarmCloseFailure(forcedStopFailure)}`;
       failures.push({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
         providerLeaseId: entry.providerLeaseId ?? null,
         reason: `${detach ? "released Runner detach failed" : "close failed"}: ${describeWarmCloseFailure(error)}${forced}` });
     } finally {
+      if (!custodyDeferred) settleCustody?.();
       entry.busy = false;
       if (closingWarmNativeSessions.get(sessionId) === closing) {
         closingWarmNativeSessions.delete(sessionId);
@@ -1565,9 +1581,13 @@ async function closeIdleWarmNativeSessions(input: {
     }
   };
   const concurrency = input.canRetire ? 1 : WARM_NATIVE_SESSION_CLOSE_CONCURRENCY;
-  await Promise.all(Array.from({ length: Math.min(concurrency, pendingAgents.length) }, closeAgentQueues));
-  if (failures.length > 0) logger.warn({ reason: input.reason, failures }, "idle warm native sessions did not close");
-  for (const [sessionId, entry] of retryIdleCloseAfterSweep) await armWarmIdleCloseRetry(sessionId, entry);
+  try {
+    await Promise.all(Array.from({ length: Math.min(concurrency, pendingAgents.length) }, closeAgentQueues));
+    if (failures.length > 0) logger.warn({ reason: input.reason, failures }, "idle warm native sessions did not close");
+    for (const [sessionId, entry] of retryIdleCloseAfterSweep) await armWarmIdleCloseRetry(sessionId, entry);
+  } finally {
+    for (const settle of deferredCustody) settle();
+  }
   return { closed, busy, failed, failures };
 }
 
@@ -9568,6 +9588,10 @@ function armWarmNativeSessionIdleTimer(
       });
     // Admission waits for this checkpoint like a restart sweep's close.
     closingWarmNativeSessions.set(sessionId, closing);
+    // custody-gaps (a): a sandbox release waits for the whole close chain, so
+    // the "owner gone" (:close_failed) or retries_exhausted marker commits
+    // before any destroy claim of the box can be taken.
+    if (!released) void trackWarmOwnerSandboxClose(current.providerLeaseId, closing);
   }, idleTimeoutMs);
   entry.idleTimer.unref();
 }
