@@ -36,7 +36,8 @@ import { NATIVE_NO_REPLAY_HOLD_CAUSE } from "../workspace-recovery-fallback-disc
  * (b) a system recovery action for the run is resolved restored with its
  *     continuation delivery pending (or not written yet), or delivered to a
  *     run that has not started yet;
- * (c) a restored/continuation wake for the run's action is queued or deferred.
+ * (c) a restored/continuation wake for the run's action is queued or deferred
+ *     (not a queued wake whose own run already ended: RFL F6).
  * FALSE when reconciliation concluded without continuing (blocked by a person
  * gate, cancelled, delivery invalidated, saved-work recovery exhausted, the
  * fallback found it person-owned) or the restored run already ended: the
@@ -93,7 +94,14 @@ export async function automaticRecoveryPending(db: Db,
     const [wake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, input.companyId), inArray(agentWakeupRequests.status, PENDING_WAKE),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
-      inArray(sql`${agentWakeupRequests.payload}->>'recoveryActionId'`, actions.map(action => action.id)))).limit(1);
+      inArray(sql`${agentWakeupRequests.payload}->>'recoveryActionId'`, actions.map(action => action.id)),
+      // RFL F6 (as the sweep's own pending-wake read): a crash between a run's 'running' commit and its
+      // wake's claim leaves the wake 'queued' after its run ran. A queued wake bound to a run that already
+      // ended is the attempt that ended, never a continuation still on its way.
+      sql`not (${agentWakeupRequests.status} = 'queued' and ${agentWakeupRequests.runId} is not null
+        and exists (select 1 from ${heartbeatRuns} ended where ended.company_id = ${agentWakeupRequests.companyId}
+          and ended.id = ${agentWakeupRequests.runId}
+          and ended.status not in ('queued', 'running', 'scheduled_retry')))`)).limit(1);
     if (wake) return true;
   }
 
