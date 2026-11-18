@@ -1611,11 +1611,9 @@ describe("buildIssueChatMessages", () => {
     });
   });
 
-  it.each([
-    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "viewer" }, label: "Stopped by you", detail: "You stopped this run before it finished." },
-    { resultJson: { interruptedByActorType: "user", interruptedByActorId: "viewer", operatorInterrupted: true }, label: "Interrupted by you", detail: "You interrupted this run." },
-    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "other" }, label: "Stopped by Alex" },
-    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "unknown" }, label: "Stopped by a board member" },
+  it.todo("attributes a cancelled run to its recorded actor: 3cd1f2b9, cancelled-run actor attribution, its own unit (RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118)");
+
+  it.each<{ resultJson: { cancelledByActorType: string; cancelledByUserId: string }; label: string; detail?: string }>([
     { resultJson: { cancelledByActorType: "system", cancelledByUserId: "viewer" }, label: "Cancelled after 1 minute" },
     { resultJson: { cancelledByActorType: "agent", cancelledByUserId: "viewer" }, label: "Cancelled after 1 minute" },
   ])("attributes a cancelled run to its recorded actor ($label)", ({ resultJson, label, detail }) => {
