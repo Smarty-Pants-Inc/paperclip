@@ -272,8 +272,11 @@ export function grokRoutineService(db: Db, deliver: Delivery = deliverGrokRoutin
         and(eq(dispatches.status, "accepted"), lte(dispatches.expiresAt, new Date()))))).limit(1);
     // A canonical finish closes this session; it never proves a webhook ACK or
     // restores execution authority. Other uncertain deliveries keep their hold.
-    if (!uncertain) await db.update(routines).set({ recoveryRequiredAt: null, recoveryReason: null, updatedAt: new Date() })
-      .where(and(eq(routines.companyId, companyId), eq(routines.bindingId, bindingId), eq(routines.recoveryReason, "dispatch")));
+    const cleared = uncertain ? [] : await db.update(routines).set({ recoveryRequiredAt: null, recoveryReason: null, updatedAt: new Date() })
+      .where(and(eq(routines.companyId, companyId), eq(routines.bindingId, bindingId), eq(routines.recoveryReason, "dispatch")))
+      .returning({ agentId: routines.agentId });
+    // FIX16 (RFL 01:00Z (a)): this also clears the routine recovery hold; its queued runs are startable from now.
+    for (const { agentId } of cleared) await stampQueuedRunsStartable(db, { companyId, agentId });
   }
 
   async function acknowledge(principal: McpPrincipal, raw: Ack) {

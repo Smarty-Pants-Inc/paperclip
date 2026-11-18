@@ -209,11 +209,29 @@ describe("durable Grok routine qualification", () => {
       assignmentId: work!.id, kind: "mailbox_updated", sourceEventId: randomUUID() });
     await db.update(grokBotDispatches).set({ status: "unknown", sentAt: new Date() }).where(eq(grokBotDispatches.id, wake.id));
     await db.update(grokBotRoutines).set({ recoveryRequiredAt: new Date(), recoveryReason: reason }).where(eq(grokBotRoutines.bindingId, f.pairing.bindingId));
+    // FIX16 writers: a run queued behind the routine recovery hold.
+    const [held] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id, status: "queued",
+      invocationSource: "assignment", contextSnapshot: {} }).returning();
+    const settledFrom = Date.now();
     await db.transaction(tx => grokRoutineService(tx as unknown as typeof db).settleWorkNotifications(f.company.id, f.pairing.bindingId, work!.id));
     expect((await db.select().from(grokBotDispatches).where(eq(grokBotDispatches.id, wake.id)))[0]!.status).toBe("cancelled");
+    // Writer 1 (routine.ts settleWorkNotifications): a settled finish clears the dispatch hold and stamps.
+    const [settled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, held!.id));
+    if (reason === "dispatch") expect(settled!.startableSince?.getTime(), "settled finish cleared the dispatch hold: stamped")
+      .toBeGreaterThanOrEqual(settledFrom - 1_000);
+    else expect(settled!.startableSince, "the work_session hold stays: no stamp").toBeNull();
+    // Writer 2 (routine.ts:321 acknowledge, routine recovery cleared): re-arm the same hold so only the ack clears it.
+    await db.update(heartbeatRuns).set({ startableSince: null }).where(eq(heartbeatRuns.id, held!.id));
+    await db.update(grokBotRoutines).set({ recoveryRequiredAt: new Date(), recoveryReason: reason }).where(eq(grokBotRoutines.bindingId, f.pairing.bindingId));
     const ack = { correlationId: wake.id, bindingId: wake.bindingId, bindingGeneration: wake.bindingGeneration };
+    const clearedFrom = Date.now();
     expect(await f.service.acknowledge(f.principal, ack)).toMatchObject({ status: "acknowledged", remoteTerminationConfirmed: false });
     expect(await f.service.recoveryNeeded(f.company.id, f.agent.id)).toBe(reason === "work_session");
+    const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, held!.id));
+    if (reason === "dispatch") expect(stamped!.startableSince?.getTime(), "routine recovery cleared: the queued run is stamped")
+      .toBeGreaterThanOrEqual(clearedFrom - 1_000);
+    else expect(stamped!.startableSince, "the work_session hold stays: no stamp").toBeNull();
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, held!.id));
     await expect(dotRunnerBroker(db).operation(f.principal, work!.id, randomUUID(), "progress", { text: "late effect" })).rejects.toThrow("expired");
     expect((await db.select().from(dotRunnerAssignments).where(eq(dotRunnerAssignments.id, work!.id)))[0]!.status).toBe("settled");
     await db.update(dotRunnerAssignments).set({ status: "fenced" }).where(eq(dotRunnerAssignments.id, work!.id));
