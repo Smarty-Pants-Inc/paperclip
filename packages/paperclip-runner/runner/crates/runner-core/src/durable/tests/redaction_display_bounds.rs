@@ -81,3 +81,43 @@ fn redaction_within_the_bound_leaves_short_tool_output_whole() {
     assert_eq!(stored["output"], "before\ntoken=[REDACTED]\nafter");
     assert_eq!(stored["outputTruncated"], false);
 }
+
+// ROW-4096 (pack-n5): the normalized Pi tool event leaves the outbox with the
+// whole tool output Pi returned to the model, not a 4,096-byte preview.
+#[test]
+fn row4096_normalized_pi_tool_output_leaves_the_outbox_whole() {
+    let mut config = config(PathBuf::from("unused"));
+    config.max_outbox_bytes = 4 * 1024 * 1024;
+    config.max_frame_bytes = 1024 * 1024;
+    let mut output: String = (0..800)
+        .map(|index| format!("out {index} {} é🦀\n", "z".repeat(60)))
+        .collect();
+    output.push_str("\n[Showing lines 1201-2000 of 2000. Full output: /tmp/pi-bash-0123.log]");
+    let events = crate::provider_events::normalize_pi_notification_in(
+        "item/completed",
+        &json!({"threadId": "thread-1", "turnId": "turn-1", "itemId": "pi-tool-1",
+            "item": {"id": "pi-tool-1", "type": "builtinToolCall", "tool": "bash",
+                "status": "completed", "output": output}}),
+        None,
+    );
+    let completed = events
+        .into_iter()
+        .find(|event| event.event_type == "tool.execution.completed")
+        .unwrap();
+    let mut state = DurableState::new(&config);
+    state
+        .enqueue_event(
+            &config,
+            "tool.execution.completed",
+            EventPriority::P1,
+            completed.payload,
+        )
+        .unwrap();
+    let stored = state.outbox[0]
+        .envelope
+        .pointer("/payload/payload/output")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(!stored.contains("[truncated]"));
+    assert_eq!(stored.as_bytes(), output.as_bytes());
+}
