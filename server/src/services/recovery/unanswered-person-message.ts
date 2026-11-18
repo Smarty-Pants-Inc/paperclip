@@ -26,6 +26,7 @@ import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
+import { senderStoppedWhileAnswering } from "./person-stopped-message.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -276,7 +277,7 @@ export function unansweredPersonMessageCommentCondition(): SQL {
 }
 
 export type UnansweredMessageOutcome =
-  | { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" }
+  | { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" | "person_stopped" }
   | { kind: "pending"; recheckAt: number }
   | { kind: "noticed"; code: string; commentId: string };
 
@@ -388,7 +389,7 @@ async function settleOwedPersonMessages(
     if (decision.kind === "notice") {
       groups.set(groupKey(decision), [...(groups.get(groupKey(decision)) ?? []), { index: outcomes.length, messageId, decision }]);
       outcomes.push({ kind: "noticed_before" });
-    } else outcomes.push(await recordPendingDecision(db, issue, decision));
+    } else outcomes.push(await recordPendingDecision(db, issue, decision, now, input.nativeBlockedRepairApplies));
   }
   for (const members of [...groups.values()].reverse()) { // the latest message's group first
     const outcome = await writeGroupNotice(db, issue, now, input.nativeBlockedRepairApplies, members);
@@ -400,7 +401,8 @@ async function settleOwedPersonMessages(
 const groupKey = (decision: NoticeDecision) => `${decision.group}|${decision.code}|${decision.upgradeCommentId ?? ""}`;
 
 /** A decision that writes no notice: record a first deferral (T0) when it asks for it. */
-async function recordPendingDecision(db: Db, issue: DecisionIssue, decision: Exclude<Decision, NoticeDecision>): Promise<UnansweredMessageOutcome> {
+async function recordPendingDecision(db: Db, issue: DecisionIssue, decision: Exclude<Decision, NoticeDecision>, now: Date,
+  nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<UnansweredMessageOutcome> {
   if (decision.kind === "pending") {
     if (decision.recordDeferral) {
       await appendHeartbeatRunEvent(db, { companyId: issue.companyId, runId: decision.recordDeferral.runId,
@@ -414,6 +416,27 @@ async function recordPendingDecision(db: Db, issue: DecisionIssue, decision: Exc
         details: { messageId: decision.recordWait.messageId, runId: decision.recordWait.runId, boundMs: PENDING_WAIT_BOUND_MS } });
     }
     return { kind: "pending", recheckAt: decision.recheckAt };
+  }
+  if (decision.kind === "person_stopped") {
+    // The sender's own Stop is the one note (ruling 8): a standing notice stops covering this message, under the
+    // same issue fence and predicate. It retires when it covered only this message; else it keeps the others.
+    if (decision.noticeId) await db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues)
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+      const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies, decision.messageId);
+      if (fenced.kind !== "person_stopped" || fenced.noticeId !== decision.noticeId) return;
+      const [notice] = await tx.select({ metadata: issueComments.metadata }).from(issueComments).where(and(
+        eq(issueComments.id, decision.noticeId!), eq(issueComments.companyId, issue.companyId),
+        eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
+      if (!notice) return;
+      const metadata = (notice.metadata ?? {}) as Record<string, unknown>;
+      const listed = metadata[UNANSWERED_MESSAGE_GROUP_KEY];
+      const others = (Array.isArray(listed) ? listed as string[] : []).filter(id => id !== decision.messageId);
+      await tx.update(issueComments).set(others.length ? { updatedAt: now, metadata: { ...metadata,
+        [UNANSWERED_MESSAGE_GROUP_KEY]: others, authorizationReason: `${UNANSWERED_MESSAGE_REASON_PREFIX}${others[others.length - 1]}` } as never }
+        : { deletedAt: now, updatedAt: now }).where(eq(issueComments.id, decision.noticeId!));
+    });
+    return { kind: "person_stopped" };
   }
   return decision;
 }
@@ -459,7 +482,9 @@ async function writeGroupNotice(db: Db, issue: DecisionIssue, now: Date, nativeB
 
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
-type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
+type Decision = { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" }
+  /** The sender stopped the run that was answering this message; noticeId is its standing notice, if any. */
+  | { kind: "person_stopped"; messageId: string; noticeId: string | null }
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: { messageId: string; runId: string | null } }
   | NoticeDecision;
@@ -490,7 +515,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
 
-  const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
+  const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
+    authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), messageId ? eq(issueComments.id, messageId) : undefined))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
@@ -510,10 +536,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
     noticeCoversSql(`"issue_comments"`, sql`${message.id}`))).limit(1);
-  // A standing WAITING note is still an open obligation: it must stay true.
-  if (noticed && !noticed.waiting) return { kind: "noticed_before" };
-  const upgrading = noticed?.waiting ? noticed.id : null;
-  const standingWaitingCode = noticed?.waiting ? noticed.waitingCode : null;
 
   // The run this message started (the latest run that carries it), if any.
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
@@ -529,6 +551,18 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // run (a timer, or the continuation that replaced a cancelled deferred wake
   // with no comment ids) is not: the message's own wake path decides.
   const messageRun = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
+  // The SENDER'S OWN Stop (RFL ruling 8): the newest run that carries this message was stopped (or interrupted) by
+  // the message's sender after it had started answering it. The person's own Stop line is the one note: the
+  // message is not owed a notice, and a standing one stops covering it. A stop by anyone else (another user, an
+  // agent, the system, a pause, a timeout) or of a run that had not read the message keeps the message owed. The
+  // ONE rule (person-stopped-message.ts senderStoppedWhileAnswering), read by this decision and the carry.
+  if (await senderStoppedWhileAnswering(q, issue.companyId, messageRun, message)) {
+    return { kind: "person_stopped", messageId: message.id, noticeId: noticed?.id ?? null };
+  }
+  // A standing WAITING note is still an open obligation: it must stay true.
+  if (noticed && !noticed.waiting) return { kind: "noticed_before" };
+  const upgrading = noticed?.waiting ? noticed.id : null;
+  const standingWaitingCode = noticed?.waiting ? noticed.waitingCode : null;
   // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
   // native-governance.ts conversationTurnAnswered): only a pending question or
   // confirmation card that the message's OWN run created stands in for its
