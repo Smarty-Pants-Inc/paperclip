@@ -349,6 +349,44 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
     } finally { s.done(); }
   }, 120_000);
 
+  // optS-N2 RED: the typed run in flight is bound to the chat only by
+  // nativeIssueId (no contextSnapshot.issueId), as the 'latest' select's other
+  // keys allow. FAKED EDGE: the run row is written directly (no production
+  // creator leaves contextSnapshot.issueId empty on a chat run); it is the
+  // issue's execution run, which is what the duplicate's insert path keys on.
+  it("optS-N2 RED: a run bound only by nativeIssueId in flight + Send => B's path, no second wake", async () => {
+    const s = await heldThenStop();
+    try {
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, s.f.runId));
+      const [typed] = await db.insert(heartbeatRuns).values({ companyId: s.f.companyId, agentId: s.f.agentId,
+        invocationSource: "on_demand", triggerDetail: "manual", status: "queued", runtimeMode: "native",
+        nativeIssueId: s.f.issueId, contextSnapshot: {}, responsibleUserId: userId,
+        // Older than the stopped run, so 'latest' is still the stopped run.
+        createdAt: new Date(stopped!.createdAt.getTime() - 1_000) }).returning();
+      await db.update(issues).set({ executionRunId: typed!.id }).where(eq(issues.id, s.f.issueId));
+      const before = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, s.f.companyId));
+      const sent = await s.send();
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, s.f.companyId));
+      const added = wakes.filter(w => !before.some(b => b.id === w.id));
+      const r = { send: sent.status, sendBody: sent.body, typedRun: typed!.id,
+        before: before.map(w => ({ id: w.id, status: w.status, key: w.idempotencyKey, wait: (w.payload as any)?.executionWait?.reason })),
+        after: wakes.map(w => ({ id: w.id, status: w.status, key: w.idempotencyKey, runId: w.runId,
+          interrupt: !!(w.payload as any)?.queuedCommentInterrupt, wait: (w.payload as any)?.executionWait?.reason,
+          ids: (w.payload as any)?._paperclipWakeContext?.wakeCommentIds })) };
+      console.log("OPTSN2", JSON.stringify(r, null, 1));
+      await evidence("optS-N2", r);
+      // No second wake carrying the held messages.
+      expect.soft(added.filter(w => ((w.payload as any)?._paperclipWakeContext?.wakeCommentIds ?? [])
+        .some((id: string) => s.held.includes(id))).map(w => w.idempotencyKey)).toEqual([]);
+      // B's path: only the Send-marked held wake waits (the ordinary path, here
+      // for the warm box's stop receipt); no unmarked queued-comment-interrupt wake.
+      const held = wakes.filter(w => w.status === "deferred_issue_execution"
+        && ((w.payload as any)?._paperclipWakeContext?.wakeCommentIds ?? []).some((id: string) => s.held.includes(id)));
+      expect(held.map(w => ({ send: !!(w.payload as any)?.queuedCommentInterrupt,
+        wait: (w.payload as any)?.executionWait?.reason }))).toEqual([{ send: true, wait: "remote_cleanup" }]);
+    } finally { s.done(); }
+  }, 120_000);
+
   it.skip("control non-person cancel: Send still waits for the box's stop receipt (unchanged)", async () => {
     const s = await heldThenStop("system");
     try {
