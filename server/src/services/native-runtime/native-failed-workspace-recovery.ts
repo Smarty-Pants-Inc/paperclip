@@ -292,7 +292,10 @@ function pendingCancelledWorkspace() {
     AND (${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'->>'state' = 'prepared' OR ${heartbeatRuns.runnerProfileJson}->'remoteWorkspace'->>'state' = 'prepared')
     AND ${heartbeatRuns.resultJson}->'nativeCancellation'->>'dispatchState' = 'acknowledged'
     AND (${heartbeatRuns.resultJson}->'workspaceRestoreRecovery'->>'schema' = 'paperclip.workspace-restore-recovery.v1'
-      AND ${heartbeatRuns.resultJson}->>'workspaceRestoreFailure' IN (${workspaceRestoreFailureCodesSql})) IS NOT TRUE`;
+      AND ${heartbeatRuns.resultJson}->>'workspaceRestoreFailure' IN (${workspaceRestoreFailureCodesSql})) IS NOT TRUE
+    AND NOT EXISTS (SELECT 1 FROM ${nativeRunFinalizations} WHERE ${nativeRunFinalizations.runId} = ${heartbeatRuns.id}
+      AND ${nativeRunFinalizations.companyId} = ${heartbeatRuns.companyId} AND ${nativeRunFinalizations.phase} = 'terminal_failure'
+      AND ${nativeRunFinalizations.leaseOwner} IS NULL AND ${nativeRunFinalizations.resultId} IS NULL)`;
 }
 
 export function registerCancelledWorkspacePreservationWork(db: Db,
@@ -342,6 +345,10 @@ export function registerCancelledWorkspacePreservationWork(db: Db,
         && await settleUnchangedNativeWorkspace(db, run.id, run.companyId)) return null;
       return { ...entry, dueAt: Date.now() + 30_000 };
     }
+    // C3: an acknowledged person Stop with no accepted result owes no restore
+    // (preserveNativeFailedWorkspace returns early), so there is nothing left to
+    // watch; never re-check it every 30 s.
+    if (!finalization.resultId) return null;
     if (await cancelledWorkspaceSource(db, run)) await preserveNativeFailedWorkspace(db, run, { allowPreterminal: true, requireCancelledStop: true });
     else if (await nativeRunNeverLaunchedRunner(db, run.id, run.companyId)
       && await settleUnchangedNativeWorkspace(db, run.id, run.companyId)) return null;
