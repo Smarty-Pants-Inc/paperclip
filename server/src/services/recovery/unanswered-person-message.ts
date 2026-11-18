@@ -104,8 +104,10 @@ export function agentPausedText(name: string) {
     + `A board user or ${name}'s manager can resume ${name}.`;
 }
 
+// RFL SUPERSEDE-BPRIME3-NOTICE-WORDING-1118: an unanswered started run
+// is not proof of side-effect-free execution, even without a final reply.
 export const UNANSWERED_MESSAGE_TEXT =
-  "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
+  "Your message wasn't answered. Check the task's recent history before trying again; the run may have taken actions.";
 export const UNANSWERED_CARD_ANSWER_TEXT =
   "Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
@@ -113,7 +115,7 @@ export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
 export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
-  "This run finished without a reply to your message. Sending it again is safe.";
+  "This run finished without a reply to your message. Check the task's recent history before trying again; the run may have taken actions.";
 /** The ONE bound (follow-Paperclip B-2, RFL 05:51Z): the fork's K=2 fresh-continuation chain cap. */
 export const FRESH_CONTINUATION_BOUND = 2;
 export const UNANSWERED_MESSAGE_BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, "
@@ -616,18 +618,44 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode ?? UNANSWERED_MESSAGE_WAITING_CODE : null;
 
   // The run this message started (the latest run that carries it), if any.
-  const runs = await q.select({
+  const runColumns = {
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
     errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
-    updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus,
-  }).from(heartbeatRuns).where(and(
+    updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, startedAt: heartbeatRuns.startedAt,
+    issueCommentStatus: heartbeatRuns.issueCommentStatus,
+  };
+  const runs = await q.select(runColumns).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     gt(heartbeatRuns.createdAt, new Date(message.createdAt.getTime() - 60 * 60_000))))
     .orderBy(desc(heartbeatRuns.createdAt)).limit(20);
   // Only a run that carries THIS message is evidence about it. An unrelated
   // run (a timer, or the continuation that replaced a cancelled deferred wake
   // with no comment ids) is not: the message's own wake path decides.
-  const messageRun = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
+  // Own pending input (R-ONCE), never ancestry. An earlier start must not
+  // disappear behind the latest-20 window or a newer unstarted carrier.
+  // Same carrier/start evidence as norun-sweep fbbb73fd (RFL record 1118).
+  const context = heartbeatRuns.contextSnapshot;
+  const ownInput = sql`(${context}->>'wakeCommentId' = ${message.id} or ${context}->>'commentId' = ${message.id}
+    or ${context}->>'conversationReplyBoundaryCommentId' = ${message.id}
+    or coalesce(${context}->'attributionCommentIds', '[]'::jsonb) ? ${message.id}
+    or ${context}->>'interactionId' = ${message.id}
+    or coalesce(${context}->'interactionIds', '[]'::jsonb) ? ${message.id}
+    or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${message.id}
+    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${message.id}
+    or (jsonb_typeof(${heartbeatRuns.resultJson}->'queuedSteeringAcknowledgements') = 'object'
+      and ${heartbeatRuns.resultJson}->'queuedSteeringAcknowledgements' ? ${message.id})
+    or exists (select 1 from ${heartbeatRunEvents} steer where steer.company_id = ${heartbeatRuns.companyId}
+      and steer.run_id = ${heartbeatRuns.id} and steer.source_event_id is not null and steer.event_type = 'item.completed'
+      and steer.payload->'prpEvent'->'payload'->>'kind' = 'steering_acknowledgement'
+      and steer.payload->'prpEvent'->>'itemId' like '%:steer:' || ${message.id}))`;
+  const carriers = await q.select(runColumns).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun, ownInput))
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
+  const startedMessageRun = carriers.find(candidate => candidate.startedAt !== null || candidate.status === "running") ?? null;
+  // A never-started carrier still owns its waiting/no-run decision. Keep
+  // that fallback distinct from the durable started-run evidence above.
+  const messageRun = startedMessageRun
+    ?? carriers.find(candidate => candidate.startedAt === null && candidate.status !== "running") ?? null;
   // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
   // native-governance.ts conversationTurnAnswered): only a pending question or
   // confirmation card that the message's OWN run created stands in for its
@@ -892,7 +920,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       }
       code = UNANSWERED_MESSAGE_WAITING_CODE;
     } else {
-      code = UNANSWERED_MESSAGE_NO_RUN_CODE;
+      code = startedMessageRun ? runCode! : UNANSWERED_MESSAGE_NO_RUN_CODE;
     }
   } else if (!run) {
     // Paperclip records a deferred or coalesced wake that could not start as

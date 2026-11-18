@@ -37,7 +37,9 @@ describe.skipIf(!support.supported)("RFL Bprime3 delivered first-turn messages",
   }
 
   for (const outcome of ["answers", "fails", "ends without answer"] as const) {
-    it(`delivered first-turn input: carrying run ${outcome}`, async () => {
+    const oldTitle = `delivered first-turn input: carrying run ${outcome}`;
+    it(outcome === "answers" ? oldTitle
+      : `supersedes(${oldTitle}; RFL record SUPERSEDE-BPRIME3-NOTICE-WORDING-1118)`, async () => {
       const f = await fixture();
       const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", runtimeMode: "native",
         nativeIssueId: f.issueId, responsibleUserId: f.userId, createdAt: new Date(f.messageAt.getTime() - 1_000),
@@ -62,8 +64,8 @@ describe.skipIf(!support.supported)("RFL Bprime3 delivered first-turn messages",
       if (outcome !== "answers") {
         expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.messageId}`);
         expect(notices[0]!.body).toBe(outcome === "fails"
-          ? "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task."
-          : "This run finished without a reply to your message. Sending it again is safe.");
+          ? "Your message wasn't answered. Check the task's recent history before trying again; the run may have taken actions."
+          : "This run finished without a reply to your message. Check the task's recent history before trying again; the run may have taken actions.");
       }
     });
   }
