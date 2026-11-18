@@ -11258,6 +11258,49 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(runtime.endpoints.get(endpoint.id)!.posts.map(post => post.text)).toEqual(["**Owner User (via Paperclip)**\n\nSmall pool work"]);
   }, 15_000);
 
+  it("does not hold a publication transaction open across Slack's Board channel check", async () => {
+    // Incident 11-17: a slow Slack call inside the publication authorization
+    // transaction left a session idle in transaction holding chat row locks.
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service, runtime } = await configuredSlackEndpoint(fixture, { linkedBoardUser: true });
+    const channel = makeThread({ channelId: "CHANG", id: "slack:CHANG:8310.1", name: "hang" });
+    await deliverMessage({ callbacks, endpointId: endpoint.id, thread: channel.thread,
+      message: makeMessage({ id: "8310.1", text: "@maya start here", mentioned: true }), trigger: "mention" });
+    await db.update(chatEndpoints).set({ status: "active" }).where(eq(chatEndpoints.id, endpoint.id));
+    const [conversation] = await service.listConversations(endpoint.id);
+    await service.publishBoardMessage(endpoint.id, conversation.id, "Hanging Slack check", randomUUID(), "owner-user");
+    // Replay the committed Board publication through a worker whose Slack call hangs.
+    await vi.waitFor(async () => expect((await db.select({ state: chatPublications.state }).from(chatPublications)
+      .where(eq(chatPublications.endpointId, endpoint.id))).map(row => row.state)).toEqual(["published"]), { timeout: 15_000 });
+    await service.shutdown();
+    await db.update(chatPublications).set({ state: "pending", nextAttemptAt: new Date(0) }).where(eq(chatPublications.endpointId, endpoint.id));
+    const slack = fakeSlackFetch() as typeof fetch;
+    // Every Slack channel check stalls briefly; sample the worker's sessions
+    // while it stalls.
+    const idleHolders: unknown[] = [];
+    let slackChecks = 0;
+    const hangingFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/conversations.info")) {
+        slackChecks += 1;
+        await new Promise(resolve => setTimeout(resolve, 500));
+        idleHolders.push(...await db.execute(sql`select state, left(query, 160) as last_statement from pg_stat_activity
+          where application_name = 'pool-hang-worker' and state like 'idle in transaction%'`) as unknown[]);
+      }
+      return slack(input, init);
+    }) as typeof fetch;
+    const workerDb = createDb(externalTestDatabaseUrl ?? tempDb!.connectionString, { maxConnections: 2, applicationName: "pool-hang-worker" });
+    const worker = chatChannelService(workerDb, {
+      fetch: hangingFetch, heartbeat: { wakeup: vi.fn(async () => ({ accepted: true })) },
+      publicBaseUrl: "https://paperclip.example", runtime: runtime as unknown as ChatSdkRuntime,
+    });
+    fixtureServices.add(worker);
+    await worker.processPendingDeliveries();
+    await worker.processPendingPublications();
+    expect(slackChecks).toBeGreaterThan(0);
+    expect([...idleHolders]).toEqual([]);
+    expect(runtime.endpoints.get(endpoint.id)!.posts.map(post => post.text)).toContain("**Owner User (via Paperclip)**\n\nHanging Slack check");
+  }, 60_000);
+
   it("refreshes Slack tool guidance without restoring disabled catalog policies", async () => {
     const { SLACK_TOOLS } = await import("@paperclipai/shared");
     const { slackBotCatalogIsCurrent, syncSlackBotTools } = await import("../services/connectors/slack-catalog.js");
@@ -11799,6 +11842,53 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await expect(service.update(endpoint.id, { executionDefaults: { projectId: randomUUID() } }, "owner-user")).rejects.toMatchObject({ status: 404 });
     expect((await service.get(endpoint.id)).executionDefaults).toEqual({ workspace: { kind: "task_directory" } });
   });
+
+  it("creates a channel-default task with one free pool connection: no second pool checkout inside the task transaction", async () => {
+    // Incident 11-17: inbound deliveries each held a task transaction (and the
+    // endpoint row lock) while awaiting a second pool connection. With the pool
+    // full of deliveries queued behind that lock, nothing can ever complete.
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service } = await configuredSlackEndpoint(fixture);
+    await service.update(endpoint.id, { executionDefaults: { workspace: { kind: "task_directory" } } }, "owner-user");
+    const thread = makeThread({ channelId: "C-POOL", id: "slack:C-POOL:8150.1", name: "pool" });
+    const transactionContext = new AsyncLocalStorage<boolean>();
+    const originalTransaction = db.transaction.bind(db);
+    const transactionSpy = vi.spyOn(db, "transaction").mockImplementation((work, ...args) =>
+      originalTransaction(tx => transactionContext.run(true, () => work(tx)), ...args));
+    const poolCheckouts: string[] = [];
+    const querySpies = (["select", "insert", "update", "delete", "execute"] as const).map(method => {
+      const original = db[method].bind(db) as (...args: unknown[]) => unknown;
+      return vi.spyOn(db, method).mockImplementation(((...args: unknown[]) => {
+        if (transactionContext.getStore()) poolCheckouts.push(`${method}: ${new Error().stack?.split("\n").slice(2, 8).join(" | ")}`);
+        return original(...args);
+      }) as never);
+    });
+    const max = Number(db.$client.options.max);
+    const held = await Promise.all(Array.from({ length: max - 1 }, () => db.$client.reserve()));
+    let outcome: "done" | "stuck" = "stuck";
+    let idleHolders: unknown[] = [];
+    let delivery: Promise<void> | null = null;
+    try {
+      delivery = deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread,
+        message: makeMessage({ id: "8150.1", text: "@maya make a report", mentioned: true }), trigger: "mention" });
+      outcome = await Promise.race([
+        delivery.then(() => "done" as const),
+        new Promise<"stuck">(resolve => setTimeout(() => resolve("stuck"), 20_000)),
+      ]);
+      if (outcome === "stuck") {
+        idleHolders = await held[0].unsafe(`select state, left(query, 160) as last_statement from pg_stat_activity
+          where datname = current_database() and state like 'idle in transaction%'`);
+      }
+    } finally {
+      for (const connection of held) connection.release();
+      await delivery?.catch(() => undefined);
+      transactionSpy.mockRestore();
+      for (const spy of querySpies) spy.mockRestore();
+    }
+    expect({ outcome, idleHolders, poolCheckouts }).toEqual({ outcome: "done", idleHolders: [], poolCheckouts: [] });
+    const [conversation] = await db.select().from(chatConversations).where(eq(chatConversations.endpointId, endpoint.id));
+    expect(conversation).toBeDefined();
+  }, 60_000);
 
   it("checks both linked sender and agent assignment grants for protected organizational defaults", async () => {
     const fixture = await seedCompany();
