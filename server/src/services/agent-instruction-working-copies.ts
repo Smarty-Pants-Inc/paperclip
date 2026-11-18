@@ -37,7 +37,7 @@ const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
 const completed = new Set(["saved", "unchanged", "resolved"]);
 const MAX_COLLECTION_ATTEMPTS = 3;
 import { instructionCopyRetryAt, INSTRUCTION_COPY_RETRY_MS } from "./instruction-copy-retry.js";
-import { AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE, agentFileHoldParked } from "./agent-file-save-hold.js";
+import { AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE, agentFileHoldNoticePending, agentFileHoldParked } from "./agent-file-save-hold.js";
 export { instructionCopyRetryAt, INSTRUCTION_COPY_RETRY_MS, INSTRUCTION_COPY_MAX_RETRY_MS } from "./instruction-copy-retry.js";
 const settledStates = new Set(["saved", "unchanged", "resolved", "unavailable", "conflict"]);
 
@@ -395,7 +395,9 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       || row.state === "unavailable" && !row.processStoppedAt && row.location.startsWith("remote:") && isAgentDirectoryCopy(row)
       // A held stopped save is retried durably until it verifies; a parked hold
       // (permanent, or waiting for its lease) is never timer-retried.
-      || agentFileSaveHeld(row) && Boolean(row.processStoppedAt) && !agentFileHoldParked(row.receipt?.savePending));
+      || agentFileSaveHeld(row) && Boolean(row.processStoppedAt) && !agentFileHoldParked(row.receipt?.savePending)
+      // B3 outbox: a permanent hold whose owner notice is still undelivered.
+      || agentFileSaveHeld(row) && agentFileHoldNoticePending(row.receipt?.savePending));
   }
   function strandsAgent(row: Copy) {
     const handedOff = row.state === "superseded" && typeof row.receipt?.successorRunId === "string"
@@ -421,7 +423,10 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       OR (${copies.receipt} ? 'savePending' AND ${copies.state} NOT IN ('saved', 'unchanged', 'resolved')
         AND ${copies.processStoppedAt} IS NOT NULL AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1'
         AND ${copies.receipt}->'savePending'->>'permanent' IS DISTINCT FROM 'true'
-        AND ${copies.receipt}->'savePending'->>'retryOn' IS DISTINCT FROM ${AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE}))`,
+        AND ${copies.receipt}->'savePending'->>'retryOn' IS DISTINCT FROM ${AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE})
+      OR (${copies.receipt} ? 'savePending' AND ${copies.state} NOT IN ('saved', 'unchanged', 'resolved')
+        AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1'
+        AND ${copies.receipt}->'savePending'->>'permanent' = 'true' AND ${copies.receipt}->'savePending'->>'noticeDelivered' = 'false'))`,
       inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"]));
   }
   type StopEvidence = "directory_save_pending" | "directory_unavailable" | "directory_preparing" | "local" | "remote" | null;

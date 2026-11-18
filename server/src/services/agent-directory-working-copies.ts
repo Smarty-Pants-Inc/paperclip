@@ -9,7 +9,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
-import { agents, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
+import { activityLog, agents, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
 import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation, type DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -979,10 +979,23 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (!stopped) return patch(row, { errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE",
       errorMessage: rejection ? `Agent-file save rejected: ${rejection} Changes were not saved.` : "Incremental checkpoint could not be validated; collecting after provider stop.", nextAttemptAt: null });
     const storageLimit = failure instanceof AgentFileLimitError || String(failure).includes("LIMIT_EXCEEDED");
+    // B2 (rf-3 item 2): a WARM permanent refusal pins a durable mirror of the
+    // exact stopped tree (the full tree, retrieved into the controller mirror)
+    // with its held-file manifest, so its destroy bound can verify it. A failed
+    // retrieve pins nothing and the box stays blocked (fail closed).
+    let mirrored: Awaited<ReturnType<typeof retrieve>> | undefined;
+    if (!storageLimit && permanentAgentFileRefusalStatus(failure) !== null && target?.kind === "remote" && !signal?.aborted) {
+      mirrored = await retrieve(row, target, signal).catch(error => {
+        logger.warn({ err: error, runId: row.runId }, "Warm permanent hold: the stopped tree could not be mirrored; its box stays blocked");
+        return undefined;
+      });
+      live();
+    }
     // Fail closed: the stopped tree is the only copy of these changes. Hold it
     // (no release, no lease destruction) and retry the save durably.
     return holdUnsaved(row, storageLimit ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED", failure,
-      storageLimit ? agentStorageWarning(failure instanceof AgentFileLimitError ? failure.message : "Agent folder exceeds a storage limit") : null);
+      storageLimit ? agentStorageWarning(failure instanceof AgentFileLimitError ? failure.message : "Agent folder exceeds a storage limit") : null,
+      mirrored ? directorySnapshotSha256(mirrored.snapshot) : undefined, "unavailable", mirrored?.snapshot);
   }
   /** Re-arms an existing hold (failed save OR unsurfaced aside copies) with the
    * shared instruction-copy backoff, keeping the hold's own operator text. */
@@ -1004,7 +1017,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (errorCode !== AGENT_FILES_ASIDE_UNSURFACED && !(failure instanceof HttpError && failure.status === 403) && await nothingToSave(row))
       return settleNothingToSave(row, reason);
     const stoppedAt = row.processStoppedAt ?? new Date();
-    const previous = row.receipt?.savePending as { since?: string; failures?: number; permanentAt?: string; heldFiles?: AgentFileHeldFile[]; noticeActivityId?: string } | undefined;
+    const previous = row.receipt?.savePending as { since?: string; failures?: number; permanentAt?: string; heldFiles?: AgentFileHeldFile[]; noticeActivityId?: string; noticeDelivered?: boolean } | undefined;
     const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
     // B1: a permanent refusal of these pinned bytes is never retried.
     const permanentStatus = errorCode === "AGENT_FILES_SAVE_FAILED" ? permanentAgentFileRefusalStatus(failure) : null;
@@ -1015,7 +1028,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const savePending = { since: since.toISOString(), code: errorCode, reason: reason.slice(0, 500),
       failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}),
       ...(permanentStatus !== null ? { permanent: true, permanentStatus, permanentAt: previous?.permanentAt ?? new Date().toISOString(),
-        ...(heldFiles ? { heldFiles } : {}), ...(previous?.noticeActivityId ? { noticeActivityId: previous.noticeActivityId } : {}) } : {}),
+        ...(heldFiles ? { heldFiles } : {}),
+        // B3 outbox (rf-3 item 5): the notice intent is written in the SAME
+        // update as the permanent marker; delivery is idempotent on this id.
+        noticeActivityId: previous?.noticeActivityId ?? randomUUID(),
+        noticeDelivered: previous?.noticeActivityId ? previous.noticeDelivered ?? true : false } : {}),
       ...(leaseGone ? { retryOn: AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE } : {}) };
     const held = await patch(row, { state, processStoppedAt: stoppedAt, errorCode,
       errorMessage: agentFileHoldInstruction({ ...row, receipt: { ...row.receipt, savePending } }),
@@ -1060,21 +1077,36 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       errorMessage: `Nothing to save: the last verified checkpoint was unchanged. The refusal (${reason.slice(0, 200)}) needs no retry.`,
       nextAttemptAt: null, receipt: { ...withoutSaveHold(row.receipt), nothingToSave: { reason: reason.slice(0, 500), at: new Date().toISOString() } } });
   }
-  /** B3: exactly one owner notice per permanent hold (CAS on savePending.noticeActivityId). */
+  /** B3 outbox: the permanent hold carries its notice intent (noticeActivityId,
+   * noticeDelivered false) from the update that made it permanent. Delivery
+   * inserts that exact activity id once and marks it delivered in one
+   * transaction; a failed delivery leaves the intent pending for the recovery
+   * worker (agentFileHoldNoticePending), so a notice is never lost. */
   async function noticePermanentHold(row: Copy): Promise<Copy> {
-    const pending = row.receipt?.savePending as { permanent?: unknown; permanentStatus?: number; reason?: string; noticeActivityId?: unknown } | undefined;
-    if (pending?.permanent !== true || pending.noticeActivityId) return row;
+    const pending = row.receipt?.savePending as { permanent?: unknown; permanentStatus?: number; reason?: string; noticeActivityId?: unknown; noticeDelivered?: unknown } | undefined;
+    if (pending?.permanent !== true || typeof pending.noticeActivityId !== "string" || pending.noticeDelivered !== false) return row;
+    try { return await deliverPermanentHoldNotice(row, pending as typeof pending & { noticeActivityId: string }); }
+    catch (error) {
+      logger.warn({ err: error, runId: row.runId }, "Permanent hold notice not delivered; it stays pending for recovery");
+      return (await get(row.companyId, row.runId)) ?? row;
+    }
+  }
+  async function deliverPermanentHoldNotice(row: Copy, pending: { permanentStatus?: number; reason?: string; noticeActivityId: string }): Promise<Copy> {
     const [agent] = await db.select({ name: agents.name }).from(agents).where(and(eq(agents.companyId, row.companyId), eq(agents.id, row.agentId)));
-    const activityId = randomUUID();
+    const activityId = pending.noticeActivityId;
     const discardRoute = `POST /api/companies/${row.companyId}/agent-file-holds/${row.runId}/discard`;
     const agentName = agent?.name ?? row.agentId;
     const message = `${agentName}'s agent-file changes from run ${row.runId} cannot be saved: ${pending.reason ?? "the save was refused"}. `
       + `They will not be retried. The changed files are kept on the server. To give them up, an instance operator can discard the held save: ${discardRoute}.`;
     const publication = await db.transaction(async tx => {
-      const [claimed] = await tx.update(copies).set({ receipt: sql`jsonb_set(${copies.receipt}, '{savePending,noticeActivityId}', ${JSON.stringify(activityId)}::jsonb)` })
+      // Marks THIS intent delivered (row-locked); a concurrent or repeated delivery finds nothing to claim.
+      const [claimed] = await tx.update(copies).set({ receipt: sql`jsonb_set(${copies.receipt}, '{savePending,noticeDelivered}', 'true'::jsonb)` })
         .where(and(eq(copies.companyId, row.companyId), eq(copies.runId, row.runId),
-          sql`${copies.receipt}->'savePending'->>'permanent' = 'true' AND NOT (${copies.receipt}->'savePending' ? 'noticeActivityId')`)).returning({ runId: copies.runId });
+          sql`${copies.receipt}->'savePending'->>'permanent' = 'true' AND ${copies.receipt}->'savePending'->>'noticeDelivered' = 'false'
+            AND ${copies.receipt}->'savePending'->>'noticeActivityId' = ${activityId}`)).returning({ runId: copies.runId });
       if (!claimed) return null;
+      const [already] = await tx.select({ id: activityLog.id }).from(activityLog).where(eq(activityLog.id, activityId));
+      if (already) return null;
       return (await persistActivity(tx as unknown as Db, { companyId: row.companyId, actorType: "system", actorId: "agent-files",
         action: "agent_files.save_held_permanent", entityType: "agent", entityId: row.agentId, agentId: row.agentId, runId: row.runId,
         responsibleUserIdOverride: row.responsibleUserId,

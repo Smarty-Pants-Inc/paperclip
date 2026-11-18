@@ -2848,6 +2848,12 @@ function createSandboxEnvironmentDriver(
       if (rolloverLease && input.heartbeatRunId) {
         await retireCompatibleConfigurationSource(rolloverLease, recordedLease, input.heartbeatRunId);
       }
+      // B0b: the built-in provider resumed the exact retained box: re-arm its LEASE-GONE holds.
+      if (reusableLease && providerLease.providerLeaseId === reusableLease.providerLeaseId) {
+        await rearmAgentFileHoldsOnLeaseActive(db, { id: reusableLease.id, companyId: reusableLease.companyId,
+          providerLeaseId: reusableLease.providerLeaseId, heartbeatRunId: reusableLease.heartbeatRunId })
+          .catch(error => logger.warn({ err: error, leaseId: reusableLease.id }, "Agent-file LEASE-GONE holds not re-armed on resume"));
+      }
       return recordedLease;
     },
 
@@ -4501,6 +4507,16 @@ export function environmentRuntimeService(
     drivers.set(driver.driver, driver);
   }
 
+  /** B0b (rf-3 item 4): every lifecycle resume that returns the exact box re-arms
+   * the agent-file saves held only because its lease was gone (event, not timer). */
+  async function rearmHeldSavesOnResume<T extends { providerLeaseId?: string | null } | null>(lease: EnvironmentLease, resumed: T): Promise<T> {
+    if (resumed && (!resumed.providerLeaseId || resumed.providerLeaseId === lease.providerLeaseId)) {
+      await rearmAgentFileHoldsOnLeaseActive(db, { id: lease.id, companyId: lease.companyId, providerLeaseId: lease.providerLeaseId,
+        heartbeatRunId: lease.heartbeatRunId })
+        .catch(error => logger.warn({ err: error, leaseId: lease.id }, "Agent-file LEASE-GONE holds not re-armed on resume"));
+    }
+    return resumed;
+  }
   function getDriver(driverKey: string): EnvironmentRuntimeDriver | null {
     return drivers.get(driverKey) ?? null;
   }
@@ -5285,7 +5301,7 @@ export function environmentRuntimeService(
       if (!driver.resumeRunLease) {
         throw new Error(`Environment driver "${driver.driver}" does not support lease resume.`);
       }
-      return await driver.resumeRunLease(input);
+      return rearmHeldSavesOnResume(input.lease, await driver.resumeRunLease(input));
     },
 
     async resumeWorkspaceRecoveryLease(input: {
@@ -5298,8 +5314,8 @@ export function environmentRuntimeService(
       if (!driver.resumeRunLease) throw new Error(`Environment driver "${driver.driver}" does not support lease resume.`);
       // Maintenance reopens the protected source only to preserve its files.
       // Ordinary resume and destructive cleanup keep their existing fences.
-      return await driver.resumeRunLease({ environment: environment as Environment, lease: lease as EnvironmentLease,
-        requestedCwd: remoteCwd });
+      return rearmHeldSavesOnResume(lease as EnvironmentLease, await driver.resumeRunLease({ environment: environment as Environment, lease: lease as EnvironmentLease,
+        requestedCwd: remoteCwd }));
     },
 
     async destroyRunLease(input: EnvironmentDriverLeaseInput): Promise<EnvironmentLease | null> {

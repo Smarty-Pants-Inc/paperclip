@@ -3,7 +3,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { directorySnapshotSha256 } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { HttpError, conflict, notFound } from "../errors.js";
+import { inspectAgentDirectory } from "./agent-file-store.js";
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
@@ -41,18 +43,41 @@ export function agentFileHoldParked(savePending: unknown): boolean {
   return pending?.permanent === true || pending?.retryOn === AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE;
 }
 export type AgentFileHeldFile = { path: string; sha256: string };
-export type AgentFileDurableCheck = { durable: boolean; checkedAt: string; files: number; changed: string[]; missing: string[]; detail?: string };
-/** Re-reads every held file from the controller mirror and compares path + sha256. */
-export async function verifyHeldFilesDurable(root: string, heldFiles: unknown): Promise<AgentFileDurableCheck> {
+export type AgentFileDurableCheck = { durable: boolean; checkedAt: string; files: number; changed: string[]; missing: string[]; detail?: string;
+  mirrorHash?: string | null; observedHash?: string | null; empty?: boolean };
+/**
+ * B2 (rf-3 items 2-3): the held bytes are durable only as the DURABLE copy the
+ * hold pinned, i.e. the controller mirror whose whole-tree snapshot hash is
+ * savePending.mirrorHash (the same proof collectStopped retries from). Every
+ * held file is also re-read (path + sha256) to name what changed or is missing.
+ * A hold with no pinned mirror proves nothing (a warm hold now pins one when it
+ * is held). An EMPTY hold (the candidate tree holds no file: nothing is left to
+ * keep, e.g. the sole configured entry was deleted) needs no copy.
+ */
+export async function verifyHeldMirrorDurable(root: string, pending: { mirrorHash?: unknown; heldFiles?: unknown }): Promise<AgentFileDurableCheck> {
   const checkedAt = new Date().toISOString();
-  if (!Array.isArray(heldFiles) || heldFiles.length === 0) return { durable: false, checkedAt, files: 0, changed: [], missing: [], detail: "The hold has no held-file manifest" };
+  const mirrorHash = typeof pending.mirrorHash === "string" ? pending.mirrorHash : null;
+  const heldFiles = Array.isArray(pending.heldFiles) ? pending.heldFiles as AgentFileHeldFile[] : null;
+  if (heldFiles && heldFiles.length === 0) return { durable: true, checkedAt, files: 0, changed: [], missing: [], empty: true, mirrorHash,
+    detail: "Empty hold: the held candidate contains no file, so nothing is left to keep" };
+  if (!mirrorHash || !heldFiles) return { durable: false, checkedAt, files: heldFiles?.length ?? 0, changed: [], missing: [], mirrorHash,
+    detail: "The hold has no pinned durable mirror (mirrorHash + held-file manifest)" };
   const changed: string[] = [], missing: string[] = [];
-  for (const file of heldFiles as AgentFileHeldFile[]) {
+  for (const file of heldFiles) {
     const bytes = await fs.readFile(path.join(root, file.path)).catch(() => null);
     if (bytes === null) missing.push(file.path);
     else if (createHash("sha256").update(bytes).digest("hex") !== file.sha256) changed.push(file.path);
   }
-  return { durable: changed.length === 0 && missing.length === 0, checkedAt, files: heldFiles.length, changed, missing };
+  let observedHash: string | null = null;
+  try { observedHash = directorySnapshotSha256((await inspectAgentDirectory(root)).snapshot); } catch { observedHash = null; }
+  const durable = observedHash === mirrorHash && changed.length === 0 && missing.length === 0;
+  return { durable, checkedAt, files: heldFiles.length, changed, missing, mirrorHash, observedHash,
+    ...(durable || changed.length || missing.length ? {} : { detail: "The mirror tree no longer matches the pinned mirrorHash" }) };
+}
+/** B3 outbox: a permanent hold's owner notice is pending until delivered. */
+export function agentFileHoldNoticePending(savePending: unknown): boolean {
+  const pending = savePending as { permanent?: unknown; noticeDelivered?: unknown } | null | undefined;
+  return pending?.permanent === true && pending.noticeDelivered === false;
 }
 type HeldCopyRow = { company_id: string; run_id: string; local_root: string; receipt: Record<string, unknown> | null };
 /**
@@ -62,11 +87,11 @@ type HeldCopyRow = { company_id: string; run_id: string; local_root: string; rec
  * sha256). The check is written to the hold (savePending.durableCheck).
  */
 async function permanentHoldReleasedForDestroy(db: Pick<Db, "execute">, row: HeldCopyRow): Promise<boolean> {
-  const pending = row.receipt?.savePending as { permanent?: unknown; permanentAt?: unknown; since?: unknown; heldFiles?: unknown } | undefined;
+  const pending = row.receipt?.savePending as { permanent?: unknown; permanentAt?: unknown; since?: unknown; heldFiles?: unknown; mirrorHash?: unknown } | undefined;
   if (pending?.permanent !== true) return false;
   const permanentAt = Date.parse(String(pending.permanentAt ?? pending.since ?? ""));
   if (!Number.isFinite(permanentAt) || Date.now() - permanentAt < AGENT_FILE_PERMANENT_HOLD_DESTROY_BOUND_MS) return false;
-  const check = await verifyHeldFilesDurable(row.local_root, pending.heldFiles);
+  const check = await verifyHeldMirrorDurable(row.local_root, pending);
   await (db as Db).execute(sql`update agent_instruction_working_copies
     set receipt = jsonb_set(receipt, '{savePending,durableCheck}', ${JSON.stringify(check)}::jsonb)
     where company_id = ${row.company_id} and run_id::text = ${row.run_id}::text and receipt ? 'savePending'`);
