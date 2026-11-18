@@ -7,6 +7,7 @@ import { redactCurrentUserText } from "../../log-redaction.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueService } from "../issues.js";
 import { readPiConversation } from "./pi-conversation-record.js";
+import { answeredPersonMessageSql } from "../person-message-answer.js";
 
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const nativeId = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
@@ -139,9 +140,11 @@ export type HeldConversationNotice = {
 /**
  * The newest held-conversation notice per issue, unless it is superseded: a
  * LATER run (created after the notice) on the same issue AND the same native
- * session that succeeded with a committed result. A success on another session
- * (a fresh conversation for a new task) does not clear it. One set-based read
- * for the whole batch.
+ * session that succeeded with a committed result, or a REAL answer on this
+ * conversation: a person message written after the notice that the shared
+ * ANSWERED predicate (answeredPersonMessageSql) holds answered. A success on
+ * another session that answers no later message does not clear it. One
+ * set-based read for the whole batch.
  */
 export async function readUnsupersededHeldConversationNotices(db: Db,
   input: { companyId: string; issueIds: readonly string[] }): Promise<Map<string, HeldConversationNotice>> {
@@ -165,7 +168,14 @@ export async function readUnsupersededHeldConversationNotices(db: Db,
         and later.native_session_id::text = ${sessionOf}
         and later.status = 'succeeded'
         and finalization.phase = 'committed'
-        and later.created_at > issue_comments.created_at)`,
+        and later.created_at > issue_comments.created_at)
+      or exists (select 1 from ${issueComments} later_message
+        where later_message.company_id = issue_comments.company_id
+          and later_message.issue_id = issue_comments.issue_id
+          and later_message.author_type = 'user' and later_message.deleted_at is null
+          and later_message.created_at > issue_comments.created_at
+          and ${answeredPersonMessageSql({ id: sql`later_message.id`, companyId: sql`later_message.company_id`,
+            issueId: sql`later_message.issue_id`, createdAt: sql`later_message.created_at` })})`,
   }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId),
     inArray(issueComments.issueId, issueIds),

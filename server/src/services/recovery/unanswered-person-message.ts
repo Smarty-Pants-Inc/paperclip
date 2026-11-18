@@ -18,7 +18,7 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
-import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
+import { heldConversationRemedy } from "../held-conversation-remedy.js";
 import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
@@ -769,6 +769,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // as isNativeContinuationRefusal already decides for its own patterns.
   const policyRefused = code === PROVIDER_POLICY_REFUSAL_CODE;
   const held = (isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run));
+  // The ONE remedy rule shared with the executor's held-predecessor writer.
+  const heldRemedy = held ? await heldConversationRemedy(q, { companyId: issue.companyId, issueId: issue.id }) : null;
   const supervisionUnconfirmed = code === REMOTE_RUNNER_SUPERVISION_EXHAUSTED && !held;
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
@@ -786,7 +788,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
-      : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
+      : heldRemedy ? heldRemedy.body : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
@@ -797,7 +799,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
-        : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
+        : boundReached ? "Send a new message to try again." : heldRemedy ? heldRemedy.nextAction
+        : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,

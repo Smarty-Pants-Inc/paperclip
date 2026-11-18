@@ -8437,6 +8437,7 @@ async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExe
 
 /** The banner text for a conversation held behind an unfinished predecessor. */
 import { HELD_PREDECESSOR_NOTICE } from "./held-predecessor-notice-text.js";
+import { heldConversationRemedy } from "../held-conversation-remedy.js";
 import { providerIdentityResetLine } from "./provider-identity-reset-notice.js";
 
 /**
@@ -8485,6 +8486,8 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
     const [owner] = await input.db.select({ resultId: nativeRunFinalizations.resultId }).from(nativeRunFinalizations)
       .where(and(eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, prior.id)));
     if (owner?.resultId) return;
+    // The ONE remedy rule shared with the unanswered sweep's held family.
+    const remedy = await heldConversationRemedy(input.db, { companyId, issueId });
     await input.db.transaction(async tx => {
       const [issue] = await tx.select({ id: issues.id }).from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId))).for("no key update");
@@ -8503,7 +8506,7 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
         eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
         isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`)).limit(1);
       if (unanswered) return;
-      await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
+      await issueService(input.db).addComment(issueId, remedy.body, {}, { authorType: "system", presentation: {
         kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true,
       }, metadata: { version: 1, authorizationReason: `${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${normalizedSessionId}`,
         sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Held conversation" }] }] } }, tx);
