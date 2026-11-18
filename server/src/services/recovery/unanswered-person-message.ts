@@ -31,7 +31,7 @@ import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal, isRecoverableNativeSupervisionFailure } from "../native-continuation-refusal.js";
 import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION } from "../native-runtime/remote-runner-recovery-diagnostics.js";
-import { personHeldChatMessageSql, personStoppedCarrierSql, runStartedAnswering, stoppedBySender } from "./person-stopped-message.js";
+import { personHeldChatMessageSql, personStoppedCarrierSql, senderStoppedWhileAnswering } from "./person-stopped-message.js";
 import { automaticRecoveryPending } from "./automatic-recovery-pending.js";
 import { AGENT_PAUSE_STOP_REASON } from "../governance-pause-stop.js";
 
@@ -501,16 +501,6 @@ export const PENDING_WAIT_BOUND_MS = 2 * 60_000;
 
 const issueRunSql = (issueId: string) =>
   or(eq(heartbeatRuns.nativeIssueId, issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`);
-
-/** The shared person-stop exclusion, WHOLE (person-stopped-message.ts): the message's SENDER stopped this
- * run AND the run had STARTED answering the message. Never one half alone. */
-async function senderStoppedWhileAnswering(q: Db, companyId: string,
-  run: { id: string; status: string; errorCode: string | null; resultJson: Record<string, unknown> | null;
-    contextSnapshot: unknown } | undefined,
-  message: { id: string; authorUserId?: string | null }): Promise<boolean> {
-  if (!run || !message.authorUserId || !stoppedBySender(run, message.authorUserId)) return false;
-  return runStartedAnswering(q, { companyId, runId: run.id, messageId: message.id, contextSnapshot: run.contextSnapshot });
-}
 
 /** The one predicate: run outside the fence to skip the lock in the common
  * case, and again unchanged inside it before writing. Reads only. */
