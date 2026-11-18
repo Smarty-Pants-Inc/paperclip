@@ -1872,7 +1872,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     execution_settling: "Waiting for the previous run to settle. Your message is saved.",
   } as const;
   const SCENARIOS = ["acknowledged person stop", "unacknowledged person stop", "interrupt stop", "person stop then Send",
-    "no person stop", "acknowledged person stop + blocker"] as const;
+    "no person stop", "acknowledged person stop + blocker", "acknowledged person stop + unrelated recovery action"] as const;
   const rows4b = (Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>).flatMap(reason =>
     [true, false].flatMap(chat => SCENARIOS.map(scenario => [reason, chat ? "chat" : "task", scenario] as const)));
   it.each(rows4b)("SCREEN row 4b: a %s wait on the %s after %s", async (reason, surface, scenario) => {
@@ -1896,6 +1896,13 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: f.runId,
         status: "active", nextAction: "Automatic recovery stopped.", evidence: { runId: f.runId } });
     }
+    // rf-5 SC1: an active recovery action that is NOT a reconciliation source
+    // (admission's read skips it and admits the owner's Send) must not hide R4.
+    if (scenario === "acknowledged person stop + unrelated recovery action") {
+      await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "stranded_assigned_issue", cause: "agent_paused_with_pending_work", fingerprint: `paused:${f.issueId}`,
+        status: "active", nextAction: "Resume the agent.", evidence: {} });
+    }
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
     const wait = { reason, message: RECOVERY_WAITS[reason] };
     await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", payload: { ...wake.payload, executionWait: wait,
@@ -1904,7 +1911,8 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       .where(eq(agentWakeupRequests.id, f.wakeId));
     const queue = (await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
     expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
-    const optionS = surface === "chat" && scenario === "acknowledged person stop";
+    const optionS = surface === "chat" && (scenario === "acknowledged person stop"
+      || scenario === "acknowledged person stop + unrelated recovery action");
     expect(queue.executionWait).toEqual(optionS ? { reason: "stopped_by_person", message: R4 }
       : scenario === "person stop then Send" ? { reason: "interrupt_handoff", message: "Sending your messages." }
         : wait);
