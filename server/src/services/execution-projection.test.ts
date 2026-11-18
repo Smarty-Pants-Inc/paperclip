@@ -54,6 +54,27 @@ describe("execution truth projection", () => {
     expect(projectExecution(stopped, undefined, [], { cause: "workspace_restore_failed", nextAction: "Save files" }, now).phase)
       .toBe("recovery_needed");
   });
+  // adopt-c3-stop-a9 (F): a person's acknowledged Stop owes no restore (C3), so
+  // the projection is the existing Stopped state, never "Recovery needed".
+  it("a9 (F): a native run cancelled by a person's acknowledged Stop is Stopped, not Recovery needed", () => {
+    const nativeCancellation = { schema: "paperclip.native-cancellation.v1", runId: "stopped", companyId: "co", issueId: "task",
+      scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+      intentAuditId: "intent", acknowledgementAuditId: "ack" };
+    const stopped = run({ id: "stopped", companyId: "co", nativeIssueId: "task", status: "cancelled", finishedAt: now,
+      errorCode: "cancelled", resultJson: { nativeCancellation } });
+    const terminal = coordinator({ phase: "terminal_failure", failureCode: "native_retry_cancelled", resultId: null, leaseExpiresAt: null });
+    const projected = projectExecution(stopped, terminal, [], undefined, now);
+    expect(projected).toMatchObject({ phase: "completed", label: "Stopped", cause: null });
+    expect(projected.label).not.toBe("Recovery needed");
+    expect(projected.permittedActions).not.toContain("inspect_recovery");
+    // Genuine recovery keeps "Recovery needed": an open recovery action, an
+    // accepted result, or a Stop that is not acknowledged.
+    expect(projectExecution(stopped, terminal, [], { status: "active", cause: "workspace_restore_failed", nextAction: "Save files" }, now))
+      .toMatchObject({ phase: "recovery_needed", label: "Recovery needed" });
+    expect(projectExecution(stopped, coordinator({ ...terminal, resultId: "accepted" }), [], undefined, now).label).toBe("Recovery needed");
+    expect(projectExecution(run({ ...stopped, resultJson: { nativeCancellation: { ...nativeCancellation, dispatchState: "requested" } } }),
+      terminal, [], undefined, now).label).toBe("Recovery needed");
+  });
   it.each([undefined, "unknown", "provider_api_stop_receipt"])("retains failure presentation for an unqualified legacy Stop proof: %s", proof => {
     const stopped = run({ status: "cancelled", runtimeMode: "legacy", finishedAt: now,
       resultJson: { cancellation: { source: "operator", expected: true, initiator: { type: "user" },
