@@ -40,10 +40,15 @@ export async function markNativeHarnessBackupMissing(db: Db, input: {
   }
   const marker: NativeHarnessBackupMissing = { runId: input.runId, sessionId: input.sessionId,
     sessionRootDigest: createHash("sha256").update(input.sessionId).digest("hex"), reason: input.reason, at: new Date().toISOString() };
-  await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
+  // The UPDATE takes this row's lock, which the final destroy claim
+  // (claimLeaseForDestroyUnlessHeld) holds on every row of the allocation: the
+  // marker commits before that claim reads, or waits for it. Confirm the row.
+  const updated = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
     metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ nativeHarnessBackupMissing: marker })}::jsonb`,
     updatedAt: new Date(),
-  }).where(and(identity, eq(environmentLeases.id, leaseId))), { companyId: input.companyId, runId: input.runId, leaseId });
+  }).where(and(identity, eq(environmentLeases.id, leaseId))).returning({ id: environmentLeases.id }),
+  { companyId: input.companyId, runId: input.runId, leaseId });
+  if (!Array.isArray(updated) || updated.length !== 1) throw new Error("native_harness_backup_missing_not_recorded");
 }
 
 /** Only a newer successful backup of this session on this allocation discharges custody.

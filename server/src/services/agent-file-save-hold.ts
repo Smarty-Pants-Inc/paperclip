@@ -2,7 +2,25 @@ import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 
-type HoldLease = { id: string; companyId: string; providerLeaseId?: string | null };
+type HoldLease = { id: string; companyId: string; provider?: string | null; providerLeaseId?: string | null };
+
+/**
+ * True while ANY lease of this allocation (same company, provider and provider
+ * box), including an expired predecessor, carries nativeHarnessBackupMissing.
+ * The marker sits on the owner row that failed its close, not on the row a
+ * later destroy names, so a row-local check lets a successor destroy past it.
+ * Only a matching verified backup clears it (clearNativeHarnessBackupMissing).
+ */
+export async function nativeHarnessBackupMissingOnAllocation(db: Pick<Db, "execute">, lease: HoldLease): Promise<boolean> {
+  if (typeof (db as Db).execute !== "function") return false;
+  const rows = await (db as Db).execute(sql`select 1 from environment_leases target
+    join environment_leases marked on marked.id = target.id
+      or (target.provider_lease_id is not null and marked.company_id = target.company_id
+        and marked.provider is not distinct from target.provider and marked.provider_lease_id = target.provider_lease_id)
+    where target.id = ${lease.id} and marked.metadata ? 'nativeHarnessBackupMissing'
+    limit 1`);
+  return Array.isArray(rows) && rows.length > 0;
+}
 
 /**
  * True while a stopped agent-file save on this lease (or the same provider
@@ -42,12 +60,26 @@ export const AGENT_FILE_COLLECTION_PINS_KEY = "agentFileCollectionPins";
  * never destroy then. Release only with releaseLeaseDestroyClaim(token).
  */
 export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease): Promise<string | null> {
-  if (typeof (db as Db).transaction !== "function") return (await agentFileSaveHeldOnLease(db, lease)) ? null : randomUUID();
+  if (typeof (db as Db).transaction !== "function") {
+    if (await nativeHarnessBackupMissingOnAllocation(db, lease)) return null;
+    return (await agentFileSaveHeldOnLease(db, lease)) ? null : randomUUID();
+  }
   return await db.transaction(async tx => {
-    const locked = await (tx as unknown as Db).execute(sql`select coalesce(metadata->${AGENT_FILE_COLLECTION_PINS_KEY}::text, '{}'::jsonb) <> '{}'::jsonb as pinned
-      from environment_leases where id = ${lease.id} for update`);
-    if (!Array.isArray(locked) || locked.length === 0) return null;
-    if ((locked[0] as { pinned?: unknown }).pinned === true) return null;
+    // Lock this row and every row of its allocation in one id-ordered statement,
+    // so a harness-missing marker write (an UPDATE of one of these rows) either
+    // commits before this claim (seen by the fresh read below) or waits for it.
+    const locked = await (tx as unknown as Db).execute(sql`select id, coalesce(metadata->${AGENT_FILE_COLLECTION_PINS_KEY}::text, '{}'::jsonb) <> '{}'::jsonb as pinned
+      from environment_leases where id = ${lease.id}
+        or (company_id, provider_lease_id) = (select company_id, provider_lease_id from environment_leases target
+          where target.id = ${lease.id} and target.provider_lease_id is not null)
+          and provider is not distinct from (select provider from environment_leases target where target.id = ${lease.id})
+      order by id for update`);
+    if (!Array.isArray(locked)) return null;
+    const own = (locked as { id?: unknown; pinned?: unknown }[]).find(row => row.id === lease.id);
+    if (!own) return null;
+    if (own.pinned === true) return null;
+    // Fresh statement after the locks: a marker committed while we waited is visible.
+    if (await nativeHarnessBackupMissingOnAllocation(tx as unknown as Db, lease)) return null;
     if (await agentFileSaveHeldOnLease(tx as unknown as Db, lease)) return null;
     const token = randomUUID();
     await (tx as unknown as Db).execute(sql`update environment_leases set metadata = coalesce(metadata, '{}'::jsonb)
