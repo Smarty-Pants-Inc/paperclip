@@ -50,6 +50,7 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
 import { heartbeatService } from "../services/heartbeat.js";
 import { agentRoutes } from "../routes/agents.js";
 import { issueRoutes } from "../routes/issues.js";
+import { activityRoutes } from "../routes/activity.js";
 import { errorHandler } from "../middleware/index.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { settleUnansweredPersonMessages } from "../services/recovery/unanswered-person-message.js";
@@ -91,7 +92,7 @@ describe.skipIf(!support.supported)("R2-1: the orphan card, notice and Retry adm
     const app = express(); app.use(express.json());
     app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId: "orphan-person", companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: false }; next(); });
-    app.use("/api", agentRoutes(db, {})); app.use("/api", issueRoutes(db, {} as any, {})); app.use(errorHandler);
+    app.use("/api", agentRoutes(db, {})); app.use("/api", issueRoutes(db, {} as any, {})); app.use("/api", activityRoutes(db)); app.use(errorHandler);
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never });
     const send = async (body: string) => {
       const sent = await request(app).post(`/api/issues/${issueId}/comments`).send({ body, clientRequestId: randomUUID() });
@@ -210,6 +211,14 @@ describe.skipIf(!support.supported)("R2-1: the orphan card, notice and Retry adm
       expect.soft(card?.observedRunId, "the card names M1's failed run").toBe(failedRun.id);
       expect.soft(nextActionOf(screen.m1Notices[0]), "plain: the notice keeps its send-again line").toMatch(/^Send the message again/);
     }
+    // bb-tamin-dom (1): the REAL responses the chat and task views read for this orphan, replayed through the
+    // real TaskChatThread by ui/src/components/TaskChatThread.orphan-notice.test.tsx (its fixture is this file's output).
+    const runIds = [...new Set(first.runs.map(run => run.id))].join(",");
+    await fs.mkdir(out, { recursive: true });
+    await fs.writeFile(path.join(out, `orphan-ui-replay-${shape}.json`), JSON.stringify({ shape, m1, m2: m2 || null, failedRunId: failedRun.id,
+      latestRunId: latestRun.id, agentId: c.agentId, issue: (await get(c, `/api/issues/${c.issueId}`)).body, comments: screen.list,
+      runs: (await get(c, `/api/issues/${c.issueId}/runs`)).body, recentRuns: (await get(c, `/api/issues/${c.issueId}/runs?view=recent`)).body,
+      runsByIds: (await get(c, `/api/issues/${c.issueId}/runs?runIds=${runIds}`)).body }, null, 2));
     const okBefore = fixture.calls.filter(call => call.ok).length;
     const retry = await pressCardRetry(c, card);
     const second = await sweep(c, 8_000);

@@ -1,0 +1,531 @@
+{
+ "shape": "m2-held",
+ "m1": "3ea7d516-2c9d-414f-9f32-f2edb11c811f",
+ "m2": "5759bf93-76d9-4faf-ba06-acf3392dddd7",
+ "failedRunId": "c292ce6e-e03c-4f28-9317-09c450da42b7",
+ "latestRunId": "8c5c611e-1a38-447b-b319-757e70bca750",
+ "agentId": "b5c9bc20-34ff-401a-9df5-7e2fd15dcbd7",
+ "issue": {
+  "id": "7bfa6c02-0429-49bf-b9ec-8702664953be",
+  "status": "in_review",
+  "displayStatus": "in_review",
+  "assigneeAgentId": "b5c9bc20-34ff-401a-9df5-7e2fd15dcbd7",
+  "conversationAgentId": "b5c9bc20-34ff-401a-9df5-7e2fd15dcbd7",
+  "conversationUserId": "orphan-person",
+  "conversationState": "waiting",
+  "interruption": {
+   "intentId": null,
+   "responsibility": "system",
+   "state": "failed",
+   "nextRetryAt": null,
+   "canRetry": true,
+   "userAction": null,
+   "sourceRunIds": [
+    "8c5c611e-1a38-447b-b319-757e70bca750"
+   ],
+   "observedRunId": "8c5c611e-1a38-447b-b319-757e70bca750",
+   "notice": {
+    "code": "person_message_owed",
+    "text": "An earlier message wasn't answered. Press Retry to answer it."
+   }
+  },
+  "activeRecoveryAction": null,
+  "executionBlocker": null,
+  "successfulRunHandoff": null
+ },
+ "comments": [
+  {
+   "id": "660cc88d-3cef-4437-a109-94f9f699185c",
+   "companyId": "accb44e3-f66c-4f73-bd13-ff4bae289e16",
+   "issueId": "7bfa6c02-0429-49bf-b9ec-8702664953be",
+   "authorAgentId": null,
+   "authorUserId": null,
+   "onBehalfOfUserId": null,
+   "authorType": "system",
+   "createdByRunId": null,
+   "derivedAuthorAgentId": null,
+   "derivedCreatedByRunId": null,
+   "derivedAuthorSource": null,
+   "clientRequestId": null,
+   "conversationSessionGeneration": null,
+   "origin": "comment",
+   "fastResponseRequestId": null,
+   "body": "Your message wasn't answered. Check the task's recent history before trying again; the run may have taken actions.",
+   "presentation": {
+    "kind": "system_notice",
+    "tone": "warning",
+    "title": "Your message wasn't answered",
+    "detailsDefaultOpen": true
+   },
+   "metadata": {
+    "version": 1,
+    "recoveryResponsibility": "user",
+    "sourceRunId": "c292ce6e-e03c-4f28-9317-09c450da42b7",
+    "authorizationReason": "unanswered_message:3ea7d516-2c9d-414f-9f32-f2edb11c811f",
+    "sections": [
+     {
+      "title": "Recovery",
+      "rows": [
+       {
+        "type": "key_value",
+        "label": "Next action",
+        "value": "Press Retry to answer it."
+       }
+      ]
+     },
+     {
+      "title": "Run evidence",
+      "rows": [
+       {
+        "type": "run_link",
+        "label": "Source run",
+        "runId": "c292ce6e-e03c-4f28-9317-09c450da42b7",
+        "agentId": "b5c9bc20-34ff-401a-9df5-7e2fd15dcbd7",
+        "title": "failed"
+       },
+       {
+        "type": "key_value",
+        "label": "Failure code",
+        "value": "unclassified_failure"
+       }
+      ]
+     }
+    ]
+   },
+   "deletedAt": null,
+   "deletedByType": null,
+   "deletedByAgentId": null,
+   "deletedByUserId": null,
+   "deletedByRunId": null,
+   "sourceTrust": null,
+   "createdAt": "2026-11-18T13:30:21.394Z",
+   "updatedAt": "2026-11-18T13:30:21.394Z"
+  },
+  {
+   "id": "b26f907f-a8ae-4edf-a9c4-252a6bb10e20",
+   "companyId": "accb44e3-f66c-4f73-bd13-ff4bae289e16",
+   "issueId": "7bfa6c02-0429-49bf-b9ec-8702664953be",
+   "authorAgentId": "b5c9bc20-34ff-401a-9df5-7e2fd15dcbd7",
+   "authorUserId": null,
+   "onBehalfOfUserId": null,
+   "authorType": "agent",
+   "createdByRunId": "8c5c611e-1a38-447b-b319-757e70bca750",
+   "derivedAuthorAgentId": null,
+   "derivedCreatedByRunId": null,
+   "derivedAuthorSource": null,
+   "clientRequestId": null,
+   "conversationSessionGeneration": null,
+   "origin": "comment",
+   "fastResponseRequestId": null,
+   "body": "answer from 8c5c611e-1a38-447b-b319-757e70bca750",
+   "presentation": null,
+   "metadata": null,
+   "deletedAt": null,
+   "deletedByType": null,
+   "deletedByAgentId": null,
+   "deletedByUserId": null,
+   "deletedByRunId": null,
+   "sourceTrust": null,
+   "createdAt": "2026-11-18T13:30:17.059Z",
+   "updatedAt": "2026-11-18T13:30:17.059Z"
+  },
+  {
+   "id": "5759bf93-76d9-4faf-ba06-acf3392dddd7",
+   "companyId": "accb44e3-f66c-4f73-bd13-ff4bae289e16",
+   "issueId": "7bfa6c02-0429-49bf-b9ec-8702664953be",
+   "authorAgentId": null,
+   "authorUserId": "orphan-person",
+   "onBehalfOfUserId": null,
+   "authorType": "user",
+   "createdByRunId": null,
+   "derivedAuthorAgentId": null,
+   "derivedCreatedByRunId": null,
+   "derivedAuthorSource": null,
+   "clientRequestId": "6e98967e-a797-493a-9e04-f68bc7317cdd",
+   "conversationSessionGeneration": null,
+   "origin": "comment",
+   "fastResponseRequestId": null,
+   "body": "Held: and also this.",
+   "presentation": null,
+   "metadata": null,
+   "deletedAt": null,
+   "deletedByType": null,
+   "deletedByAgentId": null,
+   "deletedByUserId": null,
+   "deletedByRunId": null,
+   "sourceTrust": null,
+   "createdAt": "2026-11-18T13:30:15.868Z",
+   "updatedAt": "2026-11-18T13:30:15.868Z"
+  },
+  {
+   "id": "3ea7d516-2c9d-414f-9f32-f2edb11c811f",
+   "companyId": "accb44e3-f66c-4f73-bd13-ff4bae289e16",
+   "issueId": "7bfa6c02-0429-49bf-b9ec-8702664953be",
+   "authorAgentId": null,
+   "authorUserId": "orphan-person",
+   "onBehalfOfUserId": null,
+   "authorType": "user",
+   "createdByRunId": null,
+   "derivedAuthorAgentId": null,
+   "derivedCreatedByRunId": null,
+   "derivedAuthorSource": null,
+   "clientRequestId": "2412f084-e873-4514-9e5b-4f57368edf50",
+   "conversationSessionGeneration": null,
+   "origin": "comment",
+   "fastResponseRequestId": null,
+   "body": "Typed: please answer this.",
+   "presentation": null,
+   "metadata": null,
+   "deletedAt": null,
+   "deletedByType": null,
+   "deletedByAgentId": null,
+   "deletedByUserId": null,
+   "deletedByRunId": null,
+   "sourceTrust": null,
+   "createdAt": "2026-11-18T13:30:14.773Z",
+   "updatedAt": "2026-11-18T13:30:14.773Z"
+  }
+ ],
+ "runs": [
+  {
+   "runId": "8c5c611e-1a38-447b-b319-757e70bca750",
+   "runtimeMode": "native",
+   "wakeupRequestId": "12ecb4b5-5b1f-4426-b0d5-856a8bd0840e",
+   "status": "succeeded",
+   "agentId": "b5c9bc20-34ff-401a-9df5-7e2fd15dcbd7",
+   "adapterType": "paperclip_runner",
+   "startedAt": "2026-11-18T13:30:16.567Z",
+   "finishedAt": "2026-11-18T13:30:17.123Z",
+   "createdAt": "2026-11-18T13:30:16.278Z",
+   "invocationSource": "on_demand",
+   "responsibleUserId": "orphan-person",
+   "errorCode": null,
+   "error": null,
+   "usageJson": {
+    "billingType": "unknown",
+    "inputTokens": 0,
+    "billing_type": "unknown",
+    "input_tokens": 0,
+    "outputTokens": 0,
+    "output_tokens": 0,
+    "cachedInputTokens": 0,
+    "cached_input_tokens": 0,
+    "cache_read_input_tokens": 0
+   },
+   "resultJson": {
+    "stopReason": "completed",
+    "timeoutFired": false,
+    "timeoutSource": "default",
+    "timeoutConfigured": false,
+    "effectiveTimeoutSec": 0
+   },
+   "failureCause": null,
+   "logBytes": 0,
+   "retryOfRunId": null,
+   "scheduledRetryAt": null,
+   "scheduledRetryAttempt": 0,
+   "scheduledRetryReason": null,
+   "livenessState": "advanced",
+   "livenessReason": "Run produced concrete action evidence: 1 issue comment(s), 1 workspace operation(s)",
+   "continuationAttempt": 0,
+   "lastUsefulActionAt": "2026-11-18T13:30:17.103Z",
+   "nextAction": null,
+   "wakeCommentIds": [
+    "5759bf93-76d9-4faf-ba06-acf3392dddd7"
+   ],
+   "firstTurnCommentIds": null,
+   "queuedCommentSourceWakeIds": [
+    "dcebee1e-c474-473e-bc1f-466358772ceb"
+   ],
+   "wakeCommentId": "5759bf93-76d9-4faf-ba06-acf3392dddd7",
+   "contextCommentId": "5759bf93-76d9-4faf-ba06-acf3392dddd7",
+   "contextIssueId": "7bfa6c02-0429-49bf-b9ec-8702664953be",
+   "execution": {
+    "canStop": false,
+    "phase": "completed",
+    "label": "Completed",
+    "cause": null,
+    "lastConfirmedActivityAt": "2026-11-18T13:30:17.103Z",
+    "retryAt": null,
+    "attempt": 0,
+    "maxAttempts": 3,
+    "recoveryOwner": null,
+    "nextAction": null,
+    "permittedActions": [
+     "inspect_run"
+    ],
+    "predecessorRunId": null,
+    "successorRunId": null
+   },
+   "environment": {
+    "id": "8f543fb6-dcfb-42f1-9aa1-f7130f1996da",
+    "name": "Local",
+    "driver": "local"
+   },
+   "environmentLease": {
+    "id": "124cb567-f271-439b-b0de-cc06fb67eb03",
+    "status": "released",
+    "leasePolicy": "ephemeral",
+    "provider": "local",
+    "providerLeaseId": null,
+    "executionWorkspaceId": "244fcf79-9fca-477e-b74a-8bd38974e129",
+    "workspacePath": null,
+    "failureReason": null,
+    "cleanupStatus": null,
+    "acquiredAt": "2026-11-18T13:30:16.818Z",
+    "releasedAt": "2026-11-18T13:30:17.290Z"
+   },
+   "retryExhaustedReason": null
+  },
+  {
+   "runId": "c292ce6e-e03c-4f28-9317-09c450da42b7",
+   "runtimeMode": "native",
+   "wakeupRequestId": "00366817-b54c-439e-bb01-10c9096ba68e",
+   "status": "failed",
+   "agentId": "b5c9bc20-34ff-401a-9df5-7e2fd15dcbd7",
+   "adapterType": "paperclip_runner",
+   "startedAt": "2026-11-18T13:30:15.008Z",
+   "finishedAt": "2026-11-18T13:30:15.993Z",
+   "createdAt": "2026-11-18T13:30:14.818Z",
+   "invocationSource": "on_demand",
+   "responsibleUserId": "orphan-person",
+   "errorCode": "adapter_failed",
+   "error": null,
+   "usageJson": {},
+   "resultJson": {
+    "stopReason": "adapter_failed",
+    "timeoutFired": false,
+    "timeoutSource": "default",
+    "timeoutConfigured": false,
+    "effectiveTimeoutSec": 0
+   },
+   "failureCause": "Error",
+   "logBytes": 418,
+   "retryOfRunId": null,
+   "scheduledRetryAt": null,
+   "scheduledRetryAttempt": 0,
+   "scheduledRetryReason": null,
+   "livenessState": "failed",
+   "livenessReason": "Run ended with failed (adapter_failed)",
+   "continuationAttempt": 0,
+   "lastUsefulActionAt": null,
+   "nextAction": null,
+   "wakeCommentIds": [
+    "3ea7d516-2c9d-414f-9f32-f2edb11c811f"
+   ],
+   "firstTurnCommentIds": null,
+   "queuedCommentSourceWakeIds": null,
+   "wakeCommentId": "3ea7d516-2c9d-414f-9f32-f2edb11c811f",
+   "contextCommentId": "3ea7d516-2c9d-414f-9f32-f2edb11c811f",
+   "contextIssueId": "7bfa6c02-0429-49bf-b9ec-8702664953be",
+   "execution": {
+    "canStop": false,
+    "phase": "recovery_needed",
+    "label": "Recovery needed",
+    "cause": "explicit_user_continuation",
+    "lastConfirmedActivityAt": "2026-11-18T13:30:15.529Z",
+    "retryAt": null,
+    "attempt": 0,
+    "maxAttempts": 3,
+    "recoveryOwner": "board",
+    "nextAction": null,
+    "permittedActions": [
+     "inspect_run",
+     "inspect_recovery"
+    ],
+    "predecessorRunId": null,
+    "successorRunId": null
+   },
+   "environment": {
+    "id": "8f543fb6-dcfb-42f1-9aa1-f7130f1996da",
+    "name": "Local",
+    "driver": "local"
+   },
+   "environmentLease": {
+    "id": "18258f3a-49e9-45d3-acbb-82297a1202d4",
+    "status": "failed",
+    "leasePolicy": "ephemeral",
+    "provider": "local",
+    "providerLeaseId": null,
+    "executionWorkspaceId": "244fcf79-9fca-477e-b74a-8bd38974e129",
+    "workspacePath": null,
+    "failureReason": null,
+    "cleanupStatus": null,
+    "acquiredAt": "2026-11-18T13:30:15.369Z",
+    "releasedAt": "2026-11-18T13:30:16.115Z"
+   },
+   "retryExhaustedReason": null
+  }
+ ],
+ "recentRuns": [
+  {
+   "runId": "8c5c611e-1a38-447b-b319-757e70bca750",
+   "runtimeMode": "native",
+   "wakeupRequestId": "12ecb4b5-5b1f-4426-b0d5-856a8bd0840e",
+   "status": "succeeded",
+   "agentId": "b5c9bc20-34ff-401a-9df5-7e2fd15dcbd7",
+   "adapterType": "paperclip_runner",
+   "startedAt": "2026-11-18T13:30:16.567Z",
+   "finishedAt": "2026-11-18T13:30:17.123Z",
+   "createdAt": "2026-11-18T13:30:16.278Z",
+   "invocationSource": "on_demand",
+   "responsibleUserId": "orphan-person",
+   "errorCode": null,
+   "error": null,
+   "usageJson": {
+    "billingType": "unknown",
+    "inputTokens": 0,
+    "billing_type": "unknown",
+    "input_tokens": 0,
+    "outputTokens": 0,
+    "output_tokens": 0,
+    "cachedInputTokens": 0,
+    "cached_input_tokens": 0,
+    "cache_read_input_tokens": 0
+   },
+   "resultJson": {
+    "stopReason": "completed",
+    "timeoutFired": false,
+    "timeoutSource": "default",
+    "timeoutConfigured": false,
+    "effectiveTimeoutSec": 0
+   },
+   "failureCause": null,
+   "logBytes": 0,
+   "retryOfRunId": null,
+   "scheduledRetryAt": null,
+   "scheduledRetryAttempt": 0,
+   "scheduledRetryReason": null,
+   "livenessState": "advanced",
+   "livenessReason": "Run produced concrete action evidence: 1 issue comment(s), 1 workspace operation(s)",
+   "continuationAttempt": 0,
+   "lastUsefulActionAt": "2026-11-18T13:30:17.103Z",
+   "nextAction": null,
+   "wakeCommentIds": [
+    "5759bf93-76d9-4faf-ba06-acf3392dddd7"
+   ],
+   "firstTurnCommentIds": null,
+   "queuedCommentSourceWakeIds": [
+    "dcebee1e-c474-473e-bc1f-466358772ceb"
+   ],
+   "wakeCommentId": "5759bf93-76d9-4faf-ba06-acf3392dddd7",
+   "contextCommentId": "5759bf93-76d9-4faf-ba06-acf3392dddd7",
+   "contextIssueId": "7bfa6c02-0429-49bf-b9ec-8702664953be",
+   "execution": {
+    "canStop": false,
+    "phase": "completed",
+    "label": "Completed",
+    "cause": null,
+    "lastConfirmedActivityAt": "2026-11-18T13:30:17.103Z",
+    "retryAt": null,
+    "attempt": 0,
+    "maxAttempts": 3,
+    "recoveryOwner": null,
+    "nextAction": null,
+    "permittedActions": [
+     "inspect_run"
+    ],
+    "predecessorRunId": null,
+    "successorRunId": null
+   },
+   "environment": {
+    "id": "8f543fb6-dcfb-42f1-9aa1-f7130f1996da",
+    "name": "Local",
+    "driver": "local"
+   },
+   "environmentLease": {
+    "id": "124cb567-f271-439b-b0de-cc06fb67eb03",
+    "status": "released",
+    "leasePolicy": "ephemeral",
+    "provider": "local",
+    "providerLeaseId": null,
+    "executionWorkspaceId": "244fcf79-9fca-477e-b74a-8bd38974e129",
+    "workspacePath": null,
+    "failureReason": null,
+    "cleanupStatus": null,
+    "acquiredAt": "2026-11-18T13:30:16.818Z",
+    "releasedAt": "2026-11-18T13:30:17.290Z"
+   },
+   "retryExhaustedReason": null
+  },
+  {
+   "runId": "c292ce6e-e03c-4f28-9317-09c450da42b7",
+   "runtimeMode": "native",
+   "wakeupRequestId": "00366817-b54c-439e-bb01-10c9096ba68e",
+   "status": "failed",
+   "agentId": "b5c9bc20-34ff-401a-9df5-7e2fd15dcbd7",
+   "adapterType": "paperclip_runner",
+   "startedAt": "2026-11-18T13:30:15.008Z",
+   "finishedAt": "2026-11-18T13:30:15.993Z",
+   "createdAt": "2026-11-18T13:30:14.818Z",
+   "invocationSource": "on_demand",
+   "responsibleUserId": "orphan-person",
+   "errorCode": "adapter_failed",
+   "error": null,
+   "usageJson": {},
+   "resultJson": {
+    "stopReason": "adapter_failed",
+    "timeoutFired": false,
+    "timeoutSource": "default",
+    "timeoutConfigured": false,
+    "effectiveTimeoutSec": 0
+   },
+   "failureCause": "Error",
+   "logBytes": 418,
+   "retryOfRunId": null,
+   "scheduledRetryAt": null,
+   "scheduledRetryAttempt": 0,
+   "scheduledRetryReason": null,
+   "livenessState": "failed",
+   "livenessReason": "Run ended with failed (adapter_failed)",
+   "continuationAttempt": 0,
+   "lastUsefulActionAt": null,
+   "nextAction": null,
+   "wakeCommentIds": [
+    "3ea7d516-2c9d-414f-9f32-f2edb11c811f"
+   ],
+   "firstTurnCommentIds": null,
+   "queuedCommentSourceWakeIds": null,
+   "wakeCommentId": "3ea7d516-2c9d-414f-9f32-f2edb11c811f",
+   "contextCommentId": "3ea7d516-2c9d-414f-9f32-f2edb11c811f",
+   "contextIssueId": "7bfa6c02-0429-49bf-b9ec-8702664953be",
+   "execution": {
+    "canStop": false,
+    "phase": "recovery_needed",
+    "label": "Recovery needed",
+    "cause": "explicit_user_continuation",
+    "lastConfirmedActivityAt": "2026-11-18T13:30:15.529Z",
+    "retryAt": null,
+    "attempt": 0,
+    "maxAttempts": 3,
+    "recoveryOwner": "board",
+    "nextAction": null,
+    "permittedActions": [
+     "inspect_run",
+     "inspect_recovery"
+    ],
+    "predecessorRunId": null,
+    "successorRunId": null
+   },
+   "environment": {
+    "id": "8f543fb6-dcfb-42f1-9aa1-f7130f1996da",
+    "name": "Local",
+    "driver": "local"
+   },
+   "environmentLease": {
+    "id": "18258f3a-49e9-45d3-acbb-82297a1202d4",
+    "status": "failed",
+    "leasePolicy": "ephemeral",
+    "provider": "local",
+    "providerLeaseId": null,
+    "executionWorkspaceId": "244fcf79-9fca-477e-b74a-8bd38974e129",
+    "workspacePath": null,
+    "failureReason": null,
+    "cleanupStatus": null,
+    "acquiredAt": "2026-11-18T13:30:15.369Z",
+    "releasedAt": "2026-11-18T13:30:16.115Z"
+   },
+   "retryExhaustedReason": null
+  }
+ ]
+}

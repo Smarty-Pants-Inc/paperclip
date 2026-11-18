@@ -24,6 +24,11 @@ function isAdmissionWait(run: StatusRun): boolean {
     && ["execution_reconciliation_required", "workspace_busy", "issue_not_in_progress", "issue_terminal_status"].includes(run.errorCode ?? "");
 }
 
+function speaksForUnansweredPersonMessage(comment: IssueChatComment): boolean {
+  const reason = comment.metadata?.authorizationReason;
+  return typeof reason === "string" && reason.startsWith("unanswered_message:");
+}
+
 /** Presentation only: retain every run and comment in the underlying history. */
 export function taskChatStatusRelevance(
   issueStatus: string | null | undefined,
@@ -83,6 +88,12 @@ export function taskChatStatusRelevance(
     if (recoveryActionId === recoveryAction?.id && recoveryAction) {
       return recoveryAction.status === "resolved" || recoveryAction.status === "cancelled";
     }
+    // The unanswered sweep's notice (unanswered-person-message.ts
+    // UNANSWERED_MESSAGE_REASON_PREFIX) speaks for a person message, not for its
+    // source run: the server retires it (soft delete) when that message is
+    // ANSWERED. A newer run of the same agent may have answered only another
+    // message (M1's run failed while M2 was held), so it never makes it history.
+    if (speaksForUnansweredPersonMessage(comment)) return false;
     if (sourceRunId) return isHistoricalRun(sourceRunId);
     return false;
   };
