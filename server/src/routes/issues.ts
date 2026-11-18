@@ -1,3 +1,4 @@
+import { personStopHoldsSavedWake } from "../services/person-stop-held-input.js";
 import { createServerAcceptedPlanDecompositionSchema } from "../services/plan-decomposition-limit.js";
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../services/agent-interaction-delivery.js";
@@ -7885,6 +7886,14 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
+    if (wake && queueState?.state === "deferred" && !queue.executionWait && comments.length > 0 &&
+        input.issue.conversationAgentId && input.issue.conversationAgentId === input.issue.assigneeAgentId &&
+        !queuedInteractionId(wake.payload) &&
+        await personStopHoldsSavedWake(input.executor as unknown as Db, wake, input.issue.id)) {
+      // adopt-stopu-card6: also while (or after) a new message's successor runs,
+      // the messages from before the person's Stop wait for Send: keep its line.
+      queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+    }
     if (wake && queueState?.state === "deferred" && !input.activeRun && !queue.executionWait && comments.length > 0 &&
         input.issue.conversationAgentId && input.issue.conversationAgentId === input.issue.assigneeAgentId &&
         !queuedInteractionId(wake.payload)) {
