@@ -51,6 +51,7 @@ describe.skipIf(!support.supported)("rf4 C3 independent strict crash admission (
     if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
     await db?.$client.end({ timeout: 1 });
     await temporary?.cleanup();
+    if (home) (await import("node:child_process")).execFileSync("chmod", ["-R", "u+w", home]);
     if (home) await fs.rm(home, { recursive: true, force: true });
   });
 
