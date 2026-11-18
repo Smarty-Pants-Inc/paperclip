@@ -102,6 +102,13 @@ export interface QuestionResponseDeliveryServiceOptions {
   steer?: QuestionResponseSteer;
   /** Resolve the original in-flight native input request before considering a continuation run. */
   resolveNativeQuestion?: NativeQuestionResponseResolver;
+  /**
+   * True while the source run still has one of the person's tools open (for
+   * example a foreground command beside the question). Such a run parks on its
+   * own once that tool closes; cancelling it for an early answer would kill the
+   * running command.
+   */
+  sourceRunHasOpenTool?: (runId: string) => boolean;
   now?: () => Date;
   /** Test-only lease timings. Production callers use the bounded defaults. */
   claimStaleMs?: number;
@@ -1050,6 +1057,18 @@ export function questionResponseDeliveryService(
     // runner slot and the issue execution lock before the isolated continuation
     // is enqueued. In particular, ACPX-backed local adapters may still persist
     // as `legacy` runs even though their interaction is provider-native.
+    if (
+      externalChatBoundary &&
+      sourceRun?.id === interaction.sourceRunId &&
+      sourceRun.status === "running" &&
+      options.sourceRunHasOpenTool?.(sourceRun.id)
+    ) {
+      // An early answer while a sibling tool still runs: do not cancel the
+      // source run (that would kill the person's command). The run parks once
+      // the tool closes; the receipt stays pending and is delivered then, once.
+      await releaseForRetry(claimed, "external_chat_source_tool_open", { bounded: false });
+      return null;
+    }
     if (
       externalChatBoundary &&
       sourceRun?.id === interaction.sourceRunId &&
