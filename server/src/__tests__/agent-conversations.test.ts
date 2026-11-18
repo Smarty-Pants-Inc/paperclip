@@ -879,7 +879,23 @@ import {
         expect(turns).toHaveLength(1);
         expect(await liveRuns()).toHaveLength(0);
         expect(await heldIds()).toEqual(queuedIds);
-        if (!chatMode) return;
+        if (!chatMode) {
+          // SCREEN row 4: an ordinary task's waiting messages get the same true
+          // held bar (and so its one Send), never "They will send when the task is ready".
+          const taskQueue = (await request(routes(null)).get(queuePath).expect(200)).body;
+          expect(taskQueue.entries.length).toBeGreaterThan(0);
+          expect(taskQueue.executionWait).toEqual({ reason: "stopped_by_person",
+            message: "Stopped. These messages are waiting: Send them, or delete any first." });
+          // Its one action, Send, sends the waiting messages.
+          const sentTask = await request(routes(null)).post(`${queuePath}/interrupt`)
+            .send({ queueId: taskQueue.queueId, revision: taskQueue.revision, targetRunId: null });
+          expect(sentTask.status).toBe(200);
+          await waitFor("task's waiting messages answered after Send", async () => {
+            const answered = turns.slice(1).flatMap((turn) => turn.commentIds);
+            return queuedIds.every((id) => answered.includes(id)) && (await liveRuns()).length === 0;
+          });
+          return;
+        }
 
         // The list and its one line, and a reload reads the same.
         const owner = routes(null);
