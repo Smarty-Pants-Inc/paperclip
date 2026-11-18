@@ -41,7 +41,7 @@ import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/nati
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSandboxStop, preparePreviousBootClosedTipStop, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
-import { hasBoundRemoteStopReceipt, hasProbeLeaseTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, ownLeaseTerminated, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -5018,8 +5018,10 @@ export function environmentRuntimeService(
      * its confirmRemoteRunTermination needs a run). Re-read the provider's TYPED
      * state through the driver's read-only inspect and, only on "stopped" or
      * "destroyed", write the release's own receipt on THAT lease. Never sends a
-     * destroy, stop, release or resume. True only when the existing reader
-     * accepts the written row. An unproven or failed read changes nothing.
+     * destroy, stop, release or resume. The closed one-off setup-test scope is
+     * enforced here, before the inspect. True only when the one proof reader,
+     * ownLeaseTerminated on the probe's exact lease (ownLeaseOnly), accepts it.
+     * An unproven or failed read changes nothing.
      */
     async confirmProbeLeaseTermination(input: { companyId: string; leaseId: string }): Promise<boolean> {
       const [row] = await db.select().from(environmentLeases).where(and(
@@ -5040,7 +5042,9 @@ export function environmentRuntimeService(
         updatedAt: new Date(),
       }).where(and(eq(environmentLeases.id, row.id), eq(environmentLeases.companyId, row.companyId),
         eq(environmentLeases.status, row.status), isNotNull(environmentLeases.releasedAt))).returning();
-      return Boolean(updated && hasProbeLeaseTerminationReceipt(updated, row.id));
+      if (!updated) return false;
+      return ownLeaseTerminated(db, { companyId: row.companyId, environmentId: row.environmentId,
+        providerLeaseId: row.providerLeaseId, runId: null, leaseId: row.id }, { ownLeaseOnly: true });
     },
 
     async inspectLeaseResource(leaseId: string, options?: { freshThreadStop?: true }): Promise<PluginEnvironmentLeaseObservation | undefined> {
