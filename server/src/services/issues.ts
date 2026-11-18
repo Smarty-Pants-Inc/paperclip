@@ -3012,6 +3012,7 @@ function issueLatestCommentAtExpr(companyId: string) {
       FROM ${issueComments}
       WHERE ${issueComments.issueId} = ${issues.id}
         AND ${issueComments.companyId} = ${companyId}
+        AND ${issueComments.origin} <> 'fast_response'
     )
   `;
 }
@@ -3024,6 +3025,7 @@ function issueLatestLogAtExpr(companyId: string) {
       WHERE ${activityLog.companyId} = ${companyId}
         AND ${activityLog.entityType} = 'issue'
         AND ${activityLog.entityId} = ${issues.id}::text
+        AND ${activityLog.details}->>'origin' IS DISTINCT FROM 'fast_response'
         AND NOT ${automaticReadRecoveryCleanupCondition()}
         AND ${activityLog.action} NOT IN (${sql.join(
           ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS.map((action) => sql`${action}`),
@@ -3061,6 +3063,7 @@ function unreadForUserCondition(companyId: string, userId: string) {
         WHERE ${issueComments.issueId} = ${issues.id}
           AND ${issueComments.companyId} = ${companyId}
           AND ${issueComments.deletedAt} IS NULL
+          AND ${issueComments.origin} <> 'fast_response'
           AND (
             ${issueComments.authorUserId} IS NULL
             OR ${issueComments.authorUserId} <> ${userId}
@@ -5388,6 +5391,7 @@ async function userCommentStatsForIssues(
           MAX(
             CASE
               WHEN ${issueComments.deletedAt} IS NULL
+                AND ${issueComments.origin} <> 'fast_response'
                 AND (${issueComments.authorUserId} IS NULL OR ${issueComments.authorUserId} <> ${userId})
               THEN ${issueComments.createdAt}
             END
@@ -5471,6 +5475,7 @@ async function lastActivityStatsForIssues(
           and(
             eq(issueComments.companyId, companyId),
             inArray(issueComments.issueId, issueIdChunk),
+            ne(issueComments.origin, "fast_response"),
           ),
         )
         .groupBy(issueComments.issueId),
@@ -5485,6 +5490,7 @@ async function lastActivityStatsForIssues(
             eq(activityLog.companyId, companyId),
             eq(activityLog.entityType, "issue"),
             inArray(activityLog.entityId, issueIdChunk),
+            sql`${activityLog.details}->>'origin' IS DISTINCT FROM 'fast_response'`,
             sql`NOT ${automaticReadRecoveryCleanupCondition()}`,
             sql`${activityLog.action} NOT IN (${sql.join(
               ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS.map(
