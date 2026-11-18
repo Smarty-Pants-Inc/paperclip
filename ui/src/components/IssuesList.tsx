@@ -219,7 +219,7 @@ function normalizeIssueViewState(value: unknown): IssueViewState {
   const parsed = value && typeof value === "object" ? value as Partial<IssueViewState> : {};
   return {
     ...defaultViewState,
-    ...parsed,
+    // Normalize known fields only, dropping the retired Show preference.
     ...normalizeIssueFilterState(parsed),
     // A saved workspace selection has no filter control. Drop it on load.
     // `initialWorkspaces` from the page address is applied after this.
@@ -852,12 +852,12 @@ function StreamlinedIssuesList({
     ...savedViewState,
     ...sort,
     ...(routineTasksOnly === undefined ? {} : { routineTasksOnly }),
-    ...(enableAgentCreatedVisibilityFilter ? { showAgentCreatedTasks } : {}),
+    ...(enableAgentCreatedVisibilityFilter ? { hideAgentCreatedTasks: !showAgentCreatedTasks } : {}),
   }), [savedViewState, sort, routineTasksOnly, enableAgentCreatedVisibilityFilter, showAgentCreatedTasks]);
   useEffect(() => {
     if (!enableAgentCreatedVisibilityFilter) return;
-    setViewState((previous) => previous.showAgentCreatedTasks === showAgentCreatedTasks
-      ? previous : { ...previous, showAgentCreatedTasks });
+    setViewState((previous) => previous.hideAgentCreatedTasks === !showAgentCreatedTasks
+      ? previous : { ...previous, hideAgentCreatedTasks: !showAgentCreatedTasks });
   }, [enableAgentCreatedVisibilityFilter, showAgentCreatedTasks]);
   const showHiddenTasks = useShowHiddenTasks(selectedCompanyId, viewStateKey);
   useEffect(() => {
@@ -1266,7 +1266,7 @@ function StreamlinedIssuesList({
   const filtered = useMemo(() => {
     const filteredByControls = applyIssueFilters(
       hiddenOnly ? searchScopedIssues.filter(issue => issue.hiddenAt) : searchScopedIssues,
-      hiddenOnly ? { ...viewState, showHiddenTasks: true, showAgentCreatedTasks: true } : viewState,
+      hiddenOnly ? { ...viewState, showHiddenTasks: true, hideAgentCreatedTasks: false } : viewState,
       currentUserId,
       enableAgentCreatedVisibilityFilter,
       liveIssueIds,
@@ -1366,7 +1366,7 @@ function StreamlinedIssuesList({
     || viewState.boardColdLaneMode !== "auto"
     || viewState.boardColumnPageSize !== KANBAN_COLUMN_DEFAULT_PAGE_SIZE;
 
-  const hierarchyEnabled = !hiddenOnly && enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && !viewState.routineTasksOnly && viewState.nestingEnabled && viewState.viewMode === "list";
+  const hierarchyEnabled = !hiddenOnly && enableAgentCreatedVisibilityFilter && viewState.hideAgentCreatedTasks && !viewState.routineTasksOnly && viewState.nestingEnabled && viewState.viewMode === "list";
   const hierarchy = useIssueHierarchyContext(
     selectedCompanyId, filtered.slice(0, renderedIssueRowLimit), viewState.collapsedParents,
     hierarchyEnabled,

@@ -10,8 +10,10 @@ import { Issues } from "./Issues";
 import type { IssueSort } from "../lib/issue-sort";
 import { ApiError } from "../api/client";
 import { queryKeys } from "../lib/queryKeys";
+import { taskCollectionPreferencesStorageKey, TASK_COLLECTION_PREFERENCES_CHANGED } from "../lib/task-collection-preferences";
 
 const mocks = vi.hoisted(() => ({ list: vi.fn() }));
+vi.mock("../api/instanceSettings", () => ({ instanceSettingsApi: { getGeneral: async () => ({ censorUsernameInLogs: false }) } }));
 vi.mock("../context/DesignSandboxContext", () => ({ useDesignSandbox: () => false }));
 vi.mock("../hooks/useCoordinatorWorkspaceEnabled", () => ({ useCoordinatorWorkspaceEnabled: () => ({ enabled: false }) }));
 vi.mock("../hooks/useStreamlinedUiEnabled", () => ({ useStreamlinedUiEnabled: () => ({ enabled: true }) }));
@@ -57,6 +59,28 @@ it.each([403, 404, 429])("handles a %s task-list refresh using the shared read s
   } finally { flushSync(() => root.unmount()); client.clear(); host.remove(); }
 });
 
+it.each(["/issues?view=all", "/issues?view=all&participantAgentId=agent"])("shows agent work with no setting/preference and forwards Hide to the API: %s", async route => {
+  mocks.list.mockImplementation(async (_company, filters) => filters.includeAgentCreatedTasks ? [{ id: "agent-created-work" }] : []);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const host = document.createElement("div"); document.body.append(host);
+  const root = createRoot(host);
+  const key = taskCollectionPreferencesStorageKey({ companyId: "company", collectionKey: "paperclip:issues-view" });
+  try {
+    flushSync(() => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[route]}><Issues /></MemoryRouter></QueryClientProvider>));
+    await vi.waitFor(() => expect(host.querySelector("output")?.textContent).toBe("agent-created-work"));
+    expect(mocks.list.mock.lastCall?.[1]).toMatchObject({ includeAgentCreatedTasks: true });
+    if (route.includes("participantAgentId")) expect(mocks.list.mock.lastCall?.[1].participantAgentId).toBe("agent");
+    // The old explicit Show=false cannot keep this list hidden after upgrading.
+    localStorage.setItem(key, JSON.stringify({ version: 1, companyId: "company", collectionKey: "paperclip:issues-view", columns: [], viewState: { showAgentCreatedTasks: false, showAgentCreatedTasksExplicit: true } }));
+    window.dispatchEvent(new Event(TASK_COLLECTION_PREFERENCES_CHANGED));
+    await vi.waitFor(() => expect(host.querySelector("output")?.textContent).toBe("agent-created-work"));
+    localStorage.setItem(key, JSON.stringify({ version: 1, companyId: "company", collectionKey: "paperclip:issues-view", columns: [], viewState: { hideAgentCreatedTasks: true, hideAgentCreatedTasksExplicit: true } }));
+    window.dispatchEvent(new Event(TASK_COLLECTION_PREFERENCES_CHANGED));
+    await vi.waitFor(() => expect(mocks.list.mock.lastCall?.[1]).toMatchObject({ includeAgentCreatedTasks: false }));
+    await vi.waitFor(() => expect(host.querySelector("output")?.textContent).toBe(""));
+  } finally { flushSync(() => root.unmount()); client.clear(); host.remove(); }
+});
+
 it("offers retry after an exhausted initial task-list 429", async () => {
   mocks.list.mockRejectedValue(new ApiError("rate_limited", 429, null));
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -91,7 +115,7 @@ it("fetches routine tasks before pagination and removes the URL filter when unch
     expect(mocks.list.mock.lastCall?.[1]).toMatchObject({ originKind: "routine_execution", offset: 100 });
     flushSync(() => host.querySelector("input")!.click());
     await vi.waitFor(() => expect(host.querySelector("output")?.textContent).toBe("human-task"));
-    expect(mocks.list.mock.lastCall?.[1]).toMatchObject({ includeAgentCreatedTasks: false, offset: 0 });
+    expect(mocks.list.mock.lastCall?.[1]).toMatchObject({ includeAgentCreatedTasks: true, offset: 0 });
     expect(mocks.list.mock.lastCall?.[1].originKind).toBeUndefined();
     expect(host.querySelector("p")?.textContent).toBe("?view=all");
   } finally {

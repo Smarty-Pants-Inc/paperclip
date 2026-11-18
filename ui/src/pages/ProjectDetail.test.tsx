@@ -9,6 +9,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectDetail } from "./ProjectDetail";
+import { taskCollectionPreferencesStorageKey, TASK_COLLECTION_PREFERENCES_CHANGED } from "../lib/task-collection-preferences";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -26,7 +27,7 @@ const mockAgentsApi = vi.hoisted(() => ({ list: vi.fn() }));
 const mockHeartbeatsApi = vi.hoisted(() => ({ liveRunsForCompany: vi.fn() }));
 const mockBudgetsApi = vi.hoisted(() => ({ overview: vi.fn(), upsertPolicy: vi.fn() }));
 const mockExecutionWorkspacesApi = vi.hoisted(() => ({ list: vi.fn() }));
-const mockInstanceSettingsApi = vi.hoisted(() => ({ getExperimental: vi.fn() }));
+const mockInstanceSettingsApi = vi.hoisted(() => ({ getExperimental: vi.fn(), getGeneral: vi.fn() }));
 const mockAssetsApi = vi.hoisted(() => ({ uploadImage: vi.fn() }));
 const mockResourceMembershipsApi = vi.hoisted(() => ({
   listMine: vi.fn(),
@@ -201,6 +202,8 @@ describe("ProjectDetail", () => {
     mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([]);
     mockBudgetsApi.overview.mockResolvedValue({ policies: [] });
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
+    mockInstanceSettingsApi.getGeneral.mockResolvedValue({ censorUsernameInLogs: false });
+    localStorage.clear();
     mockExecutionWorkspacesApi.list.mockResolvedValue([]);
     mockResourceMembershipsApi.listMine.mockResolvedValue({
       projectMemberships: {},
@@ -219,6 +222,7 @@ describe("ProjectDetail", () => {
     await act(() => root?.unmount());
     root = null;
     container.remove();
+    localStorage.clear();
     vi.clearAllMocks();
   });
 
@@ -265,6 +269,27 @@ describe("ProjectDetail", () => {
     expect(pill?.textContent).toBe(label);
     expect(container.textContent).not.toContain("cancelled");
     await act(() => queryClient.clear());
+  });
+
+  it.each(["none", "legacy", "v1"])("shows agent-created project tasks with no setting and %s preference, then honors Hide", async stored => {
+    mockLocation.pathname = "/projects/project-1/issues";
+    const collectionKey = "paperclip:project-issues-view";
+    const key = taskCollectionPreferencesStorageKey({ companyId: "company-1", collectionKey });
+    const oldPreference = { showAgentCreatedTasks: false, showAgentCreatedTasksExplicit: true };
+    if (stored === "legacy") localStorage.setItem(`${collectionKey}:company-1`, JSON.stringify(oldPreference));
+    if (stored === "v1") localStorage.setItem(key, JSON.stringify({ version: 1, companyId: "company-1", collectionKey, columns: [], viewState: oldPreference }));
+    mockIssuesApi.listAll.mockImplementation(async (_company, filters) => filters.includeAgentCreatedTasks ? [{ id: "project-agent-task", companyId: "company-1" }] : []);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    try {
+      await act(() => root!.render(<QueryClientProvider client={client}><ProjectDetail /></QueryClientProvider>));
+      await vi.waitFor(() => expect(mockIssuesList.mock.calls.at(-1)?.[0]).toMatchObject({ issues: [{ id: "project-agent-task" }] }));
+      expect(mockIssuesApi.listAll).toHaveBeenCalledWith("company-1", expect.objectContaining({ projectId: "project-1", includeAgentCreatedTasks: true }));
+      localStorage.setItem(key, JSON.stringify({ version: 1, companyId: "company-1", collectionKey, columns: [], viewState: { hideAgentCreatedTasks: true, hideAgentCreatedTasksExplicit: true } }));
+      window.dispatchEvent(new Event(TASK_COLLECTION_PREFERENCES_CHANGED));
+      await vi.waitFor(() => expect(mockIssuesApi.listAll.mock.lastCall?.[1]).toMatchObject({ includeAgentCreatedTasks: false }));
+      await vi.waitFor(() => expect(mockIssuesList.mock.calls.at(-1)?.[0]).toMatchObject({ issues: [] }));
+    } finally { client.clear(); }
   });
 
   it("refreshes cached task audiences when visibility is saved through the field autosave path", async () => {
