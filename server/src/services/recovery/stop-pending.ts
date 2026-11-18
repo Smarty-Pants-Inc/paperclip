@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { personStopBoundKeptBox, readPersonStopBoundDecision } from "../heartbeat/person-stop-export-bound.js";
+import { activeRunExecutions } from "../active-run-executions.js";
 import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
@@ -23,6 +24,17 @@ export const STOP_PENDING_PERSON_LINE = `Stop pending: ${STOP_PENDING_FINDING} Y
  * its own line. Pre-Stop messages stay Send-only. Stop proof retires the card. */
 export const STOP_PENDING_PERSON_ACTION =
   `Stop pending: ${STOP_PENDING_FINDING} New messages you send start now on a fresh machine; messages waiting from before the Stop still need Send.`;
+/** adopt-stopu-twoclock5 (rf-4 NEW 2, RFL 23:42Z condition 1): the card's line
+ * while the stopped executor is still ALIVE in this server. Its in-memory gate
+ * (heartbeat/queue.ts predecessor_settling_in_process: activeRunExecutions has
+ * the run) declines every new message for the task until heartbeat.ts's executor
+ * finally removes the run. So a new message waits; it does not start now. */
+export const STOP_PENDING_PERSON_ACTION_EXECUTOR_ALIVE =
+  `Stop pending: ${STOP_PENDING_FINDING} The stopped run is still closing on this server, so new messages you send wait until it closes; messages waiting from before the Stop still need Send.`;
+/** The person's card line for THIS phase, read by line from the gate's own signal. */
+export function personStopCardLine(runIds: readonly string[]): string {
+  return runIds.some(runId => activeRunExecutions.has(runId)) ? STOP_PENDING_PERSON_ACTION_EXECUTOR_ALIVE : STOP_PENDING_PERSON_ACTION;
+}
 /** ONE bound for a person's Stop card, read by BOTH writers: the recovery sweep's
  * deferral (recovery/service.ts) and the cleanup retry (recordPersonStopCleanupPending,
  * called from heartbeat/recovery.ts). Measured from nativeCancellation.recordedAt. */
@@ -103,9 +115,13 @@ export function hasTaskStopPending(action: { evidence: Record<string, unknown> }
  * a replacement for this independent obligation. Do not duplicate saved copy. */
 export function withTaskStopPendingInstruction(action: { evidence: Record<string, unknown> }, nextAction: string): string {
   if (!hasTaskStopPending(action)) return nextAction;
-  const copy = stopPendingCopy(action.evidence.stopPending as StopPending);
-  if (nextAction.includes(copy)) return nextAction;
-  return `${copy}\n\n${nextAction}`;
+  const pending = action.evidence.stopPending as StopPending;
+  const copy = stopPendingCopy(pending);
+  // adopt-stopu-twoclock5: the saved copy is the executor-gone line; while the
+  // stopped executor is alive the person reads that phase's own true line.
+  const live = pending.personStop ? personStopCardLine(Array.isArray(pending.runIds) ? pending.runIds : []) : copy;
+  if (nextAction.includes(copy)) return live === copy ? nextAction : nextAction.replace(copy, live);
+  return `${live}\n\n${nextAction}`;
 }
 function stopPending(action: typeof issueRecoveryActions.$inferSelect): StopPending | null {
   const value = action.evidence.stopPending;

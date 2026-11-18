@@ -1,3 +1,4 @@
+import { activeRunExecutions as sharedActiveRunExecutions } from "./active-run-executions.js";
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
 import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, agentFileSaveHeld } from "./agent-directory-working-copies.js";
 import { registerCompletedTurnCleanupResumer } from "./native-runtime/completed-turn-cleanup-hold-settlement.js";
@@ -616,7 +617,8 @@ export { isNonAssigneeWorkspaceBusyRetry };
 
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
-const activeRunExecutions = new Set<string>();
+// adopt-stopu-twoclock5: one module-level Set, also read by the person-Stop card line.
+const activeRunExecutions = sharedActiveRunExecutions;
 // A legacy process adapter's signal exit can race the operator cancellation CAS while
 // its owned process group is still being joined. Keep that exit from becoming
 // a successful result (or a competing failure) before Stop settles. This is an
