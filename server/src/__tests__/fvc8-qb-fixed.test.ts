@@ -53,7 +53,7 @@ import { prepareNativeWorkspaceSync, readNativeWorkspaceSyncReference } from "..
 import { currentHostMutationDrain, type HostMutationDrain } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { finishCancelledWarmWorkspaceExport } from "../services/heartbeat/cancelled-warm-workspace-export.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
-import { decidePersonStopExportAtBound, exportPersonStoppedWarmWorkspaceBeforeRelease } from "../services/heartbeat/person-stop-release-export.js";
+import { decidePersonStopExportAtBound, exportPersonStoppedWarmWorkspaceBeforeRelease, PERSON_STOP_OWNER_JOIN_CAP_MS, PERSON_STOP_OWNER_UNJOINED_LINE } from "../services/heartbeat/person-stop-release-export.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.js";
 import { PERSON_STOP_BOUND_KEY, PERSON_STOP_EXPORT_BOUND_MS, readPersonStopBoundDecision } from "../services/heartbeat/person-stop-export-bound.js";
@@ -213,12 +213,11 @@ describe.skipIf(!support.supported)("adopt-stopu-fvc8 Q-B fixed: lost lock with 
   }
 
 
-  // KEEP: never-OK (adopt-stopu-fvc8, Q-B). RFL's Q-B trace with its fixed
-  // outcome: after the export's PG lock session is lost while its dispatched
-  // host rename drains, (1) the bound does NOT decide and (2) even a decision
-  // already on the lease does not admit a plain successor (the issue execution
-  // pointer is NULL here) until the old copyback owner has joined.
-  it("Q-B fixed: no decision and no admission while the old copyback owner is unjoined; the successor's edit survives", async () => {
+  // KEEP: never-OK (adopt-stopu-fvc8b, Q-B + F5 under RFL 03:04Z). The owner
+  // never joins by the cap: no decision, no admission, ONE true note (Retry
+  // re-checks the join); once the owner joined, Retry decides and the successor
+  // runs; its newer file survives.
+  it("Q-B cap: an unjoined copyback owner at the cap gets ONE true note and no admission; Retry after the join decides; the successor's newer file survives", async () => {
     const f = await stoppedBox(Date.now() - PERSON_STOP_EXPORT_BOUND_MS - 1000);
     let arrived!: () => void; let release!: () => void;
     const entered = new Promise<void>(r => arrived = r), held = new Promise<void>(r => release = r);
@@ -234,41 +233,64 @@ describe.skipIf(!support.supported)("adopt-stopu-fvc8 Q-B fixed: lost lock with 
       expect(await work).toEqual({ outcome: "unproven", reason: "timed_out" });
       const locks = await db.execute(sql`select pid from pg_locks where locktype='advisory' and granted and pid <> pg_backend_pid()`);
       expect(locks).toHaveLength(1);
+      const renameReachedBeforeKill = spy.mock.calls.filter(([, to]) => String(to) === path.join(f.hostCwd, "notes.md")).length;
       await db.execute(sql`select pg_terminate_backend(${Number(locks[0].pid)})`);
       boxDelays.set(f.leaseId, [Infinity]);
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
       expect(run.runnerProfileJson?.nativeWorkspaceFinalizationOwner).toBeTruthy();
-      // Part 1: the free advisory lock no longer authorizes the decision.
-      const decision = await decidePersonStopExportAtBound({ db, environmentRuntime: {} as never, run, probeTimeoutMs: 25 });
-      expect(decision).toBeNull();
-      await f.pump();
-      expect(providerTurns).toHaveLength(0);
-      // Part 2: a decision already recorded (e.g. by an older controller) still
-      // does not admit while the copyback owner is unjoined.
-      const injected = { schema: "paperclip.person-stop-export-bound.v1", decision: "without_files", reason: "box_unreachable_probe",
-        runId: f.runId, providerLeaseId: f.providerLeaseId, decidedAt: new Date().toISOString() };
-      await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ [PERSON_STOP_BOUND_KEY]: injected })}::jsonb` })
-        .where(eq(environmentLeases.id, f.leaseId));
-      await f.pump();
-      const heldWhileUnjoined = providerTurns.length;
-      expect(heldWhileUnjoined).toBe(0);
-      // The old rename lands (nobody newer yet), the owner joins and clears.
+      const atCap = Date.now() + PERSON_STOP_OWNER_JOIN_CAP_MS + 1000;
+      const first = await decidePersonStopExportAtBound({ db, environmentRuntime: {} as never, run, probeTimeoutMs: 25, now: atCap });
+      const second = await decidePersonStopExportAtBound({ db, environmentRuntime: {} as never, run, probeTimeoutMs: 25, now: atCap + 1000 });
+      expect(first).toBeNull(); expect(second).toBeNull();
+      const notes = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.runId),
+        eq(heartbeatRunEvents.message, PERSON_STOP_OWNER_UNJOINED_LINE)));
+      expect(notes).toHaveLength(1); // ONE true note
+      await f.pump(); expect(providerTurns).toHaveLength(0);
       release();
-      const end = Date.now() + 20000;
-      while ((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].runnerProfileJson?.nativeWorkspaceFinalizationOwner && Date.now()<end) await new Promise(r => setTimeout(r, 20));
-      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].runnerProfileJson?.nativeWorkspaceFinalizationOwner).toBeFalsy();
-      // Only now the successor runs and writes; nothing old lands after it.
+      const joinBy = Date.now() + 20000;
+      while ((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].runnerProfileJson?.nativeWorkspaceFinalizationOwner && Date.now() < joinBy) await new Promise(r => setTimeout(r, 20));
+      const [joined] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(joined.runnerProfileJson?.nativeWorkspaceFinalizationOwner).toBeFalsy();
+      const retry = await decidePersonStopExportAtBound({ db, environmentRuntime: {} as never, run: joined, probeTimeoutMs: 25, now: atCap + 2000 });
       await f.pump();
       const successor = providerTurns[0]; expect(successor).toBeTruthy();
-      const newer = "NEW: without-files successor wrote after the old copyback joined\n";
+      const newer = "NEW: successor wrote after Retry found the old copyback joined\n";
       await fs.writeFile(path.join(f.hostCwd, "notes.md"), newer);
       await new Promise(r => setTimeout(r, 500));
       const actual = await fs.readFile(path.join(f.hostCwd, "notes.md"), "utf8");
-      const observed = { question: "Q-B-fixed", decisionAfterLockLoss: decision, heldWhileUnjoined, successor, newer, actual };
-      await fs.writeFile(path.join(process.env.TASK_OUT!, "qb-fixed.json"), JSON.stringify(observed, null, 2));
-      console.log("FVC8_QB_FIXED", JSON.stringify(observed));
+      const observed = { question: "Q-B-cap", renameReachedBeforeKill, first, second, notes: notes.length, retry, successor, newer, actual };
+      await fs.writeFile(path.join(process.env.TASK_OUT!, "qb-cap.json"), JSON.stringify(observed, null, 2));
       expect(actual).toBe(newer);
     } finally { release(); await work; spy.mockRestore(); await f.heartbeat.drainActiveRunExecutions(); }
+  }, 120_000);
+
+  // KEEP: never-OK (adopt-stopu-fvc8b, Q-C TOCTOU). Admission interleaves
+  // between a same_box export's start check and its first host write: every
+  // host write re-checks the successor epoch, so the newer file survives.
+  it("Q-C TOCTOU: admission between the old export's start check and its first rename; the successor's newer file survives", async () => {
+    const f = await stoppedBox(Date.now() - PERSON_STOP_EXPORT_BOUND_MS - 1000);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const decision = await decidePersonStopExportAtBound({ db, environmentRuntime: {} as never, run });
+    expect(decision?.decision).toBe("same_box");
+    let arrived!: () => void; let release!: () => void;
+    const entered = new Promise<void>(r => arrived = r), until = new Promise<void>(r => release = r);
+    commandGate = { arrived, until };
+    // The export starts BEFORE any successor exists (its start check passes)...
+    const retry = exportPersonStoppedWarmWorkspaceBeforeRelease({ db, environmentRuntime: {} as never, run });
+    try {
+      await entered;
+      // ...then admission happens before its first host write.
+      await f.pump();
+      const successorId = providerTurns[0]; expect(successorId).toBeTruthy();
+      const newer = "NEW: same-box successor committed notes.md on host after the old export's start check\n";
+      await fs.writeFile(path.join(f.hostCwd, "notes.md"), newer);
+      release();
+      const outcome = await retry;
+      const actual = await fs.readFile(path.join(f.hostCwd, "notes.md"), "utf8");
+      const observed = { question: "Q-C-TOCTOU", decision, successorId, outcome, newer, actual, old: f.oldContent };
+      await fs.writeFile(path.join(process.env.TASK_OUT!, "qc-toctou.json"), JSON.stringify(observed, null, 2));
+      expect(actual).toBe(newer);
+    } finally { release(); await retry; commandGate = null; await f.heartbeat.drainActiveRunExecutions(); }
   }, 120_000);
 
 });
