@@ -116,7 +116,9 @@ function createRecordingTraceContext(): {
   return { traceContext, spans };
 }
 
-describe("sandbox adapter execution targets", () => {
+// bridge.stop() waits out an in-flight 5 s callback long-poll (9fbf1eb77/2c4cb9889) for a
+// bridge without managed run state, so a start+stop test exceeds the 5 s default.
+describe("sandbox adapter execution targets", { timeout: 20_000 }, () => {
   const cleanupDirs: string[] = [];
 
   function processSessionInput(
