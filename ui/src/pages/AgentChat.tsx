@@ -16,6 +16,7 @@ import { Link, useParams } from "@/lib/router";
 import { agentRouteRef } from "@/lib/utils";
 import { TaskDetailSurface } from "./IssueDetail";
 import { isUuidLike, type Issue } from "@paperclipai/shared";
+import { afterVisibleConversationPaint } from "@/lib/onboarding-chat";
 
 export function AgentChat() {
   const { agentRef = "" } = useParams<{ agentRef: string }>();
@@ -78,6 +79,24 @@ export function AgentChat() {
   const historyView = useQueryView(historyAgent);
   const chatView = useQueryView(chat);
   const creating = useRef<Promise<Issue> | null>(null);
+  const [readyIssueId, setReadyIssueId] = useState<string | null>(null);
+  const [greetingError, setGreetingError] = useState<string | null>(null);
+  const [greetingAttempt, setGreetingAttempt] = useState(0);
+  const onReady = useCallback(() => setReadyIssueId(chat.data?.id ?? null), [chat.data?.id]);
+  useEffect(() => {
+    setGreetingError(null);
+    if (!enabled || !agent || !selectedCompanyId || !session.isSuccess
+      || readyIssueId !== chat.data?.id || chat.data?.originKind !== "onboarding_chat") return;
+    let cancelled = false;
+    const cancelPaint = afterVisibleConversationPaint(() => {
+      void agentChatsApi.greet(selectedCompanyId, agent.id).then(() => {
+        if (!cancelled) void client.invalidateQueries({ queryKey: queryKeys.issues.detail(chat.data!.id) });
+      }).catch(error => {
+        if (!cancelled) setGreetingError(error instanceof Error ? error.message : "The welcome could not start.");
+      });
+    });
+    return () => { cancelled = true; cancelPaint(); };
+  }, [enabled, agent?.id, selectedCompanyId, userId, session.isSuccess, readyIssueId, chat.data?.id, chat.data?.originKind, greetingAttempt, client]);
   useEffect(() => {
     creating.current = null;
   }, [selectedCompanyId, userId, agent?.id]);
@@ -143,7 +162,11 @@ export function AgentChat() {
         <Button size="sm" variant={memberScope === "all" ? "secondary" : "ghost"} aria-pressed={memberScope === "all"} onClick={() => setMemberScope("all")}>All members</Button>
       </div>
       {memberScope === "mine" ? <div className="flex min-h-0 flex-1 flex-col">
-        <TaskDetailSurface key={`${agent.id}:${userId}`} conversation={{ agent, issue: chat.data ?? null, ensureIssue }} />
+        {greetingError && <div role="alert" className="flex items-center gap-2 text-sm text-destructive">
+          <span>{greetingError}</span>
+          <Button variant="outline" size="sm" onClick={() => setGreetingAttempt(attempt => attempt + 1)}>Retry welcome</Button>
+        </div>}
+        <TaskDetailSurface key={`${agent.id}:${userId}`} conversation={{ agent, issue: chat.data ?? null, ensureIssue, onReady }} />
       </div> : <section aria-label={`Conversations with ${agent.name}`} className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-4 py-4">
         <h1 className="text-lg font-semibold">Conversations with {agent.name}</h1>
         {allChatsView.kind === "error" ? <QueryErrorState error={allChats.error} action="load conversations" onRetry={allChatsView.retry} />

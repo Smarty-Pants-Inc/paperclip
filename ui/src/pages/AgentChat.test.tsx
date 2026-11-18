@@ -9,16 +9,19 @@ import { ApiError } from "@/api/client";
 import { queryKeys } from "@/lib/queryKeys";
 import { AgentChat } from "./AgentChat";
 
-const api = vi.hoisted(() => ({ enabled: true, list: vi.fn(), get: vi.fn(), getChat: vi.fn(), listChats: vi.fn(), directory: vi.fn(), ensure: vi.fn(), session: vi.fn() }));
+const api = vi.hoisted(() => ({ enabled: true, list: vi.fn(), get: vi.fn(), getChat: vi.fn(), listChats: vi.fn(), directory: vi.fn(), ensure: vi.fn(), session: vi.fn(), greet: vi.fn(), onReady: undefined as (() => void) | undefined }));
 const agentId = "18c5ad50-9d70-4e24-bd82-337e1d45a414";
 vi.mock("@/api/agents", () => ({ agentsApi: { list: api.list, get: api.get } }));
-vi.mock("@/api/agentChats", () => ({ agentChatsApi: { get: api.getChat, list: api.listChats, ensure: api.ensure } }));
+vi.mock("@/api/agentChats", () => ({ agentChatsApi: { get: api.getChat, list: api.listChats, ensure: api.ensure, greet: api.greet } }));
 vi.mock("@/api/access", () => ({ accessApi: { listUserDirectory: api.directory } }));
 vi.mock("@/api/auth", () => ({ authApi: { getSession: api.session } }));
 vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "company-a" }) }));
 vi.mock("@/hooks/useAgentChatEnabled", () => ({ useAgentChatEnabled: () => ({ enabled: api.enabled, loaded: true }) }));
 vi.mock("@/lib/router", () => ({ useParams: () => ({ agentRef: "18c5ad50-9d70-4e24-bd82-337e1d45a414" }), Link: ({ to, children }: { to: string; children: React.ReactNode }) => <a href={to}>{children}</a> }));
-vi.mock("./IssueDetail", () => ({ TaskDetailSurface: ({ conversation }: { conversation: { agent: Agent } }) => <div>History for {conversation.agent.name}</div> }));
+vi.mock("./IssueDetail", () => ({ TaskDetailSurface: ({ conversation }: { conversation: { agent: Agent; onReady?: () => void } }) => {
+  api.onReady = conversation.onReady;
+  return <div>History for {conversation.agent.name}</div>;
+} }));
 
 let root: Root;
 let container: HTMLDivElement;
@@ -44,6 +47,8 @@ async function failRoster(status: number, cached = true) {
 beforeEach(() => {
   vi.clearAllMocks();
   api.enabled = true;
+  api.onReady = undefined;
+  api.greet.mockResolvedValue({ started: true });
   api.listChats.mockResolvedValue([{ id: "member-chat", companyId: "company-a", conversationAgentId: agentId, conversationUserId: "member-b", title: "Launch plan", updatedAt: "2026-11-15T12:00:00Z" }]);
   api.directory.mockResolvedValue({ users: [{ principalId: "member-b", status: "active", user: { id: "member-b", name: "Member B" } }] });
   client = new QueryClient({ defaultOptions: { queries: { retry: false, retryOnMount: false, staleTime: Infinity, gcTime: Infinity } } });
@@ -54,6 +59,26 @@ beforeEach(() => {
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
 });
 afterEach(() => { flushSync(() => root.unmount()); client.clear(); container.remove(); });
+
+it("waits for the onboarding conversation to paint before requesting its live greeting", async () => {
+  const frames: FrameRequestCallback[] = [];
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  client.setQueryData(queryKeys.agents.list("company-a"), [{ id: agentId, companyId: "company-a", name: "Ada" }]);
+  api.getChat.mockResolvedValue({ id: "welcome-chat", originKind: "onboarding_chat" });
+  try {
+    render();
+    await waitFor(() => expect(container.textContent).toContain("History for Ada"));
+    expect(api.greet).not.toHaveBeenCalled();
+    flushSync(() => api.onReady!());
+    expect(api.greet).not.toHaveBeenCalled();
+    frames.shift()!(0);
+    expect(api.greet).not.toHaveBeenCalled();
+    frames.shift()!(1);
+    await waitFor(() => expect(api.greet).toHaveBeenCalledTimes(1));
+    expect(api.greet).toHaveBeenCalledWith("company-a", agentId);
+  } finally { vi.unstubAllGlobals(); }
+});
 
 it("explains when Agent Chat is disabled without creating a conversation", async () => {
   api.enabled = false;

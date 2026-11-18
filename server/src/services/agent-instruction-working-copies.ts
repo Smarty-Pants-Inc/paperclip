@@ -22,13 +22,12 @@ import { conflict, notFound } from "../errors.js";
 import { agentInstructionsService, agentInstructionsBundleMode } from "./agent-instructions.js";
 import { agentInstructionRevisionService } from "./agent-instruction-revisions.js";
 import { resolveInstructionActor } from "./agent-instruction-authorization.js";
-import { assertInstructionPathSafe, instructionBytes, instructionPath, materializeInstructionBytes, MAX_INSTRUCTION_BYTES, readInstructionBytes, instructionGitExcludeProgram } from "./agent-instruction-files.js";
+import { assertInstructionPathSafe, instructionBytes, instructionPath, materializeInstructionBytes, MAX_INSTRUCTION_BYTES, readInstructionBytes, instructionGitExcludeProgram, excludeRuntimeFromRemoteGit } from "./agent-instruction-files.js";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { remoteExecutionHasStopped } from "./remote-execution-termination.js";
 import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import { logger } from "../middleware/logger.js";
-import { excludeAgentRuntimeFromGit } from "./agent-instruction-git-exclusion.js";
 
 const execFile = promisify(execFileCallback);
 type Copy = typeof copies.$inferSelect;
@@ -249,7 +248,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
         assets: [{ key: "instructions", localDir: localRoot, followSymlinks: false }],
       });
       if (staged.assetDirs.instructions !== executionRoot) throw new Error("Instruction copy staging path changed");
-      await excludeAgentRuntimeFromGit(input.runId, target, "Could not exclude private instructions from Git staging");
+      await excludeRuntimeFromRemoteGit(input.runId, target, "Could not exclude private instructions from Git staging");
     }
     // A refresh does not supersede the completed turn until every local and
     // remote staging step succeeds. Keep its receipt and stop evidence intact

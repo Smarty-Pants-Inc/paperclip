@@ -4451,6 +4451,18 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect((await environmentService(db).getLeaseById(f.reusableLease.id))?.metadata).toHaveProperty("reusableSandboxLeaseSuperseded");
   });
 
+  it("caps the exact resume call at the caller's remaining budget", async () => {
+    const seeded = await seedReusablePluginSandboxLease("paperclip_runner", { timeoutMs: 300_000 });
+    const lease = (await environmentService(db).getLeaseById(seeded.reusableLease.id))!;
+    const call = vi.fn(async () => ({ providerLeaseId: lease.providerLeaseId, metadata: { remoteCwd: "/workspace" } }));
+    const workerManager = { isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager;
+    await environmentRuntimeService(db, { pluginWorkerManager: workerManager })
+      .resumeRunLease({ environment: seeded.environment, lease, timeoutMs: 4_321 });
+    expect(call).toHaveBeenCalledWith(seeded.pluginId, "environmentResumeLease", expect.anything(), 4_321);
+  });
+
   it("S an unclaimed late destroy finalizer cannot overwrite a superseding snapshot", async () => {
     const f = await seedReusablePluginSandboxLease("paperclip_runner");
     await environmentService(db).releaseLease(f.reusableLease.id, "released");

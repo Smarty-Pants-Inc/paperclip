@@ -7,7 +7,6 @@ import { agentRunWritesRevoked, assertAgentRunWriteAllowed, lockAgentForRunWrite
 import { withTransactionRetry } from "./transaction-retry.js";
 import { authorizationService, canActorReadIssuePrivacy, type AuthorizationActor } from "./authorization.js";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
-import { instanceSettingsService } from "./instance-settings.js";
 import { issueService } from "./issues.js";
 import { issueTreeControlService } from "./issue-tree-control.js";
 import { resolveActorSourceTrustForIssue } from "./source-trust.js";
@@ -63,6 +62,7 @@ async function sendAgentChatMessageOnce(
   const publications: ActivityPublication[] = [];
   const result = await db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
+    await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, actor.companyId)).for("no key update");
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${actor.companyId}`}, 0))`);
     const runWhere = and(eq(heartbeatRuns.id, actor.runId), eq(heartbeatRuns.companyId, actor.companyId), eq(heartbeatRuns.agentId, actor.agentId));
     const [initial] = await tx.select().from(heartbeatRuns).where(runWhere);
@@ -94,7 +94,6 @@ async function sendAgentChatMessageOnce(
     };
     const [initialContext] = await contextQuery();
     const context = validateContext(initialContext);
-    if (!(await instanceSettingsService(tx).getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
     const userId = context.run.responsibleUserId;
     if (!userId) throw forbidden("This task has no responsible human to receive the message");
     if (actor.onBehalfOfUserId !== undefined && actor.onBehalfOfUserId !== userId) throw forbidden("The authenticated responsible human no longer matches this run");
@@ -130,7 +129,7 @@ async function sendAgentChatMessageOnce(
     let conversation = await svc.getConversation(actor.companyId, actor.agentId, userId);
     if (!conversation && !options.receiptOnly) {
       conversation = await svc.create(actor.companyId, {
-        title: `Chat with ${context.agent.name}`, assigneeAgentId: actor.agentId,
+        title: `Chat with ${context.agent.name}`, generateConversationTitle: true, assigneeAgentId: actor.agentId,
         conversationAgentId: actor.agentId, conversationUserId: userId,
         conversationState: "waiting", status: "in_review", createdByAgentId: actor.agentId,
         responsibleUserId: userId, trustExplicitResponsibleUserId: true,
@@ -164,7 +163,6 @@ async function sendAgentChatMessageOnce(
       eq(nativeRunResults.companyId, actor.companyId), eq(nativeRunResults.runId, actor.runId), eq(nativeRunResults.schemaStatus, "accepted"),
     )).limit(1);
     if (finished) throw forbidden("Send the message before finishing the run");
-    if (!(await instanceSettingsService(tx).getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
     await authorize(source.id, "issue:read");
     if (!conversation) return null;
     await authorize(conversation.id, "issue:comment");

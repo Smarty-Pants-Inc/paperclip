@@ -73,6 +73,7 @@ import { ApiError } from "@/api/client";
 import { toolsApi } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
 import { appCopyFor, credentialFieldLabel } from "@/lib/app-gallery-copy";
+import { JsonSchemaForm, validateJsonSchemaForm, type JsonSchemaNode } from "@/components/JsonSchemaForm";
 import { AgentMultiSelect, type AgentMultiSelectOption } from "@/components/AgentMultiSelect";
 import { describeError } from "@/api/errors";
 import { InlineBanner } from "@/components/InlineBanner";
@@ -763,6 +764,7 @@ function StandardConnectionSetupFlow({
   const [connectionMethodKey, setConnectionMethodKey] = useState(aiConnection && aiConnection.mode !== "responsible_user" ? `ai-${aiConnection.method}` : "");
   const [instructionDraft, setInstructionDraft] = useState<{ slug: string; value: ConnectionAgentInstructions } | null>(null);
   const [configValues, setConfigValues] = useState<Record<string, string | boolean>>({});
+  const [pluginSettings, setPluginSettings] = useState<Record<string, unknown>>({});
   const [googleSheetsLinks, setGoogleSheetsLinks] = useState("");
   const [googleSheetsError, setGoogleSheetsError] = useState<string | null>(null);
   const [connectResult, setConnectResult] = useState<ConnectToolAppResult | null>(null);
@@ -1573,6 +1575,7 @@ function StandardConnectionSetupFlow({
           name: connectionName,
           credentialSource,
           ...(credentialSource === "paperclip_vault" ? { credentialValues: credentials } : {}),
+          ...(selectedMethod?.settingsSchema ? { settings: pluginSettings } : {}),
           ...(credentialSource === "vercel_connect"
             ? { vercelConnect: { connector: vercelConnector.trim() } }
             : {}),
@@ -1964,6 +1967,10 @@ function StandardConnectionSetupFlow({
           ),
         ),
       });
+      // A plugin connector's saved settings come back for resume and reconnect.
+      if (resumedMethod.settingsSchema && storedConfig.settings && typeof storedConfig.settings === "object" && !Array.isArray(storedConfig.settings)) {
+        setPluginSettings(storedConfig.settings as Record<string, unknown>);
+      }
     }
     const storedOAuth = storedConfig.oauth && typeof storedConfig.oauth === "object"
       ? storedConfig.oauth as Record<string, unknown>
@@ -2814,6 +2821,7 @@ function StandardConnectionSetupFlow({
             setCuratedOAuthClientSecret("");
             setVercelConnector("");
             setConfigValues(defaultMethodConfig(nextMethod));
+            setPluginSettings({});
           }}
           savedCredentialPaths={identityConnection && connectionMethodKey === connectionInstructionsConfig(identityConnection).connectionMethodKey
             ? retainedAppGrant?.status === "active" ? retainedAppGrant.credentialSecretRefs.map((ref) => ref.configPath) : []
@@ -2821,6 +2829,8 @@ function StandardConnectionSetupFlow({
           fixedGitHubApp={retainedGitHubApp}
           configValues={configValues}
           onConfigChange={setConfigValues}
+          pluginSettings={pluginSettings}
+          onPluginSettingsChange={setPluginSettings}
           googleSheetsLinks={googleSheetsLinks}
           googleSheetsError={googleSheetsError}
           onGoogleSheetsLinksChange={(next) => {
@@ -3468,6 +3478,8 @@ function KeyStep({
   fixedGitHubApp = false,
   savedCredentialPaths = [],
   onConfigChange,
+  pluginSettings = {},
+  onPluginSettingsChange,
   googleSheetsLinks,
   googleSheetsError,
   onGoogleSheetsLinksChange,
@@ -3501,6 +3513,9 @@ function KeyStep({
   fixedGitHubApp?: boolean;
   savedCredentialPaths?: string[];
   onConfigChange: (next: Record<string, string | boolean>) => void;
+  /** Settings of a plugin-served connector, rendered from its `settingsSchema`. */
+  pluginSettings?: Record<string, unknown>;
+  onPluginSettingsChange?: (next: Record<string, unknown>) => void;
   googleSheetsLinks: string;
   googleSheetsError: string | null;
   onGoogleSheetsLinksChange: (next: string) => void;
@@ -3596,7 +3611,11 @@ function KeyStep({
   const configFields = visibleConfigFields.filter((field) => !field.hidden);
   const standardConfigFields = configFields.filter((field) => field.advanced !== true);
   const advancedConfigFields = configFields.filter((field) => field.advanced === true);
-  const configFilled = visibleConfigFields.every((field) => {
+  const pluginSettingsErrors = method?.settingsSchema
+    ? validateJsonSchemaForm(method.settingsSchema as JsonSchemaNode, pluginSettings)
+    : {};
+  const pluginSettingsValid = Object.keys(pluginSettingsErrors).length === 0;
+  const configFilled = pluginSettingsValid && visibleConfigFields.every((field) => {
     if (!field.required) return true;
     const value = configValues[field.key];
     return typeof value === "boolean" || (typeof value === "string" && value.trim().length > 0);
@@ -3856,6 +3875,15 @@ function KeyStep({
 
         {savedCredentialPaths.length > 0 ? <p className="text-sm text-muted-foreground">Leave the key blank to keep the saved credential, or paste a replacement.</p> : null}
         {fixedGitHubApp ? <p className="text-sm text-muted-foreground">You can rename this connection or replace its private key. App, installation, repositories, GitHub permissions and ownership are fixed. Manage agent access on the Permissions page.</p> : null}
+        {method?.settingsSchema && onPluginSettingsChange ? (
+          <JsonSchemaForm
+            schema={method.settingsSchema as JsonSchemaNode}
+            values={pluginSettings}
+            onChange={onPluginSettingsChange}
+            errors={pluginSettingsErrors}
+            disabled={submitting}
+          />
+        ) : null}
         <fieldset disabled={fixedGitHubApp} className="space-y-6">
           {standardConfigFields.map((field) => (
             <MethodConfigField

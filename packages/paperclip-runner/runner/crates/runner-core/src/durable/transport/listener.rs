@@ -126,7 +126,7 @@ impl ListenerIngress {
                     };
                     // Both deadlines start at accept, not worker scheduling.
                     let accepted = Instant::now();
-                    if stream.set_nonblocking(true).is_err() {
+                    if super::configure_prp_tcp_stream(&stream).is_err() {
                         continue;
                     }
                     let mut index = 0;

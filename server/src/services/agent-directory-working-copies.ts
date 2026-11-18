@@ -9,7 +9,7 @@ import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCom
 import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory } from "./agent-file-store.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
-import { excludeAgentRuntimeFromGit } from "./agent-instruction-git-exclusion.js";
+import { excludeRuntimeFromRemoteGit } from "./agent-instruction-files.js";
 import { resolveInstructionActor } from "./agent-instruction-authorization.js";
 import { HttpError, conflict, notFound } from "../errors.js";
 import type { AuthorizationActor } from "./authorization.js";
@@ -256,7 +256,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
     try {
       if (input.target?.kind === "remote") {
-        await excludeAgentRuntimeFromGit(input.runId, input.target, "Could not exclude agent files from task Git staging");
+        await excludeRuntimeFromRemoteGit(input.runId, input.target, "Could not exclude agent files from task Git staging");
         const runtime = await transport(row, input.target, false);
         transports.set(key(row), runtime);
         if (input.target.transport === "sandbox") {

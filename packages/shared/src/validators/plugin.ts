@@ -294,7 +294,8 @@ export const pluginManagedRoutineDeclarationSchema = z.object({
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
   variables: z.array(routineVariableSchema).optional(),
   triggers: z.array(z.object({
-    kind: z.enum(ROUTINE_TRIGGER_KINDS),
+    // Standing checks (`heartbeat`) belong to responsibilities, not plugins.
+    kind: z.enum(ROUTINE_TRIGGER_KINDS.filter((kind) => kind !== "heartbeat") as ["schedule", "webhook", "api"]),
     label: z.string().trim().max(120).nullable().optional(),
     enabled: z.boolean().optional(),
     cronExpression: z.string().trim().min(1).optional().nullable(),
@@ -916,8 +917,8 @@ export const pluginManifestV1Schema = z.object({
       // A plugin contributes catalog data only. Transports that need reviewed
       // host code per provider (REST adapters, chat channels, AI runtimes)
       // cannot be satisfied by a definition alone.
-      if (method.transport !== "mcp_remote" && method.transport !== "local_stdio") {
-        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `Plugin app methods support the mcp_remote and local_stdio transports, not ${method.transport}`, path: ["apps", index, "methods", methodIndex, "transport"] });
+      if (method.transport !== "mcp_remote" && method.transport !== "local_stdio" && method.transport !== "plugin") {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `Plugin app methods support the plugin, mcp_remote and local_stdio transports, not ${method.transport}`, path: ["apps", index, "methods", methodIndex, "transport"] });
       }
       if ((method.purpose && method.purpose !== "tool") || method.provider || method.ai) {
         ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Plugin app methods provide agent tools only", path: ["apps", index, "methods", methodIndex] });

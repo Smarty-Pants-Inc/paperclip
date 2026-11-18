@@ -308,25 +308,26 @@ async function retireConnectorConnectionsFor(db: Db, pluginKey: string): Promise
 
 export function pluginLifecycleManager(
   db: Db,
-  options?: PluginLoader | PluginLifecycleManagerOptions,
+  { loader, workerManager }: PluginLifecycleManagerOptions = {},
 ): PluginLifecycleManager {
-  // Support the legacy signature: pluginLifecycleManager(db, loader)
-  // as well as the new options object form.
-  let loaderArg: PluginLoader | undefined;
-  let workerManager: PluginWorkerManager | undefined;
-
-  if (options && typeof options === "object" && "discoverAll" in options) {
-    // Legacy: second arg is a PluginLoader directly
-    loaderArg = options as PluginLoader;
-  } else if (options && typeof options === "object") {
-    const opts = options as PluginLifecycleManagerOptions;
-    loaderArg = opts.loader;
-    workerManager = opts.workerManager;
-  }
-
   const registry = pluginRegistryService(db);
   const retireConnectorConnections = (pluginKey: string) => retireConnectorConnectionsFor(db, pluginKey);
-  const pluginLoaderInstance = loaderArg ?? pluginLoader(db);
+  /**
+   * After a plugin's worker starts with possibly new code: refresh its
+   * connector catalogs so declared tools and risks are current, and finish
+   * carrying over legacy tool access recorded while it was not running.
+   */
+  function afterConnectorPluginActivated(pluginId: string, pluginKey: string) {
+    void (async () => {
+      const [{ refreshPluginConnectionCatalogs }, { completeLegacyPluginToolAccess }] = await Promise.all([
+        import("./plugin-app-catalog.js"),
+        import("./plugin-connector-legacy-access.js"),
+      ]);
+      await refreshPluginConnectionCatalogs(db, pluginKey);
+      await completeLegacyPluginToolAccess(db, pluginKey);
+    })().catch((error) => log.warn({ err: error, pluginId }, "Could not update plugin connectors after activation"));
+  }
+  const pluginLoaderInstance = loader ?? pluginLoader(db);
   const emitter = new EventEmitter();
   emitter.setMaxListeners(100); // plugins may have many listeners; 100 is a safe upper bound
 
@@ -507,6 +508,7 @@ export function pluginLifecycleManager(
 
       const result = await transition(pluginId, "ready", null, plugin);
       await activateReadyPlugin(pluginId);
+      afterConnectorPluginActivated(pluginId, result.pluginKey);
       emitDomain("plugin.enabled", {
         pluginId,
         pluginKey: result.pluginKey,
@@ -710,6 +712,7 @@ export function pluginLifecycleManager(
           manifestJson: newManifest,
         } as PluginRecord);
         await activateReadyPlugin(pluginId);
+        afterConnectorPluginActivated(pluginId, result.pluginKey);
 
         emitDomain("plugin.loaded", {
           pluginId,
@@ -754,6 +757,7 @@ export function pluginLifecycleManager(
         pluginId,
         pluginKey: plugin.pluginKey,
       });
+      afterConnectorPluginActivated(pluginId, plugin.pluginKey);
 
       log.info(
         { pluginId, pluginKey: plugin.pluginKey },
@@ -818,6 +822,7 @@ export function pluginLifecycleManager(
         // migration, which makes downstream queries fail against missing tables.
         await deactivatePluginRuntime(pluginId, plugin.pluginKey);
         await activateReadyPlugin(pluginId);
+        afterConnectorPluginActivated(pluginId, plugin.pluginKey);
       } else {
         // No runtime activation services wired in (e.g. state-only test harness)
         // — fall back to a bare worker subprocess bounce.
@@ -828,6 +833,7 @@ export function pluginLifecycleManager(
         await handle.restart();
         emitDomain("plugin.worker_stopped", { pluginId, pluginKey: plugin.pluginKey });
         emitDomain("plugin.worker_started", { pluginId, pluginKey: plugin.pluginKey });
+        afterConnectorPluginActivated(pluginId, plugin.pluginKey);
       }
 
       log.info(

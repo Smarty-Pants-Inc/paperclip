@@ -5,6 +5,7 @@ import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/com
 import type { NativeRuntimeContextSnapshot } from "../../vendor/paperclip-runner/index.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import { changedRemoteRuntimeAssets, type RuntimeStageAsset } from "./remote-runtime-assets.js";
+import { remoteStagingFailure } from "./remote-runner-disk-reserve.js";
 
 type StageAsset = {
   sourcePath: string;
@@ -120,7 +121,7 @@ export async function stageRemoteLaunchAssets(input: LaunchAssetsInput): Promise
         timeoutMs: 10_000,
       });
       if (created.exitCode !== 0 || created.timedOut) {
-        throw new Error("runner_remote_directory_staging_failed");
+        throw remoteStagingFailure("runner_remote_directory_staging_failed", created);
       }
       if (directory.name !== "codex-home") continue;
       const localDirectory = resolve(input.root, directory.name);
