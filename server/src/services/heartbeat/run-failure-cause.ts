@@ -68,6 +68,19 @@ export function hasNativePreDispatchFailureRecord(resultJson: unknown): boolean 
 }
 
 /**
+ * S095 cap: the failed run's `resultJson.failureCause` when the successor
+ * could not confirm a stopped run's tools exited
+ * (NativeStoppedRunToolsUnconfirmedError). Its own note asks the person to
+ * press Retry; nothing else may tell them Paperclip continues on its own.
+ */
+export const NATIVE_STOPPED_RUN_TOOLS_UNCONFIRMED_CAUSE = "native_stopped_run_tools_unconfirmed";
+
+export function hasNativeStoppedRunToolsUnconfirmedFailure(resultJson: unknown): boolean {
+  if (typeof resultJson !== "object" || resultJson === null || Array.isArray(resultJson)) return false;
+  return (resultJson as Record<string, unknown>).failureCause === NATIVE_STOPPED_RUN_TOOLS_UNCONFIRMED_CAUSE;
+}
+
+/**
  * Database faults that clear on their own: serialization and deadlock aborts,
  * a lock timeout, an administrator or crash shutdown, too many connections and
  * a dropped connection (SQLSTATEs and postgres.js codes). Storage outages keep

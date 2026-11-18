@@ -22,7 +22,9 @@ import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
 import { agentRunSupersededByFreshContinuation } from "../../../agent-run-cancellation.js";
 import { freshContinuationIsolatesRun } from "../../../services/fresh-continuation-fallback.js";
-import { hasNativePreDispatchFailureRecord } from "../../../services/heartbeat/run-failure-cause.js";
+import {
+  hasNativePreDispatchFailureRecord, hasNativeStoppedRunToolsUnconfirmedFailure,
+} from "../../../services/heartbeat/run-failure-cause.js";
 import { canBypassFailedNativePredecessor } from "../../../services/native-runtime/native-provider-work-proof.js";
 import type { Db } from "@paperclipai/db";
 import { deliveredQueuedCommentIds, EXTERNAL_CHAT_MESSAGE_WAKE_MUTATION, EXTERNAL_CHAT_MESSAGE_WAKE_REASON } from "../../../services/queued-comment-delivery.js";
@@ -1596,6 +1598,15 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // reconcile; a reconciliation incident would also hide the run's Retry.
         if (!handoffAssigneeAgentId && run.runtimeMode === "native" && isConfigurationIncompleteFailedRun(run)
           && issueRow.status === "blocked" && issueRow.assigneeAgentId === run.agentId) {
+          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        }
+        // S095 cap: the run could not confirm a stopped run's tools exited. Its
+        // own note ("Press Retry") is the one true note and the failed-run card
+        // offers Retry. A reconciliation hold ("Paperclip continues the task")
+        // or an automatic continuation would contradict it; the person's
+        // message stays saved for that Retry.
+        if (!handoffAssigneeAgentId && run.runtimeMode === "native"
+          && hasNativeStoppedRunToolsUnconfirmedFailure(run.resultJson)) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
         // The fallback already decided this run's continuation; a reconciliation

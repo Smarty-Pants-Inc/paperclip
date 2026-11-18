@@ -2036,7 +2036,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
    * fails the run with the note's code as failureCause (run-completion.ts
    * failureCauseFromError) and the person presses Retry. */
   async function retryAfterCap(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
-    followUp: Awaited<ReturnType<typeof admitFollowUp>>) {
+    followUp: Awaited<ReturnType<typeof admitFollowUp>>, via: "retryOfRunId" | "task_retry_route" = "retryOfRunId") {
     await deferCycles(prior, followUp, 2);
     await ageFirstDeferral(followUp.runId, STOPPED_RUN_TOOLS_WAIT_CAP_MS);
     const capped = await executeFollowUp(prior, followUp, 300);
@@ -2046,20 +2046,27 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       error: failureText(capped.outcome), resultJson: { failureCause: "native_stopped_run_tools_unconfirmed" } })
       .where(eq(heartbeatRuns.id, followUp.runId));
     const retry = await admitFollowUp(prior);
-    await db.update(heartbeatRuns).set({ retryOfRunId: followUp.runId }).where(eq(heartbeatRuns.id, retry.runId));
+    // A failed chat run's Retry sets retryOfRunId; the task Retry route (POST
+    // /issues/:id/retry -> resumeTaskRetry) sets previousRunId with the person's
+    // receipt (heartbeat/queue.ts enqueueWakeup; heartbeat-native-stopped-run-tools-cap.test.ts).
+    await db.update(heartbeatRuns).set(via === "retryOfRunId" ? { retryOfRunId: followUp.runId } : {
+      contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({
+        wakeReason: "task_retry", previousRunId: followUp.runId, taskRetryRequestId: randomUUID() })}::jsonb` })
+      .where(eq(heartbeatRuns.id, retry.runId));
     return retry;
   }
 
   it.each([
-    ["no lease of the stopped run (NULL)", false],
-    ["the stopped run's lease released without a receipt", true],
-  ])("S095 step 3: after the cap's terminal note, a Retry with %s is admitted once and answers", async (_label, released) => {
+    ["no lease of the stopped run (NULL)", false, "retryOfRunId"],
+    ["the stopped run's lease released without a receipt", true, "retryOfRunId"],
+    ["no lease of the stopped run (NULL), pressed through the task Retry route", false, "task_retry_route"],
+  ] as const)("S095 step 3: after the cap's terminal note, a Retry with %s is admitted once and answers", async (_label, released, via) => {
     const { prior, followUp } = await stopTurnShape({ receipt: false });
     if (released) {
       await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() })
         .where(eq(environmentLeases.id, await holdOldBoxLease(prior)));
     }
-    const retry = await retryAfterCap(prior, followUp);
+    const retry = await retryAfterCap(prior, followUp, via);
     const { outcome } = await executeFollowUp(prior, retry, 5_000);
     expect.soft(outcome, "no further deferral").not.toBeInstanceOf(NativeControllerRecoveryWaitingError);
     expect.soft(failureText(outcome), "the Retry is admitted").toContain(ADMITTED);

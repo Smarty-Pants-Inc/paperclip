@@ -6,6 +6,7 @@ import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-sessi
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
 import { clearProviderIdentityBreak, noteProviderIdentityBreak, recordedProviderIdentityTransitionIsAllowed, type ProviderIdentityLineageScope } from "./provider-identity-lineage.js";
 import { settleReattachRun } from "../heartbeat/run-admission.js";
+import { NATIVE_STOPPED_RUN_TOOLS_UNCONFIRMED_CAUSE } from "../heartbeat/run-failure-cause.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { retryTransientLockContention } from "../transient-lock-contention.js";
@@ -6911,7 +6912,7 @@ async function stoppedRunWaitMessage(input: { db: Db; execution: NativeExecution
   return await stoppedRunHoldsActiveLease(input, stoppedRunId) ? RETAINED_OWNER_LEASE_WAIT_MESSAGE : STOPPED_RUN_TOOLS_WAIT_MESSAGE;
 }
 
-async function stoppedRunHoldsActiveLease(input: { db: Db; execution: NativeExecutionInput }, stoppedRunId: string) {
+export async function stoppedRunHoldsActiveLease(input: { db: Db; execution: NativeExecutionInput }, stoppedRunId: string) {
   const [held] = await input.db.select({ id: environmentLeases.id }).from(environmentLeases)
     .where(and(eq(environmentLeases.companyId, input.execution.binding.companyId),
       eq(environmentLeases.heartbeatRunId, stoppedRunId), eq(environmentLeases.status, "active"))).limit(1);
@@ -7034,7 +7035,7 @@ async function stopIssuedTurnCommandsOfDirectSuccessor(input: Parameters<typeof 
 export const STOPPED_RUN_TOOLS_STOP_AFTER_DEFERRALS = 2;
 /** From the first deferral: still no proof -> the terminal failure below. */
 export const STOPPED_RUN_TOOLS_WAIT_CAP_MS = 10 * 60_000;
-export const STOPPED_RUN_TOOLS_UNCONFIRMED = "native_stopped_run_tools_unconfirmed";
+export const STOPPED_RUN_TOOLS_UNCONFIRMED = NATIVE_STOPPED_RUN_TOOLS_UNCONFIRMED_CAUSE;
 export const STOPPED_RUN_TOOLS_UNCONFIRMED_NOTE = "Couldn't confirm the stopped run's tools exited. Your message is saved. Press Retry to try again.";
 
 /** Terminal: no quarantine, nothing deleted; the person's message stays on
@@ -7050,16 +7051,22 @@ export class NativeStoppedRunToolsUnconfirmedError extends Error {
 /** The successor's persisted wait on `stoppedRunId` (written by
  * deferNativeControllerRecovery in the deferral's transaction), and whether
  * this run is a Retry of a run that already waited on it. */
-async function readStoppedRunToolsWait(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], stoppedRunId: string) {
+export async function readStoppedRunToolsWait(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], stoppedRunId: string) {
   const { companyId, runId } = input.execution.binding;
   const [run] = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, retryOfRunId: heartbeatRuns.retryOfRunId })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId))).limit(1);
   const wait = record(record(run?.contextSnapshot)[STOPPED_RUN_TOOLS_WAIT_KEY]);
   const same = wait.stoppedRunId === stoppedRunId;
   let retryOfWaited = false, retryAfterCap = false;
-  if (run?.retryOfRunId) {
+  // A failed chat run's Retry sets retryOfRunId; the task Retry route (POST
+  // /issues/:id/retry -> resumeTaskRetry) records its source as previousRunId
+  // with the person's taskRetryRequestId (heartbeat/queue.ts enqueueWakeup).
+  const context = record(run?.contextSnapshot);
+  const retriedRunId = run?.retryOfRunId ?? (typeof context.taskRetryRequestId === "string" && context.taskRetryRequestId
+    && typeof context.previousRunId === "string" && context.previousRunId ? context.previousRunId : null);
+  if (retriedRunId) {
     const [retried] = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, resultJson: heartbeatRuns.resultJson })
-      .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.retryOfRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, retriedRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
     retryOfWaited = record(record(retried?.contextSnapshot)[STOPPED_RUN_TOOLS_WAIT_KEY]).stoppedRunId === stoppedRunId;
     // The heartbeat records the cap's terminal note as the failed run's failureCause.
     retryAfterCap = retryOfWaited && record(retried?.resultJson).failureCause === STOPPED_RUN_TOOLS_UNCONFIRMED;
