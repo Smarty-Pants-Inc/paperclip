@@ -509,14 +509,23 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         effects: [{ kind: "schedule_retry", agentId: f.agentId, cause: "native_mid_stream_cut", summary: "Recover the cut reply" }] } });
     expect((await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, committed.decision.id)))[0].targetId)
       .not.toBeNull();
+    // compose (unit 1 + u1b3): the one recovery after a cut is unit 1's recovery
+    // run (a scheduled retry of the cut run), never the generic native-status
+    // wake. R-ONCE still permits exactly that one: a partial reply is not ANSWERED.
     const dispatched = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
-    console.log("RONCE_F2_CUT", JSON.stringify({ dispatched,
+    const recovery = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.failedRunId));
+    const promoted = await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 1_000));
+    console.log("RONCE_F2_CUT", JSON.stringify({ dispatched, promoted,
       wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)),
       runs: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
         .map(run => ({ id: run.id, status: run.status, error: run.error, context: run.contextSnapshot })) }));
-    expect(dispatched.dispatched).toBe(1);
+    expect(dispatched.dispatched).toBe(0);
+    expect(recovery).toMatchObject([{ scheduledRetryReason: "native_mid_stream_cut" }]);
+    expect(promoted).toMatchObject({ promoted: 1, runIds: [recovery[0].id] });
+    await heartbeat.resumeQueuedRuns();
     await heartbeat.drainActiveRunExecutions();
-    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).toMatchObject({ dispatched: 0 });
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 60_000))).toMatchObject({ promoted: 0 });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
     expect(mockAdapterExecute).toHaveBeenCalledOnce();
   });
