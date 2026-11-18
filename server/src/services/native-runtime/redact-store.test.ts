@@ -12,6 +12,7 @@ import { startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres
 import corpus from "../../__tests__/fixtures/redact-store-corpus.json" with { type: "json" };
 import { redactSensitiveText } from "../../redaction.js";
 import { issueService } from "../issues.js";
+import { subscribeCompanyLiveEvents } from "../live-events.js";
 import { readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
 import { buildNativeSessionHandoff } from "./native-session-handoff.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
@@ -33,20 +34,32 @@ const { buildTranscript } = await import(new URL("../../../../packages/paperclip
 // KEEP: provider credentials must never be stored in agent-authored transcript/comment text.
 const keys = ["sk-proj-" + "aB3-_".repeat(8), "sk-ant-api03-" + "cD4-_".repeat(8), "sk-or-v1-" + "a1".repeat(32), "sk-" + "eF5g".repeat(8)];
 const echo = keys.join("\n");
+// Never-OK, own-event guard (RFL): a join cannot hide a leaked key fragment.
+function expectNoKeyMaterial(event: PrpEvent, secrets: string[]) {
+  const content = JSON.stringify({ payload: event.payload, debug: event.debug });
+  for (const secret of secrets) {
+    expect(content).not.toContain(secret);
+    for (let at = 0; at + 4 <= secret.length; at++) expect(content).not.toContain(secret.slice(at, at + 4));
+  }
+}
 
 describe("redact-store G1/G4 durable boundaries", () => {
   let temporary: Awaited<ReturnType<typeof startRecoveryPostgres>>;
   let db: ReturnType<typeof createDb>;
   let directory: string;
+  const publications: { payload: Record<string, unknown> }[] = [];
+  let unsubscribe: () => void;
   const companyId = randomUUID(), agentId = randomUUID();
   beforeAll(async () => {
     temporary = await startRecoveryPostgres("redact-store-");
     db = createDb(temporary.connectionString);
     directory = await mkdtemp(join(tmpdir(), "redact-store-spill-"));
+    unsubscribe = subscribeCompanyLiveEvents(companyId, event => { publications.push(event); });
     await db.insert(companies).values({ id: companyId, name: "Storage redaction guard", issuePrefix: "RS" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Storage guard", adapterType: "codex_local", status: "running" });
   }, 30_000);
   afterAll(async () => {
+    unsubscribe?.();
     await temporary?.cleanup();
     if (directory) await rm(directory, { recursive: true, force: true });
   });
@@ -63,7 +76,9 @@ describe("redact-store G1/G4 durable boundaries", () => {
       emittedAt: "2026-11-18T00:00:00.000Z", payload: { kind: "commandExecution", text, ...payload },
     });
     const stored = () => db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
-    return { issueId, runId, port, event, stored, sourceInstanceId };
+    const live = () => publications.filter(entry => entry.payload.runId === runId)
+      .map(entry => (entry.payload.payload as { prpEvent: PrpEvent }).prpEvent);
+    return { issueId, runId, port, event, stored, sourceInstanceId, live };
   }
 
   // Never-OK: every durable delta must be safe, not only the final receipt.
@@ -82,7 +97,7 @@ describe("redact-store G1/G4 durable boundaries", () => {
     { name: "unclosed-marker-tail", parts: ["Bearer [REDACTEDabc123def456ghi789"], secret: "abc123def456ghi789" },
     { name: "marker-space-key", parts: ["Bearer [REDACTED] " + keys[0]], secret: keys[0]! },
     { name: "marker-newline-key", parts: ["Bearer [REDACTED]\n" + keys[0]], secret: keys[0]! },
-  ])("rf-2 $name through Pi -> append -> Postgres -> agent comment", async ({ name, parts, secret }) => {
+  ])("supersedes(split-adopt: key-ending delta settles at terminal; RFL record SUPERSEDE-SPLIT-ADOPT-REDACTSTORE-1118) rf-2 $name through Pi -> append -> Postgres -> agent comment", async ({ name, parts, secret }) => {
     const f = await fixture();
     const projector = createPiEventProjector({ runId: f.runId, turnId: "turn", spillDirectory: directory });
     const projected = parts.flatMap(delta => projector.project({
@@ -95,8 +110,12 @@ describe("redact-store G1/G4 durable boundaries", () => {
     let seq = 0;
     for (const event of projected.filter(event => event.payload.kind === "agentMessage")) {
       await f.port.appendEvent({ ...f.event("", ++seq, event.payload), eventType: event.eventType as PrpEvent["eventType"] });
+      // Read publications immediately, before a later terminal can hide a leak.
+      for (const live of f.live()) expectNoKeyMaterial(live, [secret]);
+      for (const row of await f.stored()) expectNoKeyMaterial(row.payload!.prpEvent as unknown as PrpEvent, [secret]);
     }
     const rows = await f.stored();
+    expect(f.live().length).toBe(rows.length);
     expect(rows.some(row => (row.payload!.prpEvent as unknown as PrpEvent).eventType === "item.delta")).toBe(true);
     expect(JSON.stringify(rows)).not.toContain(secret);
     const stored = rows.map(row => {
@@ -105,6 +124,13 @@ describe("redact-store G1/G4 durable boundaries", () => {
       return { eventType: event.eventType, text: event.payload.text, hashAgrees: row.sourcePayloadSha256 === nativeSha256(event) };
     });
     const final = stored.find(row => row.eventType === "item.completed")!;
+    // Pi's whole-message scanner already uses [REDACTED] and strips ANSI;
+    // assert the controller stored that masked terminal text, not a rescan of raw input.
+    const projectedFinal = projected.find(event => event.eventType === "item.completed" && event.payload.kind === "agentMessage")!;
+    expect(final.text).toBe(redactSensitiveText(String(projectedFinal.payload.text)));
+    expect(String(final.text)).toMatch(/REDACTED/);
+    for (const row of rows) expectNoKeyMaterial(row.payload!.prpEvent as unknown as PrpEvent, [secret]);
+    for (const live of f.live()) expectNoKeyMaterial(live, [secret]);
     const posted = await issueService(db).addComment(f.issueId, String(final.text), { agentId, runId: f.runId });
     const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, posted.id));
     expect(comment!.body).toBe(final.text);
@@ -113,6 +139,9 @@ describe("redact-store G1/G4 durable boundaries", () => {
       expect(final.text).toBe('the Bearer [REDACTED] bad news arrived\n\"Bearer [REDACTED]\"');
       // The closing quoted credential is held until the terminal event settles it (outputTails).
       const settled = rows.flatMap(row => ((row.payload!.prpEvent as unknown as PrpEvent).payload.outputTails ?? []) as { payload: { text: string } }[]);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]!.payload.text).toContain("[REDACTED]");
+      expect(settled[0]!.payload.text).not.toContain(secret);
       expect(stored.filter(row => row.eventType === "item.delta").map(row => row.text).join("") + settled.map(tail => tail.payload.text).join("")).toBe(final.text);
     }
     if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `durable-${name}.json`), JSON.stringify({
@@ -147,12 +176,16 @@ describe("redact-store G1/G4 durable boundaries", () => {
     expect(chunks.map(chunk => JSON.parse(chunk).event)).toEqual([committed]);
   });
 
-  it.each(["item.delta", "semantic_tool.result"] as const)("G1 %s text leaves and debug are masked without changing envelope or numeric metrics", async eventType => {
+  it.each(["item.delta", "semantic_tool.result"] as const)("supersedes(split-adopt: key-ending delta settles at terminal; RFL record SUPERSEDE-SPLIT-ADOPT-REDACTSTORE-1118) G1 %s text leaves and debug are masked without changing envelope or numeric metrics", async eventType => {
     const f = await fixture();
     const event: PrpEvent = { ...f.event(echo), eventType, debug: { message: echo }, payload: { text: echo, content: [{ text: echo }], inputTokens: 123 } };
     await f.port.appendEvent(event);
     const [row] = await f.stored();
     const committed = row!.payload!.prpEvent as unknown as PrpEvent;
+    // Assert the stored event and the already-delivered live event BEFORE settle.
+    expect(f.live()).toHaveLength(1);
+    expectNoKeyMaterial(committed, keys);
+    for (const live of f.live()) expectNoKeyMaterial(live, keys);
     // A delta that ends inside a key cannot know the key is complete: the last
     // key waits for the next delta or the terminal event (see split-credential-shape.test.ts).
     const masked = eventType === "item.delta" ? redactSensitiveText(keys.slice(0, -1).join("\n")) + "\n" : redactSensitiveText(echo);
@@ -161,6 +194,11 @@ describe("redact-store G1/G4 durable boundaries", () => {
       await f.port.appendEvent({ ...f.event("", 2), payload: { kind: "commandExecution" } });
       const terminal = (await f.stored()).map(stored => stored.payload!.prpEvent as unknown as PrpEvent).find(stored => stored.eventType === "item.completed")!;
       expect(terminal.payload.outputTails).toEqual([{ itemId: "item", payload: { text: "***REDACTED***" } }]);
+      expectNoKeyMaterial(terminal, keys);
+      expect(f.live()).toHaveLength(2);
+      for (const live of f.live()) expectNoKeyMaterial(live, keys);
+    } else {
+      expect(committed.payload.text).toBe(redactSensitiveText(echo));
     }
     expect(committed.debug).toEqual({ message: redactSensitiveText(echo) });
     expect({ ...committed, payload: event.payload, debug: event.debug }).toEqual(event);
