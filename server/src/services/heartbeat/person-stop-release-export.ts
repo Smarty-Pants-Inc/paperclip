@@ -148,12 +148,23 @@ export async function exportPersonStoppedWarmWorkspaceBeforeRelease(input: {
   const [environment] = lease.environmentId ? await db.select().from(environments)
     .where(eq(environments.id, lease.environmentId)).limit(1) : [];
   const reference = { state: prepared.state as string };
+  // One resolution of the box serves the process-gone proof and the export.
+  let resolved: ReturnType<typeof resolveEnvironmentExecutionTarget> | null = null;
+  const resolveBox = (signal?: AbortSignal) => {
+    if (!environment) return Promise.reject(new Error("person_stop_export_environment_missing"));
+    resolved ??= resolveEnvironmentExecutionTarget({ db, companyId: run.companyId, adapterType: "paperclip_runner",
+      environment, leaseId: lease.id, leaseMetadata: lease.metadata, lease: lease as never, environmentRuntime, signal });
+    return resolved;
+  };
   return await finishCancelledWarmWorkspaceExport({ db, runId: run.id, companyId: run.companyId,
     timeoutMs: input.timeoutMs, settledBy: "terminal_cancelled_run",
+    stoppedTurnBox: async signal => {
+      const target = await resolveBox(signal);
+      return target && target.kind === "remote" && "runner" in target && target.runner
+        ? { runner: target.runner, remoteCwd: target.remoteCwd } : null;
+    },
     nativeWorkspaceSync: { reference, restoreWorkspace: async (assertOwnership, options) => {
-      if (!environment) throw new Error("person_stop_export_environment_missing");
-      const target = await resolveEnvironmentExecutionTarget({ db, companyId: run.companyId, adapterType: "paperclip_runner",
-        environment, leaseId: lease.id, leaseMetadata: lease.metadata, lease: lease as never, environmentRuntime, signal: options?.signal });
+      const target = await resolveBox(options?.signal);
       if (!target || !await resumeNativeWorkspaceSync({ db, runId: run.id, target, assertOwnership, signal: options?.signal }))
         throw new Error("person_stop_export_target_unavailable");
       const [after] = await db.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns)

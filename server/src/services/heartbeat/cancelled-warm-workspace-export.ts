@@ -8,6 +8,11 @@ import {
   NativeWorkspaceFinalizationOwnershipLostError,
   withNativeWorkspaceFinalizationOwnership,
 } from "../native-runtime/native-workspace-finalization-ownership.js";
+import { noStoppedTurnProcessRemains, type StoppedTurnBox } from "./stopped-turn-process-gone.js";
+
+class StoppedTurnProcessesNotProvenGoneError extends Error {
+  constructor(readonly detail: string) { super(`stopped_turn_processes_not_proven_gone:${detail}`); }
+}
 
 /** pl/cancel-finalize: the longest a Stop's cancellation boundary waits for the
  * stopped turn's workspace export. The box's stop_and_retain release runs only
@@ -96,6 +101,11 @@ export async function finishCancelledWarmWorkspaceExport(input: {
    * `cancelled` by an acknowledged run-only Stop; that, not the NSE settle
    * row, is the trigger there (the Stop may have surfaced as another error). */
   settledBy?: "nse_settle" | "terminal_cancelled_run";
+  /** adopt-stopu-ugate (rf-4 + RFL 00:50Z): the stopped turn's box, through
+   * its existing command path. The CLOSED-case export runs only after
+   * noStoppedTurnProcessRemains proves (kill, then re-read) that no process
+   * newer than the turn start remains on it. Absent -> nothing is exported. */
+  stoppedTurnBox?: (signal: AbortSignal) => Promise<StoppedTurnBox | null>;
 }): Promise<CancelledWarmExportOutcome> {
   const sync = input.nativeWorkspaceSync;
   if (!sync || sync.reference.state !== "prepared") return { outcome: "not_applicable" };
@@ -147,6 +157,14 @@ export async function finishCancelledWarmWorkspaceExport(input: {
         if (controller.signal.aborted) throw controller.signal.reason;
         await ownership.assertHeld();
       };
+      // adopt-stopu-ugate: close-success alone is NOT proof (an escaped
+      // setsid/nohup writer survives it). No export unless the box's process
+      // table shows no process of the stopped turn remains.
+      const box = input.stoppedTurnBox ? await input.stoppedTurnBox(controller.signal).catch(() => null) : null;
+      const proof = await noStoppedTurnProcessRemains(box, run.startedAt);
+      if (!proof.proven) throw new StoppedTurnProcessesNotProvenGoneError(
+        `${proof.detail}${proof.remaining?.length ? `:${proof.remaining.join(",")}` : ""}`);
+      await assertHeld();
       const export_ = sync.restoreWorkspace(assertHeld, { signal: controller.signal });
       export_.catch(() => undefined);
       await Promise.race([export_, aborted]);
@@ -163,6 +181,15 @@ export async function finishCancelledWarmWorkspaceExport(input: {
     if (result === "timed_out") reason = "timed_out";
     else if (!result.acquired) reason = `ownership_${result.reason}`;
   } catch (error) {
+    if (error instanceof StoppedTurnProcessesNotProvenGoneError && !controller.signal.aborted) {
+      if (timer) clearTimeout(timer);
+      controller.abort(timedOut);
+      await recordCancelledWarmExportOutcome(input.db, run, {
+        reason: TOOLS_NOT_PROVEN_STOPPED, detail: error.detail, timeoutMs: null, line: TOOLS_NOT_PROVEN_LINE });
+      logger.warn({ runId: input.runId, reason: TOOLS_NOT_PROVEN_STOPPED, detail: error.detail },
+        "Stopped warm turn's processes are not proven gone from the box; its workspace is not exported and the box is kept");
+      return { outcome: "unproven", reason: TOOLS_NOT_PROVEN_STOPPED };
+    }
     reason = controller.signal.reason instanceof NativeWorkspaceFinalizationOwnershipLostError
       || error instanceof NativeWorkspaceFinalizationOwnershipLostError ? "ownership_lost"
       : error instanceof Error && error.message === "cancelled_warm_export_timed_out" ? "timed_out" : "export_failed";
