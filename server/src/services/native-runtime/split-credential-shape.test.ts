@@ -256,7 +256,15 @@ describe("split credential shapes through the real append, Postgres and the live
         expect(tailsOf(final).length).toBeLessThanOrEqual(1);
         settledTails += tailsOf(final).length;
         maxTail = Math.max(maxTail, ...tailsOf(final).map(tail => tail.payload.text.length));
-        expect(final.payload.text).toBe(redactSensitiveText(row.text));
+        // supersedes(split json row form: either masked marker form; RFL record SUPERSEDE-REDACT-COMPOSE-AUTHZ-MARKER-1118)
+        // A stored JSON text is masked leaf by leaf (`{"authorization":"Bearer ***REDACTED***"}`); the
+        // plain scan masks the whole value (`{"authorization": "***REDACTED***"}`). Both are masked.
+        if (row.name === "json") {
+          expect(leaked(String(final.payload.text), row.secret)).toBe(false);
+          expect([redactSensitiveText(row.text), '{"authorization":"Bearer ***REDACTED***"}']).toContain(final.payload.text);
+        } else {
+          expect(final.payload.text).toBe(redactSensitiveText(row.text));
+        }
       }
       report.push({ row: row.name, cases: cases.length, storedEvents: events.length, publishedEvents: live.length,
         casesSettledByTerminal: settledTails, maxSettledTailChars: maxTail, tokenInStoredOrPublished: false });
