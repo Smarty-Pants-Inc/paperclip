@@ -6,6 +6,37 @@ import {
   sanitizeFeedbackValue,
 } from "../services/feedback-redaction.js";
 
+describe.each([
+  ["sanitizeFeedbackText", sanitizeFeedbackText],
+  ["sanitizeFeedbackValue", sanitizeFeedbackValue],
+] as const)("%s provider-key boundaries", (_name, sanitize) => {
+  // The command-redaction cases, with feedback's existing replacement markers.
+  it.each([
+    ["sk-aaaaaaaaaaa-", "[REDACTED_API_KEY]"],
+    ["sk-aaaaaaaaaaaa", "[REDACTED_API_KEY]"],
+    ["KEY=sk-proj-AbCdEf0123456789AbCdEf0123456789-suffix", "KEY=[REDACTED_API_KEY]"],
+    ["https://x.example/sk-or-v1-0123456789abcdef0123456789abcdef-path", "https://x.example/[REDACTED_API_KEY]"],
+    ["--api-key=sk-ant-api03-AbCdEf0123456789AbCdEf0123456789AbCdEf-", "--api-key=[REDACTED]"],
+    ["sk-AbCdEf0123456789AbCdEf0123456789-", "[REDACTED_API_KEY]"],
+    ["KEY=sk-proj-AbCdEf0123456789AbCdEf0123456789", "KEY=[REDACTED_API_KEY]"],
+    ["https://x.example/sk-or-v1-0123456789abcdef0123456789abcdef", "https://x.example/[REDACTED_API_KEY]"],
+    ["--api-key=sk-ant-api03-AbCdEf0123456789AbCdEf0123456789AbCdEf", "--api-key=[REDACTED]"],
+    ["sk-AbCdEf0123456789AbCdEf0123456789", "[REDACTED_API_KEY]"],
+    ["sk-proj-AbCdEf0123456789AbCdEf0123456789-", "[REDACTED_API_KEY]"],
+    ["sk-or-v1-0123456789abcdef0123456789abcdef-", "[REDACTED_API_KEY]"],
+    ["sk-ant-api03-AbCdEf0123456789AbCdEf0123456789AbCdEf-", "[REDACTED_API_KEY]"],
+    ["Before: sk-aaaaaaaaaaa- after", "Before: [REDACTED_API_KEY] after"],
+    ["sk-aaaaaaaaaaa--", "[REDACTED_API_KEY]"],
+    ["\"sk-aaaaaaaaaaa-\"", "\"[REDACTED_API_KEY]\""],
+    ["risk-free", "risk-free"],
+    ["sk-learn", "sk-learn"],
+  ])("redacts the whole provider-key run without masking ordinary prose: %s", (input, expected) => {
+    const state = createFeedbackRedactionState();
+
+    expect(sanitize(input, state, "body", 10_000)).toBe(expected);
+  });
+});
+
 describe("feedback redaction", () => {
   it.each([
     "https://agents.staging.example.com/team/chats/assistant",
