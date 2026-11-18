@@ -12279,7 +12279,9 @@ describe("native warm session supervision", () => {
         contextSnapshot: { issueId: chatId, conversationSessionGeneration: chat!.conversationSessionGeneration } }).returning();
       await db.insert(tables.nativeRunFinalizations).values({ runId: chatRunId, companyId, issueId: chatId, phase: "observed" });
       await db.update(tables.issues).set({ executionRunId: chatRunId }).where(eq(tables.issues.id, chatId));
-      await prepareNativeHeartbeatRun({ db, run: chatRun!, issue: chat! });
+      const [chatLease] = await db.insert(tables.environmentLeases).values({ companyId, environmentId, heartbeatRunId: chatRunId, issueId: chatId,
+        provider: "daytona", providerLeaseId: "chat-owned-allocation", leasePolicy: "ephemeral", metadata: { remoteCwd } }).returning();
+      await prepareNativeHeartbeatRun({ db, run: chatRun!, issue: chat!, environmentLeaseId: chatLease!.id });
       const [chatContract] = await db.select().from(tables.completionContracts).where(eq(tables.completionContracts.issueId, chatId));
       const chatExecution: NativeExecutionInputV3 = { ...h.current,
         task: { ...h.current.task, prompt: message },
