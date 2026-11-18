@@ -94,10 +94,10 @@ describe("native continuation refusal", () => {
     expect(isNativeContinuationRefusal(undefined)).toBe(false);
   });
 
-  it("uses the durable notice's one wording: the files are kept, a new task continues, never send a message", () => {
+  it("uses the durable notice's one wording: the message and saved work are kept, send a new message to retry", () => {
+    // Cut B (928c3f8021a) restored upstream's fresh-continuation fallback.
     expect(HELD_PREDECESSOR_NOTICE)
-      .toBe("Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.");
-    expect(HELD_PREDECESSOR_NOTICE).not.toMatch(/send a message/i);
+      .toBe("Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.");
   });
 
   it("names the refused action with the same one wording, not a second text", () => {
