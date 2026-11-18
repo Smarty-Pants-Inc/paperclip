@@ -15205,10 +15205,35 @@ describe("native warm session supervision", () => {
             Object.assign(runDb, { select: proofDb.select.bind(proofDb), insert: proofDb.insert.bind(proofDb),
               update: proofDb.update.bind(proofDb), execute: proofDb.execute.bind(proofDb), transaction: proofDb.transaction.bind(proofDb) });
             collectStopped.mockClear(); sandboxRunner.syncIn.mockClear(); signals.length = 0;
-            if (delaySeconds > 0) { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(Date.now() + delaySeconds * 1_000); }
+            // The refusal rows: the successor's retirement (worker-side, in
+            // executePaperclipNativeSession) waits up to warmSessionReleaseWait
+            // (30 s) for Boat's typed receipt that never comes. Fake setTimeout/Date
+            // let that bound elapse without real waiting; real PostgreSQL I/O
+            // still runs between fake steps.
+            const realSetTimeout = globalThis.setTimeout;
+            const realSleepBound = (ms: number) => new Promise(resolve => realSetTimeout(resolve, ms));
+            // no-sandbox-runner has no owner lease to wait on: it refuses at once, as on the base.
+            const waitsForReceipt = !answered && holder !== "no-sandbox-runner";
+            if (waitsForReceipt) vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+            else if (delaySeconds > 0) vi.useFakeTimers({ toFake: ["Date"] });
+            if (delaySeconds > 0) vi.setSystemTime(Date.now() + delaySeconds * 1_000);
             const followUp = { ...next, session: base.session };
+            const attemptStarted = Date.now();
             const attempt = executePaperclipNativeSession({ db: leaseDb(followUp), execution: followUp, runnerInstanceId: "runner",
               refreshTools: true, ...(target ? { runnerExecutionTarget: target } : {}) });
+            if (waitsForReceipt) {
+              let settledAt: number | undefined;
+              void attempt.then(() => { settledAt = Date.now(); }, () => { settledAt = Date.now(); });
+              const bound = warmSessionReleaseWait.timeoutMs;
+              while (settledAt === undefined && Date.now() - attemptStarted < bound - 1_000) {
+                await vi.advanceTimersByTimeAsync(Math.min(250, bound - 1_000 - (Date.now() - attemptStarted)));
+                await realSleepBound(2);
+              }
+              expect(settledAt, "still waiting inside warmSessionReleaseWait").toBeUndefined();
+              for (let step = 0; settledAt === undefined && step < 2_000; step++) { await vi.advanceTimersByTimeAsync(250); await realSleepBound(2); }
+              expect(settledAt! - attemptStarted, "refused only after warmSessionReleaseWait").toBeGreaterThanOrEqual(bound);
+              vi.useRealTimers();
+            }
             if (answered) {
               // On the base this is the live failure: retirement unproven, the
               // fence's superseded refusal of an unsettled Runner as its cause.
