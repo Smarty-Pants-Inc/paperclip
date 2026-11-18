@@ -8,12 +8,14 @@ import { REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT } from "./remote-runner-recovery-d
 
 export const SANDBOX_RUNNER_HOLDER_LIST_SCRIPT = [
   "set -eu",
-  'root=$1; own=$2',
+  // B1 fence (b) G1: this run's own session directory is listed too. A finished run's runner left there
+  // (this run continues its conversation) is classified like any other; this run's own live runner is
+  // excluded by run id in retireSandboxRunnerPortHolders, never by directory.
+  'root=$1',
   'test -d "$root/sessions" && test ! -L "$root/sessions" || exit 0',
   'for session in "$root"/sessions/*; do',
   '  test -d "$session" && test ! -L "$session" || continue',
   '  case "${session##*/}" in *.*) continue;; esac',
-  '  test "$session" = "$own" && continue',
   '  identity="$session/runner/runner-process.identity"; state="$session/runner/runner-state.json"',
   '  test -f "$identity" && test ! -L "$identity" || continue',
   '  encoded_state=""',
@@ -69,13 +71,36 @@ export function parseSandboxRunnerHolders(stdout: string): SandboxRunnerHolder[]
 
 type HolderProbe = "alive" | "gone" | "unproven";
 
+/** B1 fence (b) G2: runnerd is launched by `nohup setsid`, so it leads its own process group (pgid = its pid) and
+ * its agent children live in that group. In group mode ($7 = group) a signal goes to the whole group once the
+ * marker-verified leader is alive (to the pid alone when it leads no group: the no-setsid launch), and the runner
+ * counts as alive while any group member is left, even after the leader exited. The leader-gone remnant group is
+ * only signalled inside one reap that verified the leader first: while the group exists its id cannot be reused
+ * as a pid. Exit codes are the check script's: 0 alive, 45 gone, anything else unproven. */
+const GROUP_TARGET = '"-$4"';
+const GROUP_MEMBERS_SCRIPT = String.raw`node -e 'try { process.kill(-Number(process.argv[1]), 0); } catch (error) { process.exit(error.code === "ESRCH" ? 1 : 2); }' "$4"`;
+const HOLDER_CHECK_SCRIPT = [
+  `(${REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT})`,
+  "leader=$?",
+  'if test "$leader" = 0; then',
+  '  if test -n "${6:-}"; then if test "${7:-}" = group && kill -s 0 -- "-$4" 2>/dev/null; then kill -s "$6" -- ' + GROUP_TARGET + ' || exit 46; else kill -s "$6" "$4" || exit 46; fi; fi',
+  "  exit 0",
+  "fi",
+  'test "$leader" = 45 && test "${7:-}" = group || exit "$leader"',
+  `${GROUP_MEMBERS_SCRIPT} && members=0 || members=$?`,
+  'test "$members" = 1 && exit 45',
+  'test "$members" = 0 || exit 46',
+  'if test -n "${6:-}"; then kill -s "$6" -- ' + GROUP_TARGET + " || exit 46; fi",
+  "exit 0",
+].join("\n");
+
 async function checkHolder(runner: CommandManagedRuntimeRunner, holder: SandboxRunnerHolder, label: string,
-  signal?: "TERM" | "KILL"): Promise<number | null> {
+  signal?: "TERM" | "KILL", group = false): Promise<number | null> {
   const result = await runner.execute({
     command: "sh",
-    args: ["-c", REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT + (signal ? '; kill -"$6" "$pid"' : ""),
+    args: ["-c", HOLDER_CHECK_SCRIPT,
       label, holder.identityPath, holder.nonce, holder.runnerInstanceId, String(holder.pid),
-      holder.processStartFingerprint ?? "", ...(signal ? [signal] : [])],
+      holder.processStartFingerprint ?? "", signal ?? "", ...(group ? ["group"] : [])],
     bypassSession: true,
     timeoutMs: 10_000,
   }).catch(() => null);
@@ -83,17 +108,17 @@ async function checkHolder(runner: CommandManagedRuntimeRunner, holder: SandboxR
 }
 
 async function probeHolder(runner: CommandManagedRuntimeRunner, holder: SandboxRunnerHolder,
-  signal?: "TERM" | "KILL"): Promise<HolderProbe> {
-  const exitCode = await checkHolder(runner, holder, "paperclip-runner-port-holder-check", signal);
+  signal?: "TERM" | "KILL", group = false): Promise<HolderProbe> {
+  const exitCode = await checkHolder(runner, holder, "paperclip-runner-port-holder-check", signal, group);
   if (exitCode === 0) return "alive";
   if (exitCode === 45 || exitCode === 47) return "gone";
   return "unproven";
 }
 
-async function listSandboxRunnerHolders(runner: CommandManagedRuntimeRunner, runtimeRoot: string, ownSessionRoot: string) {
+async function listSandboxRunnerHolders(runner: CommandManagedRuntimeRunner, runtimeRoot: string) {
   const listed = await runner.execute({
     command: "sh",
-    args: ["-c", SANDBOX_RUNNER_HOLDER_LIST_SCRIPT, "paperclip-runner-port-holders", runtimeRoot, ownSessionRoot],
+    args: ["-c", SANDBOX_RUNNER_HOLDER_LIST_SCRIPT, "paperclip-runner-port-holders", runtimeRoot],
     bypassSession: true,
     timeoutMs: 15_000,
   }).catch(() => null);
@@ -109,7 +134,7 @@ export async function sandboxSessionRunnerExited(input: {
   runtimeRoot: string;
   sessionDirectory: string;
 }): Promise<boolean> {
-  const { holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot, "");
+  const { holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot);
   const holder = holders?.find(candidate => holderSessionDirectory(candidate) === input.sessionDirectory);
   return holder !== undefined && await checkHolder(input.runner, holder, "paperclip-runner-exit-check") === 45;
 }
@@ -165,10 +190,11 @@ export async function inspectSandboxSessionRunner(input: {
   } catch { return null; }
 }
 
-async function waitUntilGone(runner: CommandManagedRuntimeRunner, holder: SandboxRunnerHolder, waitMs: number, pollMs: number) {
+async function waitUntilGone(runner: CommandManagedRuntimeRunner, holder: SandboxRunnerHolder, waitMs: number, pollMs: number,
+  group = false) {
   const deadline = Date.now() + waitMs;
   for (;;) {
-    const probe = await probeHolder(runner, holder);
+    const probe = await probeHolder(runner, holder, undefined, group);
     if (probe !== "alive") return probe;
     if (Date.now() >= deadline) return "alive" as const;
     await new Promise(done => setTimeout(done, pollMs));
@@ -191,7 +217,7 @@ export async function retireSandboxRunnerPortHolders(input: {
   waitMs?: number;
   pollMs?: number;
 }): Promise<string[]> {
-  const { listed, holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot, input.ownSessionRoot);
+  const { listed, holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot);
   if (!holders) {
     throw new NativePredecessorRetirementUnprovenError(null, input.providerLeaseId,
       new Error(`runner_port_holder_inventory_unavailable: exit=${listed?.exitCode ?? "none"} timedOut=${listed?.timedOut ?? false}`));
@@ -217,19 +243,22 @@ export async function retireSandboxRunnerPortHolders(input: {
     if (!RETIRABLE_HOLDER_RUN_STATUSES.has(owner.status) || owner.agentId !== input.agentId || !holder.idle) {
       throw unproven("owner_not_settled");
     }
+    // TERM then KILL the runner's whole process group; reaped only once no group member is left.
+    // Nothing is deleted: the session's journal and state files stay on disk as its trace.
     let outcome: "stopped" | "killed" = "stopped";
-    let probe = await probeHolder(input.runner, holder, "TERM");
-    if (probe === "alive") probe = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500);
+    let probe = await probeHolder(input.runner, holder, "TERM", true);
+    if (probe === "alive") probe = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500, true);
     if (probe === "alive") {
       outcome = "killed";
-      probe = await probeHolder(input.runner, holder, "KILL");
-      if (probe === "alive") probe = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500);
+      probe = await probeHolder(input.runner, holder, "KILL", true);
+      if (probe === "alive") probe = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500, true);
     }
     if (probe !== "gone") throw unproven("stop_unconfirmed");
     await persistActivity(input.db, {
       companyId: input.companyId, actorType: "system", actorId: "native-runtime", agentId: input.agentId,
       action: "native.runner_port_holder_retired", entityType: "heartbeat_run", entityId: input.runId, runId: input.runId,
       details: { holderRunId: holder.runId, holderRunnerInstanceId: holder.runnerInstanceId, holderStatus: owner.status, outcome,
+        holderInOwnSession: input.ownSessionRoot !== "" && posix.dirname(posix.dirname(holder.identityPath)) === input.ownSessionRoot,
         providerLeaseId: input.providerLeaseId },
     });
     await input.onLog?.("stdout",
