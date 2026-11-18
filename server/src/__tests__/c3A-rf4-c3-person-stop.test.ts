@@ -46,6 +46,7 @@ import { hasConfirmedSandboxStopAndRetain } from "../services/sandbox-stop-and-r
 import { executionProjectionsForRuns } from "../services/execution-projection.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.js";
+import { PERSON_STOP_NOTE } from "../services/system-recovery-state.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 async function waitFor(check: () => Promise<boolean>, ms = 10_000) {
@@ -218,11 +219,11 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     try {
       const r = await exercise("mid_turn", "q5-control");
       const failure = r.holds.filter(h => h.evidence?.runId !== r.runId && ["active", "escalated"].includes(h.status));
-      const stopNotes = r.holds.filter(h => h.evidence?.runId === r.runId && /unsaved changes stay on the previous sandbox/.test(h.nextAction ?? ""));
+      const stopNotes = r.holds.filter(h => h.evidence?.runId === r.runId && h.nextAction === PERSON_STOP_NOTE);
       await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q5-control-holds.json"), JSON.stringify({ holds: r.holds, blocker: r.blocker }, null, 2));
       expect(r.calls.length, "the provider was reached").toBe(2);
       expect(failure, "the successor's real failure has its own note").toHaveLength(1);
-      expect(failure[0]!.nextAction).not.toMatch(/unsaved changes stay on the previous sandbox/);
+      expect(failure[0]!.nextAction).not.toBe(PERSON_STOP_NOTE);
       expect(r.blocker?.runId, "the blocker names the failed successor, not the stopped run").toBe(r.runs[0]?.id);
       expect(stopNotes, "the Stop note is still there once").toHaveLength(1);
     } finally { fixture.successorThrows = false; }
