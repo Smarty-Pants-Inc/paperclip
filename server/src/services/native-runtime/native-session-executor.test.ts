@@ -12153,7 +12153,7 @@ describe("bounded stopped instruction collection", () => {
 });
 
 describe("native warm session supervision", () => {
-  it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-remove-entry-held-person", "claim-canonical", "claim-config", "claim-uncertain"])("composes remote warm ownership with real DB successor leases and current-run collection: %s", async ending => {
+  it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-remove-entry-held-person", "claim-remove-entry-held-successor", "claim-canonical", "claim-config", "claim-uncertain"])("composes remote warm ownership with real DB successor leases and current-run collection: %s", async ending => {
     const tables = await import("@paperclipai/db");
     const { eq, sql } = await import("drizzle-orm");
     const { randomUUID } = await import("node:crypto");
@@ -12206,6 +12206,26 @@ describe("native warm session supervision", () => {
         turnId: "warm-turn", normalizedSessionId: environmentId, providerSessionId: environmentId,
         driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
     });
+    // rf-3 follow-up found on this native path (not fixed here): the successor
+    // whose claim retired the old box owns the held row. heartbeat/
+    // instruction-working-copy.ts re-enters prepare(runId) once the claim returns
+    // null, and prepare returns that unsettled held row: the successor would run
+    // in the held, entry-less tree instead of its canonical directory.
+    const successorContinuesWhileHeld = async (h: { heldRunId: string; target: Record<string, unknown> }) => {
+      const { agentFileSaveHeld } = await import("../agent-directory-working-copies.js");
+      const canonicalEntry = "Retain this exact directory.\n";
+      const stillHeld = async () => agentFileSaveHeld(await copies.get(companyId, h.heldRunId));
+      const successor = await copies.prepare({ companyId, agentId, runId: h.heldRunId, target: h.target as never, cwd: remoteCwd });
+      const successorEntry = await readFile(join(successor!.executionRoot, "AGENTS.md"), "utf8").catch(error => `missing (${error.code})`);
+      const context = await buildNativeRuntimeContext({ db, agent, runId: h.heldRunId, runtimeConfig: {}, runtimeSkillEntries: [],
+        instructionWorkingCopy: { rootPath: successor!.executionRoot, entryPath: "AGENTS.md", kind: "agent_files" } })
+        .then(built => ({ ok: true, root: built.instructions.workingCopy?.rootPath }), error => ({ ok: false, error: String(error?.message ?? error).slice(0, 300) }));
+      console.log("PERSON_A_SUCCESSOR", JSON.stringify({ runId: h.heldRunId, state: successor?.state, root: successor?.executionRoot,
+        held: agentFileSaveHeld(successor), entry: successorEntry, runtimeContext: context }));
+      expect.soft(successor?.state, "the continuing successor gets a prepared copy, not the held row").toBe("prepared");
+      expect.soft(successorEntry, "the continuing successor reads canonical AGENTS.md, not the held entry-less tree").toBe(canonicalEntry);
+      expect.soft(await stillHeld(), "the hold stays").toBe(true);
+    };
     // rf-3 (smarty-dev#20787 C1, required 1 and 3): the person's next actions
     // while a permanent 422 save stays held, on this native path, continuing
     // after the hold instead of discarding first. The provider turn is the
@@ -12342,7 +12362,7 @@ describe("native warm session supervision", () => {
           if (ending === "claim-remove") await rm(join(originalRoot, "optional-memory.txt"));
           if (ending.startsWith("claim-remove-entry")) await rm(join(originalRoot, "AGENTS.md"));
           if (ending === "claim-canonical") await writeFile(join(canonical, "AGENTS.md"), "Canonical edit before next claim\n");
-          if (["claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-remove-entry-held-person", "claim-canonical"].includes(ending)) {
+          if (["claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-remove-entry-held-person", "claim-remove-entry-held-successor", "claim-canonical"].includes(ending)) {
             // Ordinary adoption remains unchanged-only and cannot alias this owner.
             expect(await copies.adopt({ companyId, agentId, runId, previousRunId: prior.binding.runId, target, cwd: remoteCwd })).toBeNull();
             expect((await copies.get(companyId, prior.binding.runId))?.receipt?.retainedByRunId).toBeUndefined();
@@ -12369,6 +12389,10 @@ describe("native warm session supervision", () => {
               expect(held.receipt?.cleanupPending).toBeUndefined(); // No compact cleanup receipt while held.
               expect((await lstat(originalRoot)).isDirectory()).toBe(true);
               expect(await readFile(join(canonical, "AGENTS.md"), "utf8")).toBe("Retain this exact directory.\n");
+              if (ending === "claim-remove-entry-held-successor") {
+                await successorContinuesWhileHeld({ heldRunId: runId, target });
+                return;
+              }
               if (ending === "claim-remove-entry-held-person") {
                 await personNextActionsWhileHeld({ heldRunId: runId, current, target });
                 return;
