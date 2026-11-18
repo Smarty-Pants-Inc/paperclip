@@ -2700,8 +2700,10 @@ describe("persistent agent directories", () => {
     const result = await copies.collectStopped({ companyId, runId: copy.runId });
     expect(result?.state).toBe("unavailable");
     expect((await fs.readFile(path.join(copy.localRoot, entryFile))).length).toBe(1024 * 1024 + 1);
-    // supersedes (held-save bound B1): the over-limit entry is a permanent 422 refusal of
-    // these pinned bytes, so the hold is permanent, never timer-retried, and names the discard route.
+    // RFL record SUPERSEDE-AGENTDIR-1MIB-PERMHOLD-1118 (superseded in 1990314e; held-save bound B1):
+    // the old assertion (errorMessage === AGENT_FILES_SAVE_PENDING_INSTRUCTION, a timer-retried
+    // hold) is replaced: the over-limit entry is a permanent 422 refusal of these pinned bytes,
+    // so the hold is permanent, never timer-retried, and names the discard route.
     expect(result?.errorMessage).toContain(`/api/companies/${companyId}/agent-file-holds/${copy.runId}/discard`);
     expect(result?.nextAttemptAt).toBeNull();
     expect(result?.receipt?.savePending).toMatchObject({ permanent: true, permanentStatus: 422 });
