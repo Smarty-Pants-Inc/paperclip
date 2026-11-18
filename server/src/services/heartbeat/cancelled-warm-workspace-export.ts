@@ -248,7 +248,7 @@ export async function finishCancelledWarmWorkspaceExport(input: {
         eventType: PROCESSES_VERIFIED_GONE_EVENT, stream: "system", level: "info",
         message: "The stopped turn's processes are verified gone from the box.",
         payload: { at: verifiedGoneAt.toISOString(), killed: proof.killed, remaining: 0, scoped: proof.scoped,
-          decision: decided } });
+          decision: decided } }).catch(error => logger.warn({ err: error, runId: run.id }, "verified-gone record not written"));
       await assertHeld();
       while (Date.now() <= verifiedGoneAt.getTime()) await new Promise(resolve => setTimeout(resolve, 1));
       const runner = (box as StoppedTurnBox | null)?.runner as { syncOut?: unknown } | undefined;
@@ -256,7 +256,7 @@ export async function finishCancelledWarmWorkspaceExport(input: {
         eventType: EXPORT_STARTED_EVENT, stream: "system", level: "info",
         message: "The stopped turn's workspace export started.",
         payload: { at: new Date().toISOString(), copyPath: typeof runner?.syncOut === "function" ? "provider_syncOut" : "remote_tar",
-          verifiedGoneAt: verifiedGoneAt.toISOString() } });
+          verifiedGoneAt: verifiedGoneAt.toISOString() } }).catch(error => logger.warn({ err: error, runId: run.id }, "export-start record not written"));
       await assertHeld();
       const export_ = sync.restoreWorkspace(assertHeld, { signal: controller.signal });
       export_.catch(() => undefined);
