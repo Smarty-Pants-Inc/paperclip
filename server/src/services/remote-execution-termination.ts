@@ -52,10 +52,6 @@ function boundStopReceipt(lease: Pick<ReceiptLease, keyof LeaseIdentity | "metad
 export function hasRemoteTerminationReceipt(lease: ReceiptLease): boolean {
   return terminationReceipt(lease);
 }
-/** The same, for a setup probe's run-less lease read by its holder's exact id. */
-export function hasProbeLeaseTerminationReceipt(lease: ReceiptLease, probeLeaseId: string): boolean {
-  return terminationReceipt(lease, probeLeaseId);
-}
 function terminationReceipt(lease: ReceiptLease, probeLeaseId?: string): boolean {
   return Boolean(lease.releasedAt && lease.cleanupStatus === "success" &&
     ["released", "expired", "failed"].includes(lease.status) && boundStopReceipt(lease, probeLeaseId));
