@@ -87,6 +87,8 @@ describeRealProducer(
       expect(provider.pgid).toBe(provider.pid);
       expect(provider.pgid).not.toBe(runnerProc.pgid);
     }
+    console.log(JSON.stringify({ topology: true, runnerPid: child.pid, runnerPgid: runnerProc.pgid,
+      providers: providerProcs.map(provider => ({ pid: provider.pid, pgid: provider.pgid })) }));
     return { child, runnerPid: child.pid!, runnerPgid: runnerProc.pgid, providers, stateDir };
   }
 
@@ -140,6 +142,8 @@ describeRealProducer(
     const x = await seedOwners("r1");
     const r = await launchRunner({ runtimeRoot: x.runtimeRoot, session: "a".repeat(64), runId: x.owner.runId, providers: [TERM_HONOURING] });
     await expect(retire(x)).resolves.toEqual([x.owner.runId]);
+    console.log(JSON.stringify({ retirementReturnedSuccess: true, runnerStillAlive: !await gone(r.runnerPid),
+      providerStillAlive: !await gone(r.providers[0]!) }));
     expect(await gone(r.runnerPid)).toBe(true);
     expect(await gone(r.providers[0]!), "the provider's own group must be reaped too").toBe(true);
     expect(await outcomeOf(x.current.db, x.current.runId)).toBe("stopped");
