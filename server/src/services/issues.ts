@@ -7171,6 +7171,13 @@ async function lockIssueForCommentMutation(tx: DbTransaction, commentId: string)
   return Boolean(issue);
 }
 
+/** The posted body is the accepted summary. Native event text is masked at
+ * append while an accepted summary can still be raw, so both sides are compared
+ * in the same masked projection. */
+function presentsAcceptedSummary(summary: unknown, body: string): boolean {
+  return typeof summary === "string" && redactSensitiveText(summary) === redactSensitiveText(body);
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -13815,7 +13822,13 @@ export function issueService(db: Db) {
           ownOrigin: instancePublicOrigin(),
         })
         : body;
-      const redactedBody = redactCurrentUserText(linkedBody, currentUserRedactionOptions);
+      // A person's message is source material, not agent output. Keep the
+      // existing username policy, but mask provider keys only for agent prose.
+      // The mask runs last, on the text that is stored (after the links).
+      const redactedBody = redactCurrentUserText(
+        actor.agentId && !actor.userId ? redactSensitiveText(linkedBody) : linkedBody,
+        currentUserRedactionOptions,
+      );
       if (actor.userId && options?.clientRequestId) {
         const [existing] = await dbOrTx.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
           eq(issueComments.authorUserId, actor.userId), eq(issueComments.clientRequestId, options.clientRequestId)));
@@ -13896,7 +13909,7 @@ export function issueService(db: Db) {
         if (
           presentationRun?.resultJson?.finalizationReasonCode ===
             "governed_response_waiting" &&
-          (parseObject(presentationRun.resultJson.nativeResult).summary !== body ||
+          (!presentsAcceptedSummary(parseObject(presentationRun.resultJson.nativeResult).summary, body) ||
             !(await authorizeNativeChatReviewPresentation(
               dbOrTx,
               {
