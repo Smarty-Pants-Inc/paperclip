@@ -213,6 +213,7 @@ function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }
       and coalesce(r.finished_at, r.updated_at) > ${since}::timestamptz
       and (r.context_snapshot->>'wakeCommentId' = ${m.id}::text or r.context_snapshot->>'commentId' = ${m.id}::text
         or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${m.id}::text
+        or coalesce(r.context_snapshot->'attributionCommentIds', '[]'::jsonb) ? ${m.id}::text
         or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
         or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${m.id}::text))
     or exists (select 1 from ${agentWakeupRequests} w where w.company_id = ${m.companyId} and w.updated_at > ${since}::timestamptz
@@ -276,12 +277,12 @@ export type UnansweredMessageOutcome =
   | { kind: "noticed"; code: string; commentId: string };
 
 /** A native-status continuation carrying the message only as its attribution
- * field (conversationReplyBoundaryCommentId), never as prompt input. */
+ * fields (conversationReplyBoundaryCommentId, attributionCommentIds), never as prompt input. */
 function carriesForAttributionOnly(contextSnapshot: unknown, messageId: string): boolean {
   const context = (contextSnapshot ?? {}) as Record<string, unknown>;
   return context.statusDecisionSource === "native_status_decision"
-    && context.conversationReplyBoundaryCommentId === messageId
-    && !runCarriesMessage({ ...context, conversationReplyBoundaryCommentId: undefined }, messageId);
+    && runCarriesMessage(context, messageId)
+    && !runCarriesMessage({ ...context, conversationReplyBoundaryCommentId: undefined, attributionCommentIds: undefined }, messageId);
 }
 
 function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean {
@@ -293,6 +294,8 @@ function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean
   const ids = [
     ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
     ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : []),
+    // The native-status continuation's attribution-only ids (status-decision-committer.ts).
+    ...(Array.isArray(context.attributionCommentIds) ? context.attributionCommentIds : []),
     context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
   ];
   return ids.includes(messageId);
