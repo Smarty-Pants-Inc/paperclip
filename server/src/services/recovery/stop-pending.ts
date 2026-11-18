@@ -1,8 +1,9 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { issueRecoveryActions, type Db } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { logActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
+import { PROVIDER_POLICY_REFUSAL_CODE } from "../native-runtime/native-provider-failure.js";
 
 const STOP_PENDING_CODE = "execution_stop_pending";
 export const STOP_PENDING_SCHEMA = "paperclip.task-stop-pending.v1";
@@ -25,6 +26,17 @@ type StopPending = {
   standalone: boolean;
   previousNextAction: string | null;
 };
+/** Recorded requests, not a terminal status or a paused assignee, establish intent.
+ * (Ported with refusal2: the fork helper its refusal filter needs; absent on this line.) */
+function hasRecordedStopRequest(run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">): boolean {
+  const result = run.resultJson ?? {};
+  return run.errorCode === "operator_interrupted" ||
+    ["executionCancellation", "startupCancellation", "nativeCancellation", "cancellation",
+      "operatorInterrupted", "cancelledByActorType", "cancelledByUserId", "interruptedByActorType",
+      "queuedCommentInterruptQueueId", "pauseRequested", "stopRequested", "interruptRequested"]
+      .some(key => result[key] != null && result[key] !== false);
+}
+
 /** Ordinary task progress is not evidence that this retained executor stopped. */
 export function hasTaskStopPending(action: { evidence: Record<string, unknown> }): boolean {
   const value = action.evidence.stopPending;
@@ -58,7 +70,16 @@ async function notify(tx: Db, input: TaskBinding) {
  * The existing recovery-action projection is durable even for an unassigned
  * task or a historical run without issue context. No task workflow state changes. */
 export async function recordTaskStopPending(tx: Db, input: TaskBinding & { source: string }, publications: ActivityPublication[]) {
-  const runIds = [...new Set(input.runIds)].sort();
+  const boundRunIds = [...new Set(input.runIds)].sort();
+  const boundRuns = boundRunIds.length ? await tx.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, boundRunIds),
+  )) : [];
+  // A provider refusal is not a Stop request. Suppress only that diagnostic,
+  // never the underlying execution claims or any genuinely requested Stop.
+  const noStopRefusals = new Set(boundRuns.filter(run => run.status === "failed"
+    && run.errorCode === PROVIDER_POLICY_REFUSAL_CODE && !hasRecordedStopRequest(run)).map(run => run.id));
+  const runIds = boundRunIds.filter(id => !noStopRefusals.has(id));
+  if (!runIds.length) return;
   let existing = await activeAction(tx, input);
   const prior = existing && stopPending(existing);
   if (prior && JSON.stringify(prior.runIds) === JSON.stringify(runIds) && existing!.nextAction.includes(STOP_PENDING_CODE)) return;

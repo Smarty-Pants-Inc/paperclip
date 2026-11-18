@@ -1799,8 +1799,9 @@ export async function finalizeNativeRun(input: {
       planWaitAuthorized: planWait !== null,
       hasPendingChildCompletion,
       providerModelRejected: providerFailure?.errorCode === "native_provider_model_rejected" && ownsProviderFailureDecision,
+      providerPolicyRefused: providerFailure?.errorCode === "provider_policy_refusal" && ownsProviderFailureDecision,
       providerOverloaded: providerFailure?.errorCode === "native_provider_overloaded" && ownsProviderFailureDecision,
-      providerFailureSuperseded: providerFailure?.errorCode === "native_provider_overloaded" && !ownsProviderFailureDecision,
+      providerFailureSuperseded: ["native_provider_overloaded", "provider_policy_refusal"].includes(providerFailure?.errorCode ?? "") && !ownsProviderFailureDecision,
       toolReceiptLimitStopped: terminalState !== "succeeded" && ownsProviderFailureDecision && !reviewContext
         && !stopRequested && await readPersistedNativeToolReceiptLimitStop(input.db, run, resultRow.turnId),
       environmentBlocker: terminalState === "succeeded" && ownsProviderFailureDecision && !reviewContext && !stopRequested
@@ -1967,6 +1968,7 @@ export async function finalizeNativeRun(input: {
           ? { agentId: run.agentId, reviewContext }
           : undefined,
         requireProviderFailureOwner: decision.reasonCode?.startsWith("native_provider_overloaded")
+          || decision.reasonCode === "provider_policy_refusal"
           || decision.reasonCode === "native_run_failed_continuation_exhausted"
           || decision.reasonCode === NATIVE_TOOL_RECEIPT_LIMIT_CODE
           || decision.reasonCode === NATIVE_ENVIRONMENT_BLOCKER_CODE

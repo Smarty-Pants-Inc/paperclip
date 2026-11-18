@@ -9,6 +9,37 @@ export const NATIVE_PROVIDER_OVERLOADED_MESSAGE =
   "Selected model is at capacity. Please try a different model.";
 export const NATIVE_PROVIDER_OVERLOADED_CODE = "native_provider_overloaded";
 export const NATIVE_PROVIDER_CAPACITY_MAX_RETRIES = 2;
+export const PROVIDER_POLICY_REFUSAL_CODE = "provider_policy_refusal";
+export const PROVIDER_POLICY_REFUSAL_MESSAGE =
+  "The model provider refused this request under its policies; it won't be retried automatically.";
+
+// Anthropic's documented stop_details.category vocabulary. A refusal can also
+// have a null or future category; stop_reason / stop_details.type takes priority.
+const PI_REFUSAL_CATEGORIES = new Set([
+  "cyber", "bio", "frontier_llm", "reasoning_extraction", "general_harms",
+]);
+
+/** Pi forwards the provider's errorMessage on its failed terminal. This is
+ * provider error evidence, never assistant prose, tools or notice text. Prefer
+ * native refusal evidence when forwarded: explanation text is not stable.
+ * Pinned packs can forward only that text, including OUTPUT-side Terms of
+ * Service refusals. Match request refusals, not account/key rejection plus an
+ * unrelated policy/terms mention. Native refusal fields remain authoritative. */
+function isPiPolicyRefusal(error: Record<string, unknown>): boolean {
+  if (error.code === PROVIDER_POLICY_REFUSAL_CODE) return true;
+  if (error.code !== "pi_provider_error") return false;
+  const details = record(error.stop_details ?? error.stopDetails);
+  if (error.rawStopReason === "refusal" || error.stop_reason === "refusal" || error.stopReason === "refusal"
+    || details.type === "refusal"
+    || (typeof details.category === "string" && PI_REFUSAL_CATEGORIES.has(details.category))) return true;
+  if (typeof error.message !== "string") return false;
+  const message = error.message;
+  return message.trim() === "The model refused to complete the request"
+    || /https:\/\/(?:platform\.claude\.com\/docs\/en\/build-with-claude\/refusals-and-fallback|www\.anthropic\.com\/legal\/commercial-terms)(?:[\s"'?#/.,]|$)/i.test(message)
+    || /\b(?:this|your|the) request triggered\b[^\n]*\brestrictions\b/i.test(message)
+    || /\bblocked as it seems to violate\b[^\n]*\bterms of service restrictions on\b/i.test(message)
+    || /\b(?:this|your|the) request (?:was |is |has been |would )?(?:blocked|flagged|refused|rejected|violate[sd]?)\b[^\n]*\b(?:(?:usage|acceptable[ -]use|safety|content)[ -]polic(?:y|ies)|terms[ -]of[ -]use|commercial[ -]terms)\b/i.test(message);
+}
 export const NATIVE_PROVIDER_OVERLOADED_DIAGNOSTIC = {
   provider: "codex",
   category: "server_overloaded",
@@ -225,6 +256,7 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
   /** A Codex API-key turn whose configured model the Responses API does not serve (404). */
   let missingModelTurnId: string | null = null;
   let overloadedTurnId: string | null = null;
+  const policyRefusedTurns = new Set<string>();
   const failedTurns = new Map<string, NativeTurnFailureDiagnostic>();
   const providerFailures = new Map<string, ProviderFailure>();
   /** A driver-classified, action-required model rejection; `forTerminal` classifies it, so it is not "unclassified". */
@@ -236,7 +268,9 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
     observe(event: PrpEvent) {
       if (event.sourceKind === "runner" && event.eventType === "turn.failed" && event.turnId
         && event.payload.status === "failed") {
-        const failure = readProviderFailure(record(event.payload.error).providerFailure);
+        const error = record(event.payload.error);
+        if (provider.kind === "pi_rpc" && isPiPolicyRefusal(error)) policyRefusedTurns.add(event.turnId);
+        const failure = readProviderFailure(error.providerFailure);
         if (failure && !providerFailures.has(event.turnId)) providerFailures.set(event.turnId, failure);
       }
       if ((provider.kind !== "codex" && provider.kind !== "opencode") ||
@@ -288,6 +322,11 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
     },
     forTerminal(turnId: string | null | undefined, terminal: PrpTerminalState) {
       if (!turnId || terminal.turnTerminalState !== "failed" || terminal.runTerminalState !== "failed") return null;
+      if (policyRefusedTurns.has(turnId)) return {
+        errorCode: PROVIDER_POLICY_REFUSAL_CODE,
+        errorMessage: PROVIDER_POLICY_REFUSAL_MESSAGE,
+        diagnostic: { provider: "pi_rpc", category: "policy_refusal" } as const,
+      };
       if (turnId === overloadedTurnId) return {
         errorCode: NATIVE_PROVIDER_OVERLOADED_CODE,
         errorMessage: NATIVE_PROVIDER_OVERLOADED_MESSAGE,
@@ -308,7 +347,7 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
     /** Diagnostics only: the failed turn that `forTerminal` did not classify. */
     unclassifiedTurnFailure(turnId: string | null | undefined, terminal: PrpTerminalState) {
       if (!turnId || terminal.turnTerminalState !== "failed" || terminal.runTerminalState !== "failed" ||
-          turnId === overloadedTurnId || turnId === rejectedTurnId || turnId === missingModelTurnId ||
+          policyRefusedTurns.has(turnId) || turnId === overloadedTurnId || turnId === rejectedTurnId || turnId === missingModelTurnId ||
           modelUnavailableTurn(turnId)) return null;
       const diagnostic = failedTurns.get(turnId);
       return diagnostic ? { ...diagnostic } : null;

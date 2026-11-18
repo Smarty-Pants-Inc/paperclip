@@ -18,6 +18,7 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
+import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
@@ -100,6 +101,7 @@ export const UNANSWERED_MESSAGE_BOUND_REACHED_TEXT = "Paperclip tried to continu
 // Codes the notice metadata may name. A run's error is reduced to its leading
 // code token; anything not listed is unclassified_failure, never raw text.
 const SHOWN_CODES = new Set([
+  PROVIDER_POLICY_REFUSAL_CODE,
   "adapter_failed", "cancelled", "timeout", "timed_out", "interrupted", "process_lost", "setup_failed",
   "native_controller_recovery_missing_evidence", "native_controller_recovery_dependency_unavailable",
   "native_controller_recovery_unsupported", "native_controller_recovery_wait_authority_changed",
@@ -665,6 +667,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // A fresh-thread refusal is continued by the fresh-continuation fallback on
   // its own (#20925): never the held-conversation "send a new message" note,
   // as isNativeContinuationRefusal already decides for its own patterns.
+  const policyRefused = code === PROVIDER_POLICY_REFUSAL_CODE;
   const held = (isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run));
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
@@ -674,17 +677,18 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const boundReached = Boolean(!paused && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
     && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
       >= FRESH_CONTINUATION_BOUND);
-  const body = paused ? agentPausedText(pausedName)
+  const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : paused ? agentPausedText(pausedName)
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: paused ? `${pausedName} is paused` : "Your message wasn't answered",
+      title: policyRefused ? "The provider refused this request" : paused ? `${pausedName} is paused` : "Your message wasn't answered",
       body,
       tone: "warning",
-      nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+      nextAction: policyRefused ? "Automatic retry is disabled for this request."
+        : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
