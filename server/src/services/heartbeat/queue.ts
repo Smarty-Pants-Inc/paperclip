@@ -1,4 +1,4 @@
-import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { failedTurnPendingCommentIds, readContinuationCommentInput } from "../continuation-comment-input.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
@@ -5253,6 +5253,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             adoptedCommentIds = await undeliveredLegacyUserCommentIds(tx as unknown as Db,
               agent.companyId, issueId, agentId, adoptedCommentIds);
           }
+          // The held message that takes over a failed chat turn also carries that turn's unanswered input.
+          if (explicitContinuation && opts.queuedCommentRequestId) adoptedCommentIds = [...new Set([
+            ...await failedTurnPendingCommentIds(tx as unknown as Db, { companyId: agent.companyId, issueId: issue.id,
+              agentId, runId: explicitContinuation.previousRunId }), ...adoptedCommentIds])];
           await notifyChatRunMilestones(tx, { companyId: agent.companyId, issueId: issueId ?? undefined });
           const newRun = await tx
             .insert(heartbeatRuns)

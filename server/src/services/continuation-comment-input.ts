@@ -1,5 +1,6 @@
 import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { heartbeatRuns, issueComments, issueThreadInteractions, type Db } from "@paperclipai/db";
+import { heartbeatRuns, issueComments, issueThreadInteractions, statusDecisionEffects, statusDecisions, type Db } from "@paperclipai/db";
+import { PROVIDER_POLICY_REFUSAL_CODE } from "./native-runtime/native-provider-failure.js";
 import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
 import { answeredPersonMessageSql } from "./person-message-answer.js";
 
@@ -63,6 +64,23 @@ export async function pendingContinuationInteractionInput(db: Pick<Db, "select">
   )).orderBy(asc(issueThreadInteractions.resolvedAt), asc(issueThreadInteractions.id));
   const interactionIds = rows.map(row => row.id);
   return interactionIds.length ? { interactionIds, interactionId: interactionIds.at(-1) } : {};
+}
+
+/** A FAILED chat turn's still-unanswered typed input, for the held message that takes it over.
+ * Not a policy refusal, and not a run whose failure applied `schedule_retry`: that retry owns it. */
+export async function failedTurnPendingCommentIds(db: Pick<Db, "select">, input: {
+  companyId: string; issueId: string; agentId: string; runId: string;
+}): Promise<string[]> {
+  const [source] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.agentId, input.agentId),
+    eq(heartbeatRuns.status, "failed"), sql`${heartbeatRuns.errorCode} is distinct from ${PROVIDER_POLICY_REFUSAL_CODE}`,
+    sql`not exists ${db.select({ id: statusDecisions.id }).from(statusDecisions).innerJoin(statusDecisionEffects, and(
+      eq(statusDecisionEffects.decisionId, statusDecisions.id), eq(statusDecisionEffects.effectKind, "schedule_retry"))).where(and(
+      eq(statusDecisions.companyId, input.companyId), eq(statusDecisions.runId, input.runId), eq(statusDecisions.applicationState, "applied")))}`,
+  )).limit(1);
+  if (!source) return [];
+  const pending = await readContinuationCommentInput(db, input);
+  return Array.isArray(pending.wakeCommentIds) ? pending.wakeCommentIds as string[] : [];
 }
 
 /** For fresh recovery seeds whose caller keeps only a predecessor id. */
