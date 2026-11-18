@@ -67,6 +67,7 @@ import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { ownerSendAfterAcknowledgedPersonStop } from "../services/acknowledged-native-stop.js";
+import { readContinuationReconciliationSources } from "../services/explicit-native-continuation.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -7910,14 +7911,14 @@ export function issueRoutes(
       const personStop = lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId;
       const optionS = async () => {
         if (!lastTurn || lastTurn.runtimeMode !== "native" || input.actor.actorType !== "user") return false;
-        const blocker = await getExecutionBlocker(input.executor as Db, input.issue.companyId, input.issue.id);
-        const [source] = blocker ? [] : await input.executor.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
-          .where(and(eq(issueRecoveryActions.companyId, input.issue.companyId),
-            eq(issueRecoveryActions.sourceIssueId, input.issue.id), inArray(issueRecoveryActions.status, ["active", "escalated"])))
-          .limit(1);
+        // rf-5 SC1: the SAME read admission takes (blocker + reconciliation
+        // sources), so an unrelated recovery action does not hide the Stop bar
+        // when the Send would be admitted.
+        const { blockedOrReconciling } = await readContinuationReconciliationSources(input.executor as Db,
+          input.issue.companyId, input.issue.id, { forUpdate: false });
         return ownerSendAfterAcknowledgedPersonStop(input.executor as Db, { task: input.issue, agentId: input.issue.assigneeAgentId!,
           companyId: input.issue.companyId, issueId: input.issue.id,
-          senderId: input.actor.actorId, latest: lastTurn, sentAt: new Date(), blockedOrReconciling: !!blocker || !!source });
+          senderId: input.actor.actorId, latest: lastTurn, sentAt: new Date(), blockedOrReconciling });
       };
       if (personStop && (!recoveryWait || await optionS())) {
         queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };

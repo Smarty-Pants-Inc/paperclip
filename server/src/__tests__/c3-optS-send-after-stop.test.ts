@@ -259,15 +259,22 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
     return { f, client, heartbeat, held, settle, answered, send, lease, post, done: () => factory.mockRestore() };
   }
 
-  it("S10: three held, Stop, Send => one run answers all three, once each, at once", async () => {
+  it.each(["no recovery action", "an unrelated active recovery action"] as const)("S10: three held, Stop, Send => one run answers all three, once each, at once (%s)", async (beside) => {
     const s = await heldThenStop();
     try {
+      // rf-5 SC1: an unrelated active recovery action (not a reconciliation
+      // source) neither hides the Stop bar nor stops the Send's admission.
+      if (beside === "an unrelated active recovery action") await db.insert(issueRecoveryActions).values({
+        companyId: s.f.companyId, sourceIssueId: s.f.issueId, kind: "stranded_assigned_issue",
+        cause: "agent_paused_with_pending_work", fingerprint: `paused:${s.f.issueId}`, status: "active",
+        nextAction: "Resume the agent.", evidence: {} });
       const [r1] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, s.f.runId));
       console.log("OPTS RUN1", JSON.stringify({ calls: fixture.calls, held: s.held, status: r1?.status, err: r1?.error, code: r1?.errorCode, lease: await s.lease() }));
       // The box is kept warm: retained, no stop receipt.
       expect((await s.lease())?.status).toBe("retained");
       const queue = await request(s.client).get(`/api/issues/${s.f.issueId}/queued-comments`).expect(200);
       console.log("OPTS QUEUE", JSON.stringify(queue.body));
+      if (beside !== "no recovery action") expect(queue.body.executionWait?.reason).toBe("stopped_by_person");
       await readTurns();
       expect(turns).toEqual([]);
       const pressedAt = Date.now();
