@@ -13,7 +13,7 @@ import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-m
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
 import { createHash } from "node:crypto";
-import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
+import { appendHeartbeatRunEvent, stopAcceptanceEventSql } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun, QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, userStopBoundaryAt } from "./run-cancellation.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { isCancelledNativeStartup, isFailedNativePreparation, isFailedNativePreparationRetryAncestor } from "./cancelled-native-startup.js";
@@ -24,7 +24,7 @@ import { z } from "zod";
 import { and, desc, eq, gt, inArray, isNull, ne, not, or, sql, type SQL } from "drizzle-orm";
 import {
   agents, agentWakeupRequests, approvals, issueApprovals, issueThreadInteractions,
-  environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
+  environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, type Db,
 } from "@paperclipai/db";
 import { executionBlockerPredicate, getExecutionBlocker, hasPendingRunCleanup, nativeExecutionRecoveryActionPredicate, restoreHoldReleasedForCurrentOwnerPredicate } from "./execution-blocker.js";
@@ -356,7 +356,15 @@ export async function admitExplicitNativeContinuation(input: {
         eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId), ne(heartbeatRuns.id, latest.id),
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
         inArray(heartbeatRuns.status, ["running", "queued", "scheduled_retry"]),
-      )).limit(1)).length;
+      )).limit(1)).length
+      // Positive proof: the Stop route's server-owned acceptance row, and no acceptance of any other kind (an Interrupt or a malformed row denies).
+      // Adapter events can write a caller-chosen lifecycle row (source ids NULL) but always add their receipt stamp, so the exact keys,
+      // the chat owner and a write before the run finished bind the row to the Stop route's acceptance (forgery.md).
+      && ((rows: { payload: Record<string, unknown> | null; createdAt: Date }[]) => rows.length > 0 && rows.every(({ payload, createdAt }) =>
+        Object.keys(payload ?? {}).sort().join() === "acceptedAt,issueId,kind,schema,userId" && payload!.schema === "paperclip.stop-acceptance.v1"
+        && payload!.kind === "person_stop" && payload!.userId === task.conversationUserId && createdAt <= latest.finishedAt!))(
+        await db.select({ payload: heartbeatRunEvents.payload, createdAt: heartbeatRunEvents.createdAt }).from(heartbeatRunEvents)
+          .where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, latest.id), stopAcceptanceEventSql())));
     if (latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) && !ownerSendAfterPersonStop &&
         !sourceChecks.some(source => (source.evidence.runId ?? source.evidence.sourceRunId) === latest.id)) {
       sourceChecks.push({ cause: "native_continuation_requires_reconciliation", evidence: { runId: latest.id } });

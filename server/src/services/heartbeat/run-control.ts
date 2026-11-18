@@ -20,6 +20,7 @@ import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProc
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { pendingCaseHandoffForRun, cancelCaseHandoffsForIssue, isCaseHandoffSourceReleased } from "./case-handoff-lifecycle.js";
 import { publishActivity, type ActivityPublication } from "../activity-log.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
 import { publishLiveEvent } from "../live-events.js";
 import { DEFERRED_WAKE_CONTEXT_KEY } from "./queue.js";
@@ -308,6 +309,8 @@ export type CancelRunOptions = {
     terminationGraceMs?: number;
     /** Caller is immediately scheduling an explicit successor path. */
     suppressImmediateRecovery?: boolean;
+    /** Board Stop/Interrupt kind; a native run records it with the accepted fence (Option S proof). */
+    stopAcceptance?: "person_stop" | "interrupt";
   };
 
 /** The same durable fence protects both individual Stop and budget fan-out.
@@ -1489,6 +1492,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           inArray(heartbeatRuns.status, cancellableStatuses))).returning();
         if (options.expectedStatus && !fenced) return false;
         if (fenced) run = fenced;
+        // Server-owned (source ids NULL) and in the fence's commit: a failed append rolls back the acceptance.
+        // Every accepted Interrupt leaves its row (it only denies); a person Stop counts only on a native run.
+        if (fenced && (options.stopAcceptance === "interrupt" || (options.stopAcceptance && fenced.runtimeMode === "native"))) await appendHeartbeatRunEvent(tx as unknown as Db, {
+          companyId: fenced.companyId, runId, agentId: fenced.agentId, eventType: "lifecycle", stream: "system", level: "info",
+          message: "run.stop.accepted", payload: { schema: "paperclip.stop-acceptance.v1", kind: options.stopAcceptance,
+            issueId: handoffIssueId, userId: attribution.cancelledByUserId ?? null, acceptedAt: requestedAt } });
         // A board terminal request deliberately has no source run. It belongs
         // to the current task execution, not whichever historical run is stopped.
         // Queue admission may bind execution before adopting an old checkout.

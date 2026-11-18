@@ -139,7 +139,7 @@ async function readBoardMessageRetrySource(db: Db, input: {
       sql`not exists (select 1 from heartbeat_run_events where company_id = ${input.companyId}::uuid and run_id = ${input.sourceRunId}::uuid
         and (stream <> 'system' or source_event_id is not null or source_instance_id is not null or source_seq is not null
           or source_payload_sha256 is not null or protocol_schema_version is not null or event_type not in ('error', 'agent_observability.unavailable', 'lifecycle')
-          or (event_type = 'lifecycle' and (message <> 'task.run.measured' or payload->>'durableSettlement' is distinct from 'true'))
+          or (event_type = 'lifecycle' and message <> 'run.stop.accepted' and (message <> 'task.run.measured' or payload->>'durableSettlement' is distinct from 'true'))
           or (event_type = 'error' and message is distinct from ${heartbeatRuns.error})))`,
   ];
   const [origin] = await db.select({ commentId: issueComments.id, identityContextId: runIdentityContexts.id })

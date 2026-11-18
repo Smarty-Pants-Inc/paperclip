@@ -12,6 +12,7 @@ import express from "express";
 import request from "supertest";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
 import { issueService } from "../services/issues.js";
 import { deliverConversationComments } from "../services/agent-conversations.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -134,6 +135,7 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       next();
     });
     testApp.use("/api", issueRoutes(db, {} as any, {}));
+    testApp.use("/api", agentRoutes(db));
     testApp.use(errorHandler);
     return testApp;
   }
@@ -218,9 +220,9 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       // Three person messages while the turn is busy: the chat route holds them.
       for (const body of ["M1 held", "M2 held", "M3 held"])
         held.push((await post(body).expect(201)).body.id);
-      stopping = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
-        resultJson: stopBy === "person" ? { cancelledByActorType: "user", cancelledByUserId: userId }
-          : { cancelledByActorType: "system" } });
+      // optS-dd: the person's Stop goes through the real Stop route (POST /api/heartbeat-runs/:runId/cancel).
+      stopping = stopBy === "person" ? request(client).post(`/api/heartbeat-runs/${runId}/cancel`).send({}).expect(200)
+        : heartbeat.cancelRun(runId, "Cancelled by a board operator", { resultJson: { cancelledByActorType: "system" } });
       void stopping.catch(() => undefined);
       await waitFor(async () => {
         const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
