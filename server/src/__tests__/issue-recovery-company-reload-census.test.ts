@@ -1,10 +1,10 @@
 import { setImmediate as immediate } from "node:timers/promises";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
-import { agents, costEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
+import { agents, costEvents, heartbeatRuns, issueComments, issues, projects } from "@paperclipai/db";
 import { workSignalDebug } from "@paperclipai/db/work-signal-debug";
 import { reconcileDatabaseWorkNotifications } from "@paperclipai/db/work-signals";
-import { ISSUE_RECOVERY_BACKSTOP_MS, notifyIssueGraphRecovery } from "../services/issue-recovery-notifications.js";
+import { ISSUE_RECOVERY_BACKSTOP_MS, notifyIssueGraphRecovery, notifyIssueRecovery } from "../services/issue-recovery-notifications.js";
 import { createAgentLifecycle, createAgentLifecycleEffects } from "../services/agent-lifecycle.js";
 import { budgetService } from "../services/budgets.js";
 import { documentService } from "../services/documents.js";
@@ -13,6 +13,9 @@ import { createHeartbeatAgentStatus } from "../services/heartbeat/agent-status.j
 import { notifyExecutionRunWork } from "../services/execution-control-notifications.js";
 import { reconcileAbandonedExecutionControl } from "../services/execution-control-reconciliation.js";
 import { describeIssueRecovery, issueRecoveryFixture } from "./issue-recovery.test-fixture.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { registerIssueRecoveryWork } from "../services/recovery/work.js";
+import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 
 vi.hoisted(() => { process.env.PAPERCLIP_DEBUG_WORK_SIGNALS = "stranded-assignments:1,assigned-work-invariant:1"; });
 
@@ -363,4 +366,197 @@ describeIssueRecovery("company hints and notification reloads (census)", () => {
     expect(checks[0], `task ${target} was not checked by the next full pass`).toBeDefined();
     expect(checks[0]!.at).toBeLessThanOrEqual(deadline);
   }, TEST_TIMEOUT_MS);
+
+  /** The cost row of the stranded sweep with the fork's blocked leg (Smarty
+   * fork, C9: blocked AND an unanswered person message, plus the per-page
+   * comment scan) inside upstream's changed-rows load (#21729/#21872). N tasks
+   * across the swept statuses, M comments each, real SQL on embedded
+   * Postgres. The check is the heartbeat's unanswered step for flagged tasks
+   * (heartbeat.ts reconcileStrandedAssignedIssues); the stranded reconcile is
+   * left out so the row measures the sweep's reads, not run starts. */
+  it("an idle stranded pass loads no task and scans no comments; one new person message loads only its task, noted once", async () => {
+    const N_PER_STATUS = 50, M = 5;
+    const f = await state.fixture();
+    const old = new Date(Date.now() - 2 * HOUR);
+    await state.db.update(agents).set({ status: "idle", updatedAt: old, lastHeartbeatAt: old }).where(eq(agents.id, f.agentId));
+    const kinds = ["todo", "in_progress", "in_review", "blocked-unanswered", "blocked-answered", "blocked-plain"] as const;
+    const counts: Record<(typeof kinds)[number], number> = { todo: N_PER_STATUS, in_progress: N_PER_STATUS, in_review: N_PER_STATUS,
+      "blocked-unanswered": 20, "blocked-answered": 15, "blocked-plain": 15 };
+    const ids: Record<string, string[]> = {};
+    for (const kind of kinds) {
+      const status = kind.startsWith("blocked") ? "blocked" : kind;
+      const rows = await state.db.insert(issues).values(Array.from({ length: counts[kind] }, (_, index) => ({ companyId: f.companyId,
+        title: `${kind} ${index}`, status, assigneeAgentId: f.agentId, createdAt: old, updatedAt: old }))).returning({ id: issues.id });
+      ids[kind] = rows.map(row => row.id);
+      for (const [index, issueId] of ids[kind]!.entries()) {
+        const at = (minute: number) => new Date(old.getTime() + index * 1000 + minute * MINUTE);
+        const agentComment = (minute: number) => ({ companyId: f.companyId, issueId, body: `Progress ${minute}`, authorType: "agent" as const,
+          authorAgentId: f.agentId, createdAt: at(minute), updatedAt: at(minute) });
+        if (kind === "blocked-unanswered") {
+          await state.db.insert(issueComments).values([...[0, 1, 2, 3].map(agentComment), { companyId: f.companyId, issueId,
+            body: "Why is this blocked?", authorType: "user", authorUserId: "recovery-user", createdAt: at(4), updatedAt: at(4) }]);
+        } else if (kind === "blocked-answered") {
+          await state.db.insert(issueComments).values([0, 1, 2].map(agentComment));
+          const [asked] = await state.db.insert(issueComments).values({ companyId: f.companyId, issueId, body: "Why is this blocked?",
+            authorType: "user", authorUserId: "recovery-user", createdAt: at(3), updatedAt: at(3) }).returning({ id: issueComments.id });
+          const [run] = await state.db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+            startedAt: at(3), finishedAt: at(4), createdAt: at(3), updatedAt: at(4),
+            contextSnapshot: { issueId, wakeCommentId: asked!.id } }).returning({ id: heartbeatRuns.id });
+          await state.db.insert(issueComments).values({ ...agentComment(4), body: "Waiting on the vendor.", createdByRunId: run!.id });
+        } else {
+          await state.db.insert(issueComments).values([0, 1, 2, 3, 4].map(agentComment));
+        }
+      }
+    }
+    // Comment writes may touch their task; every seeded row is old.
+    await state.db.update(issues).set({ updatedAt: old }).where(eq(issues.companyId, f.companyId));
+    const all = kinds.flatMap(kind => ids[kind]!);
+    const [{ comments }] = await state.db.execute<{ comments: number }>(sql`select count(*)::int as comments from issue_comments
+      where company_id = ${f.companyId}::uuid`) as unknown as Array<{ comments: number }>;
+    expect(all.length).toBeGreaterThanOrEqual(200);
+    expect(comments).toBeGreaterThanOrEqual(all.length * M);
+    // Planner statistics as a live database has them (autovacuum analyzes;
+    // a fresh test database would plan with none).
+    await state.db.execute(sql`analyze issues, issue_comments, heartbeat_runs, agents`);
+
+    const visits: Array<{ at: number; issueId: string; unanswered?: boolean }> = [];
+    const loads: Array<{ at: number; scope: string }> = [];
+    vi.spyOn(workSignalDebug, "event").mockImplementation((topic, name, fields = {}) => {
+      if (topic === "stranded-assignments" && name === "load") loads.push({ at: Date.now(), scope: String(fields.scope) });
+    });
+    const statements: Array<{ query: string; params: unknown[] }> = [];
+    const priorDebug = state.db.$client.options.debug;
+    state.db.$client.options.debug = (_connection: unknown, query: string, params: unknown[]) => { statements.push({ query, params }); };
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    state.coordinator = createDeliveryWorkCoordinator({ owner: state.db, canRun: () => true, onError: error => state.errors.push(error) });
+    const register = state.coordinator.register.bind(state.coordinator);
+    state.coordinator.register = (queue, task) => register(queue, { ...task, run: signal => {
+      const pass = task.run(signal); state.passes.add(pass);
+      void pass.then(() => state.passes.delete(pass), () => state.passes.delete(pass));
+      return pass;
+    } });
+    state.worker = registerIssueRecoveryWork(state.db, state.coordinator, {
+      stranded: async scope => {
+        visits.push({ at: Date.now(), issueId: scope.issueId, unanswered: scope.unanswered });
+        if (scope.unanswered === true) await settleUnansweredPersonMessagesForTask(state.db, { companyId: scope.companyId,
+          issueId: scope.issueId, onDeferredDeadline: scope.onDeferredDeadline });
+      },
+      orphanBlockers: async () => {}, recoveryActions: async () => {},
+      dependencies: async () => ({ enqueueFailed: 0 }), locks: async () => {},
+      watchdogs: async () => ({ incomplete: 0 }), schedulingSuppressed: async () => false,
+    }, () => true) as never;
+    const run = async (ms: number) => {
+      for (let step = 0; step < ms / 1000; step++) {
+        await bounded(vi.advanceTimersByTimeAsync(1000), () => "simulated time to advance");
+        await bounded(Promise.allSettled([...state.passes]), () => "the recovery passes to settle");
+        await immediate();
+      }
+    };
+    /** pg_stat_user_tables for the two tables a stranded load reads, after
+     * every pooled backend flushed its counters (PG 15+ flushes an idle
+     * backend's pending counters within about a second; ours is forced). */
+    const counters = async () => {
+      await new Promise(resolve => realSetTimeout(resolve, 2_500));
+      await state.db.execute(sql`select pg_stat_force_next_flush()`);
+      await state.db.execute(sql`select pg_stat_clear_snapshot()`);
+      const rows = await state.db.execute<{ relname: string; seq_scan: string; seq_tup_read: string; idx_scan: string; idx_tup_fetch: string }>(sql`
+        select relname, seq_scan::text, seq_tup_read::text, coalesce(idx_scan, 0)::text as idx_scan, coalesce(idx_tup_fetch, 0)::text as idx_tup_fetch
+        from pg_stat_user_tables where relname in ('issues', 'issue_comments')`);
+      return Object.fromEntries([...rows].map(row => [row.relname, { seqScan: Number(row.seq_scan), seqTupRead: Number(row.seq_tup_read),
+        idxScan: Number(row.idx_scan), idxTupFetch: Number(row.idx_tup_fetch) }])) as Record<"issues" | "issue_comments",
+        { seqScan: number; seqTupRead: number; idxScan: number; idxTupFetch: number }>;
+    };
+    const delta = (a: Awaited<ReturnType<typeof counters>>, b: Awaited<ReturnType<typeof counters>>) => Object.fromEntries(
+      (["issues", "issue_comments"] as const).map(table => [table, Object.fromEntries(Object.entries(b[table]).map(([key, value]) =>
+        [key, value - a[table][key as keyof typeof a.issues]]))])) as Record<"issues" | "issue_comments", Record<string, number>>;
+    const notices = async (issueId: string) => (await state.db.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
+      sql`starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})`))).length;
+    // The stranded queue's page load: the one issues page with the blocked leg's condition.
+    const pageLoads = (from: number) => statements.slice(from).filter(s => /from "issues"/.test(s.query)
+      && /order by "issues"."id"/.test(s.query) && /from "issue_comments" m/.test(s.query));
+    const commentScans = (from: number) => statements.slice(from).filter(s => /from "issue_comments"/.test(s.query)
+      && /order by "issue_comments"."issue_id"/.test(s.query));
+    try {
+      await bounded(state.worker.ready, () => "the recovery worker to start");
+      // 1. The full pass: every swept task, the blocked leg's tasks flagged.
+      const fullFrom = statements.length;
+      await run(2 * MINUTE);
+      const full = { visited: new Set(visits.map(v => v.issueId)).size, flagged: visits.filter(v => v.unanswered).length,
+        pageLoads: pageLoads(fullFrom).length, commentScans: commentScans(fullFrom).length };
+      expect(full.visited).toBe(counts.todo + counts.in_progress + counts.in_review + counts["blocked-unanswered"]);
+      expect(visits.filter(v => v.unanswered).map(v => v.issueId).sort()).toEqual([...ids["blocked-unanswered"]!].sort());
+      // Let the notes and the full pass's own writes age out of the changed window.
+      await run(2 * ISSUE_RECOVERY_BACKSTOP_MS + MINUTE);
+
+      // 2. An idle pass, nothing changed: a plain company hint (changed rows
+      // once a full pass is recent) and the backstop pass it schedules.
+      const idleFrom = statements.length, idleVisits = visits.length, idleLoads = loads.length;
+      const before = await counters();
+      await state.db.transaction(tx => notifyIssueRecovery(tx, { companyId: f.companyId }));
+      await run(ISSUE_RECOVERY_BACKSTOP_MS + MINUTE);
+      const after = await counters();
+      const idle = { loads: loads.slice(idleLoads).map(l => l.scope), visited: visits.length - idleVisits,
+        pageLoads: pageLoads(idleFrom).length, commentScans: commentScans(idleFrom).length, pg: delta(before, after) };
+      const idleSql = pageLoads(idleFrom)[0];
+
+      // 3. One new person message on one quiet blocked task.
+      const target = ids["blocked-plain"]![0]!;
+      const oneFrom = statements.length, oneVisits = visits.length;
+      const [message] = await state.db.insert(issueComments).values({ companyId: f.companyId, issueId: target, body: "Any news?",
+        authorType: "user", authorUserId: "recovery-user", createdAt: new Date(), updatedAt: new Date() }).returning({ id: issueComments.id });
+      const oneBefore = await counters();
+      // A plain company hint, not the task's own: the changed-rows load must find it.
+      await state.db.transaction(tx => notifyIssueRecovery(tx, { companyId: f.companyId }));
+      await run(ISSUE_RECOVERY_BACKSTOP_MS + MINUTE);
+      const oneAfter = await counters();
+      await run(2 * ISSUE_RECOVERY_BACKSTOP_MS);
+      const one = { visited: [...new Set(visits.slice(oneVisits).map(v => v.issueId))],
+        flagged: [...new Set(visits.slice(oneVisits).filter(v => v.unanswered).map(v => v.issueId))],
+        notices: await notices(target), pageLoads: pageLoads(oneFrom).length, commentScans: commentScans(oneFrom).length,
+        pg: delta(oneBefore, oneAfter) };
+      const scanSql = commentScans(oneFrom)[0] ?? commentScans(fullFrom)[0];
+
+      // The per-pass plans of the two loads, on the seeded data.
+      const explain = async (statement: { query: string; params: unknown[] } | undefined) => statement
+        ? (await state.db.$client.unsafe(`explain (analyze, buffers, costs off, timing off, summary off) ${statement.query}`, statement.params as never[]))
+          .map(row => Object.values(row)[0]).join("\n") : "(no statement)";
+      const plans = { idlePageLoad: await explain(idleSql), commentScan: await explain(scanSql) };
+      console.info(`stranded cost row: ${JSON.stringify({ tasks: all.length, comments, full, idle, one })}`);
+      console.info(`stranded cost row plan (idle page load):\n${plans.idlePageLoad}`);
+      console.info(`stranded cost row plan (comment scan):\n${plans.commentScan}`);
+      console.info(`stranded cost row sql (idle page load): ${idleSql?.query}`);
+      const shapes: Record<string, number> = {};
+      for (const s of statements.slice(idleFrom, oneFrom)) {
+        const shape = s.query.replace(/\s+/g, " ").slice(0, 140);
+        shapes[shape] = (shapes[shape] ?? 0) + 1;
+      }
+      console.info(`stranded cost row idle-window statements: ${JSON.stringify(shapes, null, 1)}`);
+
+      // The idle pass ran (a backstop load) and loaded nothing: no task
+      // checked, no comment scan. Its reads stay below one row per task: the
+      // changed-rows clause and the leg's condition only touch tasks through
+      // indexes, never every task's M comments (a full rescan reads >= N rows
+      // of issues and >= N*M comment rows).
+      expect(idle.loads.length).toBeGreaterThan(0);
+      expect(idle.visited).toBe(0);
+      expect(idle.commentScans).toBe(0);
+      expect(idle.pageLoads).toBeGreaterThan(0);
+      expect(idle.pg.issues!.seqTupRead + idle.pg.issues!.idxTupFetch).toBeLessThan(all.length);
+      // issue_comments is read whole a few times per idle window, not per
+      // task: the stranded load plans the changed clause's comment EXISTS
+      // (upstream) as one seq scan and the blocked leg's condition (fork) as
+      // two more (hashed anti-joins); the company queues add their own. This
+      // is O(N*M) per idle pass, the measured cost; not O(changed).
+      expect(idle.pg.issue_comments!.seqTupRead + idle.pg.issue_comments!.idxTupFetch).toBeLessThanOrEqual(8 * comments);
+      // The new message: only its task is loaded and checked, flagged, noted once.
+      expect(one.visited).toEqual([target]);
+      expect(one.flagged).toEqual([target]);
+      expect(one.notices).toBe(1);
+      expect(await state.db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, target),
+        sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + message!.id}`))).toHaveLength(1);
+    } finally {
+      state.db.$client.options.debug = priorDebug;
+    }
+  }, 240_000);
 });
