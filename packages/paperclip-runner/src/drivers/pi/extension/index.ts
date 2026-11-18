@@ -44,6 +44,7 @@ export interface PiBindApi {
   on(event: "input", handler: LifecycleHandler): () => void;
   on(event: "before_agent_start", handler: LifecycleHandler): () => void;
   on(event: "before_provider_request", handler: LifecycleHandler): () => void;
+  on(event: "context_with_system", handler: LifecycleHandler): () => void;
   /** Present in Pi 1.5.2; optional for older structural host fixtures. */
   appendEntry?(customType: string, data: unknown): void;
   on(event: "cache_warming_decision", handler: LifecycleHandler): () => void;
@@ -547,16 +548,52 @@ export function piCurrentTimeLine(now: Date = new Date(), environment: NodeJS.Pr
   return `Current time: ${part.year}-${part.month}-${part.day}T${part.hour}:${part.minute}:${part.second}${zone} (${configured})`;
 }
 
+type PiContextMessage = { role: string; customType?: string };
+
+/** Request projection: each time message moves to just before its run's starting message.
+ * Pi appends before_agent_start messages AFTER the run's prompt (agent-session _prepareRun), which
+ * would make the time line, not the run's prompt or task envelope, the latest user message the
+ * model sees. Moves only within the run's opening block (user/custom messages since the last
+ * system/assistant/tool message), so a system patch stays first. A pure function of the
+ * transcript: every request of every later run carries the same prefix bytes (prompt cache).
+ * Returns undefined when nothing moves. */
+export function piCurrentTimeBeforePrompt<T extends PiContextMessage>(messages: readonly T[]): T[] | undefined {
+  const isTime = (message: T) => message.role === "custom" && message.customType === PI_CURRENT_TIME_MESSAGE;
+  if (!messages.some(isTime)) return undefined;
+  const result: T[] = [];
+  let moved = false;
+  for (const message of messages) {
+    if (!isTime(message)) { result.push(message); continue; }
+    let at = result.length, start = result.length;
+    for (let index = result.length - 1; index >= 0; index--) {
+      const role = result[index]!.role;
+      if ((role !== "user" && role !== "custom") || isTime(result[index]!)) break;
+      start = index;
+      if (role === "user" && at === result.length) at = index;
+    }
+    if (at === result.length) at = start;
+    if (at !== result.length) moved = true;
+    result.splice(at, 0, message);
+  }
+  return moved ? result : undefined;
+}
+
 /** Pi has no date setting. Its documented per-run hook returns a `message` added to the run
- * (docs/extensions.md, before_agent_start): a persisted custom message the model receives
- * after the run's prompt. NOT a prompt section: the host-instructions handlers force the
- * whole system prompt each run, so a per-run section would change those bytes and miss the
- * provider prompt cache on every run's first request. Fires per run, so a warm session that
- * outlives a day still gets this run's time. */
+ * (docs/extensions.md, before_agent_start): a persisted, hidden custom message. NOT a prompt
+ * section: the host-instructions handlers force the whole system prompt each run, so a per-run
+ * section would change those bytes and miss the provider prompt cache on every run's first
+ * request. Fires per run, so a warm session that outlives a day still gets this run's time.
+ * Pi's documented context_with_system hook (messages sent as returned, system messages left
+ * untouched) then sends it just BEFORE the run's prompt, so the prompt (a probe, a JSON task
+ * envelope) stays the latest user message and its own message. */
 export function installPiCurrentTime(pi: PiBindApi, now: () => Date = () => new Date()): void {
   pi.on("before_agent_start", () => ({
     message: { customType: PI_CURRENT_TIME_MESSAGE, content: piCurrentTimeLine(now()), display: false },
   }));
+  pi.on("context_with_system", (event: { messages?: PiContextMessage[] }) => {
+    const messages = Array.isArray(event?.messages) ? piCurrentTimeBeforePrompt(event.messages) : undefined;
+    return messages ? { messages } : undefined;
+  });
 }
 
 export default function paperclipPiBindExtension(pi: PiBindApi): void {

@@ -6,12 +6,12 @@ import { createAssistantMessageEventStream, getCurrentSystemPrompt, type Assista
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createPiEventProjector } from "../pi-event-projector.js";
-import paperclipPiExtension, { piHostInstructionSegment, type PiBindApi } from "./index.js";
+import paperclipPiExtension, { piCurrentTimeBeforePrompt, piHostInstructionSegment, type PiBindApi } from "./index.js";
 
 // Keep reason: Paul's Smarty did not know today's date. Pi has no date setting, so the
 // shipped host extension tells the model the time once per run through Pi's documented
 // before_agent_start per-run `message` return (a hidden custom message, sent to the model
-// after the run's prompt), NOT a system-prompt section: our host-instructions handler
+// just before the run's prompt), NOT a system-prompt section: our host-instructions handler
 // forces the whole system prompt every run, so a per-run section would change the
 // forced prompt bytes and miss the provider prompt cache on every run's first request.
 // This drives the REAL Pi 1.5.2 SDK session with the real default host extension; only
@@ -106,7 +106,7 @@ describe("Pi host extension: current time per run (hidden per-run message)", () 
     await session.prompt("second run, same warm session, after midnight");
     expect(requests).toHaveLength(2);
     const [first, second] = requests as [Context, Context];
-    // Each run adds exactly one time line, after its own prompt, as a user-role context message.
+    // Each run adds exactly one time line, just before its own prompt, as a user-role context message.
     expect(timeLines(added(first))).toEqual(["Current time: 2026-11-16T23:59:30-05:00 (America/New_York)"]);
     expect(timeLines(added(second, first))).toEqual(["Current time: 2026-11-17T00:00:30-05:00 (America/New_York)"]);
     expect(added(second, first).map(message => message.role)).toEqual(["assistant", "user", "user"]);
@@ -213,6 +213,20 @@ describe("Pi host extension: current time per run (hidden per-run message)", () 
     // Cache prefix: run 2's request starts with run 1's request byte for byte.
     expect(JSON.stringify(requests[1]!.messages.slice(0, requests[0]!.messages.length))).toBe(JSON.stringify(requests[0]!.messages));
     expect(systemBytes(requests[1]!)).toBe(systemBytes(requests[0]!));
+  });
+
+  it("projects each time message before its run's starting message only: system patch stays first, nothing crosses an assistant/tool turn, no-op returns undefined", () => {
+    const time = (n: number) => ({ role: "custom", customType: CUSTOM_TYPE, n });
+    const m = (role: string, n: number, customType?: string) => ({ role, n, ...(customType ? { customType } : {}) });
+    const order = (messages: Array<{ n: number }> | undefined) => messages?.map(message => message.n);
+    // system head, run 1 (prompt, next-turn custom, time), tool loop, run 2 with a prompt-patch system message.
+    expect(order(piCurrentTimeBeforePrompt([m("system", 0), m("user", 1), m("custom", 2, "other"), time(3), m("assistant", 4), m("toolResult", 5),
+      m("assistant", 6), m("system", 7), m("user", 8), time(9)]))).toEqual([0, 3, 1, 2, 4, 5, 6, 7, 9, 8]);
+    // A run started by a custom message (no user prompt): before that message.
+    expect(order(piCurrentTimeBeforePrompt([m("assistant", 1), m("custom", 2, "trigger"), time(3)]))).toEqual([1, 3, 2]);
+    // Already in place / nothing to move.
+    expect(piCurrentTimeBeforePrompt([m("assistant", 1), time(2), m("user", 3)])).toBeUndefined();
+    expect(piCurrentTimeBeforePrompt([m("user", 1), m("assistant", 2)])).toBeUndefined();
   });
 
   it("also installs the time message in managed (broker-bound) mode without touching the prompt the authority handler forces", () => {
