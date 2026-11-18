@@ -27,11 +27,13 @@ import { NATIVE_CLEANUP_SETTLING_MESSAGE } from "./native-runtime/completed-turn
 import { NATIVE_CLEANUP_HOLD_CAUSE, NATIVE_CLEANUP_HOLD_NEXT_ACTION, nativeCleanupAdmissionBlock }
   from "./native-runtime/native-cleanup-admission-hold.js";
 import { isAcknowledgedLegacyUserStop, runStopPresentationJson } from "./run-cancellation.js";
+import { hasAcknowledgedNativeRunStopRequest } from "./acknowledged-native-stop.js";
 const MAX_PREDECESSOR_CLEANUP_CHECKS = 16;
 const ANOTHER_ROUTINE_TASK = "another task in this routine";
 const text = (v: unknown) => (typeof v === "string" ? v : null);
 const executionRunColumns = {
   id: heartbeatRuns.id,
+  companyId: heartbeatRuns.companyId,
   agentId: heartbeatRuns.agentId,
   driverKind: heartbeatRuns.driverKind,
   error: heartbeatRuns.error,
@@ -58,7 +60,8 @@ const executionRunColumns = {
     'executionRetryAccounting', ${heartbeatRuns.contextSnapshot}->'executionRetryAccounting')`,
   resultJson: sql<Record<string, unknown>>`${runStopPresentationJson(heartbeatRuns.resultJson)} || jsonb_build_object(
     'finalizationPhase', ${heartbeatRuns.resultJson}->'finalizationPhase',
-    'finalizationReasonCode', ${heartbeatRuns.resultJson}->'finalizationReasonCode')`,
+    'finalizationReasonCode', ${heartbeatRuns.resultJson}->'finalizationReasonCode',
+    'nativeCancellation', ${heartbeatRuns.resultJson}->'nativeCancellation')`,
 };
 type Run = Pick<typeof heartbeatRuns.$inferSelect, keyof typeof executionRunColumns>;
 type Coordinator = typeof nativeRunFinalizations.$inferSelect;
@@ -514,6 +517,15 @@ export function projectExecution(
         ? "Retry scheduled"
         : "Reconnecting",
     );
+  }
+  // C3: a run cancelled by a person's acknowledged Stop with no accepted result
+  // owes no restore (the predicate preserveNativeFailedWorkspace uses), so it
+  // is Stopped, not "Recovery needed". A real recovery action still wins.
+  if (run.status === "cancelled" && !coordinator?.resultId && !recoveryAction
+      && hasAcknowledgedNativeRunStopRequest(run)) {
+    projection.cause = null;
+    projection.nextAction = null;
+    return set("completed", "Stopped");
   }
   if (coordinator?.phase === "terminal_failure" || recoveryAction || cleanupQuarantined) {
     if (
