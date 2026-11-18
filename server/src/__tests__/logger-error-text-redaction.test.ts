@@ -563,6 +563,18 @@ describe("the streamWrite backstop masks the finished JSON line", () => {
     expectCleanLines(text);
   });
 
+  it("decodes Buffer and Uint8Array bytes in fields the walker never visits; leaves clean bytes as written", () => {
+    const { log, output } = captureLayer("production");
+    const bytes = Buffer.from(CANARY_LINE, "utf8");
+    log.info({ ctx: { body: bytes, view: new Uint8Array(bytes), clean: Buffer.from("hi") } }, "bytes");
+    const text = output();
+    expectCleanLines(text);
+    const [record] = records(text);
+    expect(record.ctx.body).toBe(MASKED_LINE);
+    expect(record.ctx.view).toBe(MASKED_LINE);
+    expect(record.ctx.clean).toEqual({ type: "Buffer", data: [104, 105] });
+  });
+
   it("covers a child that replaces serializers.msg with identity (Pino's intended override)", () => {
     const { log, output } = captureLayer("production");
     log.child({}, { serializers: { msg: (value: unknown) => value } }).warn(CANARY_LINE);

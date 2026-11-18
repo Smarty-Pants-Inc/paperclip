@@ -35,9 +35,11 @@ import { redactSensitiveText } from "../redaction.js";
  *   overrides the msg mask: that is Pino's intended serializer override. No app
  *   call site does it. The streamWrite backstop still masks that msg, since
  *   hooks are inherited and children cannot replace them.
- * - The backstop sees text. Bytes in a field no serializer visits are written
- *   by JSON as a number array ({"type":"Buffer","data":[...]}) and are not
- *   decoded there; only err, stderr, stdout and msg decode binary values.
+ * - Bytes in a field no serializer visits reach the line as JSON number
+ *   arrays. The backstop decodes a Buffer ({"type":"Buffer","data":[...]}) and
+ *   a Uint8Array ({"0":n,...}); other typed arrays (Uint16Array, ...) and a
+ *   DataView or ArrayBuffer there (written as {}) are not decoded. In err,
+ *   stderr, stdout and msg the walker decodes every binary value.
  * - A credential split across two fields, or across two log lines, is in no
  *   single string either layer scans.
  * - Masking is by credential shape. A plain value under a sensitive key name
@@ -137,6 +139,42 @@ function redactLogObject(value: object, depth: number, ancestors: Set<object>): 
 // integer-like keys and collapse duplicates). The scan is a loop, not a
 // recursion: there is no depth limit to fall past.
 export function maskSerializedLogLine(line: string): string {
+  return maskSerializedLogStrings(maskSerializedLogBytes(line));
+}
+
+// JSON writes bytes in a field no serializer visits as a number array: a
+// Buffer as {"type":"Buffer","data":[...]}, a Uint8Array as {"0":n,"1":n,...}.
+// Those structural shapes (never inside a string: there the quotes are escaped)
+// are decoded; one whose UTF-8 text holds a credential is replaced with the
+// masked text. Bytes that are not text, or hold none, are left as written.
+const SERIALIZED_BUFFER_RE = /\{"type":"Buffer","data":\[([0-9,]*)\]\}/g;
+const SERIALIZED_BYTE_INDEX_RE = /\{"0":\d{1,3}(?:,"\d+":\d{1,3})*\}/g;
+
+function maskedSerializedBytes(match: string, values: number[]): string {
+  if (values.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 255)) return match;
+  let text: string;
+  try {
+    text = strictUtf8.decode(Uint8Array.from(values));
+  } catch {
+    return match;
+  }
+  const masked = redactSensitiveText(text);
+  return masked === text ? match : JSON.stringify(masked);
+}
+
+function maskSerializedLogBytes(line: string): string {
+  if (!line.includes('"data":[') && !line.includes('{"0":')) return line;
+  return line
+    .replace(SERIALIZED_BUFFER_RE, (match, data: string) =>
+      data ? maskedSerializedBytes(match, data.split(",").map(Number)) : match)
+    .replace(SERIALIZED_BYTE_INDEX_RE, (match) => {
+      const entries = Object.entries(JSON.parse(match) as Record<string, number>);
+      if (entries.some(([key], index) => key !== String(index))) return match;
+      return maskedSerializedBytes(match, entries.map(([, byte]) => byte));
+    });
+}
+
+function maskSerializedLogStrings(line: string): string {
   let parts: string[] | null = null;
   let copied = 0;
   let index = line.indexOf('"');
