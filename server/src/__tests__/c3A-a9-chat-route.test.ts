@@ -191,7 +191,7 @@ describe.skipIf(!support.supported)("a9 (E) rf-4 Q1/Q2 through the CHAT route", 
     const queue = (await request(r.app).get(`/api/issues/${r.issueId}/queued-comments`)).body;
     await fs.writeFile(path.join(process.env.TASK_OUT!, "a9-chat-q1-line.json"), JSON.stringify(queue, null, 2));
     expect(queue.entries.map((e: any) => e.comment.id)).toEqual([r.commentId]);
-    expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first." });
+    expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." });
   }, 60_000);
   it("a9 Q2 CHAT: a message POSTed to the chat after a mid-turn person Stop gives ONE run, answered in bound, no workspace_repair_required", async () => {
     const r = await exercise("mid_turn", "q2");
