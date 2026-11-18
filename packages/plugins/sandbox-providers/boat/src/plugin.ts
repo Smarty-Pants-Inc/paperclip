@@ -23,7 +23,7 @@ import type {
   PluginEnvironmentExecuteResult, PluginEnvironmentLease, PluginEnvironmentProbeParams, PluginEnvironmentProbeResult,
   PluginEnvironmentRealizeWorkspaceParams, PluginEnvironmentRealizeWorkspaceResult,
   PluginEnvironmentReleaseLeaseParams, PluginEnvironmentResumeLeaseParams,
-  PluginEnvironmentValidateConfigParams, PluginEnvironmentValidationResult, PluginEnvironmentCreationCleanup,
+  PluginEnvironmentValidateConfigParams, PluginEnvironmentValidationResult, PluginEnvironmentCreationCleanup, PluginEnvironmentAcquisitionDiagnostic,
   PluginEnvironmentInspectLeaseParams, PluginEnvironmentLeaseObservation,
   PluginEnvironmentRunnerIngressEndpointParams, PluginEnvironmentRunnerIngressEndpoint, PluginContext,
 } from "@paperclipai/plugin-sdk";
@@ -920,6 +920,59 @@ export function boatResumeStateTransition(code: string | undefined, retryAfter: 
   const waitMs = seconds ? Number(seconds[1]) * 1_000 : NaN;
   return !Number.isFinite(waitMs) || waitMs > remainingMs;
 }
+/** Boat reported the box `error` ("Start or runtime failed", api/v1 lifecycle,
+ * boat-llms-full.txt:2255) or `archived` while we waited for it to be ready. */
+class BoatSandboxStateError extends Error {
+  constructor(readonly sandboxId: string, readonly state: "error" | "archived") {
+    super(`Boat sandbox ${sandboxId} entered ${state}`);
+  }
+}
+// Daytona's create cap within its acquire budget (#20828, daytona plugin.ts
+// DAYTONA_CREATE_ATTEMPT_MS / DAYTONA_ACQUIRE_ATTEMPT_BUDGET_MS), measured from
+// the start of this create attempt.
+const BOAT_CREATE_ATTEMPT_MS = 90_000;
+const BOAT_ACQUIRE_ATTEMPT_BUDGET_MS = 180_000;
+const BOAT_CREATE_LOOKUP_INTERVAL_MS = 5_000;
+/** Our create POST reached its own 30 s deadline (or a transport ETIMEDOUT)
+ * with no HTTP answer: Boat may still be creating the box, as Daytona's create
+ * is still pending at its cap. Any other failure is a create that failed, which
+ * keeps the cleanup path (Daytona: destroyFailedCreation). */
+function createTimedOut(error: unknown): boolean {
+  const fields = error && typeof error === "object" ? error as { httpStatus?: unknown; code?: unknown } : {};
+  return fields.httpStatus === null && fields.code === "ETIMEDOUT";
+}
+/**
+ * Daytona's createWithinCap/lookupCreation (#20828) for Boat. The create timed
+ * out, so look up the box it made by its own `paperclip-acquire` label
+ * (list-sandboxes, boat-llms-full.txt:1791-1794; ownership checked by
+ * acquisitionMatches) until the create cap. The Idempotency-Key keeps it one
+ * box (create-sandbox, boat-llms-full.txt:2230-2242), so no second create is
+ * sent. One match is returned for adoption; the caller waits for it to be
+ * ready inside the acquire budget. A failed lookup (Daytona: `unavailable`),
+ * several matches, or nothing by the cap (`absent`) rethrow the create's own
+ * error, with its closed status and errno unchanged (frozen7), so the
+ * caller's cleanup lookup runs and the host retries the ETIMEDOUT. The step,
+ * time and provider state are added as closed fields; the SDK on this line has
+ * no envelope that carries them without a cleanup record (upstream #22194's
+ * PluginEnvironmentAcquisitionError).
+ */
+async function findTimedOutCreation(config: Config, attemptId: string, owner: { companyId: string; environmentId: string; runId?: string }, createError: unknown, createStartedAt: number): Promise<string> {
+  if (!createTimedOut(createError) || shuttingDown) throw createError;
+  const capAt = createStartedAt + BOAT_CREATE_ATTEMPT_MS;
+  const fail = (providerState: "absent" | "unavailable" | "other") => Object.assign(createError as object, {
+    phase: "create", providerState, elapsedMs: Math.max(0, Date.now() - createStartedAt), budgetMs: BOAT_CREATE_ATTEMPT_MS });
+  for (;;) {
+    let ids: string[];
+    try { ids = await acquisitionMatches(config, attemptId, owner); }
+    catch { throw fail("unavailable"); }
+    if (ids.length === 1) return ids[0];
+    // More than one box for one idempotent create: adopt none; cleanup stops all.
+    if (ids.length > 1) throw fail("other");
+    const remaining = capAt - Date.now();
+    if (remaining <= 0 || shuttingDown) throw fail("absent");
+    await delay(Math.min(BOAT_CREATE_LOOKUP_INTERVAL_MS, remaining));
+  }
+}
 async function waitReady(config: Config, id: string, allowArchived = false, bound: { signal?: AbortSignal; deadline?: number; sendGuard?: () => void } = {}): Promise<any> {
   // A bounded caller (a 409 recovery) never waits past its call budget, and its
   // admission and lifecycle check runs before every poll (frozen8 F-01/F-03).
@@ -938,7 +991,7 @@ async function waitReady(config: Config, id: string, allowArchived = false, boun
     const s = result.sandbox ?? result;
     assertSandboxId(s, id);
     if (["ready", "idle", "running"].includes(s.state)) return s;
-    if (s.state === "error" || (!allowArchived && s.state === "archived")) throw new Error(`Boat sandbox ${id} entered ${s.state}`);
+    if (s.state === "error" || (!allowArchived && s.state === "archived")) throw new BoatSandboxStateError(id, s.state);
     lastObservedState = s.state;
     // Bounded transition observation only; no idle worker poller. Ready webhook
     // delivery belongs to the host; this acquisition has no callback endpoint.
@@ -1047,7 +1100,7 @@ function definiteRefusalStatus(error: unknown): number | undefined {
   return typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 499
     && ![408, 425, 429].includes(status) ? status : undefined;
 }
-async function cleanupAcquisition(config: Config, ids: string[], owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string, cause: unknown): Promise<void> {
+async function cleanupAcquisition(config: Config, ids: string[], owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string, cause: unknown, acquisitionDiagnostic?: PluginEnvironmentAcquisitionDiagnostic): Promise<void> {
   const failures: unknown[] = []; let firstFailed: string | undefined;
   for (const id of ids) {
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -1059,7 +1112,7 @@ async function cleanupAcquisition(config: Config, ids: string[], owner: { compan
     }
   }
   if (firstFailed) throw new PluginEnvironmentCreationCleanupError([cause, ...failures],
-    `Boat acquire failed and cleanup of ${firstFailed} was not confirmed.`, cleanupIdentity(config, firstFailed, owner, attemptId));
+    `Boat acquire failed and cleanup of ${firstFailed} was not confirmed.`, cleanupIdentity(config, firstFailed, owner, attemptId), acquisitionDiagnostic);
 }
 function privateEnvDirectory(id: string, roots: string[] = []): string | null {
   const suffix = createHash("sha256").update(id).digest("hex").slice(0, 24);
@@ -1886,13 +1939,30 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       // accepted (gold) because the R1 boat-create-alarm cron reads Boat's inventory
       // directly every 30 minutes and counts every company's runs.
       if (hasSpareSetting) refreshRunCreateLedger(c, params.companyId, params.environmentId);
+      const createStartedAt = Date.now();
+      // Set only when Boat reported the box `error` before it was ready (#22194).
+      let startFailure: PluginEnvironmentAcquisitionDiagnostic | undefined;
       try {
         if (shuttingDown) throw new Error("Boat provider is shutting down");
-        const created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
+        let created: any, adopted = false;
+        try {
+          created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
+        } catch (createError) {
+          // #20828: adopt the box our timed-out create made; never send a second create.
+          created = { sandbox: { id: await findTimedOutCreation(c, attemptId, params, createError, createStartedAt) } };
+          adopted = true;
+        }
         const sb = created?.sandbox ?? created; if (typeof sb?.id !== "string" || !sb.id) throw new Error("Boat create response did not contain sandbox.id");
         id = sb.id;
         idleActivity.resource(activityKey(c, sb.id));
-        const ready = await waitReady(c, sb.id);
+        // An adopted box is still starting (or preparing): wait inside the acquire budget.
+        const ready = await waitReady(c, sb.id, false, adopted ? { deadline: createStartedAt + BOAT_ACQUIRE_ATTEMPT_BUDGET_MS } : {}).catch(error => {
+          if (error instanceof BoatSandboxStateError && error.state === "error") {
+            startFailure = { phase: "create", elapsedMs: Math.min(Math.max(0, Date.now() - createStartedAt), BOAT_ACQUIRE_ATTEMPT_BUDGET_MS - 1),
+              budgetMs: BOAT_ACQUIRE_ATTEMPT_BUDGET_MS, providerState: "error" };
+          }
+          throw error;
+        });
         const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id) : ready;
         return await finishAcquisition(params, c, sb.id, { ...ready, ...ownershipObservation }, labels, remoteCwd, snapshot, null);
       } catch (error) {
@@ -1916,7 +1986,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           await duplexChannels.suspend({ ...params, providerLeaseId: id });
           await retireForLifecycle({ ...params, providerLeaseId: id });
         }
-        await cleanupAcquisition(c, ids, params, attemptId, error);
+        await cleanupAcquisition(c, ids, params, attemptId, error, startFailure);
+        // #22194: Boat could not start the box, before any agent work. The SDK on
+        // this line carries the acquisition diagnostic (providerState "error")
+        // only with a cleanup envelope, so the stopped box's exact ownership
+        // goes with it; the host's repeat stop of an archived box is a no-op.
+        if (startFailure && id) throw new PluginEnvironmentCreationCleanupError([error],
+          `Boat sandbox ${id} entered error; Boat could not start it, and it was stopped.`, cleanupIdentity(c, id, params, attemptId), startFailure);
         throw error;
       }
     };
