@@ -42,7 +42,7 @@ import type { EnvironmentRuntimeService } from "../services/environment-runtime.
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createReusableLeaseHandoff } from "../services/environment-lease-handoff.js";
 import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService, agentFileHoldInstruction, agentFileSaveHeld, applyWarmNotesProgram } from "../services/agent-directory-working-copies.js";
-import { agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim } from "../services/agent-file-save-hold.js";
+import { agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, rearmAgentFileHoldsOnLeaseActive, releaseLeaseDestroyClaim } from "../services/agent-file-save-hold.js";
 import * as checkpointsModule from "../services/agent-file-checkpoints.js";
 import { collectStoppedInstructionCopyWithRetries } from "../services/agent-instruction-working-copies.js";
 import { HttpError } from "../errors.js";
@@ -701,6 +701,138 @@ describe("persistent agent directories", () => {
     }finally{await applyDone;factory?.mockRestore();await unlock(db).catch(()=>{});vi.unstubAllEnvs();}
   },90000);
       });
+      // bd3 (rf-3 items 1 + 2, one WARM REMOTE row on the Boat sandbox fixture).
+      // Real producer: chat A's last verified warm checkpoint records UNCHANGED,
+      // then the run really edits its tree on the box (a new note, and it deletes
+      // the configured entry AGENTS.md), and the REAL store refuses the stopped
+      // save with 422 (no mock). Never-OK: the edit is settled as "nothing to
+      // save" and lost (rf-3 B0a). PLANTED, named: each chat gets its own box
+      // (providerLeaseId) so one box's gate is read alone; the LEASE-GONE
+      // refusal is the runner boundary throwing Boat's message; the failed
+      // mirror copy is the retrieve's read of the server mirror throwing EIO.
+      it("BD3-WARM-REMOTE never-lose-data: unchanged warm checkpoint, real edit, real 422 STAYS HELD with its tree in the server mirror (destroy only after per-file + mirrorHash); LEASE-GONE stays held and is saved on resume; a failed mirror copy keeps destroy blocked", async () => {
+        await paulBundle();
+        const recorded: Record<string, unknown> = {};
+        const evidence = async (name: string, value: unknown) => { recorded[name] = value; console.log(name, JSON.stringify(value)); await writeJudgeEvidence("bd3-warm-remote-evidence.json", recorded); };
+        const HOUR = 60 * 60_000, LEASE_GONE = "Boat sandbox lease is no longer active.";
+        const edit = "memory/after-checkpoint.md", editBytes = "EDIT AFTER THE LAST CHECKPOINT\n";
+        const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+        const ownBox = async (runId: string) => {
+          const leaseId = ((await copies.get(companyId, runId))!.receipt?.cleanup as { leaseId?: string } | undefined)?.leaseId;
+          expect(leaseId).toEqual(expect.any(String));
+          const [lease] = await db.update(environmentLeases).set({ providerLeaseId: `box-${runId}` }).where(eq(environmentLeases.id, leaseId!)).returning();
+          return lease!;
+        };
+        const gateAt = async (lease: typeof environmentLeases.$inferSelect, hours: number) => {
+          vi.useFakeTimers({ toFake: ["Date"] });
+          try { vi.setSystemTime(Date.now() + hours * HOUR); return await agentFileSaveHeldOnLease(db, lease); }
+          finally { vi.useRealTimers(); }
+        };
+        const durableCheck = async (runId: string) => ((await copies.get(companyId, runId))!.receipt?.savePending as { durableCheck?: Record<string, unknown> }).durableCheck;
+        const unchangedWarmCheckpoint = async (boat: Awaited<ReturnType<typeof sandbox>>) => {
+          const chat = await boat.prepare({ warm: true });
+          const lease = await ownBox(chat.runId);
+          const checkpointed = (await copies.checkpointWarm({ companyId, runId: chat.runId, target: boat.executionTarget }))!;
+          expect(checkpointed).toMatchObject({ state: "warm_saved", receipt: { checkpointState: "unchanged" } });
+          expect(checkpointed.receipt?.checkpointAt).toEqual(expect.any(String));
+          return { chat, lease, checkpointed };
+        };
+
+        // (1) + (2): unchanged checkpoint -> real edit -> real store.apply 422.
+        const boatA = await sandbox();
+        const a = await unchangedWarmCheckpoint(boatA);
+        await fs.mkdir(path.join(a.chat.executionRoot, "memory"), { recursive: true });
+        await fs.writeFile(path.join(a.chat.executionRoot, edit), editBytes);
+        await fs.rm(path.join(a.chat.executionRoot, "AGENTS.md"));
+        const heldA = (await copies.collectStopped({ companyId, runId: a.chat.runId, target: boatA.executionTarget }))!;
+        const pendingA = heldA.receipt?.savePending as { permanent?: unknown; permanentStatus?: unknown; reason?: string; mirrorHash?: string; heldFiles?: Array<{ path: string; sha256: string }> };
+        const mirrorA = await inspectAgentDirectory(heldA.localRoot).then(read => directorySnapshotSha256(read.snapshot), (error: { code?: string }) => `MISSING:${error.code}`);
+        await evidence("BD3_WARM_422_HELD", ({ runId: heldA.runId, state: heldA.state, held: agentFileSaveHeld(heldA), checkpointAt: a.checkpointed.receipt?.checkpointAt,
+          processStoppedAt: heldA.processStoppedAt, nothingToSave: heldA.receipt?.nothingToSave ?? null, savePending: pendingA, mirrorObserved: mirrorA }));
+        expect(agentFileSaveHeld(heldA)).toBe(true);
+        expect(heldA.receipt?.nothingToSave).toBeUndefined();
+        expect(pendingA).toMatchObject({ permanent: true, permanentStatus: 422, reason: "The configured instruction entry cannot be deleted" });
+        // The box keeps the edit; the canonical folder is untouched.
+        expect(await fs.readFile(path.join(a.chat.executionRoot, edit), "utf8")).toBe(editBytes);
+        expect(await fs.readFile(path.join(root, "AGENTS.md"), "utf8")).toBe("# AGENTS.md\n");
+        await expect(fs.stat(path.join(root, edit))).rejects.toMatchObject({ code: "ENOENT" });
+        // Item 2 WARM: the full stopped tree is in the server mirror, its hash pinned.
+        expect(pendingA.mirrorHash).toEqual(expect.any(String));
+        expect(mirrorA).toBe(pendingA.mirrorHash);
+        expect(await fs.readFile(path.join(heldA.localRoot, edit), "utf8")).toBe(editBytes);
+        expect(pendingA.heldFiles).toContainEqual({ path: edit, sha256: sha(editBytes) });
+        expect(pendingA.heldFiles?.map(file => file.path)).not.toContain("AGENTS.md");
+        // Destroy: blocked now; at +25 h only while every held file AND the whole mirror match.
+        expect(await agentFileSaveHeldOnLease(db, a.lease)).toBe(true);
+        const editPath = path.join(heldA.localRoot, edit);
+        await fs.writeFile(editPath, "changed in the mirror\n");
+        const blockedChanged = await gateAt(a.lease, 25), checkChanged = await durableCheck(heldA.runId);
+        await fs.writeFile(editPath, editBytes);
+        await fs.writeFile(path.join(heldA.localRoot, "drift.txt"), "not in the held tree\n");
+        const blockedDrift = await gateAt(a.lease, 25), checkDrift = await durableCheck(heldA.runId);
+        await fs.rm(path.join(heldA.localRoot, "drift.txt"));
+        const allowed = !await gateAt(a.lease, 25), checkOk = await durableCheck(heldA.runId);
+        await evidence("BD3_WARM_422_GATE", ({ blockedChanged, checkChanged, blockedDrift, checkDrift, allowed, checkOk }));
+        expect(blockedChanged).toBe(true);
+        expect(checkChanged).toMatchObject({ durable: false, changed: [edit] });
+        expect(blockedDrift).toBe(true);
+        expect(checkDrift).toMatchObject({ durable: false, changed: [], missing: [], mirrorHash: pendingA.mirrorHash });
+        expect(checkDrift?.observedHash).not.toBe(pendingA.mirrorHash);
+        expect(allowed).toBe(true);
+        expect(checkOk).toMatchObject({ durable: true, mirrorHash: pendingA.mirrorHash, observedHash: pendingA.mirrorHash });
+        expect(agentFileSaveHeld(await copies.get(companyId, heldA.runId))).toBe(true);
+
+        // (1) LEASE-GONE: unchanged checkpoint -> real edit -> the box's lease is gone.
+        const boatB = await sandbox();
+        const b = await unchangedWarmCheckpoint(boatB);
+        await fs.mkdir(path.join(b.chat.executionRoot, "memory"), { recursive: true });
+        await fs.writeFile(path.join(b.chat.executionRoot, edit), editBytes);
+        const realRunner = boatB.executionTarget.runner;
+        const goneTarget = { ...boatB.executionTarget, runner: { execute: async () => { throw new Error(LEASE_GONE); } } };
+        const heldB = (await copies.collectStopped({ companyId, runId: b.chat.runId, target: goneTarget }))!;
+        await evidence("BD3_WARM_LEASE_GONE_HELD", ({ runId: heldB.runId, state: heldB.state, held: agentFileSaveHeld(heldB), nextAttemptAt: heldB.nextAttemptAt,
+          savePending: heldB.receipt?.savePending ?? null, nothingToSave: heldB.receipt?.nothingToSave ?? null }));
+        expect(agentFileSaveHeld(heldB)).toBe(true);
+        expect(heldB.receipt?.nothingToSave).toBeUndefined();
+        expect(heldB.receipt?.savePending).toMatchObject({ reason: LEASE_GONE, retryOn: "lease_active" });
+        expect(heldB.nextAttemptAt).toBeNull();
+        expect(await fs.readFile(path.join(b.chat.executionRoot, edit), "utf8")).toBe(editBytes);
+        // Resume: the lease is active again, the hold is re-armed, and the edit is saved.
+        expect(boatB.executionTarget.runner).toBe(realRunner);
+        const rearmed = await rearmAgentFileHoldsOnLeaseActive(db, b.lease);
+        const savedB = (await copies.collectStopped({ companyId, runId: b.chat.runId, target: boatB.executionTarget }))!;
+        const canonicalEdit = await fs.readFile(path.join(root, edit), "utf8").catch(error => `MISSING:${error.code}`);
+        await evidence("BD3_WARM_LEASE_GONE_RESUMED", ({ rearmed, state: savedB.state, held: agentFileSaveHeld(savedB), canonicalEdit }));
+        expect(rearmed).toContain(b.chat.runId);
+        expect(savedB.state).toBe("saved");
+        expect(canonicalEdit).toBe(editBytes);
+
+        // (2) A FAILED mirror copy pins nothing and keeps destroy blocked.
+        await fs.rm(path.join(root, edit));
+        const boatC = await sandbox();
+        const c = await unchangedWarmCheckpoint(boatC);
+        await fs.writeFile(path.join(c.chat.executionRoot, "memory", "failed-copy.md"), "kept on the box\n");
+        await fs.rm(path.join(c.chat.executionRoot, "AGENTS.md"));
+        const realInspect = fileStoreModule.inspectAgentDirectory;
+        let mirrorReads = 0;
+        const inspect = vi.spyOn(fileStoreModule, "inspectAgentDirectory").mockImplementation(async (dir, ...rest) => {
+          if (String(dir) === c.chat.localRoot) { mirrorReads++; throw Object.assign(new Error("injected: the server mirror copy failed (EIO)"), { code: "EIO" }); }
+          return realInspect(dir, ...rest);
+        });
+        let heldC: Awaited<ReturnType<typeof copies.collectStopped>>;
+        try { heldC = (await copies.collectStopped({ companyId, runId: c.chat.runId, target: boatC.executionTarget }))!; }
+        finally { inspect.mockRestore(); }
+        const pendingC = heldC!.receipt?.savePending as { permanent?: unknown; mirrorHash?: unknown; heldFiles?: unknown };
+        const blockedC = await gateAt(c.lease, 25), checkC = await durableCheck(heldC!.runId);
+        await evidence("BD3_WARM_FAILED_COPY", ({ runId: heldC!.runId, mirrorReads, held: agentFileSaveHeld(heldC), savePending: pendingC, blockedAt25h: blockedC, checkC }));
+        expect(mirrorReads).toBeGreaterThan(0);
+        expect(agentFileSaveHeld(heldC!)).toBe(true);
+        expect(pendingC).toMatchObject({ permanent: true, permanentStatus: 422 });
+        expect(pendingC.mirrorHash).toBeUndefined();
+        expect(blockedC).toBe(true);
+        expect(checkC).toMatchObject({ durable: false });
+        expect(await fs.readFile(path.join(c.chat.executionRoot, "memory", "failed-copy.md"), "utf8")).toBe("kept on the box\n");
+      }, 120_000);
       const contextFor = async (copy: { runId: string; executionRoot: string }) => buildNativeRuntimeContext({ db, agent: { id: agentId, companyId, name: "Target",
         adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } },
         runId: copy.runId, runtimeConfig: {}, runtimeSkillEntries: [], instructionWorkingCopy: { rootPath: copy.executionRoot, entryPath: "AGENTS.md", kind: "agent_files" } });
