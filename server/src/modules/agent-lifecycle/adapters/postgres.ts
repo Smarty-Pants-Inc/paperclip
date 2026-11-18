@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { agents, agentApiKeys, agentIdentityKeys, companies, budgetPolicies, type Db } from "@paperclipai/db";
+import { agents, agentApiKeys, agentIdentityKeys, companies, budgetPolicies, heartbeatRuns, type Db } from "@paperclipai/db";
 import { persistActivity } from "../../../services/activity-log.js";
+import { notifyIssueRecovery } from "../../../services/issue-recovery-notifications.js";
+import { pendingFailedNativeRetryCancellationCondition } from "../../../services/native-runtime/native-cancellation-request.js";
 import type { AgentLifecycleOperation } from "@paperclipai/shared";
 import { AgentLifecycleConflict, canConfigureAgentConnection, compatibilityStatus, isLifecycleWorkPending, PAUSE_SETTLEMENT_TIMEOUT_MS, transition, type LifecycleCommand } from "../domain/policy.js";
 import type { LifecycleEffects } from "./effects.js";
@@ -37,13 +39,16 @@ const pauseStopLine = (resumeRequested: SQL) => sql`'pause_stop_unconfirmed: ' |
 /** At the bound an unresolved pause becomes stable `paused` with its outcome. The operation, its claim,
  * version and Stop targets stay, so the same lifecycle Stop owner keeps working (`stopPending`).
  * `legacy` settles a pre-fix row (no request time) only on an authorized Retry, never on deploy. */
-export async function settleOverduePauses(db: Pick<Db, "update">, now: Date, id?: string, legacy = false) {
-  return db.update(agents).set({ lifecycleState: "paused", lifecycleError: pauseStopLine(sql`${agents.lifecycleHolds} = '[]'::jsonb`),
+export async function settleOverduePauses(db: Db, now: Date, id?: string, legacy = false) {
+  // The waiting line's recovery is notified in the same transaction as the bound (C/F4).
+  return db.transaction(async tx => { const rows = await tx.update(agents).set({ lifecycleState: "paused", lifecycleError: pauseStopLine(sql`${agents.lifecycleHolds} = '[]'::jsonb`),
     lifecycleOperation: sql`${agents.lifecycleOperation} || ${JSON.stringify({ stopPending: true, pauseOutcome: "pause_stop_unconfirmed",
       ...(legacy ? { repairNeedsFreshResume: true } : {}) })}::jsonb`, updatedAt: now,
   }).where(and(id ? eq(agents.id, id) : undefined, eq(agents.lifecycleState, "pausing"), legacy
     ? sql`${agents.lifecycleOperation} ? 'pauseCause' and not (${agents.lifecycleOperation} ? 'pauseDeadlineAt')`
     : sql`(${agents.lifecycleOperation}->>'pauseDeadlineAt')::timestamptz <= ${now.toISOString()}::timestamptz`)).returning();
+  for (const companyId of new Set(rows.map(row => row.companyId))) await notifyIssueRecovery(tx, { companyId });
+  return rows; });
 }
 
 // Prepared drafts wait for the wizard; they have no background verification obligation.
@@ -182,10 +187,14 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     !agent.lifecycleOperation.hostComplete || agent.lifecycleRequiredPluginIds === null ||
     agent.lifecycleRequiredPluginIds.some(id => !agent.lifecycleOperation!.completedPluginIds.includes(id)))) return null;
   const residual = agent.lifecycleOperation?.stopPending === true;
+  // F3: a pre-build pause (its cause, no bound) never auto-resumes from an old queued Resume.
+  const legacyPause = agent.lifecycleState === "pausing" && !!agent.lifecycleOperation?.pauseCause && !agent.lifecycleOperation.pauseDeadlineAt;
   if (command === "retry") {
+    // F5: the repair is done; a repeated Retry is a no-op until a fresh Resume.
+    if (agent.lifecycleState === "paused" && !residual && agent.lifecycleOperation?.repairNeedsFreshResume) return agent;
     // Section F: an authorized Retry settles a pre-fix Pause (its cause, no request time) through the bound's
     // path, then un-parks as usual. Other pausing producers (migration, setup) keep their plain Retry.
-    if (agent.lifecycleState === "pausing" && agent.lifecycleOperation?.pauseCause && !agent.lifecycleOperation.pauseDeadlineAt) {
+    if (legacyPause) {
       await settleOverduePauses(tx, new Date(), agent.id, true);
     }
     if (!residual) transition(agent.lifecycleState, command);
@@ -228,7 +237,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     : transition(agent.lifecycleState, command, agent.lifecycleOperation?.resumeState);
   if (restartPause && next === "paused") next = "pausing";
   if (command === "complete" && next === "ready" && holds.length) next = "pausing";
-  if (command === "complete" && next === "paused" && !holds.length && !agent.lifecycleOperation?.repairNeedsFreshResume) next = "resuming";
+  if (command === "complete" && next === "paused" && !holds.length && !agent.lifecycleOperation?.repairNeedsFreshResume && !legacyPause) next = "resuming";
   if (["complete", "reconcile"].includes(command) && next === "paused" && holds.length === 1 && holds[0] === "setup"
     && await effects.setupRequiresPreparation(tx, agent.companyId, agent.defaultEnvironmentId, agent)) next = "preparing";
   if (next === agent.lifecycleState) {
@@ -261,6 +270,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
       : agent.lifecycleOperation?.resumeState,
   };
   if (next === "ready") operation.resumeState = "ready";
+  if (legacyPause && next === "paused") operation.repairNeedsFreshResume = true;
   if (next === "pausing") {
     const [company] = await tx.select({ pauseReason: companies.pauseReason }).from(companies)
       .where(eq(companies.id, agent.companyId));
@@ -268,6 +278,9 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     const requestedAt = Date.now();
     operation.pauseRequestedAt = new Date(requestedAt).toISOString();
     operation.pauseDeadlineAt = new Date(requestedAt + PAUSE_SETTLEMENT_TIMEOUT_MS).toISOString();
+    // C exact-target authority: the pause's cancellation may touch only the runs live at the pause.
+    operation.stopRunIds = (await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, agent.id),
+      or(inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]), pendingFailedNativeRetryCancellationCondition())))).map(run => run.id);
   }
   const status = compatibilityStatus(next, agent.status);
   if(!canConfigureAgentConnection(agent)&&canConfigureAgentConnection({lifecycleState:next,status}))await effects.beforeConnectionEligibilityRestore?.(tx,agent.companyId,agent.id);

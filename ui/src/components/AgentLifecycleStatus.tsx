@@ -21,6 +21,8 @@ const failedPhases = {
   terminating: "Agent termination failed", cleaning_up: "Agent cleanup failed",
 };
 
+const PAUSE_STOP_UNCONFIRMED = "pause_stop_unconfirmed: ";
+
 function pendingPhase(state?: AgentLifecycleState) {
   return state && state in phases ? phases[state as keyof typeof phases] : undefined;
 }
@@ -48,6 +50,12 @@ export function AgentLifecycleStatus({ agent, onRetry, retryPending, refreshErro
   refreshError?: boolean;
 }) {
   const phase = pendingPhase(agent.lifecycleState);
+  // Past the pause bound the agent is stably paused: show that outcome and its line, not a failure or progress.
+  const outcome = agent.lifecycleState === "paused" && agent.lifecycleError?.startsWith(PAUSE_STOP_UNCONFIRMED)
+    ? agent.lifecycleError.slice(PAUSE_STOP_UNCONFIRMED.length) : null;
+  if (outcome) return <div role="status" aria-live="polite" className="flex flex-wrap items-center gap-2 text-sm">
+    <Badge variant="secondary">Paused</Badge><span className="text-muted-foreground">{outcome}</span>
+  </div>;
   if (!phase && !refreshError) return null;
   return <div role="status" aria-live="polite" className="space-y-2 text-sm">
     {refreshError && <p className="text-destructive">Could not refresh agent lifecycle status.</p>}

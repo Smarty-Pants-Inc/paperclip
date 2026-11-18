@@ -41,6 +41,8 @@ export interface AgentLifecycleOperation {
   pauseOutcome?: "pause_stop_unconfirmed";
   stopPending?: boolean;
   resumeRequested?: boolean;
+  /** The exact runs live when this pause began: the only runs its route-level cancel may touch. */
+  stopRunIds?: string[];
   /** A legacy repaired pause: only a fresh authorized Resume may resume it. */
   repairNeedsFreshResume?: boolean;
   /** Who asked for a termination. The terminal step's `agent.terminated` audit row names this caller. */

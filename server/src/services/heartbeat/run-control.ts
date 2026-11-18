@@ -1892,13 +1892,16 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     agentId: string,
     reason = "Cancelled due to agent pause",
     errorCode = "cancelled",
+    runIds?: string[],
   ) {
+    if (runIds && !runIds.length) return 0;
     const runs = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
       .where(
         and(
           eq(heartbeatRuns.agentId, agentId),
+          runIds ? inArray(heartbeatRuns.id, runIds) : undefined,
           or(inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
             pendingFailedNativeRetryCancellationCondition()),
         ),

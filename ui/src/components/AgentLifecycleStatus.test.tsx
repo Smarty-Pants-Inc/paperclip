@@ -63,3 +63,17 @@ it("retries a failed step once while pending and removes the failure after recov
     expect(container.textContent).toBe("");
   } finally { await act(async () => root.unmount()); }
 });
+
+it.each([
+  "Stack Lead is paused for new work. We could not confirm that its previous run stopped.",
+  "Resume was requested for Stack Lead. New work is waiting for its previous run to stop.",
+])("shows the stable paused outcome past the pause bound: %s", line => {
+  const html = renderToStaticMarkup(<AgentLifecycleStatus agent={{ lifecycleState: "paused",
+    lifecycleError: `pause_stop_unconfirmed: ${line}` }} onRetry={() => {}} retryPending={false} />);
+  expect(html).toContain("Paused");
+  expect(html).toContain(line);
+  expect(html).not.toContain("pause_stop_unconfirmed");
+  expect(html).not.toContain("Retry");
+  expect(html).not.toContain("failed");
+  expect(html).not.toContain('aria-hidden="true"');
+});

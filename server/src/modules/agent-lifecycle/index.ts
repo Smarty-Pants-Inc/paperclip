@@ -160,6 +160,19 @@ export function startAgentLifecycle(db: Db, effects: LifecycleEffects, driver: L
     }
     if (page.length < 100) recoveryDone = true;
   }
+  // The bound's own delivery: an in-memory check of the next pause deadline (refreshed every 5 s),
+  // and the cheap settling UPDATE only when it is due; never behind the Stop-proof pass.
+  let boundWatch: ReturnType<typeof setInterval> | undefined, boundDue = -Infinity, boundCheckedAt = -Infinity, settling = false;
+  async function settleBound() {
+    if (settling || stopped || (Date.now() < boundDue && Date.now() - boundCheckedAt < 5_000)) return;
+    settling = true;
+    try {
+      if ((await settleOverduePauses(db, new Date())).length) wakes.get(db)?.();
+      const [next] = await db.select({ at: sql<string | null>`min(${agents.lifecycleOperation}->>'pauseDeadlineAt')` })
+        .from(agents).where(eq(agents.lifecycleState, "pausing"));
+      boundDue = next?.at ? Date.parse(next.at) : Infinity; boundCheckedAt = Date.now();
+    } catch (error) { effects.reportFailure({ stage: "scan" }, error); } finally { settling = false; }
+  }
   // The coordinator supplies the wake after construction. No direct work escapes it.
   wakes.set(db, () => {});
   return {
@@ -190,13 +203,16 @@ export function startAgentLifecycle(db: Db, effects: LifecycleEffects, driver: L
       if (stopped || !canRun()) return Promise.resolve();
       // The pause bound is one cheap update, never queued behind an active sweep's provider I/O.
       const bound = settleOverduePauses(db, new Date()).catch(error => { effects.reportFailure({ stage: "scan" }, error); });
+      // C: while this pass may sit in a provider call, the bound keeps its own timer delivery.
+      boundWatch ??= setInterval(() => { void settleBound(); }, 50);
+      boundWatch.unref?.();
       return running ??= bound.then(async () => {
         try { await projectCompanyHolds(db, effects); }
         catch (error) { effects.reportFailure({ stage: "policy_scan" }, error); throw error; }
         try { await recoverPage(); }
         catch (error) { effects.reportFailure({ stage: "scan" }, error); throw error; }
         await worker.sweep();
-      }).finally(() => { running = undefined; });
+      }).finally(() => { running = undefined; clearInterval(boundWatch); boundWatch = undefined; });
     },
     async stop() {
       stopped = true;

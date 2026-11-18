@@ -438,7 +438,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
-  const [noticed] = await q.select({ id: issueComments.id,
+  const [noticed] = await q.select({ id: issueComments.id, body: issueComments.body,
     waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)`,
     waitingCode: sql<string | null>`(select r->>'value' from jsonb_array_elements(coalesce(${issueComments.metadata}->'sections', '[]'::jsonb)) sec,
       jsonb_array_elements(coalesce(sec->'rows', '[]'::jsonb)) r where r->>'label' = ${WAITING_ROW_LABEL} limit 1)` })
@@ -529,7 +529,13 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     inArray(heartbeatRuns.status, LIVE))).limit(1);
   const liveRuns = otherLive ? [...live, otherLive] : live;
-  if (liveRuns.some(candidate => candidate.status === "running")) {
+  const [agentRow] = await q.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
+    lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason, lifecycleError: agents.lifecycleError,
+    lifecycleOperation: agents.lifecycleOperation })
+    .from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
+  // F4: while the pause's Stop is unconfirmed, a running row is the pre-pause run, not an answer in progress.
+  const stopUnconfirmed = agentRow?.lifecycleState === "pausing" || agentRow?.lifecycleOperation?.stopPending === true;
+  if (!stopUnconfirmed && liveRuns.some(candidate => candidate.status === "running")) {
     return { kind: "pending", recheckAt: now.getTime() + 30_000 };
   }
   // The agent is paused (Paperclip's lifecycle: status paused, lifecycle state
@@ -537,10 +543,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // it is resumed, so "sending it again" would do nothing. The note says it is
   // paused and who can resume it; it stays a waiting-kind note, so after the
   // resume the saved message's own run decides (its answer supersedes it).
-  const [agentRow] = await q.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
-    lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason, lifecycleError: agents.lifecycleError,
-    lifecycleOperation: agents.lifecycleOperation })
-    .from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
   // Setup uses the compatibility status "paused", but completes by itself.
   // Its saved message remains an obligation: use the existing sweep deadline
   // and bound, never a second wake. After ten minutes, one true setup note
@@ -567,7 +569,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (agentPaused) {
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
-    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
+    // A standing paused note stays only while its line is still true (Resume requested upgrades it).
+    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE && noticed?.body
+      === agentPausedText(agentRow?.name?.trim() || "This agent", stopUnconfirmed, stopUnconfirmed && !agentRow?.lifecycleHolds?.length)) {
       return { kind: "pending", recheckAt: now.getTime() + 5 * 60_000 };
     }
   }
@@ -760,7 +764,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const supervisionUnconfirmed = code === REMOTE_RUNNER_SUPERVISION_EXHAUSTED && !held;
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
-  const stopUnconfirmed = agentRow?.lifecycleState === "pausing" || agentRow?.lifecycleOperation?.stopPending === true;
   const waiting = WAITING_KIND_CODES.has(code);
   // The ONE bound: the message's automatic lineage used its K=2 fresh
   // continuations and the last one failed. Nothing further starts by itself.

@@ -6099,7 +6099,8 @@ export function agentRoutes(
     const agent = await lifecycleForRequest(req, existing).retry(id);
     if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
     const actor = getActorInfo(req);
-    await logActivity(db, { companyId: agent.companyId, actorType: actor.actorType, actorId: actor.actorId,
+    // F5: a repeated repair Retry changes nothing, so it records no second activity.
+    if (JSON.stringify(agent.updatedAt) !== JSON.stringify(existing.updatedAt)) await logActivity(db, { companyId: agent.companyId, actorType: actor.actorType, actorId: actor.actorId,
       agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
       action: "agent.lifecycle_retried", entityType: "agent", entityId: agent.id });
     res.json(redactAgentRowForResponse(agent));

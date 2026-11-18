@@ -4886,9 +4886,13 @@ export function heartbeatService(
      * Pause-only. Emits errorCode "agent_paused" unconditionally; its sole caller is the
      * agent pause route. For non-pause cancellations use cancelRun, or call the internal
      * cancelActiveForAgentInternal(agentId, reason, errorCode) with an explicit errorCode.
+     * Exact-target (PAUSING-DESIGN-R2 C): it cancels only the pause's recorded stopRunIds,
+     * never "all active for the agent", so a late delivery cannot touch a post-Resume run.
      */
-    cancelActiveForAgent: (agentId: string, reason?: string) =>
-      cancelActiveForAgentInternal(agentId, reason, "agent_paused"),
+    cancelActiveForAgent: async (agentId: string, reason?: string) => {
+      const [agent] = await db.select({ operation: agents.lifecycleOperation }).from(agents).where(eq(agents.id, agentId));
+      return cancelActiveForAgentInternal(agentId, reason, "agent_paused", agent?.operation?.stopRunIds ?? []);
+    },
 
     cancelInvocationsForAgents: (agentIds: string[], reason: string) =>
       cancelInvocationsForAgentsInternal(agentIds, reason),
