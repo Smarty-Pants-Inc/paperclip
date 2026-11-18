@@ -32,7 +32,7 @@ const COMMAND_ENV_SECRET_ASSIGNMENT_RE = new RegExp(
 );
 const COMMAND_AUTHORIZATION_BEARER_RE =
   /(\bAuthorization\s*:\s*Bearer\s+)[^\s"'`]+/gi;
-const COMMAND_OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{12,}\b/g;
+const COMMAND_OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{12,}(?![A-Za-z0-9_-])/g;
 const COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g;
 const COMMAND_JWT_RE =
   /\b(?<![A-Za-z0-9_]-*)[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,}){2}(?:\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})?\b/g;

@@ -18,6 +18,31 @@ import {
   redactCommandText,
 } from "./command-redaction.js";
 
+describe.each([redactCommandText, redactDiagnosticText])("%s provider-key boundaries", (redact) => {
+  it.each([
+    ["sk-aaaaaaaaaaa-", REDACTED_COMMAND_TEXT_VALUE],
+    ["sk-aaaaaaaaaaaa", REDACTED_COMMAND_TEXT_VALUE],
+    ["KEY=sk-proj-AbCdEf0123456789AbCdEf0123456789-suffix", `KEY=${REDACTED_COMMAND_TEXT_VALUE}`],
+    ["https://x.example/sk-or-v1-0123456789abcdef0123456789abcdef-path", `https://x.example/${REDACTED_COMMAND_TEXT_VALUE}`],
+    ["--api-key=sk-ant-api03-AbCdEf0123456789AbCdEf0123456789AbCdEf-", `--api-key=${REDACTED_COMMAND_TEXT_VALUE}`],
+    ["sk-AbCdEf0123456789AbCdEf0123456789-", REDACTED_COMMAND_TEXT_VALUE],
+    ["KEY=sk-proj-AbCdEf0123456789AbCdEf0123456789", `KEY=${REDACTED_COMMAND_TEXT_VALUE}`],
+    ["https://x.example/sk-or-v1-0123456789abcdef0123456789abcdef", `https://x.example/${REDACTED_COMMAND_TEXT_VALUE}`],
+    ["--api-key=sk-ant-api03-AbCdEf0123456789AbCdEf0123456789AbCdEf", `--api-key=${REDACTED_COMMAND_TEXT_VALUE}`],
+    ["sk-AbCdEf0123456789AbCdEf0123456789", REDACTED_COMMAND_TEXT_VALUE],
+    ["sk-proj-AbCdEf0123456789AbCdEf0123456789-", REDACTED_COMMAND_TEXT_VALUE],
+    ["sk-or-v1-0123456789abcdef0123456789abcdef-", REDACTED_COMMAND_TEXT_VALUE],
+    ["sk-ant-api03-AbCdEf0123456789AbCdEf0123456789AbCdEf-", REDACTED_COMMAND_TEXT_VALUE],
+    ["Before: sk-aaaaaaaaaaa- after", `Before: ${REDACTED_COMMAND_TEXT_VALUE} after`],
+    ["sk-aaaaaaaaaaa--", REDACTED_COMMAND_TEXT_VALUE],
+    ["\"sk-aaaaaaaaaaa-\"", `\"${REDACTED_COMMAND_TEXT_VALUE}\"`],
+    ["risk-free", "risk-free"],
+    ["sk-learn", "sk-learn"],
+  ])("redacts the whole provider-key run without masking ordinary prose: %s", (input, expected) => {
+    expect(redact(input)).toBe(expected);
+  });
+});
+
 describe("looksLikeCredentialJwt", () => {
   it("recognizes encoded headers even with short payloads and signatures", () => {
     const header = Buffer.from('{"alg":"HS256"}').toString("base64url");
