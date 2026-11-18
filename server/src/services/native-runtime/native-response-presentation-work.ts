@@ -73,7 +73,9 @@ export function nativeResponsePresentationWork(db: Db) {
     const recoveryStartedAt = Date.now();
     let failure: unknown = null;
     try {
-      if ("withheld" in pending) await publishWithheldAcceptedReply(db, { ...scope, runId: entry.id });
+      if ("withheld" in pending) await publishWithheldAcceptedReply(db, { ...scope, runId: entry.id },
+        // The outbox entry names its own trigger (native-withheld-reply-trigger.ts).
+        (pending as { trigger?: string | null }).trigger === "acceptance" ? "acceptance" : "terminal");
       else await recoverCommittedNativeChatResponse(db, { ...scope, runId: entry.id, onlyWhenDue: true });
     } catch (error) {
       // Ordinary task replies own a durable, bounded retry below. Other

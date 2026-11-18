@@ -1,0 +1,26 @@
+{
+  "comments": [
+    {
+      "authorType": "agent",
+      "body": "Done. I renamed the helper and updated its two callers.\n\n- `src/util.ts`\n- `src/app.ts`  \nTests pass ✅",
+      "byRun": true,
+      "isMessage": false
+    },
+    {
+      "authorType": "user",
+      "body": "Please rename the helper.",
+      "byRun": false,
+      "isMessage": true
+    }
+  ],
+  "issueStatus": "in_progress",
+  "run": {
+    "status": "running",
+    "replyFileLine": {
+      "onTheReply": true,
+      "state": "saving",
+      "deadlineAfterAcceptanceMs": 600000
+    }
+  },
+  "recoveryAction": null
+}
