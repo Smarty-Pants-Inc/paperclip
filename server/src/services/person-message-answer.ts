@@ -6,13 +6,16 @@ export const ISSUE_IMPORTED_ACTION = "issue.imported";
 /** The import routes' audit row, written after a committed import (routes/companies.ts). */
 export const COMPANY_IMPORTED_ACTION = "company.imported";
 
-/** SQL: run r's OWN input names person input `id` (a typed message's comment id, or a card answer's interaction id). */
+/** SQL: run r's OWN input names person input `id` (a typed message's comment id, or a card answer's interaction id).
+ * attributionInteractionIds: the card answers a native-status continuation (schedule_retry) carries from the run it
+ * continues, for this attribution only (status-decision-committer.ts nativeContinuationCardAnswerAttribution). */
 const ownInputNamesSql = (id: SQL) => sql`(r.context_snapshot->>'wakeCommentId' = ${id}::text or r.context_snapshot->>'commentId' = ${id}::text
   or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${id}::text
   or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${id}::text
   or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${id}::text
   or r.context_snapshot->>'interactionId' = ${id}::text
-  or coalesce(r.context_snapshot->'interactionIds', '[]'::jsonb) ? ${id}::text)`;
+  or coalesce(r.context_snapshot->'interactionIds', '[]'::jsonb) ? ${id}::text
+  or coalesce(r.context_snapshot->'attributionInteractionIds', '[]'::jsonb) ? ${id}::text)`;
 
 /** SQL over card q: the person can still answer it, or has answered it (rulings 2, 3). The ONE copy. */
 const ANSWERABLE_CARD_SQL = sql`(q.status = 'pending' or (q.resolved_by_user_id is not null and (q.status in ('answered', 'accepted', 'rejected')

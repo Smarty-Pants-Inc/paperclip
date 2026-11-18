@@ -297,6 +297,23 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
     expect(after[0]!.deletedAt, "the answered answer's line is retired").not.toBeNull();
   }, 60_000);
 
+  it("ruling 4: the answer's run FAILS and a native-status continuation that carries the answer for attribution replies -> no line", async () => {
+    const f = await cardFixture();
+    await f.resumeRun(f.cardId, "failed");
+    // The schedule_retry successor continues the same conversation: it names the answer in attributionInteractionIds only
+    // (status-decision-committer.ts nativeContinuationCardAnswerAttribution), never as prompt input.
+    const successor = await f.resumeRun(f.cardId, "succeeded", true);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_status_changed",
+      source: "native_status_decision", attributionInteractionIds: [f.cardId] } }).where(eq(heartbeatRuns.id, successor));
+    for (const minutes of PASSES) expect(await f.sweep(minutes)).toEqual({ noticed: 0, pending: 0 });
+    expect(await f.notices(), "no notice was ever written").toHaveLength(0);
+    // Control: a successor that does NOT name the answer does not answer it (never ancestry): the answer keeps its one line.
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_status_changed",
+      source: "native_status_decision" } }).where(eq(heartbeatRuns.id, successor));
+    expect((await f.sweep(31)).noticed).toBe(1);
+    expect(await f.notices()).toMatchObject([{ deletedAt: null, body: UNANSWERED_CARD_ANSWER_TEXT, metadata: key(f.cardId) }]);
+  }, 60_000);
+
   it("ruling 4: card answered, the run that took the answer FINISHES WITHOUT A REPLY -> exactly one finished-without-a-reply line", async () => {
     const f = await cardFixture();
     const resume = await f.resumeRun(f.cardId, "succeeded");

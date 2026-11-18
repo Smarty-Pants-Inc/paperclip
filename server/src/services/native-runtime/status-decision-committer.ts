@@ -93,6 +93,7 @@ import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_C
 import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
 import { NATIVE_TOOL_RECEIPT_LIMIT_CODE } from "./native-tool-receipt-limit.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 
 export class NativeStatusRaceError extends Error {
   readonly code = "native_status_race" as const;
@@ -462,6 +463,21 @@ function failAt(
 ) {
   if (actual === requested)
     throw new Error(`native_status_failpoint:${actual}`);
+}
+
+/** The native-status continuation (schedule_retry) successor's OWN pending CARD ANSWERS, for ANSWERED attribution
+ * ONLY (the card half of bb/tamin6 5cddd3d1 status-decision-committer.ts:483-498 nativeContinuationAttributionContext).
+ * The successor continues the SAME conversation, so the person's answer is not sent again: its id goes in
+ * attributionInteractionIds, which only the one answered function (person-message-answer.ts) and the sweep's carrier
+ * lookup read, never interactionId(s) (runtime-selection.ts builds the prompt from those). Without it the
+ * card-answer duty (RFL ruling 4) would say "Your answer wasn't acted on" after the continuation acted on it.
+ * Collected by the one carry (readContinuationCommentInput): still pending, not ANSWERED, not sender-stopped. */
+export async function nativeContinuationCardAnswerAttribution(
+  tx: Pick<Db, "select">, input: { companyId: string; issueId: string; originRunId: string },
+): Promise<Record<string, unknown>> {
+  const carried = await readContinuationCommentInput(tx, { companyId: input.companyId, issueId: input.issueId, runId: input.originRunId });
+  const cards = Array.isArray(carried.interactionIds) ? carried.interactionIds.filter((id): id is string => typeof id === "string") : [];
+  return cards.length ? { attributionInteractionIds: cards } : {};
 }
 
 export async function enqueueWake(input: {
@@ -931,6 +947,8 @@ async function materializeDecisionEffect(input: {
       reason: "issue_status_changed",
       idempotencyKey: `native-status:${input.decisionId}:retry`,
       originRunId: input.runId,
+      contextSnapshot: await nativeContinuationCardAnswerAttribution(input.tx, {
+        companyId: input.companyId, issueId: input.issue.id, originRunId: input.runId }),
       payload: {
         nativeDecisionId: input.decisionId,
         retryCause: effect.cause,

@@ -362,6 +362,7 @@ function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean
     context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
     // A person's card answer is the run's own input too: the answer-resume run's interactionId, a carry's interactionIds.
     context.interactionId, ...(Array.isArray(context.interactionIds) ? context.interactionIds : []),
+    ...(Array.isArray(context.attributionInteractionIds) ? context.attributionInteractionIds : []),
   ];
   return ids.includes(messageId);
 }
