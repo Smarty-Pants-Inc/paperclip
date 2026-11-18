@@ -136,6 +136,7 @@ import {
   readTruncatedCompletedAgentMessageItemId,
   readTruncatedCompletedAssistantMessageCandidate,
   selectHeartbeatRunFinalAgentMessage,
+  type CompletedFinalAgentMessageCandidate,
   type RunPresentationDecision,
 } from "../heartbeat-run-summary.js";
 import {
@@ -2450,7 +2451,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
   async function findLatestCompletedFinalAgentMessage(
     runId: string,
     companyId: string,
-  ) {
+  ): Promise<(CompletedFinalAgentMessageCandidate & { reasonCode?: string }) | null> {
     const rows = await db
       .select({
         seq: heartbeatRunEvents.seq,
