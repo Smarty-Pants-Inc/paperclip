@@ -169,7 +169,7 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.textContent).toContain("Second queued message");
   });
 
-  it("renders every later-wake message with safe controls and its own deletion target", async () => {
+  it("supersedes(renders every later-wake message with safe controls and its own deletion target; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
     const entries = [queue.entries[0],
       { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" },
       { ...queue.entries[1], comment: { ...queue.entries[1].comment, id: "comment-3", body: "Third queued message" },
@@ -181,8 +181,10 @@ describe("TaskChatQueuedMessages", () => {
     for (const id of ["comment-2", "comment-3"]) {
       const row = container.querySelector(`[data-testid="task-chat-queued-message-${id}"]`)!;
       const edit = row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-edit-${id}"]`)!;
-      expect(edit.disabled).toBe(true);
-      expect(edit.title).toBe("Edit it after /new starts");
+      expect(edit.disabled).toBe(false);
+      expect(edit.title).toBe("Edit message");
+      await act(async () => edit.click());
+      expect(props.onEdit).toHaveBeenCalledWith(id);
       const discard = row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${id}"]`)!;
       expect(discard.disabled).toBe(false);
       await act(async () => discard.click());
@@ -192,6 +194,26 @@ describe("TaskChatQueuedMessages", () => {
     }
     expect(props.onDiscard).toHaveBeenCalledTimes(2);
     expect(container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.disabled).toBe(false);
+  });
+
+  it("offers later-wake Edit, Interrupt now and reorder before /new", () => {
+    render({ queue: { ...queue, entries: [queue.entries[0],
+      { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" }] }, onInterrupt: vi.fn() });
+    for (const action of ["edit", "interrupt", "grip"]) {
+      expect(container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-${action}-comment-2"]`)?.disabled).toBe(false);
+    }
+  });
+
+  it.each(["reset", "behindReset", "acknowledged", "started"])("disables Edit on a %s row", kind => {
+    const entry = { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2",
+      ...(kind === "reset" ? { comment: { ...queue.entries[1].comment, body: "/new" } } : {}),
+      ...(kind === "behindReset" ? { behindReset: true } : {}),
+      ...(["acknowledged", "started"].includes(kind) ? { canEdit: false } : {}) };
+    const props = render({ queue: { ...queue, entries: [queue.entries[0], entry] } });
+    const button = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-edit-comment-2"]')!;
+    expect(button.disabled).toBe(true);
+    button.click();
+    expect(props.onEdit).not.toHaveBeenCalled();
   });
 
   // SUPERSEDE: "does not offer a reorder across distinct chat wakes".
@@ -215,6 +237,9 @@ describe("TaskChatQueuedMessages", () => {
           await issuesApi.reorderQueuedComments(candidate.issueId, { orderedCommentIds: ids, revision, queueId: candidate.queueId! });
         } finally { completed.resolve(); }
       } });
+      // A sensor callback alone bypasses a disabled button. Prove the
+      // person's later-wake drag can actually begin before invoking it.
+      expect(container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-grip-comment-2"]')?.disabled).toBe(false);
       await act(async () => {
         dragSensor.end!({ active: { id: "comment-2" }, over: { id: "comment-1" } } as DragEndEvent);
         await completed.promise;
@@ -229,7 +254,7 @@ describe("TaskChatQueuedMessages", () => {
     });
   });
 
-  it.each(["chat", "task"] as const)("restores the order and exact rollback bytes after a Stop-crossing HTTP 409 for %s", async kind => {
+  it.each(["chat", "task"] as const)("shows RFL's named Stop-line sentence and restores order after queued_comment_stop_line_crossing HTTP 409 for %s", async kind => {
     const stop = new Date("2026-11-18T08:00:00.000Z").getTime();
     const candidate: IssueQueuedCommentQueue = { ...queue, targetRunId: null, entries: queue.entries.map((entry, position) => ({
       ...entry, deliveryIntent: "queue",
@@ -264,10 +289,10 @@ describe("TaskChatQueuedMessages", () => {
       } }]);
       expect(shown()).toEqual(["comment-1", "comment-2"]);
       const rollback = [...container.querySelectorAll('[role="status"]')]
-        .find(node => node.textContent === "Couldn’t reorder. Previous order restored.");
-      expect(rollback?.textContent).toBe("Couldn’t reorder. Previous order restored.");
+        .find(node => node.textContent === "Messages sent before and after you pressed Stop can't swap places. Previous order restored.");
+      expect(rollback?.textContent).toBe("Messages sent before and after you pressed Stop can't swap places. Previous order restored.");
       expect(Buffer.from(rollback!.textContent!, "utf8").toString("hex")).toBe(
-        "436f756c646ee28099742072656f726465722e2050726576696f7573206f7264657220726573746f7265642e");
+        Buffer.from("Messages sent before and after you pressed Stop can't swap places. Previous order restored.", "utf8").toString("hex"));
       expect(container.textContent).not.toContain("The queue changed in another session");
     });
   });

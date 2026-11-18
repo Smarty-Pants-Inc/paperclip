@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import express from "express";
 import request from "supertest";
 import { and, asc, eq, sql } from "drizzle-orm";
@@ -6,6 +12,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agentWakeupRequests,
   agents,
+  authUsers,
   companies,
   companyMemberships,
   createDb,
@@ -25,7 +32,7 @@ import {
   undeliveredConversationComments,
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
-import { runningProcesses } from "../adapters/index.js";
+import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -59,6 +66,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-chat-steering-");
     db = createDb(tempDb.connectionString);
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    await db.insert(authUsers).values({ id: owner, name: "Chat owner", email: "chat-owner@example.test", emailVerified: true,
+      createdAt: new Date(), updatedAt: new Date() });
   }, 60_000);
 
   afterEach(async () => {
@@ -72,6 +81,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   });
 
   afterAll(async () => {
+    await db?.delete(authUsers).where(eq(authUsers.id, owner));
     await db?.$client.end();
     await tempDb?.cleanup();
   });
@@ -110,6 +120,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     await db.insert(companyMemberships).values([owner, "other-operator"].map((principalId) => ({
       companyId, principalType: "user", principalId, status: "active", membershipRole: "operator",
     })));
+    await ensureHumanRoleDefaultGrants(db, { companyId, principalId: owner,
+      membershipRole: "operator", grantedByUserId: null });
     const issue = await issueService(db).create(companyId, {
       title: "Conversation",
       conversationAgentId: agentId,
@@ -185,19 +197,105 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     return issue!;
   }
 
-  // RED 1: one deferred wake for plain chat messages.
-  it("keeps plain chat messages sent during a turn in one ordered queue the owner can see and edit", async () => {
+  /** Real admission + process-adapter drain. Replies record the exact carried
+   * input ids and session; no saved wake shape is assumed by this witness. */
+  async function drainVisibleQueue(chat: Chat, expected: string[], deleted: string[] = [], selectedId?: string) {
+    const seen: { runId: string; ids: string[]; generation: number; input: string }[] = [];
+    const adapter = getServerAdapter("process");
+    const received = new Map<string, Record<string, unknown>>();
+    registerServerAdapter({ ...adapter, execute: async ctx => {
+      received.set(ctx.runId, structuredClone(ctx.context));
+      return adapter.execute(ctx);
+    } });
+    const responder = createServer(async (req, res) => {
+      try {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        const { runId } = JSON.parse(body);
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const context = run!.contextSnapshot as Record<string, any>;
+        const ids: string[] = context.wakeCommentIds ?? [context.wakeCommentId ?? context.commentId];
+        seen.push({ runId, ids, generation: context.conversationSessionGeneration,
+          input: JSON.stringify(received.get(runId)) });
+        await issueService(db).addComment(chat.issue.id, JSON.stringify({ answers: ids }),
+          { agentId: chat.agentId, runId });
+        res.end("ok");
+      } catch (error) { res.statusCode = 500; res.end(String(error)); }
+    });
+    responder.listen(0, "127.0.0.1");
+    await once(responder, "listening");
+    const port = (responder.address() as { port: number }).port;
+    const script = `fetch("http://127.0.0.1:${port}/reply",{method:"POST",body:JSON.stringify({runId:process.env.PAPERCLIP_RUN_ID})}).then(async r=>{if(!r.ok)throw Error(await r.text())})`;
+    const heartbeat = heartbeatService(db);
+    const cwd = await mkdtemp(join(tmpdir(), "chat-queue-witness-"));
+    try {
+      await db.update(agents).set({ adapterConfig: { command: process.execPath, args: ["-e", script], cwd },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } }).where(eq(agents.id, chat.agentId));
+      if (selectedId) {
+        runningProcesses.delete(chat.runId);
+        await db.update(heartbeatRuns).set({ runtimeMode: "legacy" }).where(eq(heartbeatRuns.id, chat.runId));
+      } else {
+        await finishTurn(chat);
+        runningProcesses.delete(chat.runId);
+      }
+      const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
+      if (selectedId) expect(queue.entries.map((entry: any) => entry.comment.id).sort()).toEqual([...expected].sort());
+      else expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual(expected);
+      await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
+        .send({ queueId: queue.queueId, revision: queue.revision,
+          targetRunId: selectedId ? chat.runId : null, ...(selectedId ? { commentId: selectedId } : {}) }).expect(200);
+      const deadline = Date.now() + 20_000;
+      while (true) {
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, chat.agentId));
+        const waiting = await deferredWakes(chat);
+        if (!waiting.length && !runs.some(run => ["running", "queued"].includes(run.status))) break;
+        if (Date.now() > deadline) throw Error(JSON.stringify({ seen, waiting, runs }));
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, chat.issue.id));
+      const byId = new Map(comments.map(comment => [comment.id, comment]));
+      const messages = expected.filter(id => !/^\s*\/new\s*$/.test(byId.get(id)!.body));
+      expect(seen.flatMap(turn => turn.ids)).toEqual(messages);
+      expect(new Set(seen.flatMap(turn => turn.ids)).size).toBe(messages.length);
+      const replies = comments.filter(comment => seen.some(turn => turn.runId === comment.createdByRunId));
+      expect(replies).toHaveLength(seen.length);
+      for (const turn of seen) {
+        const reply = replies.find(comment => comment.createdByRunId === turn.runId)!;
+        expect(JSON.parse(reply.body).answers).toEqual(turn.ids);
+        for (const id of turn.ids) {
+          expect(await answered(id)).toBe(true);
+          const reset = expected.findIndex(id => /^\s*\/new\s*$/.test(byId.get(id)!.body));
+          expect(turn.generation).toBe(reset >= 0 && expected.indexOf(id) > reset ? 1 : 0);
+        }
+      }
+      for (const id of deleted) {
+        expect(seen.flatMap(turn => turn.ids)).not.toContain(id);
+        expect(await answered(id)).toBe(false);
+      }
+      expect((await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body.entries).toEqual([]);
+      return seen;
+    } finally {
+      await heartbeat.cancelActiveForAgent(chat.agentId).catch(() => undefined);
+      await heartbeat.drainActiveRunExecutions();
+      registerServerAdapter(adapter);
+      responder.closeAllConnections();
+      await new Promise<void>((resolve, reject) => responder.close(error => error ? reject(error) : resolve()));
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }
+
+  // RFL SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118: outcomes, not persisted wake count.
+  it("supersedes(keeps plain chat messages sent during a turn in one ordered queue the owner can see and edit; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
     const chat = await seedChat();
     const sent = await send(chat, ["Second", "Third", "Fourth"]);
     const wakes = await deferredWakes(chat);
-    expect(wakes).toHaveLength(1);
-    expect(wakeCommentIds(wakes[0]!)).toEqual(sent.map((comment) => comment.id));
     expect(await undeliveredConversationComments(db, chat.companyId, chat.issue.id)).toHaveLength(0);
     const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
     expect(queue.body.queueId).toBe(wakes[0]!.id);
     expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map((comment) => comment.id));
     expect(queue.body.entries.every((entry: any) => entry.canEdit && entry.canDiscard)).toBe(true);
-  });
+    await drainVisibleQueue(chat, sent.map(comment => comment.id));
+  }, 30_000);
 
   // RED 2 (guard part): a reset is never merged, in either direction.
   it("never merges a chat message across a /new reset (guard)", async () => {
@@ -208,14 +306,14 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   });
 
   // RED 2 + RFL (2) merge boundary: plain runs merge on each side of a reset only.
-  it("merges plain messages on each side of a /new without crossing it", async () => {
+  it("supersedes(merges plain messages on each side of a /new without crossing it; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
     const chat = await seedChat();
     const sent = await send(chat, ["One", "Two", "/new", "Three", "Four"]);
-    const wakes = await deferredWakes(chat);
-    expect(wakes.map(wakeCommentIds)).toEqual([
-      [sent[0]!.id, sent[1]!.id], [sent[2]!.id], [sent[3]!.id, sent[4]!.id],
-    ]);
-  });
+    const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
+    expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map(comment => comment.id));
+    expect(queue.entries.map((entry: any) => Boolean(entry.behindReset))).toEqual([false, false, true, true, true]);
+    await drainVisibleQueue(chat, sent.map(comment => comment.id));
+  }, 30_000);
 
   // RED 3: reorder works on a chat.
   it("reorders the queued messages of a chat", async () => {
@@ -304,14 +402,13 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   });
 
   // RFL (3): merged messages are each answered once, none lost, none doubled.
-  it("answers each merged message once: none lost and none doubled", async () => {
+  it("supersedes(answers each merged message once: none lost and none doubled; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
     const chat = await seedChat();
     const sent = await send(chat, ["Second", "Third", "Fourth"]);
     // A repeated delivery pass is idempotent.
     await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
-    const wakes = await deferredWakes(chat);
-    expect(wakes).toHaveLength(1);
-    expect(wakeCommentIds(wakes[0]!)).toEqual(sent.map((comment) => comment.id));
+    const queue = (await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200)).body;
+    expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map(comment => comment.id));
     for (const comment of sent) {
       const receipts = await db.select().from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, chat.companyId),
@@ -319,21 +416,20 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       ));
       expect(receipts).toHaveLength(1);
     }
-    // The next turn carries the merged queue's saved context: one run answers all three.
-    await finishTurn(chat);
-    const deferredContext = (wakes[0]!.payload as Record<string, any>)._paperclipWakeContext;
-    const [nextRun] = await db.insert(heartbeatRuns).values({
-      companyId: chat.companyId, agentId: chat.agentId, status: "running", runtimeMode: "native",
-      contextSnapshot: deferredContext,
-    }).returning();
-    await db.update(issues).set({ executionRunId: nextRun!.id }).where(eq(issues.id, chat.issue.id));
-    const prepared = await prepareConversationTurn(db, nextRun!);
-    expect(prepared.reset).toBe(false);
     for (const comment of sent) expect(await answered(comment.id)).toBe(false);
-    const issue = await finishTurn({ ...chat, runId: nextRun!.id });
+    const order = sent.map(comment => comment.id).reverse();
+    await request(app(chat.companyId)).put(`/api/issues/${chat.issue.id}/queued-comments/order`)
+      .send({ queueId: queue.queueId, revision: queue.revision, orderedCommentIds: order }).expect(200);
+    const turns = await drainVisibleQueue(chat, order);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, chat.agentId));
+    for (const turn of turns) {
+      const context = runs.find(run => run.id === turn.runId)!.contextSnapshot as Record<string, any>;
+      expect(context.wakeCommentIds ?? [context.wakeCommentId]).toEqual(turn.ids);
+    }
+    const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
     expect(issue).toMatchObject({ status: "in_review", conversationState: "waiting" });
     for (const comment of sent) expect(await answered(comment.id)).toBe(true);
-  });
+  }, 30_000);
 
   // RED 6 + code-lead ORDER: only the head, never a /new, never behind a /new.
   it("refuses to steer the second entry of a chat queue without calling the provider", async () => {

@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import express from "express";
 import request from "supertest";
 import { and, asc, eq, sql } from "drizzle-orm";
@@ -6,6 +12,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agentWakeupRequests,
   agents,
+  authUsers,
   companies,
   companyMemberships,
   createDb,
@@ -25,7 +32,7 @@ import {
   undeliveredConversationComments,
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
-import { runningProcesses } from "../adapters/index.js";
+import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -61,6 +68,8 @@ describeEmbeddedPostgres("agent chat queue: every message, stored delivery inten
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-chat-queue-intent-");
     db = createDb(tempDb.connectionString);
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    await db.insert(authUsers).values({ id: owner, name: "Chat owner", email: "chat-owner@example.test", emailVerified: true,
+      createdAt: new Date(), updatedAt: new Date() });
   }, 60_000);
 
   afterEach(async () => {
@@ -74,6 +83,7 @@ describeEmbeddedPostgres("agent chat queue: every message, stored delivery inten
   });
 
   afterAll(async () => {
+    await db?.delete(authUsers).where(eq(authUsers.id, owner));
     await db?.$client.end();
     await tempDb?.cleanup();
   });
@@ -99,7 +109,7 @@ describeEmbeddedPostgres("agent chat queue: every message, stored delivery inten
   }
 
   /** A chat whose first message is being answered by a running native turn. */
-  async function seedChat() {
+  async function seedChat(initialProcessCwd?: string) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -107,11 +117,17 @@ describeEmbeddedPostgres("agent chat queue: every message, stored delivery inten
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(agents).values({
-      id: agentId, companyId, name: "Chat agent", role: "engineer", status: "idle", adapterType: "process",
+      id: agentId, companyId, name: "Chat agent", role: "engineer", status: "idle",
+      adapterType: initialProcessCwd ? "codex_local" : "process",
+      ...(initialProcessCwd ? { adapterConfig: { command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"], cwd: initialProcessCwd },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } } : {}),
     });
     await db.insert(companyMemberships).values([owner, "other-operator"].map((principalId) => ({
       companyId, principalType: "user", principalId, status: "active", membershipRole: "operator",
     })));
+    await ensureHumanRoleDefaultGrants(db, { companyId, principalId: owner,
+      membershipRole: "operator", grantedByUserId: null });
     const issue = await issueService(db).create(companyId, {
       title: "Conversation",
       conversationAgentId: agentId,
@@ -121,6 +137,32 @@ describeEmbeddedPostgres("agent chat queue: every message, stored delivery inten
       conversationState: "waiting",
     });
     const first = await issueService(db).addComment(issue.id, "First message", { userId: owner });
+    if (initialProcessCwd) {
+      const heartbeat = heartbeatService(db);
+      try {
+        const run = await heartbeat.wakeup(agentId, { source: "on_demand", reason: "issue_commented",
+          payload: { issueId: issue.id, commentId: first.id },
+          contextSnapshot: { issueId: issue.id, taskKey: issue.id, wakeCommentId: first.id, commentId: first.id },
+          requestedByActorType: "user", requestedByActorId: owner, idempotencyKey: `initial:${first.id}` });
+        if (!run) throw Error("Initial process was not admitted");
+        const deadline = Date.now() + 10_000;
+        while (true) {
+          const [started] = await db.select({ processPid: heartbeatRuns.processPid }).from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, run.id));
+          // runningProcesses is set before onSpawn persists process identity.
+          // Wait for that real startup boundary, not a partially prepared run.
+          if (runningProcesses.has(run.id) && started?.processPid) break;
+          if (Date.now() > deadline) throw Error("Initial process did not finish startup");
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return { companyId, agentId, issue, first, runId: run.id };
+      } catch (error) {
+        // The caller has not received its Chat yet, so startup owns cleanup.
+        await heartbeat.cancelActiveForAgent(agentId).catch(() => undefined);
+        await heartbeat.drainActiveRunExecutions();
+        throw error;
+      }
+    }
     const [inserted] = await db.insert(heartbeatRuns).values({
       companyId, agentId, status: "running", runtimeMode: "native",
       startedAt: new Date(),
@@ -198,6 +240,84 @@ describeEmbeddedPostgres("agent chat queue: every message, stored delivery inten
     request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/comments`)
       .send({ body, clientRequestId: randomUUID(), ...(deliveryIntent ? { deliveryIntent } : {}) });
 
+  /** Observe actual adapter input while the real HTTP + Postgres queue drains. */
+  async function drain(chat: Chat, expected: string[], deleted: string[] = [], selectedId?: string,
+    onStarted?: () => Promise<void>) {
+    const seen: { ids: string[]; input: string }[] = [];
+    const [agent] = await db.select({ adapterType: agents.adapterType }).from(agents).where(eq(agents.id, chat.agentId));
+    const adapter = getServerAdapter(agent!.adapterType);
+    const received = new Map<string, Record<string, unknown>>();
+    registerServerAdapter({ ...adapter, execute: async ctx => {
+      received.set(ctx.runId, structuredClone(ctx.context));
+      await onStarted?.();
+      return adapter.execute(ctx);
+    } });
+    const responder = createServer(async (req, res) => {
+      try {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        const { runId } = JSON.parse(body);
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const context = run!.contextSnapshot as Record<string, any>;
+        const ids: string[] = context.wakeCommentIds ?? [context.wakeCommentId ?? context.commentId];
+        seen.push({ ids, input: JSON.stringify(received.get(runId)) });
+        await issueService(db).addComment(chat.issue.id, JSON.stringify({ answers: ids }), { agentId: chat.agentId, runId });
+        res.end("ok");
+      } catch (error) { res.statusCode = 500; res.end(String(error)); }
+    });
+    responder.listen(0, "127.0.0.1");
+    await once(responder, "listening");
+    const port = (responder.address() as { port: number }).port;
+    const script = `fetch("http://127.0.0.1:${port}/reply",{method:"POST",body:JSON.stringify({runId:process.env.PAPERCLIP_RUN_ID})}).then(async r=>{if(!r.ok)throw Error(await r.text())})`;
+    const heartbeat = heartbeatService(db);
+    const cwd = await mkdtemp(join(tmpdir(), "queue-intent-witness-"));
+    try {
+      await db.update(agents).set({ adapterConfig: { command: process.execPath, args: ["-e", script], cwd },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } }).where(eq(agents.id, chat.agentId));
+      if (!selectedId) {
+        await finishTurn(chat);
+        runningProcesses.delete(chat.runId);
+      }
+      const dispatch = async () => {
+        const queue = await queueRead(chat);
+        return request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
+          .send({ queueId: queue.queueId, revision: queue.revision,
+            targetRunId: selectedId ? chat.runId : null, ...(selectedId ? { commentId: selectedId } : {}) });
+      };
+      let dispatchResponse = await dispatch();
+      // Edit may win the optimistic revision race before dispatch acquires its
+      // lock. That is a refused dispatch, not a refused edit: refresh and Send.
+      if (dispatchResponse.status === 409 && dispatchResponse.body.code === "queued_comment_revision_conflict") {
+        dispatchResponse = await dispatch();
+      }
+      expect(dispatchResponse.status, JSON.stringify(dispatchResponse.body)).toBe(200);
+      const deadline = Date.now() + 20_000;
+      while (true) {
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, chat.agentId));
+        // Promotion can happen between the runs and wakes reads. A mixed
+        // empty snapshot is not completion until all expected answers arrived.
+        if (seen.flatMap(turn => turn.ids).length >= expected.length &&
+            !(await deferredWakes(chat)).length && !runs.some(run => ["running", "queued"].includes(run.status))) break;
+        if (Date.now() > deadline) throw Error(JSON.stringify({ seen, runs, wakes: await deferredWakes(chat),
+          issue: (await db.select().from(issues).where(eq(issues.id, chat.issue.id)))[0] }));
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      expect(seen.flatMap(turn => turn.ids)).toEqual(expected);
+      expect(new Set(seen.flatMap(turn => turn.ids)).size).toBe(expected.length);
+      for (const id of expected) expect(await answered(id)).toBe(true);
+      for (const id of deleted) { expect(seen.flatMap(turn => turn.ids)).not.toContain(id); expect(await answered(id)).toBe(false); }
+      expect((await queueRead(chat)).entries).toEqual([]);
+      return seen;
+    } finally {
+      await heartbeat.cancelActiveForAgent(chat.agentId).catch(() => undefined);
+      await heartbeat.drainActiveRunExecutions();
+      registerServerAdapter(adapter);
+      responder.closeAllConnections();
+      await new Promise<void>((resolve, reject) => responder.close(error => error ? reject(error) : resolve()));
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }
+
   // org RED (Paul's real case): five waiting messages are five rows, never one.
   it("lists all five waiting messages of a chat, in the order sent", async () => {
     const chat = await seedChat();
@@ -206,17 +326,14 @@ describeEmbeddedPostgres("agent chat queue: every message, stored delivery inten
     expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map((comment) => comment.id));
   });
 
-  it("lists all five waiting messages when a /new sits among them, and marks the /new boundary", async () => {
+  it("supersedes(lists all five waiting messages when a /new sits among them, and marks the /new boundary; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
     const chat = await seedChat();
     const sent = await send(chat, ["One", "Two", "/new", "Three", "Four"]);
     const queue = await queueRead(chat);
     expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map((comment) => comment.id));
     expect(queue.entries.map((entry: any) => Boolean(entry.behindReset))).toEqual([false, false, true, true, true]);
     expect(queue.entries.map((entry: any) => entry.deliveryIntent)).toEqual(["steer", "steer", "queue", "steer", "steer"]);
-    // A row behind the head wake names its own wake, so its own Edit/Delete target it.
-    const wakes = await deferredWakes(chat);
-    expect(queue.entries.map((entry: any) => entry.queueId ?? queue.queueId))
-      .toEqual([wakes[0]!.id, wakes[0]!.id, wakes[1]!.id, wakes[2]!.id, wakes[2]!.id]);
+    await drain(chat, [sent[0]!.id, sent[1]!.id, sent[3]!.id, sent[4]!.id]);
   });
 
   // D3: the mode is stored on the server, set at create.
@@ -318,7 +435,7 @@ describeEmbeddedPostgres("agent chat queue: every message, stored delivery inten
     },
   );
 
-  it("reorders the head wake and deletes a row behind a /new, answering with the whole chat queue each time", async () => {
+  it("supersedes(reorders the head wake and deletes a row behind a /new, answering with the whole chat queue each time; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
     const chat = await seedChat();
     const [one, two, reset, behind] = await send(chat, ["One", "Two", "/new", "Behind"]);
     const queue = await queueRead(chat);
@@ -330,25 +447,112 @@ describeEmbeddedPostgres("agent chat queue: every message, stored delivery inten
     const deleted = await request(app(chat.companyId)).delete(`/api/issues/${chat.issue.id}/queued-comments/${behind!.id}`)
       .send({ queueId: row.queueId, revision: row.queueRevision });
     expect(deleted.status, JSON.stringify(deleted.body)).toBe(200);
-    expect(deleted.body.queueId).toBe(queue.queueId);
     expect(deleted.body.entries.map((entry: any) => entry.comment.id)).toEqual([two!.id, one!.id, reset!.id]);
+    expect(deleted.body.entries.some((entry: any) => entry.comment.id === behind!.id)).toBe(false);
+    await drain(chat, [two!.id, one!.id], [behind!.id]);
   });
 
-  it("Interrupt now on one row sends that message first and keeps the rest queued, in order", async () => {
-    const chat = await seedChat();
-    const [one, two, three] = await send(chat, ["One", "Two", "Three"]);
-    // Keep the successor from starting a model in this test: the agent's only slot is taken.
-    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, chat.agentId));
-    runningProcesses.delete(chat.runId);
-    // This harness has no native cancellation binding; the stop itself is the existing Interrupt's, tested elsewhere.
-    await db.update(heartbeatRuns).set({ runtimeMode: "legacy" }).where(eq(heartbeatRuns.id, chat.runId));
+  it("supersedes(Interrupt now on one row sends that message first and keeps the rest queued, in order; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "queue-interrupt-source-"));
+    // A conversational adapter owns normal Stop -> next-turn admission. Use a
+    // real child as its deterministic execution boundary, without provider auth.
+    const conversationAdapter = getServerAdapter("codex_local");
+    registerServerAdapter({ ...conversationAdapter, execute: getServerAdapter("process").execute });
+    let chat: Chat | undefined;
+    try {
+      chat = await seedChat(cwd);
+      const [one, two, three] = await send(chat, ["One", "Two", "Three"]);
+      expect((await queueRead(chat)).entries.map((entry: any) => entry.comment.id)).toEqual([one!.id, two!.id, three!.id]);
+      const started = Date.now();
+      const turns = await drain(chat, [two!.id, one!.id, three!.id], [], two!.id);
+      expect(turns[0]?.ids).toEqual([two!.id]);
+      console.log("QUEUE_INTERRUPT_WITNESS", JSON.stringify({ selected: two!.id,
+        answered: turns.map(turn => turn.ids), elapsedMs: Date.now() - started }));
+    } finally {
+      if (chat) await heartbeatService(db).cancelActiveForAgent(chat.agentId).catch(() => undefined);
+      await heartbeatService(db).drainActiveRunExecutions();
+      registerServerAdapter(conversationAdapter);
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  const edit = async (chat: Chat, commentId: string, body: string, target?: any) => {
     const queue = await queueRead(chat);
-    const response = await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
-      .send({ queueId: queue.queueId, targetRunId: chat.runId, revision: queue.revision, commentId: two!.id });
-    expect(response.status, JSON.stringify(response.body)).toBe(200);
-    const [interrupted] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queue.queueId));
-    expect(wakeCommentIds(interrupted!)).toEqual([two!.id]);
-    const rest = (await deferredWakes(chat)).filter((wake) => wake.id !== queue.queueId);
-    expect(rest.map(wakeCommentIds)).toEqual([[one!.id, three!.id]]);
+    const row = target ?? queue.entries.find((entry: any) => entry.comment.id === commentId);
+    return request(app(chat.companyId)).patch(`/api/issues/${chat.issue.id}/queued-comments/${commentId}`)
+      .send({ body, queueId: row?.queueId ?? queue.queueId, revision: row?.queueRevision ?? queue.revision });
+  };
+
+  it("Edit (a): ordinary later-wake edit reaches the actual answering adapter as edited text", async () => {
+    const chat = await seedChat();
+    const [one, later] = await send(chat, ["First queued", "ORIGINAL later input"]);
+    const result = await edit(chat, later!.id, "EDITED later input");
+    expect(result.status, JSON.stringify(result.body)).toBe(200);
+    const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, later!.id));
+    expect(stored!.body).toBe("EDITED later input");
+    const turns = await drain(chat, [one!.id, later!.id]);
+    const answering = turns.find(turn => turn.ids.includes(later!.id))!;
+    expect(answering.input).toContain("EDITED later input");
+    expect(answering.input).not.toContain("ORIGINAL later input");
+  }, 30_000);
+
+  it("Edit (b): a started run refuses Edit with no write", async () => {
+    const chat = await seedChat();
+    const [later] = await send(chat, ["Input captured at dispatch"]);
+    const before = await queueRead(chat);
+    const target = { ...before.entries[0], queueId: before.entries[0].queueId ?? before.queueId,
+      queueRevision: before.entries[0].queueRevision ?? before.revision };
+    await drain(chat, [later!.id], [], undefined, async () => {
+      const response = await edit(chat, later!.id, "Must not land", target);
+      expect(response.status).toBe(409);
+      const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, later!.id));
+      expect(stored!.body).toBe("Input captured at dispatch");
+      expect((await queueRead(chat)).entries.find((row: any) => row.comment.id === later!.id)?.canEdit ?? false).toBe(false);
+    });
+  }, 30_000);
+
+  it("Edit (b,d): an acknowledged row refuses Edit with no write", async () => {
+    const chat = await seedChat();
+    const [message] = await send(chat, ["Acknowledged original"]);
+    const before = await queueRead(chat);
+    const target = { ...before.entries[0], queueId: before.entries[0].queueId ?? before.queueId,
+      queueRevision: before.entries[0].queueRevision ?? before.revision };
+    mocks.steer.mockResolvedValueOnce({ turnId: "turn-edit" });
+    expect((await steer(chat, message!.id, target.queueId ?? (await queueRead(chat)).queueId)).status).toBe(200);
+    const response = await edit(chat, message!.id, "Must not land", target);
+    expect(response.status).toBe(409);
+    const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, message!.id));
+    expect(stored!.body).toBe("Acknowledged original");
+    expect((await queueRead(chat)).entries.some((entry: any) => entry.comment.id === message!.id)).toBe(false);
   });
+
+  it.each([1, 2])("Edit (d): disabled and refused on /new or behind it (row %i)", async index => {
+    const chat = await seedChat();
+    const sent = await send(chat, ["Before", "/new", "Behind"]);
+    const queue = await queueRead(chat);
+    expect(queue.entries[index].canEdit).toBe(false);
+    const response = await edit(chat, sent[index]!.id, "Must not land");
+    expect(response.status).toBe(409);
+    const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, sent[index]!.id));
+    expect(stored!.body).toBe(sent[index]!.body);
+  });
+
+  it("Edit (c): dispatch race either lands first or refuses; the screen matches actual answering input", async () => {
+    const chat = await seedChat();
+    const [message] = await send(chat, ["Race original"]);
+    const before = await queueRead(chat);
+    const target = { ...before.entries[0], queueId: before.entries[0].queueId ?? before.queueId,
+      queueRevision: before.entries[0].queueRevision ?? before.revision };
+    const [response, turns] = await Promise.all([
+      edit(chat, message!.id, "Race edited", target), drain(chat, [message!.id]),
+    ]);
+    expect([200, 409]).toContain(response.status);
+    const screen = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
+    const shown = screen.body.find((comment: any) => comment.id === message!.id).body;
+    console.log("QUEUE_EDIT_DISPATCH_RACE", JSON.stringify({ editStatus: response.status, shown,
+      adapterInput: turns.find(turn => turn.ids.includes(message!.id))!.input }));
+    expect(shown).toBe(response.status === 200 ? "Race edited" : "Race original");
+    expect(turns.find(turn => turn.ids.includes(message!.id))!.input).toContain(shown);
+    expect(turns.find(turn => turn.ids.includes(message!.id))!.input).not.toContain(response.status === 200 ? "Race original" : "Race edited");
+  }, 30_000);
 });
