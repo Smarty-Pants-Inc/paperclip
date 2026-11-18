@@ -42,6 +42,7 @@ import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSand
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
 import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { loadPersonStoppedRunIds, personStoppedBoxRefusedToOtherRun } from "./person-stopped-box-fence.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -1219,8 +1220,12 @@ async function waitForSettlingReusableLease(db: Db, input: {
 function reusableLeaseCanBeResumed(input: {
   lease: Pick<EnvironmentLease, "status" | "heartbeatRunId" | "metadata">;
   heartbeatRunId: string | null;
+  /** Runs a person stopped, among the candidates' runs (loadPersonStoppedRunIds). */
+  personStoppedRunIds: ReadonlySet<string>;
 }): boolean {
   if (abandonedWorkspaceFilesParked(input.lease)) return false;
+  // org purple (2): a box whose run a person stopped is never another run's.
+  if (personStoppedBoxRefusedToOtherRun(input)) return false;
   if (input.lease.status === "released" || input.lease.status === "retained") return true;
   return input.lease.status === "active" && input.heartbeatRunId !== null && input.lease.heartbeatRunId === input.heartbeatRunId;
 }
@@ -2218,15 +2223,19 @@ function createSandboxEnvironmentDriver(
           input.heartbeatRunId !== null &&
           (input.executionWorkspaceId !== null || input.issueId !== null) &&
           input.agentId !== null
-          ? (await environmentsSvc.listLeases(input.environment.id))
-              .filter((lease) =>
+          ? await (async () => {
+              const leases = (await environmentsSvc.listLeases(input.environment.id)).filter((lease) =>
                 lease.leasePolicy === "reuse_by_environment" &&
                 !reusableSandboxKeptAfterReplacement(lease) &&
-                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
                 lease.executionWorkspaceId === input.executionWorkspaceId &&
                 (input.executionWorkspaceId !== null || lease.issueId === input.issueId) &&
                 lease.metadata?.agentId === input.agentId,
-              )
+              );
+              // One read of the in-scope candidates' runs, not one per candidate.
+              const personStoppedRunIds = await loadPersonStoppedRunIds(db, leases);
+              return leases.filter(lease =>
+                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId, personStoppedRunIds }));
+            })()
           : [];
         for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
           // Protected allocations must stay out of both selection and obsolete cleanup.
@@ -2658,15 +2667,19 @@ function createSandboxEnvironmentDriver(
         input.heartbeatRunId !== null &&
         (input.executionWorkspaceId !== null || input.issueId !== null) &&
         input.agentId !== null
-          ? (await environmentsSvc.listLeases(input.environment.id))
-              .filter((lease) =>
+          ? await (async () => {
+              const leases = (await environmentsSvc.listLeases(input.environment.id)).filter((lease) =>
                 lease.leasePolicy === "reuse_by_environment" &&
                 !reusableSandboxKeptAfterReplacement(lease) &&
-                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
                 lease.executionWorkspaceId === input.executionWorkspaceId &&
                 (input.executionWorkspaceId !== null || lease.issueId === input.issueId) &&
                 lease.metadata?.agentId === input.agentId,
-              )
+              );
+              // One read of the in-scope candidates' runs, not one per candidate.
+              const personStoppedRunIds = await loadPersonStoppedRunIds(db, leases);
+              return leases.filter(lease =>
+                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId, personStoppedRunIds }));
+            })()
           : [];
       for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
         // Protected allocations must stay out of both selection and obsolete cleanup.
@@ -4128,7 +4141,7 @@ function createPluginEnvironmentDriver(
           return toEnvironmentLeaseSnapshot(lease);
         }
       }
-      const candidates = warm ? await db.select().from(environmentLeases).where(and(
+      const retainedTasks = warm ? await db.select().from(environmentLeases).where(and(
         eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.environmentId, input.environment.id),
         eq(environmentLeases.status, "retained"), eq(environmentLeases.issueId, input.issueId!),
         sql`${environmentLeases.executionWorkspaceId} IS NOT DISTINCT FROM ${input.executionWorkspaceId ?? null}::uuid`,
@@ -4137,6 +4150,12 @@ function createPluginEnvironmentDriver(
         sql`${environmentLeases.metadata}->>'driverKey' = ${parsed.config.driverKey}`,
         sql`${environmentLeases.metadata}->'portableTaskSuccessor' is null`,
       )) : [];
+      // org purple (2): a box whose run a person stopped is never another
+      // run's. It is left as it is (no inline release: the next message never
+      // waits on a provider stop) and is not counted as an owner below.
+      const personStoppedRunIds = await loadPersonStoppedRunIds(db, retainedTasks);
+      const candidates = retainedTasks.filter(lease =>
+        !personStoppedBoxRefusedToOtherRun({ lease, heartbeatRunId: input.heartbeatRunId ?? null, personStoppedRunIds }));
       if (candidates.length > 1) throw new Error("Ambiguous retained plugin task ownership");
       const previous = candidates[0];
       const previousSessionId = (previous?.metadata?.runnerTaskIdentity as { sessionId?: unknown } | undefined)?.sessionId;

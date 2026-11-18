@@ -2,6 +2,7 @@ import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY } fr
 import { notifyEnvironmentConfigChange, withEnvironmentConfigChange } from "./environment-config-revision.js";
 import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
 import { inheritWarmRetentionMetadata } from "./environment-warm-retention.js";
+import { loadPersonStoppedRunIds, personStoppedBoxRefusedToOtherRun } from "./person-stopped-box-fence.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { clearRemoteWorkspaceLocationForReleasedLease } from "./remote-workspace-snapshot-retention.js";
 import { notifyNativeEnvironmentSettlement } from "./native-environment-settlement-notifications.js";
@@ -1664,6 +1665,15 @@ export function environmentService(db: Db) {
                 if (retired.length !== 1) {
                   throw conflict(
                     "Reusable sandbox lease ownership changed during acquisition.",
+                  );
+                }
+                // org purple (2) mirror of selection (reusableLeaseCanBeResumed):
+                // a box whose run a person stopped is never another run's; the
+                // throw rolls the retirement back.
+                if (personStoppedBoxRefusedToOtherRun({ lease: retired[0]!, heartbeatRunId: input.heartbeatRunId ?? null,
+                  personStoppedRunIds: await loadPersonStoppedRunIds(tx, retired) })) {
+                  throw conflict(
+                    "Reusable sandbox lease belongs to a run a person stopped; another run may not resume it.",
                   );
                 }
                 const handoff = createReusableLeaseHandoff(retired[0]!, { ...values, id: replacementLeaseId! });
