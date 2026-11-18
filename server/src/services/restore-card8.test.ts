@@ -172,6 +172,11 @@ const FAILURE_WORDS = /could not recover|could not be put back|restore failed/i;
     expect(shown?.retryWait?.message ?? "").toMatch(RECOVERING);
     const answer = await retry(f) as Record<string, any>;
     expect(answer).toMatchObject({ accepted: true, held: { message: shown!.retryWait!.message } });
+    // fam-retry-c3fix item 1 (rf-3 #1): AFTER the accepted held click the card
+    // still says the hold's words (held, no Retry), never an empty 'working'.
+    const after = await card(f);
+    expect(after).toMatchObject({ canRetry: false, retryAdmission: "held",
+      retryWait: { message: shown!.retryWait!.message } });
   }, 120_000);
   it("fam-retry-r2: J5 NEGATIVE stop wait under the bound is refused on card and API with the same words, never held", async () => {
     const f = await seedOwed();

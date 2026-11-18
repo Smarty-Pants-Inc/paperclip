@@ -98,3 +98,26 @@ describe("chat card with a standing notice (C9 G1)", () => {
     expect(container.querySelector('[data-testid="task-execution-retry"]')).toBeNull();
   });
 });
+
+// fam-retry-c3fix item 1 (rf-3 #1): the server's accept-held projection before
+// the click (failed + held) and AFTER the accepted held click (its deferred
+// intent: working + held, task-interruption-presentation.ts) renders the hold's
+// words as the card's status, with no Retry button and never an empty card.
+describe("accept-held card before and after the click", () => {
+  let root: Root;
+  let container: HTMLDivElement;
+  const retry = vi.fn();
+  const HOLD = "Recovering your saved work; your message is kept and runs when it's back.";
+  beforeEach(() => { retry.mockReset(); container = document.createElement("div"); document.body.append(container); root = createRoot(container); });
+  afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
+  const held = { retryAdmission: "held" as const, retryWait: { reason: "workspace_repair_required", message: HOLD } };
+  it.each([
+    ["before", { ...failed, canRetry: false, ...held }],
+    ["after", { ...failed, intentId: "accepted-intent", state: "working" as const, canRetry: false, ...held }],
+  ])("%s the click: the hold's words, no Retry", async (_phase, presentation) => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={presentation as TaskInterruptionPresentation} canRetry onRetry={retry} />));
+    expect(container.querySelector('[data-testid="task-execution-held"]')?.textContent).toBe(HOLD);
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(HOLD);
+    expect(container.querySelector('[data-testid="task-execution-retry"]')).toBeNull();
+  });
+});
