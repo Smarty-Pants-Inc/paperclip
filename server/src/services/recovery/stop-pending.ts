@@ -4,6 +4,7 @@ import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { logActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
+import { PROVIDER_POLICY_REFUSAL_CODE } from "../native-runtime/native-provider-failure.js";
 
 const STOP_PENDING_CODE = "execution_stop_pending";
 export const STOP_PENDING_SCHEMA = "paperclip.task-stop-pending.v1";
@@ -111,7 +112,16 @@ async function notify(tx: Db, input: TaskBinding) {
  * The existing recovery-action projection is durable even for an unassigned
  * task or a historical run without issue context. No task workflow state changes. */
 export async function recordTaskStopPending(tx: Db, input: TaskBinding & { source: string }, publications: ActivityPublication[]) {
-  const runIds = [...new Set(input.runIds)].sort();
+  const boundRunIds = [...new Set(input.runIds)].sort();
+  const boundRuns = boundRunIds.length ? await tx.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, boundRunIds),
+  )) : [];
+  // A provider refusal is not a Stop request. Suppress only that diagnostic,
+  // never the underlying execution claims or any genuinely requested Stop.
+  const noStopRefusals = new Set(boundRuns.filter(run => run.status === "failed"
+    && run.errorCode === PROVIDER_POLICY_REFUSAL_CODE && !hasRecordedStopRequest(run)).map(run => run.id));
+  const runIds = boundRunIds.filter(id => !noStopRefusals.has(id));
+  if (!runIds.length) return;
   // Do not recreate a retired no-Stop card on every tick while the old lease
   // remains held. A later answer does not release either execution claim.
   if (await laterSuccessfulTaskRun(tx, { ...input, runIds })) return;
