@@ -8,7 +8,8 @@ describe("explicit diagnostic credential forms", () => {
   });
   it("masks standalone bearer values and whitespace-prefixed JSON token headers", () => {
     const jwt = `${Buffer.from(' {"alg":"HS256","typ":"JWT"}').toString("base64url")}.abcdefghijk.abcdefghijkl`;
-    expect(redactSensitiveText("provider said Bearer abcdefghijkl")).not.toContain("abcdefghijkl");
+    // supersedes("provider said Bearer abcdefghijkl" masked; RFL record SUPERSEDE-BEARER-PROSE-1117): an all-letter word is prose under the allowlist (the accepted residual); a credential-shaped value with digits stays masked.
+    expect(redactSensitiveText("provider said Bearer abc123def456")).not.toContain("abc123def456");
     expect(redactEventPayload({ diagnostic: jwt })?.diagnostic).toBe("***REDACTED***");
     expect(redactSensitiveText("Use bearer authentication and bearer tokens.")).toBe("Use bearer authentication and bearer tokens.");
   });
