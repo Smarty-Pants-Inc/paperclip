@@ -1,3 +1,4 @@
+import { reportRecoverSavedFilesShown } from "@/lib/recover-saved-files-control";
 import { useLayoutEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { IssueRecoveryAction, WorkspaceSourceInspection } from "@paperclipai/shared";
@@ -17,6 +18,14 @@ import { Textarea } from "./ui/textarea";
 
 /** Reports whether this surface owns the task's next recovery action. The task's
  * generic Retry stays hidden only while this surface offers its own control. */
+function ReportRecoverButton({ issueId, shown }: { issueId: string; shown: boolean }) {
+  useLayoutEffect(() => {
+    reportRecoverSavedFilesShown(issueId, shown);
+    return () => reportRecoverSavedFilesShown(issueId, false);
+  }, [issueId, shown]);
+  return null;
+}
+
 function ReportRecoveryControl({ owns, onChange }: { owns: boolean; onChange?: (owns: boolean) => void }) {
   useLayoutEffect(() => {
     onChange?.(owns);
@@ -361,8 +370,11 @@ function RetainedFilesRecovery({ action, issueId, companyId, className, onRecove
   // `waiting` already excludes a failed accepted request, so the reason stays
   // visible after a failed attempt and hides only while recovery is running.
   const unverified = Boolean(current && !verified && !saved && !waiting);
+  const recoverButtonShown = Boolean(canMutate && current && verified && retryable && !waiting && !diskFullRest
+    && (!pending || unconfirmed && checkedUnconfirmed || confirmedFailedAttempt));
   return <div className={cn("flex flex-col gap-2 text-sm", className)} data-testid="retained-file-recovery">
     <ReportRecoveryControl owns={ownsRecoveryControl} onChange={onRecoveryControlChange} />
+    <ReportRecoverButton issueId={issueId} shown={recoverButtonShown} />
     <p role="status">{saved ? "Saved files recovered. Task recovery is still being checked."
       : diskFullRest && !waiting ? "The sandbox disk was full when Paperclip saved the files. Free space, then use Retry to save them and finish the task."
       : failedReceipt ? "File recovery has not finished. The saved source remains protected."
@@ -370,7 +382,7 @@ function RetainedFilesRecovery({ action, issueId, companyId, className, onRecove
         : waiting ? "File recovery is queued. Waiting for verified saved files."
           : "The saved files need recovery before work can continue."}</p>
     {canMutate ? <>
-      {current && verified && retryable && !waiting && !diskFullRest && (!pending || unconfirmed && checkedUnconfirmed || confirmedFailedAttempt) ? <Button variant="outline" size="sm"
+      {recoverButtonShown ? <Button variant="outline" size="sm"
         className="self-start" disabled={request.isPending || check.isPending}
         onClick={() => request.mutate(confirmedFailedAttempt)}>{request.isPending ? "Requesting file recovery…"
           : confirmedFailedAttempt ? "Try file recovery again" : "Recover saved files"}</Button> : null}

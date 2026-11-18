@@ -9,7 +9,8 @@ import {
   scheduleIssueDetailPaintMeasure,
   recordIssueDetailReadiness,
 } from "@/lib/issue-detail-performance";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, readReplyFileLine, replyFileLineText, type ReplyFileLine } from "@paperclipai/shared";
+import { useRecoverSavedFilesShown } from "@/lib/recover-saved-files-control";
 import { workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
 import { credentialAccessNotice } from "@/lib/credential-access-notice";
 import type { ActivityEvent, Issue, IssueQueuedCommentQueue, TaskBrowser } from "@paperclipai/shared";
@@ -985,9 +986,47 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     [comments, interactions, linkedRunMetaById, statusRelevance, imageReceipts],
   );
 
+  // The file line of a presented reply is a bounded STATE on its run
+  // (resultJson.replyFileLine, from presentationDecision.fileLine), rendered
+  // here and never stored in the reply: it shows, changes and clears without
+  // the reply being rewritten. Keyed by the reply's comment id.
+  const replyFileLines = useMemo(() => {
+    const lines = new Map<string, { runId: string; fileLine: ReplyFileLine }>();
+    const read = (runId: string, resultJson: unknown) => {
+      const value = resultJson && typeof resultJson === "object" ? (resultJson as Record<string, unknown>).replyFileLine : null;
+      const fileLine = readReplyFileLine(value);
+      const commentId = value && typeof value === "object" ? (value as Record<string, unknown>).commentId : null;
+      if (fileLine && typeof commentId === "string") lines.set(commentId, { runId, fileLine });
+    };
+    for (const run of linkedRuns ?? []) read(run.runId, run.resultJson);
+    for (const run of [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]) read(run.id, (run as { resultJson?: unknown }).resultJson);
+    return lines;
+  }, [linkedRuns, liveRuns, activeRun]);
+  // "Saving…" is bounded: at its deadline the line re-renders as not saved yet.
+  const [replyFileLineClock, setReplyFileLineClock] = useState(0);
+  useEffect(() => {
+    const now = Date.now();
+    const deadlines = [...replyFileLines.values()].flatMap(({ fileLine }) => {
+      const at = fileLine.state === "saving" && fileLine.deadlineAt ? Date.parse(fileLine.deadlineAt) : Number.NaN;
+      return Number.isFinite(at) && at > now ? [at] : [];
+    });
+    if (deadlines.length === 0) return;
+    const timer = setTimeout(() => setReplyFileLineClock(tick => tick + 1), Math.min(...deadlines) - now + 25);
+    return () => clearTimeout(timer);
+  }, [replyFileLines, replyFileLineClock]);
+  const recoverSavedFilesShown = useRecoverSavedFilesShown(issueId);
+  const renderedComments = useMemo(
+    () => replyFileLines.size === 0 ? projectedComments : projectedComments.map((comment) => {
+      const line = comment.deletedAt ? null : replyFileLineText(replyFileLines.get(comment.id)?.fileLine,
+        { nowMs: Date.now(), recoverSavedFilesShown });
+      return line ? { ...comment, body: `${comment.body}\n\n${line}` } : comment;
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the clock tick re-reads Date.now() at a deadline.
+    [projectedComments, replyFileLines, recoverSavedFilesShown, replyFileLineClock],
+  );
   const commentItems = useMemo(
     () =>
-      commentsToTaskChatItems(projectedComments, {
+      commentsToTaskChatItems(renderedComments, {
         agentMap,
         userLabelMap,
         userProfileMap,
@@ -996,7 +1035,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         verificationCaveatsByRunId,
       }),
     [
-      projectedComments,
+      renderedComments,
       agentMap,
       userLabelMap,
       userProfileMap,
