@@ -33,6 +33,120 @@ mod skill_edit {
         refresh_admission("close_failure", "refresh_fresh");
     }
 
+    #[test]
+    fn pi_registered_assets_and_new_contract_keep_thread() {
+        registered_asset_prepare("asset_copy");
+    }
+
+    #[test]
+    fn pi_registered_assets_do_not_hide_real_instruction_edits() {
+        registered_asset_prepare("instruction_edit");
+    }
+
+    #[test]
+    fn pi_registered_assets_do_not_hide_profile_changes() {
+        registered_asset_prepare("profile_change");
+    }
+
+    #[test]
+    fn pi_registered_assets_require_context_and_a_terminal_suffix() {
+        registered_asset_prepare("missing_context");
+        registered_asset_prepare("nonterminal_suffix");
+    }
+
+    fn registered_asset_prepare(variation: &str) {
+        let copy = |root: &str| {
+            let context = json!({"instructions": {
+                "bundle": {"rootPath": format!("{root}/readonly")},
+                "workingCopy": {"kind": "agent_files", "rootPath": root, "entryPath": "AGENTS.md"}
+            }});
+            let text = format!("original instructions\n\nYour persistent agent directory (AGENT_HOME) is {root}. This is the current turn's copy; its absolute path may change between turns. In shell commands, use the current $AGENT_HOME environment variable instead of an absolute agent-directory path from an earlier turn. Your instruction entry is AGENTS.md, relative to that directory. All supported files and subfolders there are restored across tasks and sessions, and collected after this provider stops. Write task deliverables in the task working directory. Only changed or deleted files synchronize; the last sync wins for the same file. Temporary copies are cleaned up without retaining file history. Check the save receipt before claiming persistence.\n\nRead-only instruction sibling root: {root}/readonly");
+            (context, text)
+        };
+        let (directory, mut old, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+        let (old_context, old_text) = copy("/agent-copies/run-A");
+        let (new_context, new_text) = copy("/agent-copies/run-B");
+        let state = old.state.as_mut().unwrap();
+        state.run_identity = Some(prepare_contract_identity("run-A"));
+        state.config.instructions = old_text;
+        state.pi_runtime_context = old_context;
+        old.save_state().unwrap();
+        let before = old.state.as_ref().unwrap().clone();
+        let bytes = fs::read(old.state_path()).unwrap();
+        assert!(before.thread_id.is_some());
+        assert!(before.is_settled_for_run_attachment());
+        payload["provider"]["instructions"] = json!(new_text);
+        payload["provider"]["runtimeContext"] = new_context;
+        payload["completionContract"] =
+            json!({"revision": "next-human-message", "criterionIds": ["objective"]});
+        match variation {
+            "instruction_edit" => {
+                payload["provider"]["instructions"] = json!(format!("Edited skill\n{new_text}"));
+            }
+            "profile_change" => payload["provider"]["model"] = json!("other/model"),
+            "missing_context" => payload["provider"]["runtimeContext"] = Value::Null,
+            "nonterminal_suffix" => {
+                payload["provider"]["instructions"] =
+                    json!(format!("{new_text}\nCustom instruction"));
+            }
+            "asset_copy" => {}
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            before.completion_contract,
+            completion_contract(&payload).unwrap()
+        );
+        let mut next = CodexCommandExecutor::new(&directory);
+        next.pi_launch_profile = old.pi_launch_profile.clone();
+        next.event_identity = Some(prepare_contract_identity("run-B"));
+        let result = next.execute(&Command {
+            schema: "paperclip.prp.command.v1".to_owned(),
+            command_id: "note-follow-up".to_owned(),
+            controller_seq: 1,
+            command_type: "run.prepare".to_owned(),
+            issued_at: "2026-11-14T09:00:00Z".to_owned(),
+            deadline_at: None,
+            precondition: None,
+            payload: payload.clone(),
+        });
+        if variation == "profile_change" {
+            assert!(result.is_err(), "immutable profile must still refuse");
+            assert_eq!(fs::read(old.state_path()).unwrap(), bytes);
+        } else {
+            assert_eq!(result.unwrap().result["status"], "prepared", "{variation}");
+            let after = next.state.as_ref().unwrap();
+            if variation == "asset_copy" {
+                assert_eq!(
+                    after.thread_id, before.thread_id,
+                    "a saved note must not discard Pi history"
+                );
+                assert_eq!(
+                    after.pi_runtime_context,
+                    payload["provider"]["runtimeContext"]
+                );
+            } else {
+                assert_ne!(
+                    after.thread_id, before.thread_id,
+                    "{variation}: retain the fresh-history boundary"
+                );
+            }
+            assert_eq!(
+                after.config.instructions,
+                payload["provider"]["instructions"]
+            );
+            assert_eq!(
+                after.completion_contract,
+                completion_contract(&payload).unwrap()
+            );
+            assert_eq!(after.run_identity, Some(prepare_contract_identity("run-B")));
+            let mut recovered = CodexCommandExecutor::new(&directory);
+            recovered.pi_launch_profile = old.pi_launch_profile.clone();
+            recovered.load_state_without_provider().unwrap();
+            assert_eq!(recovered.state, next.state, "{variation}: durable outcome");
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn refresh_admission(blocker: &str, expected: &str) {
         let provider = if blocker == "deferred_terminal" {
             "pi_rpc"
@@ -131,36 +245,66 @@ mod skill_edit {
         );
         if blocker == "close_failure" {
             if let Ok(artifacts) = std::env::var("TL07_JUDGE_ARTIFACTS") {
-                fs::write(std::path::Path::new(&artifacts).join("close-failure-receipt.json"),
-                    serde_json::to_vec_pretty(&result.as_ref().unwrap().result).unwrap()).unwrap();
+                fs::write(
+                    std::path::Path::new(&artifacts).join("close-failure-receipt.json"),
+                    serde_json::to_vec_pretty(&result.as_ref().unwrap().result).unwrap(),
+                )
+                .unwrap();
             }
         }
         assert_eq!(result.unwrap().result["status"], expected, "{blocker}");
         if expected == "prepared" {
             // Independent RFL probe: preserve the OLD checkpoint bytes somewhere
             // in its owned tree, and use a distinct file for the fresh session.
-            let artifacts = std::env::var("TL07_JUDGE_ARTIFACTS").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-                let dir = std::env::temp_dir().join(format!("tl07-judge-{}", std::process::id()));
-                fs::create_dir_all(&dir).unwrap();
-                dir
-            });
-            fs::write(artifacts.join(format!("trace-{blocker}-before.json")), &bytes).unwrap();
+            let artifacts = std::env::var("TL07_JUDGE_ARTIFACTS")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    let dir =
+                        std::env::temp_dir().join(format!("tl07-judge-{}", std::process::id()));
+                    fs::create_dir_all(&dir).unwrap();
+                    dir
+                });
+            fs::write(
+                artifacts.join(format!("trace-{blocker}-before.json")),
+                &bytes,
+            )
+            .unwrap();
             let after = fs::read(next.state_path()).unwrap();
-            fs::write(artifacts.join(format!("trace-{blocker}-after.json")), &after).unwrap();
+            fs::write(
+                artifacts.join(format!("trace-{blocker}-after.json")),
+                &after,
+            )
+            .unwrap();
             fn checkpoint_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
                 for entry in fs::read_dir(root).unwrap() {
                     let path = entry.unwrap().path();
-                    if path.is_dir() { checkpoint_files(&path, out); }
-                    else if path.is_file() { out.push(path); }
+                    if path.is_dir() {
+                        checkpoint_files(&path, out);
+                    } else if path.is_file() {
+                        out.push(path);
+                    }
                 }
             }
             let mut paths = Vec::new();
             checkpoint_files(&directory, &mut paths);
-            let retained: Vec<_> = paths.iter().filter(|path| fs::read(path).is_ok_and(|data| data == bytes)).collect();
-            fs::write(artifacts.join(format!("trace-{blocker}-inventory.txt")),
-                format!("old={}\nfresh={}\nall={paths:?}\nretained={retained:?}\n", old.state_path().display(), next.state_path().display())).unwrap();
+            let retained: Vec<_> = paths
+                .iter()
+                .filter(|path| fs::read(path).is_ok_and(|data| data == bytes))
+                .collect();
+            fs::write(
+                artifacts.join(format!("trace-{blocker}-inventory.txt")),
+                format!(
+                    "old={}\nfresh={}\nall={paths:?}\nretained={retained:?}\n",
+                    old.state_path().display(),
+                    next.state_path().display()
+                ),
+            )
+            .unwrap();
             assert!(!retained.is_empty(), "RFL trace loss: {blocker}: old checkpoint bytes are absent from {directory:?}; fresh state overwrote {}", old.state_path().display());
-            assert!(retained.iter().all(|path| **path != next.state_path()), "fresh session must write a NEW file, never the retained old trace");
+            assert!(
+                retained.iter().all(|path| **path != next.state_path()),
+                "fresh session must write a NEW file, never the retained old trace"
+            );
         }
         if expected != "prepared" {
             assert_eq!(
@@ -300,7 +444,9 @@ mod skill_edit {
             next.event_identity = Some(prepare_contract_identity("run-B"));
             next.load_state_without_provider().unwrap();
             if let Err(error) = next.prepare(&payload) {
-                eprintln!("SKILL_EDIT provider={provider} shape=no_thread_prepared REFUSED: {error}");
+                eprintln!(
+                    "SKILL_EDIT provider={provider} shape=no_thread_prepared REFUSED: {error}"
+                );
                 refusals.push(format!("{provider}: {error}"));
                 fs::remove_dir_all(directory).unwrap();
                 continue;
@@ -323,7 +469,10 @@ mod skill_edit {
             eprintln!("SKILL_EDIT provider={provider} shape=no_thread_prepared ADOPTED persisted=true retry=true");
             fs::remove_dir_all(directory).unwrap();
         }
-        assert!(refusals.is_empty(), "instructions-only refresh refused: {refusals:?}");
+        assert!(
+            refusals.is_empty(),
+            "instructions-only refresh refused: {refusals:?}"
+        );
     }
 
     #[test]
