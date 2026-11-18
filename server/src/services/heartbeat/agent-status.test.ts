@@ -5,10 +5,23 @@ import {
   issues, nativeRunFinalizations, type Db,
 } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { createHeartbeatAgentStatus, settledAgentWorkCondition } from "./agent-status.js";
+
+// Lets a race test commit a concurrent write between the settle's active-run
+// check and its agent update (the delivery signal runs between the two).
+const raceWindow = vi.hoisted(() => ({ hook: null as null | (() => Promise<void>) }));
+vi.mock("../delivery-work-notifications.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../delivery-work-notifications.js")>();
+  return { ...actual, notifyDeliveryWork: async (...args: Parameters<typeof actual.notifyDeliveryWork>) => {
+    const hook = raceWindow.hook;
+    raceWindow.hook = null;
+    if (hook) await hook();
+    return actual.notifyDeliveryWork(...args);
+  } };
+});
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_AGENT_STATUS_TEST_DATABASE_URL");
 const support = external ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -76,6 +89,54 @@ describePostgres("heartbeat agent status", () => {
 
   const reconcile = () => service.reconcileStrandedAgentStatuses(() => live);
   const agent = (id: string) => db.select().from(agents).where(eq(agents.id, id)).then(rows => rows[0]!);
+
+  describe("settleAgentAfterCommittedRun (smarty-dev#21005)", () => {
+    async function otherRun(seeded: { companyId: string; agentId: string }, status: "running" | "queued") {
+      await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
+        invocationSource: "automation", status, runtimeMode: "native" });
+    }
+    const settle = (seeded: { companyId: string; agentId: string; runId: string }) =>
+      service.settleAgentAfterCommittedRun({ id: seeded.runId, companyId: seeded.companyId, agentId: seeded.agentId });
+
+    it("idles the agent exactly once when its last active run is terminal", async () => {
+      const seeded = await seed("succeeded");
+      const first = await settle(seeded);
+      expect(first).toMatchObject({ id: seeded.agentId, status: "idle", errorReason: null });
+      const settledAt = (await agent(seeded.agentId)).updatedAt;
+      expect(await settle(seeded)).toBeNull();
+      expect(await agent(seeded.agentId)).toMatchObject({ status: "idle", updatedAt: settledAt });
+    });
+
+    it.each(["running", "queued"] as const)("never idles an agent that still has another %s run", async status => {
+      const seeded = await seed("succeeded");
+      await otherRun(seeded, status);
+      expect(await settle(seeded)).toBeNull();
+      expect(await agent(seeded.agentId)).toMatchObject({ status: "running" });
+    });
+
+    afterEach(() => { raceWindow.hook = null; });
+
+    it.each(["running", "queued"] as const)("never idles an agent whose new %s run commits after the active-run check", async status => {
+      const seeded = await seed("succeeded");
+      raceWindow.hook = () => otherRun(seeded, status);
+      expect(await settle(seeded)).toBeNull();
+      expect(raceWindow.hook).toBeNull();
+      expect(await agent(seeded.agentId)).toMatchObject({ status: "running" });
+    });
+
+    it("does not settle an agent whose run is not terminal", async () => {
+      const seeded = await seed("running");
+      expect(await settle(seeded)).toBeNull();
+      expect(await agent(seeded.agentId)).toMatchObject({ status: "running" });
+    });
+
+    it.each(["paused", "terminated"] as const)("never changes a %s agent's status", async status => {
+      const seeded = await seed("succeeded");
+      await db.update(agents).set({ status }).where(eq(agents.id, seeded.agentId));
+      expect(await settle(seeded)).toBeNull();
+      expect(await agent(seeded.agentId)).toMatchObject({ status });
+    });
+  });
 
   it("repairs a shutdown flag without inventing a heartbeat, and records the repair once", async () => {
     const { agentId, runId } = await seed();

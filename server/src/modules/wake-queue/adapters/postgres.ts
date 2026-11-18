@@ -1,3 +1,4 @@
+import { lockAgentForRunAdmission } from "../../../services/heartbeat-run-admission-lock.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
@@ -657,6 +658,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async finalizePromotedWake(input) {
+      await lockAgentForRunAdmission(tx, { companyId: input.companyId, agentId: input.deferredAgent.id });
       await notifyChatRunMilestones(tx, { companyId: input.companyId, issueId: input.issue.id });
       const newRun = await tx
         .insert(heartbeatRuns)
@@ -791,6 +793,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async queueReviewParticipantRecoveryRun({ companyId, issue, finishingRun, recoveryAgent, sessionBefore, now }) {
+      await lockAgentForRunAdmission(tx, { companyId, agentId: recoveryAgent.id });
       await notifyStatusCardIssueChange(tx, companyId);
       const executionState = parseIssueExecutionState(issue.executionState);
       const commentInput = await pendingContinuationCommentInput(tx, { companyId, issueId: issue.id, contextSnapshot: finishingRun.contextSnapshot });
@@ -883,6 +886,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       sessionBefore,
       now,
     }) {
+      await lockAgentForRunAdmission(tx, { companyId, agentId: recoveryAgent.id });
       await notifyChatRunMilestones(tx, { companyId, issueId: issue.id });
       const commentInput = await pendingContinuationCommentInput(tx, { companyId, issueId: issue.id, contextSnapshot: finishingRun.contextSnapshot });
       const wakeupRequest = await tx
