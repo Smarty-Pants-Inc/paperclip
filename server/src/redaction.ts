@@ -743,10 +743,20 @@ function redactStandaloneBearerCredentials(input: string): string {
       }
     }
 
-    const candidate = input.slice(credentialStart, end);
-    // Preserve known authentication terms after bearer, unless explicitly quoted.
-    // Named Authorization fields are already handled independently above.
-    if (/^(?:tokens?|authentication|authorization|credentials?|schemes?|flows?)[.,;:!?]?$/i.test(candidate)) continue;
+    // Only plain prose may bypass the base credential mask. Inspect the whole
+    // whitespace-delimited word, not just the credential parser's structural
+    // prefix (so `word;123` cannot pass as `word`). Quotes are never stripped,
+    // including an opening quote immediately before Bearer itself.
+    let proseEnd = credentialStart;
+    while (proseEnd < input.length && !/\s/.test(input[proseEnd])) proseEnd += 1;
+    const proseWord = input
+      .slice(credentialStart, proseEnd)
+      .replace(/[.,;:!?)\]]+$/, "");
+    if (
+      !/["'`]/.test(input[match.index - 1] ?? "") &&
+      proseWord.length < 20 &&
+      /^[A-Za-z][a-z]*(?:-[a-z]+)?$/.test(proseWord)
+    ) continue;
     if (credentialStart < copiedThrough) continue;
     parts.push(input.slice(copiedThrough, credentialStart), replacement);
     copiedThrough = end;
