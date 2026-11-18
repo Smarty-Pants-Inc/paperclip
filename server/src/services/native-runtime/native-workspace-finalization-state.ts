@@ -2,7 +2,7 @@ import { environmentLeases, executionWorkspaces, heartbeatRunEvents, heartbeatRu
 import { executionStartedEventPredicate } from "../pre-dispatch-execution-evidence.js";
 import { and, eq, exists, sql } from "drizzle-orm";
 import { hasRequiredWorkspaceRecovery, nativeRunHasNoWorkspaceAccess } from "../workspace-restore-recovery-state.js";
-import { recordRequiredWorkspaceRestoreFailure } from "../legacy-execution-recovery.js";
+import { recordRequiredWorkspaceRestoreFailure, workspaceRestoreOnlyOwed } from "../legacy-execution-recovery.js";
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import { abandonedWorkspaceFilesHeldOnLease } from "../remote-workspace-abandoned-files-hold.js";
 import { matchPreparedRemoteWorkspaceSource, preparedRemoteWorkspaceSource, type WorkspaceSourceLease } from "../remote-workspace-lifecycle.js";
@@ -40,8 +40,10 @@ export async function preserveRemoteWorkspacePreparationFailure(db: Db, lease: W
     if (options.assertOwned && run.controllerBootId !== null
       && (!run.controllerLeaseExpiresAt || run.controllerLeaseExpiresAt.getTime() <= Date.now())) return null;
     if (hasRequiredWorkspaceRecovery(run.resultJson)) return run;
+    // Setup failed on a prepared source; nothing was copied back. Only a failure
+    // the adapter already recorded on the run keeps the Retry words.
     return await recordRequiredWorkspaceRestoreFailure(tx as unknown as Db, run,
-      { workspaceRestoreFailure: "restore_failed" }, current.lease);
+      { workspaceRestoreFailure: "restore_failed" }, current.lease, { restorePending: workspaceRestoreOnlyOwed(run) });
   });
 }
 
