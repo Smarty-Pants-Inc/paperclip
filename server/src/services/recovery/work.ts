@@ -1,6 +1,5 @@
 import { registerTaskWatchdogWork } from "../task-watchdog-work.js";
 import { and, asc, eq, gt, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
-import { unionAll } from "drizzle-orm/pg-core";
 import { issueComments, issueRecoveryActions, issueRelations, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, type DeliveryQueue } from "../delivery-work-notifications.js";
@@ -321,14 +320,14 @@ export function registerIssueRecoveryWork(
         // (It reads issue_comments, not issues: it is a comment scan, budgeted
         // on its own in unanswered-person-message.test.ts, not a page load.)
         const flagged = alsoBlockedWhen && rows.length
-          // The same statement also reads the page's owed CARD ANSWERS (the card-answer duty, RFL ruling 4).
-          ? new Set((await unionAll(
-            db.select({ issueId: issueComments.issueId }).from(issueComments)
-              .where(and(inArray(issueComments.issueId, rows.map(row => row.id)), unansweredPersonMessageCommentCondition()))
-              .orderBy(asc(issueComments.issueId)).limit(PAGE_SIZE * 10),
-            db.select({ issueId: issueThreadInteractions.issueId }).from(issueThreadInteractions)
-              .where(and(inArray(issueThreadInteractions.issueId, rows.map(row => row.id)), owedCardAnswerInteractionCondition()))
-              .limit(PAGE_SIZE))).map(row => row.issueId))
+          // A second batched read, of the same shape, finds the page's owed CARD ANSWERS (the card-answer duty, RFL
+          // ruling 4): a person's answer to a card has no comment row.
+          ? new Set([...await db.select({ issueId: issueComments.issueId }).from(issueComments)
+            .where(and(inArray(issueComments.issueId, rows.map(row => row.id)), unansweredPersonMessageCommentCondition()))
+            .orderBy(asc(issueComments.issueId)).limit(PAGE_SIZE * 10),
+          ...await db.select({ issueId: issueThreadInteractions.issueId }).from(issueThreadInteractions)
+            .where(and(inArray(issueThreadInteractions.issueId, rows.map(row => row.id)), owedCardAnswerInteractionCondition()))
+            .orderBy(asc(issueThreadInteractions.issueId)).limit(PAGE_SIZE)].map(row => row.issueId))
           : null;
         return { rows: rows.map(row => ({ ...row, dueAt: Date.now(), ...(origin ? { origin } : {}),
           ...(flagged ? { unanswered: flagged.has(row.id) } : {}) })), complete, ...keepUnseen };
