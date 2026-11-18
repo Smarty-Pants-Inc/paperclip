@@ -25,7 +25,7 @@ class IdleTransport {
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 const model = (fields: Record<string, unknown>) => ({ id: "source-proof", ...fields });
 const provider = (fields: Record<string, unknown>) => ({ models: [model(fields)] });
-const resolved = (fields: Record<string, unknown>) => model({ input: ["text"], ...fields });
+const resolved = (fields: Record<string, unknown>) => model({ input: ["text"], compat: { sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" }, ...fields });
 
 async function fixture(primary: unknown, user: unknown, originalPiDir = false, managedPiDir = false, settings?: { managed?: unknown; user?: unknown }) {
   const root = await mkdtemp(join(tmpdir(), "pi-model-sources-"));

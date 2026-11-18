@@ -1,0 +1,86 @@
+[
+  {
+    "producer": "item",
+    "eventType": "item.started",
+    "kind": "agentMessage",
+    "method": "item/started",
+    "event": "item.started"
+  },
+  {
+    "producer": "item",
+    "eventType": "item.delta",
+    "kind": "agentMessage",
+    "method": "item/agentMessage/delta",
+    "event": "item.delta"
+  },
+  {
+    "producer": "item",
+    "eventType": "item.completed",
+    "kind": "agentMessage",
+    "method": "item/completed",
+    "event": "item.completed"
+  },
+  {
+    "producer": "item",
+    "eventType": "item.failed",
+    "kind": "agentMessage",
+    "method": "item/failed",
+    "event": "item.failed"
+  },
+  {
+    "producer": "item",
+    "eventType": "item.delta",
+    "kind": "reasoning",
+    "method": "item/reasoning/textDelta",
+    "event": "item.delta"
+  },
+  {
+    "producer": "item",
+    "eventType": "item.delta",
+    "kind": "tool",
+    "method": "item/delta",
+    "drop": "unsupported_generic_tool_delta"
+  },
+  {
+    "producer": "tool",
+    "eventType": "tool.execution.started",
+    "method": "item/started",
+    "event": "tool.execution.started"
+  },
+  {
+    "producer": "tool",
+    "eventType": "tool.execution.progressed",
+    "method": "item/updated",
+    "event": "tool.execution.progressed"
+  },
+  {
+    "producer": "tool",
+    "eventType": "tool.execution.completed",
+    "method": "item/completed",
+    "event": "tool.execution.completed"
+  },
+  {
+    "producer": "terminal",
+    "eventType": "turn.completed",
+    "method": "turn/completed",
+    "event": "turn.completed"
+  },
+  {
+    "producer": "terminal",
+    "eventType": "turn.failed",
+    "method": "turn/failed",
+    "event": "turn.failed"
+  },
+  {
+    "producer": "terminal",
+    "eventType": "turn.interrupted",
+    "method": "turn/interrupted",
+    "event": "turn.interrupted"
+  },
+  {
+    "producer": "terminal",
+    "eventType": "turn.cancelled",
+    "method": "turn/cancelled",
+    "event": "turn.cancelled"
+  }
+]

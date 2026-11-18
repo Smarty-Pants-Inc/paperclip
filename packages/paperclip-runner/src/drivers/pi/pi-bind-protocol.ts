@@ -36,7 +36,10 @@ export interface PiBindingConfig {
   homeDigest?: string;
 }
 export type PiJsonValue = null | boolean | number | string | PiJsonValue[] | { [key: string]: PiJsonValue };
-export type PiModelCompat = { [key: string]: PiJsonValue };
+export type PiModelCompat = { [key: string]: PiJsonValue } & {
+  sendSessionAffinityHeaders?: boolean;
+  sessionAffinityFormat?: "openai" | "openai-nosession" | "openrouter";
+};
 
 /** Lossless JSON metadata only: no prototypes, accessors, symbols, holes or cycles.
  * Shared references are fine (JSON duplicates them); only ancestor cycles fail.
@@ -64,7 +67,9 @@ export function isPiModelCompat(value: unknown): value is PiModelCompat {
       return true;
     } finally { ancestors.delete(item); }
   }
-  try { return value !== null && typeof value === "object" && !Array.isArray(value) && visit(value); }
+  try { return value !== null && typeof value === "object" && !Array.isArray(value) && visit(value)
+    && (!("sendSessionAffinityHeaders" in value) || typeof value.sendSessionAffinityHeaders === "boolean")
+    && (!("sessionAffinityFormat" in value) || value.sessionAffinityFormat === "openai" || value.sessionAffinityFormat === "openai-nosession" || value.sessionAffinityFormat === "openrouter"); }
   catch { return false; }
 }
 

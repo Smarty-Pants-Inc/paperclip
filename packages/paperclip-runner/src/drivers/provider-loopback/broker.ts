@@ -108,6 +108,15 @@ export async function startProviderLoopbackBroker(input: {
         return;
       }
       if (input.transformPayload?.(payload)) body = Buffer.from(JSON.stringify(payload), "utf8");
+      // Forward only the session-affinity routing token, never arbitrary client
+      // headers. A 1–128 byte ASCII token (alphanumeric first, then . _ - too)
+      // admits native session UUIDs and rejects whitespace, CR/LF and duplicates.
+      const routingHeaders: Record<string, string> = {};
+      const sessionId = request.headers["x-session-id"];
+      if (typeof sessionId === "string" && sessionId.length <= 128
+        && /^[A-Za-z0-9]/.test(sessionId) && !/[^A-Za-z0-9._-]/.test(sessionId)) {
+        routingHeaders["x-session-id"] = sessionId;
+      }
       refreshIdleDeadline();
       const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
         const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
@@ -119,6 +128,7 @@ export async function startProviderLoopbackBroker(input: {
             "Content-Type": "application/json",
             "Content-Length": body.length,
             ...input.adapter.upstreamHeaders({ key: input.key, auth: input.auth, incoming: request.headers }),
+            ...routingHeaders,
           },
           signal: controller.signal,
         }, resolve);
