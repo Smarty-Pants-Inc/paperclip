@@ -258,7 +258,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         const carried = new Set(seen.flatMap(turn => turn.ids));
         const sawEveryMessage = expectedMessageIds.every(id => carried.has(id));
         if (!waiting.length && !runs.some(run => ["running", "queued"].includes(run.status)) && sawEveryMessage) break;
-        if (Date.now() > deadline) throw Error(JSON.stringify({ seen, waiting, runs }));
+        if (Date.now() > deadline) throw Error(JSON.stringify({ missing: expectedMessageIds.filter(id => !carried.has(id)), seen, waiting, runs }));
         await new Promise(resolve => setTimeout(resolve, 25));
       }
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, chat.issue.id));
@@ -304,7 +304,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map((comment) => comment.id));
     expect(queue.body.entries.every((entry: any) => entry.canEdit && entry.canDiscard)).toBe(true);
     await drainVisibleQueue(chat, sent.map(comment => comment.id));
-  }, 30_000);
+  }, 60_000); // C3 (rf-5): above setup + the helper's 20 s deadline, so a failure ends in the helper's state dump
 
   // RED 2 (guard part): a reset is never merged, in either direction.
   it("never merges a chat message across a /new reset (guard)", async () => {
@@ -322,7 +322,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(queue.entries.map((entry: any) => entry.comment.id)).toEqual(sent.map(comment => comment.id));
     expect(queue.entries.map((entry: any) => Boolean(entry.behindReset))).toEqual([false, false, true, true, true]);
     await drainVisibleQueue(chat, sent.map(comment => comment.id));
-  }, 30_000);
+  }, 60_000); // C3 (rf-5): above setup + the helper's 20 s deadline, so a failure ends in the helper's state dump
 
   // RED 3: reorder works on a chat.
   it("reorders the queued messages of a chat", async () => {
@@ -438,7 +438,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
     expect(issue).toMatchObject({ status: "in_review", conversationState: "waiting" });
     for (const comment of sent) expect(await answered(comment.id)).toBe(true);
-  }, 30_000);
+  }, 60_000); // C3 (rf-5): above setup + the helper's 20 s deadline, so a failure ends in the helper's state dump
 
   // RED 6 + code-lead ORDER: only the head, never a /new, never behind a /new.
   it("refuses to steer the second entry of a chat queue without calling the provider", async () => {
