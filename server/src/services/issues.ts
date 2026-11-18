@@ -7138,7 +7138,10 @@ async function lockIssueForCommentMutation(tx: DbTransaction, commentId: string)
 /** The posted body is the accepted summary, or the whole answer that the
  * schema-capped (12,000-character) summary previews. */
 function presentsAcceptedSummary(summary: unknown, body: string): boolean {
-  return typeof summary === "string" && (summary === body || (summary.length >= 12_000 && body.startsWith(summary)));
+  if (typeof summary !== "string") return false;
+  const maskedSummary = redactSensitiveText(summary);
+  const maskedBody = redactSensitiveText(body);
+  return maskedSummary === maskedBody || (summary.length >= 12_000 && maskedBody.startsWith(maskedSummary));
 }
 
 export function issueService(db: Db) {
@@ -13774,7 +13777,12 @@ export function issueService(db: Db) {
         enabled: (await instanceSettings.getGeneral({ db: dbOrTx }))
           .censorUsernameInLogs,
       };
-      const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
+      // A person's message is source material, not agent output. Keep the
+      // existing username policy, but mask provider keys only for agent prose.
+      const redactedBody = redactCurrentUserText(
+        actor.agentId && !actor.userId ? redactSensitiveText(body) : body,
+        currentUserRedactionOptions,
+      );
       if (actor.userId && options?.clientRequestId) {
         const [existing] = await dbOrTx.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
           eq(issueComments.authorUserId, actor.userId), eq(issueComments.clientRequestId, options.clientRequestId)));
