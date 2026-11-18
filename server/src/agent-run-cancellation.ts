@@ -14,6 +14,19 @@ export function agentRunWritesRevoked(run: {
     && "state" in cancellation && cancellation.state === "requested");
 }
 
+/** The one exemption from agentRunWritesRevoked: the SERVER publishing the
+ * accepted answer of a run whose only revocation is its settled cancel. A
+ * superseded run, or a Stop that is still only requested, stays revoked. */
+export function publishesAcceptedReplyOfCancelledRun(run: {
+  status: string;
+  resultJson?: Record<string, unknown> | null;
+} | null | undefined, options: { withheldAcceptedReply?: boolean; completionReply?: boolean } | null | undefined): boolean {
+  const cancellation = run?.resultJson?.executionCancellation;
+  return options?.withheldAcceptedReply === true && options.completionReply === true && run?.status === "cancelled"
+    && !agentRunSuperseded(run)
+    && !(cancellation && typeof cancellation === "object" && "state" in cancellation && cancellation.state === "requested");
+}
+
 /**
  * Shared lock order for agent-run writes: agents FOR SHARE -> issue(s) FOR
  * UPDATE -> heartbeat_runs (FOR SHARE here, or FOR UPDATE OF heartbeat_runs in
