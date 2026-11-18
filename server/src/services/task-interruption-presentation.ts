@@ -1,11 +1,12 @@
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
-import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON } from "./execution-recovery-attempt.js";
+import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON, NATIVE_BLOCKED_WAIT_REFUSED_ACTION } from "./execution-recovery-attempt.js";
 import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-setup-command-failure.js";
 import { and, desc, eq, inArray, isNull, not, notInArray, sql, type SQL } from "drizzle-orm";
 import { unidentifiedLocalLaunchRefusals } from "./native-local-process-stop.js";
 import { nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
+import { dotRunnerBroker, externalBotStartGateBindingId } from "./dot-runner-broker.js";
 import { agents, agentWakeupRequests, approvals, chatActions, companies, environmentLeases, heartbeatRuns, issueApprovals, issueRecoveryActions,
-  issues, issueTreeHoldMembers, issueTreeHolds, nativeRunFinalizations, projects, type Db } from "@paperclipai/db";
+  caseHandoffs, issues, issueTreeHoldMembers, issueTreeHolds, nativeRunFinalizations, nativeRunResults, projects, type Db } from "@paperclipai/db";
 import { unionAll } from "drizzle-orm/pg-core";
 import { EXECUTION_RECONCILIATION_CAUSES, HEARTBEAT_RUN_STATUSES, readProviderFailure, type TaskInterruptionPresentation } from "@paperclipai/shared";
 import { captureTaskInterruptionFailure } from "../sentry.js";
@@ -23,7 +24,7 @@ import { canonicalExecutionUuid } from "./execution-identity.js";
 import { chatActionDeadline } from "./chat-action-work.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { isAcknowledgedLegacyUserStop, isQueuedDependencyWait, runStopPresentationJson } from "./run-cancellation.js";
-import { heldRetryOffersRetry } from "./task-retry-eligibility.js";
+import { heldRetryOffersRetry, taskRetryStateRefusal } from "./task-retry-eligibility.js";
 import { exhaustedNativeFinalizationCondition, savedResultRetryPendingCondition } from "./native-runtime/exhausted-finalization-retry.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON } from "../modules/run-dispatch/index.js";
@@ -43,6 +44,15 @@ const QUEUED_INTERRUPT_HANDOFF_GRACE_MS = 5 * 60_000;
 const QUEUED_INPUT_DISPATCH_GRACE_MS = 2 * 60_000;
 const AUTOMATIC_DISPOSITION_GRACE_MS = 2 * 60_000;
 const WAITING_CONTINUATION_MOVE_FORWARD_MS = 15 * 60_000;
+// A run a person asked for that has not started by this long after it became
+// STARTABLE (the agent's slot was free) is a failed start for that person: the card shows it with Retry
+// instead of "working" forever (D157/D168). Upstream's own queued-run bounds
+// are not person-facing: the dispatch redrive (queued-run-dispatch-liveness.ts:6-7)
+// only re-pokes the dispatcher, the I7 report (recovery/ownership-invariant-report.ts:150)
+// only logs, and the assigned-work sweep's stalled test (recovery/stalled-queued-run-sql.ts:28,
+// QUEUED_RUN_AGING_MS = 60 min) needs an hour plus passed-over starts.
+const PERSON_QUEUED_RUN_START_BOUND_MS = 10 * 60_000;
+const FAILED_ATTEMPT_STATUSES = new Set(["failed", "timed_out"]);
 const NO_WORK_CONTINUATION_HANDOFF_GRACE_MS = 30_000;
 const NO_WORK_CONTINUATION_CAUSES = new Set(["native_predecessor_retirement_unproven", "native_failed_before_provider_turn"]);
 
@@ -69,6 +79,10 @@ type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
   nativeFinalizationRetry?: boolean;
   /** A saved-result Retry of this succeeded run is still being applied. */
   nativeFinalizationRetryPending?: boolean;
+  /** When this succeeded native run's accepted blocked result (with an unblock action) was committed. */
+  nativeBlockedResultAt?: Date | null;
+  /** The stranded sweep REFUSED to apply that blocked result to the task (its recorded outcome). */
+  nativeBlockedRepairRefused?: boolean;
   /** The configured model id the provider rejected (native_provider_model_rejected only). */
   rejectedModel?: string | null;
   /** A cleanup-gate refusal after this run's own provider turn completed; its work is saved. */
@@ -112,7 +126,33 @@ type ProjectionState = {
   freshContinuation?: { state: "continuing"; pendingSince?: number } | { state: "scheduled"; nextCheckAt: number };
   automaticDispositionAt?: number;
   waitingContinuation?: { queuedAt: number; personRequested: boolean };
+  /** The queued run is one a person asked for (the dispatcher's own person-origin rule). */
+  personQueuedRun?: boolean;
+  /** When that queued run became startable: the agent's slot is free now and was
+   * last freed at this time (RFL S9 queued-time rule). Absent while the agent is
+   * busy, so a message waiting behind a turn is waiting, never failed. */
+  queuedRunStartableSince?: number;
+  /** A TASK-level hold the dispatcher declines every start of this task for
+   * (heartbeat/queue.ts lockIssueExecutionClaim and claimQueuedRun), read from
+   * existing rows. A Retry's fresh run would be held the same way. */
+  taskStartHold?: TaskStartHold;
   recoveryHandedToPerson?: boolean;
+};
+
+/** Task-level start holds and their true line (rf-3 / RFL 20:46Z). Not a failed
+ * start, and no Retry: a fresh run would wait on the same hold. */
+type TaskStartHold = "previous_run_running" | "previous_run_cleanup" | "previous_session_cleanup" | "case_handoff" | "agent_setup"
+  | "external_agent_setup" | "external_agent_busy";
+const taskStartHoldMessages: Record<TaskStartHold, string> = {
+  previous_run_running: "Waiting: the previous run on this task is still finishing. Your message is saved and starts after it.",
+  previous_run_cleanup: "Waiting: the previous run is still cleaning up. Your message is saved and starts when it finishes.",
+  // The existing line for this hold (heartbeat/queue.ts native_session_cleanup_settling).
+  previous_session_cleanup: NATIVE_CLEANUP_SETTLING_MESSAGE,
+  case_handoff: "Waiting: this task is being handed off. Your message is saved and starts when the handoff completes.",
+  agent_setup: "Waiting: the agent is still being set up. Your message is saved and starts when setup finishes.",
+  // heartbeat/queue.ts claimQueuedRun external-bot gate (dot.ts canStartNewWork).
+  external_agent_setup: "Waiting: this external agent's connection is not ready for new work. Your message is saved and starts when it is reconnected.",
+  external_agent_busy: "Waiting: this external agent is finishing another assignment. Your message is saved and starts after it.",
 };
 
 // A task read reports the change that made a task fail, not every later read of
@@ -251,10 +291,22 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   const base: TaskInterruptionPresentation = { intentId: wait?.id ?? null, responsibility: "system",
     state: "resolved", nextRetryAt: null, canRetry: false, userAction: null,
     sourceRunIds: [run.id], observedRunId: run.id };
-  if (["done", "cancelled"].includes(issue.status)) return base;
+  const stateRefusal = taskRetryStateRefusal(issue, run.agentId);
+  if (stateRefusal) return { ...base, responsibility: "user",
+    state: ["done", "cancelled"].includes(issue.status) ? "resolved" : "waiting_for_user",
+    userAction: ["task_reassigned", "task_unassigned"].includes(stateRefusal.reason) ? "assign_agent" : null,
+    notice: { code: stateRefusal.reason, text: stateRefusal.message },
+    retryWait: stateRefusal };
   // Retry took effect: the saved result is being applied again.
   if (run.status === "succeeded" && run.nativeFinalizationRetryPending)
     return { ...base, state: "working", recoveryStep: "finishing_recovery" };
+  // An accepted blocked result the sweep REFUSED to apply leaves the task in
+  // progress with nothing running: a failed attempt, not a resolved one (D122).
+  // The sweep's recorded refusal is the authority, never elapsed time: a
+  // healthy repair waiting on the issue lock is not a failure (rf-3 20:53Z).
+  if (run.status === "succeeded" && run.nativeBlockedResultAt && run.nativeBlockedRepairRefused
+      && issue.status === "in_progress" && !run.nativeFinalizationRetry)
+    return { ...base, state: "failed", canRetry: true };
   if (run.status === "succeeded" && !wait && !run.nativeFinalizationRetry) return base;
   const providerFailure = run.status === "failed" || run.status === "scheduled_retry"
     ? readProviderFailure(run.resultJson?.providerFailure) : null;
@@ -293,6 +345,20 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
       && Number.isFinite(interruptAt) && now - interruptAt < QUEUED_INTERRUPT_HANDOFF_GRACE_MS
       && !(retryWait?.sourceRunId === run.id && retryWait.preparationStatus) && system?.state !== "exhausted")
     return { ...base, intentId: interruptWait.id, state: "working" };
+  // A person's run that never started is a failed start, with Retry, once it
+  // has been startable for the bound; until then, and while the agent is busy
+  // with another run, it is waiting and shows working (D157/D168, RFL S9).
+  // A task-level hold declines every start of this task, a Retry's fresh run
+  // included: name the hold, never failed + Retry (RFL 20:46Z). A hold on THIS
+  // run only (fix10b: its retryOfRunId predecessor's cleanup) is not read here
+  // and keeps failed + Retry, which a fresh run without that ancestry clears.
+  if (run.status === "queued" && input.personQueuedRun && input.taskStartHold)
+    return { ...base, state: "working", canRetry: false,
+      retryWait: { reason: input.taskStartHold, message: taskStartHoldMessages[input.taskStartHold] } };
+  const startableSince = input.queuedRunStartableSince;
+  if (run.status === "queued" && input.personQueuedRun && startableSince !== undefined
+      && now - startableSince >= PERSON_QUEUED_RUN_START_BOUND_MS)
+    return { ...base, state: "failed", canRetry: true };
   const waiting = input.waitingContinuation;
   if (run.status === "queued" && waiting && !waiting.personRequested && run.agentId === issue.assigneeAgentId
       && now - waiting.queuedAt >= WAITING_CONTINUATION_MOVE_FORWARD_MS)
@@ -461,6 +527,22 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   const [runs, waits, agentRows, projectRows, pauseRows, approvalRows, companyRows, admissionWaits] = await Promise.all([
     db.select({ issueId: requestedIssueId, id: heartbeatRuns.id, status: heartbeatRuns.status,
       createdAt: heartbeatRuns.createdAt, finishedAt: heartbeatRuns.finishedAt, agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId,
+      startableSince: heartbeatRuns.startableSince,
+      // When the person wrote the LATEST message this failed attempt carried: its
+      // wakeCommentId/commentId, any wakeCommentIds entry (queued-batch coalescing
+      // keeps the older scalar and appends the newer id there) or its first-turn
+      // input. The approval boundary (approvalOwnsTask) is this message, not the
+      // run row: a message can fold into a run queued before the approval.
+      carriedMessageAt: sql<Date | null>`case when ${heartbeatRuns.status} in ('failed', 'timed_out') then (
+        select max(carried.created_at) from issue_comments carried
+        where carried.company_id = ${heartbeatRuns.companyId} and carried.issue_id = ${requestedUuid}
+          and carried.author_user_id is not null and carried.author_agent_id is null
+          and (carried.id::text in (${heartbeatRuns.contextSnapshot}->>'wakeCommentId', ${heartbeatRuns.contextSnapshot}->>'commentId')
+            or (jsonb_typeof(${heartbeatRuns.contextSnapshot}->'wakeCommentIds') = 'array'
+              and ${heartbeatRuns.contextSnapshot}->'wakeCommentIds' @> jsonb_build_array(carried.id::text))
+            or (jsonb_typeof(${heartbeatRuns.contextSnapshot}#>'{firstTurnQueuedInput,commentIds}') = 'array'
+              and ${heartbeatRuns.contextSnapshot}#>'{firstTurnQueuedInput,commentIds}' @> jsonb_build_array(carried.id::text)))) end`
+        .mapWith(value => value == null ? null : new Date(value)),
       nativeIssueId: heartbeatRuns.nativeIssueId, runtimeMode: heartbeatRuns.runtimeMode, startedAt: heartbeatRuns.startedAt,
       processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
       agentAdapter: agents.adapterType,
@@ -502,6 +584,28 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
           and coalesce(${nativeRunFinalizations.failureDetail}->>'successorRunId', '') = '')`.mapWith(value => value == null ? null : new Date(value)),
       nativeFinalizationRetry: exhaustedNativeFinalizationCondition(),
       nativeFinalizationRetryPending: savedResultRetryPendingCondition(),
+      // The predicate of recovery/service.ts nativeBlockedUnblockAction: a committed,
+      // accepted, contract-bound blocked result with an unblock action.
+      nativeBlockedResultAt: sql<Date | null>`(select ${nativeRunFinalizations.updatedAt} from ${nativeRunFinalizations}
+        inner join ${nativeRunResults} on ${nativeRunResults.id} = ${nativeRunFinalizations.resultId}
+          and ${nativeRunResults.companyId} = ${nativeRunFinalizations.companyId} and ${nativeRunResults.issueId} = ${nativeRunFinalizations.issueId}
+          and ${nativeRunResults.runId} = ${nativeRunFinalizations.runId}
+        where ${nativeRunFinalizations.companyId} = ${heartbeatRuns.companyId} and ${nativeRunFinalizations.runId} = ${heartbeatRuns.id}
+          and ${nativeRunFinalizations.issueId} = ${heartbeatRuns.nativeIssueId} and ${nativeRunFinalizations.phase} = 'committed'
+          and ${nativeRunResults.schemaStatus} = 'accepted' and ${nativeRunResults.completionContractId} = ${heartbeatRuns.completionContractId}
+          and ${heartbeatRuns.runtimeMode} = 'native' and ${heartbeatRuns.status} = 'succeeded'
+          and ${nativeRunResults.resultJson}#>>'{result,schema}' = 'paperclip.run_result.v1'
+          and ${nativeRunResults.resultJson}#>>'{result,reportedWorkDisposition}' = 'blocked'
+          and ${nativeRunResults.resultJson}#>>'{terminal,runTerminalState}' = 'succeeded'
+          and ${nativeRunResults.resultJson}#>>'{terminal,reportedWorkDisposition}' = 'blocked'
+          and ${nativeRunResults.resultJson}#>>'{result,blocker,scope}' in ('current_track', 'task_wide')
+          and nullif(btrim(${nativeRunResults.resultJson}#>>'{result,blocker,unblockAction}'), '') is not null
+        limit 1)`.mapWith(value => value == null ? null : new Date(value)),
+      // The sweep's recorded refusal of this run's blocked result (recovery/service.ts
+      // repairNativeBlockedWait writes it once per run in the repair transaction).
+      nativeBlockedRepairRefused: sql<boolean>`coalesce(${heartbeatRuns.status} = 'succeeded' and ${heartbeatRuns.runtimeMode} = 'native'
+        and exists (select 1 from activity_log refused where refused.company_id = ${heartbeatRuns.companyId}
+          and refused.run_id = ${heartbeatRuns.id} and refused.action = ${NATIVE_BLOCKED_WAIT_REFUSED_ACTION}), false)`,
       // The run whose resultJson supplied providerFailure. A scheduled retry
       // shows its predecessor's reason, so redaction must use that run's registry.
       providerFailureRunId: sql<string>`case when ${heartbeatRuns.resultJson}->'providerFailure' is null
@@ -570,7 +674,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       eq(issueTreeHolds.companyId, issueTreeHoldMembers.companyId), eq(issueTreeHolds.id, issueTreeHoldMembers.holdId)))
       .where(and(eq(issueTreeHoldMembers.companyId, companyId), inArray(issueTreeHoldMembers.issueId, ids),
         eq(issueTreeHolds.status, "active"), eq(issueTreeHolds.mode, "pause"))),
-    db.select({ issueId: issueApprovals.issueId }).from(issueApprovals).innerJoin(approvals, and(
+    db.select({ issueId: issueApprovals.issueId, createdAt: approvals.createdAt }).from(issueApprovals).innerJoin(approvals, and(
       eq(approvals.companyId, issueApprovals.companyId), eq(approvals.id, issueApprovals.approvalId)))
       .where(and(eq(issueApprovals.companyId, companyId), inArray(issueApprovals.issueId, ids),
         inArray(approvals.status, ["pending", "revision_requested"]))),
@@ -702,6 +806,149 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.runId, queuedContinuationIds),
       eq(agentWakeupRequests.requestedByActorType, "user"))),
   ]) : [[], []];
+  // Queued runs a person asked for, at any age. FIX21 (rf-3): the external-bot
+  // hold names its wait from enqueue, so person origin is read for fresh runs too;
+  // the start bound and the other task-level holds below still read only the
+  // runs past the bound (personQueued).
+  const queuedIds = runs.filter(run => run.status === "queued" && run.createdAt).map(run => run.id);
+  const personQueuedRunIds = new Set<string>();
+  if (queuedIds.length) {
+    const { personOriginRunSql } = await import("./heartbeat/queued-run-line.js");
+    const rows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+      inArray(heartbeatRuns.id, queuedIds), personOriginRunSql(sql`${companyId}::uuid`, sql`${heartbeatRuns.id}`)));
+    for (const row of rows) personQueuedRunIds.add(row.id);
+  }
+  const isOverdue = (run: typeof runs[number]) => Boolean(run.createdAt
+    && run.createdAt.getTime() <= Date.now() - PERSON_QUEUED_RUN_START_BOUND_MS);
+  // When each such run became startable (RFL S9: the queued-time clock starts at
+  // the END of the preceding run, never at enqueue). No new state:
+  // - busy is the dispatcher's own rule (heartbeat/queue.ts:2638-2641): the
+  //   agent's running count against parseHeartbeatPolicy(agent).maxConcurrentRuns.
+  //   A busy agent has no startable time, so the card stays working.
+  // - otherwise startable since = the latest heartbeat_runs.finished_at of the
+  //   agent's other runs that ended after this run was queued AND ended with the
+  //   agent at capacity just before (runs started by then and not yet finished,
+  //   itself included, >= maxConcurrentRuns): only such a finish freed the slot
+  //   this run waited for, whether it succeeded or failed. A finish beside a
+  //   free slot restarts nothing (rf-3 (d): on a multi-slot agent another
+  //   slot's turns must not hold the card at working forever). With no such
+  //   finish (no previous run, or a slot was already free), startable since
+  //   enqueue (heartbeat_runs.created_at).
+  const queuedRunStartableSince = new Map<string, number>();
+  const agentRowsForHolds = new Map<string, typeof agents.$inferSelect>();
+  const personQueued = runs.filter(run => personQueuedRunIds.has(run.id) && run.createdAt && isOverdue(run));
+  if (personQueued.length) {
+    const agentIds = [...new Set(personQueued.map(run => run.agentId))];
+    const { parseHeartbeatPolicy } = await import("./heartbeat/timer-policy.js");
+    const agentRows = await db.select().from(agents).where(and(eq(agents.companyId, companyId), inArray(agents.id, agentIds)));
+    for (const agent of agentRows) agentRowsForHolds.set(agent.id, agent);
+    const maxRuns = new Map(agentRows.map(agent => [agent.id, parseHeartbeatPolicy(agent).maxConcurrentRuns]));
+    const [runningRows, endRows] = await Promise.all([
+      db.select({ agentId: heartbeatRuns.agentId, count: sql<number>`count(*)::int` }).from(heartbeatRuns)
+        .where(and(inArray(heartbeatRuns.agentId, agentIds), eq(heartbeatRuns.status, "running"))).groupBy(heartbeatRuns.agentId),
+      Promise.all(personQueued.map(async run => {
+        const [row] = await db.select({ endedAt: sql<string | null>`max(${heartbeatRuns.finishedAt})` }).from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.agentId, run.agentId), sql`${heartbeatRuns.id} <> ${run.id}`,
+            sql`${heartbeatRuns.finishedAt} > ${run.createdAt!.toISOString()}::timestamptz`,
+            sql`(select count(*) from heartbeat_runs at_end where at_end.agent_id = ${heartbeatRuns.agentId}
+              and at_end.id <> ${run.id} and (at_end.started_at is not null or at_end.status = 'running')
+              and coalesce(at_end.started_at, at_end.created_at) <= ${heartbeatRuns.finishedAt}
+              and (at_end.finished_at is null or at_end.finished_at >= ${heartbeatRuns.finishedAt})) >= ${maxRuns.get(run.agentId) ?? 1}`));
+        return { runId: run.id, endedAt: row?.endedAt ? new Date(row.endedAt).getTime() : null };
+      })),
+    ]);
+    const running = new Map(runningRows.map(row => [row.agentId, Number(row.count)]));
+    const busy = new Set(agentRows.filter(agent => (running.get(agent.id) ?? 0) >= parseHeartbeatPolicy(agent).maxConcurrentRuns)
+      .map(agent => agent.id));
+    const endedAt = new Map(endRows.map(row => [row.runId, row.endedAt]));
+    // A task-level hold that CLEARED after this run was queued restarts the
+    // clock at the clear (RFL 20:46Z, rf-3 22:23Z), from existing fields only:
+    // - previous run of this task ending (any agent): heartbeat_runs.finished_at;
+    // - a case handoff leaving awaiting_release / pending_dispatch: case_handoffs.updated_at.
+    // A sandbox cleanup settling has no settled time: environment_leases.updated_at
+    // moves on any write (metadata, reuse stamps), so it is not read. Agent setup,
+    // the in-process native session cleanup, a budget pause and the external-bot
+    // gate store no clear time either (named in the fix12 result).
+    const clearRows = await Promise.all(personQueued.map(async run => {
+      const created = run.createdAt!.toISOString();
+      const result = await db.execute<{ cleared_at: string | null }>(sql`select greatest(
+        (select max(prior.finished_at) from heartbeat_runs prior where prior.company_id = ${companyId}::uuid
+          and prior.issue_id = ${run.issueId}::uuid and prior.id <> ${run.id}::uuid and prior.finished_at > ${created}::timestamptz),
+        (select max(handoff.updated_at) from case_handoffs handoff where handoff.company_id = ${companyId}::uuid
+          and handoff.issue_id = ${run.issueId}::uuid and handoff.state not in ('awaiting_release', 'pending_dispatch')
+          and handoff.updated_at > ${created}::timestamptz)) as cleared_at`);
+      const value = [...result][0]?.cleared_at ?? null;
+      return [run.id, value ? new Date(value).getTime() : 0] as const;
+    }));
+    const clearedAt = new Map(clearRows);
+    for (const run of personQueued) {
+      if (busy.has(run.agentId)) continue;
+      // RFL 01:00Z (a): heartbeat_runs.startable_since, stamped where each hold clears.
+      queuedRunStartableSince.set(run.id, Math.max(run.createdAt!.getTime(), endedAt.get(run.id) ?? 0, clearedAt.get(run.id) ?? 0,
+        run.startableSince?.getTime() ?? 0));
+    }
+  }
+  // Task-level start holds for those person runs, read from the same rows the
+  // dispatcher's claim reads (heartbeat/queue.ts): the task's execution owner
+  // (issues.execution_run_id) still running, or terminal with its cleanup
+  // pending (hasPendingRunCleanup, unless a fresh continuation superseded it),
+  // a pending case handoff for another wake, or the agent awaiting setup.
+  const taskStartHolds = new Map<string, TaskStartHold>();
+  if (personQueued.length) {
+    const { hasPendingRunCleanup } = await import("./execution-blocker.js");
+    const { isAgentAwaitingSetup } = await import("../modules/agent-lifecycle/domain/policy.js");
+    for (const run of personQueued) {
+      const issue = selected.find(candidate => candidate.id === run.issueId);
+      const [task] = await db.select({ executionRunId: issues.executionRunId, assigneeAgentId: issues.assigneeAgentId,
+        wakeupRequestId: sql<string | null>`(select wakeup_request_id from heartbeat_runs queued where queued.id = ${run.id}::uuid)` })
+        .from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, run.issueId)));
+      if (!issue || !task) continue;
+      const ownerId = task.assigneeAgentId === run.agentId ? task.executionRunId : null;
+      if (ownerId && ownerId !== run.id) {
+        const [owner] = await db.select({ status: heartbeatRuns.status,
+          superseded: sql<boolean>`coalesce(${heartbeatRuns.resultJson} ? 'freshContinuationSupersededAt', false)` })
+          .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, ownerId)));
+        if (owner && !["succeeded", "failed", "timed_out", "cancelled"].includes(owner.status)) {
+          taskStartHolds.set(run.id, "previous_run_running"); continue;
+        }
+        if (owner && !owner.superseded && await hasPendingRunCleanup(db, companyId, ownerId)) {
+          taskStartHolds.set(run.id, "previous_run_cleanup"); continue;
+        }
+      }
+      const [handoff] = await db.select({ id: caseHandoffs.id }).from(caseHandoffs).where(and(eq(caseHandoffs.companyId, companyId),
+        eq(caseHandoffs.issueId, run.issueId), inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]),
+        sql`(${caseHandoffs.state} = 'awaiting_release' or ${caseHandoffs.wakeupRequestId} is distinct from ${task.wakeupRequestId}::uuid)`)).limit(1);
+      if (handoff) { taskStartHolds.set(run.id, "case_handoff"); continue; }
+      const agent = agentRowsForHolds.get(run.agentId);
+      // heartbeat/queue.ts native_session_cleanup_settling: this process's gate on the task's previous session.
+      if (agent?.adapterType === "paperclip_runner" && nativeSessionCleanupBlock({ companyId, issueId: run.issueId })) {
+        taskStartHolds.set(run.id, "previous_session_cleanup"); continue;
+      }
+      if (agent && isAgentAwaitingSetup(agent)) { taskStartHolds.set(run.id, "agent_setup"); continue; }
+      // heartbeat/queue.ts claimQueuedRun: the external-bot gate (canStartNewExternalBotWork).
+      const externalBindingId = agent ? externalBotStartGateBindingId(agent) : null;
+      if (agent && externalBindingId !== null) {
+        const hold = await dotRunnerBroker(db).newWorkHold(companyId, agent.id, externalBindingId).catch(() => null);
+        if (hold) taskStartHolds.set(run.id, hold);
+      }
+    }
+  }
+  // FIX21 (rf-3): the external-bot hold (the dispatcher's canStartNewExternalBotWork,
+  // heartbeat/queue.ts claimQueuedRun) declines a run from enqueue, so a fresh person
+  // run it holds names the wait too, never "Working for 1s". Same read as above.
+  const freshPersonQueued = runs.filter(run => personQueuedRunIds.has(run.id) && run.createdAt && !isOverdue(run));
+  if (freshPersonQueued.length) {
+    const missing = [...new Set(freshPersonQueued.map(run => run.agentId))].filter(id => !agentRowsForHolds.has(id));
+    if (missing.length) for (const agent of await db.select().from(agents)
+      .where(and(eq(agents.companyId, companyId), inArray(agents.id, missing)))) agentRowsForHolds.set(agent.id, agent);
+    for (const run of freshPersonQueued) {
+      const agent = agentRowsForHolds.get(run.agentId);
+      const externalBindingId = agent ? externalBotStartGateBindingId(agent) : null;
+      if (!agent || externalBindingId === null) continue;
+      const hold = await dotRunnerBroker(db).newWorkHold(companyId, agent.id, externalBindingId).catch(() => null);
+      if (hold) taskStartHolds.set(run.id, hold);
+    }
+  }
   const waitingContinuationRunIds = new Set(continuationRows.map(row => row.runId));
   const personRequestedRunIds = new Set(personRows.flatMap(row => row.runId ? [row.runId] : []));
   const waitingContinuationFor = (run: typeof runs[number] | undefined): ProjectionState["waitingContinuation"] =>
@@ -801,7 +1048,18 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   };
   const agentMap = new Map(agentRows.map(agent => [agent.id, agent]));
   const projectMap = new Map(projectRows.map(project => [project.id, project]));
-  const pauses = new Set(pauseRows.map(row => row.issueId)), approvalsSet = new Set(approvalRows.map(row => row.issueId));
+  const pauses = new Set(pauseRows.map(row => row.issueId));
+  // An approval asked for before the person's LATEST message that a FAILED (or
+  // timed-out) latest attempt carried does not explain that failure: the
+  // attempt was answering that later message, so its failure and Retry stay
+  // visible instead of the older approval's wait (D128/D153/D180). The boundary
+  // is the message's createdAt, not the run row's: production coalescing folds
+  // a newer message into a run queued before the approval (rf-3, the removed
+  // re-offer's shape). A run that carried no message falls back to its own row.
+  // The approval stays pending in its own UI; a newer approval still owns the task.
+  const approvalOwnsTask = (issueId: string, run: { status: string; createdAt: Date; carriedMessageAt?: Date | null } | undefined) =>
+    approvalRows.some(row => row.issueId === issueId && (!run || !FAILED_ATTEMPT_STATUSES.has(run.status)
+      || row.createdAt.getTime() >= (run.carriedMessageAt ?? run.createdAt).getTime()));
   const admissionWaitMap = byIssue(admissionWaits);
   const launchWaits = [...retryWaitMap].flatMap(([issueId, wait]) => {
     const run = runMap.get(issueId);
@@ -821,13 +1079,16 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       freshContinuation: freshContinuationFor(issue.id, facts.run?.id),
       automaticDispositionAt: automaticDispositionAt.get(issue.id),
       waitingContinuation: waitingContinuationFor(facts.run),
+      personQueuedRun: facts.run ? personQueuedRunIds.has(facts.run.id) : false,
+      queuedRunStartableSince: facts.run ? queuedRunStartableSince.get(facts.run.id) : undefined,
+      taskStartHold: facts.run ? taskStartHolds.get(facts.run.id) : undefined,
       recoveryHandedToPerson: handedToPerson.has(issue.id),
       interruptWait: interruptWaitFor(issue.id),
       projectAccessAllowed: denied?.length === 0,
       projectAccessProjectId: denied?.includes(issue.projectId ?? "") ? issue.projectId : null,
       workspaceSelectionAvailable: required?.available ?? false,
       agent: agentMap.get(issue.assigneeAgentId ?? ""), project: projectMap.get(issue.projectId ?? ""),
-      company: companyRows[0], paused: pauses.has(issue.id), approval: approvalsSet.has(issue.id),
+      company: companyRows[0], paused: pauses.has(issue.id), approval: approvalOwnsTask(issue.id, facts.run),
       ownerStopRequired: ownerStopRequired.has(`${issue.id}:${facts.run?.id}`),
       unidentifiedLaunchConfirmable: confirmableLaunches.has(issue.id),
       admissionWait: admissionWaitMap.get(issue.id),
@@ -847,26 +1108,16 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         agentAdapter: run.agentAdapter ?? "unknown" });
     }
   }
-  // Upstream paperclipai/paperclip b4861d5e task-interruption-presentation.ts:824-840:
-  // a card that offers Retry asks the task's execution blocker, and withholds
-  // Retry where the blocker refuses it. C9 also selects tasks whose conversation
-  // has a standing notice, and the card shows that notice's own text. One
-  // batched read; blockers only for those tasks.
   const offered = [...result].flatMap(([issueId, presentation]) => presentation?.canRetry ? [issueId] : []);
   if (offered.length) {
-    const [{ executionBlockerPredicate, getExecutionBlocker, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate },
-      { readStandingRunNotices }] = await Promise.all([import("./execution-blocker.js"), import("./standing-run-notice.js")]);
-    const [held, notices] = await Promise.all([db.selectDistinct({ issueId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions).where(and(
+    const { executionBlockerPredicate, getExecutionBlocker, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate } =
+      await import("./execution-blocker.js");
+    const held = await db.selectDistinct({ issueId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, companyId), inArray(issueRecoveryActions.sourceIssueId, offered),
-      executionBlockerPredicate(), not(restoreHoldReleasedForCurrentOwnerPredicate()), restoreHoldPredicate())),
-      readStandingRunNotices(db, { companyId, issueIds: offered })]);
-    for (const issueId of new Set([...held.map(row => row.issueId), ...notices.keys()])) {
-      const presentation = result.get(issueId);
-      const notice = notices.get(issueId);
-      // The standing notice is shown in place of generic text. Whether Retry
-      // is offered is the execution blocker's decision below.
-      if (presentation && notice) presentation.notice = { code: notice.code, text: notice.text };
+      executionBlockerPredicate(), not(restoreHoldReleasedForCurrentOwnerPredicate()), restoreHoldPredicate()));
+    for (const { issueId } of held) {
       const blocker = await getExecutionBlocker(db, companyId, issueId);
+      const presentation = result.get(issueId);
       if (!presentation || !blocker || blocker.canRetry) continue;
       presentation.canRetry = false;
       delete presentation.retryAction;

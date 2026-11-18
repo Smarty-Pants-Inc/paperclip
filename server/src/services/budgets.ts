@@ -45,6 +45,7 @@ import type { AuthorizationActor } from "./authorization.js";
 import { computeObservedSpend, computeObservedSpends, type ObservedSpend } from "./budget-exposure.js";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { listPendingBudgetCancellationScopes } from "./heartbeat/budget-cancellation.js";
+import { stampQueuedRunsStartable } from "./heartbeat/startable-since.js";
 import { withBudgetSpan } from "./budget-tracing.js";
 import { queueBudgetEvaluation } from "./budget-evaluation-work.js";
 export { computeObservedSpend, computeObservedSpends } from "./budget-exposure.js";
@@ -445,7 +446,9 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
           pausedAt: null,
           updatedAt: now,
         })
-        .where(and(eq(projects.id, policy.scopeId), eq(projects.pauseReason, "budget")));
+        .where(and(eq(projects.id, policy.scopeId), eq(projects.pauseReason, "budget"))).returning({ id: projects.id })
+        // RFL 01:00Z (a): a project budget pause clears; its tasks' queued runs are startable from now.
+        .then(rows => rows.length ? stampQueuedRunsStartable(db, { companyId: policy.companyId, projectId: policy.scopeId }) : undefined);
       return;
     }
 
@@ -470,7 +473,9 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
         pausedAt: null,
         updatedAt: now,
       })
-      .where(and(eq(companies.id, policy.scopeId), eq(companies.status, "paused"), eq(companies.pauseReason, "budget")));
+      .where(and(eq(companies.id, policy.scopeId), eq(companies.status, "paused"), eq(companies.pauseReason, "budget"))).returning({ id: companies.id })
+      // RFL 01:00Z (a): a company budget pause clears; every queued run in it is startable from now.
+      .then(rows => rows.length ? stampQueuedRunsStartable(db, { companyId: policy.companyId, everyTask: true }) : undefined);
   }
 
   async function getPolicyRow(policyId: string) {

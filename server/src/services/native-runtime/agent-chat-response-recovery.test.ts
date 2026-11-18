@@ -14,6 +14,8 @@ import { instanceSettingsService } from "../instance-settings.js";
 import { issueService } from "../issues.js";
 import * as nativeResponseNotifications from "../native-response-presentation-notifications.js";
 import { compactRunLogChunk } from "../heartbeat/run-log.js";
+import { redeliverUnansweredConversationTurn } from "../agent-conversations.js";
+import { SETTLING_GRACE_MS } from "../recovery/settling-grace.js";
 
 const runLogReads = vi.hoisted(() => [] as unknown[]);
 vi.mock("../run-log-store.js", async (importOriginal) => {
@@ -648,6 +650,37 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     await expect(recoverCommittedNativeChatResponse(db, f.input)).resolves.toBe(true);
     expect(await comments(f.runId)).toHaveLength(1);
     expect(await issue(f.issueId)).toMatchObject({ status: "in_progress", conversationState: "active" });
+  });
+  // F3 D160 (RFL 19:17Z ruling 3). R-SILENT runs while the message's own
+  // native turn is still finishing (finalization workspace_pending). Its
+  // finalizer later commits and committed-response recovery publishes that
+  // turn's reply. If R-SILENT had re-offered the message meanwhile, the
+  // redelivered turn answers too: two answers to one message.
+  it("D160: a turn whose finalization is still workspace_pending is not re-offered; its later reply is the one answer", async () => {
+    const f = await fixture();
+    await db.update(nativeRunFinalizations).set({ phase: "workspace_pending" }).where(eq(nativeRunFinalizations.runId, f.runId));
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const redelivered: string[] = [];
+    const outcome = await redeliverUnansweredConversationTurn(db, task!, f.runId, async (agentId, options) => {
+      // The redelivered turn runs and answers the same message.
+      const [turn] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId, status: "succeeded",
+        invocationSource: "on_demand", responsibleUserId: f.userId, contextSnapshot: options.contextSnapshot,
+        startedAt: new Date("2020-01-01T00:05:00Z"), finishedAt: new Date("2020-01-01T00:06:00Z") }).returning();
+      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorAgentId: agentId,
+        createdByRunId: turn!.id, body: "Answer from the redelivered turn.", createdAt: new Date("2020-01-01T00:06:00Z") });
+      redelivered.push(turn!.id);
+      return null;
+    }, { now: new Date(run!.finishedAt!.getTime() + SETTLING_GRACE_MS + 1) });
+    // The finalizer then commits, and the committed reply is published by its owner.
+    await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, f.runId));
+    await recoverCommittedNativeChatResponse(db, f.input);
+    const answers = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      sql`${issueComments.authorAgentId} is not null`))).filter(comment => !comment.deletedAt);
+    console.info(JSON.stringify({ d160: { outcome, redeliveries: redelivered.length,
+      answers: answers.map(comment => comment.createdByRunId === f.runId ? "own-turn" : "redelivered-turn") } }));
+    expect(answers.map(comment => comment.body), "one answer to one message, never two").toEqual([f.reply]);
+    expect(outcome).toBe("none");
   });
   it("does not duplicate a reply under concurrent recovery", async () => {
     const f = await fixture();

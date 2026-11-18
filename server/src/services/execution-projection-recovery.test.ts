@@ -4,8 +4,8 @@ import { eq } from "drizzle-orm";
 import { agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults, completionContracts } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
-import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
-import { readUnsupersededHeldConversationNotice, writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
+const HELD_PREDECESSOR_NOTICE = "Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.";
+import { writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("persisted stopped-workspace projection", () => {
@@ -89,7 +89,7 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     expect(refused).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"] });
     expect(refused?.nextAction).not.toMatch(/send a message to continue/i);
     expect(refused?.nextAction).toBe("Saved work recovered.");
-    // The output notice remains readable, but cannot override the projection.
+    // A historical notice cannot override the projection.
     const sessionId = randomUUID();
     await db.update(heartbeatRuns).set({ error: "Fixture failure", nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, runId));
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction)
@@ -98,9 +98,7 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
       authorizationReason: `native_prior_owner_held:${sessionId}`, body: HELD_PREDECESSOR_NOTICE }));
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)).toMatchObject({
       phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"], nextAction: "Saved work recovered." });
-    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).toMatchObject({ body: HELD_PREDECESSOR_NOTICE });
-    // A committed success on another conversation (a new task) does not clear it;
-    // one on the same conversation does.
+    // Later results cannot change the historical run's recovered-work projection.
     const succeed = async (nativeSessionId: string) => {
       const later = randomUUID();
       await db.insert(heartbeatRuns).values({ id: later, companyId, agentId, nativeIssueId: issueId, nativeSessionId,
@@ -109,9 +107,7 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     };
     await succeed(randomUUID());
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction).toBe("Saved work recovered.");
-    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).not.toBeNull();
     await succeed(sessionId);
-    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).toBeNull();
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction)
       .toBe("Saved work recovered.");
   });
@@ -148,7 +144,6 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     // follow-Paperclip Cut B R4: a refusal cannot synthesize a notice or a projection veto.
     expect(projected).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"],
       nextAction: "Saved work recovered." });
-    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).toBeNull();
     expect(projected?.permittedActions).not.toContain("retry");
   });
 

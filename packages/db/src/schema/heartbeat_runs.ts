@@ -47,6 +47,9 @@ export const heartbeatRuns = pgTable(
     activeIdentityContextId: uuid("active_identity_context_id"),
     startedAt: timestamp("started_at", { withTimezone: true }),
     finishedAt: timestamp("finished_at", { withTimezone: true }),
+    // A queued run's latest hold clear (RFL 01:00Z ruling (a)): the person start
+    // bound counts from the later of created_at and this. Null: never held/cleared.
+    startableSince: timestamp("startable_since", { withTimezone: true }),
     // Set only after provider execution settles; never a timeout on thinking.
     executionControlDeadlineAt: timestamp("execution_control_deadline_at", { withTimezone: true }),
     // Transactional delivery marker. Null on historical rows; publication never replays provider work.

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { assignedWorkSweep } from "./recovery/assigned-work-sweep.js";
 import { currentNotices } from "./rfl-current-notice-assertions.js";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
@@ -8,7 +9,7 @@ import { join } from "node:path";
 import { and, eq, sql, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog, agentWakeupRequests, agents, approvals, authUsers, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueApprovals, issueRecoveryActions, issueThreadInteractions,
+  applyPendingMigrations, activityLog, agentTaskSessions, agentWakeupRequests, agents, approvals, authUsers, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueApprovals, issueRecoveryActions, issueThreadInteractions,
   heartbeatRunEvents, issueComments, issues, nativeRunFinalizations, toolInvocations, companyMemberships,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
@@ -20,7 +21,17 @@ import {
   resetBacklogContinuationPacingForTests,
   freshContinuationNote, heldExecutionsAwaitingFreshContinuation, nextFreshContinuationCheckAt, recordFreshContinuationCheck, FRESH_CONTINUATION_PENDING_BOUND_MS, FRESH_CONTINUATION_PROGRESS_BOUND_MS, FRESH_CONTINUATION_SAVED_WORK_BOUND_MS,
 } from "./fresh-continuation-fallback.js";
-import { heartbeatService } from "./heartbeat.js";
+import { deriveTaskKeyWithHeartbeatFallback, heartbeatService, shouldResetTaskSessionForWake } from "./heartbeat.js";
+import { prepareHeartbeatSession } from "./heartbeat/session-preparation.js";
+import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
+import { createHeartbeatRunPreparation } from "./heartbeat/run-preparation.js";
+import { issueService } from "./issues.js";
+import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
+import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
+import { selectPaperclipTaskMarkdown } from "@paperclipai/adapter-utils/server-utils";
+import { getAdapterSessionCodec, normalizeSessionParams } from "./heartbeat/run-state.js";
+import { attachPaperclipSessionMetadataToSessionParams } from "./heartbeat/workspaces.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { currentProcessSpaceHash, observedProcessStartedAt } from "./controller-process-identity.js";
 import { executionControlSchedule } from "./execution-control-work.js";
@@ -34,15 +45,18 @@ import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapte
 import { createSystemRecovery } from "./system-recovery-state.js";
 import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
-import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
-import { freshContinuationChain } from "./fresh-continuation-chain.js";
-import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT } from "./recovery/unanswered-person-message.js";
+const NATIVE_CONTINUATION_REFUSED_ACTION = "Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.";
 import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";
 import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
 import { createReusableLeaseHandoff } from "./environment-lease-handoff.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
 import { taskAutomaticAttempts } from "./recovery/task-automatic-attempts.js";
+import express from "express";
+import request from "supertest";
+import { issueRoutes } from "../routes/issues.js";
+import { errorHandler } from "../middleware/index.js";
+import { instanceSettingsService } from "./instance-settings.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -176,8 +190,1743 @@ suite("fresh-continuation fallback", () => {
     return next;
   }
 
+  // rf-3 R-SILENT (stack135, RFL 09:01Z). Keep reason: never-OK person-facing
+  // guarantee. An accepted person message whose run succeeded with no published
+  // answer is answered, or gets a successor or one truthful notice, within 120 s.
+  // Synthetic DB shape, real heartbeat wrapper + assigned-work checker. NOT live proof.
+  it("R-SILENT: succeeded chat with no published answer has a visible notice or successor after 121 seconds", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "adapter_failed", hold: "none" });
+    const ended = new Date(Date.now() - 121_000);
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please answer this accepted request.", createdAt: new Date(ended.getTime() - 60_000) }).returning();
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "active", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: ended, createdAt: new Date(ended.getTime() - 30_000),
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message.id } }).where(eq(heartbeatRuns.id, f.runId));
+    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    const upstreamSweep = assignedWorkSweep(db, { enqueueWakeup: async () => { throw new Error("unexpected unobserved wake"); } });
+    const result = await upstreamSweep.checkIssue({ companyId, issueId: f.issueId });
+    const card = await taskInterruptionPresentation(db, await issue(f.issueId));
+    const notices = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"))))
+      .filter(comment => !comment.deletedAt);
+    const live = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId, f.issueId), inArray(heartbeatRuns.status, ["queued", "running"])));
+    console.info(JSON.stringify({ rSilent: { messageId: message.id, elapsed: Date.now() - ended.getTime(), result, card, notices: notices.length, live: live.length } }));
+    expect(notices.length > 0 || live.length > 0 || ["failed", "retry_scheduled"].includes(card?.state ?? ""),
+      "a succeeded run is not evidence of an answer; conversation wait cannot silently retire accepted input").toBe(true);
+  }, 120_000);
+
+  // R-SILENT owner check (stack135 F1): the re-homed rule lives in upstream's
+  // conversation outbox, fires once per message, waits out the finalizer's
+  // grace, and stays quiet once anything answered.
+  it.each(["silent", "inside_grace", "answered", "newer_message"] as const)("R-SILENT redelivers a succeeded-but-unanswered message exactly once: %s", async shape => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "adapter_failed", hold: "none" });
+    const ended = new Date(Date.now() - (shape === "inside_grace" ? 30_000 : 121_000));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please answer this accepted request.", createdAt: new Date(ended.getTime() - 60_000) }).returning();
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "active", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: ended, createdAt: new Date(ended.getTime() - 30_000),
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message.id } }).where(eq(heartbeatRuns.id, f.runId));
+    if (shape === "answered") await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "agent", authorAgentId: agentId,
+      body: "Here is the answer.", createdAt: new Date(ended.getTime() - 1_000) });
+    if (shape === "newer_message") await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "And one more thing.", createdAt: new Date(ended.getTime() + 1_000) });
+    const deadlines: number[] = [];
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass++) {
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId, onDeferredDeadline: at => { deadlines.push(at); } });
+    }
+    const redeliveries = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${message.id}`)));
+    const original = (await db.select().from(issueComments).where(eq(issueComments.id, message.id)))[0];
+    console.info(JSON.stringify({ rSilentOwner: { shape, redeliveries: redeliveries.length, deadlines: deadlines.length,
+      runs: redeliveries.map(row => row.runId) } }));
+    expect(original).toMatchObject({ body: "Please answer this accepted request.", authorUserId: userId, deletedAt: null });
+    if (shape === "silent") {
+      expect(redeliveries).toHaveLength(1);
+      expect(redeliveries[0]).toMatchObject({ reason: "issue_commented", requestedByActorType: "user", requestedByActorId: userId });
+      const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, redeliveries[0]!.id));
+      expect(next?.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeCommentId: message.id });
+    } else expect(redeliveries).toHaveLength(0);
+    if (shape === "inside_grace") expect(deadlines).toContain(ended.getTime() + 90_000);
+  }, 120_000);
+
+  /** A person's message whose own conversation turn succeeded with no reply, ended at `ended`. */
+  /**
+   * What the PROVIDER receives for a run, built the way heartbeat.ts builds it
+   * (prepareHeartbeatTaskContext :2880 -> runtime-selection.ts
+   * buildNativeExecutionInput -> runner model envelope). fix7 R-REPLAY helper.
+   */
+  async function providerInputFor(next: typeof heartbeatRuns.$inferSelect, issueId: string) {
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const preparation = createHeartbeatRunPreparation(db);
+    const issueContext = await preparation.getIssueExecutionContext(companyId, issueId);
+    const context = { ...(next.contextSnapshot ?? {}) } as Record<string, unknown>;
+    await prepareHeartbeatTaskContext(db, { run: next, agent: agent!,
+      task: { issueRef: issueContext!, issueContext, context, taskSession: null },
+      policy: { trustPreset: { kind: "standard" }, experimentalInstanceSettings: {} },
+      services: { issuesSvc: issueService(db), getPinnedSkillTestContext: preparation.getPinnedSkillTestContext } });
+    const input = buildNativeExecutionInput({ companyId, agentId, runId: next.id,
+      issue: { id: issueId, identifier: issueContext!.identifier, title: issueContext!.title, description: issueContext!.description ?? null, workMode: issueContext!.workMode },
+      taskPrompt: selectPaperclipTaskMarkdown(context, { resumedSession: false, includeCommunicationGuidance: false }) || `# ${issueContext!.title}`,
+      wakePayload: context.paperclipWake, turnContext: context.paperclipTurnContext, resumedSession: true, conversationMode: true,
+      workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, normalizedSessionId: randomUUID(),
+      provider: "pi_rpc", model: "openai/gpt-5", runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Answer the person", criteria: [{ id: "answer", requirement: "Answer the person" }] } } } as never);
+    return { context, input, provider: JSON.stringify(buildNativeModelEnvelope(input as never)) };
+  }
+
+  /** The real Retry route (routes/issues.ts POST /issues/:id/retry), as the route tests mount it. */
+  function retryRouteApp() {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", userId, source: "local_implicit" } as never; next(); });
+    app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1]));
+    app.use(errorHandler);
+    return app;
+  }
+
+  async function silentConversationTurn(ended: Date, person = userId) {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "adapter_failed", hold: "none" });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: person,
+      body: "Please answer this accepted request.", createdAt: new Date(ended.getTime() - 60_000) }).returning();
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: agentId, conversationUserId: person,
+      conversationState: "active", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: ended, createdAt: new Date(ended.getTime() - 30_000),
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } }).where(eq(heartbeatRuns.id, f.runId));
+    const redeliveries = async () => db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${message!.id}`)));
+    return { ...f, messageId: message!.id, redeliveries };
+  }
+
+  // RFL DESIGN-F1 condition 1 (R-REPLAY): the redelivered turn continues the
+  // SAME provider session as the silent run (the comment-wake path resumes the
+  // task session keyed by the issue; nothing forces a fresh session), so the
+  // model sees its own earlier turn and no tool of that turn runs again.
+  // Real seam: heartbeat/session-preparation.ts prepareHeartbeatSession (config
+  // freshness, wake reset, credential compatibility, isNativeSessionId) with a
+  // canonical native session UUID, as heartbeat.ts calls it at run start.
+  async function prepareSessionFor(run: typeof heartbeatRuns.$inferSelect, taskSession: typeof agentTaskSessions.$inferSelect | null) {
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const sessionCodec = getAdapterSessionCodec(agent!.adapterType);
+    const context = { ...(run.contextSnapshot ?? {}) } as Record<string, unknown>;
+    return prepareHeartbeatSession(db, {
+      run, agent: agent!,
+      task: { context, issueRef: { id: String(context.issueId) }, issueContext: null, taskProjectContext: null, workspaceProjectContext: null,
+        wakeCommentId: typeof context.wakeCommentId === "string" ? context.wakeCommentId : null,
+        acceptedPlanContinuationWake: false, acceptedPlanWakeRoutingDecision: null },
+      session: { taskSession, taskSessionDecodedParams: normalizeSessionParams(sessionCodec.deserialize(taskSession?.sessionParamsJson ?? null)),
+        explicitResumeSessionParams: null, explicitResumeSessionDisplayId: null, sessionCodec },
+      config: { runtimeConfig: (agent!.adapterConfig ?? {}) as Record<string, unknown>, agentIdentity: undefined, issueAssigneeOverrides: null,
+        originalAiIssueOverrides: null, managedAiRuntime: undefined, aiBinding: undefined, requestedAiBinding: undefined, secretManifest: [],
+        runtimeSkillEntries: [], routineEnvContext: { env: null } },
+      workspace: { requestedExecutionWorkspaceMode: "shared_workspace", effectiveExecutionWorkspaceMode: "shared_workspace",
+        projectExecutionWorkspacePolicy: null, issueExecutionWorkspaceSettings: null, executionPolicy: null,
+        requestedReusableExecutionWorkspaceConfig: null, reusableExistingExecutionWorkspace: null },
+      environment: { environmentResolution: { source: "default" } as never, selectedEnvironmentId: null, selectedEnvironmentForConfig: null },
+      getLatestAgentConfigRevision: async () => null as never,
+    });
+  }
+
+  it("R-REPLAY: the redelivered turn resumes the silent run's provider session, never a fresh one", async () => {
+    const f = await silentConversationTurn(new Date(Date.now() - 121_000));
+    const sessionId = randomUUID(); // canonical native session id (isNativeSessionId)
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeSessionId: sessionId, sessionIdBefore: sessionId, sessionIdAfter: sessionId })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const [silent] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    // Stamp the task session the way the silent run's own start left it.
+    const stamp = await prepareSessionFor(silent!, null);
+    await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner", taskKey: f.issueId,
+      sessionDisplayId: sessionId, lastRunId: f.runId,
+      sessionParamsJson: attachPaperclipSessionMetadataToSessionParams({ sessionId }, stamp.configuredModel, stamp.sessionConfigMetadata) });
+    await occupySlot(); // keep the redelivered run queued, as admitted
+    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    const [wake] = await f.redeliveries();
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, wake!.id));
+    // The same resolvers heartbeat.ts uses at run start (taskKey -> getTaskSession -> prepareHeartbeatSession).
+    const nextKey = deriveTaskKeyWithHeartbeatFallback(next!.contextSnapshot, null);
+    expect(nextKey).toBe(deriveTaskKeyWithHeartbeatFallback(silent!.contextSnapshot, null));
+    expect(shouldResetTaskSessionForWake(next!.contextSnapshot)).toBe(false);
+    const [taskSession] = await db.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, companyId),
+      eq(agentTaskSessions.agentId, agentId), eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, nextKey!)));
+    const prepared = await prepareSessionFor(next!, taskSession ?? null);
+    console.info(JSON.stringify({ rReplay: { silentSession: silent!.sessionIdAfter, taskResumeSessionId: prepared.taskResumeSessionId,
+      reset: prepared.resetTaskSession, resetReason: prepared.sessionResetReason, nextRunId: next!.id } }));
+    expect(prepared.resetTaskSession).toBe(false);
+    expect(prepared.taskSessionCredentialCompatible).toBe(true);
+    // successor.session_id_before (the session the runner resumes) == silent.session_id_after
+    expect(prepared.taskResumeSessionId).toBe(silent!.sessionIdAfter);
+    expect(prepared.taskResumeSessionId).toBe(sessionId);
+  }, 120_000);
+
+  // rf-3 R-REPLAY on the WIDENED re-offer (18:38Z): a FAILED own turn that a later
+  // run replaced is re-offered once. Assert on what the PROVIDER receives for the
+  // re-offered turn, built the way heartbeat.ts builds it (prepareHeartbeatTaskContext
+  // :2880 -> runtime-selection.ts buildNativeExecutionInput -> runner model envelope):
+  // the person's message exactly once, and nothing of the replaced run's wake
+  // context (its assignment, agent message, stale wake/task text) as new work.
+  it("R-REPLAY provider input: the re-offered turn carries the person's message once and none of the replaced run's work", async () => {
+    const t = new Date(Date.now() - 600_000);
+    const f = await silentConversationTurn(t);
+    const OLD = "OLD-ASSIGNMENT-7f3 rotate the production signing keys and redeploy";
+    const [person] = await db.select().from(issueComments).where(eq(issueComments.id, f.messageId));
+    // The replaced run: failed, and its wake context carried an assignment as well as the message.
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", error: "adapter failed before an answer",
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_assigned", wakeCommentId: f.messageId, wakeCommentIds: [f.messageId],
+        paperclipAgentMessage: { text: OLD }, paperclipTaskMarkdown: OLD, paperclipWake: { reason: "issue_assigned", instructions: OLD },
+        executionStage: { stage: "execute", instructions: OLD } } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId, invocationSource: "timer", status: "succeeded",
+      createdAt: new Date(t.getTime() + 5_000), startedAt: new Date(t.getTime() + 10_000), finishedAt: new Date(t.getTime() + 20_000),
+      responsibleUserId: userId, contextSnapshot: { issueId: f.issueId, wakeReason: "heartbeat_timer", wakeSource: "timer" } });
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass++) await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    const wakes = await f.redeliveries();
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.payload).toMatchObject({ redeliveredAfterRunId: f.runId, redeliveredAfterRunStatus: "failed" });
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, wakes[0]!.id));
+    const { context, input, provider } = await providerInputFor(next!, f.issueId);
+    const count = (text: string, needle: string) => text.split(needle).length - 1;
+    const wakeComments = ((context.paperclipWake as Record<string, unknown> | undefined)?.comments as Array<{ id: string }> | undefined) ?? [];
+    console.info(JSON.stringify({ rReplayProviderInput: { nextRunId: next!.id, messageInPrompt: count(input.task.prompt, person!.body),
+      messageInEnvelope: count(provider, person!.body), oldInEnvelope: count(provider, "OLD-ASSIGNMENT-7f3"), wakeCommentIds: wakeComments.map(c => c.id),
+      wakeReason: context.wakeReason ?? null } }));
+    // The person's message is the new input, exactly once.
+    expect(wakeComments.map(c => c.id)).toEqual([f.messageId]);
+    expect(count(input.task.prompt, person!.body)).toBe(1);
+    // None of the replaced run's assignment or instructions reaches the provider.
+    expect(provider).not.toContain("OLD-ASSIGNMENT-7f3");
+    expect(next!.contextSnapshot).not.toHaveProperty("paperclipAgentMessage");
+    expect(next!.contextSnapshot).not.toHaveProperty("executionStage");
+    expect(next!.contextSnapshot?.wakeReason ?? null).not.toBe("issue_assigned");
+  }, 120_000);
+
+  // RFL DESIGN-F1 condition 3, enforced with H3 stacked: a live `none` recorded
+  // before the run's own finalization committed (native_presentation_pending_commit)
+  // is committed-response recovery's to publish, so it is never redelivered.
+  it.each([true, false])("R-SILENT skips a turn whose presentation is pending commit (pending=%s)", async pending => {
+    const f = await silentConversationTurn(new Date(Date.now() - 121_000));
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "none",
+      reasonCodes: ["interaction_owns_conversation_response", ...(pending ? ["native_presentation_pending_commit"] : [])] } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass++) await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    expect(await f.redeliveries()).toHaveLength(pending ? 0 : 1);
+  }, 120_000);
+
+  // D109/D131 (isolation) + D159 (race), re-homed onto the R-SILENT owner: one
+  // unscoped stranded sweep over a mixed population, run by two workers at
+  // once, neither throws nor starves a conversation, and each silent message
+  // gets exactly one redelivery (wake key under the conversation-delivery lock).
+  it("R-SILENT: two racing unscoped sweeps over mixed conversations give each silent message exactly one redelivery", async () => {
+    const ended = new Date(Date.now() - 121_000);
+    const people: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const id = randomUUID(); people.push(id);
+      await db.insert(authUsers).values({ id, name: `Person ${i}`, email: `${id}@example.test`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+    }
+    const silent = [];
+    for (let i = 0; i < 4; i++) silent.push(await silentConversationTurn(ended, people[i]));
+    const answered = await silentConversationTurn(ended, people[4]);
+    await db.insert(issueComments).values({ companyId, issueId: answered.issueId, authorType: "agent", authorAgentId: agentId,
+      body: "Here is the answer.", createdAt: new Date(ended.getTime() - 1_000) });
+    const grace = await silentConversationTurn(new Date(Date.now() - 10_000), people[5]);
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    await Promise.all([heartbeat.reconcileStrandedAssignedIssues({ companyId }), heartbeatService(db).reconcileStrandedAssignedIssues({ companyId })]);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId });
+    const counts = { silent: await Promise.all(silent.map(async s => (await s.redeliveries()).length)),
+      answered: (await answered.redeliveries()).length, grace: (await grace.redeliveries()).length };
+    console.info(JSON.stringify({ rSilentMixedRace: counts }));
+    expect(counts).toEqual({ silent: [1, 1, 1, 1], answered: 0, grace: 0 });
+  }, 120_000);
+
+  // F3 D126 (stack135 fix7): an agent answer committed while the sweep waits on
+  // the conversation fence (the `conversation-delivery:<issue>` lock the outbox
+  // and the redelivery share) prevents the redelivery, and the next tick too.
+  it("R-SILENT: an answer committed while the sweep waits on the conversation fence prevents the redelivery, including next tick", async () => {
+    const f = await silentConversationTurn(new Date(Date.now() - 200_000));
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    let settled = false;
+    let sweep: Promise<unknown> | undefined;
+    await db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"conversation-delivery:" + f.issueId}, 0))`);
+      sweep = heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId }).finally(() => { settled = true; });
+      await new Promise(resolve => setTimeout(resolve, 1_500));
+      // The sweep saw the message unanswered and is now waiting on the fence.
+      expect(settled, "the sweep waits on the conversation fence").toBe(false);
+      await tx.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "agent", authorAgentId: agentId,
+        body: "Here is the answer, now delivered.", createdAt: sql`statement_timestamp()` });
+    });
+    await sweep;
+    expect(await f.redeliveries()).toHaveLength(0);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    expect(await f.redeliveries()).toHaveLength(0);
+  }, 120_000);
+
+  // RFL DESIGN-F1 condition 2 (the clock), on a fake clock: the run ends at t,
+  // nothing happens before t+90 s, ONE wake lands by t+120 s, and a second
+  // recovery pass is a no-op (wake idempotency key).
+  it("R-SILENT clock: nothing before t+90 s, one wake by t+120 s, a second pass is a no-op", async () => {
+    const t = new Date(Date.now() - 600_000);
+    const f = await silentConversationTurn(t);
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    const deadlines: number[] = [];
+    const pass = (at: number) => { vi.setSystemTime(at);
+      return heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId, onDeferredDeadline: d => { deadlines.push(d); } }); };
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const seen: Array<{ at: number; wakes: number }> = [];
+    try {
+      for (const offset of [0, 45_000, 89_999]) {
+        await pass(t.getTime() + offset);
+        seen.push({ at: offset, wakes: (await f.redeliveries()).length });
+      }
+      await pass(t.getTime() + 120_000);
+      seen.push({ at: 120_000, wakes: (await f.redeliveries()).length });
+      await pass(t.getTime() + 120_000);
+      await pass(t.getTime() + 600_000);
+      seen.push({ at: 600_000, wakes: (await f.redeliveries()).length });
+    } finally { vi.useRealTimers(); }
+    console.info(JSON.stringify({ rSilentClock: { seen, deadlines: deadlines.map(d => d - t.getTime()) } }));
+    expect(seen).toEqual([{ at: 0, wakes: 0 }, { at: 45_000, wakes: 0 }, { at: 89_999, wakes: 0 }, { at: 120_000, wakes: 1 }, { at: 600_000, wakes: 1 }]);
+    expect(deadlines.length).toBeGreaterThanOrEqual(3);
+    expect(deadlines.every(d => d === t.getTime() + 90_000)).toBe(true);
+  }, 120_000);
+
+  // stack135 FIX3 item 2 (D129/D150/D151/D183): the rule is keyed on the run
+  // that carried the person's message, not the latest run. An unrelated timer
+  // run that succeeds afterwards must not hide the silent turn.
+  it("R-SILENT keys on the message's own run: an unrelated later success still gets exactly one redelivery", async () => {
+    const ended = new Date(Date.now() - 200_000);
+    const f = await silentConversationTurn(ended);
+    const [timer] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId, invocationSource: "timer",
+      status: "succeeded", createdAt: new Date(ended.getTime() + 5_000), startedAt: new Date(ended.getTime() + 10_000),
+      finishedAt: new Date(ended.getTime() + 20_000), responsibleUserId: userId,
+      contextSnapshot: { issueId: f.issueId, wakeReason: "heartbeat_timer", wakeSource: "timer" } }).returning();
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass++) await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    const wakes = await f.redeliveries();
+    const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.wakeupRequestId, wakes.map(w => w.id)));
+    console.info(JSON.stringify({ rSilentLaterSuccess: { timerRunId: timer!.id, redeliveries: wakes.length, carried: runs.map(r => r.contextSnapshot?.wakeCommentId) } }));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.payload).toMatchObject({ commentId: f.messageId, redeliveredAfterRunId: f.runId });
+    expect(runs.map(r => r.contextSnapshot?.wakeCommentId)).toEqual([f.messageId]);
+  }, 120_000);
+
+  // Item 2 boundary (stack135 r3): upstream keeps a failed turn while it is the
+  // task's latest attempt (the card offers Retry), and a person's Stop is never
+  // restarted. The redelivery re-offers only a failed turn the card no longer shows.
+  it.each(["failed_is_latest", "cancelled_then_unrelated_success"] as const)("a person's %s turn is left to its upstream owner, never redelivered", async shape => {
+    const t = new Date(Date.now() - 600_000);
+    const f = await silentConversationTurn(t);
+    await db.update(heartbeatRuns).set({ status: shape === "failed_is_latest" ? "failed" : "cancelled", errorCode: shape === "failed_is_latest" ? "adapter_failed" : "cancelled",
+      error: "adapter failed before an answer" }).where(eq(heartbeatRuns.id, f.runId));
+    if (shape !== "failed_is_latest") await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId, invocationSource: "timer",
+      status: "succeeded", createdAt: new Date(t.getTime() + 5_000), startedAt: new Date(t.getTime() + 10_000), finishedAt: new Date(t.getTime() + 20_000),
+      responsibleUserId: userId, contextSnapshot: { issueId: f.issueId, wakeReason: "heartbeat_timer", wakeSource: "timer" } });
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass++) await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    const card = await taskInterruptionPresentation(db, await issue(f.issueId));
+    console.info(JSON.stringify({ rSilentUpstreamOwner: { shape, redeliveries: (await f.redeliveries()).length, card: card && { state: card.state, canRetry: card.canRetry } } }));
+    expect(await f.redeliveries()).toHaveLength(0);
+    if (shape === "failed_is_latest") expect(card).toMatchObject({ state: "failed", canRetry: true });
+  }, 120_000);
+
+  // F3 re-home (stack135 r3) of the PINS-DELETED-MECHANISM rows. Their deleted
+  // owner (U5 notices) is gone; the behaviour each pinned is now asserted on its
+  // current owners: the conversation recovery branch (R-SILENT redelivery) and
+  // upstream's computed card, through the real heartbeat wrapper at t+120 s.
+  // Oracle (rf-3): current notes + live runs + a failed/retry_scheduled card is
+  // exactly one for an unanswered latest message, and the message is untouched.
+  type PinShape = "D008_failed_first_message" | "D110_first_turn_input_silent" | "D110_first_turn_input_failed_then_timer"
+    | "D114_two_messages_first_answered" | "D115_earlier_runs_card_after_message" | "D116_three_messages_before_prose"
+    | "D117_scalar_commentId" | "D118_soft_deleted_later_message" | "D128_old_approval_before_failed_message"
+    | "D181_old_question_before_failed_message" | "D182_board_confirmation_for_someone_else" | "D152_first_turn_input_failed"
+    | "D139_no_wake_no_run" | "D136_board_hold_no_run" | "D138_wake_failed_no_run" | "D137_coalesced_execution_wait_failed"
+    | "D180_old_approval_board_hold" | "D157_queued_wake_never_runs" | "D160_workspace_pending" | "D168_carrying_queued_run_never_starts"
+    | "D128_approval_after_run_before_message" | "D138_wake_failed_no_run_blocked" | "D137_coalesced_execution_wait_failed_blocked"
+    | "D160_ready_for_assessment" | "D160_arbitrating";
+  it.each([
+    "D008_failed_first_message", "D110_first_turn_input_silent", "D110_first_turn_input_failed_then_timer",
+    "D114_two_messages_first_answered", "D115_earlier_runs_card_after_message", "D116_three_messages_before_prose",
+    "D117_scalar_commentId", "D118_soft_deleted_later_message", "D128_old_approval_before_failed_message",
+    "D181_old_question_before_failed_message", "D182_board_confirmation_for_someone_else", "D152_first_turn_input_failed",
+    "D139_no_wake_no_run", "D136_board_hold_no_run", "D138_wake_failed_no_run", "D137_coalesced_execution_wait_failed",
+    "D180_old_approval_board_hold", "D157_queued_wake_never_runs", "D160_workspace_pending", "D168_carrying_queued_run_never_starts",
+    "D128_approval_after_run_before_message", "D138_wake_failed_no_run_blocked", "D137_coalesced_execution_wait_failed_blocked",
+    "D160_ready_for_assessment", "D160_arbitrating",
+  ] satisfies PinShape[])("F3 pin re-home %s: the latest person message has exactly one truthful outcome by 120 s", async shape => {
+    const t = new Date(Date.now() - 600_000);
+    const at = (offset: number) => new Date(t.getTime() + offset);
+    let busyTurnId: string | null = null;
+    const [task] = await db.insert(issues).values({ companyId, title: `F3 ${shape}`, status: "in_progress", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: at(-300_000) }).returning();
+    const issueId = task!.id;
+    // A chat message (clientRequestId) whose durable outbox receipt the original delivery consumed, unless `delivered` is false.
+    const message = async (body: string, offset: number, delivered: boolean | "failed" | "coalesced" = true) => {
+      const [row] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId, body,
+        clientRequestId: randomUUID(), createdAt: at(offset) }).returning();
+      if (delivered) await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented",
+        status: delivered === true ? "completed" : delivered,
+        ...(delivered === "failed" ? { error: "provider or completion contract changed" } : {}), requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${row!.id}`,
+        payload: { issueId, commentId: row!.id }, createdAt: at(offset + 1_000), finishedAt: at(offset + 2_000) });
+      return row!;
+    };
+    const run = async (offset: number, status: string, contextSnapshot: Record<string, unknown>, extra: Partial<typeof heartbeatRuns.$inferInsert> = {}) =>
+      (await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status,
+        createdAt: at(offset - 30_000), startedAt: at(offset - 29_000), finishedAt: at(offset), responsibleUserId: userId,
+        errorCode: status === "failed" ? "adapter_failed" : null, error: status === "failed" ? "adapter failed before an answer" : null,
+        contextSnapshot: { issueId, wakeReason: "issue_commented", ...contextSnapshot }, ...extra }).returning())[0]!;
+    const reply = async (runId: string, offset: number) => db.insert(issueComments).values({ companyId, issueId, authorType: "agent",
+      authorAgentId: agentId, createdByRunId: runId, body: "Here is the answer.", createdAt: at(offset) });
+    const question = async (sourceRunId: string | null, offset: number) => db.insert(issueThreadInteractions).values({ companyId, issueId,
+      kind: "ask_user_questions", status: "pending", createdByAgentId: agentId, sourceRunId, addresseeUserId: userId, createdAt: at(offset),
+      payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
+        options: [{ id: "eu", label: "EU" }, { id: "us", label: "US" }] }] } } as never);
+    const timer = async (offset: number) => run(offset, "succeeded", { wakeReason: "heartbeat_timer", wakeSource: "timer" }, { invocationSource: "timer" });
+    // A failed native run held by an active board-owned native-reconciliation
+    // recovery action, in the shape today's release leaves it (as unfinishedRun).
+    const boardHeldNativeRun = async (issueId: string, finishedAt: Date, contextSnapshot: Record<string, unknown> = {}) => {
+      await db.update(issues).set({ status: "blocked", statusVersion: 4, blockedTransitionAt: finishedAt }).where(eq(issues.id, issueId));
+      const [held] = await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "on_demand", issueId, nativeIssueId: issueId,
+        runtimeMode: "native", status: "failed", errorCode: "adapter_failed", error: "Native session failed", nativePhase: "terminal_failure",
+        startedAt: new Date(finishedAt.getTime() - 29_000), finishedAt, createdAt: new Date(finishedAt.getTime() - 30_000), responsibleUserId: userId,
+        contextSnapshot: { issueId, wakeReason: "issue_commented", ...contextSnapshot } }).returning();
+      await db.insert(nativeRunFinalizations).values({ runId: held!.id, companyId, issueId, phase: "terminal_failure",
+        recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation", leaseOwner: null });
+      await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "active",
+        ownerType: "board", returnOwnerAgentId: agentId, cause: "native_continuation_requires_reconciliation",
+        fingerprint: `native-continuation:${held!.id}`, maxAttempts: 3, createdAt: finishedAt,
+        nextAction: "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.",
+        evidence: { runId: held!.id, originalFailureCode: "adapter_failed", nativeFailureBlock: { runId: held!.id, statusVersion: 4 } } });
+      return held!;
+    };
+    let latest: typeof issueComments.$inferSelect;
+    switch (shape) {
+      case "D152_first_turn_input_failed": latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "failed", { firstTurnQueuedInput: { commentIds: [latest.id] } }); break;
+      case "D139_no_wake_no_run": latest = await message("Please answer this accepted request.", -60_000, false); break;
+      case "D008_failed_first_message": latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "failed", { wakeCommentId: latest.id }); break;
+      case "D110_first_turn_input_silent": latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "succeeded", { firstTurnQueuedInput: { commentIds: [latest.id] } }); break;
+      case "D110_first_turn_input_failed_then_timer": latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "failed", { firstTurnQueuedInput: { commentIds: [latest.id] } }); await timer(20_000); break;
+      case "D114_two_messages_first_answered": {
+        const first = await message("First question.", -120_000);
+        await reply((await run(-90_000, "succeeded", { wakeCommentId: first.id })).id, -91_000);
+        latest = await message("Second question.", -60_000);
+        await run(0, "succeeded", { wakeCommentId: latest.id }); break;
+      }
+      case "D115_earlier_runs_card_after_message": {
+        const earlierMessage = await message("Earlier request.", -200_000);
+        const earlier = await run(-150_000, "succeeded", { wakeCommentId: earlierMessage.id });
+        await reply(earlier.id, -151_000);
+        latest = await message("Please answer this accepted request.", -60_000);
+        await question(earlier.id, -30_000); // the EARLIER run's card, created after the current message
+        await run(0, "succeeded", { wakeCommentId: latest.id }); break;
+      }
+      case "D116_three_messages_before_prose": {
+        const a = await message("One.", -80_000), b = await message("Two.", -70_000);
+        latest = await message("Three.", -60_000);
+        await run(0, "succeeded", { wakeCommentIds: [a.id, b.id, latest.id] }); break;
+      }
+      case "D117_scalar_commentId": latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "succeeded", { commentId: latest.id }); break;
+      case "D118_soft_deleted_later_message": {
+        latest = await message("Please answer this accepted request.", -60_000);
+        await run(0, "succeeded", { wakeCommentId: latest.id });
+        const later = await message("Oops, ignore.", 10_000);
+        await db.update(issueComments).set({ deletedAt: at(11_000) }).where(eq(issueComments.id, later.id)); break;
+      }
+      case "D128_old_approval_before_failed_message": {
+        const prior = await message("Deploy when approved.", -200_000);
+        await reply((await run(-150_000, "succeeded", { wakeCommentId: prior.id })).id, -151_000);
+        const [approval] = await db.insert(approvals).values({ companyId, type: "deploy", requestedByAgentId: agentId, status: "pending",
+          payload: { summary: "Deploy to production" }, createdAt: at(-140_000) } as typeof approvals.$inferInsert).returning();
+        await db.insert(issueApprovals).values({ companyId, issueId, approvalId: approval!.id, linkedByAgentId: agentId, createdAt: at(-140_000) } as typeof issueApprovals.$inferInsert);
+        latest = await message("Never mind the deploy. What is the current version?", -60_000);
+        await run(0, "failed", { wakeCommentId: latest.id }); break;
+      }
+      // rf-3 (REMOVED-REOFFER-REGRESSION): the run carrying "Deploy when approved." was queued at t-100 s,
+      // the approval asked at t-80 s, and the person's different instruction at t-60 s folded into that
+      // queued run in production's coalesced format (older scalar commentId/wakeCommentId, then
+      // wakeCommentIds: [older, latest]; the latest wake `coalesced` into the run). The approval predates
+      // the MESSAGE but not the run row: the failed attempt's card is the one outcome, not the approval wait.
+      case "D128_approval_after_run_before_message": {
+        const prior = await message("Deploy when approved.", -140_000);
+        const [approval] = await db.insert(approvals).values({ companyId, type: "deploy", requestedByAgentId: agentId, status: "pending",
+          payload: { summary: "Deploy" }, createdAt: at(-80_000) } as typeof approvals.$inferInsert).returning();
+        await db.insert(issueApprovals).values({ companyId, issueId, approvalId: approval!.id, linkedByAgentId: agentId, createdAt: at(-80_000) } as typeof issueApprovals.$inferInsert);
+        latest = await message("Never mind the deploy. What is the current version?", -60_000);
+        const carrying = await run(0, "failed", { commentId: prior.id, wakeCommentId: prior.id, wakeCommentIds: [prior.id, latest.id] },
+          { createdAt: at(-100_000), startedAt: at(-29_000), updatedAt: at(0) });
+        const [primary] = await db.update(agentWakeupRequests).set({ runId: carrying.id, requestedAt: at(-139_000), finishedAt: at(0), updatedAt: at(0) })
+          .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${prior.id}`))).returning();
+        await db.update(heartbeatRuns).set({ wakeupRequestId: primary!.id }).where(eq(heartbeatRuns.id, carrying.id));
+        await db.update(agentWakeupRequests).set({ status: "coalesced", runId: carrying.id, requestedAt: at(-59_000), finishedAt: at(-59_000), updatedAt: at(-59_000) })
+          .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${latest.id}`)));
+        break;
+      }
+      case "D181_old_question_before_failed_message": {
+        const prior = await message("Deploy it.", -200_000);
+        const priorRun = await run(-150_000, "succeeded", { wakeCommentId: prior.id });
+        await question(priorRun.id, -151_000);
+        latest = await message("Never mind the deploy. What is the current version?", -60_000);
+        await run(0, "failed", { wakeCommentId: latest.id }); break;
+      }
+      case "D182_board_confirmation_for_someone_else": {
+        latest = await message("What is the current version?", -60_000);
+        await run(0, "failed", { wakeCommentId: latest.id });
+        await db.insert(issueThreadInteractions).values({ companyId, issueId, kind: "request_confirmation", status: "pending",
+          sourceRunId: null, continuationPolicy: "none", requestedResolverPolicy: "human_only", effectiveResolverPolicy: "human_only",
+          resolverPolicyProvenance: "explicit", addresseeUserId: "someone-else", createdByUserId: userId, title: "Other person's decision",
+          createdAt: at(30_000), payload: { version: 1, prompt: "Approve the unrelated deploy?" } } as never); break;
+      }
+      // Zero-outcome shapes (stack135 fix7). A board-owned native-reconciliation
+      // hold on an earlier failed native run, in the shape today's release leaves it.
+      case "D136_board_hold_no_run": {
+        await boardHeldNativeRun(issueId, at(-300_000));
+        latest = await message("Please answer this accepted request.", -60_000); break;
+      }
+      case "D138_wake_failed_no_run_blocked":
+      case "D138_wake_failed_no_run": {
+        // The original outbox wake ended FAILED with no run. (REG-21's "blocked" half has no writer at head:
+        // its error text "provider or completion contract changed" is not produced anywhere in server/src.)
+        latest = await message("Please answer this accepted request.", -60_000, "failed"); break;
+      }
+      case "D137_coalesced_execution_wait_failed_blocked":
+      case "D137_coalesced_execution_wait_failed": {
+        latest = await message("Please answer this accepted request.", -60_000, "coalesced");
+        await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", reason: "execution_wait", status: "failed",
+          error: "remote cleanup wake failed", payload: { issueId, executionWait: { reason: "remote_cleanup" },
+            _paperclipWakeContext: { issueId, wakeCommentIds: [latest.id] } }, createdAt: at(-59_000), finishedAt: at(-30_000) }); break;
+      }
+      case "D180_old_approval_board_hold": {
+        const prior = await message("Deploy when approved.", -200_000);
+        await reply((await run(-150_000, "succeeded", { wakeCommentId: prior.id })).id, -151_000);
+        const [approval] = await db.insert(approvals).values({ companyId, type: "deploy", requestedByAgentId: agentId, status: "pending",
+          payload: { summary: "Deploy to production" }, createdAt: at(-140_000) } as typeof approvals.$inferInsert).returning();
+        await db.insert(issueApprovals).values({ companyId, issueId, approvalId: approval!.id, linkedByAgentId: agentId, createdAt: at(-140_000) } as typeof issueApprovals.$inferInsert);
+        latest = await message("Never mind the deploy. What is the current version?", -60_000);
+        await boardHeldNativeRun(issueId, at(0), { wakeCommentId: latest.id }); break;
+      }
+      case "D157_queued_wake_never_runs": {
+        // Production shape: enqueue writes the queued wake and its queued run in one
+        // transaction (heartbeat/queue.ts:5618-5668), so a queued wake always has its run.
+        latest = await message("Please answer this accepted request.", -60_000, false);
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
+          requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${latest.id}`,
+          payload: { issueId, commentId: latest.id }, createdAt: at(-59_000), requestedAt: at(-59_000) }).returning();
+        const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
+          createdAt: at(-59_000), responsibleUserId: userId, wakeupRequestId: wake!.id,
+          contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: latest.id } }).returning();
+        await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id)); break;
+      }
+      // rf-3 D160 residual: the executor settles the run succeeded even when finalizeNativeRun threw after
+      // writing ready_for_assessment (native-run-finalizer.ts) or arbitrating (runtime-execution.ts catch
+      // "the reconciliation loop will retry"); the reconciler can still commit and publish its reply.
+      case "D160_ready_for_assessment":
+      case "D160_arbitrating":
+      case "D160_workspace_pending": {
+        const phase = shape === "D160_workspace_pending" ? "workspace_pending" : shape === "D160_arbitrating" ? "arbitrating" : "ready_for_assessment";
+        latest = await message("Please answer this accepted request.", -60_000);
+        const pending = await run(0, "succeeded", { wakeCommentId: latest.id }, { runtimeMode: "native", nativeIssueId: issueId, nativePhase: phase } as never);
+        await db.insert(nativeRunFinalizations).values({ runId: pending.id, companyId, issueId, phase, recoveryState: "pending", leaseOwner: null } as never); break;
+      }
+      case "D168_carrying_queued_run_never_starts": {
+        // The person's own wake owns the queued run (heartbeat/queue.ts:5618-5668).
+        latest = await message("Please answer this accepted request.", -60_000);
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
+          requestedByActorType: "user", requestedByActorId: userId, payload: { issueId, commentId: latest.id },
+          createdAt: at(-59_000), requestedAt: at(-59_000) }).returning();
+        const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
+          createdAt: at(-59_000), responsibleUserId: userId, wakeupRequestId: wake!.id,
+          contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: latest.id } }).returning();
+        await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id));
+        // RFL 19:59Z: the message waits behind the conversation's own long turn, which later FAILS.
+        busyTurnId = (await run(-120_000, "running", {}, { finishedAt: null, startedAt: at(-120_000), createdAt: at(-121_000) })).id; break;
+      }
+    }
+    // rf-3 R-SILENT: the same failed delivery while the task is BLOCKED (the person's message never ran).
+    if (shape.endsWith("_blocked")) await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+    // D168 waits behind its own busy turn (one slot); every other shape behind other work.
+    if (!busyTurnId) await occupySlot();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const heartbeat = heartbeatService(db);
+      // Every production owner a tick drives (heartbeat.ts:4752 stranded sweep,
+      // index.ts executionDisposition + executionContinuation queues).
+      const tick = async (elapsed: number) => {
+        vi.setSystemTime(t.getTime() + elapsed);
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
+        await settleUnrecoverableExecutions(db);
+        await deliverReconciledExecutions(db, heartbeat.wakeup);
+      };
+      // A person's queued run that never starts (D157/D168, RFL 19:17Z): at enqueue + 10 min it is
+      // a failed start the card owns (failed + Retry), not a live run; the queued run is no second outcome.
+      const observe = async () => {
+        const card = await taskInterruptionPresentation(db, await issue(issueId));
+        const notes = (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+          eq(issueComments.authorType, "system")))).filter(c => !c.deletedAt && !(c.metadata as Record<string, unknown> | null)?.supersededByIncident);
+        const live = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])))).filter(r =>
+          r.id !== busyTurnId && !(card?.state === "failed" && card.observedRunId === r.id));
+        const redeliveries = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${latest.id}`)));
+        const [after] = await db.select().from(issueComments).where(eq(issueComments.id, latest.id));
+        // A wake still queued for the message (no run yet) is the wake queue's owned, pending delivery (D157).
+        const queuedWakes = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.runId} is null`,
+          inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+          sql`(${agentWakeupRequests.idempotencyKey} like 'conversation-comment%' and ${agentWakeupRequests.payload}->>'commentId' = ${latest.id})`));
+        // The message's own native turn still finishing (workspace_pending) is its finalizer's owned, pending
+        // publication: committed-response recovery posts its reply once it commits (D160, RFL 19:17Z ruling 3).
+        const finishing = await db.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
+          .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, nativeRunFinalizations.runId)).where(and(
+            eq(nativeRunFinalizations.companyId, companyId),
+            inArray(nativeRunFinalizations.phase, ["workspace_pending", "ready_for_assessment", "arbitrating"]),
+            sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${latest.id}`));
+        const outcomes = notes.length + live.length + queuedWakes.length + finishing.length
+          + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
+        console.info(JSON.stringify({ f3PinRehome: { shape, elapsedMs: Date.now() - t.getTime(), card: card && { state: card.state, canRetry: card.canRetry },
+          notes: notes.length, live: live.map(r => r.contextSnapshot?.wakeCommentId ?? null), queuedWakes: queuedWakes.length,
+          finishing: finishing.length, redeliveries: redeliveries.length, outcomes } }));
+        expect(after).toMatchObject({ body: latest.body, authorUserId: userId, deletedAt: null });
+        expect(outcomes, "exactly one truthful outcome, never zero or two").toBe(1);
+        if (live.length) expect(live.map(r => r.contextSnapshot?.wakeCommentId)).toEqual([latest.id]);
+        return { card, redeliveries: redeliveries.length };
+      };
+      for (const elapsed of [90_001, 119_999, 120_000]) await tick(elapsed);
+      const first = await observe();
+      if (shape === "D128_approval_after_run_before_message")
+        expect(first.card, "the failed attempt for the later message owns the card, not the older approval").toMatchObject({ state: "failed", canRetry: true });
+      if (shape.startsWith("D160_")) expect(first.redeliveries, "the finishing turn is not re-offered (D160)").toBe(0);
+      if (shape === "D157_queued_wake_never_runs" || shape === "D168_carrying_queued_run_never_starts") {
+        expect(first.card, "inside the start bound the person's queued run is working").toMatchObject({ state: "working" });
+        // RFL 19:59Z (S9 queued-time rule): queued at t - 59 s behind a busy turn. At enqueue + 10 min
+        // the turn still runs, so the message is WAITING: working, never failed (red when the bound
+        // counts from enqueue).
+        for (const elapsed of [540_999, 541_000]) await tick(elapsed);
+        const waiting = await observe();
+        expect(waiting.card, "behind a busy turn at enqueue + 10 min: waiting, not failed").toMatchObject({ state: "working" });
+        expect(waiting.card!.observedRunId, "the card is the queued message's own run").not.toBe(busyTurnId);
+        // The busy turn ends at t + 660 s (a 12-min turn): D157 other work succeeds; D168 the
+        // conversation's own turn FAILS. The slot is free from then on (startable since its finishedAt).
+        const [busy] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
+        await db.update(heartbeatRuns).set(busyTurnId
+          ? { status: "failed", errorCode: "adapter_failed", error: "adapter failed before an answer", finishedAt: at(660_000) }
+          : { status: "succeeded", finishedAt: at(660_000) }).where(eq(heartbeatRuns.id, busy!.id));
+        // A turn that ran has started (production always stamps started_at at claim).
+        if (!busy!.startedAt) await db.update(heartbeatRuns).set({ startedAt: at(-120_000) }).where(eq(heartbeatRuns.id, busy!.id));
+        for (const elapsed of [661_000, 1_259_999]) await tick(elapsed);
+        const startable = await observe();
+        expect(startable.card, "startable for under 10 min: working, never the failed turn's card").toMatchObject({ state: "working" });
+        expect(startable.card!.observedRunId).not.toBe(busy!.id);
+        // Kept (D157/D168): startable for 10 min and the dispatcher never took it: failed + Retry.
+        await tick(1_260_000);
+        const bounded = await observe();
+        expect(bounded.card, "at startable + 10 min: failed + Retry").toMatchObject({ state: "failed", canRetry: true });
+        expect(bounded.card!.observedRunId, "the queued message's own failed start, not the busy turn's").not.toBe(busy!.id);
+        expect(bounded.redeliveries, "the card is the one outcome; no redelivery beside it").toBe(0);
+        // rf-3 19:59Z: Retry is not a dead end. It does not just join the stuck queued run: the receipt
+        // names that run for the caller (routes/issues.ts) to start now through the dispatcher.
+        const queuedId = bounded.card!.observedRunId!;
+        const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: userId, idempotencyKey: randomUUID(),
+          observedRunId: queuedId });
+        expect(receipt).toMatchObject({ accepted: true, stale: false, startQueuedRunId: queuedId });
+        const messageRuns = async () => (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.issueId, issueId)))).filter(r => r.id !== busyTurnId);
+        // What routes/issues.ts does with that receipt: the dispatcher starts the run now.
+        await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
+        const [started] = await messageRuns();
+        expect(await messageRuns(), "Retry starts the message's own run, never a second").toHaveLength(1);
+        expect(started, "the stuck run STARTED (claimed by the dispatcher), carrying the message once").toMatchObject({ id: queuedId });
+        expect(started!.startedAt, "started within seconds of the press").not.toBeNull();
+        expect(started!.status).not.toBe("queued");
+        expect(started!.contextSnapshot).toMatchObject({ wakeCommentId: latest.id });
+        const afterRetry = await taskInterruptionPresentation(db, await issue(issueId));
+        expect(afterRetry?.state === "failed" && afterRetry.observedRunId === queuedId, "the failed start card clears").toBe(false);
+        // A second press starts nothing: the message's run is no longer a stuck queued run.
+        const second = await requestTaskRetry({ db, companyId, issueId, actorId: userId, idempotencyKey: randomUUID(),
+          observedRunId: afterRetry?.observedRunId ?? queuedId }).catch((error: unknown) => ({ error: String(error) }));
+        expect(second).not.toHaveProperty("startQueuedRunId");
+        expect(await messageRuns(), "the second press starts no run").toHaveLength(1);
+        console.info(JSON.stringify({ f3QueuedStart: { shape, waiting: waiting.card!.state, startable: startable.card!.state,
+          bounded: bounded.card!.state, receipt, started: { id: started!.id, status: started!.status, startedAt: started!.startedAt },
+          afterRetry: afterRetry?.state ?? null, second } }));
+      }
+    } finally { vi.useRealTimers(); }
+  }, 120_000);
+
   // RFL 12:36Z regression probes. Keep reasons: executor exclusion is a data
   // safety boundary; these reproduce the recorded D10 failure paths.
+  // rf-3 20:20Z (b) + (a) + R-ONCE on the Retry. A REAL dispatcher skip cause, not "nobody poked":
+  // the person's message rode on the failed turn's retry run (coalesced), and that failed turn's
+  // sandbox cleanup FAILED (environment_leases.cleanup_status = 'failed'). Every claim of the retry
+  // run declines it at heartbeat/queue.ts lockIssueExecutionClaim "predecessor_cleanup_pending"
+  // (run.retryOfRunId -> hasPendingRunCleanup), with the agent's slot FREE. The liveness re-poke
+  // (resumeQueuedRunsAfterDrain -> startNextQueuedRunForAgent(agent, true, true)) runs first and
+  // leaves it queued. Retry through the REAL POST route then cancels that run (it never starts later)
+  // and starts ONE fresh run whose PROVIDER INPUT carries the message once and none of the old turn.
+  it("D168 real stuck cause: liveness leaves it untaken; Retry via the route starts ONE fresh run carrying the message once", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    const t = new Date(Date.now() - 600_000);
+    const at = (offset: number) => new Date(t.getTime() + offset);
+    const OLD = "OLD-ASSIGNMENT-9c1 rotate the production signing keys and redeploy";
+    const [task] = await db.insert(issues).values({ companyId, title: "F3 D168 real stuck cause", status: "in_progress", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: at(-300_000) }).returning();
+    const issueId = task!.id;
+    const oldContext = { issueId, wakeReason: "issue_assigned", paperclipAgentMessage: { text: OLD }, paperclipTaskMarkdown: OLD,
+      paperclipWake: { reason: "issue_assigned", instructions: OLD }, executionStage: { stage: "execute", instructions: OLD } };
+    // The failed turn, and its sandbox whose cleanup failed (a real, durable hold no re-poke clears).
+    const [failedTurn] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "assignment", status: "failed",
+      errorCode: "adapter_failed", error: "adapter failed before an answer", createdAt: at(-200_000), startedAt: at(-190_000),
+      finishedAt: at(-70_000), responsibleUserId: userId, contextSnapshot: oldContext }).returning();
+    await db.insert(environmentLeases).values({ companyId, heartbeatRunId: failedTurn!.id, issueId, provider: "boat",
+      providerLeaseId: `d168-${randomUUID()}`, status: "released", releasedAt: at(-69_000), cleanupStatus: "failed" });
+    // Its bounded retry, queued; the person's message coalesced into it (the wake names the run).
+    const [retryWake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", reason: "retry_failed_run",
+      status: "queued", requestedByActorType: "system", payload: { issueId }, createdAt: at(-60_000), requestedAt: at(-60_000) }).returning();
+    const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "What is the current version?", clientRequestId: randomUUID(), createdAt: at(-55_000) }).returning();
+    const [stuck] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "automation", status: "queued",
+      createdAt: at(-60_000), responsibleUserId: userId, wakeupRequestId: retryWake!.id, retryOfRunId: failedTurn!.id,
+      contextSnapshot: { ...oldContext, wakeCommentId: message!.id, wakeCommentIds: [message!.id] } }).returning();
+    await db.update(agentWakeupRequests).set({ runId: stuck!.id }).where(eq(agentWakeupRequests.id, retryWake!.id));
+    await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "coalesced",
+      runId: stuck!.id, requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${message!.id}`,
+      payload: { issueId, commentId: message!.id }, createdAt: at(-54_000), requestedAt: at(-54_000), finishedAt: at(-54_000) });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const heartbeat = heartbeatService(db);
+      const runsCarrying = async () => (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.issueId, issueId)))).filter(r => r.contextSnapshot?.wakeCommentId === message!.id
+          || (r.contextSnapshot?.wakeCommentIds as string[] | undefined)?.includes(message!.id));
+      const repoke = async (elapsed: number) => {
+        vi.setSystemTime(t.getTime() + elapsed);
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
+        await settleUnrecoverableExecutions(db);
+        await deliverReconciledExecutions(db, heartbeat.wakeup);
+        // Upstream liveness: the queued-run redrive (dispatch-work.ts -> resumeQueuedRunsAfterDrain).
+        await heartbeat.resumeQueuedRunsAfterDrain({ companyId });
+        await heartbeat.drainActiveRunExecutions();
+      };
+      for (const elapsed of [5_000, 120_000, 300_000, 539_000]) {
+        await repoke(elapsed);
+        const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stuck!.id));
+        expect(row, `the liveness re-poke leaves it untaken (t+${elapsed})`).toMatchObject({ status: "queued", startedAt: null });
+        expect((await taskInterruptionPresentation(db, await issue(issueId)))?.state, "inside the bound: working").toBe("working");
+      }
+      expect(await heartbeat.resumeQueuedRunsForAgent(companyId, agentId), "the old Retry re-poke takes nothing either").toEqual([]);
+      await repoke(541_000);
+      const card = await taskInterruptionPresentation(db, await issue(issueId));
+      expect(card, "startable for 10 min, never taken: failed + Retry").toMatchObject({ state: "failed", canRetry: true, observedRunId: stuck!.id });
+      expect(await runsCarrying()).toHaveLength(1);
+      // Retry through the REAL route.
+      const app = retryRouteApp();
+      const first = await request(app).post(`/api/issues/${issueId}/retry`).send({ observedRunId: stuck!.id, idempotencyKey: randomUUID() });
+      expect(first.status, JSON.stringify(first.body)).toBeLessThan(300);
+      await heartbeat.drainActiveRunExecutions();
+      const [old] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stuck!.id));
+      expect(old, "the stuck run is cancelled before it ever started").toMatchObject({ status: "cancelled", startedAt: null });
+      const fresh = (await runsCarrying()).filter(r => r.id !== stuck!.id);
+      expect(fresh, "ONE fresh run carries the message").toHaveLength(1);
+      expect(fresh[0]!.startedAt, "the fresh run STARTED (the dispatcher took it)").not.toBeNull();
+      expect(fresh[0]!.retryOfRunId, "no retry ancestry follows the message").toBeNull();
+      // (a) R-REPLAY: the provider input of the Retry-started run.
+      const { context, input, provider } = await providerInputFor(fresh[0]!, issueId);
+      const count = (text: string, needle: string) => text.split(needle).length - 1;
+      const wakeComments = ((context.paperclipWake as Record<string, unknown> | undefined)?.comments as Array<{ id: string }> | undefined) ?? [];
+      console.info(JSON.stringify({ d168RetryProviderInput: { oldRunId: stuck!.id, freshRunId: fresh[0]!.id, messageInPrompt: count(input.task.prompt, message!.body),
+        messageInEnvelope: count(provider, message!.body), oldInEnvelope: count(provider, "OLD-ASSIGNMENT-9c1"), wakeCommentIds: wakeComments.map(c => c.id),
+        wakeReason: context.wakeReason ?? null, route: first.status } }));
+      expect(wakeComments.map(c => c.id)).toEqual([message!.id]);
+      expect(count(input.task.prompt, message!.body)).toBe(1);
+      expect(provider).not.toContain("OLD-ASSIGNMENT-9c1");
+      expect(fresh[0]!.contextSnapshot).not.toHaveProperty("paperclipAgentMessage");
+      expect(fresh[0]!.contextSnapshot).not.toHaveProperty("executionStage");
+      expect(fresh[0]!.contextSnapshot?.wakeReason).toBe("issue_commented");
+      // R-ONCE: a second press and further sweeps start nothing, and the old run never starts.
+      const second = await request(app).post(`/api/issues/${issueId}/retry`).send({ observedRunId: stuck!.id, idempotencyKey: randomUUID() });
+      await heartbeat.drainActiveRunExecutions();
+      for (const elapsed of [600_000, 900_000]) await repoke(elapsed);
+      const [oldAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stuck!.id));
+      expect(oldAfter, "the old run never starts later").toMatchObject({ status: "cancelled", startedAt: null });
+      const allRuns = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.issueId, issueId))))
+        .filter(r => r.id !== failedTurn!.id);
+      console.info(JSON.stringify({ d168RetryOnce: { second: second.status, secondBody: second.body,
+        runs: allRuns.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt, carries: r.contextSnapshot?.wakeCommentId ?? null })) } }));
+      expect(allRuns.map(r => r.id).sort(), "the Retry, a second press and sweeps start no other run of any kind").toEqual([stuck!.id, fresh[0]!.id].sort());
+    } finally {
+      vi.useRealTimers();
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: false });
+    }
+  }, 120_000);
+
+  // RFL 20:46Z (ruled): a TASK-level hold. c9a2f934's fixture, but the failed turn whose sandbox
+  // cleanup failed is the TASK's execution owner (issues.execution_run_id), so the dispatcher declines
+  // every start of this task (heartbeat/queue.ts lockIssueExecutionClaim, executionOwnerId ->
+  // predecessor_cleanup_pending), a Retry's fresh run included. At +10 min the card names the hold:
+  // not failed, no Retry. When the hold clears, liveness starts exactly ONE run.
+  it("D168 task-level hold: the card names the hold at +10 min (no failed, no Retry); the hold clears and one run starts", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    const t = new Date(Date.now() - 1_800_000);
+    const at = (offset: number) => new Date(t.getTime() + offset);
+    const [task] = await db.insert(issues).values({ companyId, title: "F3 D168 task-level hold", status: "in_progress", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: at(-300_000) }).returning();
+    const issueId = task!.id;
+    const [failedTurn] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "failed",
+      errorCode: "adapter_failed", error: "adapter failed before an answer", createdAt: at(-200_000), startedAt: at(-190_000),
+      finishedAt: at(-70_000), responsibleUserId: userId, contextSnapshot: { issueId, wakeReason: "issue_commented" } }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: failedTurn!.id, issueId, provider: "boat",
+      providerLeaseId: `d168-task-${randomUUID()}`, status: "released", releasedAt: at(-69_000), cleanupStatus: "failed" }).returning();
+    // The failed turn still owns the task's execution slot.
+    await db.update(issues).set({ executionRunId: failedTurn!.id }).where(eq(issues.id, issueId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "Is it deployed?", clientRequestId: randomUUID(), createdAt: at(-61_000) }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
+      requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${message!.id}`,
+      payload: { issueId, commentId: message!.id }, createdAt: at(-60_000), requestedAt: at(-60_000) }).returning();
+    const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
+      createdAt: at(-60_000), responsibleUserId: userId, wakeupRequestId: wake!.id,
+      contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: message!.id, wakeCommentIds: [message!.id] } }).returning();
+    await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const heartbeat = heartbeatService(db);
+      const carrying = async () => (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.issueId, issueId)))).filter(r => r.contextSnapshot?.wakeCommentId === message!.id
+          || (r.contextSnapshot?.wakeCommentIds as string[] | undefined)?.includes(message!.id));
+      const repoke = async (elapsed: number) => {
+        vi.setSystemTime(t.getTime() + elapsed);
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
+        await settleUnrecoverableExecutions(db);
+        await deliverReconciledExecutions(db, heartbeat.wakeup);
+        await heartbeat.resumeQueuedRunsAfterDrain({ companyId });
+        await heartbeat.drainActiveRunExecutions();
+      };
+      for (const elapsed of [5_000, 300_000, 541_000, 1_200_000]) {
+        await repoke(elapsed);
+        const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
+        expect(row, `the task-level hold declines the start (t+${elapsed})`).toMatchObject({ status: "queued", startedAt: null });
+        const card = await taskInterruptionPresentation(db, await issue(issueId));
+        console.info(JSON.stringify({ d168TaskHold: { elapsed, card: card && { state: card.state, canRetry: card.canRetry, retryWait: card.retryWait } } }));
+        expect(card?.state, `under a task-level hold the card never says failed (t+${elapsed})`).not.toBe("failed");
+        expect(card?.canRetry ?? false, `no Retry while the hold blocks every start (t+${elapsed})`).toBe(false);
+        if (elapsed >= 541_000) expect(card, "past the 10-min bound: the named hold").toMatchObject({ state: "working",
+          observedRunId: queued!.id, retryWait: { reason: "previous_run_cleanup", message: expect.stringMatching(/^Waiting: the previous run is still cleaning up/) } });
+      }
+      // The hold clears (the failed turn's cleanup succeeds): the next liveness pass starts exactly one run.
+      await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, lease!.id));
+      await repoke(1_205_000);
+      const runs = await carrying();
+      console.info(JSON.stringify({ d168TaskHoldCleared: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) }));
+      expect(runs.map(r => r.id), "exactly one run carries the message").toEqual([queued!.id]);
+      expect(runs[0]!.startedAt, "it started once the hold cleared").not.toBeNull();
+      // (This suite has no provider or membership, so the started run ends at setup; it STARTED, which is the point.)
+      expect(runs[0]!.status, "the message's own run left the queue").not.toBe("queued");
+      for (const elapsed of [1_500_000]) await repoke(elapsed);
+      expect((await carrying()).map(r => r.id), "later passes start no second run").toEqual([queued!.id]);
+    } finally {
+      vi.useRealTimers();
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: false });
+    }
+  }, 120_000);
+
+  // Independent judge rows: deterministic ordering of the actual dispatcher/cancel CAS.
+  async function judgeQueued(personMessage = true, ageMs = 660_000) {
+    await instanceSettingsService(db).updateExperimental({enableAgentChat:true});
+    const t = new Date(Date.now() - ageMs), issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Judge Retry", status: "in_progress", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: t });
+    const [source] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, status: "failed", errorCode: "adapter_failed",
+      createdAt: new Date(t.getTime()-60_000), startedAt: new Date(t.getTime()-59_000), finishedAt: new Date(t.getTime()-1_000),
+      responsibleUserId: userId, contextSnapshot: { issueId, wakeReason: "issue_assigned" } }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: source!.id, issueId,
+      provider: "boat", providerLeaseId: `judge-${randomUUID()}`, status: "released", releasedAt: t, cleanupStatus: "failed" }).returning();
+    const [message] = personMessage ? await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "Judge new question", clientRequestId: randomUUID(), createdAt: t }).returning() : [];
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: personMessage ? "issue_commented" : "issue_assigned",
+      status: "queued", requestedByActorType: "user", requestedByActorId: userId, payload: { issueId, ...(message ? { commentId: message.id } : {}) },
+      createdAt: t, requestedAt: t }).returning();
+    const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, status: "queued", invocationSource: "on_demand",
+      createdAt: t, responsibleUserId: userId, wakeupRequestId: wake!.id, retryOfRunId: source!.id,
+      contextSnapshot: { issueId, wakeReason: personMessage ? "issue_commented" : "issue_assigned",
+        ...(message ? { wakeCommentId: message.id, wakeCommentIds: [message.id] } : {}) } }).returning();
+    await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id));
+    return { issueId, queued: queued!, source: source!, lease: lease!, message };
+  }
+
+  it("JUDGE successful-cleanup control is taken by the first liveness pass", async () => {
+    const f=await judgeQueued(),heartbeat=heartbeatService(db);
+    await db.update(environmentLeases).set({cleanupStatus:"success"}).where(eq(environmentLeases.id,f.lease.id));
+    await heartbeat.resumeQueuedRunsAfterDrain({companyId});await heartbeat.drainActiveRunExecutions();
+    const row=(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,f.queued.id)))[0]!;
+    console.info(JSON.stringify({judgeCleanupControl:{runId:row.id,status:row.status,startedAt:row.startedAt}}));
+    expect(row.startedAt).not.toBeNull();
+  },120_000);
+
+  async function judgeCleanupGate(f:Awaited<ReturnType<typeof judgeQueued>>) {
+    const {executeNativeSession,parseNativeExecutionInput,NativeSessionCloseUnrecoverableError,nativeSessionCleanupBlock}=await import("../vendor/paperclip-runner/index.js");
+    const identity={companyId,agentId,issueId:f.issueId,runId:f.source.id,sessionId:randomUUID()};
+    const capabilities={resume:true,typedEvents:true,steering:false,interruption:false,structuredResult:true};
+    const result={schema:"paperclip.run_result.v1",reportedWorkDisposition:"done",summary:"Saved work",
+      completionClaim:{contractRevision:"1",objectiveSatisfied:true,criteria:[{criterionId:"done",status:"satisfied",evidenceRefs:[]}],remainingWork:[]},
+      evidence:[],verification:[],attentionRequests:[],artifacts:[]};
+    const terminal={schema:"paperclip.prp.terminal.v1",turnTerminalState:"completed",runTerminalState:"succeeded",reportedWorkDisposition:"done"};
+    const session={identity:()=>identity,capabilities:async()=>capabilities,
+      async *events(){yield {schema:"paperclip.prp.event.v1",sourceEventId:"done",sourceSeq:1,sourceInstanceId:"runner",sourceKind:"runner",
+        runId:identity.runId,normalizedSessionId:identity.sessionId,turnId:"turn",eventType:"turn.completed",schemaVersion:1,priority:0,emittedAt:new Date().toISOString(),payload:{}};},
+      startTurn:async()=>({turnId:"turn"}),result:async()=>({result,terminal,turnId:"turn"}),
+      close:async()=>{throw new NativeSessionCloseUnrecoverableError({runnerSuspended:false,providerDrained:false});},
+      snapshot:async()=>({backendKind:"mock",sessionId:"driver",identity,providerSessionId:"provider",cursor:null,activeTurnId:null,pendingRuntimeRequests:[],lineage:[]})};
+    await db.update(heartbeatRuns).set({runtimeMode:"native",nativeIssueId:f.issueId,runnerInstanceId:randomUUID()}).where(eq(heartbeatRuns.id,f.source.id));
+    await executeNativeSession({input:parseNativeExecutionInput({schema:"paperclip.native-execution-input.v1",provider:{kind:"codex",model:null},
+      binding:{companyId,agentId,issueId:f.issueId,runId:f.source.id,executionWorkspaceId:f.source.id},
+      task:{identifier:"JUDGE",title:"Cleanup",description:null,prompt:"Continue",workMode:"standard"},workspace:{cwd:tmpdir(),repoUrl:null,repoRef:null,branchName:null},
+      session:{normalizedSessionId:identity.sessionId,driverKind:"codex_app_server",protocolVersion:1,lifecyclePolicy:{mode:"per_turn",idleTimeoutMs:null}},
+      completionContract:{id:"contract",sha256:"sha",schemaVersion:"paperclip.completion-contract.v1",contract:{revision:"1",objective:"Continue",criteria:[{id:"done",requirement:"Save work"}]}},
+      interactionResponses:[],credentialBindings:[]}),backend:{descriptor:async()=>({kind:"mock",name:"cleanup",version:"1",capabilities}),openSession:async()=>session},
+      controlPlane:{openRun:async()=>{},checkpointSession:async()=>{},appendEvent:async()=>({cursor:1,highestContiguousSourceSeq:1,disposition:"committed"}),
+        replayEvents:async()=>({events:[],highestContiguousSourceSeq:0}),completeRun:async()=>{}},runnerInstanceId:randomUUID(),controlPlaneInstanceId:"control",
+      remoteCleanupScope:JSON.stringify([f.lease.provider,f.lease.providerLeaseId])} as never);
+    expect(nativeSessionCleanupBlock({companyId,issueId:f.issueId})).toBe("operator_required");
+  }
+
+  // Superseded by replacement (RFL record SUPERSEDE-B-STARTABLE-SINCE-1117, ruling (a)): the cleanup success is a
+  // clear that starts the 10-min window, so Retry is offered only past stamp + 10 min. ONLY the precondition changes:
+  // the clock advances to stamp + 10 min + 1 ms, the card offers Retry, then the press. Every race assertion is unchanged.
+  it.each(["dispatcher_first", "retry_first"] as const)("(superseded by replacement: startable-since clock, RFL record SUPERSEDE-B-STARTABLE-SINCE-1117) JUDGE Retry CAS race %s never starts two runs or cancels a started run", async order => {
+    const f = await judgeQueued();
+    await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+    vi.setSystemTime(stamped!.startableSince!.getTime() + 600_001);
+    expect(await taskInterruptionPresentation(db, await issue(f.issueId)), "past stamp + 10 min the card offers Retry")
+      .toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
+    const heartbeat = heartbeatService(db);
+    const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId,
+      observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+    expect(receipt).toMatchObject({ startQueuedRunId: f.queued.id });
+    // The press happened past the bound; the race itself runs on the real clock (a faked clock
+    // would expire the dispatcher's controller lease, controller_lease_lost, not the race under test).
+    vi.useRealTimers();
+    const { startPersonQueuedRunFresh } = await import("./task-retry.js");
+    const cancel = async (id: string) => {
+      if (order === "dispatcher_first") {
+        await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
+        await heartbeat.drainActiveRunExecutions();
+      }
+      const cancelled = await heartbeat.cancelStuckQueuedRunForRetry(id);
+      if (order === "retry_first") await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
+      return cancelled;
+    };
+    await startPersonQueuedRunFresh(db, { ...heartbeat, cancelStuckQueuedRunForRetry: cancel } as never,
+      { companyId, issueId: f.issueId, runId: f.queued.id, actorId: userId });
+    await heartbeat.drainActiveRunExecutions();
+    const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).filter(r => r.id !== f.source.id);
+    const old = runs.find(r => r.id === f.queued.id)!;
+    console.info(JSON.stringify({ judgeRace: { order, runs: runs.map(r => ({ id:r.id,status:r.status,startedAt:r.startedAt })) } }));
+    expect(runs.filter(r => r.startedAt), "exactly one dispatched run in either CAS ordering").toHaveLength(1);
+    if (order === "dispatcher_first") {
+      expect(runs).toHaveLength(1);
+      expect(old.startedAt).not.toBeNull();
+      expect(old.errorCode).not.toBe("person_queued_run_replaced");
+    } else {
+      expect(old).toMatchObject({ status:"cancelled", startedAt:null });
+      expect(runs).toHaveLength(2);
+    }
+    } finally { vi.useRealTimers(); }
+  }, 120_000);
+
+  // Superseded by replacement (RFL record SUPERSEDE-B-NOCOMMENT-RETRY-1117; rf-3 ruling 11-17): the judge's
+  // original body asserted the OLD run itself starts. The bar is the opposite: Retry cancels the stuck run
+  // while queued and starts ONE fresh assignment run. Title kept; body replaced in place with the bar.
+  it("(superseded by replacement: cancel stuck run + one fresh run, RFL record SUPERSEDE-B-NOCOMMENT-RETRY-1117) JUDGE no person comment card Retry is not just a re-poke", async () => {
+    const f = await judgeQueued(false), heartbeat = heartbeatService(db);
+    const before = await taskInterruptionPresentation(db, await issue(f.issueId));
+    expect(before).toMatchObject({ state:"failed",canRetry:true,observedRunId:f.queued.id });
+    const app = retryRouteApp();
+    const response = await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId:f.queued.id,idempotencyKey:randomUUID() });
+    await heartbeat.drainActiveRunExecutions();
+    const after = await taskInterruptionPresentation(db, await issue(f.issueId));
+    const others = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId)))
+      .filter(r => r.id !== f.source.id && r.id !== f.queued.id);
+    const old = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,f.queued.id)))[0]!;
+    const fresh = await others();
+    console.info(JSON.stringify({ judgeNoMessageSuperseded:{ route:response.status,receipt:response.body,before,after,old:{id:old.id,status:old.status,startedAt:old.startedAt},
+      fresh: fresh.map(r => ({ id:r.id,status:r.status,startedAt:r.startedAt,retryOfRunId:r.retryOfRunId,context:r.contextSnapshot })) } }));
+    expect(response.status, JSON.stringify(response.body)).toBe(202);
+    expect(old, "the old run is cancelled while still queued").toMatchObject({ status:"cancelled", startedAt:null });
+    expect(fresh, "exactly ONE fresh assignment run").toHaveLength(1);
+    expect(fresh[0]!.startedAt, "the fresh run started").not.toBeNull();
+    expect(fresh[0]!.retryOfRunId, "no retry ancestry").toBeNull();
+    expect(fresh[0]!.contextSnapshot).toMatchObject({ issueId:f.issueId, wakeReason:"issue_assigned" });
+    expect(fresh[0]!.contextSnapshot, "only the assignment: no carried comment").not.toHaveProperty("wakeCommentIds");
+    expect(fresh[0]!.contextSnapshot, "only the assignment: no carried comment").not.toHaveProperty("wakeCommentId");
+    const { context } = await providerInputFor(fresh[0]!, f.issueId);
+    expect((context.paperclipWake as Record<string, unknown> | undefined)?.reason, "the input is the assignment").toBe("issue_assigned");
+    const second = await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId:f.queued.id,idempotencyKey:randomUUID() });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await others()).map(r => r.id), "a second press starts nothing").toEqual([fresh[0]!.id]);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const pressed = Date.now();
+    try {
+      for (const later of [600_000, 1_200_000]) {
+        vi.setSystemTime(pressed + later);
+        await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+        const [oldLater] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+        expect(oldLater, `the old run never starts (+${later / 60_000} min)`).toMatchObject({ status:"cancelled", startedAt:null });
+      }
+    } finally { vi.useRealTimers(); }
+    console.info(JSON.stringify({ judgeNoMessageSupersededOnce:{ second:second.status, runs:(await others()).map(r => r.id) } }));
+    expect((await others()).map(r => r.id), "a second press and later passes start nothing").toEqual([fresh[0]!.id]);
+  },120_000);
+
+  // fix12 item 1 (rf-3 (1), RFL bar as fix10b): a person's ASSIGNMENT with no carried comment reaches
+  // failed + Retry. Retry through the real route cancels the stuck run only while queued and starts
+  // ONE fresh run carrying the assignment once, none of the old run's context; a second press and
+  // later liveness passes start nothing; the old run never starts.
+  it("fix12 dead chat: a no-comment assignment's Retry starts ONE fresh assignment run, never a re-poke", async () => {
+    const f = await judgeQueued(false), heartbeat = heartbeatService(db);
+    const OLD = "OLD-CONTEXT-fix12 rotate the signing keys";
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...f.queued.contextSnapshot, paperclipAgentMessage: { text: OLD },
+      paperclipTaskMarkdown: OLD, executionStage: { stage: "execute", instructions: OLD } } }).where(eq(heartbeatRuns.id, f.queued.id));
+    expect(await taskInterruptionPresentation(db, await issue(f.issueId))).toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
+    const app = retryRouteApp();
+    const first = await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+    expect(first.status, JSON.stringify(first.body)).toBeLessThan(300);
+    await heartbeat.drainActiveRunExecutions();
+    const others = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId)))
+      .filter(r => r.id !== f.source.id && r.id !== f.queued.id);
+    const [old] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+    expect(old, "the stuck run is cancelled while still queued").toMatchObject({ status: "cancelled", startedAt: null });
+    const fresh = await others();
+    console.info(JSON.stringify({ fix12NoComment: { route: first.status, receipt: first.body, old: { status: old!.status, startedAt: old!.startedAt },
+      fresh: fresh.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt, retryOfRunId: r.retryOfRunId, context: r.contextSnapshot })) } }));
+    expect(fresh, "ONE fresh run").toHaveLength(1);
+    expect(fresh[0]!.startedAt, "the fresh run STARTED (the dispatcher took it)").not.toBeNull();
+    expect(fresh[0]!.retryOfRunId, "no retry ancestry").toBeNull();
+    expect(fresh[0]!.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeReason: "issue_assigned", replacedQueuedRunId: f.queued.id });
+    expect(fresh[0]!.contextSnapshot).not.toHaveProperty("wakeCommentIds");
+    const { context, provider } = await providerInputFor(fresh[0]!, f.issueId);
+    expect((context.paperclipWake as Record<string, unknown> | undefined)?.reason, "the provider gets the assignment").toBe("issue_assigned");
+    expect(provider, "none of the old run's context").not.toContain("OLD-CONTEXT-fix12");
+    expect((await taskInterruptionPresentation(db, await issue(f.issueId)))?.observedRunId, "the card follows the fresh run").not.toBe(f.queued.id);
+    const second = await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+    await heartbeat.drainActiveRunExecutions();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      for (const later of [600_001, 1_200_000]) {
+        vi.setSystemTime(Date.now() + later);
+        await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+      }
+    } finally { vi.useRealTimers(); }
+    const [oldAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+    console.info(JSON.stringify({ fix12NoCommentOnce: { second: second.status, secondBody: second.body, runs: (await others()).map(r => r.id) } }));
+    expect(oldAfter, "the old run never starts later").toMatchObject({ status: "cancelled", startedAt: null });
+    expect((await others()).map(r => r.id), "a second press and later passes start nothing").toEqual([fresh[0]!.id]);
+    // A task that is no longer this agent's open work (closed, backlog, assigned to another agent) has no
+    // input to carry: Retry cancels nothing and starts nothing (task-retry.ts startPersonQueuedRunFresh).
+    const [otherAgent] = await db.insert(agents).values({ companyId, name: "Other assignee", status: "idle", adapterType: "paperclip_runner" }).returning();
+    // A person-agent conversation cannot be closed or reassigned (issues_conversation_identity_check): those two
+    // leave the conversation as the product does, and become an ordinary task.
+    const leaveConversation = { conversationAgentId: null, conversationUserId: null, conversationState: null };
+    for (const [label, change, reason, message] of [
+      ["closed", { status: "done", ...leaveConversation }, "task_closed", "This task is Done. Move it to To do to run it."],
+      ["cancelled", { status: "cancelled", ...leaveConversation }, "task_closed", "This task is Cancelled. Move it to To do to run it."],
+      ["backlog", { status: "backlog", ...leaveConversation }, "task_backlog", "This task is in Backlog. Move it to To do to run it."],
+      ["another assignee", { assigneeAgentId: otherAgent!.id, ...leaveConversation }, "task_reassigned",
+        "This task is assigned to another agent. Reassign it to the previous agent to retry this attempt."],
+    ] as const) {
+      // One person-agent conversation per company: retire the previous fixture's conversation identity.
+      await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null })
+        .where(and(eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId)));
+      const g = await judgeQueued(false);
+      await db.update(issues).set(change as never).where(eq(issues.id, g.issueId));
+      const taskWakes = () => db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${g.issueId}`)).orderBy(agentWakeupRequests.id);
+      const wakesBefore = await taskWakes();
+      const cardBefore = await taskInterruptionPresentation(db, await issue(g.issueId));
+      const press = await request(app).post(`/api/issues/${g.issueId}/retry`).send({ observedRunId: g.queued.id, idempotencyKey: randomUUID() });
+      await heartbeat.drainActiveRunExecutions();
+      const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, g.issueId));
+      const [kept] = rows.filter(r => r.id === g.queued.id);
+      const started = rows.filter(r => r.id !== g.source.id && r.startedAt);
+      const created = rows.filter(r => r.id !== g.source.id && r.id !== g.queued.id);
+      const cardAfter = await taskInterruptionPresentation(db, await issue(g.issueId));
+      console.info(JSON.stringify({ fix14NotOpenWork: { label, issueId: g.issueId, route: press.status, body: press.body, cardBefore, cardAfter,
+        old: { id: kept!.id, status: kept!.status, startedAt: kept!.startedAt, errorCode: kept!.errorCode }, created: created.map(r => r.id), started: started.map(r => r.id) } }));
+      expect.soft(press.status, `${label}: TRUE refusal, never 202`).toBe(200);
+      expect.soft(press.body, `${label}: named refusal`).toMatchObject({ accepted: false, requestId: null, refused: { reason, message } });
+      for (const card of [cardBefore, cardAfter, press.body.presentation]) {
+        expect.soft(card, `${label}: no Retry`).toMatchObject({ canRetry: false, notice: { code: reason, text: message } });
+        expect.soft(card?.state, `${label}: never working`).not.toBe("working");
+      }
+      expect(created, `${label}: no fresh run`).toEqual([]);
+      expect(started, `${label}: nothing started`).toEqual([]);
+      expect(kept, `${label}: the old run is unchanged`).toMatchObject({ status: "queued", startedAt: null, errorCode: g.queued.errorCode });
+      expect.soft(await taskWakes(), `${label}: no wake queued, cancelled or changed`).toEqual(wakesBefore);
+      if (label === "backlog") {
+        // Change only status through the real route: no lease or queued run is repaired by the test.
+        const move = await request(app).patch(`/api/issues/${g.issueId}`).send({ status: "todo" });
+        expect(move.status, JSON.stringify(move.body)).toBe(200);
+        await vi.waitFor(async () => {
+          await heartbeat.drainActiveRunExecutions();
+          const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, g.issueId));
+          expect(runs.filter(r => r.id !== g.source.id && r.startedAt)).toHaveLength(1);
+        }, { timeout: 5_000, interval: 50 });
+        for (let pass = 0; pass < 2; pass++) {
+          await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+        }
+        const movedRuns = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, g.issueId)))
+          .filter(r => r.id !== g.source.id && r.startedAt);
+        console.info(JSON.stringify({ fix14MoveToTodo: { issueId: g.issueId, route: move.status,
+          started: movedRuns.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+        expect(movedRuns, "Moving to To do starts exactly ONE run, including later queue passes").toHaveLength(1);
+        expect(movedRuns[0]!.id, "the held old run is not re-poked").not.toBe(g.queued.id);
+        expect(movedRuns[0]!.retryOfRunId, "the assignment has no old retry ancestry").toBeNull();
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, g.queued.id)))[0])
+          .toMatchObject({ status: "cancelled", startedAt: null });
+      }
+    }
+  }, 120_000);
+
+  // fix17 (rf-3 smarty-dev#20787 c6966691438 (1)): Backlog commits while the Retry waits on the issue
+  // lock. Admission refuses; the ANSWER must be projected from the task as admission saw it, not the
+  // pre-admission row (routes/issues.ts POST /issues/:id/retry), or the card shows failed + Retry.
+  it("fix17 race: Backlog committed during the Retry's lock wait answers the refusal, never failed + Retry", async () => {
+    await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null })
+      .where(and(eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId)));
+    const f = await judgeQueued(false), heartbeat = heartbeatService(db);
+    expect(await taskInterruptionPresentation(db, await issue(f.issueId))).toMatchObject({ state: "failed", canRetry: true });
+    const message = "This task is in Backlog. Move it to To do to run it.";
+    let press: request.Response | undefined;
+    await db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("update");
+      const [{ holder }] = Array.from(await tx.execute(sql`select pg_backend_pid() as holder`) as unknown as { holder: number }[]);
+      const pending = request(retryRouteApp()).post(`/api/issues/${f.issueId}/retry`)
+        .send({ observedRunId: f.queued.id, idempotencyKey: randomUUID() }).then(res => { press = res; });
+      // The Retry has read the task and now waits on the issue lock this transaction holds.
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select pid from pg_stat_activity where ${holder}::int = any(pg_blocking_pids(pid))`);
+        expect(Array.from(waiting as unknown as unknown[]), "the Retry waits on the issue lock").toHaveLength(1);
+      }, { timeout: 10_000, interval: 25 });
+      expect(press, "no answer before the lock is released").toBeUndefined();
+      await tx.update(issues).set({ status: "backlog", conversationAgentId: null, conversationUserId: null, conversationState: null })
+        .where(eq(issues.id, f.issueId));
+      void pending;
+    });
+    await vi.waitFor(() => expect(press).toBeDefined(), { timeout: 10_000, interval: 25 });
+    await heartbeat.drainActiveRunExecutions();
+    const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId));
+    console.info(JSON.stringify({ fix17Race: { issueId: f.issueId, route: press!.status, body: press!.body,
+      runs: rows.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+    expect.soft(press!.status, "a true refusal, never 202").toBe(200);
+    expect.soft(press!.body, "the named refusal").toMatchObject({ accepted: false, requestId: null,
+      refused: { reason: "task_backlog", message } });
+    expect.soft(press!.body.presentation, "the answer's card: the refusal, no Retry")
+      .toMatchObject({ canRetry: false, notice: { code: "task_backlog", text: message } });
+    expect.soft(press!.body.presentation?.state, "the answer's card is never failed").not.toBe("failed");
+    expect(rows.filter(r => r.id !== f.source.id && r.id !== f.queued.id), "no run is created").toEqual([]);
+    expect(rows.find(r => r.id === f.queued.id), "the old run is unchanged").toMatchObject({ status: "queued", startedAt: null });
+  }, 120_000);
+
+  // fix12 item 2b (rf-3 22:23Z): the external-bot gate (heartbeat/queue.ts claimQueuedRun
+  // canStartNewExternalBotWork) holds a person's run for an external agent with no ready binding.
+  // The card names it: no failed, no Retry, at +10 min and later.
+  it("fix12 external-bot gate: the card names the hold, never failed + Retry", async () => {
+    const f = await judgeQueued(), heartbeat = heartbeatService(db);
+    await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    const [before] = await db.select().from(agents).where(eq(agents.id, agentId));
+    await db.update(agents).set({ adapterConfig: { provider: "grok_bot", externalBindingId: randomUUID() } }).where(eq(agents.id, agentId));
+    try {
+      await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+      const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      expect(row, "the dispatcher's external-bot gate keeps it queued").toMatchObject({ status: "queued", startedAt: null });
+      vi.useFakeTimers({ toFake: ["Date"] });
+      for (const later of [0, 600_001, 3_600_000]) {
+        vi.setSystemTime(Date.now() + later);
+        const card = await taskInterruptionPresentation(db, await issue(f.issueId));
+        console.info(JSON.stringify({ fix12ExternalBot: { later, card: card && { state: card.state, canRetry: card.canRetry, retryWait: card.retryWait } } }));
+        expect(card, `the named hold (+${later})`).toMatchObject({ state: "working", canRetry: false, observedRunId: f.queued.id,
+          retryWait: { reason: "external_agent_setup", message: expect.stringMatching(/^Waiting: this external agent/) } });
+      }
+    } finally {
+      vi.useRealTimers();
+      await db.update(agents).set({ adapterConfig: before!.adapterConfig }).where(eq(agents.id, agentId));
+    }
+  }, 120_000);
+
+  // FIX20 (rf-3 03:07Z/03:09Z): the same gate for a Dot agent (adapterType paperclip_runner, provider
+  // openai_dot, adapterConfig.dotBindingId). While the Dot binding is not ready the dispatcher keeps the
+  // aged person run queued and the card shows the Grok hold's waiting line, never Retry (the UI shows
+  // retryWait.message, ExecutionBlockerNotice.tsx:94-99, not 'Working'). The real readiness writer
+  // (external-agents/dot.ts confirmChallenge) stamps startable_since; working only inside stamp + 10 min,
+  // then failed + Retry, one run. Dropping the Dot case of externalBotStartGateBindingId turns this red.
+  it("FIX20 Dot binding not ready: the card shows the external-agent wait, then the readiness stamp starts the 10-min bound", async () => {
+    const f = await judgeQueued(), heartbeat = heartbeatService(db);
+    const { createHash } = await import("node:crypto");
+    const { dotAgentBindings, mcpEventSubscriptions, mcpOauthClients, mcpOauthGrants } = await import("@paperclipai/db");
+    const { dotRunnerBroker } = await import("./dot-runner-broker.js");
+    await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "owner" });
+    const settings = instanceSettingsService(db), experimentalBefore = await settings.getExperimental();
+    await settings.updateExperimental({ enablePublicMcp: true, enableOpenAiDot: true });
+    const [agentBefore] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const clientId = `fix20-${randomUUID()}`;
+    await db.insert(mcpOauthClients).values({ id: clientId, name: "Dedicated Dot", redirectUris: ["https://chatgpt.com/connector_platform/oauth/callback"] });
+    const [grant] = await db.insert(mcpOauthGrants).values({ companyId, userId, clientId, resource: "https://paperclip.example/mcp/runner",
+      purpose: "agent", agentId, scopes: ["paperclip:agent"] }).returning();
+    // Paired (dot.ts pair: status connected, grant bound, dotBindingId written); its event test is not done.
+    const [binding] = await db.insert(dotAgentBindings).values({ companyId, agentId, operatorId: userId, providerKind: "openai_dot",
+      status: "connected", grantId: grant!.id }).returning();
+    await db.update(agents).set({ adapterConfig: { provider: "openai_dot", dotBindingId: binding!.id, allowUnmeteredProvider: true } }).where(eq(agents.id, agentId));
+    const card = async () => taskInterruptionPresentation(db, await issue(f.issueId));
+    try {
+      await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+      const [held] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      console.info(JSON.stringify({ fix20DotDispatch: { status: held!.status, startedAt: held!.startedAt, errorCode: held!.errorCode, startableSince: held!.startableSince } }));
+      expect(held, "the dispatcher's external-bot gate keeps the Dot run queued").toMatchObject({ status: "queued", startedAt: null });
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const base = Date.now(), during: unknown[] = [];
+      for (const later of [0, 600_001, 3_600_000]) {
+        vi.setSystemTime(base + later);
+        const c = await card();
+        during.push({ later, state: c?.state, canRetry: c?.canRetry, retryWait: c?.retryWait });
+        expect(c, `the Dot hold's waiting line, no Retry (+${later})`).toMatchObject({ state: "working", canRetry: false, observedRunId: f.queued.id,
+          retryWait: { reason: "external_agent_setup",
+            message: "Waiting: this external agent's connection is not ready for new work. Your message is saved and starts when it is reconnected." } });
+      }
+      console.info(JSON.stringify({ fix20DotDuringHold: during }));
+      vi.useRealTimers();
+      // The binding becomes ready through its real writer: subscription verified, event test confirmed.
+      const nonce = randomUUID();
+      await db.insert(mcpEventSubscriptions).values({ id: `fix20-${randomUUID()}`, companyId, grantId: grant!.id, name: "paperclip.dot.mailbox_updated",
+        bindingId: binding!.id, arguments: { companyId, bindingId: binding!.id }, deliveryMaterial: {}, verifiedAt: new Date(), expiresAt: new Date(Date.now() + 3_600_000) });
+      await db.update(dotAgentBindings).set({ challengeHash: createHash("sha256").update(nonce).digest("hex"), challengeExpiresAt: new Date(Date.now() + 600_000) })
+        .where(eq(dotAgentBindings.id, binding!.id));
+      const [grantRow] = await db.select().from(mcpOauthGrants).where(eq(mcpOauthGrants.id, grant!.id));
+      const principal = { grant: grantRow, actor: { type: "agent", agentId, companyId } } as unknown as Parameters<ReturnType<typeof dotRunnerBroker>["confirmChallenge"]>[0];
+      const confirmedFrom = Date.now();
+      expect(await dotRunnerBroker(db).confirmChallenge(principal, nonce)).toEqual({ status: "ready" });
+      const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      expect(stamped!.startableSince?.getTime(), "the readiness writer stamped the held run at the clear").toBeGreaterThanOrEqual(confirmedFrom);
+      const stamp = stamped!.startableSince!.getTime();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const seen: Array<{ after: number; state: string | undefined; canRetry: boolean | undefined; retryWait: unknown }> = [];
+      for (const after of [1, 300_000, 599_999]) {
+        vi.setSystemTime(stamp + after);
+        const c = await card();
+        seen.push({ after, state: c?.state, canRetry: c?.canRetry, retryWait: c?.retryWait ?? null });
+      }
+      vi.setSystemTime(stamp + 1_000);
+      const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+      const startQueuedRunId = "startQueuedRunId" in receipt ? receipt.startQueuedRunId : undefined;
+      vi.setSystemTime(stamp + 600_000);
+      const lapsed = await card();
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).filter(r => r.id !== f.source.id);
+      console.info(JSON.stringify({ fix20DotAfterReady: { stamp: stamped!.startableSince, seen, retry: startQueuedRunId ?? null,
+        lapsed: lapsed && { state: lapsed.state, canRetry: lapsed.canRetry }, runs: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+      expect(seen.map(s => s.state), "working at stamp + 1 ms, +300 s, +599.999 s").toEqual(["working", "working", "working"]);
+      expect(seen.map(s => s.canRetry ?? false), "no Retry inside the window").toEqual([false, false, false]);
+      expect(seen.map(s => s.retryWait), "the hold has cleared").toEqual([null, null, null]);
+      expect(startQueuedRunId, "a Retry inside the window starts nothing").toBeUndefined();
+      expect(runs.map(r => ({ id: r.id, startedAt: r.startedAt })), "exactly one run, nothing extra").toEqual([{ id: f.queued.id, startedAt: null }]);
+      expect(lapsed, "still untaken at stamp + 10 min: failed + Retry").toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
+    } finally {
+      vi.useRealTimers();
+      await db.update(agents).set({ adapterConfig: agentBefore!.adapterConfig }).where(eq(agents.id, agentId));
+      await db.delete(mcpEventSubscriptions).where(eq(mcpEventSubscriptions.grantId, grant!.id));
+      await db.delete(dotAgentBindings).where(eq(dotAgentBindings.id, binding!.id));
+      await db.delete(mcpOauthGrants).where(eq(mcpOauthGrants.id, grant!.id));
+      await db.delete(mcpOauthClients).where(eq(mcpOauthClients.id, clientId));
+      await settings.updateExperimental({ enablePublicMcp: experimentalBefore.enablePublicMcp, enableOpenAiDot: experimentalBefore.enableOpenAiDot });
+    }
+  }, 120_000);
+
+  // FIX21 shared setup: a Dot agent (paperclip_runner, provider openai_dot, adapterConfig.dotBindingId)
+  // with a dedicated grant and a binding in the given readiness.
+  async function dotAgent(ready: boolean) {
+    const { dotAgentBindings, mcpEventSubscriptions, mcpOauthClients, mcpOauthGrants } = await import("@paperclipai/db");
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "owner" })
+      .onConflictDoNothing();
+    const [agentBefore] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const clientId = `fix21-${randomUUID()}`;
+    await db.insert(mcpOauthClients).values({ id: clientId, name: "Dedicated Dot", redirectUris: ["https://chatgpt.com/connector_platform/oauth/callback"] });
+    const [grant] = await db.insert(mcpOauthGrants).values({ companyId, userId, clientId, resource: "https://paperclip.example/mcp/runner",
+      purpose: "agent", agentId, scopes: ["paperclip:agent"] }).returning();
+    const [binding] = await db.insert(dotAgentBindings).values({ companyId, agentId, operatorId: userId, providerKind: "openai_dot",
+      status: ready ? "ready" : "connected", grantId: grant!.id, ...(ready ? { readyAt: new Date() } : {}) }).returning();
+    if (ready) await db.insert(mcpEventSubscriptions).values({ id: `fix21-${randomUUID()}`, companyId, grantId: grant!.id, name: "paperclip.dot.mailbox_updated",
+      bindingId: binding!.id, arguments: { companyId, bindingId: binding!.id }, deliveryMaterial: {}, verifiedAt: new Date(), expiresAt: new Date(Date.now() + 3_600_000) });
+    await db.update(agents).set({ adapterConfig: { provider: "openai_dot", dotBindingId: binding!.id, allowUnmeteredProvider: true } }).where(eq(agents.id, agentId));
+    return { binding: binding!, grant: grant!, cleanup: async () => {
+      await db.update(agents).set({ adapterConfig: agentBefore!.adapterConfig }).where(eq(agents.id, agentId));
+      await db.delete(mcpEventSubscriptions).where(eq(mcpEventSubscriptions.grantId, grant!.id));
+      await db.delete(dotAgentBindings).where(eq(dotAgentBindings.id, binding!.id));
+      await db.delete(mcpOauthGrants).where(eq(mcpOauthGrants.id, grant!.id));
+      await db.delete(mcpOauthClients).where(eq(mcpOauthClients.id, clientId));
+    } };
+  }
+
+  // FIX21 item 1 (rf-3, smarty-dev#20787): a FRESH person run (queued 1 s ago) for a Dot agent whose binding
+  // is not ready. The dispatcher's external-bot gate holds it from enqueue, so the card names the wait at
+  // once: the waiting line, never 'Working', never Retry. At af7c17cf the hold was read only for runs past
+  // the 10-min bound, so this card was plain working (the screen: 'Working for 1s'). The rendered card is
+  // pinned by ui/src/components/ExecutionBlockerNotice.test.tsx with this projection's retryWait.
+  it("FIX21 fresh unready Dot hold: the card shows the waiting line from enqueue, no Working, no Retry", async () => {
+    const f = await judgeQueued(true, 1_000), heartbeat = heartbeatService(db);
+    await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    const settings = instanceSettingsService(db), experimentalBefore = await settings.getExperimental();
+    await settings.updateExperimental({ enablePublicMcp: true, enableOpenAiDot: true });
+    const dot = await dotAgent(false);
+    try {
+      await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+      const [held] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      expect(held, "the dispatcher's external-bot gate keeps the fresh Dot run queued").toMatchObject({ status: "queued", startedAt: null });
+      const c = await taskInterruptionPresentation(db, await issue(f.issueId));
+      console.info(JSON.stringify({ fix21FreshDotCard: { queuedAgeMs: Date.now() - f.queued.createdAt.getTime(),
+        card: c && { state: c.state, canRetry: c.canRetry, observedRunId: c.observedRunId, retryWait: c.retryWait } } }));
+      expect(Date.now() - f.queued.createdAt.getTime(), "a fresh run, far inside the 10-min bound").toBeLessThan(60_000);
+      expect(c, "the Dot hold's waiting line from enqueue, no Retry").toMatchObject({ state: "working", canRetry: false, observedRunId: f.queued.id,
+        retryWait: { reason: "external_agent_setup",
+          message: "Waiting: this external agent's connection is not ready for new work. Your message is saved and starts when it is reconnected." } });
+      // The live run pill (ui TaskChatLiveRunPill) reads the run's execution projection: a named cause
+      // shows its label instead of "Working for 1s".
+      const { executionProjectionForRun } = await import("./execution-projection.js");
+      const execution = await executionProjectionForRun(db, companyId, f.queued.id);
+      console.info(JSON.stringify({ fix21FreshDotExecution: execution && { phase: execution.phase, label: execution.label, cause: execution.cause, nextAction: execution.nextAction } }));
+      expect(execution, "the run's execution projection names the external-bot hold").toMatchObject({ phase: "queued",
+        cause: "external_agent_setup", label: "Waiting for the external agent's connection" });
+    } finally {
+      await dot.cleanup();
+      await settings.updateExperimental({ enablePublicMcp: experimentalBefore.enablePublicMcp, enableOpenAiDot: experimentalBefore.enableOpenAiDot });
+    }
+  }, 120_000);
+
+  // FIX21 item 2 (rf-3): the Dot provider switched off holds a ready Dot agent's run (dot.ts snapshot `enabled`).
+  // Switching it back on through the REAL settings writer (instance-settings.ts updateExperimental, which
+  // PATCH /instance/settings/experimental calls, routes/instance-settings.ts) clears the hold. At af7c17cf it
+  // wrote no startable_since, so the aged run's card went failed + Retry at +1 ms. Now: working, no Retry, until
+  // stamp + 10 min; a Retry inside starts nothing; then failed + Retry, exactly one run.
+  it("FIX21 Dot provider re-enabled through the settings writer stamps startable_since: no flash of failed + Retry", async () => {
+    const f = await judgeQueued(), heartbeat = heartbeatService(db);
+    await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    const settings = instanceSettingsService(db), experimentalBefore = await settings.getExperimental();
+    // The lease trigger (0496) stamped that cleanup clear; this row is about the provider hold alone.
+    await db.update(heartbeatRuns).set({ startableSince: null }).where(eq(heartbeatRuns.id, f.queued.id));
+    await settings.updateExperimental({ enablePublicMcp: true, enableOpenAiDot: false });
+    const dot = await dotAgent(true);
+    const card = async () => taskInterruptionPresentation(db, await issue(f.issueId));
+    try {
+      await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+      const [held] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      expect(held, "the provider switch holds the ready Dot agent's run").toMatchObject({ status: "queued", startedAt: null, startableSince: null });
+      const during = await card();
+      expect(during, "while switched off: the waiting line, no Retry").toMatchObject({ state: "working", canRetry: false,
+        retryWait: { reason: "external_agent_setup" } });
+      const enabledFrom = Date.now();
+      await settings.updateExperimental({ enableOpenAiDot: true });
+      const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      // The clock counts from the re-enable; with no stamp (af7c17cf) the card counts from enqueue, 11 min ago.
+      const stamp = stamped!.startableSince?.getTime() ?? enabledFrom;
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const seen: Array<{ after: number; state: string | undefined; canRetry: boolean | undefined; retryWait: unknown }> = [];
+      for (const after of [1, 300_000, 599_999]) {
+        vi.setSystemTime(stamp + after);
+        const c = await card();
+        seen.push({ after, state: c?.state, canRetry: c?.canRetry, retryWait: c?.retryWait ?? null });
+      }
+      vi.setSystemTime(stamp + 1_000);
+      const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+      const startQueuedRunId = "startQueuedRunId" in receipt ? receipt.startQueuedRunId : undefined;
+      vi.setSystemTime(stamp + 600_000);
+      const lapsed = await card();
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).filter(r => r.id !== f.source.id);
+      console.info(JSON.stringify({ fix21DotReenabled: { stamp: stamped!.startableSince, during: during && { state: during.state, canRetry: during.canRetry, retryWait: during.retryWait },
+        seen, retry: startQueuedRunId ?? null, lapsed: lapsed && { state: lapsed.state, canRetry: lapsed.canRetry },
+        runs: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+      expect(seen.map(s => s.state), "working at stamp + 1 ms, +300 s, +599.999 s").toEqual(["working", "working", "working"]);
+      expect(seen.map(s => s.canRetry ?? false), "no Retry inside the window").toEqual([false, false, false]);
+      expect(seen.map(s => s.retryWait), "the hold has cleared").toEqual([null, null, null]);
+      expect(startQueuedRunId, "a Retry inside the window starts nothing").toBeUndefined();
+      expect(runs.map(r => ({ id: r.id, startedAt: r.startedAt })), "exactly one run, nothing extra").toEqual([{ id: f.queued.id, startedAt: null }]);
+      expect(lapsed, "still untaken at stamp + 10 min: failed + Retry").toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
+      expect(stamped!.startableSince?.getTime(), "the settings writer stamped the held run at the re-enable").toBeGreaterThanOrEqual(enabledFrom);
+    } finally {
+      vi.useRealTimers();
+      await dot.cleanup();
+      await settings.updateExperimental({ enablePublicMcp: experimentalBefore.enablePublicMcp, enableOpenAiDot: experimentalBefore.enableOpenAiDot });
+    }
+  }, 120_000);
+
+  // fix12 item 2b clock (rf-3 22:23Z): a 20-min hold (the task's previous run, on another agent, still
+  // running, its sandbox cleanup pending) clears; the dispatcher is slow. Superseded by replacement (RFL
+  // record SUPERSEDE-B-STARTABLE-SINCE-1117, ruling (a)): the cleanup success is the clear and stamps
+  // startable_since (0496 lease trigger). No flash at the clear: working, no Retry, at stamp + 1 ms /
+  // +300 s / +599.999 s; a Retry pressed inside the window starts nothing extra; failed + Retry at
+  // stamp + 10 min with no run. The from-enqueue mutation turns this red.
+  it("(superseded by replacement: startable-since clock, RFL record SUPERSEDE-B-STARTABLE-SINCE-1117) fix12 clock from the clear: a 20-min hold clears, a slow dispatcher shows working for 10 min after the clear", async () => {
+    const f = await judgeQueued();
+    const enqueued = new Date(Date.now() - 1_500_000);
+    await db.update(heartbeatRuns).set({ createdAt: enqueued }).where(eq(heartbeatRuns.id, f.queued.id));
+    const [previousAgent] = await db.insert(agents).values({ companyId, name: "Previous owner", status: "running", adapterType: "paperclip_runner" }).returning();
+    await db.update(heartbeatRuns).set({ agentId: previousAgent!.id, status: "running", finishedAt: null, errorCode: null,
+      createdAt: new Date(enqueued.getTime() - 60_000), startedAt: new Date(enqueued.getTime() - 59_000) }).where(eq(heartbeatRuns.id, f.source.id));
+    await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
+    const card = async () => taskInterruptionPresentation(db, await issue(f.issueId));
+    expect(await card(), "held 25 min: working, never failed").toMatchObject({ state: "working", canRetry: false });
+    // The hold clears: the previous run ends and its sandbox cleanup settles (the 0496 trigger stamps).
+    const clear = new Date();
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: clear }).where(eq(heartbeatRuns.id, f.source.id));
+    await db.update(environmentLeases).set({ cleanupStatus: "success", updatedAt: clear }).where(eq(environmentLeases.id, f.lease.id));
+    const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+    expect(stamped!.startableSince, "the clear wrote the startable-since stamp").not.toBeNull();
+    const stamp = stamped!.startableSince!.getTime();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const seen: Array<{ after: number; state: string | undefined; canRetry: boolean | undefined; observedRunId: string | null | undefined }> = [];
+      for (const after of [1, 300_000, 599_999]) {
+        vi.setSystemTime(stamp + after);
+        const c = await card();
+        seen.push({ after, state: c?.state, canRetry: c?.canRetry, observedRunId: c?.observedRunId });
+      }
+      vi.setSystemTime(stamp + 1_000);
+      const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId,
+        observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+      const startQueuedRunId = "startQueuedRunId" in receipt ? receipt.startQueuedRunId : undefined;
+      vi.setSystemTime(stamp + 600_000);
+      const lapsed = await card();
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).filter(r => r.id !== f.source.id);
+      console.info(JSON.stringify({ fix12ClockFromClear: { enqueued, clear, stamp: stamped!.startableSince, seen, retry: startQueuedRunId ?? null,
+        lapsed: lapsed && { state: lapsed.state, canRetry: lapsed.canRetry }, runs: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+      expect(seen.map(s => s.state), "working at stamp + 1 ms, +300 s, +599.999 s").toEqual(["working", "working", "working"]);
+      expect(seen.map(s => s.canRetry ?? false), "no Retry inside the window").toEqual([false, false, false]);
+      expect(startQueuedRunId, "a Retry inside the window starts nothing").toBeUndefined();
+      expect(runs.map(r => ({ id: r.id, startedAt: r.startedAt })), "nothing extra exists or started").toEqual([{ id: f.queued.id, startedAt: null }]);
+      expect(lapsed, "still untaken at stamp + 10 min: failed + Retry").toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
+    } finally { vi.useRealTimers(); }
+  }, 120_000);
+
+  // FIX15 (RFL 01:00Z ruling (a)): a hold with no other stored clear time clears through its real
+  // writer. The card counts its 10-min bound from the LATER of enqueue and heartbeat_runs.startable_since:
+  // working inside the bound, a Retry press then starts nothing, failed + Retry only at stamp + 10 min,
+  // and the dispatcher taking it starts exactly one run.
+  // FIX16: each other field of hasPendingRunCleanup (execution-blocker.ts:93-114) holds the run ALONE
+  // (cleanup_status already 'success', so 0496 never fires) and the clear goes ONLY through that field.
+  it.each(["sandbox_cleanup", "agent_setup", "ordinary_pause", "budget_pause",
+    "lease_released_at", "lease_status", "lease_pending_cleanup_in_flight", "lease_leaves_run",
+    "run_finalization_owner", "native_finalization_row", "manual_admission_release", "recovered_stopped_receipt"] as const)("FIX15 %s clears: no failed flash inside the bound, one run, failed + Retry at stamp + 10 min", async hold => {
+    const f = await judgeQueued(), heartbeat = heartbeatService(db);
+    const { createLifecycleStore } = await import("../modules/agent-lifecycle/adapters/postgres.js");
+    const { createAgentLifecycleEffects } = await import("./agent-lifecycle.js");
+    const { startPersonQueuedRunFresh } = await import("./task-retry.js");
+    const [agentBefore] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const [companyBefore] = await db.select().from(companies).where(eq(companies.id, companyId));
+    const { budgetPolicies } = await import("@paperclipai/db");
+    const enqueued = f.queued.createdAt; // 11 min ago: already past the bound from enqueue
+    const fieldHolds: Record<string, () => Promise<unknown>> = {
+      lease_released_at: () => db.update(environmentLeases).set({ cleanupStatus: "success", releasedAt: null }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_status: () => db.update(environmentLeases).set({ cleanupStatus: "success", status: "active" }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_pending_cleanup_in_flight: () => db.update(environmentLeases).set({ cleanupStatus: "success", metadata: { pendingCleanupInFlight: true } }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_leaves_run: () => db.update(environmentLeases).set({ cleanupStatus: "success", status: "active" }).where(eq(environmentLeases.id, f.lease.id)),
+      run_finalization_owner: async () => {
+        await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeWorkspaceFinalizationOwner: "fix16" } }).where(eq(heartbeatRuns.id, f.source.id));
+      },
+      native_finalization_row: async () => {
+        await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+        await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.source.id));
+        await db.insert(nativeRunFinalizations).values({ runId: f.source.id, companyId, issueId: f.issueId, phase: "committed", leaseOwner: "native-finalizer:fix16" });
+      },
+      // FIX18 (1): execution-blocker.ts:81, the manual admission hold that waits for a person.
+      manual_admission_release: async () => {
+        const { createSystemRecovery } = await import("./system-recovery-state.js");
+        await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+        await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.source.id));
+        await db.insert(nativeRunFinalizations).values({ runId: f.source.id, companyId, issueId: f.issueId, phase: "terminal_failure",
+          failureCode: "native_restart_recovery_blocked", failureDetail: { systemRecovery: { ...createSystemRecovery(f.source.id), state: "exhausted" } } });
+        const { hasPendingRunCleanup } = await import("./execution-blocker.js");
+        expect(await hasPendingRunCleanup(db, companyId, f.source.id), "the manual admission hold alone holds the run").toBe(true);
+      },
+      // FIX18 (2): execution-blocker.ts:84-87, the recovered-stopped exclusion. The lease holds ONLY by
+      // pendingCleanupInFlight; the receipt write (shape of workspace-recovery.ts:598) leaves it
+      // pending_cleanup (still holding by 0497's clause) but excluded by its stop receipt.
+      recovered_stopped_receipt: () => db.update(environmentLeases).set({ cleanupStatus: "success", metadata: { pendingCleanupInFlight: true } }).where(eq(environmentLeases.id, f.lease.id)),
+    };
+    const fieldClears: Record<string, () => Promise<unknown>> = {
+      lease_released_at: () => db.update(environmentLeases).set({ releasedAt: new Date() }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_status: () => db.update(environmentLeases).set({ status: "released" }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_pending_cleanup_in_flight: () => db.update(environmentLeases).set({ metadata: { pendingCleanupInFlight: false } }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_leaves_run: () => db.update(environmentLeases).set({ heartbeatRunId: null }).where(eq(environmentLeases.id, f.lease.id)),
+      run_finalization_owner: () => db.update(heartbeatRuns).set({ runnerProfileJson: {} }).where(eq(heartbeatRuns.id, f.source.id)),
+      native_finalization_row: () => db.update(nativeRunFinalizations).set({ leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.source.id)),
+      // The person releases the hold: the exhausted system-recovery policy is cleared from the owner.
+      manual_admission_release: async () => {
+        await db.update(nativeRunFinalizations).set({ failureDetail: {} }).where(eq(nativeRunFinalizations.runId, f.source.id));
+        const { hasPendingRunCleanup } = await import("./execution-blocker.js");
+        expect(await hasPendingRunCleanup(db, companyId, f.source.id), "released: nothing holds the run").toBe(false);
+      },
+      recovered_stopped_receipt: async () => {
+        const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+        const stopReceipt = { schema: "paperclip.remote-termination.v1", companyId, runId: f.source.id, leaseId: lease!.id,
+          provider: lease!.provider, providerLeaseId: lease!.providerLeaseId, state: "stopped", confirmedAt: new Date().toISOString() };
+        await db.update(environmentLeases).set({ status: "pending_cleanup", cleanupStatus: "failed", leasePolicy: "ephemeral",
+          metadata: { workspaceRecoveryCleanup: { runId: f.source.id, stopReceipt }, pendingCleanupInFlight: false } }).where(eq(environmentLeases.id, f.lease.id));
+        const { hasPendingRunCleanup } = await import("./execution-blocker.js");
+        expect(await hasPendingRunCleanup(db, companyId, f.source.id), "the receipt excludes the lease: nothing holds the run").toBe(false);
+      },
+    };
+    if (hold === "sandbox_cleanup") await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
+    else if (fieldHolds[hold]) {
+      await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
+      await fieldHolds[hold]!();
+      await db.update(heartbeatRuns).set({ startableSince: null }).where(eq(heartbeatRuns.id, f.queued.id));
+    } else if (hold === "budget_pause") {
+      await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+      await db.update(heartbeatRuns).set({ startableSince: null }).where(eq(heartbeatRuns.id, f.queued.id));
+      // A company budget hard stop; the policy's spend is now under its limit, so the budget writer lifts it.
+      await db.update(companies).set({ status: "paused", pauseReason: "budget", pausedAt: new Date() }).where(eq(companies.id, companyId));
+      await db.insert(budgetPolicies).values({ companyId, scopeType: "company", scopeId: companyId, windowKind: "calendar_month_utc",
+        amount: 1_000_000, hardStopEnabled: true, unpricedUsagePolicy: "allow" });
+    } else {
+      await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+      await db.update(heartbeatRuns).set({ startableSince: null }).where(eq(heartbeatRuns.id, f.queued.id));
+      await db.update(agents).set({ lifecycleState: hold === "agent_setup" ? "verifying" : "paused", lifecycleHolds: [], status: "paused",
+        lifecycleRequiredPluginIds: [] }).where(eq(agents.id, agentId));
+    }
+    const card = async () => taskInterruptionPresentation(db, await issue(f.issueId));
+    try {
+      const held = await card();
+      expect(held?.state, "held 11 min past enqueue: never failed").not.toBe("failed");
+      // The hold clears through its production writer.
+      const store = createLifecycleStore(db, createAgentLifecycleEffects());
+      const owned = { id: randomUUID(), hostComplete: true, completedPluginIds: [], attempts: 0, leaseOwner: "fix15",
+        leaseUntil: new Date(Date.now() + 3_600_000).toISOString(), resumeState: "ready" as const };
+      const before = Date.now();
+      if (hold === "sandbox_cleanup") await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+      else if (fieldClears[hold]) await fieldClears[hold]!();
+      else if (hold === "budget_pause") {
+        const { budgetServiceInTransaction } = await import("./budgets.js");
+        await db.transaction(async tx => { await budgetServiceInTransaction(tx as unknown as typeof db).reconcileScope(companyId, "company", companyId); });
+        const [lifted] = await db.select().from(companies).where(eq(companies.id, companyId));
+        expect(lifted, "the budget writer lifts the company budget pause").toMatchObject({ status: "active", pauseReason: null });
+      } else {
+        if (hold === "ordinary_pause") expect(await store.change(agentId, "resume", { reason: "manual" }), "resume").toMatchObject({ lifecycleState: "resuming" });
+        await db.update(agents).set({ lifecycleOperation: owned }).where(eq(agents.id, agentId));
+        expect(await store.change(agentId, "complete", { owner: "fix15" }), "the lifecycle writer makes it ready").toMatchObject({ lifecycleState: "ready" });
+      }
+      const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      const stamp = stamped!.startableSince?.getTime() ?? before;
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const seen: Array<{ after: number; state?: string; canRetry?: boolean }> = [];
+      for (const after of [1, 300_000, 599_999]) {
+        vi.setSystemTime(stamp + after);
+        const c = await card();
+        seen.push({ after, state: c?.state, canRetry: c?.canRetry });
+      }
+      // A Retry pressed inside the clear window joins the queued run; it starts nothing extra.
+      vi.setSystemTime(stamp + 1_000);
+      const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId,
+        observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+      const startQueuedRunId = "startQueuedRunId" in receipt ? receipt.startQueuedRunId : undefined;
+      if (startQueuedRunId) await startPersonQueuedRunFresh(db, heartbeat as never,
+        { companyId, issueId: f.issueId, runId: startQueuedRunId, actorId: userId });
+      vi.setSystemTime(stamp + 600_000);
+      const lapsed = await card();
+      console.info(JSON.stringify({ fix15: { hold, enqueued, stamp: stamped!.startableSince, seen, retry: startQueuedRunId ?? null,
+        lapsed: lapsed && { state: lapsed.state, canRetry: lapsed.canRetry } } }));
+      expect(stamped!.startableSince, "the clear wrote the startable-since stamp").not.toBeNull();
+      expect(seen.map(s => s.state), "working at clear + 1 ms and throughout the bound").toEqual(["working", "working", "working"]);
+      expect(seen.map(s => s.canRetry ?? false), "no Retry inside the bound").toEqual([false, false, false]);
+      expect(startQueuedRunId, "the Retry press starts no fresh run").toBeUndefined();
+      expect(lapsed, "never taken: failed + Retry at stamp + 10 min").toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
+      vi.useRealTimers();
+      await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
+      await heartbeat.drainActiveRunExecutions();
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).filter(r => r.id !== f.source.id);
+      console.info(JSON.stringify({ fix15Runs: { hold, runs: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+      expect(runs.filter(r => r.startedAt).map(r => r.id), "the dispatcher takes it: exactly one run").toEqual([f.queued.id]);
+      expect(runs.map(r => r.id), "no second run exists").toEqual([f.queued.id]);
+    } finally {
+      vi.useRealTimers();
+      await db.update(agents).set({ lifecycleState: agentBefore!.lifecycleState, lifecycleHolds: agentBefore!.lifecycleHolds,
+        status: agentBefore!.status, lifecycleOperation: agentBefore!.lifecycleOperation,
+        lifecycleRequiredPluginIds: agentBefore!.lifecycleRequiredPluginIds }).where(eq(agents.id, agentId));
+      await db.delete(budgetPolicies).where(eq(budgetPolicies.companyId, companyId));
+      await db.update(companies).set({ status: companyBefore!.status, pauseReason: companyBefore!.pauseReason,
+        pausedAt: companyBefore!.pausedAt }).where(eq(companies.id, companyId));
+    }
+  }, 120_000);
+
+  it.each(["issue_owner_cleanup", "issue_owner_running", "agent_setup", "budget_accounting", "budget_hard_stop", "case_handoff", "native_cleanup"] as const)("JUDGE named hold %s has its own truthful card, not a Retry requeue loop", async hold => {
+    const { budgetPolicies, cases, caseHandoffs } = await import("@paperclipai/db");
+    const f = await judgeQueued(), heartbeat = heartbeatService(db);
+    const [agentBefore] = await db.select().from(agents).where(eq(agents.id,agentId));
+    const [companyBefore] = await db.select().from(companies).where(eq(companies.id,companyId));
+    try {
+      if (hold === "native_cleanup") await judgeCleanupGate(f);
+      if (hold === "issue_owner_cleanup") await db.update(issues).set({executionRunId:f.source.id}).where(eq(issues.id,f.issueId));
+      if (hold === "issue_owner_running") {
+        const [previousAgent] = await db.insert(agents).values({companyId,name:"Previous task owner",status:"idle",adapterType:"paperclip_runner"}).returning();
+        await db.update(heartbeatRuns).set({agentId:previousAgent!.id,status:"running",finishedAt:null,errorCode:null}).where(eq(heartbeatRuns.id,f.source.id));
+        await db.update(issues).set({executionRunId:f.source.id}).where(eq(issues.id,f.issueId));
+      }
+      if (hold === "agent_setup") await db.update(agents).set({lifecycleState:"preparing",lifecycleHolds:[]}).where(eq(agents.id,agentId));
+      if (hold === "budget_accounting") {
+        await db.insert(budgetPolicies).values({companyId,scopeType:"company",scopeId:companyId,windowKind:"calendar_month_utc",amount:2000,hardStopEnabled:true,unpricedUsagePolicy:"allow"});
+        const [other] = await db.insert(agents).values({companyId,name:"Accounting owner",status:"idle",adapterType:"paperclip_runner"}).returning();
+        await db.insert(heartbeatRuns).values({companyId,agentId:other!.id,status:"succeeded",startedAt:new Date(Date.now()-60_000),finishedAt:new Date(),costAccountingPending:true,
+          usageJson:{costUsd:0.01,usageSource:"per_run",billingType:"metered_api",provider:"openai",model:"gpt"},contextSnapshot:{}});
+      }
+      if (hold === "budget_hard_stop") await db.update(companies).set({status:"paused",pauseReason:"budget"}).where(eq(companies.id,companyId));
+      if (hold === "case_handoff") {
+        const [record] = await db.insert(cases).values({companyId,caseNumber:1,identifier:`CASE-${randomUUID()}`,caseType:"work",title:"Judge pending handoff",workIssueId:f.issueId,handoffVersion:1,phase:"implementation"}).returning();
+        await db.insert(caseHandoffs).values({companyId,caseId:record!.id,issueId:f.issueId,version:1,toAgentId:agentId,phase:"implementation",instructions:"Wait for handoff",
+          actorType:"user",actorId:userId,responsibleUserId:userId,expectedIssueStatusVersion:0,appliedIssueStatusVersion:0,wakeupRequestId:randomUUID(),idempotencyKey:randomUUID(),inputFingerprint:"judge",state:"awaiting_release"});
+      }
+      const before = await taskInterruptionPresentation(db,await issue(f.issueId));
+      const response = await request(retryRouteApp()).post(`/api/issues/${f.issueId}/retry`).send({observedRunId:f.queued.id,idempotencyKey:randomUUID()});
+      await heartbeat.drainActiveRunExecutions();
+      const after = await taskInterruptionPresentation(db,await issue(f.issueId));
+      const pressTime=Date.now();
+      vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(pressTime+600_001);
+      await heartbeat.resumeQueuedRunsAfterDrain({companyId});await heartbeat.drainActiveRunExecutions();
+      const later=await taskInterruptionPresentation(db,await issue(f.issueId));
+      const runs=(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId,f.issueId))).map(r=>({id:r.id,status:r.status,startedAt:r.startedAt,createdAt:r.createdAt}));
+      const wakes=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,companyId),sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`));
+      console.info(JSON.stringify({judgeHold:{hold,route:response.status,receipt:response.body,before,after,later,runs,wakes:wakes.map(w=>({id:w.id,reason:w.reason,status:w.status,runId:w.runId,payload:w.payload}))}}));
+      expect(later?.state==="waiting_for_user" || Boolean(later?.retryWait) || runs.some(r=>r.id!==f.queued.id&&r.id!==f.source.id&&r.startedAt),
+        "an enduring hold must name its own true state/action, not failed+Retry that only requeues").toBe(true);
+    } finally {
+      vi.useRealTimers();
+      await db.update(agents).set({lifecycleState:agentBefore!.lifecycleState,lifecycleHolds:agentBefore!.lifecycleHolds}).where(eq(agents.id,agentId));
+      await db.delete(budgetPolicies).where(eq(budgetPolicies.companyId,companyId));
+      await db.update(companies).set({status:companyBefore!.status,pauseReason:companyBefore!.pauseReason}).where(eq(companies.id,companyId));
+      if(hold === "native_cleanup") {
+        const {completeTerminatedRemoteNativeSessionCleanup}=await import("../vendor/paperclip-runner/index.js");
+        completeTerminatedRemoteNativeSessionCleanup({companyId,runId:f.source.id,remoteCleanupScope:JSON.stringify([f.lease.provider,f.lease.providerLeaseId])});
+      }
+    }
+  },120_000);
+
+  // rf-3 (c) R-ONCE: a message queued behind a busy turn; the busy turn ends; exactly ONE run starts
+  // and answers once. The card offers no Retry, and later sweeps/liveness passes start nothing.
+  it("R-ONCE: a message queued behind a busy turn starts exactly one run when the turn ends and is answered once", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    const t = new Date(Date.now() - 600_000);
+    const at = (offset: number) => new Date(t.getTime() + offset);
+    const [task] = await db.insert(issues).values({ companyId, title: "R-ONCE behind busy", status: "in_progress", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: at(-300_000) }).returning();
+    const issueId = task!.id;
+    const [busy] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "running",
+      createdAt: at(-121_000), startedAt: at(-120_000), responsibleUserId: userId, contextSnapshot: { issueId, wakeReason: "issue_commented" } }).returning();
+    const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "And the changelog?", clientRequestId: randomUUID(), createdAt: at(-60_000) }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
+      requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${message!.id}`,
+      payload: { issueId, commentId: message!.id }, createdAt: at(-59_000), requestedAt: at(-59_000) }).returning();
+    const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
+      createdAt: at(-59_000), responsibleUserId: userId, wakeupRequestId: wake!.id,
+      contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } }).returning();
+    await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const heartbeat = heartbeatService(db);
+      const carrying = async () => (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.issueId, issueId)))).filter(r => r.contextSnapshot?.wakeCommentId === message!.id
+          || (r.contextSnapshot?.wakeCommentIds as string[] | undefined)?.includes(message!.id));
+      const sweep = async (elapsed: number) => {
+        vi.setSystemTime(t.getTime() + elapsed);
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
+        await settleUnrecoverableExecutions(db);
+        await deliverReconciledExecutions(db, heartbeat.wakeup);
+        await heartbeat.resumeQueuedRunsAfterDrain({ companyId });
+        await heartbeat.drainActiveRunExecutions();
+      };
+      await sweep(120_000);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id)))[0], "busy: it waits").toMatchObject({ status: "queued", startedAt: null });
+      // The busy turn ends (succeeds with its answer), and the finish path re-dispatches the agent
+      // (heartbeat.ts:4440 startNextQueuedRunForAgent, public as resumeQueuedRunsForAgent).
+      vi.setSystemTime(t.getTime() + 300_000);
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: at(300_000) }).where(eq(heartbeatRuns.id, busy!.id));
+      await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
+      await heartbeat.drainActiveRunExecutions();
+      const [started] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
+      expect(started!.startedAt, "the message's own run starts when the turn ends").not.toBeNull();
+      expect((await carrying()).map(r => r.id), "exactly one run carries the message").toEqual([queued!.id]);
+      // The turn's answer (no provider in this suite: the run's own answer is written as its executor would).
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: at(330_000), error: null, errorCode: null }).where(eq(heartbeatRuns.id, queued!.id));
+      await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId, createdByRunId: queued!.id,
+        body: "Here is the changelog.", createdAt: at(329_000) });
+      const card = await taskInterruptionPresentation(db, await issue(issueId));
+      expect(card?.state === "failed" && card.canRetry, "no failed + Retry card for an answered message").toBe(false);
+      // The card offers no Retry, so no press can start a second run.
+      expect(card?.canRetry ?? false, "no Retry offered for an answered message").toBe(false);
+      for (const elapsed of [450_000, 900_000, 1_500_000]) await sweep(elapsed);
+      const allRuns = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.issueId, issueId))))
+        .filter(r => r.id !== busy!.id);
+      const answers = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "agent")));
+      const redeliveries = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${message!.id}`)));
+      console.info(JSON.stringify({ rOnce: { runs: allRuns.map(r => ({ id: r.id, status: r.status, carries: r.contextSnapshot?.wakeCommentId ?? null })),
+        answers: answers.length, redeliveries: redeliveries.length, card: card ? { state: card.state, canRetry: card.canRetry } : null } }));
+      expect(allRuns.map(r => r.id), "no second run of any kind from the card or later sweeps/liveness").toEqual([queued!.id]);
+      expect(answers, "answered once").toHaveLength(1);
+      expect(redeliveries).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: false });
+    }
+  }, 120_000);
+
+  // rf-3 (d) the multi-slot dead chat: on a 2-slot agent with one slot FREE, another slot's turn
+  // finishing every 5 min must not restart the start clock. The dispatcher never takes the message:
+  // at enqueue + 10 min the card is failed + Retry (red when every finish restarts the clock).
+  it("D168 multi-slot: another slot's finishes beside a free slot do not hold the card at working", async () => {
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } } }).where(eq(agents.id, agentId));
+    const t = new Date(Date.now() - 1_200_000);
+    const at = (offset: number) => new Date(t.getTime() + offset);
+    try {
+      const [task] = await db.insert(issues).values({ companyId, title: "D168 multi-slot", status: "in_progress", assigneeAgentId: agentId,
+        conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: at(-300_000) }).returning();
+      const issueId = task!.id;
+      const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+        body: "Ping?", clientRequestId: randomUUID(), createdAt: at(-1_000) }).returning();
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
+        requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${message!.id}`,
+        payload: { issueId, commentId: message!.id }, createdAt: at(0), requestedAt: at(0) }).returning();
+      const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
+        createdAt: at(0), responsibleUserId: userId, wakeupRequestId: wake!.id,
+        contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } }).returning();
+      await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id));
+      const [other] = await db.insert(issues).values({ companyId, title: "Other slot", status: "in_progress", assigneeAgentId: agentId }).returning();
+      // The other slot: one turn at a time, each finishing 5 min after it started, the next starting 1 s later.
+      for (const start of [-60_000, 241_000, 542_000]) await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: other!.id,
+        status: start === 542_000 ? "running" : "succeeded", createdAt: at(start), startedAt: at(start),
+        finishedAt: start === 542_000 ? null : at(start + 300_000), contextSnapshot: { issueId: other!.id } });
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(at(599_999));
+      expect((await taskInterruptionPresentation(db, await issue(issueId)))?.state, "inside the bound: working").toBe("working");
+      vi.setSystemTime(at(600_000));
+      const card = await taskInterruptionPresentation(db, await issue(issueId));
+      console.info(JSON.stringify({ d168MultiSlot: { card: card && { state: card.state, canRetry: card.canRetry, observedRunId: card.observedRunId } } }));
+      expect(card, "enqueue + 10 min with a free slot: failed + Retry").toMatchObject({ state: "failed", canRetry: true, observedRunId: queued!.id });
+    } finally {
+      vi.useRealTimers();
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, agentId));
+    }
+  }, 60_000);
+
   it.each(["queued", "succeeded", "older_answer"])("RFL F1 checks %s before any stop or note", async shape => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     const sessionId = randomUUID();
@@ -719,6 +2468,83 @@ suite("fresh-continuation fallback", () => {
       evidence: { runId: run.id, nativeFailureBlock: { runId: run.id, statusVersion: Number(task!.statusVersion) } } });
   }
 
+  // Keep: failure path reproduced by the K=2 policy; no provider is needed to
+  // prove the recovery sweep and durable wake admission boundary.
+  it("step 1 RED: a third system-owned failure starts a third continuation without person input", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await settleUnrecoverableExecutions(db);
+    let source = await expectOneFreshSuccessor(f);
+    for (let attempt = 2; attempt <= 3; attempt++) {
+      await refuseContinuation(source, "temporary_runner_transport_unavailable");
+      await finishFailedWake(source);
+      const result = await ensureFreshContinuation(db, { companyId, runId: source.id, trigger: "recovery_refused" });
+      expect(result, `system-owned continuation ${attempt}`).toMatchObject({ kind: "continued" });
+      await deliver();
+      const next = await successors(source.id);
+      expect(next).toHaveLength(1);
+      source = next[0]!;
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, source.wakeupRequestId!));
+      expect(wake).toMatchObject({ requestedByActorType: "system", reason: "issue_recovery_action_restored" });
+    }
+  }, 60_000);
+
+  it.each(["direct", "watchdog"] as const)("step 1 loop: %s refusal backs off at upstream's rolling-hour brake", async path => {
+    const failure = path === "watchdog" ? "native_controller_recovery_missing_evidence:snapshot_binding"
+      : "temporary_runner_transport_unavailable";
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation", error: failure });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please finish the requested work.", createdAt: new Date(Date.now() - 12 * 60_000) }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await occupySlot();
+    let sourceId: string = f.runId;
+    for (let attempt = 1; attempt <= FRESH_CONTINUATIONS_PER_HOUR; attempt++) {
+      if (path === "watchdog") {
+        // Production disposition consumes a fresh active_run_watchdog action
+        // on every failed preparation; it must not get a new allowance per hold.
+        await settleUnrecoverableExecutions(db);
+      } else {
+        expect(await ensureFreshContinuation(db, { companyId, runId: sourceId, trigger: "recovery_refused" }),
+          `deterministic failure ${attempt}`).toMatchObject({ kind: "continued" });
+      }
+      await deliver();
+      const next = await successors(sourceId);
+      expect(next).toHaveLength(1);
+      sourceId = next[0]!.id;
+      await refuseContinuation(next[0]!, failure);
+      await finishFailedWake(next[0]!);
+    }
+    const now = new Date();
+    expect(await ensureFreshContinuation(db, { companyId, runId: sourceId, trigger: "recovery_refused", now }))
+      .toMatchObject({ kind: "backoff", retryAt: expect.any(Date) });
+    await settleUnrecoverableExecutions(db);
+    await continueHeldExecutions(db);
+    await deliver();
+    expect(await successors(sourceId)).toHaveLength(0);
+    const records = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, f.issueId),
+      sql`${issueRecoveryActions.evidence}->'freshContinuation' is not null`));
+    expect(records).toHaveLength(FRESH_CONTINUATIONS_PER_HOUR);
+    expect(records.every(record => !/Send a new message|tried to continue this task twice/.test(record.nextAction))).toBe(true);
+    // Step 5 deletes the temporary message-owner wait. The upstream scheduled
+    // retry remains the only instruction, including after controller restart.
+    const scheduled = await taskInterruptionPresentation(db, await issue(f.issueId));
+    expect(scheduled).toMatchObject({ state: "retry_scheduled", canRetry: false, nextRetryAt: expect.any(String) });
+    const restarted = createDb(temporary!.connectionString);
+    try {
+      for (let pass = 0; pass < 3; pass++) {
+        await settleUnrecoverableExecutions(restarted); await continueHeldExecutions(restarted);
+        await deliverReconciledExecutions(restarted, heartbeatService(restarted).wakeup);
+        expect(await successors(sourceId)).toHaveLength(0);
+      }
+    } finally { await restarted.$client.end(); }
+    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+    expect(notes).toHaveLength(0); // At most one: the sweep adds none to the card/transcript's one instruction.
+    if (process.env.PAPERCLIP_STEP1B_OBSERVATIONS) await writeFile(
+      join(process.env.PAPERCLIP_STEP1B_OBSERVATIONS, `loop-${path}.json`),
+      JSON.stringify({ path, failure, rootRunId: f.runId, stoppedSourceRunId: sourceId, continuations: records.length,
+        scheduled, sweepNotes: notes.length, forbiddenSuccessors: (await successors(sourceId)).length }, null, 2) + "\n");
+  }, 60_000);
+
   // follow-Paperclip Cut B R1/R5: preserve the unproven retained source, not the removed stop-before-fresh upgrade.
   async function retainClass2Source(f: { runId: string; issueId: string }) {
     const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId, issueId: f.issueId,
@@ -732,7 +2558,7 @@ suite("fresh-continuation fallback", () => {
   it.each([
     "native_controller_recovery_unsupported:metadata_format",
     "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=journal_terminal_unsettled",
-  ])("continues a terminal continuation refusal once within the chain cap: %s", async error => {
+  ])("continues a terminal continuation refusal again: %s", async error => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
     await settleUnrecoverableExecutions(db);
     const next = await expectOneFreshSuccessor(f);
@@ -765,131 +2591,10 @@ suite("fresh-continuation fallback", () => {
     expect(notes[0].body).toBe(d10 ? FRESH_THREAD_STARTED_NOTE : NATIVE_CONTINUATION_REFUSED_ACTION);
   }, 60_000);
 
-  it("durably stops a transient fallback chain at two attempts, including legacy records outside the hourly window", async () => {
-    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
-    await settleUnrecoverableExecutions(db);
-    const first = await expectOneFreshSuccessor(f);
-    // Existing production records predate the chain markers. Neither an upgrade
-    // nor waiting out the hourly budget may reset their attempts.
-    await db.execute(sql`update issue_recovery_actions set evidence = jsonb_set(evidence,
-      '{freshContinuation}', ((evidence->'freshContinuation') - 'chainRootRunId' - 'chainAttempt')
-      || jsonb_build_object('recordedAt', (now() - interval '2 hours')::text))
-      where source_issue_id = ${f.issueId} and evidence ? 'freshContinuation'`);
-    await refuseContinuation(first, "temporary_runner_transport_unavailable");
-    // The durable context is also lineage when an older release omitted the FK.
-    await db.update(heartbeatRuns).set({ retryOfRunId: null }).where(eq(heartbeatRuns.id, first.id));
-    await settleUnrecoverableExecutions(db); await deliver();
-    const second = (await successors(first.id))[0]!;
-    expect(second).toBeDefined();
-    await refuseContinuation(second, "temporary_runner_transport_unavailable");
-    // New DB handle: no in-memory attempt counter can make this test pass.
-    const restarted = createDb(temporary!.connectionString);
-    try {
-      for (let pass = 0; pass < 3; pass++) {
-        await settleUnrecoverableExecutions(restarted); await continueHeldExecutions(restarted);
-        await deliverReconciledExecutions(restarted, heartbeatService(restarted).wakeup);
-      }
-    } finally { await restarted.$client.end(); }
-    expect(await successors(second.id)).toHaveLength(0);
-    const records = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, f.issueId),
-      sql`${issueRecoveryActions.evidence}->'freshContinuation' is not null`));
-    expect(records).toHaveLength(2);
-    expect(records.find(record => (record.evidence.freshContinuation as { sourceRunId: string }).sourceRunId === first.id)!.evidence)
-      .toMatchObject({ freshContinuation: { chainRootRunId: f.runId, chainAttempt: 2 } });
-    // A separate user-started source run on this issue is not the old chain.
-    const independentId = randomUUID();
-    await db.insert(heartbeatRuns).values({ id: independentId, companyId, agentId, issueId: f.issueId,
-      status: "failed", errorCode: "temporary_runner_transport_unavailable", startedAt: new Date(), finishedAt: new Date(),
-      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented" } });
-    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
-    expect(await ensureFreshContinuation(db, { companyId, runId: independentId, trigger: "recovery_refused" }))
-      .toMatchObject({ kind: "continued" });
-  }, 60_000);
-
-  async function unansweredChat() {
-    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
-    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId,
-      conversationState: "active", responsibleUserId: userId }).where(eq(issues.id, f.issueId));
-    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user",
-      authorUserId: userId, body: "Please help with this task.", createdAt: new Date(Date.now() - 12 * 60_000) }).returning();
-    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } })
-      .where(eq(heartbeatRuns.id, f.runId));
-    return { ...f, messageId: message!.id };
-  }
   async function finishFailedWake(run: typeof heartbeatRuns.$inferSelect) {
     if (run.wakeupRequestId) await db.update(agentWakeupRequests).set({ status: "failed", finishedAt: new Date() })
       .where(eq(agentWakeupRequests.id, run.wakeupRequestId));
   }
-  async function sweepFallback() {
-    await settleUnrecoverableExecutions(db); await continueHeldExecutions(db); await deliver();
-  }
-
-  it("a real new person-message admission after the cap gets its own two attempts, without erasing previousRunId", async () => {
-    const f = await unansweredChat();
-    await settleUnrecoverableExecutions(db);
-    const first = await expectOneFreshSuccessor(f);
-    await refuseContinuation(first, "temporary_runner_transport_unavailable"); await finishFailedWake(first); await sweepFallback();
-    const second = (await successors(first.id))[0]!;
-    expect(second).toBeDefined();
-    await refuseContinuation(second, "temporary_runner_transport_unavailable"); await finishFailedWake(second); await sweepFallback();
-    expect(await successors(second.id)).toHaveLength(0);
-    const child = spawnSync(process.execPath, ["-e", "console.log(process.pid)"], { encoding: "utf8" });
-    expect(child.status).toBe(0);
-    await db.update(heartbeatRuns).set({ processPid: Number(child.stdout.trim()) }).where(eq(heartbeatRuns.id, second.id));
-    const [comment] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
-      body: "Please try again now; this is a new question." }).returning();
-    const admitted = await heartbeatService(db).wakeup(agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
-      requestedByActorType: "user", requestedByActorId: userId, payload: { issueId: f.issueId, commentId: comment!.id },
-      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented", wakeCommentId: comment!.id } });
-    expect(admitted).toMatchObject({ status: "queued", contextSnapshot: { previousRunId: second.id,
-      explicitUserContinuation: { previousRunId: second.id, commentId: comment!.id } } });
-    const chainInput = { companyId, issueId: f.issueId, runId: admitted!.id };
-    expect(await freshContinuationChain(db, chainInput)).toEqual({ rootRunId: admitted!.id, attempts: 0 });
-    let source = admitted!;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      await refuseContinuation(source, "temporary_runner_transport_unavailable"); await finishFailedWake(source); await sweepFallback();
-      const next = await successors(source.id);
-      expect(next).toHaveLength(1);
-      source = next[0]!;
-      expect(await freshContinuationChain(db, { ...chainInput, runId: source.id })).toEqual({ rootRunId: admitted!.id, attempts: attempt });
-    }
-    await refuseContinuation(source, "temporary_runner_transport_unavailable"); await finishFailedWake(source);
-    for (let pass = 0; pass < 3; pass++) await sweepFallback();
-    expect(await successors(source.id)).toHaveLength(0);
-  }, 60_000);
-
-  it.each([
-    ["native_controller_recovery_unsupported:metadata_format", "native_controller_recovery_unsupported"],
-    ["runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=journal_terminal_unsettled", "runner_state_identity_mismatch"],
-  ])("the real notice owner generates one bound note after two fallback preparation refusals: %s", async (error, code) => {
-    const f = await unansweredChat();
-    await settleUnrecoverableExecutions(db);
-    const next = await expectOneFreshSuccessor(f);
-    await refuseContinuation(next, error); await finishFailedWake(next);
-    const lease = error === "native_controller_recovery_unsupported:metadata_format"
-      ? await retainClass2Source({ runId: next.id, issueId: f.issueId }) : null;
-    // follow-Paperclip Cut B R1/R8: both refusal families get the remaining attempt; K=2 leaves one truthful message-bound note.
-    await sweepFallback();
-    const following = await successors(next.id);
-    expect(following).toHaveLength(1);
-    const last = following[0];
-    await refuseContinuation(last, error); await finishFailedWake(last);
-    for (let pass = 0; pass < 3; pass++) {
-      await sweepFallback();
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + 30_000) });
-    }
-    expect(await successors(last.id)).toHaveLength(0);
-    if (lease) expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
-    const notices = currentNotices(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"))));
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(UNANSWERED_MESSAGE_BOUND_REACHED_TEXT);
-    expect(notices[0]!.body).not.toMatch(/sending it again is safe|assign.*new task/i);
-    expect(notices[0]!.metadata).toMatchObject({ sourceRunId: last.id, authorizationReason: `unanswered_message:${f.messageId}`,
-      recoveryResponsibility: "user" });
-    const rows = notices[0]!.metadata!.sections!.flatMap(section => section.rows);
-    expect(rows).toContainEqual({ type: "key_value", label: "Failure code", value: code });
-    expect(rows).toContainEqual({ type: "key_value", label: "Next action", value: "Send a new message to try again." });
-  }, 60_000);
 
   it("delivers an older pending terminal fallback once without upgrading physical-stop proof", async () => {
     const f = await unfinishedThread({ runtime: "native", errorCode: "native_session_interrupted" });
@@ -910,29 +2615,6 @@ suite("fresh-continuation fallback", () => {
     const notes = currentNotices(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)));
     expect(notes).toHaveLength(1);
     expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
-  }, 60_000);
-
-  it("invalidates an older pending third attempt using durable lineage, even without chain markers", async () => {
-    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
-    await settleUnrecoverableExecutions(db);
-    const first = await expectOneFreshSuccessor(f);
-    await refuseContinuation(first, "temporary_runner_transport_unavailable");
-    await settleUnrecoverableExecutions(db); await deliver();
-    const second = (await successors(first.id))[0]!;
-    await refuseContinuation(second, "temporary_runner_transport_unavailable");
-    const [record] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!));
-    const { id: _id, ...template } = record!;
-    const fresh: Record<string, unknown> = { ...(record!.evidence.freshContinuation as Record<string, unknown>), sourceRunId: second.id,
-      recordedAt: new Date().toISOString() };
-    delete fresh.chainRootRunId; delete fresh.chainAttempt;
-    const [pending] = await db.insert(issueRecoveryActions).values({ ...template, fingerprint: `old-fallback:${second.id}`,
-      evidence: { ...record!.evidence, runId: second.id, continuationDelivery: "pending", freshContinuation: fresh,
-        executionReconciliation: { ...(record!.evidence.executionReconciliation as Record<string, unknown>), runId: second.id } },
-    }).returning();
-    await deliver();
-    expect(await successors(second.id)).toHaveLength(0);
-    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, pending!.id)))[0]!.evidence)
-      .toMatchObject({ continuationDelivery: "invalidated", continuationStopReason: "fresh_continuation_chain_exhausted" });
   }, 60_000);
 
   it("leaves a successful delivered continuation unchanged", async () => {
@@ -2156,17 +3838,9 @@ suite("fresh-continuation fallback", () => {
     const f = await preparationDeathChain();
     const visible = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
       eq(issueComments.authorType, "system")))).filter(note => !note.deletedAt);
-    // The unanswered sweep may run before the held sweep, and again later
-    // while the continuation is still queued.
-    for (const ahead of [30_000, 3 * 60_000]) {
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + ahead) });
-    }
     await continueHeldExecutions(db);
     await occupySlot();
     await deliver();
-    for (const ahead of [30_000, 4 * 60_000]) {
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + ahead) });
-    }
     expect(await successors(f.refusedRunId)).toHaveLength(1);
     for (const note of await visible()) {
       expect(note.body.trim()).not.toBe("");
@@ -2313,4 +3987,287 @@ suite("fresh-continuation fallback", () => {
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
       .toEqual({ kind: "person_owned", reason: "retry_needed" });
   }, 60_000);
+
+  // D054 re-homed (never-OK, stack135 F2). The fork lineage walk
+  // (fresh-continuation-chain.ts) is gone; the per-task automatic-attempt
+  // ledgers that replaced it own scope and bounded input now.
+  it("company/task scope and malformed or unbounded ledger input stay bounded at the automatic-attempt ledgers", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    const at = new Date();
+    const recordedAt = new Date(at.getTime() - 5 * 60_000).toISOString();
+    const record = (sourceIssueId: string, fingerprint: string, when: string) => ({ companyId, sourceIssueId,
+      kind: "active_run_watchdog" as const, status: "resolved" as const, cause: "fresh_continuation", fingerprint, nextAction: "Continue",
+      evidence: { freshContinuation: { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: f.runId, recordedAt: when, trigger: "held_recovery" } } });
+    await db.insert(issueRecoveryActions).values(record(f.issueId, `scope-${randomUUID()}`, recordedAt));
+    expect(await sharedContinuationAttempts(db, companyId, f.issueId, at)).toHaveLength(1);
+    expect((await taskAutomaticAttempts(db, companyId, f.issueId, at)).all).toHaveLength(1);
+    // Another company or another task never sees, or is charged by, this task's records.
+    expect(await sharedContinuationAttempts(db, randomUUID(), f.issueId, at)).toEqual([]);
+    expect(await sharedContinuationAttempts(db, companyId, randomUUID(), at)).toEqual([]);
+    expect((await taskAutomaticAttempts(db, randomUUID(), f.issueId, at)).all).toEqual([]);
+    expect((await taskAutomaticAttempts(db, companyId, randomUUID(), at)).all).toEqual([]);
+    const [other] = await db.insert(issues).values({ companyId, title: "Sibling", status: "todo", assigneeAgentId: agentId }).returning();
+    expect(await sharedContinuationAttempts(db, companyId, other!.id, at)).toEqual([]);
+    // Malformed durable input is ignored, never thrown and never counted.
+    await db.insert(issueRecoveryActions).values(record(f.issueId, `bad-${randomUUID()}`, "9999-not-a-date"));
+    await expect(sharedContinuationAttempts(db, companyId, f.issueId, at)).resolves.toHaveLength(1);
+    await expect(taskAutomaticAttempts(db, companyId, f.issueId, at)).resolves.toMatchObject({ all: [expect.any(Date)] });
+    // Unbounded history is read with a bound, so a long-lived task cannot make the brake read unbounded rows.
+    await db.insert(issueRecoveryActions).values(Array.from({ length: 80 }, () => record(f.issueId, `many-${randomUUID()}`, recordedAt)));
+    const many = await sharedContinuationAttempts(db, companyId, f.issueId, at);
+    expect(many.length).toBeGreaterThanOrEqual(6);
+    expect(many.length).toBeLessThanOrEqual(64 * 3);
+  }, 60_000);
+
+  // F4 migration: old U5 notes are history, not current instructions. Exercise
+  // the upgrade executor, continuation card and the API's comment read service.
+  // The 0495 receipt by its file hash (the executor's own key, packages/db/src/client.ts
+  // mapHashesToMigrationFiles). A later migration (0496 onward) keeps its own receipt, so the rewind
+  // never re-runs a non-idempotent later file (fix15c: 0496's ADD COLUMN re-ran and failed).
+  async function legacyNotesReceipt() {
+    const [{ readFile }, { createHash }] = await Promise.all([import("node:fs/promises"), import("node:crypto")]);
+    return createHash("sha256").update(await readFile(new URL("../../../packages/db/src/migrations/0503_retire_legacy_message_notes.sql",
+      import.meta.url), "utf8")).digest("hex");
+  }
+  async function migrateLegacyNotes() {
+    // The fixture starts at head. Rewind ONLY the new data-migration receipt
+    // so its persisted rows have the same shape as an upgraded database.
+    await db.execute(sql`delete from drizzle.__drizzle_migrations where hash = ${await legacyNotesReceipt()}`);
+    await applyPendingMigrations(temporary!.connectionString);
+  }
+
+  it("an upgraded send-it-again note is hidden after migration but still retrievable by API", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" })
+      .where(eq(issues.id, f.issueId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "Please finish the notes.", createdAt: new Date(Date.now() - 5 * 60_000) }).returning();
+    const [otherMessage] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "An older, separate request.", createdAt: new Date(Date.now() - 50 * 60_000) }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const legacy = (messageId: string, body: string) => ({ companyId, issueId: f.issueId, authorType: "system" as const, body,
+      presentation: { kind: "system_notice" as const, tone: "warning" as const, density: "compact" as const, detailsDefaultOpen: true },
+      metadata: { version: 1 as const, authorizationReason: `unanswered_message:${messageId}`, recoveryResponsibility: "user" as const,
+        sections: [{ rows: [{ type: "key_value" as const, label: "Next action", value: "Send a new message to try again." }] }] } });
+    const before = await db.insert(issueComments).values([
+      legacy(message!.id, "Your message wasn't answered. Sending it again is safe."),
+      legacy(otherMessage!.id, "Your earlier message wasn't answered. Sending it again is safe."),
+    ]).returning();
+    await migrateLegacyNotes();
+    await settleUnrecoverableExecutions(db);
+    const card = await taskInterruptionPresentation(db, await issue(f.issueId));
+    expect(card).toMatchObject({ responsibility: "system", canRetry: false });
+    expect(["working", "retry_scheduled"]).toContain(card!.state);
+    const after = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+    const current = currentNotices(after, before);
+    expect(current).toEqual([]);
+    expect(JSON.stringify({ card, current })).not.toMatch(/send (it|a new message).*again/i);
+    const retired = after.find(note => note.id === before[0]!.id)!;
+    expect(retired).toMatchObject({ body: before[0]!.body, deletedAt: null });
+    expect(retired.metadata?.supersededByMigration).toEqual({ migration: "0495_retire_legacy_message_notes" });
+    expect(retired.metadata?.supersededByIncident).toBeUndefined();
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId,
+      membershipRole: "owner", status: "active" });
+    const [{ default: express }, { default: request }, { issueRoutes }] = await Promise.all([
+      import("express"), import("supertest"), import("../routes/issues.js"),
+    ]);
+    const app = express();
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", userId, companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        source: "cloud_tenant", isInstanceAdmin: false };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never));
+    const apiResponse = await request(app).get(`/api/issues/${f.issueId}/comments/${retired.id}`).expect(200);
+    const apiNote = apiResponse.body;
+    expect(apiNote).toMatchObject({ id: retired.id, body: before[0]!.body, deletedAt: null,
+      metadata: { authorizationReason: before[0]!.metadata!.authorizationReason,
+        supersededByMigration: { migration: "0495_retire_legacy_message_notes" } } });
+    console.info(JSON.stringify({ legacyMigration: { hidden: before.map(note => note.id),
+      apiStatus: apiResponse.status, apiNote: { id: apiNote.id, body: apiNote.body, metadata: apiNote.metadata }, card } }));
+    // The journal makes a second startup a no-op.
+    await applyPendingMigrations(temporary!.connectionString);
+    await settleUnrecoverableExecutions(db); await deliver();
+    const again = await db.select().from(issueComments).where(eq(issueComments.id, before[0]!.id));
+    expect(again[0]!.metadata).toEqual(retired.metadata);
+  }, 60_000);
+
+  // Never-OK history/attribution guard: only the removed U5 system notes may
+  // be marked. Authored comments and similar-looking system notices survive.
+  it("the one-time migration marks only legacy U5 system notes, never people, agents or other notices", async () => {
+    const [task] = await db.insert(issues).values({ companyId, title: "Answer the question", status: "in_progress",
+      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" }).returning();
+    const issueId = task!.id;
+    const [answered] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "What is the status?", createdAt: new Date(Date.now() - 10 * 60_000) }).returning();
+    const [later] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "And a follow-up written after the answer.", createdAt: new Date(Date.now() + 60 * 60_000) }).returning();
+    const legacy = (reason: string, body: string) => ({ companyId, issueId, authorType: "system" as const, body,
+      presentation: { kind: "system_notice" as const, tone: "warning" as const, density: "compact" as const, detailsDefaultOpen: true },
+      metadata: { version: 1 as const, authorizationReason: reason, recoveryResponsibility: "user" as const,
+        sections: [{ rows: [{ type: "key_value" as const, label: "Next action", value: "Send a new message to try again." }] }] } });
+    // Cross multiple 500-row keyset batches, including both UUID extremes.
+    await db.insert(issueComments).values(Array.from({ length: 1001 }, (_, index) =>
+      legacy(`other_notice:${index}`, "Retained unrelated history.")));
+    const before = await db.insert(issueComments).values([
+      { ...legacy(`unanswered_message:${answered!.id}`, "Your message wasn't answered. Sending it again is safe."),
+        id: "00000000-0000-0000-0000-000000000000" },
+      legacy(`retrying_message:${answered!.id}`, "Your message is being retried."),
+      { ...legacy(`unanswered_message:${later!.id}`, "Your later message wasn't answered. Sending it again is safe."),
+        id: "ffffffff-ffff-ffff-ffff-ffffffffffff" },
+    ]).returning();
+    const controls = await db.insert(issueComments).values([
+      { ...legacy(`unanswered_message:${answered!.id}`, "A person's own words."), authorType: "user", authorUserId: userId },
+      { ...legacy(`retrying_message:${answered!.id}`, "Here is the agent's answer."), authorType: "agent", authorAgentId: agentId },
+      legacy(`unansweredXmessage:${answered!.id}`, "Not the literal U5 prefix."),
+      legacy(`retryingXmessage:${answered!.id}`, "Also not the literal U5 prefix."),
+      legacy(`other_notice:${answered!.id}`, "An unrelated system notice."),
+    ]).returning();
+    const comments = async () => db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    await migrateLegacyNotes();
+    const after = await comments();
+    for (const old of before) {
+      const retired = after.find(note => note.id === old.id)!;
+      expect(retired).toMatchObject({ body: old.body, deletedAt: null });
+      expect(retired.metadata).toEqual({ ...old.metadata,
+        supersededByMigration: { migration: "0495_retire_legacy_message_notes" } });
+    }
+    const current = currentNotices(after, before);
+    for (const old of before) expect(current.map(note => note.id)).not.toContain(old.id);
+    expect(current).toHaveLength(1008); // 1001 other notices, 5 controls, 2 person messages.
+    for (const old of controls) expect(after.find(note => note.id === old.id)).toEqual(old);
+    // Re-running both startup and the idempotent SQL does not rewrite anything.
+    await applyPendingMigrations(temporary!.connectionString);
+    const { readFile } = await import("node:fs/promises");
+    await db.$client.unsafe(await readFile(new URL("../../../packages/db/src/migrations/0503_retire_legacy_message_notes.sql", import.meta.url), "utf8"));
+    const again = await comments();
+    expect(again.sort((a, b) => a.id.localeCompare(b.id))).toEqual(after.sort((a, b) => a.id.localeCompare(b.id)));
+    const receipt = await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations where hash = ${await legacyNotesReceipt()}`);
+    expect(receipt[0]!.count).toBe(1);
+    console.info(JSON.stringify({ migrationScope: { marked: before.length, untouched: current.length, receipts: receipt[0]!.count } }));
+  }, 60_000);
+
+  // stack135 F3 re-home of D002/D010/D013/D018/D171 (S1-pause). The U5 paused
+  // note is gone; the card owns the one truthful explanation: the agent is
+  // paused, a person resumes it, and nothing asks to send the message again.
+  it("a paused agent's unanswered message shows one resume instruction, never send-again, across repeated passes", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "agent_paused", status: "cancelled", hold: "none" });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please keep going.", createdAt: new Date(Date.now() - 5 * 60_000) }).returning();
+    await db.update(issues).set({ status: "in_progress", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(agents).set({ status: "paused", pauseReason: "manual", lifecycleHolds: ["manual"] }).where(eq(agents.id, agentId));
+    try {
+      const cards = [];
+      for (let pass = 0; pass < 3; pass++) {
+        await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+        cards.push(await taskInterruptionPresentation(db, await issue(f.issueId)));
+      }
+      expect(cards[0]).toMatchObject({ responsibility: "user", state: "waiting_for_user", userAction: "resume", canRetry: false });
+      expect(cards[2]).toEqual(cards[0]);
+      const visible = JSON.stringify({ cards, notices: await db.select().from(issueComments).where(and(
+        eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"))) });
+      expect(visible).not.toMatch(/send (it|a new message)|again/i);
+      expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId, f.issueId),
+        inArray(heartbeatRuns.status, ["queued", "running"])))).toHaveLength(0);
+      expect((await db.select().from(issueComments).where(eq(issueComments.id, message!.id)))[0]).toMatchObject({ deletedAt: null });
+    } finally {
+      await db.update(agents).set({ status: "idle", pauseReason: null, lifecycleHolds: [] }).where(eq(agents.id, agentId));
+    }
+  }, 60_000);
+
+  // D146 re-homed (never-OK, stack135 F2). The U5 notice that owned this is
+  // deleted; the person-visible card and any recovery notice now own it.
+  it.each([
+    ["adapter_failed", "Something exploded at /srv/secret/path with token abc123", /exploded|secret|abc123/],
+    ["brand_new_failure_code", "brand_new_failure_code: provider said something private", /brand_new|private/],
+  ])("raw error text never shows on the card or a notice for a person's failed message: %s", async (errorCode, error, raw) => {
+    const f = await unfinishedRun({ runtime: "native", errorCode, error, hold: "none" });
+    const ended = new Date(Date.now() - 121_000);
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please answer this.", createdAt: new Date(ended.getTime() - 60_000) }).returning();
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "active", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ finishedAt: ended,
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } }).where(eq(heartbeatRuns.id, f.runId));
+    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    await settleUnrecoverableExecutions(db);
+    const card = await taskInterruptionPresentation(db, await issue(f.issueId));
+    const blocker = await getExecutionBlocker(db, companyId, f.issueId);
+    const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+    const visible = JSON.stringify({ card, blocker, notices: notices.map(n => ({ body: n.body, presentation: n.presentation, metadata: n.metadata })) });
+    expect(card ?? blocker ?? notices[0], "the failure is shown to the person somewhere").toBeTruthy();
+    expect(visible).not.toMatch(raw);
+    expect(visible).not.toMatch(/\/srv\/|token/);
+  }, 60_000);
+  // Judge-only: same accepted native-result schema as the five-pass hardened gate.
+  // Original message has a consumed durable outbox receipt; run chronology is real.
+  it.each(["failed_then_unrelated_success", "array_only_then_unrelated_success", "array_only_no_timer"] as const)("named gap hardened %s has a truthful outcome by 120 seconds", async (shape) => {
+    const { completionContracts, nativeRunResults } = await import("@paperclipai/db");
+    const t = new Date(Date.now()-600_000), failed=shape==="failed_then_unrelated_success";
+    const f=await silentConversationTurn(t);
+    await db.update(issues).set({createdAt:new Date(t.getTime()-120_000),updatedAt:t}).where(eq(issues.id,f.issueId));
+    await db.update(issueComments).set({clientRequestId:randomUUID(),updatedAt:new Date(t.getTime()-60_000)}).where(eq(issueComments.id,f.messageId));
+    const nativeSessionId=randomUUID();
+    await db.update(heartbeatRuns).set({invocationSource:"on_demand",nativeSessionId,sessionIdBefore:nativeSessionId,sessionIdAfter:nativeSessionId,
+      createdAt:new Date(t.getTime()-30_000),startedAt:new Date(t.getTime()-29_000),
+      finishedAt:t,updatedAt:t,status:failed?"failed":"succeeded",error:failed?"adapter failed before an answer":null,
+      errorCode:failed?"adapter_failed":null,nativePhase:failed?"terminal_failure":"committed",
+      contextSnapshot:failed?{issueId:f.issueId,wakeReason:"issue_commented",wakeCommentId:f.messageId}:
+        {issueId:f.issueId,wakeReason:"issue_commented",wakeCommentIds:[f.messageId]}}).where(eq(heartbeatRuns.id,f.runId));
+    const [wake]=await db.insert(agentWakeupRequests).values({companyId,agentId,source:"on_demand",reason:"issue_commented",
+      status:failed?"failed":"completed",requestedByActorType:"user",requestedByActorId:userId,
+      idempotencyKey:`conversation-comment:${f.messageId}`,payload:{issueId:f.issueId,commentId:f.messageId},
+      createdAt:new Date(t.getTime()-30_000),finishedAt:t,runId:f.runId}).returning();
+    await db.update(heartbeatRuns).set({wakeupRequestId:wake!.id}).where(eq(heartbeatRuns.id,f.runId));
+    if (!failed) {
+      const contractId=randomUUID(),resultId=randomUUID();
+      await db.insert(completionContracts).values({id:contractId,companyId,issueId:f.issueId,revision:1,
+        schemaVersion:"paperclip.completion-contract.v1",policyVersion:"rf3-silent-v1",risk:"standard",
+        completionAuthority:"server_arbiter",incompleteCriteriaPolicy:"preserve_non_terminal",
+        contractJson:{objective:"answer the accepted person message"},canonicalSha256:`contract-${contractId}`,
+        createdByActorType:"system",createdByActorId:"rf3-judge",createdAt:new Date(t.getTime()-50_000)});
+      await db.update(heartbeatRuns).set({completionContractId:contractId,resultJson:null}).where(eq(heartbeatRuns.id,f.runId));
+      await db.insert(nativeRunResults).values({id:resultId,companyId,issueId:f.issueId,runId:f.runId,
+        completionContractId:contractId,serverFingerprint:`result-${resultId}`,schemaStatus:"accepted",
+        resultJson:{},canonicalSha256:`result-${resultId}`,createdAt:new Date(t.getTime()-1_000)});
+      await db.update(nativeRunFinalizations).set({phase:"committed",resultId,recoveryState:null,
+        failureCode:null,failureDetail:null,nextAttemptAt:null,updatedAt:t}).where(eq(nativeRunFinalizations.runId,f.runId));
+    }
+    if (shape!=="array_only_no_timer") await db.insert(heartbeatRuns).values({companyId,agentId,issueId:f.issueId,
+      invocationSource:"timer",runtimeMode:"legacy",status:"succeeded",errorCode:null,error:null,
+      createdAt:new Date(t.getTime()+5_000),startedAt:new Date(t.getTime()+10_000),finishedAt:new Date(t.getTime()+20_000),
+      responsibleUserId:userId,contextSnapshot:{issueId:f.issueId,wakeReason:"heartbeat_timer",wakeSource:"timer"}});
+    await occupySlot();
+    vi.useFakeTimers({toFake:["Date"]});
+    try {
+      const heartbeat=heartbeatService(db);
+      for (const elapsed of [90_001,119_999,120_000]) {
+        vi.setSystemTime(t.getTime()+elapsed);
+        await heartbeat.reconcileStrandedAssignedIssues({companyId,issueId:f.issueId});
+      }
+      const card=await taskInterruptionPresentation(db,await issue(f.issueId));
+      const [message]=await db.select().from(issueComments).where(eq(issueComments.id,f.messageId));
+      const notes=(await db.select().from(issueComments).where(and(eq(issueComments.companyId,companyId),
+        eq(issueComments.issueId,f.issueId),eq(issueComments.authorType,"system")))).filter(c=>!c.deletedAt&&!(c.metadata as any)?.supersededByIncident);
+      const live=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`,inArray(heartbeatRuns.status,["queued","running","scheduled_retry"])));
+      const [actual]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,f.runId));
+      const [finalization]=await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId,f.runId));
+      const observation={shape,messageId:f.messageId,runId:f.runId,at:Date.now()-t.getTime(),body:message?.body,
+        authorUserId:message?.authorUserId,deletedAt:message?.deletedAt,actualStatus:actual?.status,
+        nativePhase:actual?.nativePhase,nativeSessionId:actual?.nativeSessionId,sessionIdAfter:actual?.sessionIdAfter,
+        finalizationPhase:finalization?.phase,card,
+        notes:notes.map(n=>({id:n.id,body:n.body})),live:live.map(r=>({id:r.id,status:r.status})),
+        redeliveries:(await f.redeliveries()).length,trueOutcomes:notes.length+live.length+(card&&["failed","retry_scheduled"].includes(card.state)?1:0)};
+      console.info(JSON.stringify({namedGapHardened:observation}));
+      if (process.env.RF3_OBSERVATIONS_PATH) (await import("node:fs")).appendFileSync(process.env.RF3_OBSERVATIONS_PATH,JSON.stringify({namedGapHardened:observation})+"\n");
+      expect(message).toMatchObject({body:"Please answer this accepted request.",authorUserId:userId,deletedAt:null});
+      expect(actual).toMatchObject({nativeSessionId,sessionIdBefore:nativeSessionId,sessionIdAfter:nativeSessionId});
+      expect(observation.trueOutcomes,"exactly one truth, never zero or two").toBe(1);
+    } finally {vi.useRealTimers();}
+  },120_000);
 });

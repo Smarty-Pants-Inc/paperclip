@@ -34,7 +34,6 @@ const executionRunColumns = {
   id: heartbeatRuns.id,
   agentId: heartbeatRuns.agentId,
   driverKind: heartbeatRuns.driverKind,
-  error: heartbeatRuns.error,
   errorCode: heartbeatRuns.errorCode,
   executionControlDeadlineAt: heartbeatRuns.executionControlDeadlineAt,
   finishedAt: heartbeatRuns.finishedAt,
@@ -207,9 +206,24 @@ export async function executionProjectionsForRuns(
   const setupAgents = setupAgentIds.length ? await read(async () => db
     .select({ id: agents.id, lifecycleState: agents.lifecycleState,
       lifecycleHolds: agents.lifecycleHolds, adapterType: agents.adapterType,
+      adapterConfig: agents.adapterConfig, runtimeConfig: agents.runtimeConfig,
       retryRequired: sql<boolean>`coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') = 'true'` })
     .from(agents).where(and(eq(agents.companyId, companyId), inArray(agents.id, setupAgentIds)))) : [];
   const setupByAgent = new Map(setupAgents.map(agent => [agent.id, agent]));
+  // FIX21 (rf-3): the dispatcher's external-bot gate (heartbeat.ts canStartNewExternalBotWork,
+  // heartbeat/queue.ts claimQueuedRun) holds a Grok/Dot agent's never-started run from enqueue.
+  // Name it with the card's own read (dotRunnerBroker newWorkHold), so the live pill never says
+  // "Working for 1s" for a run the gate holds. Read once per agent.
+  const externalHoldByAgent = new Map<string, "external_agent_setup" | "external_agent_busy">();
+  if (setupAgents.some(agent => agent.adapterType === "paperclip_runner")) {
+    const { dotRunnerBroker, externalBotStartGateBindingId } = await import("./dot-runner-broker.js");
+    for (const agent of setupAgents) {
+      const bindingId = externalBotStartGateBindingId(agent);
+      if (bindingId === null) continue;
+      const hold = await read(() => dotRunnerBroker(db).newWorkHold(companyId, agent.id, bindingId)).catch(() => null);
+      if (hold) externalHoldByAgent.set(agent.id, hold);
+    }
+  }
   // Only never-started runs wait on the agent's limit; their place in line is
   // read once per full agent, not once per run.
   const agentQueueByRun = queuedRuns.some(run => !run.startedAt)
@@ -330,6 +344,7 @@ export async function executionProjectionsForRuns(
         agentQueueByRun.get(run.id),
         run.status === "queued" && !run.startedAt ? routineHolderByIssue.get(issueIdOf(run) ?? "") : undefined,
         cleanupHeldRuns.has(run.id),
+        run.status === "queued" && !run.startedAt ? externalHoldByAgent.get(run.agentId) : undefined,
       ),
     );
   }
@@ -362,6 +377,8 @@ export function projectExecution(
   routineHolder?: string,
   /** Admission holds this run while its task's previous native session cleanup is unsettled. */
   nativeCleanupHold = false,
+  /** FIX21: the dispatcher's external-bot gate holds this never-started run. */
+  externalAgentHold?: "external_agent_setup" | "external_agent_busy",
 ): ExecutionProjection {
   const detail = coordinator?.failureDetail ?? {};
   const successorRunId = text(detail.successorRunId);
@@ -627,6 +644,15 @@ export function projectExecution(
     projection.cause = "routine_execution_in_progress";
     projection.nextAction = `This routine runs one task at a time and ${routineHolder === ANOTHER_ROUTINE_TASK ? "another of its tasks" : routineHolder} is still open with its run. This task starts automatically when that one finishes.`;
     return set("queued", `Waiting for ${routineHolder} to finish`);
+  }
+  // Checked before the agent's limit: a free slot would not start this run either.
+  if (run.status === "queued" && !run.startedAt && externalAgentHold) {
+    projection.cause = externalAgentHold;
+    projection.nextAction = externalAgentHold === "external_agent_setup"
+      ? "This external agent's connection is not ready for new work. Your message is saved and starts when it is reconnected."
+      : "This external agent is finishing another assignment. Your message is saved and starts after it.";
+    return set("queued", externalAgentHold === "external_agent_setup"
+      ? "Waiting for the external agent's connection" : "Waiting for the external agent's other assignment");
   }
   if (run.status === "queued" && !run.startedAt && agentQueue) {
     projection.cause = "agent_at_capacity";

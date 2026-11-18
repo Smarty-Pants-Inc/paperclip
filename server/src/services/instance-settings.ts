@@ -19,6 +19,7 @@ import { notifyVoiceChange } from "./voice/voice-recovery-notifications.js";
 import { notifyToolConnectionHealth } from "./tool-connection-health-notifications.js";
 import { notifyExternalObjectRefresh } from "./external-object-refresh-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { externalBotProviderOn, stampExternalProviderReenabled } from "./heartbeat/startable-since.js";
 import type { Db } from "@paperclipai/db";
 import { companies, instanceSettings } from "@paperclipai/db";
 
@@ -698,6 +699,11 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         }
         if (patch.enableChatConnectors !== undefined) await notifyVoiceChange(tx);
         await notifyToolConnectionHealth(tx, "*");
+        // FIX21 (rf-3): a provider switched back on clears the external-bot hold; stamp
+        // startable_since on the runs it held (heartbeat/startable-since.ts).
+        await stampExternalProviderReenabled(tx as unknown as Db, (["openai_dot", "grok_bot"] as const).filter(provider =>
+          !externalBotProviderOn(toExperimentalView(current.experimental), provider)
+          && externalBotProviderOn(toExperimentalView(nextExperimental), provider)), now);
         return tx
           .update(instanceSettings)
           .set({

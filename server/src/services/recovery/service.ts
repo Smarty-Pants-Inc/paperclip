@@ -33,7 +33,7 @@ import { pendingExternalConversationSettlement, settleSlackConversation } from "
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { isIssueReviewPathRecoveryRun } from "./review-path-recovery.js";
 import { escalateExhaustedIssueReviewPathRecovery } from "./review-path-recovery-escalation.js";
-import { executionRetryAccounting, INTERRUPTED_PREPARATION_RETRY_REASON } from "../execution-recovery-attempt.js";
+import { executionRetryAccounting, INTERRUPTED_PREPARATION_RETRY_REASON, NATIVE_BLOCKED_WAIT_REFUSED_ACTION } from "../execution-recovery-attempt.js";
 import { assignedWorkSweep, type AssignedWorkDeps } from "./assigned-work-sweep.js";
 import { isExplicitContinuationRetryClaim } from "../explicit-continuation-retry-claim.js";
 import {
@@ -43,7 +43,7 @@ import {
 import { CONTROLLER_LEASE_LOST_FAILURE_CODE, hasLiveLegacyController, legacyControllerBootId, liveLegacyControllerExpiresAt } from "../legacy-controller-lease.js";
 import { isCompletedOnboardingHandoffWake } from "../chat-completion-delivery.js";
 import { NATIVE_STATUS_COMMITTER_ACTOR_ID } from "../issue-rewake-throttle.js";
-import { isWaitingConversation, settleConversationTurnForRun, deliverConversationComments } from "../agent-conversations.js";
+import { isWaitingConversation, settleConversationTurnForRun, deliverConversationComments, latestPersonMessageTurn, redeliverUnansweredConversationTurn, redeliverFailedConversationDelivery } from "../agent-conversations.js";
 import {
   and,
   asc,
@@ -1782,10 +1782,30 @@ export function recoveryService(
         current.executionRunId !== issue.executionRunId ||
         current.checkoutRunId !== issue.checkoutRunId ||
         current.updatedAt.getTime() !== issue.updatedAt.getTime() ||
-        current.hiddenAt ||
-        current.lastStatusDecisionId !== candidate.decisionId
+        current.hiddenAt
       )
         return false;
+      // The repair's refusal is its OUTCOME, recorded once per run (D122,
+      // rf-3 20:53Z): the task card shows failed + Retry from this record, never
+      // from elapsed time, so a repair that is merely waiting on the issue lock
+      // is not a false failure. Only the two permanent refusal families record:
+      // a later status decision and a changed carried message. A changed issue
+      // snapshot above is a race the next pass rereads, not a refusal.
+      const refuse = async (reason: "later_status_decision" | "carried_message_changed" | "later_message") => {
+        const [recorded] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
+          eq(activityLog.companyId, current.companyId), eq(activityLog.runId, latestRun.id),
+          eq(activityLog.action, NATIVE_BLOCKED_WAIT_REFUSED_ACTION))).limit(1);
+        if (!recorded) await logActivity(tx as unknown as Db, {
+          companyId: current.companyId, actorType: "system", actorId: "recovery",
+          action: NATIVE_BLOCKED_WAIT_REFUSED_ACTION, entityType: "issue", entityId: current.id,
+          runId: latestRun.id,
+          details: { source: "recovery.native_blocked_wait", reason, latestRunId: latestRun.id,
+            nativeResultId: candidate.resultId },
+        }, publications);
+        return false;
+      };
+      if (current.lastStatusDecisionId !== candidate.decisionId)
+        return refuse("later_status_decision");
 
       const source = await tx
         .select({
@@ -1895,7 +1915,7 @@ export function recoveryService(
         ) ||
         commentIds.some((id) => !comments.some((comment) => comment.id === id))
       )
-        return false;
+        return refuse(comments.some((comment) => !commentIds.includes(comment.id)) ? "later_message" : "carried_message_changed");
       const paths = await collectDispositionRepairSourceState(
         tx as unknown as Db,
         { issue: current },
@@ -1948,10 +1968,9 @@ export function recoveryService(
       );
       return true;
     });
-    if (repaired) {
-      for (const publication of publications) publishActivity(publication);
-      await executeIssuePostCommitActions(db, postCommitActions);
-    }
+    // A recorded refusal is published too, so the task view updates to its card.
+    for (const publication of publications) publishActivity(publication);
+    if (repaired) await executeIssuePostCommitActions(db, postCommitActions);
     return repaired;
   }
 
@@ -4984,6 +5003,31 @@ export function recoveryService(
       issueIds: [] as string[],
     };
 
+    // rf-3 R-SILENT (D137/D138 on a BLOCKED task): the person's latest message
+    // to a blocked conversation whose wake failed without a run. The candidates
+    // above exclude blocked tasks, so nothing else would deliver it, and the
+    // card has no run to show. A person's message wakes a blocked task like any
+    // other (heartbeat.ts shouldAutoCheckoutIssueForWake checks out "blocked"),
+    // so the same owner as the unblocked shape re-offers it once (same key).
+    const blockedConversations = await db.select(recoveryIssueFields).from(issues).where(and(
+      opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+      opts?.issueId ? eq(issues.id, opts.issueId) : undefined,
+      eq(issues.status, "blocked"), isNull(issues.assigneeUserId), isNull(issues.hiddenAt),
+      sql`${issues.conversationAgentId} is not null`,
+      opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+      sql`exists (select 1 from agent_wakeup_requests failed_wake where failed_wake.company_id = ${issues.companyId}
+        and failed_wake.status = 'failed' and failed_wake.run_id is null and failed_wake.payload->>'issueId' = ${issues.id}::text)`,
+    ));
+    if (blockedConversations.length) {
+      for (const issue of blockedConversations) {
+        if (await latestPersonMessageTurn(db, issue)) continue;
+        if (await redeliverFailedConversationDelivery(db, issue, deps.enqueueWakeup) === "redelivered") {
+          result.continuationRequeued += 1;
+          result.issueIds.push(issue.id);
+        }
+      }
+    }
+
     const pass = opts?.pass ?? (candidates.length > 1
       ? createRecoveryPassReads(candidates.filter((issue) => issue.status === "in_review").map((issue) => issue.id)) : undefined);
     const handledIssueIds = await resumeShutdownStoppedRetryPreparations(candidates, result, opts?.onDeferredDeadline);
@@ -5036,6 +5080,23 @@ export function recoveryService(
             const [current] = await db.select().from(issues).where(eq(issues.id, issue.id));
             if (current) Object.assign(issue, current);
           }
+        }
+        // A succeeded turn with no durable response did not answer its message (R-SILENT).
+        // Keyed on the run that carried the person's latest message, not the latest
+        // run: an unrelated later success must not hide it (D129/D150/D151/D183),
+        // nor hide upstream's failed-turn card for it.
+        const messageTurn = await latestPersonMessageTurn(db, issue);
+        if (messageTurn && await redeliverUnansweredConversationTurn(db, issue, messageTurn.runId, deps.enqueueWakeup,
+          { onDeferredDeadline: opts?.onDeferredDeadline, messageId: messageTurn.messageId }) === "redelivered") {
+          result.continuationRequeued += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+        // No run ever carried the message: its wake failed without a run (D137/D138).
+        if (!messageTurn && await redeliverFailedConversationDelivery(db, issue, deps.enqueueWakeup) === "redelivered") {
+          result.continuationRequeued += 1;
+          result.issueIds.push(issue.id);
+          continue;
         }
         {
           if (await deliverConversationComments(db, issue, deps.enqueueWakeup,
@@ -7161,25 +7222,11 @@ export function recoveryService(
     startSavedWorkRecovery: deps.startSavedWorkRecovery,
     cancelStalledQueuedRun: deps.cancelStalledQueuedRun,
   });
-  /** Whether the native blocked-request repair (nativeBlockedUnblockAction)
-   * applies to this run: it then publishes the run's unblock request as a
-   * visible notice itself. Read-only; for the unanswered-message step. */
-  async function nativeBlockedRepairApplies(input: { companyId: string; issueId: string; runId: string }, database: Db = db) {
-    const [issue] = await database.select().from(issues)
-      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
-    const [run] = await database.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
-      error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode, contextSnapshot: heartbeatRuns.contextSnapshot,
-      livenessState: heartbeatRuns.livenessState, startedAt: heartbeatRuns.startedAt, createdAt: heartbeatRuns.createdAt })
-      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
-    if (!issue || !run) return false;
-    return Boolean(await nativeBlockedUnblockAction(issue as RecoveryIssue, run, database));
-  }
 
   return {
     assignedWork,
     buildRunOutputSilence,
     buildRunOutputSilences,
-    nativeBlockedRepairApplies,
     escalateStrandedRecoveryIssueInPlace,
     escalateStrandedAssignedIssue,
     refreshStrandedAssignedIssueRecoveryProjection,

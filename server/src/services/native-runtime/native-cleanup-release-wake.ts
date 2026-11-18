@@ -1,6 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import { notifyDeferredExecutionWork } from "../deferred-execution-notifications.js";
 import { notifyQueuedRunDispatch } from "../run-dispatch-notifications.js";
+import { stampQueuedRunsStartable } from "../heartbeat/startable-since.js";
 import { onNativeSessionCleanupQuarantined, onNativeSessionCleanupSettled } from "../../vendor/paperclip-runner/index.js";
 
 /**
@@ -10,9 +11,11 @@ import { onNativeSessionCleanupQuarantined, onNativeSessionCleanupSettled } from
  * dispatch repeats every admission check under its own locks.
  */
 export function registerNativeCleanupReleaseWake(db: Db, onError: (error: unknown, companyId: string) => void): () => void {
-  const unsubscribeSettled = onNativeSessionCleanupSettled(({ companyId }) => {
+  const unsubscribeSettled = onNativeSessionCleanupSettled(({ companyId, issueIds }) => {
     if (!companyId) return;
     void db.transaction(async tx => {
+      // RFL 01:00Z (a): the native session cleanup hold clears; the task's queued runs are startable from now.
+      await stampQueuedRunsStartable(tx, { companyId, issueIds });
       await notifyDeferredExecutionWork(tx, { companyId });
       await notifyQueuedRunDispatch(tx, { companyId });
     }).catch((error: unknown) => onError(error, companyId));

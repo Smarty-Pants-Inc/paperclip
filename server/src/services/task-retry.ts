@@ -28,6 +28,7 @@ import { rearmExhaustedNativeFinalization } from "./native-runtime/exhausted-fin
 import { NativeChatReviewPresentationContentionError } from "./native-runtime/native-chat-review-presentation.js";
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
 import { selectTaskRetryInput } from "./chat-channels/task-retry-input.js";
+import { taskRetryStateRefusal } from "./task-retry-eligibility.js";
 
 export async function taskRetryMutationAllowed(db: Db, input: {
   companyId: string; issueId: string; actorId: string; actorSource: TaskRetryIntent["actorSource"];
@@ -294,6 +295,15 @@ function admitTaskRetry(input: TaskRetryRequest) {
       eq(issues.id, input.issueId))).for("update");
     if (!issue) throw notFound("Task not found");
     assertTaskRetryConversationAllowed(issue, input.actorId);
+    const [latest] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
+      or(eq(heartbeatRuns.issueId, issue.id), eq(heartbeatRuns.nativeIssueId, issue.id),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`)))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+    const refused = taskRetryStateRefusal(issue, latest?.agentId);
+    // Before idempotency or any mutation: a former accepted press cannot
+    // queue/cancel work after the task moved to Backlog, closed or changed owner.
+    if (refused) return { requestId: null, accepted: false, stale: true,
+      observedRunId: latest?.id ?? null, chatActionId: undefined, refused };
     const key = `task-retry:${input.idempotencyKey}`;
     const [sameRequest] = await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
@@ -309,11 +319,7 @@ function admitTaskRetry(input: TaskRetryRequest) {
         observedRunId: intent?.sourceRunId ?? null, chatActionId: intent?.chatActionId,
         ...(coalescedRun?.status === "scheduled_retry" ? { scheduledRetryRunId: coalescedRun.id } : {}) };
     }
-    const [latest] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
-      or(eq(heartbeatRuns.issueId, issue.id), eq(heartbeatRuns.nativeIssueId, issue.id),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`)))
-      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-    if (["done", "cancelled"].includes(issue.status) || !issue.assigneeAgentId || !latest ||
+    if (!issue.assigneeAgentId || !latest ||
         latest.agentId !== issue.assigneeAgentId || input.observedRunId !== latest.id) {
       return { requestId: null, accepted: false, stale: true, observedRunId: latest?.id ?? null, chatActionId: undefined };
     }
@@ -516,9 +522,20 @@ function admitTaskRetry(input: TaskRetryRequest) {
       details: { requestId: active?.id ?? id, sourceRunId: latest.id, attachedToExistingWork: Boolean(active || busy),
         ...(replacedRequestId ? { replacedRequestId } : {}),
         ...(input.initiatedBy ? { initiatedBy: input.initiatedBy, onBehalfOfUserId: input.actorId } : {}) } });
+    // A person's queued run the card shows as a failed start (startable for the
+    // bound, never taken: D157/D168) is not joined and left stuck: the receipt
+    // names it so the caller starts it now through the dispatcher, as a
+    // scheduled retry is started now. Same card decision, no second rule.
+    const startQueuedRunId = latest.status === "queued" && !active
+      ? await (async () => {
+        const { taskInterruptionPresentation } = await import("./task-interruption-presentation.js");
+        const card = await taskInterruptionPresentation(db, issue);
+        return card?.state === "failed" && card.observedRunId === latest.id ? latest.id : undefined;
+      })() : undefined;
     return { requestId: active?.id ?? id, accepted: true, stale: false, observedRunId: latest.id,
       chatActionId: intent.chatActionId,
-      ...(!active && latest.status === "scheduled_retry" ? { scheduledRetryRunId: latest.id } : {}) };
+      ...(!active && latest.status === "scheduled_retry" ? { scheduledRetryRunId: latest.id } : {}),
+      ...(startQueuedRunId ? { startQueuedRunId } : {}) };
   }, { companyId: input.companyId });
 }
 
@@ -708,4 +725,74 @@ export async function reconcileTaskChatRetryReceipts(db: Db, scope: { companyId?
     });
     else await write(db);
   }
+}
+
+/**
+ * Retry on a person's queued run the card shows as a failed start (D157/D168).
+ * The dispatcher, re-poked by liveness on every pass with refused claims
+ * retried (queue.ts resumeQueuedRunsAfterDrain), already left that run untaken
+ * for the start bound, so a re-poke does nothing a Retry promises. Cancel the
+ * stuck run while it is still queued (it can never start later), then enqueue
+ * ONE fresh run carrying only the person's message(s) the stuck run carried:
+ * none of its retry ancestry or old wake context, so a hold bound to that run
+ * (its predecessor, its scheduled-retry reason) does not follow the message.
+ * Once: only the press whose cancel wins enqueues, and the fresh wake has a
+ * per-run idempotency key. A run that carried no person message (a person's
+ * assignment, D-dead-chat) carries the assignment itself: the task, still open
+ * and still assigned to that agent, is the input, delivered once as a fresh
+ * assignment wake with the same once-only key. A task that is no longer that
+ * agent's open work has no input to carry, and nothing is started or cancelled.
+ */
+export async function startPersonQueuedRunFresh(db: Db, heartbeat: {
+  cancelStuckQueuedRunForRetry(runId: string): Promise<typeof heartbeatRuns.$inferSelect | null>;
+  resumeQueuedRunsForAgent(companyId: string, agentId: string): Promise<unknown>;
+  wakeup(agentId: string, options: Record<string, unknown>): Promise<unknown>;
+}, input: { companyId: string; issueId: string; runId: string; actorId: string }) {
+  const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "queued")));
+  if (!run) return null;
+  // Repeat the current-task gate at the cancellation boundary, including runs
+  // carrying comments; a state change after admission must not replace old work.
+  const [task] = await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId }).from(issues)
+    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  if (!task || taskRetryStateRefusal(task, run.agentId)) return null;
+  const context = (run.contextSnapshot ?? {}) as Record<string, unknown>;
+  const carried = [...new Set([...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
+    context.wakeCommentId, context.commentId].filter((id): id is string => typeof id === "string" && id.length > 0))];
+  const messages = carried.length ? await db.select({ id: issueComments.id, authorUserId: issueComments.authorUserId,
+    createdAt: issueComments.createdAt }).from(issueComments).where(and(eq(issueComments.companyId, input.companyId),
+    eq(issueComments.issueId, input.issueId), inArray(issueComments.id, carried), isNull(issueComments.deletedAt),
+    isNull(issueComments.authorAgentId), sql`${issueComments.authorUserId} is not null`)).orderBy(issueComments.createdAt) : [];
+  if (!messages.length) {
+    const cancelled = await heartbeat.cancelStuckQueuedRunForRetry(run.id);
+    if (!cancelled) return null;
+    await heartbeat.wakeup(run.agentId, {
+      source: "assignment",
+      triggerDetail: "manual",
+      reason: "issue_assigned",
+      idempotencyKey: `task-retry-queued-start:${run.id}`,
+      requestedByActorType: "user",
+      requestedByActorId: input.actorId,
+      payload: { issueId: input.issueId, mutation: "retry", replacedQueuedRunId: run.id },
+      contextSnapshot: { issueId: input.issueId, taskKey: input.issueId, source: "issue.retry",
+        wakeReason: "issue_assigned", replacedQueuedRunId: run.id },
+    });
+    return cancelled;
+  }
+  const cancelled = await heartbeat.cancelStuckQueuedRunForRetry(run.id);
+  if (!cancelled) return null;
+  const ids = messages.map(message => message.id);
+  const latest = messages[messages.length - 1]!;
+  await heartbeat.wakeup(run.agentId, {
+    source: "on_demand",
+    triggerDetail: "manual",
+    reason: "issue_commented",
+    idempotencyKey: `task-retry-queued-start:${run.id}`,
+    requestedByActorType: "user",
+    requestedByActorId: latest.authorUserId ?? input.actorId,
+    payload: { issueId: input.issueId, commentId: latest.id, replacedQueuedRunId: run.id },
+    contextSnapshot: { issueId: input.issueId, taskKey: input.issueId, commentId: latest.id, wakeCommentId: latest.id,
+      wakeCommentIds: ids, source: "issue.comment", wakeReason: "issue_commented", replacedQueuedRunId: run.id },
+  });
+  return cancelled;
 }

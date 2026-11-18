@@ -1,3 +1,4 @@
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
@@ -576,6 +577,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       suppressImmediateRecovery: true,
     });
 
+    return cancelled;
+  }
+
+  /**
+   * Retry on a person's queued run the dispatcher left untaken for the start
+   * bound (D157/D168). Every pass, the liveness redrive included
+   * (resumeQueuedRunsAfterDrain, retryRefused), already re-offered it to this
+   * same claim, so another re-poke changes nothing. Cancel exactly that run,
+   * only while it is still queued (the same compare-and-set a claim makes), so
+   * it can never start later; the caller then enqueues ONE fresh run for the
+   * person's message. Only the press whose cancel wins gets the run back.
+   */
+  async function cancelStuckQueuedRunForRetry(runId: string) {
+    const now = new Date();
+    const reason = "Replaced by Retry: this queued run never started";
+    const cancelled = await cancelRunIfStillQueued(runId, { finishedAt: now, error: reason,
+      errorCode: "person_queued_run_replaced" });
+    if (!cancelled) return null;
+    await setWakeupStatus(cancelled.wakeupRequestId, "cancelled", { finishedAt: now, error: reason });
+    await appendRunEvent(cancelled, { eventType: "lifecycle", stream: "system", level: "info", message: reason });
+    await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
     return cancelled;
   }
 
@@ -2890,6 +2912,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       enrichedContextSnapshot.forceFreshSession = true;
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
       enrichedContextSnapshot.taskRetryRequestId = receipt.id;
+      // H3 R-ONCE: a person's Retry of a run that held their answer takes that answer
+      // as input, through the one continuation seam (scope from the source run's own
+      // row, never this payload). Saved board messages keep their own Retry carry.
+      const answered = await readContinuationCommentInput(db, { companyId: receipt.companyId, issueId: issueId!,
+        runId: retry.sourceRunId });
+      if (answered.interactionIds) Object.assign(enrichedContextSnapshot, answered);
       if (retry.boardMessageOrigin) enrichedContextSnapshot.boardMessageRetry = true;
     }
 
@@ -6061,6 +6089,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     dispatchPendingNativeStatusWakeups,
     createNativeStatusWakeBatch,
     startNextQueuedRunForAgent,
+    cancelStuckQueuedRunForRetry,
     countRunningRunsForAgent,
     releaseClaimBackoffsForTask,
     releaseRunClaimedJustBeforeSuppression,

@@ -9,7 +9,6 @@ import { agents, companies, createDb, heartbeatRuns, issueComments, issues, type
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "./continuation-comment-input.js";
 import { assignedWorkSweep } from "./recovery/assigned-work-sweep.js";
-import { settleUnansweredPersonMessage } from "./recovery/unanswered-person-message.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("continuation comment carry: never re-present an answered comment", () => {
@@ -94,15 +93,13 @@ describe.skipIf(!support.supported)("continuation comment carry: never re-presen
 
   // RFL ruling 20:22Z (review-fleet-2): run-less AGENT comments exist outside the onboarding greeting (the Muse external
   // agent's task.comment, modules/external-agents/muse.ts:537; agent-chat-messages.ts:198 outside a run). A run-less
-  // agent comment NEVER answers a person's comment, in the carry AND in B''s notice, so the two can never disagree.
-  it("(f) a run-less NON-greeting agent comment (the Muse shape) after the person's comment does not answer it: still carried, and B' still counts it unanswered", async () => {
+  // agent comment NEVER answers a person's comment in the continuation carry.
+  it("(f) a run-less NON-greeting agent comment (the Muse shape) after the person's comment does not answer it: still carried", async () => {
     const f = await fixture({ status: "failed" });
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
       createdByRunId: null, body: "Muse: noted on the task.", createdAt: f.at(30_000) });
     expect.soft(await readContinuationCommentInput(db, { ...f, runId: f.run.id }), "the continuation still carries it")
       .toMatchObject({ commentContinuation: true, wakeCommentIds: [f.message.id], wakeCommentId: f.message.id });
-    const settled = await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now: f.at(20 * 60_000) });
-    expect.soft(settled.kind, "B' does not treat the run-less post as an answer").not.toBe("answered");
   });
 
   it("(d) a SUCCEEDED parent whose response was never published (publication failed or pending retry, or a yield with no visible reply) still carries the comment", async () => {

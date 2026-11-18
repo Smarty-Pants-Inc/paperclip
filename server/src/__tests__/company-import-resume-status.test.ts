@@ -88,14 +88,14 @@ describe.skipIf(!support.supported)("import resume preserves source waiting stat
           reason: "issue_assigned", payload: { issueId: task.id }, requestedByActorType: "system",
           contextSnapshot: { issueId: task.id } });
       }
-      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, unanswered: false });
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
       for (const task of f.tasks) await heartbeat.checkAssignedWorkInvariant({ companyId: f.companyId, issueId: task.id });
     }
     try {
       console.log(JSON.stringify({ check: "immediately-imported", owner, runs: await runRows(f.companyId), wakes: await wakeRows(f.companyId) }));
       // Real owners see the paused import before Resume. Assignment candidates
       // are submitted only after readiness; no fabricated import-time receipt.
-      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, unanswered: false });
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
       for (const task of f.tasks) await heartbeat.checkAssignedWorkInvariant({ companyId: f.companyId, issueId: task.id });
       expect(await runRows(f.companyId)).toHaveLength(0);
       await ready(f);
@@ -177,7 +177,7 @@ describe.skipIf(!support.supported)("import resume preserves source waiting stat
       enqueueWakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts),
       afterStrandedLatestRunRead: async ({ runId }) => {
         expect(runId).toBeNull();
-        await peerHeartbeat.reconcileStrandedAssignedIssues({ ...scope, unanswered: false });
+        await peerHeartbeat.reconcileStrandedAssignedIssues(scope);
         const [first] = await runRows(f.companyId); expect(first).toBeDefined();
         await peerHeartbeat.cancelRun(first!.id, "Operator stopped imported todo", {
           suppressImmediateRecovery: true, resultJson: { cancelledByActorType: "user", cancelledByUserId: f.actor },

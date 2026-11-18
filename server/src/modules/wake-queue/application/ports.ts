@@ -237,9 +237,11 @@ export interface WakeQueueTransaction {
   isAutomaticRecoverySuppressedByPauseHold(input: { companyId: string; issueId: string }): Promise<boolean>;
   /** Deny-only facts from the exact finishing run and its durable chat wake owner. */
   isImmediateRecoverySourceBlocked(input: { companyId: string; runId: string }): Promise<boolean>;
+  /** The shared continuation seam; `agentId` is the predecessor run's agent. */
   pendingContinuationCommentInput(input: {
     companyId: string;
     issueId: string;
+    agentId: string;
     contextSnapshot: unknown;
   }): Promise<Record<string, unknown>>;
   queueReviewParticipantRecoveryRun(input: {

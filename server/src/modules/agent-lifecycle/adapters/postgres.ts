@@ -8,6 +8,7 @@ import type { LifecycleEffects } from "./effects.js";
 import type { LifecycleStore } from "../application/ports.js";
 import type { ActivityPublication } from "../../../types/activity-publication.js";
 import { lifecycleRetryDelay, LIFECYCLE_STOP_RETRY_REQUIRED } from "../application/retry.js";
+import { stampQueuedRunsStartable } from "../../../services/heartbeat/startable-since.js";
 
 export function assertRootDatabase(db: Db) {
   if ("nestedIndex" in db) throw new AgentLifecycleConflict("Lifecycle commands require the root database connection");
@@ -231,6 +232,10 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     pausedAt: next === "pausing" ? new Date() : next === "ready" ? null : agent.pausedAt,
     updatedAt: new Date(),
   }).where(eq(agents.id, agent.id)).returning();
+  // RFL 01:00Z (a): agent setup, an ordinary pause and a budget pause all clear
+  // here, when the agent becomes ready; its queued runs are startable from now.
+  if (updated && next === "ready" && agent.lifecycleState !== "ready")
+    await stampQueuedRunsStartable(tx, { companyId: agent.companyId, agentId: agent.id });
   if (next === "terminating" || next === "rejected") {
     await tx.update(agentApiKeys).set({ revokedAt: new Date() }).where(eq(agentApiKeys.agentId, agent.id));
     const revokedKeys = await tx.update(agentIdentityKeys).set({ revokedAt: sql`now()` })

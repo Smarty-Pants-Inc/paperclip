@@ -84,7 +84,7 @@ describe.skipIf(!support.supported)("F1 stopped-owner continuation routing", () 
     const records = await listFreshContinuations(db, { companyId: f.company.id, issueId: f.issue.id });
     expect(records).toHaveLength(1);
     // follow-Paperclip Cut B R1/R5: exact owner settlement stays; fresh admission records isolation, not physical death.
-    expect(records[0].evidence).toMatchObject({ freshContinuation: { sourceRunId: f.source.id, chainAttempt: 1 },
+    expect(records[0].evidence).toMatchObject({ freshContinuation: { sourceRunId: f.source.id },
       freshContinuationSettlement: { sourceRunId: f.source.id, replay: "none" },
       executionReconciliation: { runId: f.source.id }, continuationDelivery: "pending" });
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, holdId)))[0])

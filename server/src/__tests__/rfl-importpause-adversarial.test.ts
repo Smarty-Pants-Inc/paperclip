@@ -11,7 +11,6 @@ import { companyPortabilityService } from "../services/company-portability.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { configureAgentLifecycle, createAgentLifecycle } from "../services/agent-lifecycle.js";
-import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 
 // Independent RFL acceptance checks. Keep reason: trust boundary and durable
 // admission race, specifically RFL asks A-D. Real local PG and importBundle;
@@ -83,23 +82,6 @@ describe.skipIf(!support.supported)("RFL importpause adversarial acceptance", ()
     expect(updateIssueSchema.parse({ title: "Forged", originKind: "company_import" })).not.toHaveProperty("originKind");
   });
 
-  it.each(["manual", "import-then-manual", "manual-then-import"])("true paused note exactly once across repeat sweeps: %s", async order => {
-    const f = await fixture();
-    if (order !== "import-then-manual") await ready(f);
-    await createAgentLifecycle(db).pauseAgent(f.agentId, "manual");
-    // The internal import caller uses this same lifecycle operation. This
-    // exercises hold order, not a public API forgery.
-    if (order === "manual-then-import") await createAgentLifecycle(db).pauseAgent(f.agentId, "import");
-    for (let i = 0; i < 3; i++) {
-      await heartbeatService(db, options).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.tasks[0]!.id });
-      await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.tasks[0]!.id, now: new Date(Date.now() + 60 * 60_000) });
-    }
-    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
-    console.log(JSON.stringify({ check: order, holds: agent!.lifecycleHolds, pauseReason: agent!.pauseReason, notes: (await noteRows(f.tasks[0]!.id)).map(n => n.body) }));
-    expect((await noteRows(f.tasks[0]!.id)).map(n => n.body)).toEqual([
-      "RFL worker is paused. Your message is saved, and it will run when RFL worker is resumed. A board user or RFL worker's manager can resume RFL worker.",
-    ]);
-  });
 
   it("two independent DB clients and repeated resume admit only one queued run", async () => {
     const f = await fixture(); await ready(f);
@@ -113,7 +95,7 @@ describe.skipIf(!support.supported)("RFL importpause adversarial acceptance", ()
 
   it("stale no-run snapshot cannot re-admit initial import after a peer's first run becomes terminal", async () => {
     const f = await fixture(); await ready(f);
-    const scope = { companyId: f.companyId, issueId: f.tasks[0]!.id, unanswered: false };
+    const scope = { companyId: f.companyId, issueId: f.tasks[0]!.id };
     const peerHeartbeat = heartbeatService(peer, options);
     const localHeartbeat = heartbeatService(db, options);
     let crossed = false;
@@ -177,14 +159,14 @@ describe.skipIf(!support.supported)("RFL importpause adversarial acceptance", ()
     const f = await fixture(3); await ready(f);
     await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "company", scopeId: f.companyId, windowKind: "calendar_month_utc", amount: 1 });
     await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.agentId, provider: "local-test", biller: "local-test", billingType: "metered_api", model: "no-provider", inputTokens: 1, outputTokens: 1, costCents: 2, occurredAt: new Date() });
-    await heartbeatService(db, options).reconcileStrandedAssignedIssues({ companyId: f.companyId, unanswered: false });
+    await heartbeatService(db, options).reconcileStrandedAssignedIssues({ companyId: f.companyId });
     expect(await runRows(f.companyId)).toHaveLength(0);
   });
 
   it("an existing queued wake prevents an extra import admission", async () => {
     const f = await fixture(); await ready(f);
     await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "assignment", reason: "issue_assigned", status: "queued", payload: { issueId: f.tasks[0]!.id } });
-    await heartbeatService(peer, options).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.tasks[0]!.id, unanswered: false });
+    await heartbeatService(peer, options).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.tasks[0]!.id });
     expect(await runRows(f.companyId)).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(1);
   });
@@ -234,7 +216,7 @@ describe.skipIf(!support.supported)("RFL importpause adversarial acceptance", ()
 
   it("five qualifying imported tasks produce exactly five ordinary durable assignment admissions", async () => {
     const f = await fixture(5); await ready(f);
-    await heartbeatService(db, options).reconcileStrandedAssignedIssues({ companyId: f.companyId, unanswered: false });
+    await heartbeatService(db, options).reconcileStrandedAssignedIssues({ companyId: f.companyId });
     const runs = await runRows(f.companyId);
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
     console.log(JSON.stringify({ check: "burst-five", runCount: runs.length, wakeCount: wakes.length, sources: wakes.map(w => w.source) }));

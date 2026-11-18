@@ -4,6 +4,7 @@ import { and, asc, count, inArray, eq, gt, gte, isNotNull, isNull, lt, lte, or, 
 import { z } from "zod";
 import { companies, activityLog, issueComments, heartbeatRuns, dotMailboxItems, dotAgentBindings, dotRunnerAssignments, mcpEventAdmissions as admissions, mcpEventDeliveries as deliveries, mcpEventSubscriptions as subscriptions, type Db } from "@paperclipai/db";
 import { dotRunnerBroker } from "../dot-runner-broker.js";
+import { stampQueuedRunsStartable } from "../heartbeat/startable-since.js";
 import { ISSUE_STATUSES } from "@paperclipai/shared";
 import { createLocalEncryptedCipher, localEncryptedProvider } from "../../secrets/local-encrypted-provider.js";
 import { logActivity } from "../activity-log.js";
@@ -191,12 +192,18 @@ export function createPublicMcpEvents(db: Db, oauth: PublicMcpOAuth, api: ApiDis
           arguments: input.arguments, deliveryMaterial: material, expiresAt, stoppedAt: null,
           verifiedAt: verify ? new Date(now()) : existing!.verifiedAt, startsAt: existing?.startsAt ?? requestedAt, scannedAt: new Date(now()) };
         await notifyDeliveryWork(tx, queue, input.arguments.bindingId ? `binding:${input.arguments.bindingId}` : id);
+        // FIX20: a ready Dot binding with no live subscription holds new work (dot.ts newWorkHold,
+        // wakeVerified). A subscription that restores one clears that hold: stamp the agent's queued runs.
+        const restoresDotWake = !!input.arguments.bindingId && !!lease && (await tx.select({ id: subscriptions.id }).from(subscriptions).where(and(
+          eq(subscriptions.bindingId, input.arguments.bindingId), eq(subscriptions.grantId, principal.grant.id),
+          isNull(subscriptions.stoppedAt), gt(subscriptions.expiresAt, new Date(now())))).limit(1)).length === 0;
         await tx.insert(subscriptions).values({ id, ...value }).onConflictDoUpdate({ target: subscriptions.id, set: value });
         if (input.arguments.bindingId && lease) {
           const [binding] = await tx.select().from(dotAgentBindings).where(and(
             eq(dotAgentBindings.id, input.arguments.bindingId), eq(dotAgentBindings.companyId, principal.grant.companyId),
             eq(dotAgentBindings.grantId, principal.grant.id), isNull(dotAgentBindings.revokedAt))).for("update");
           if (!binding) throw new McpEventError(-32602, "The Dot binding was revoked. Reconnect the agent.");
+          if (restoresDotWake && binding.status === "ready" && binding.readyAt) await stampQueuedRunsStartable(tx, { companyId: binding.companyId, agentId: binding.agentId });
           const outstanding = await tx.select().from(dotRunnerAssignments).where(and(
             eq(dotRunnerAssignments.bindingId, binding.id), eq(dotRunnerAssignments.bindingGeneration, binding.generation),
             gt(dotRunnerAssignments.expiresAt, new Date(now())),
