@@ -98,14 +98,13 @@ export async function readNativeMidStreamCut(db: Pick<Db, "select">, input: { co
   return classifyNativeMidStreamCut(await readRunAnswerEvents(db, input.companyId, input.runId));
 }
 
-const ORDINARY_STATUS_REJECTION = /^\s*(?:429|529)\b/u;
-
 /**
- * compose (unit 1 + dl-refusal2): the provider answered the request with an
- * ordinary capacity status (HTTP 429 rate limit, 529 overloaded) and no answer
- * text was streamed. Nothing was cut mid-stream: the request was turned away.
+ * The run's last turn failed with an ACCOUNT rejection (billing, quota hard
+ * limit, credentials, permission). The provider will reject the same request
+ * again until a person acts on the account, so it has no automatic successor
+ * of any kind. Re-derived from the run's own persisted turn events.
  */
-export function isOrdinaryProviderStatusRejection(rows: readonly { seq: number; payload: unknown }[]): boolean {
+export function classifyNativeProviderAccountFailure(rows: readonly { seq: number; payload: unknown }[]): boolean {
   let last: Record<string, unknown> | null = null;
   for (const row of [...rows].sort((a, b) => a.seq - b.seq)) {
     const event = record(record(row.payload).prpEvent);
@@ -113,25 +112,11 @@ export function isOrdinaryProviderStatusRejection(rows: readonly { seq: number; 
   }
   if (!last || last.eventType !== "turn.failed") return false;
   const error = record(record(last.payload).error);
-  return error.code === "pi_provider_error" && typeof error.message === "string"
-    && ORDINARY_STATUS_REJECTION.test(error.message) && !isNativeProviderRefusal(error)
-    && readFailedTurnStreamedAnswer(rows) === null;
+  return (error.code === "pi_provider_error" || error.code === "pi_rpc_transport_failed") && isNativeProviderAccountFailure(error);
 }
 
-/**
- * The cut that takes the recovery lane. An ordinary 429/529 status rejection
- * is not one: it keeps the generic failed-turn retry (`native_run_failed`,
- * the refusal family's judged control), which the arbiter bounds to one
- * continuation exactly as before. `classifyNativeMidStreamCut` is unchanged,
- * so a cut successor that then meets a 429/529 still gets its own true
- * exhausted note, never the generic resend line.
- */
-export function classifyNativeMidStreamCutRecovery(rows: readonly { seq: number; payload: unknown }[]): NativeMidStreamCut | null {
-  return isOrdinaryProviderStatusRejection(rows) ? null : classifyNativeMidStreamCut(rows);
-}
-
-export async function readNativeMidStreamCutRecovery(db: Pick<Db, "select">, input: { companyId: string; runId: string }) {
-  return classifyNativeMidStreamCutRecovery(await readRunAnswerEvents(db, input.companyId, input.runId));
+export async function readNativeProviderAccountFailure(db: Pick<Db, "select">, input: { companyId: string; runId: string }) {
+  return classifyNativeProviderAccountFailure(await readRunAnswerEvents(db, input.companyId, input.runId));
 }
 
 /** A cap stop with no text needs a new process on the SAME conversation; the cut turn is not sent. */

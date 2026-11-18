@@ -52,6 +52,7 @@ import {
 } from "@paperclipai/db";
 import {
   heldByAnotherRun,
+  NATIVE_PROVIDER_ACCOUNT_FAILURE_CODE,
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeGovernanceGate,
   type NativeStatusDecision,
@@ -89,7 +90,7 @@ import {
 } from "../activity-log.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { materializeNativeEnvironmentBlockerRetry, materializeNativeMidStreamCutRetry, materializeNativeProviderCapacityRetry } from "./native-provider-capacity-retry.js";
-import { NATIVE_MID_STREAM_CUT_CODE, readNativeMidStreamCutRecovery } from "./native-mid-stream-cut.js";
+import { NATIVE_MID_STREAM_CUT_CODE, readNativeMidStreamCut } from "./native-mid-stream-cut.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE } from "./native-environment-blocker.js";
 import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
@@ -836,7 +837,7 @@ async function materializeDecisionEffect(input: {
     // mid-stream is that cut's recovery: one successor, through the same
     // materializer as schedule_retry, never the generic wake as well.
     const cut = effect.continuationKind === "same_agent" && effect.agentId === input.actorAgentId
-      ? await readNativeMidStreamCutRecovery(input.tx, { companyId: input.companyId, runId: input.runId }) : null;
+      ? await readNativeMidStreamCut(input.tx, { companyId: input.companyId, runId: input.runId }) : null;
     if (cut && cut !== "provider_refusal") {
       const retryId = await materializeNativeMidStreamCutRetry({
         tx: input.tx as unknown as Db, companyId: input.companyId,
@@ -1725,7 +1726,7 @@ export async function commitNativeStatusDecision(input: {
     throw new Error("native_model_rejection_owner_required");
   }
   if ((reasonCode.startsWith("native_provider_overloaded") || reasonCode === "provider_policy_refusal" || reasonCode === "native_run_failed_continuation_exhausted"
-      || reasonCode === NATIVE_ENVIRONMENT_BLOCKER_CODE || reasonCode === NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE)
+      || reasonCode === NATIVE_PROVIDER_ACCOUNT_FAILURE_CODE || reasonCode === NATIVE_ENVIRONMENT_BLOCKER_CODE || reasonCode === NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE)
       && !input.requireProviderFailureOwner) {
     throw new Error("native_provider_failure_owner_required");
   }

@@ -13,6 +13,11 @@ export const NATIVE_RESPONSE_WAKE_WAITING_REASON = "response_wake_waiting_for_in
 export const NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION =
   "The agent's turn failed again after Paperclip continued it automatically. The saved work is kept. Check the failed run, then Retry the task.";
 
+/** An account rejection (billing, quota hard limit, credentials, permission): a person's action, never an automatic successor. */
+export const NATIVE_PROVIDER_ACCOUNT_FAILURE_CODE = "native_provider_account_failure";
+export const NATIVE_PROVIDER_ACCOUNT_FAILURE_ACTION =
+  "The model provider rejected this request for an account reason (billing, quota or credentials). Paperclip did not retry it. Fix the provider account, then Retry the task.";
+
 export type NativeAuthoritativeIssueStatus =
   | "backlog"
   | "todo"
@@ -276,6 +281,13 @@ export function arbitrateNativeStatus(input: {
    * persisted turn events. Null for every other failure.
    */
   midStreamCut?: NativeMidStreamCut | null;
+  /**
+   * The failed turn ended with the provider rejecting the ACCOUNT (billing,
+   * quota hard limit, credentials, permission), re-derived from the run's own
+   * persisted turn events. The same request is rejected again until a person
+   * acts on the account, so it never gets an automatic successor.
+   */
+  providerAccountFailure?: boolean;
   agentId: string;
   priorIssueStatus: NativeAuthoritativeIssueStatus;
 }): NativeStatusDecision {
@@ -357,6 +369,24 @@ export function arbitrateNativeStatus(input: {
       statusAction: "blocked", toStatus: "blocked", reasonCode: PROVIDER_POLICY_REFUSAL_CODE,
       unblockDescriptor: { owner: "board", action: PROVIDER_POLICY_REFUSAL_MESSAGE },
       effects: [{ kind: "bind_blocker", owner: "board", action: PROVIDER_POLICY_REFUSAL_MESSAGE }],
+    };
+  }
+  // An account rejection has NO automatic successor of any kind: no generic
+  // retry, no cut-lane recovery, no capacity retry, no continuation. The
+  // person gets the provider's own text once (the failed run's attributed
+  // reply) and the next attempt is theirs, after the account is fixed.
+  if (input.providerAccountFailure && input.terminalState === "failed") {
+    if (input.nativeReviewOutcome) return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: NATIVE_PROVIDER_ACCOUNT_FAILURE_CODE, unblockDescriptor: null,
+      effects: [{ kind: "release_checkout" }],
+    };
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "blocked", toStatus: "blocked", reasonCode: NATIVE_PROVIDER_ACCOUNT_FAILURE_CODE,
+      unblockDescriptor: { owner: "board", action: NATIVE_PROVIDER_ACCOUNT_FAILURE_ACTION },
+      effects: [{ kind: "bind_blocker", owner: "board", action: NATIVE_PROVIDER_ACCOUNT_FAILURE_ACTION }],
     };
   }
   if (input.providerModelRejected && input.terminalState === "failed" &&
