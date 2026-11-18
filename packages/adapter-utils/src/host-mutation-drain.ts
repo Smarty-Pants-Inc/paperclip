@@ -162,7 +162,28 @@ export function currentHostMutationDrain(): HostMutationDrain | undefined {
  * owner's drain is closed; tracked so the owner's release waits for it. */
 export function hostMutation<T>(fn: () => Promise<T>): Promise<T> {
   const drain = store.getStore();
-  return drain ? drain.run(fn) : fn();
+  const guard = guardStore.getStore();
+  // adopt-stopu-fvc8b (Q-C): a guard in scope is re-checked at EACH host write
+  // (tracked, so the owner's release still waits for it); a refusal or a drain
+  // closed meanwhile refuses the write.
+  const guarded = guard ? async () => {
+    await guard();
+    if (drain?.closed) throw new HostMutationRefusedError("drain_closed_during_guard");
+    return fn();
+  } : fn;
+  return drain ? drain.run(guarded) : guarded();
+}
+
+const GUARD_KEY = Symbol.for("paperclip.adapter-utils.host-mutation-guard");
+const guardStore: AsyncLocalStorage<() => Promise<void>> =
+  ((globalThis as Record<symbol, unknown>)[GUARD_KEY] as AsyncLocalStorage<() => Promise<void>> | undefined)
+  ?? ((globalThis as Record<symbol, unknown>)[GUARD_KEY] = new AsyncLocalStorage<() => Promise<void>>()) as AsyncLocalStorage<() => Promise<void>>;
+
+/** adopt-stopu-fvc8b (Q-C): run `fn` with `guard` re-checked before every
+ * `hostMutation` it issues; the guard throws (e.g. HostMutationRefusedError)
+ * to refuse that write. */
+export function withHostMutationGuard<T>(guard: () => Promise<void>, fn: () => Promise<T>): Promise<T> {
+  return guardStore.run(guard, fn);
 }
 
 /** Housekeeping of this work's own private scratch or lock files: always

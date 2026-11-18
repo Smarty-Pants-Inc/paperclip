@@ -1,5 +1,5 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { environmentLeases, environments, heartbeatRuns, type Db } from "@paperclipai/db";
+import { controllerInstances, environmentLeases, environments, heartbeatRuns, type Db } from "@paperclipai/db";
 import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
 import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
 import type { environmentRuntimeService } from "../environment-runtime.js";
@@ -106,15 +106,29 @@ export async function decidePersonStopExportAtBound(input: {
   // export reads this decision under the same lock and, for without_files,
   // saves the old files aside instead of over the successor's host workspace
   // (native-workspace-sync.ts resumeNativeWorkspaceSync).
+  // adopt-stopu-fvc8b (RFL 03:04Z, Q-B + F5): the bound decides ONLY with a
+  // JOIN proof of the old copyback owner (its drain-complete record: the owner
+  // record cleared; or its PROCESS proven dead: its controller instance lease
+  // expired past PERSON_STOP_OWNER_DEAD_GRACE_MS). Never the lock session.
+  // At the cap with neither: no decision, ONE true note, and the next retry
+  // (or the person's Retry) re-checks the join.
+  let unjoinedAtCap = false;
   const recorded = await db.transaction(async tx => {
     if (!await tryLockNativeWorkspaceFinalization(tx as unknown as Db, { companyId: run.companyId, runId: run.id })) return null;
-    if (await personStopCopybackOwnerUnjoined(tx as unknown as Db, run)) return null;
+    if (await personStopCopybackOwnerUnjoined(tx as unknown as Db, run)) {
+      const boundAt = personStopExportBoundAt(lease.metadata);
+      unjoinedAtCap = boundAt !== null && (input.now ?? Date.now()) >= boundAt + PERSON_STOP_OWNER_JOIN_CAP_MS;
+      return null;
+    }
     return tx.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
       || ${JSON.stringify({ [PERSON_STOP_BOUND_KEY]: decision })}::jsonb` })
       .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "active"),
         sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? ${PERSON_STOP_BOUND_KEY})`)).returning({ id: environmentLeases.id });
   });
-  if (recorded === null) return null;
+  if (recorded === null) {
+    if (unjoinedAtCap) await notePersonStopCopybackUnjoinedAtCap(db, run, lease.id);
+    return null;
+  }
   if (recorded.length === 0) {
     const [again] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(eq(environmentLeases.id, lease.id));
     return readPersonStopBoundDecision(again?.metadata);
@@ -146,9 +160,48 @@ export async function decidePersonStopExportAtBound(input: {
  * (the finalization-owner join/stop proof) and clears the record.
  */
 async function personStopCopybackOwnerUnjoined(db: Db, run: typeof heartbeatRuns.$inferSelect): Promise<boolean> {
-  const [row] = await db.select({ owner: sql<unknown>`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceFinalizationOwner'` })
+  const [row] = await db.select({ owner: sql<{ controllerBootId?: unknown } | null>`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceFinalizationOwner'` })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
-  return row?.owner !== null && row?.owner !== undefined;
+  // Join proof 1: the drain-complete record (the owner record is cleared only
+  // after the owner's action AND its host-mutation drain joined).
+  if (row?.owner === null || row?.owner === undefined) return false;
+  // Join proof 2: the owner PROCESS is proven dead: its controller instance
+  // stopped, or its liveness lease expired past the self-fence grace (a live
+  // process fences itself CONTROLLER_LEASE_SELF_FENCE_MS without renewal).
+  // Never the advisory-lock session, which can die while the process lives.
+  const bootId = typeof row.owner.controllerBootId === "string" ? row.owner.controllerBootId : null;
+  if (!bootId) return true;
+  const [dead] = await db.select({ bootId: controllerInstances.bootId }).from(controllerInstances).where(and(
+    eq(controllerInstances.bootId, bootId),
+    sql`(${controllerInstances.stoppedAt} is not null or ${controllerInstances.leaseExpiresAt} < now() - make_interval(secs => ${PERSON_STOP_OWNER_DEAD_GRACE_MS / 1000}))`)).limit(1);
+  return !dead;
+}
+
+/** adopt-stopu-fvc8b (F5): how long past the bound an unjoined copyback owner
+ * is waited for before the person is told (no separate successor path exists
+ * by line, so the fallback applies: ONE true note + Retry re-checks the join). */
+export const PERSON_STOP_OWNER_JOIN_CAP_MS = 5 * 60_000;
+/** Past the controller lease's expiry, the owner process is proven dead. */
+export const PERSON_STOP_OWNER_DEAD_GRACE_MS = 30_000; // = CONTROLLER_LEASE_FENCE_GRACE_MS (controller-instance-lease.ts)
+export const PERSON_STOP_OWNER_UNJOINED_LINE = "The stopped turn is still copying its files back to this computer. "
+  + "Your message waits so it can't overwrite your newer changes; press Retry to check again.";
+const PERSON_STOP_OWNER_UNJOINED_NOTE_KEY = "personStopOwnerUnjoinedNote";
+
+/** ONE true note at the cap (recorded once per lease; Retry re-runs the bound). */
+async function notePersonStopCopybackUnjoinedAtCap(db: Db, run: typeof heartbeatRuns.$inferSelect, leaseId: string) {
+  const marked = await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
+      || ${JSON.stringify({ [PERSON_STOP_OWNER_UNJOINED_NOTE_KEY]: { at: new Date().toISOString() } })}::jsonb` })
+    .where(and(eq(environmentLeases.id, leaseId),
+      sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? ${PERSON_STOP_OWNER_UNJOINED_NOTE_KEY})`))
+    .returning({ id: environmentLeases.id });
+  if (marked.length === 0) return;
+  const line = PERSON_STOP_OWNER_UNJOINED_LINE;
+  await appendHeartbeatRunEvent(db, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
+    eventType: "provider.notice.recorded", stream: "system", level: "warn", message: line,
+    payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "control_plane",
+      runId: run.id, eventType: "provider.notice.recorded", emittedAt: new Date().toISOString(),
+      payload: { schema: "paperclip.provider.notice.v1", severity: "warning", category: "person_stop_copyback_unjoined",
+        summary: line, message: line, action: "retry" } } } }).catch(() => undefined);
 }
 
 /**
@@ -225,12 +278,9 @@ export async function personStopExportPendingHoldsAdmission(db: Db,
     if (!lease.provider || lease.provider === "local" || !hasAcknowledgedNativeRunStopRequest(run)) continue;
     // adopt-stopu-compose4: at the bound the hold ends (rf-4 22:53Z); the
     // decision is durable on the lease.
-    if (readPersonStopBoundDecision(lease.metadata)) {
-      // adopt-stopu-fvc8 (Q-B): a decided bound still holds while the old
-      // copyback owner is unjoined (independent of the issue execution pointer).
-      if (run.runnerProfileJson?.nativeWorkspaceFinalizationOwner) return run.id;
-      continue;
-    }
+    // adopt-stopu-fvc8b (RFL 03:04Z liveness): the hold ENDS at the decision;
+    // the bound decides only with a join proof of the old copyback owner.
+    if (readPersonStopBoundDecision(lease.metadata)) continue;
     if (await nativeWorkspaceExportPendingForLease(db, lease, { destructive: false })) return run.id;
   }
   return null;

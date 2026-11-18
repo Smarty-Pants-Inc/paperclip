@@ -294,7 +294,7 @@ describe.skipIf(!support.supported)("adopt-stopu-compose6 (c): a late export of 
       expect(actual).toBe(newer);
     } finally { release(); await retry; commandGate = null; await f.heartbeat.drainActiveRunExecutions(); }
   }, 120_000);
-  it("Q-B: lost lock permits bound decision while timed-out old host rename is still draining", async () => {
+  it("supersedes(fvc8 Q-B bug-step assertions; RFL record SUPERSEDE-FVC8-QB-STEPS-1118) Q-B: after the lock loss, no decision and no admission until the old copyback owner joined; the successor's newer file survives", async () => {
     const f = await stoppedBox(Date.now() - PERSON_STOP_EXPORT_BOUND_MS - 1000);
     let arrived!: () => void; let release!: () => void;
     const entered = new Promise<void>(r => arrived = r), held = new Promise<void>(r => release = r);
@@ -318,12 +318,26 @@ describe.skipIf(!support.supported)("adopt-stopu-compose6 (c): a late export of 
       boxDelays.set(f.leaseId, [Infinity]);
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
       expect(run.runnerProfileJson?.nativeWorkspaceFinalizationOwner).toBeTruthy();
+      // Not vacuous: the export REACHED the host rename (the spy's record) BEFORE the lock-session kill above, and it is still pending.
+      const renameReachedBeforeKill = spy.mock.calls.filter(([, to]) => String(to) === path.join(f.hostCwd, "notes.md")).length;
+      const hostBeforeJoin = await fs.readFile(path.join(f.hostCwd, "notes.md"), "utf8");
+      console.log("FVC8_QB_ORDER", JSON.stringify({ renameReachedBeforeKill, lockSessionKilled: Number(locks[0].pid), hostBeforeJoinIsOld: hostBeforeJoin === f.oldContent }));
+      expect(renameReachedBeforeKill).toBe(1); expect(hostBeforeJoin).not.toBe(f.oldContent);
       const decision = await decidePersonStopExportAtBound({ db, environmentRuntime: {} as never, run, probeTimeoutMs: 25 });
-      expect(decision?.decision).toBe("without_files");
+      expect(decision).toBeNull(); // no join proof (owner record present, owner process alive), not at the cap
+      await f.pump(); expect(providerTurns).toHaveLength(0); // no admission
+      release(); // the old rename lands while nobody newer exists; the owner drains and joins
+      const joinBy = Date.now() + 20000;
+      while ((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].runnerProfileJson?.nativeWorkspaceFinalizationOwner && Date.now() < joinBy) await new Promise(r => setTimeout(r, 20));
+      const [joined] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(joined.runnerProfileJson?.nativeWorkspaceFinalizationOwner).toBeFalsy(); // the drain-complete record
+      const decisionAfterJoin = await decidePersonStopExportAtBound({ db, environmentRuntime: {} as never, run: joined, probeTimeoutMs: 25 });
       await f.pump();
       const successor = providerTurns[0]; expect(successor).toBeTruthy();
-      const newer = "NEW: without-files successor wrote after bound decision\n";
+      const newer = "NEW: successor wrote after the old copyback joined\n";
       await fs.writeFile(path.join(f.hostCwd, "notes.md"), newer);
+      await new Promise(r => setTimeout(r, 500));
+      console.log("FVC8_QB_JOINED", JSON.stringify({ decisionAfterJoin }));
       release();
       const end = Date.now() + 20000;
       while ((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].runnerProfileJson?.nativeWorkspaceFinalizationOwner && Date.now()<end) await new Promise(r => setTimeout(r, 20));

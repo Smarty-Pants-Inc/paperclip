@@ -8,7 +8,7 @@ import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import type { WorkspaceCheckpointMetrics } from "@paperclipai/adapter-utils/workspace-checkpoint";
 import type { RuntimeSpanRunner } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import fs from "node:fs/promises";
-import { hostCleanup, hostDeferredCleanup, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
+import { HostMutationRefusedError, hostCleanup, hostDeferredCleanup, hostMutation, withHostMutationGuard } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -1349,6 +1349,26 @@ export async function resumeNativeWorkspaceSync(input: {
     await hostMutation(() => fs.rm(asideDir, { recursive: true, force: true }));
     await hostMutation(() => fs.mkdir(asideDir, { recursive: true }));
   }
+  // adopt-stopu-fvc8b (Q-C TOCTOU), never-OK: the start check above and the
+  // successor's admission are not serialised, so a `same_box` export that
+  // starts toward the host re-checks the successor epoch at EACH host write:
+  // once a successor of this agent/task was admitted after the decision, every
+  // further host write is refused (the export stays unproven; the next retry
+  // saves the files aside), so the successor's newer files survive.
+  const sameBoxDecision = asideDir ? null : await personStopSameBoxDecisionFor(input.db, input.runId, existing.descriptor.binding.leaseId);
+  if (sameBoxDecision) {
+    return withHostMutationGuard(async () => {
+      if (await personStopSameBoxSuccessorAdmitted(input.db, input.runId, sameBoxDecision.decidedAt))
+        throw new HostMutationRefusedError("person_stop_same_box_successor_admitted");
+    }, () => finishResumedExport(input, target, existing, null, run));
+  }
+  return finishResumedExport(input, target, existing, asideDir, run);
+}
+
+async function finishResumedExport(input: Parameters<typeof resumeNativeWorkspaceSync>[0],
+  target: ReturnType<typeof abandonableTarget>,
+  existing: NonNullable<Awaited<ReturnType<typeof readDescriptor>>>,
+  asideDir: string | null, run: { companyId: string; agentId: string } | null): Promise<boolean> {
   const runtime = await prepareRuntime({
     runId: input.runId,
     target,
@@ -1413,6 +1433,14 @@ async function personStopWithoutFilesAsideDir(db: Db, runId: string, leaseId: st
   if (decision.decision === "without_files") return personStopAsideDirectory(runId);
   return decision.decision === "same_box" && await personStopSameBoxSuccessorAdmitted(db, runId, decision.decidedAt)
     ? personStopAsideDirectory(runId) : null;
+}
+
+/** adopt-stopu-fvc8b (Q-C): this run's `same_box` bound decision, if any. */
+async function personStopSameBoxDecisionFor(db: Db, runId: string, leaseId: string) {
+  const [lease] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
+    .where(eq(environmentLeases.id, leaseId)).limit(1);
+  const decision = readPersonStopBoundDecision(lease?.metadata);
+  return decision?.decision === "same_box" && decision.runId === runId ? decision : null;
 }
 
 /** adopt-stopu-fvc8 (Q-C): a later run of the same agent and task started after
