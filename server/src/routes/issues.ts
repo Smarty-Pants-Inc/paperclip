@@ -10481,7 +10481,10 @@ export function issueRoutes(
       if (timer) clearTimeout(timer);
       if (answeredInTime) admissionSettled = requestId;
     }
-    const presentation = await taskInterruptionPresentation(db, issue);
+    // Project the answer from the task as admission left it: the Retry may have
+    // waited on the issue lock while the task moved (to Backlog, closed or to
+    // another agent), and the pre-admission row would still offer Retry.
+    const presentation = await taskInterruptionPresentation(db, (await svc.getById(issue.id)) ?? issue);
     if (admissionSettled) refused = await Promise.resolve()
       .then(() => taskRetryRefusal(db, issue.companyId, admissionSettled!, presentation)).catch(err => {
         logger.warn({ err, issueId: issue.id }, "Task Retry admission state could not be read");
