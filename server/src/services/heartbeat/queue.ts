@@ -4884,6 +4884,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               return { kind: "coalesced" as const, run: activeExecutionRun };
             }
 
+            // A saved Send/delivery already owns its deferred wake: it waits there
+            // behind the active run, never in a second unmarked wake (dupwake).
+            if (executionWaitRequestId && (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId)
+              return { kind: "deferred" as const, admitted: true };
             const admissionScope = wakeQueue.createAdmissionTransactionScope(
               agent.companyId,
               tx as unknown as Db,
