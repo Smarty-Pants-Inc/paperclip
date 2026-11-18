@@ -19,6 +19,7 @@ import { createScheduledRetryCancellationRecovery } from "./scheduled-retry-canc
 import {
   PENDING_CLEANUP_ATTEMPTS_METADATA_KEY,
   PENDING_CLEANUP_SWEEP_ATTEMPT_CAP,
+  PERSON_STOP_CARD_ATTEMPTS,
   pendingCleanupAttemptsSql,
   pendingCleanupDeadlineSql,
   pendingCleanupMetadataObjectSql,
@@ -32,7 +33,11 @@ import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { listExpiredNativeRunnerAuthorities } from "../native-runtime/native-runner-checkpoint.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
-import { preserveCancelledNativeWorkspaces, preserveOrphanedNativeWorkspace } from "../native-runtime/native-failed-workspace-recovery.js";
+import { admittedNativeResourceDisposition, preserveCancelledNativeWorkspaces, preserveOrphanedNativeWorkspace } from "../native-runtime/native-failed-workspace-recovery.js";
+import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
+import { resumeNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
+import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
+import { finishCancelledWarmWorkspaceExport } from "./cancelled-warm-workspace-export.js";
 import { hasNativeWorkspaceExportResume } from "../native-runtime/native-workspace-export-resume.js";
 import { nativeWorkspaceExportPendingForLease, pendingNativeWorkspaceFinalizationCondition } from "../native-runtime/native-workspace-finalization-state.js";
 import { expireAbandonedWorkspaceFileHoldsWhenDue, parkAbandonedWorkspaceFilesLease, recordAbandonedWorkspaceFilesRemoved } from "../remote-workspace-abandoned-files-hold.js";
@@ -85,6 +90,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   environmentLeases,
+  environments,
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
@@ -114,6 +120,8 @@ import {
 import { performance } from "node:perf_hooks";
 import { buildProcessLossDiagnostic } from "../process-loss-diagnostics.js";
 import { logActivity, persistActivity } from "../activity-log.js";
+import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
+import { recheckPersonStopCleanupPending, recordPersonStopCleanupPending } from "../recovery/stop-pending.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { releaseRuntimeServicesForRun } from "../workspace-runtime.js";
@@ -1663,6 +1671,24 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       );
   }
 
+  // adopt-stopu r2 (row 20): the controller died after a person's run-only
+  // Stop of a warm (keep_running) turn was durably cancelled, before its
+  // cancel-finalize export and lease release; no deferral was saved. Do what
+  // its teardown would have done in U's shape: the same bounded cancel-finalize
+  // export (U1) from the still-running box, then upstream's stop_and_retain,
+  // never destroy. A finalized export leaves no prepared reference, so the
+  // release writes no preserve hold and the next message is admitted; an
+  // unproven export keeps today's preservation and its honest line.
+  async function crashedPersonStopRelease(run: typeof heartbeatRuns.$inferSelect,
+    lease: typeof environmentLeases.$inferSelect): Promise<ProviderResourceDisposition> {
+    if (run.status !== "cancelled" || !hasAcknowledgedNativeRunStopRequest(run)
+      || !["reuse_by_environment", "reuse_by_execution_workspace"].includes(lease.leasePolicy)
+      || admittedNativeResourceDisposition(run.runnerProfileJson) !== "keep_running") return "destroy";
+    // adopt-stopu-xpaths: the export now runs at the ONE release-site guard
+    // (run-control releaseEnvironmentLeasesForRun -> person-stop-release-export.ts).
+    return "stop_and_retain";
+  }
+
   async function retryTerminalRunLeaseRelease(lease: typeof environmentLeases.$inferSelect,
     localRuns: { has(runId: string): boolean }, onDeferredDeadline?: (at: number) => void): Promise<boolean> {
     if (!lease.heartbeatRunId || localRuns.has(lease.heartbeatRunId)) return false;
@@ -1672,9 +1698,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       onDeferredDeadline?.(dueAt);
       return false;
     }
-    const [run] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
-      status: heartbeatRuns.status, error: heartbeatRuns.error, runtimeMode: heartbeatRuns.runtimeMode,
-      controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt })
+    const [run] = await db.select()
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, lease.companyId)));
     if (!run || !HEARTBEAT_RUN_TERMINAL_STATUSES.some(status => status === run.status)) return false;
     if (!deferral && !(run.runtimeMode === "native" && run.status === "cancelled")) return false;
@@ -1688,7 +1712,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     }
     await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId, agentId: run.agentId,
       status: run.status, failureReason: run.error ?? undefined,
-      providerResourceDisposition: deferral ? deferral.providerResourceDisposition ?? undefined : "destroy" });
+      providerResourceDisposition: deferral ? deferral.providerResourceDisposition ?? undefined
+        : await crashedPersonStopRelease(run, lease) });
     const [after] = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata })
       .from(environmentLeases).where(eq(environmentLeases.id, lease.id));
     if (after?.status !== "active") return true;
@@ -2004,6 +2029,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       }, 30_000);
       renewal.unref();
 
+      const destroyedBefore = destroyed;
       try {
         if (opts?.explicitRetry) await logActivity(db, {
           companyId: row.companyId, actorType: "user", actorId: opts.explicitRetry.actorId,
@@ -2120,6 +2146,17 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       }).where(and(eq(environmentLeases.id, lease.id),
         sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${claimed}`)), { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
       if (lease.heartbeatRunId) {
+        // adopt-stopu-bound2: a person's Stop whose box still has no stop
+        // receipt after this retry gets the existing Stop-pending card (never
+        // an unbounded hold); a retry that settles retires it before resume.
+        // adopt-stopu-card2: the writer itself waits for the ONE person's-Stop bound
+        // (personStopCardBoundAt) that the recovery sweep's deferral also reads.
+        await (async () => {
+          const stopped = await getRun(lease.heartbeatRunId!);
+          if (!stopped || !hasAcknowledgedNativeStopIntent(stopped)) return;
+          if (destroyed > destroyedBefore) await recheckPersonStopCleanupPending(db, stopped);
+          else if (attempts + 1 >= PERSON_STOP_CARD_ATTEMPTS) await recordPersonStopCleanupPending(db, stopped);
+        })().catch(() => logger.warn({ leaseId: lease.id }, "could not record the person's Stop-pending card"));
         // Delivery failure must not revert successful provider cleanup. A new
         // message can still use the persisted receipt on its next admission.
         await (async () => {

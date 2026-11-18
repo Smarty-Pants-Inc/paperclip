@@ -183,6 +183,17 @@ function click(element: Element | null) {
 }
 
 describe("RunWorkspaceRecoverySurface", () => {
+  it("agent run page: a person's Stop is not a workspace recovery and renders no escalated card", async () => {
+    const action: IssueRecoveryAction = { ...buildRecoveryAction(), kind: "active_run_watchdog",
+      cause: "execution_stop_pending", status: "escalated", evidence: { stopPending: { personStop: true } } };
+    issueGetMock.mockResolvedValue(buildIssue(action));
+    recoveryActionsMock.mockResolvedValue({ active: action, actions: [action] });
+    const node = await renderSurface(buildRun({ status: "cancelled", errorCode: "cancelled" }));
+    expect(node.textContent).toBe("");
+    expect(issueGetMock).not.toHaveBeenCalled();
+    expect(recoveryActionsMock).not.toHaveBeenCalled();
+  });
+
   it("inspects a selected resolved source only on request and separates current identity from the recorded failure", async () => {
     const action = { ...buildRecoveryAction(), status: "resolved", cause: "native_workspace_sync_out_retry_exhausted",
       evidence: { systemRecovery: { failure: { code: "source_binding_invalid" } } } };

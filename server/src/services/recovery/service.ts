@@ -118,11 +118,12 @@ import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
+import { readStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
 import { isCancelledNativeStartup } from "../cancelled-native-startup.js";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
-import { clearTaskStopPending, hasRecordedStopRequest, hasTaskStopPending, recheckTaskStopPending, recordTaskStopPending } from "./stop-pending.js";
+import { clearTaskStopPending, hasRecordedStopRequest, hasTaskStopPending, isPersonStop, personStopCardBoundAt, recheckTaskStopPending, recordTaskStopPending } from "./stop-pending.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
@@ -4281,10 +4282,9 @@ export function recoveryService(
     });
   }
 
-  /** Caller-side grace, NOT Stop proof. All terminal outcomes qualify only
-   * without a recorded request and with leases as the sole blockers. Both
-   * claims remain held. The existing worker reconstructs every 30s (work.ts);
-   * five minutes is at least one tick and is measured per lease, never per run. */
+  /** Caller-side grace, NOT Stop proof. Ordinary terminal cleanup has no Stop
+   * request; U's acknowledged person Stop requires its own bound stop-only intent.
+   * Both claims remain held. The existing worker reconstructs every 30s (work.ts). */
   async function onlyUnreleasedLeasesWithinBoundBlockStop(tx: Db,
     issue: Pick<RecoveryIssue, "id" | "companyId" | "status" | "cancelledAt">, ownerRunIds: string[],
     onDeferredDeadline?: (at: number) => void) {
@@ -4292,8 +4292,9 @@ export function recoveryService(
     const runs = await tx.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, ownerRunIds),
     ));
+    const personStops = new Map(runs.filter(isPersonStop).map(run => [run.id, run]));
     if (runs.length !== ownerRunIds.length || runs.some(run =>
-      !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) || hasRecordedStopRequest(run))) return false;
+      !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) || (hasRecordedStopRequest(run) && !personStops.has(run.id)))) return false;
     const leases = await tx.select().from(environmentLeases).where(and(
       eq(environmentLeases.companyId, issue.companyId), inArray(environmentLeases.heartbeatRunId, ownerRunIds),
     ));
@@ -4303,8 +4304,38 @@ export function recoveryService(
       lease.status === "pending_cleanup" || lease.cleanupStatus === "failed");
     if (!blockers.length) return false;
     const now = Date.now();
+    // U writes no retained-idle receipt. Grace ends at the ONE person's-Stop card
+    // bound (personStopCardBoundAt: PERSON_STOP_CARD_AFTER_MS from
+    // nativeCancellation.recordedAt), never a renewable cleanup lease/updatedAt.
+    // The cleanup retry's card writer reads the same bound (stop-pending.ts).
+    const personStopDeadline = (lease: typeof environmentLeases.$inferSelect): number | null => {
+      const run = lease.heartbeatRunId && personStops.get(lease.heartbeatRunId);
+      const bound = run ? personStopCardBoundAt(run, now) : null;
+      if (bound === null || !lease.provider || lease.provider === "local") return null;
+      let deadline = bound;
+      if (lease.status === "pending_cleanup") {
+        // Its stop-only request is bound to the exact remote allocation by the existing reader.
+        if (parseObject(lease.metadata?.sandboxStopAndRetain).schema !== "paperclip.sandbox-stop-and-retain.v1"
+          || !readStopOnlyCleanup(lease)) return null;
+        const claim = lease.metadata?.pendingCleanupLeaseExpiresAtMs;
+        if (lease.metadata?.pendingCleanupInFlight === true)
+          deadline = typeof claim === "number" && Number.isFinite(claim) ? Math.min(bound, claim) : NaN;
+      } else if (lease.status !== "active" || lease.releasedAt) {
+        return null;
+      }
+      // adopt-stopu-card2, live gate 4 (card 56bcdc6a, 3.7 s after the Stop): before the
+      // stop_and_retain release the person's Stop is still in flight on an unreleased
+      // active lease (cancel-finalize export first). That is the same Stop, same bound.
+      return Number.isFinite(deadline) && now < deadline ? deadline : null;
+    };
     let next = now + 30_000;
     for (const lease of blockers) {
+      if (lease.heartbeatRunId && personStops.has(lease.heartbeatRunId)) {
+        const deadline = personStopDeadline(lease);
+        if (deadline === null) return false;
+        next = Math.min(next, deadline);
+        continue;
+      }
       const deferral = parseObject(lease.metadata?.releaseDeferral);
       if (lease.metadata?.releaseDeferral !== undefined && !(deferral.reason === "release_failed" || (deferral.reason === "release_skipped" && lease.status === "active"))) return false;
       let expiry = lease.expiresAt?.getTime();
@@ -4327,15 +4358,19 @@ export function recoveryService(
     const leaseRunIds = new Set(blockers.map(lease => lease.heartbeatRunId!));
     // The guard returns its lease blocker first. Inspect independent owners
     // too, without weakening that guard or settling a finalizer under run locks.
-    if (runs.some(run => leaseRunIds.has(run.id) && run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt.getTime() > now)) return false;
+    // A person's Stop inside its bound (every lease passed personStopDeadline above) is
+    // carried out by these owners (controller, cancel-finalize export): not a reason to card.
+    if (runs.some(run => leaseRunIds.has(run.id) && !personStops.has(run.id)
+      && run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt.getTime() > now)) return false;
     const coordinators = await tx.select().from(nativeRunFinalizations).where(
       inArray(nativeRunFinalizations.runId, [...leaseRunIds]));
-    if (coordinators.some(row => row.leaseOwner)) return false;
+    if (coordinators.some(row => row.leaseOwner && !personStops.has(row.runId))) return false;
     for (const run of runs.filter(run => leaseRunIds.has(run.id))) {
       const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
       if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
         // Lease cleanup masks this independent blocker in the shared guard.
-        if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return false;
+        if (run.status === "cancelled" && !runLeases.every(lease => hasRemoteTerminationReceipt(lease)
+          || personStopDeadline(lease) !== null)) return false;
         continue;
       }
       const processProof = await proveRunProcessGone(run, "recovery_lease_release_pending");

@@ -114,6 +114,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { personStopExportPendingHoldsAdmission } from "./person-stop-release-export.js";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -1216,6 +1217,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         logger.info({ runId: run.id, agentId: run.agentId, companyId: run.companyId, issueId,
           reason: "predecessor_settling_in_process", predecessorRunId: settlingOwner.id },
         "claimQueuedRun: queued run declined at the issue execution claim");
+        return null;
+      }
+    }
+    if (issueId && !run.startedAt && agent.adapterType === "paperclip_runner") {
+      // adopt-stopu-xpaths (F10): never admit the next message while a stopped
+      // box still holds the only copy of the edit (durable, survives restarts).
+      const exportOwner = await personStopExportPendingHoldsAdmission(db, { companyId: run.companyId, agentId: run.agentId, issueId });
+      if (exportOwner) {
+        logger.info({ runId: run.id, agentId: run.agentId, companyId: run.companyId, issueId,
+          reason: "person_stop_export_pending", predecessorRunId: exportOwner },
+        "claimQueuedRun: queued run kept queued until the stopped box's files are exported");
         return null;
       }
     }

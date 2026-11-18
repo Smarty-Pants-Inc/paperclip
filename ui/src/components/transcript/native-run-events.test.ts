@@ -1540,3 +1540,25 @@ describe("an OpenCode reply settled from an answer and a closing line", () => {
     expect(JSON.stringify(timeline)).not.toContain("Two inbox items need you");
   });
 });
+
+describe("pl/cancel-finalize2: a Stop's unproven workspace export is visible", () => {
+  it("renders the helper's real rows as ONE transcript entry carrying the honest words", () => {
+    // Pinned to the rows finishCancelledWarmWorkspaceExport writes by
+    // server/src/services/cancel-finalize-warm-stop.test.ts.
+    const fixture = JSON.parse(readFileSync(
+      new URL("./fixtures/cancelled-warm-export-deferred.json", import.meta.url),
+      "utf8",
+    )) as { run: { id: string }; events: HeartbeatRunEvent[] };
+    const entries = nativeRunEventsToTranscript(fixture.events);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ kind: "provider_activity", family: "provider_notice" });
+    const shown = JSON.stringify(entries[0]);
+    // pl/cancel-finalize4: only what is known (not confirmed; the box is kept), and
+    // no action this state does not have (it creates no recovery action, so there
+    // is no "Recover saved files" button to name).
+    expect(shown).toContain("could not be confirmed in time (export_failed)");
+    expect(shown).toContain("The box is kept, so nothing on it is lost.");
+    expect(shown).not.toContain("Recover saved files");
+    expect(shown).not.toContain("not yet on the host");
+  });
+});

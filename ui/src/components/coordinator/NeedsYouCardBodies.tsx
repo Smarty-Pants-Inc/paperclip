@@ -136,7 +136,8 @@ const RECOVERY_KIND_LABELS: Record<string, string> = {
  */
 export function RecoveryCardBody({ item, leading, footerContext, onOpen }: NeedsYouCardBodyProps) {
   const kind = metadataString(item, "kind");
-  const title = [
+  const personStop = item.subject.metadata?.personStop === true;
+  const title = personStop ? "Stop pending" : [
     kind ? RECOVERY_KIND_LABELS[kind] ?? `${kind[0]!.toUpperCase()}${kind.slice(1).replaceAll("_", " ")}` : "Recovery",
     item.subject.status === "escalated" ? "Recovery escalated" : "Recovery paused",
   ].join(" · ");
@@ -145,7 +146,9 @@ export function RecoveryCardBody({ item, leading, footerContext, onOpen }: Needs
     <NeedsYouPanel>
       <NeedsYouPanelRow icon={<TriangleAlert className="text-amber-600 dark:text-amber-300" />} title={title} />
       {/* The ask above is the recovery's next action; this says where it is done. */}
-      <NeedsYouPanelNote>Resolve, reassign or cancel it in the recovery control on the task.</NeedsYouPanelNote>
+      <NeedsYouPanelNote>{personStop
+        ? "This card closes by itself once the stop is confirmed."
+        : "Resolve, reassign or cancel it in the recovery control on the task."}</NeedsYouPanelNote>
     </NeedsYouPanel>
     {footerContext}
     <DecisionCardFooter leading={leading}>

@@ -2106,6 +2106,11 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         if (!sourceIssue) continue;
         const recoveryIssue = recovery.recoveryIssueId ? recoveryIssueMap.get(recovery.recoveryIssueId) ?? null : null;
         const dedupKey = `recovery:${recovery.kind}:${recovery.sourceIssueId}:${recovery.cause}:${recovery.fingerprint}`;
+        // Project the same stored signal as the task's recovery card, not a guess
+        // from its cause/status (non-person stops may share both).
+        const stopPending = recovery.evidence.stopPending;
+        const personStop = stopPending !== null && typeof stopPending === "object" &&
+          !Array.isArray(stopPending) && "personStop" in stopPending && stopPending.personStop === true;
         add(createItem({
           companyId,
           sourceKind: "recovery_action",
@@ -2124,11 +2129,13 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
               ownerUserId: recovery.ownerUserId,
               sourceIssueId: recovery.sourceIssueId,
               recoveryIssueId: recovery.recoveryIssueId,
+              personStop,
             },
           },
-          whyNow: recovery.status === "escalated"
-            ? "Recovery action escalated to a human owner."
-            : "Recovery action is assigned to a human owner.",
+          whyNow: personStop ? "Your Stop is not confirmed yet."
+            : recovery.status === "escalated"
+              ? "Recovery action escalated to a human owner."
+              : "Recovery action is assigned to a human owner.",
           // PAP-749 Rule 7: resolving, reassigning or cancelling a recovery
           // also sets the task's next status, so the card links to the recovery
           // control on the task instead of offering verbs it cannot complete.

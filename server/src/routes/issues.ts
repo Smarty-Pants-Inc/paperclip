@@ -1,3 +1,4 @@
+import { personStopHoldsSavedWake } from "../services/person-stop-held-input.js";
 import { createServerAcceptedPlanDecompositionSchema } from "../services/plan-decomposition-limit.js";
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../services/agent-interaction-delivery.js";
@@ -7868,7 +7869,9 @@ export function issueRoutes(
     // The user's Interrupt click is delivering these messages. Its stopped run
     // settling is not something to read about under the composer; the task
     // notice owns any wait that needs the user.
-    const interruptHandoff = queueState?.state === "deferred" && readObject(wake?.payload).queuedCommentInterrupt != null;
+    // adopt-stopu-bound2: a Send held by the Stop-pending card is not "Sending".
+    const interruptHandoff = queueState?.state === "deferred" && readObject(wake?.payload).queuedCommentInterrupt != null
+      && wait.reason !== "execution_stop_pending";
     const queue = buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
       executionWait: interruptHandoff ? QUEUED_INTERRUPT_HANDOFF_WAIT
@@ -7883,6 +7886,14 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
+    if (wake && queueState?.state === "deferred" && !queue.executionWait && comments.length > 0 &&
+        input.issue.conversationAgentId && input.issue.conversationAgentId === input.issue.assigneeAgentId &&
+        !queuedInteractionId(wake.payload) &&
+        await personStopHoldsSavedWake(input.executor as unknown as Db, wake, input.issue.id)) {
+      // adopt-stopu-card6: also while (or after) a new message's successor runs,
+      // the messages from before the person's Stop wait for Send: keep its line.
+      queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+    }
     if (wake && queueState?.state === "deferred" && !input.activeRun && !queue.executionWait && comments.length > 0 &&
         input.issue.conversationAgentId && input.issue.conversationAgentId === input.issue.assigneeAgentId &&
         !queuedInteractionId(wake.payload)) {

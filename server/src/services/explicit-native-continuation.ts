@@ -1,4 +1,5 @@
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
+import { personStopPendingLine } from "./recovery/stop-pending.js";
 import { agentDirectoryPreparationWaitPredicate, isAgentDirectoryPreparationWait } from "./pre-dispatch-execution-evidence.js";
 import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
@@ -570,7 +571,13 @@ export async function admitExplicitNativeContinuation(input: {
     const remote = leases.some(lease => lease.provider !== "local");
     if (remote) {
       // Never interpret remote PIDs using the control-plane host's process table.
-      if (!leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      if (!leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) {
+        // adopt-stopu-bound2: once the Stop-pending card is raised for this run
+        // (recovery.ts cleanup retry), the person reads its true line, not a promise.
+        const stopPendingLine = await personStopPendingLine(db, { companyId, issueId, runId: run.id });
+        return stopPendingLine ? blocked("execution_stop_pending", stopPendingLine)
+          : blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      }
       if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
       }))) return refused("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");

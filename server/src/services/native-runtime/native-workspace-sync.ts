@@ -8,10 +8,13 @@ import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import type { WorkspaceCheckpointMetrics } from "@paperclipai/adapter-utils/workspace-checkpoint";
 import type { RuntimeSpanRunner } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import fs from "node:fs/promises";
+import { hostCleanup, hostDeferredCleanup, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
+import { personStopKeptBoxForSuccessor, readPersonStopBoundDecision } from "../heartbeat/person-stop-export-bound.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import type { Db } from "@paperclipai/db";
 import { environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import { retryUnlessTransactionBound } from "../transaction-retry.js";
@@ -99,7 +102,10 @@ export interface NativeWorkspaceSyncReference {
 export interface PreparedNativeWorkspaceSync {
   mode: WorkspaceInboundMode;
   reference: NativeWorkspaceSyncReference;
-  restoreWorkspace(assertOwnership?: () => Promise<void>): Promise<void>;
+  /** `signal` (pl/cancel-finalize2): once aborted, no further remote command,
+   * stamp or finalized descriptor is written; a copyback already in flight
+   * that joins later writes nothing. */
+  restoreWorkspace(assertOwnership?: () => Promise<void>, options?: { signal?: AbortSignal }): Promise<void>;
   cleanup(): Promise<void>;
 }
 
@@ -247,7 +253,7 @@ async function verifiedDurableSeed(input: {
 }
 
 async function ensurePrivateDirectory(dir: string): Promise<void> {
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await hostMutation(() => fs.mkdir(dir, { recursive: true, mode: 0o700 }));
   const stat = await fs.lstat(dir);
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error("native_workspace_sync_state_root_invalid");
@@ -282,13 +288,15 @@ async function writeDescriptor(
     throw new Error("native_workspace_sync_descriptor_digest_collision");
   }
   const tempPath = path.join(dir, `${DESCRIPTOR_NAME}.${randomUUID()}.tmp`);
+  // adopt-drain4: registered with the owner's drain before it is created.
+  const removeTemp = hostDeferredCleanup(() => hostCleanup(() => fs.rm(tempPath, { force: true }).catch(() => undefined)));
   try {
     if (existingBody === null) {
-      await fs.writeFile(tempPath, body, { encoding: "utf8", mode: 0o600 });
-      await fs.rename(tempPath, finalPath);
+      await hostMutation(() => fs.writeFile(tempPath, body, { encoding: "utf8", mode: 0o600 }));
+      await hostMutation(() => fs.rename(tempPath, finalPath));
     }
   } finally {
-    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    await removeTemp();
   }
   return {
     schema: descriptor.schema,
@@ -398,18 +406,20 @@ async function persistSnapshotManifests(runId: string, snapshot: NonNullable<Pre
     // A shared reference may already have been updated by the baseline.
     if (path.dirname(oldPath) === descriptorDirectory(runId)) continue;
     const temporary = path.join(descriptorDirectory(runId), `manifest.${randomUUID()}.tmp`);
+    // adopt-drain4: registered with the owner's drain before it is created.
+    const removeTemporary = hostDeferredCleanup(() => hostCleanup(() => fs.rm(temporary, { force: true })));
     try {
       const sourceStat = await fs.lstat(oldPath);
       if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("native_workspace_sync_manifest_invalid");
       assertWorkspaceManifestDiskSpace(descriptorDirectory(runId), sourceStat.size);
-      await fs.copyFile(oldPath, temporary);
-      await fs.chmod(temporary, 0o600);
+      await hostMutation(() => fs.copyFile(oldPath, temporary));
+      await hostMutation(() => fs.chmod(temporary, 0o600));
       const digest = await manifestFileSha256(temporary);
       const target = path.join(descriptorDirectory(runId), `manifest.${digest}.sqlite`);
-      await fs.rename(temporary, target);
+      await hostMutation(() => fs.rename(temporary, target));
       copies.set(oldPath, target);
       manifest.filePath = target;
-    } finally { await fs.rm(temporary, { force: true }); }
+    } finally { await removeTemporary(); }
   }
   // Ownership tracks original scratch directories, never the new durable path.
   await disposeDirectorySnapshot(snapshot.baseline);
@@ -682,6 +692,37 @@ function providerLeaseIdFor(input: {
   return providerLeaseId;
 }
 
+/** pl/cancel-finalize3: the copyback's remote commands run through this runner.
+ * Once the export's signal is aborted (its deadline passed and its ownership was
+ * released), a command is not started, and a command that joins late fails
+ * before its result reaches the copyback's host-side steps (download, Git
+ * import, merge into the host workspace): an abandoned export writes nothing
+ * more to the host. Without a signal it is the runner unchanged. */
+function abandonableTarget(
+  target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>,
+  signal: () => AbortSignal | undefined,
+): Extract<AdapterExecutionTarget, { transport: "sandbox" }> {
+  const runner = target.runner;
+  if (!runner) return target;
+  // execute, and the provider-native file copies (syncOut/syncIn), are fenced;
+  // every other member is the runner's own, bound to it.
+  const fencedMembers = new Set<PropertyKey>(["execute", "syncOut", "syncIn"]);
+  const fenced = new Proxy(runner, {
+    get(base, property) {
+      const value = Reflect.get(base, property, base);
+      if (typeof value !== "function") return value;
+      if (!fencedMembers.has(property)) return value.bind(base);
+      return async (...args: unknown[]) => {
+        signal()?.throwIfAborted();
+        const result = await value.apply(base, args);
+        signal()?.throwIfAborted();
+        return result;
+      };
+    },
+  });
+  return { ...target, runner: fenced };
+}
+
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
@@ -689,6 +730,10 @@ function shellQuote(value: string): string {
 async function writeRemoteStamp(input: {
   target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>;
   stamp: Record<string, unknown>;
+  /** pl/cancel-finalize2: when given, the stamp is written in two commands and
+   * this re-check runs AFTER the payload write returns and BEFORE the stamp is
+   * published (mv): a payload write held past the deadline publishes nothing. */
+  beforePublish?: () => Promise<void>;
 }): Promise<void> {
   if (!input.target.runner) {
     throw new Error("native_workspace_sync_runner_missing");
@@ -704,19 +749,27 @@ async function writeRemoteStamp(input: {
     `${canonicalJson(input.stamp)}\n`,
     "utf8",
   ).toString("base64");
-  const result = await input.target.runner.execute({
-    command: input.target.shellCommand ?? "sh",
-    args: [
-      "-c",
-      `umask 077; mkdir -p ${shellQuote(runtimeDir)} && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(tempPath)} && mv ${shellQuote(tempPath)} ${shellQuote(stampPath)}`,
-    ],
-    cwd: "/",
-    timeoutMs: 15_000,
-    bypassSession: true,
-  });
-  if (result.timedOut || result.exitCode !== 0) {
-    throw new Error("native_workspace_sync_remote_stamp_failed");
+  const write = `umask 077; mkdir -p ${shellQuote(runtimeDir)} && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(tempPath)}`;
+  const publish = `mv ${shellQuote(tempPath)} ${shellQuote(stampPath)}`;
+  const run = async (script: string) => {
+    const result = await input.target.runner!.execute({
+      command: input.target.shellCommand ?? "sh",
+      args: ["-c", script],
+      cwd: "/",
+      timeoutMs: 15_000,
+      bypassSession: true,
+    });
+    if (result.timedOut || result.exitCode !== 0) {
+      throw new Error("native_workspace_sync_remote_stamp_failed");
+    }
+  };
+  if (!input.beforePublish) {
+    await run(`${write} && ${publish}`);
+    return;
   }
+  await run(write);
+  await input.beforePublish();
+  await run(publish);
 }
 
 async function remoteStampMatches(input: {
@@ -856,17 +909,34 @@ async function finalizePreparedRuntime(input: {
   runtime: PreparedAdapterExecutionTargetRuntime;
   descriptor: NativeWorkspaceSyncDescriptor;
   assertOwnership?: () => Promise<void>;
+  signal?: AbortSignal;
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
+  /** adopt-stopu-compose6 (c): the directory the copyback was merged into, when
+   * it is not the descriptor's host workspace (the person-Stop aside directory). */
+  localDir?: string;
 }): Promise<NativeWorkspaceSyncReference> {
-  if (input.onPhase) await input.onPhase("workspace.restore", () => input.runtime.restoreWorkspace());
-  else await input.runtime.restoreWorkspace();
-  return measureRunPhase("execution.workspace_commit", async () => {
+  // Ownership (and the caller's deadline) is re-checked AFTER every remote or
+  // long step, immediately before the next write: a held command that joins
+  // after the deadline must not lead to a remote stamp or a finalized descriptor.
+  const stillOwned = async () => {
+    input.signal?.throwIfAborted();
     await input.assertOwnership?.();
+    input.signal?.throwIfAborted();
+  };
+  input.signal?.throwIfAborted();
+  // The same signal reaches the LOCAL restore (extraction + host merge): it is
+  // checked after the host merge-lock wait and before every host mutation, so
+  // an abandoned restore cannot overwrite the next owner's workspace.
+  const restoreOptions = input.signal ? { signal: input.signal } : undefined;
+  if (input.onPhase) await input.onPhase("workspace.restore", () => input.runtime.restoreWorkspace(undefined, restoreOptions));
+  else await input.runtime.restoreWorkspace(undefined, restoreOptions);
+  return measureRunPhase("execution.workspace_commit", async () => {
+    await stillOwned();
     const finalSnapshot =
       await import("@paperclipai/adapter-utils/workspace-restore-merge").then(
         ({ captureDirectorySnapshotOffThread: captureDirectorySnapshot }) =>
-          captureDirectorySnapshot(input.descriptor.binding.localCwd, {
+          captureDirectorySnapshot(input.localDir ?? input.descriptor.binding.localCwd, {
             exclude: input.runtime.workspaceSyncSnapshot?.baseline.exclude ?? [],
             ignoredPaths: input.runtime.workspaceSyncSnapshot?.baseline.ignoredPaths,
             diskBacked: true,
@@ -878,16 +948,20 @@ async function finalizePreparedRuntime(input: {
       descriptor: input.descriptor,
       hostSha256: finalHostSha256,
     });
-    await writeRemoteStamp({ target: input.target, stamp });
+    // After the copyback and the host snapshot, before the remote stamp.
+    await stillOwned();
+    await writeRemoteStamp({ target: input.target, stamp, beforePublish: input.signal ? stillOwned : undefined });
     const finalizedDescriptor: NativeWorkspaceSyncDescriptor = {
       ...input.descriptor,
       state: "finalized",
       finalizedAt: new Date().toISOString(),
       finalHostSha256,
     };
-    await input.assertOwnership?.();
+    await stillOwned();
     const reference = await writeDescriptor(finalizedDescriptor);
+    input.signal?.throwIfAborted();
     await persistRunReference(input.db, input.runId, reference);
+    input.signal?.throwIfAborted();
     await persistLeaseStamp({
       db: input.db,
       leaseId: input.descriptor.binding.leaseId,
@@ -916,7 +990,8 @@ export async function prepareNativeWorkspaceSync(input: {
   if (input.target?.kind !== "remote" || input.target.transport !== "sandbox" || input.target.runnerTask) {
     return null;
   }
-  const target = input.target;
+  let exportSignal: AbortSignal | undefined;
+  const target = abandonableTarget(input.target, () => exportSignal);
   const providerLeaseId = providerLeaseIdFor({ target, lease: input.lease });
   // Reattachment may never seed a replacement sandbox over a still-live run.
   if (input.restartRecovery?.kind === "reattach_remote_runner") {
@@ -942,6 +1017,7 @@ export async function prepareNativeWorkspaceSync(input: {
   let descriptor: NativeWorkspaceSyncDescriptor;
   let mode: WorkspaceInboundMode = "host_current";
   let reuseReason: StartupReuseReason = "created";
+  let keptPersonStopBox: ReturnType<typeof personStopKeptBoxForSuccessor> = null;
   const seedPaths = durableSeedPaths(input.runId);
   await measureRunPhase("workspace_sync.descriptor_directory", () => ensureRunDirectory(input.runId));
 
@@ -1011,7 +1087,13 @@ export async function prepareNativeWorkspaceSync(input: {
       providerLeaseId,
       remoteCwd: target.remoteCwd,
     });
-    mode = classifyNativeWorkspaceInbound({
+    // adopt-stopu-compose4 (rf-4 22:53Z FIRST choice): the successor of a kept
+    // person-Stop box (same_box at the bound) adopts the box's files in place:
+    // the stopped turn's unexported edit is there; staging the host copy over it
+    // would lose it. Its own export later carries the edit to the host.
+    keptPersonStopBox = acquisition === "resumed"
+      ? personStopKeptBoxForSuccessor({ providerLeaseId, metadata: input.lease.metadata as Record<string, unknown> | null }) : null;
+    mode = keptPersonStopBox ? "adopt_remote" : classifyNativeWorkspaceInbound({
       kind: "new_run",
       acquisition,
       hasPriorStamp: priorStamp !== null,
@@ -1043,7 +1125,7 @@ export async function prepareNativeWorkspaceSync(input: {
     let gitArchiveSha256 = currentSnapshot.gitSnapshot || currentSnapshot.repositories?.length
       ? await sha256File(seedPaths.gitArchivePath)
       : null;
-    if (acquisition === "resumed" && priorStamp) {
+    if (acquisition === "resumed" && priorStamp && !keptPersonStopBox) {
       const currentHostSha256 = directorySnapshotSha256(
         currentSnapshot.baseline,
       );
@@ -1116,6 +1198,17 @@ export async function prepareNativeWorkspaceSync(input: {
   const preparedRuntime = runtime;
   let reference = await measureRunPhase("workspace_sync.descriptor_write", () => writeDescriptor(descriptor));
   await measureRunPhase("workspace_sync.reference_write", () => persistRunReference(input.db, input.runId, reference));
+  if (keptPersonStopBox && keptPersonStopBox.runId !== input.runId) {
+    // The stopped turn's files now belong to this run's workspace (adopted in
+    // place); its own prepared descriptor no longer names an owed export.
+    await input.db.update(heartbeatRuns).set({ runnerProfileJson: sql`(${heartbeatRuns.runnerProfileJson} - 'nativeWorkspaceSync')
+      || jsonb_build_object('nativeWorkspaceSyncAdoptedBySuccessor', ${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync',
+        'nativeCancelledWarmExport', jsonb_build_object('state', 'adopted_by_successor', 'successorRunId', ${input.runId}::text,
+          'at', ${new Date().toISOString()}::text))` })
+      .where(and(eq(heartbeatRuns.id, keptPersonStopBox.runId), eq(heartbeatRuns.companyId, input.companyId),
+        sql`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'->>'state' = 'prepared'`,
+        sql`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'->>'providerLeaseId' = ${keptPersonStopBox.providerLeaseId}::text`));
+  }
   await emitStartupReuse(input.onEvent, "workspace", {
     state: mode === "adopt_remote" ? "reused" : "fresh",
     reason: reuseReason,
@@ -1126,8 +1219,9 @@ export async function prepareNativeWorkspaceSync(input: {
     get reference() {
       return reference;
     },
-    restoreWorkspace: async (assertOwnership) => {
+    restoreWorkspace: async (assertOwnership, options) => {
       if (!restorePromise) {
+        exportSignal = options?.signal;
         restorePromise = finalizePreparedRuntime({
           db: input.db,
           runId: input.runId,
@@ -1135,6 +1229,7 @@ export async function prepareNativeWorkspaceSync(input: {
           runtime: preparedRuntime,
           descriptor,
           assertOwnership,
+          signal: options?.signal,
           onPhase: input.onPhase,
           onCheckpoint: input.onCheckpoint,
         })
@@ -1184,14 +1279,18 @@ export async function resumeNativeWorkspaceSync(input: {
   runId: string;
   target: AdapterExecutionTarget;
   assertOwnership?: () => Promise<void>;
+  /** pl/lockloss: the finalization ownership's `lost` signal; once aborted the
+   * copyback writes nothing more (the same fence as a cancelled export). */
+  signal?: AbortSignal;
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
 }): Promise<boolean> {
   if (input.target.kind !== "remote" || input.target.transport !== "sandbox") {
     throw new Error("workspace_sync_out_unrecoverable");
   }
+  const target = abandonableTarget(input.target, () => input.signal);
   const run = await input.db
-    .select({ companyId: heartbeatRuns.companyId, runnerProfileJson: heartbeatRuns.runnerProfileJson })
+    .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, runnerProfileJson: heartbeatRuns.runnerProfileJson })
     .from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, input.runId))
     .limit(1)
@@ -1233,32 +1332,83 @@ export async function resumeNativeWorkspaceSync(input: {
     });
     return true;
   }
+  input.signal?.throwIfAborted();
+  // adopt-stopu-compose6 (c), never-OK: once a person's Stop was decided
+  // `without_files` at the bound, a successor has run WITHOUT these files and
+  // owns the host workspace. A late export of the stopped box must never merge
+  // over it (the baseline merge copies every path the box changed, including a
+  // path the successor changed since). The decision is written only under this
+  // run's finalization lock (person-stop-release-export.ts), and every caller
+  // here holds that lock, so the read below cannot race it. The old files go
+  // to a separate directory instead, with ONE true line.
+  const asideDir = await personStopWithoutFilesAsideDir(input.db, input.runId, existing.descriptor.binding.leaseId);
+  if (asideDir) {
+    // adopt-stopu-compose8 (drain): the saved-aside directory is a host write
+    // like any other, so it goes through the owner's drain (refused once the
+    // drain closed; awaited before ownership is released).
+    await hostMutation(() => fs.rm(asideDir, { recursive: true, force: true }));
+    await hostMutation(() => fs.mkdir(asideDir, { recursive: true }));
+  }
   const runtime = await prepareRuntime({
     runId: input.runId,
-    target: input.target,
+    target,
     onPhase: input.onPhase,
     onCheckpoint: input.onCheckpoint,
-    workspaceLocalDir: existing.descriptor.binding.localCwd,
+    workspaceLocalDir: asideDir ?? existing.descriptor.binding.localCwd,
     mode: "adopt_remote",
     baseline: existing.baseline,
-    gitSnapshot: existing.descriptor.gitSnapshot,
-    repositories: existing.descriptor.repositories,
+    // Aside is a plain directory: no host repository to integrate into.
+    gitSnapshot: asideDir ? null : existing.descriptor.gitSnapshot,
+    repositories: asideDir ? [] : existing.descriptor.repositories,
   });
   await finalizePreparedRuntime({
     db: input.db,
     runId: input.runId,
-    target: input.target,
+    target,
     runtime,
     descriptor: existing.descriptor,
     assertOwnership: input.assertOwnership,
+    signal: input.signal,
     onPhase: input.onPhase,
     onCheckpoint: input.onCheckpoint,
+    ...(asideDir ? { localDir: asideDir } : {}),
   });
+  if (asideDir && run) {
+    const line = PERSON_STOP_SAVED_ASIDE_LINE;
+    const payload = { asideDir, hostCwd: existing.descriptor.binding.localCwd };
+    await appendHeartbeatRunEvent(input.db, { companyId: run.companyId, agentId: run.agentId, runId: input.runId,
+      eventType: "workspace_export_saved_aside", stream: "system", level: "info", message: line, payload })
+      .catch(() => undefined);
+    await appendHeartbeatRunEvent(input.db, { companyId: run.companyId, agentId: run.agentId, runId: input.runId,
+      eventType: "provider.notice.recorded", stream: "system", level: "info", message: line,
+      payload: { ...payload, prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "control_plane",
+        runId: input.runId, eventType: "provider.notice.recorded", emittedAt: new Date().toISOString(),
+        payload: { schema: "paperclip.provider.notice.v1", severity: "info", category: "person_stop_files_saved_aside",
+          summary: line, message: line } } } }).catch(() => undefined);
+  }
   return true;
 }
 
+/** adopt-stopu-compose6 (c): the person reads this when the stopped turn's files
+ * become available after its successor ran without them. */
+export const PERSON_STOP_SAVED_ASIDE_LINE =
+  "The files from the stopped turn are now saved separately; your newer changes were kept.";
+
+/** Where a late person-Stop export lands instead of the host workspace: outside
+ * every workspace, under the instance's own state root, one directory per run. */
+export function personStopAsideDirectory(runId: string): string {
+  return path.join(resolvePaperclipInstanceRoot(), "stopped-turn-files", requireSafeSegment(runId, "run_id"));
+}
+
+async function personStopWithoutFilesAsideDir(db: Db, runId: string, leaseId: string): Promise<string | null> {
+  const [lease] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
+    .where(eq(environmentLeases.id, leaseId)).limit(1);
+  const decision = readPersonStopBoundDecision(lease?.metadata);
+  return decision?.decision === "without_files" && decision.runId === runId ? personStopAsideDirectory(runId) : null;
+}
+
 export async function cleanupNativeWorkspaceSync(runId: string): Promise<void> {
-  await fs.rm(descriptorDirectory(runId), { recursive: true, force: true });
+  await hostMutation(() => fs.rm(descriptorDirectory(runId), { recursive: true, force: true }));
 }
 
 export const nativeWorkspaceSyncInternals = {

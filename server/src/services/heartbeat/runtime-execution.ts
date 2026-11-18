@@ -59,6 +59,7 @@ import { heartbeatRuns, nativeRunFinalizations, workspaceOperations } from "@pap
 import { conflict } from "../../errors.js";
 import { getStartupTraceContext } from "../../instrumentation.js";
 import { logger } from "../../middleware/logger.js";
+import { finishCancelledWarmWorkspaceExport } from "./cancelled-warm-workspace-export.js";
 import {
   buildNativeProviderEnvironment,
   executePaperclipNativeSession,
@@ -1047,7 +1048,9 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           else await recordWorkspaceFinalize(hasWorkspaceRestoreFailure(adapterResult.resultJson) ? "failed" : "succeeded", undefined,
             async () => { await measureRunPhase("execution.workspace_finalize", () => restoreNativeWorkspaceBestEffort({
               db, runId: run.id, assertOwnership: ownership?.assertHeld,
-              restore: () => nativeWorkspaceSync!.restoreWorkspace(ownership?.assertHeld),
+              // pl/lockloss: losing the lock session stops the copyback's host writes.
+              restore: () => nativeWorkspaceSync!.restoreWorkspace(ownership?.assertHeld,
+                ownership ? { signal: ownership.lost } : undefined),
             })); });
         }
         await ownership?.assertHeld();
@@ -1107,6 +1110,13 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
     if (adapterErr instanceof NativeCancellationPendingRecoveryError) {
       // Durable cancellation is settled by the outer recovery handler;
       // it does not imply a failed workspace or a persisted run result.
+      // pl/cancel-finalize: a settled Stop of a warm turn first finishes its
+      // own prepared export (bounded), before the box's stop_and_retain release.
+      await finishCancelledWarmWorkspaceExport({ db, runId: run.id, companyId: run.companyId, nativeWorkspaceSync,
+        // adopt-stopu-ugate: the same box's command path proves the turn's processes gone first.
+        stoppedTurnBox: async () => executionTarget?.kind === "remote" && "runner" in executionTarget && executionTarget.runner
+          ? { runner: executionTarget.runner, remoteCwd: executionTarget.remoteCwd } : null })
+        .catch((error) => logger.warn({ err: error, runId: run.id }, "cancelled warm workspace export failed"));
       throw adapterErr;
     }
     if (adapterErr instanceof NativeWorkspaceFinalizationBusyError

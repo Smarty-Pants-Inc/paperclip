@@ -120,7 +120,11 @@ export function recoveryChipLabel(
   state: ActiveRecoveryDisplayState,
   kind: IssueRecoveryActionKind,
   lineage?: RecoveryRetryLineage | null,
+  evidence?: IssueRecoveryAction["evidence"],
 ): string {
+  const stopPending = evidence?.stopPending;
+  if (stopPending !== null && typeof stopPending === "object" && !Array.isArray(stopPending) &&
+      "personStop" in stopPending && stopPending.personStop === true) return "Stop pending";
   if (kind === "workspace_validation" && state === "needed") {
     return "Workspace recovery needed";
   }

@@ -32,6 +32,7 @@ import { flushDeferredEnvironmentCleanup, registerDeferredEnvironmentCleanup, wr
 import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatchedEnvironmentTask } from "./environment-task-runtime.js";
 import { allowLegacyShutdownWorkspaceCleanup, legacyShutdownWorkspaceResourceProtected } from "./legacy-shutdown-workspace-settlement.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
+import { personStopKeptBoxForSuccessor } from "./heartbeat/person-stop-export-bound.js";
 import { hasNativeHarnessBackupMissing } from "./native-runtime/native-harness-backup-missing.js";
 import { abandonedWorkspaceFilesHeldOnLease, abandonedWorkspaceFilesParked, parkAbandonedWorkspaceFilesLease } from "./remote-workspace-abandoned-files-hold.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
@@ -2230,6 +2231,10 @@ function createSandboxEnvironmentDriver(
           : [];
         for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
           // Protected allocations must stay out of both selection and obsolete cleanup.
+          // adopt-stopu-compose4 (rf-4 22:53Z): the 'prepared' descriptor does not
+          // exclude a kept person-Stop box from its OWN successor (same agent and
+          // issue, by the candidate filter above) once the bound decided same_box.
+          if (personStopKeptBoxForSuccessor(reusableCandidateLeases[index]!)) continue;
           if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId)
             || await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!))
             reusableCandidateLeases.splice(index, 1);
@@ -2259,6 +2264,11 @@ function createSandboxEnvironmentDriver(
           provider: parsed.config.provider, config: providerConfigForLease,
         });
         reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
+        // adopt-stopu-compose4: a kept person-Stop box that does not match is never obsolete-cleaned.
+        for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
+          if (personStopKeptBoxForSuccessor(reusableCandidateLeases[index]!)
+            && !reusableExistingLeases.includes(reusableCandidateLeases[index]!)) reusableCandidateLeases.splice(index, 1);
+        }
         // J3-26: a previous boot's closed ACTIVE tip whose boot source changed.
         const closedActiveTips = declaredReusableLeases && parsed.config.reuseLease
           ? await previousBootClosedActiveSourceTips({ companyId: input.companyId, environmentId: input.environment.id,
@@ -2564,6 +2574,8 @@ function createSandboxEnvironmentDriver(
                 nativeWorkspaceSync: reusableLease.metadata.nativeWorkspaceSync,
               }
             : {}),
+          ...(providerLease && reusableLease && personStopKeptBoxForSuccessor(reusableLease)
+            ? { personStopExportBound: reusableLease.metadata!.personStopExportBound } : {}),
           ...(reusableScope ? { reusableSandboxLease: reusableScope } : {}),
           ...warmSandboxWindowMetadata(input.warmRunnerIdleTimeoutMs),
         };
@@ -2670,6 +2682,7 @@ function createSandboxEnvironmentDriver(
           : [];
       for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
         // Protected allocations must stay out of both selection and obsolete cleanup.
+        if (personStopKeptBoxForSuccessor(reusableCandidateLeases[index]!)) continue;
         if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId)
           || await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!))
           reusableCandidateLeases.splice(index, 1);
@@ -2699,6 +2712,11 @@ function createSandboxEnvironmentDriver(
         provider: parsed.config.provider, config: providerConfigForLease,
       });
       reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
+      // adopt-stopu-compose4: a kept person-Stop box that does not match is never obsolete-cleaned.
+      for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
+        if (personStopKeptBoxForSuccessor(reusableCandidateLeases[index]!)
+          && !reusableExistingLeases.includes(reusableCandidateLeases[index]!)) reusableCandidateLeases.splice(index, 1);
+      }
       // J3-26: a previous boot's closed ACTIVE tip whose boot source changed.
       const closedActiveTips = supportsReusableLeases && parsed.config.reuseLease
         ? await previousBootClosedActiveSourceTips({ companyId: input.companyId, environmentId: input.environment.id,
@@ -2823,6 +2841,9 @@ function createSandboxEnvironmentDriver(
               nativeWorkspaceSync: reusableLease.metadata.nativeWorkspaceSync,
             }
           : {}),
+        ...(reusableLease && providerLease.providerLeaseId === reusableLease.providerLeaseId
+          && personStopKeptBoxForSuccessor(reusableLease)
+          ? { personStopExportBound: reusableLease.metadata!.personStopExportBound } : {}),
         ...(reusableScope ? { reusableSandboxLease: reusableScope } : {}),
         ...warmSandboxWindowMetadata(input.warmRunnerIdleTimeoutMs),
       };
