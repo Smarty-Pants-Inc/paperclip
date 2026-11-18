@@ -32,6 +32,19 @@ describe("mergedPiModelsJson", () => {
     expect(merged.providers.paperclip).toEqual({ baseUrl: "http://127.0.0.1:1", api: "openai-completions", apiKey: "t", models: [metadata] });
     if (provider !== "paperclip") expect(merged.providers[provider].apiKey).toBe("not-the-broker");
   });
+  it.each([
+    ["compat without the flags", { supportsStore: false }],
+    ["compat {}", {}],
+    ["compat disabling affinity", { sendSessionAffinityHeaders: false, sessionAffinityFormat: "openai" }],
+  ])("keeps managed session-affinity routing over an existing HOME entry with %s", async (_label, compat) => {
+    dir = await mkdtemp(join(tmpdir(), "pi-merge-"));
+    const file = join(dir, "models.json");
+    const managed = `${JSON.stringify({ providers: { paperclip: { baseUrl: "http://127.0.0.1:1", api: "openai-completions", apiKey: "t",
+      models: [{ id: "m", compat: { sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" } }] } } })}\n`;
+    await writeFile(file, JSON.stringify({ providers: { paperclip: { api: "openai-completions", models: [{ id: "m", compat }] } } }));
+    const merged = JSON.parse(await mergedPiModelsJson(file, managed));
+    expect(merged.providers.paperclip.models[0].compat).toEqual({ ...compat, sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" });
+  });
   it("refuses to overwrite an unparsable models.json", async () => {
     dir = await mkdtemp(join(tmpdir(), "pi-merge-"));
     const file = join(dir, "models.json");
