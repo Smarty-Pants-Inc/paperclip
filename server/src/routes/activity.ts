@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { runsFollowingDecision } from "../services/recovery/stranded-retry-admission.js";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { normalizeIssueIdentifier } from "@paperclipai/shared";
@@ -380,13 +381,15 @@ export function activityRoutes(db: Db) {
         typeof req.query.runIds === "string" ? req.query.runIds.split(",") : null,
       );
       if (!parsed.success) throw badRequest("runIds must contain 1 to 100 UUIDs");
-      res.json(await svc.runsForIssue(issue.companyId, issue.id, viewerUserId, undefined, parsed.data));
+      res.json(await runsFollowingDecision(db, { companyId: issue.companyId, issueId: issue.id },
+        await svc.runsForIssue(issue.companyId, issue.id, viewerUserId, undefined, parsed.data)));
       return;
     }
     const result = await (req.query.view === "recent"
       ? svc.runsForIssue(issue.companyId, issue.id, viewerUserId, 2)
       : svc.runsForIssue(issue.companyId, issue.id, viewerUserId));
-    res.json(result);
+    // F3: the run ledger says the one Retry decision's step (stranded-retry-admission.ts).
+    res.json(await runsFollowingDecision(db, { companyId: issue.companyId, issueId: issue.id }, result));
   });
 
   router.get("/issues/:id/context-usage", async (req, res) => {

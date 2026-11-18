@@ -8,7 +8,17 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { and, eq, ne, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+// F3: the F1 row renders the task screen's real ordinary notice (ui ExecutionBlockerNotice)
+// from the real GET's interruption. The ui's "@/lib/*" aliases resolve to the ui's own files;
+// only components and the API client its rendered branch does not reach are stubbed.
+vi.mock("@/lib/router", async () => { const { createElement } = await import("../../../ui/node_modules/react/index.js");
+  return { Link: ({ children, to }: { children?: unknown; to: string }) => createElement("a", { href: to }, children as never) }; });
+vi.mock("@/lib/utils", async () => await import("../../../ui/src/lib/utils"));
+vi.mock("@/lib/status-colors", async () => await import("../../../ui/src/lib/status-colors"));
+vi.mock("../../../ui/src/api/issues", () => ({ issuesApi: {} }));
+vi.mock("../../../ui/src/components/TaskProjectAccessNotice", () => ({ TaskProjectAccessNotice: () => null }));
+vi.mock("../../../ui/src/components/WorkspaceExportRecovery", () => ({ PreviousServerStopConfirmation: () => null }));
 import {
   agents, authUsers, agentWakeupRequests, budgetPolicies, closeRegisteredClients, companies, companyMemberships, costEvents, createDb,
   environments, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issueRelations, issues, nativeRunFinalizations,
@@ -641,6 +651,14 @@ describe("Task Retry recovery-card refresh", () => {
   // binds nothing (two real presses, 202, no new run), so every surface of the SAME GET, before and
   // after a press, says the new-task step; and the new task for the same agent ANSWERS its message once.
   it("JUDGE F1 foreign held source: all five surfaces say the new task before and after a press; the new task ANSWERS once", async () => {
+    // F3: the sixth surface, the ordinary interruption notice as the task screen renders it
+    // (IssueDetail.tsx mounts ExecutionBlockerNotice with issue.interruption).
+    const { createElement } = await import("../../../ui/node_modules/react/index.js");
+    const { renderToStaticMarkup } = await import("../../../ui/node_modules/react-dom/server.node.js");
+    const { JSDOM } = await import("jsdom");
+    const { ExecutionBlockerNotice } = await import("../../../ui/src/components/ExecutionBlockerNotice");
+    const ordinaryNoticeText = (presentation: unknown) => new JSDOM(renderToStaticMarkup(createElement(ExecutionBlockerNotice,
+      { presentation: presentation as never, canRetry: true, onRetry: () => {} }))).window.document.body.textContent?.trim() || null;
     const { recordNativeLocalProcessStop } = await import("../services/native-local-process-stop.js");
     const { recordRequiredWorkspaceRestoreFailure } = await import("../services/legacy-execution-recovery.js");
     const { adoptSystemRecovery } = await import("../services/system-recovery.js");
@@ -710,39 +728,90 @@ describe("Task Retry recovery-card refresh", () => {
       issue: await issueRow(issueId), previousStatus: "todo", latestRun: (await runRows(issueId)).find(run => run.id === successor!.id)! });
 
     const app = appForBoard();
+    // The screen's run reads (GET /issues/:id/runs, the activity feed) are activityRoutes'.
+    const { activityRoutes } = await import("../routes/activity.js");
+    const readApp = appForBoard().use("/api", activityRoutes(db)).use(errorHandler);
+    const SECOND_READING = /Recovering saved work|Restoring saved work|Paperclip recovers the saved work|Retry is waiting|execution checks|Press Retry|Retry is offered|Retry when ready/;
     // The five surfaces of one GET (+ the wake-skip and heartbeat-context read at the same moment).
     const surfaces = async () => {
       const shown = (await request(app).get(`/api/issues/${issueId}`).expect(200)).body;
       if (process.env.G1_GET_FILE) appendFileSync(process.env.G1_GET_FILE, `${JSON.stringify({ when: "f1-foreign",
         activeRecoveryAction: shown.activeRecoveryAction, executionBlocker: shown.executionBlocker, interruption: shown.interruption })}\n`);
       const context = (await request(app).get(`/api/issues/${issueId}/heartbeat-context`).expect(200)).body;
+      // THE CLASS (rf-5 onA F3): every string the task screen, the inbox and an agent read for this
+      // task, wherever it comes from, may not name a wait or a Retry offer: a second reading.
+      const hits: Array<{ route: string; path: string; text: string }> = [];
+      // A posted notice's "Run evidence" section is the run's own record (its Failure summary is what the
+      // stale-run gate recorded, kept verbatim by held-source-comment-retry-21914.test.ts:216), not a next step.
+      const runEvidence: Array<{ route: string; path: string; rows: unknown }> = [];
+      const walk = (route: string, value: unknown, at: string): void => {
+        if (value && typeof value === "object" && (value as { title?: unknown }).title === "Run evidence" && /\.metadata\.sections\[\d+\]$/.test(at)) {
+          runEvidence.push({ route, path: at, rows: (value as { rows?: unknown }).rows }); return;
+        }
+        if (typeof value === "string") { if (/Retry|recover|saved work|waiting for|execution checks/i.test(value)) hits.push({ route, path: at, text: value }); }
+        else if (Array.isArray(value)) value.forEach((item, i) => walk(route, item, `${at}[${i}]`));
+        else if (value && typeof value === "object") for (const [key, item] of Object.entries(value)) walk(route, item, `${at}.${key}`);
+      };
+      for (const route of [`/api/issues/${issueId}`, `/api/issues/${issueId}/heartbeat-context`, `/api/companies/${companyId}/issues`,
+        `/api/issues/${issueId}/runs`, `/api/issues/${issueId}/runs?view=recent`, `/api/issues/${issueId}/live-runs`, `/api/issues/${issueId}/active-run`,
+        `/api/issues/${issueId}/recovery-actions`, `/api/issues/${issueId}/comments`, `/api/issues/${issueId}/recent-comments`,
+        `/api/issues/${issueId}/queued-comments`, `/api/issues/${issueId}/interactions`, `/api/companies/${companyId}/activity`,
+        `/api/heartbeat-runs/${successor!.id}`, `/api/heartbeat-runs/${native!.id}`, `/api/issues/${issueId}/execution`,
+        `/api/companies/${companyId}/heartbeat-runs`, `/api/companies/${companyId}/heartbeat-runs?agentId=${agentId}`,
+        `/api/companies/${companyId}/heartbeat-runs?agentId=${otherAgentId}`]) {
+        const got = await request(readApp).get(route);
+        expect(got.status, route).toBeLessThan(400);
+        walk(route.replace(issueId, ":id").replace(companyId, ":companyId").replace(successor!.id, ":runId")
+          .replace(native!.id, ":sourceRunId").replace(otherAgentId, ":sourceAgentId").replace(agentId, ":agentId"), got.body, "$");
+      }
+      if (process.env.SWEEP_FILE) appendFileSync(process.env.SWEEP_FILE, `${JSON.stringify({ hits, runEvidence })}\n`);
+      const secondReadings = hits.filter(hit => SECOND_READING.test(hit.text));
       const wake = await request(app).post(`/api/agents/${agentId}/wakeup`).send({ source: "on_demand", reason: "f1_foreign", payload: { issueId } });
       const notices = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"))))
         .sort((a, b) => +a.createdAt - +b.createdAt);
       return { canRetry: shown.interruption?.canRetry ?? null, notice: notices.at(-1)?.body ?? null,
         blocker: shown.executionBlocker?.nextAction ?? null, card: shown.activeRecoveryAction?.nextAction ?? null,
         wakeSkip: wake.body.message ?? null, heartbeatContext: context.issue?.activeRecoveryAction?.nextAction ?? null,
-        runs: (await runRows(issueId)).length };
+        ordinaryNotice: ordinaryNoticeText(shown.interruption), interruptionState: shown.interruption?.state ?? null,
+        secondReadings, runs: (await runRows(issueId)).length };
     };
-    const rows = [{ when: "before press", ...await surfaces() }];
+    const rows: Array<{ when: string; pressedNotice: string | null; pressedState: string | null } & Awaited<ReturnType<typeof surfaces>>> =
+      [{ when: "before press", pressedNotice: null, pressedState: null, ...await surfaces() }];
     resetProcessRunAdmissionForTests();
     for (const press of [1, 2]) {
       const retried = await request(app).post(`/api/issues/${issueId}/retry`).send({ observedRunId: successor!.id, idempotencyKey: randomUUID() });
       expect(retried.status).toBe(202);
+      // The screen caches the press's own presentation until it refetches (useTaskRetry.ts).
+      const pressedNotice = ordinaryNoticeText(retried.body.presentation);
+      const pressedState = retried.body.presentation?.state ?? null;
+      // The press's own response (the screen's toast/not-started reason reads it) is a read too.
+      const pressHits: Array<{ route: string; path: string; text: string }> = [];
+      const walkPress = (value: unknown, at: string): void => {
+        if (typeof value === "string") { if (SECOND_READING.test(value)) pressHits.push({ route: "POST /api/issues/:id/retry", path: at, text: value }); }
+        else if (Array.isArray(value)) value.forEach((item, i) => walkPress(item, `${at}[${i}]`));
+        else if (value && typeof value === "object") for (const [key, item] of Object.entries(value)) walkPress(item, `${at}.${key}`);
+      };
+      walkPress(retried.body, "$");
+      expect(pressHits, `press ${press}`).toEqual([]);
       if (retried.body.requestId) await heartbeatService(db).resumeTaskRetry(companyId, retried.body.requestId);
       await heartbeatService(db).drainActiveRunExecutions();
-      rows.push({ when: `after press ${press}`, ...await surfaces() });
+      rows.push({ when: `after press ${press}`, pressedNotice, pressedState, ...await surfaces() });
     }
     closeProcessRunAdmission();
     console.info("JUDGE_F1_FOREIGN_SURFACES", JSON.stringify(rows));
     if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: expect.getState().currentTestName, f1Foreign: rows })}\n`);
     for (const row of rows) {
       expect(row.canRetry, row.when).toBe(false);
+      expect([row.interruptionState, row.pressedState ?? "failed"], row.when).toEqual(["failed", "failed"]);
       expect(row.runs, row.when).toBe(rows[0]!.runs);
-      for (const surface of [row.notice, row.blocker, row.card, row.wakeSkip, row.heartbeatContext]) {
+      // Six surfaces (+ after a press, the notice the screen renders from the press's own presentation).
+      for (const surface of [row.notice, row.blocker, row.card, row.wakeSkip, row.heartbeatContext, row.ordinaryNotice,
+        ...row.when === "before press" ? [] : [row.pressedNotice]]) {
         expect(surface, `${row.when}: ${JSON.stringify(row)}`).toContain(NEW_TASK_CONTINUE_ACTION);
-        expect(surface, row.when).not.toMatch(/Recovering saved work|Paperclip recovers the saved work/);
+        expect(surface, row.when).not.toMatch(/Recovering saved work|Paperclip recovers the saved work|Retry is waiting/);
       }
+      // ...and no other read of the task says a wait or offers Retry (the class).
+      expect(row.secondReadings, row.when).toEqual([]);
     }
 
     // The step shown WORKS: the new task for the same agent ANSWERS its message once.

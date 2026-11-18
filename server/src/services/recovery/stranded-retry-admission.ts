@@ -103,10 +103,75 @@ export async function executionBlockerFollowingPresentation<B extends { nextActi
   // work…"). Where the one decision says that wait never ends in a run on this
   // task (held_source_unbound), its words are replaced whole by the decision's
   // step, so the blocker and wake-skip say what the notice and card say.
-  if (!blocker.canRetry) return !admission.admits && admission.refusal === "held_source_unbound"
-    ? { ...blocker, nextAction: strandedRetryRefusalCopy(admission).nextAction } : blocker;
+  // F3: its raw workspaceRecovery.message (the same wait) says the same step.
+  if (!blocker.canRetry) {
+    if (admission.admits || admission.refusal !== "held_source_unbound") return blocker;
+    const step = strandedRetryRefusalCopy(admission).nextAction;
+    const recovery = (blocker as { workspaceRecovery?: Record<string, unknown> | null }).workspaceRecovery;
+    return { ...blocker, nextAction: step, ...(recovery && typeof recovery.message === "string"
+      ? { workspaceRecovery: { ...recovery, message: step } } : {}) };
+  }
   const nextAction = textFollowingAdmission(blocker.nextAction, admission, true);
   return nextAction === null ? blocker : { ...blocker, canRetry: false, nextAction };
+}
+
+/**
+ * rf-5 onA F3: the task screen's ordinary interruption notice
+ * (ExecutionBlockerNotice, from GET /issues/:id `interruption`; also the POST
+ * /issues/:id/retry `presentation` the screen caches and the issue list's
+ * `interruption` the inbox reads) says the step the one decision says. The
+ * presentation is the decision's input, so its own retry-wait wording cannot
+ * know a refusal the decision adds (held_source_unbound): there its wait
+ * ("Retry is waiting for … Your message is saved.") is replaced whole by the
+ * decision's step, as the execution blocker's is. Pass the RAW presentation to
+ * the other …FollowingPresentation mappings; this one only shapes the output.
+ */
+export async function interruptionFollowingPresentation(
+  db: Db, issue: { id: string; companyId: string; assigneeAgentId: string | null }, presentation: Presentation,
+): Promise<Presentation> {
+  if (!presentation || presentation.canRetry) return presentation;
+  const admission = await admissionFollowingPresentation(db, issue, presentation);
+  if (admission.admits || admission.refusal !== "held_source_unbound") return presentation;
+  // No run follows on this task, so a press's grace "working" (or a scheduled
+  // retry) is not shown either: the notice states the failed attempt and the step.
+  return { ...presentation, state: "failed", retryWait: { reason: presentation.retryWait?.reason ?? "execution_recovery",
+    message: strandedRetryRefusalCopy(admission).nextAction } };
+}
+
+/**
+ * rf-5 onA F3 (the class): the task's runs say the same step. The run ledger
+ * (GET /issues/:id/runs; IssueRunLedger.tsx renders `execution.nextAction`) and
+ * the run page (GET /heartbeat-runs/:runId `error`) show the hold's wait for the
+ * held source run ("Recovering saved work…", workspaceRecoveryDisplay) and for the
+ * run the stale-run gate cancelled behind it (its recorded reason). Where the one
+ * decision replaces that wait whole (held_source_unbound) they say its step.
+ */
+export async function runsFollowingDecision<R extends { errorCode?: string | null; error?: string | null;
+  execution?: { phase?: string | null; nextAction?: string | null } | null }>(
+  db: Db, input: { companyId: string; issueId: string | null | undefined }, runs: R[],
+): Promise<R[]> {
+  const waitShown = (run: R) => Boolean(run.execution?.phase === "recovery_needed" && run.execution.nextAction);
+  const reasonShown = (run: R) => Boolean(run.errorCode === "execution_reconciliation_required" && run.error);
+  if (!input.issueId || !runs.some(run => waitShown(run) || reasonShown(run))) return runs;
+  const admission = await decideStrandedRetryAdmission(db, { companyId: input.companyId, issueId: input.issueId });
+  if (admission.admits || admission.refusal !== "held_source_unbound") return runs;
+  const step = strandedRetryRefusalCopy(admission).nextAction;
+  return runs.map(run => !waitShown(run) && !reasonShown(run) ? run : { ...run,
+    ...(waitShown(run) ? { execution: { ...run.execution, nextAction: step } } : {}),
+    ...(reasonShown(run) ? { error: step } : {}) });
+}
+
+/** The same mapping for a run list that spans tasks (an agent's or the company's runs page). */
+export async function runsFollowingDecisionAcrossIssues<R extends { issueId?: string | null; errorCode?: string | null; error?: string | null;
+  execution?: { phase?: string | null; nextAction?: string | null } | null }>(db: Db, companyId: string, runs: R[]): Promise<R[]> {
+  const byIssue = new Map<string, R[]>();
+  for (const run of runs) if (run.issueId) byIssue.set(run.issueId, [...byIssue.get(run.issueId) ?? [], run]);
+  const shown = new Map<R, R>();
+  await Promise.all([...byIssue].map(async ([issueId, group]) => {
+    const mapped = await runsFollowingDecision(db, { companyId, issueId }, group);
+    group.forEach((run, index) => shown.set(run, mapped[index]!));
+  }));
+  return runs.map(run => shown.get(run) ?? run);
 }
 
 /**

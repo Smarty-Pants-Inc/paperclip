@@ -14,7 +14,7 @@ import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { INBOX_MINE_ISSUE_STATUS_FILTER, latestFailedRunsByAgent } from "@paperclipai/shared";
 import { getHeartbeatRunReadDecisions, redactHeartbeatRunListRow } from "../services/heartbeat-run-privacy.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
-import { executionBlockerFollowingPresentation, recoveryActionFollowingPresentation } from "../services/recovery/stranded-retry-admission.js";
+import { executionBlockerFollowingPresentation, interruptionFollowingPresentation, recoveryActionFollowingPresentation } from "../services/recovery/stranded-retry-admission.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
 import { ISSUE_SUMMARIES_MAX_IDS, issueChatBootstrapQuerySchema, issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
@@ -9001,6 +9001,13 @@ export function issueRoutes(
     }
     const issueIds = result.map((issue) => issue.id);
     const interruptions = await taskInterruptionPresentations(db, companyId, result);
+    // F3: the inbox reads each row's interruption.retryWait; it says the one decision's step.
+    // `interruptions` stays the raw presentation, the decision's input.
+    const shownInterruptions = new Map(await Promise.all(result.map(async issue => {
+      const presentation = interruptions.get(issue.id) ?? null;
+      return [issue.id, presentation && !presentation.canRetry
+        ? await interruptionFollowingPresentation(db, issue, presentation) : presentation] as const;
+    })));
     if (compactView) {
       const [handoffStates, recoveryActionByIssue] = await Promise.all([
         listSuccessfulRunHandoffStates(db, companyId, issueIds),
@@ -9018,7 +9025,9 @@ export function issueRoutes(
             actor,
             activeRecoveryAction,
           });
-          if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
+          // F3: each row's recovery action says what GET /issues/:id's says (the one decision).
+          if (revalidated) recoveryActionByIssue.set(issue.id, (await recoveryActionFollowingPresentation(db, issue, revalidated,
+            interruptions.get(issue.id) ?? null))!);
           else recoveryActionByIssue.delete(issue.id);
         }),
       );
@@ -9026,7 +9035,7 @@ export function issueRoutes(
         ({ ...toCompactIssue({
           ...issue,
           activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
-          interruption: interruptions.get(issue.id) ?? null,
+          interruption: shownInterruptions.get(issue.id) ?? null,
           successfulRunHandoff: handoffStates.get(issue.id) ?? null,
         }), ...(view === "rows" ? { listProjection: "rows" as const } : {}) }),
       );
@@ -9054,7 +9063,9 @@ export function issueRoutes(
           actor,
           activeRecoveryAction,
         });
-        if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
+        // F3: each row's recovery action says what GET /issues/:id's says (the one decision).
+        if (revalidated) recoveryActionByIssue.set(issue.id, (await recoveryActionFollowingPresentation(db, issue, revalidated,
+          interruptions.get(issue.id) ?? null))!);
         else recoveryActionByIssue.delete(issue.id);
       }),
     );
@@ -9064,7 +9075,7 @@ export function issueRoutes(
         ...issue,
         successfulRunHandoff: handoffStates.get(issue.id) ?? null,
         activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
-        interruption: interruptions.get(issue.id) ?? null,
+        interruption: shownInterruptions.get(issue.id) ?? null,
       })),
       pagination,
     };
@@ -10282,7 +10293,8 @@ export function issueRoutes(
       ...(reviewAttention ? { reviewAttention } : {}),
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
       executionBlocker,
-      interruption,
+      // F3: the ordinary notice (ExecutionBlockerNotice) says the same step.
+      interruption: await interruptionFollowingPresentation(db, issue, interruption),
       scheduledRetry,
       // r2f SD2: the recovery card's next action follows the same Retry decision.
       activeRecoveryAction: await recoveryActionFollowingPresentation(db, issue, revalidatedActiveRecoveryAction, interruption),
@@ -10450,7 +10462,7 @@ export function issueRoutes(
         actionId ? eq(issueRecoveryActions.id, actionId) : undefined,
       )).orderBy(desc(issueRecoveryActions.createdAt)).limit(actionId ? 1 : 20);
       if (actionId && !rows[0]) throw notFound("Recovery source not found.");
-      const actions = rows.map(issueRecoveryActionReadModel);
+      const actions = await actionsFollowingDecision(issue, rows.map(issueRecoveryActionReadModel));
       const sourceInspection = actionId ? await inspectWorkspaceSource(db, {
         companyId: issue.companyId, issueId: issue.id, runId, actionId,
       }) : undefined;
@@ -10471,12 +10483,21 @@ export function issueRoutes(
         inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
       ))),
     )).orderBy(desc(issueRecoveryActions.createdAt));
+    const [shownActive, ...shownHolds] = await actionsFollowingDecision(issue, [active, ...retainedHolds
+      .filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel)]);
     res.json({
-      active,
-      actions: [...(active ? [active] : []), ...retainedHolds
-        .filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel)],
+      active: shownActive ?? null,
+      actions: [...(shownActive ? [shownActive] : []), ...shownHolds],
     });
   });
+
+  /** F3: a recovery-actions read says what GET /issues/:id's card says (the one Retry decision). */
+  async function actionsFollowingDecision<A extends { nextAction?: string | null; wakePolicy?: Record<string, unknown> | null } | null>(
+    issue: Parameters<typeof taskInterruptionPresentation>[1], actions: A[]): Promise<A[]> {
+    if (!actions.some(action => action?.nextAction)) return actions;
+    const presentation = await taskInterruptionPresentation(db, issue);
+    return Promise.all(actions.map(async action => (await recoveryActionFollowingPresentation(db, issue, action, presentation)) as A));
+  }
 
   router.post("/issues/:id/retry", validate(taskRetrySchema), async (req, res) => {
     assertBoard(req);
@@ -10507,7 +10528,7 @@ export function issueRoutes(
     }
     res.status(receipt.accepted ? 202 : 200).json({ ...receipt,
       ...(scheduledRetry ? { scheduledRetry: { outcome: scheduledRetry.outcome, message: scheduledRetry.message } } : {}),
-      presentation: await taskInterruptionPresentation(db, issue) });
+      presentation: await interruptionFollowingPresentation(db, issue, await taskInterruptionPresentation(db, issue)) });
     // The receipt commits before dispatch. Maintenance redelivers it after a
     // crash or a lost response; this nudge only reduces perceived latency.
     const chatActionId = "chatActionId" in receipt ? receipt.chatActionId : undefined;
@@ -10575,7 +10596,7 @@ export function issueRoutes(
       await heartbeat.resumeTaskRetry(issue.companyId, wake.id).catch(err =>
         logger.warn({ err, issueId: issue.id, requestId: wake.id }, "Task Retry remains queued after the stop was confirmed"));
     }
-    res.json({ ...receipt, presentation: await taskInterruptionPresentation(db, issue) });
+    res.json({ ...receipt, presentation: await interruptionFollowingPresentation(db, issue, await taskInterruptionPresentation(db, issue)) });
   });
 
   router.post("/issues/:id/recovery-actions/confirm-controller-stopped", validate(confirmNativeControllerStoppedSchema), async (req, res) => {

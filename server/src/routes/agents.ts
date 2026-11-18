@@ -56,7 +56,7 @@ import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent
 import { isAiConnectionCompatible } from "@paperclipai/shared";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
-import { executionBlockerFollowingPresentation } from "../services/recovery/stranded-retry-admission.js";
+import { executionBlockerFollowingPresentation, recoveryActionFollowingPresentation, runsFollowingDecision, runsFollowingDecisionAcrossIssues } from "../services/recovery/stranded-retry-admission.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import { canRetryStoppedRun } from "../services/cancelled-native-startup.js";
 import { rejectedModelRetryRefusal } from "../services/native-runtime/model-rejected-retry.js";
@@ -7366,7 +7366,9 @@ export function agentRoutes(
       : HEARTBEAT_RUN_LIST_DEFAULT_LIMIT;
     const summary = req.query.summary === "true" || req.query.summary === "1";
     const recentRuns = await heartbeat.list(companyId, agentId, limit, { summary });
-    const runs = req.query.latestFailuresOnly === "true" ? latestFailedRunsByAgent(recentRuns) : recentRuns;
+    // F3: a run list says the one Retry decision's step for each task's runs (stranded-retry-admission.ts).
+    const runs = await runsFollowingDecisionAcrossIssues(db, companyId,
+      req.query.latestFailuresOnly === "true" ? latestFailedRunsByAgent(recentRuns) : recentRuns);
     const readDecisions = await getHeartbeatRunReadDecisions(db, access, req.actor, runs);
     res.json(await runRedactions.redactForRuns(companyId, runs.map((run, index) =>
       readDecisions[index] ? run : redactHeartbeatRunListRow(run)),
@@ -7548,12 +7550,14 @@ export function agentRoutes(
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
     if (!(await assertRunReadAllowed(req, res, run))) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
-    const decoratedRun = heartbeat.decorateActiveRunStatus(run);
+    // F3: the run page says the one Retry decision's step (stranded-retry-admission.ts).
+    const [decoratedRun] = await runsFollowingDecision(db, { companyId: run.companyId, issueId: run.issueId },
+      [{ ...heartbeat.decorateActiveRunStatus(run), execution: await executionProjectionForRun(db, run.companyId, run.id) }]);
     res.json(await runRedactions.redactForRun(
       run.companyId,
       run.id,
       redactCurrentUserValue(
-        { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        { ...decoratedRun!, identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
         await getCurrentUserRedactionOptions(),
       ),
       req.actor.type === "board" ? getActorInfo(req).actorId : null,
@@ -8182,7 +8186,13 @@ export function agentRoutes(
       eq(heartbeatRuns.companyId, issue.companyId),
       sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
     )).orderBy(sql`case when ${heartbeatRuns.id} = ${issue.executionRunId} then 0 when ${heartbeatRuns.status} = 'running' then 1 else 2 end`, desc(heartbeatRuns.createdAt)).limit(1);
-    res.json(run ? { runId: run.id, agentId: run.agentId, recoveryAction: await issueRecoveryActionService(db).getActiveForIssue(issue.companyId, issue.id), execution: await executionProjectionForRun(db, issue.companyId, run.id) } : null);
+    if (!run) { res.json(null); return; }
+    // F3: the task's execution read says what GET /issues/:id says (the one Retry decision).
+    const [shown] = await runsFollowingDecision(db, { companyId: issue.companyId, issueId: issue.id },
+      [{ execution: await executionProjectionForRun(db, issue.companyId, run.id) }]);
+    res.json({ runId: run.id, agentId: run.agentId, recoveryAction: await recoveryActionFollowingPresentation(db, issue,
+      await issueRecoveryActionService(db).getActiveForIssue(issue.companyId, issue.id), await taskInterruptionPresentation(db, issue)),
+      execution: shown!.execution });
   });
 
   router.get("/issues/:issueId/active-run", async (req, res) => {
