@@ -168,7 +168,11 @@ describe("task Retry after inherited native cleanup quarantine", () => {
       expect(wake).toMatchObject({ status: "coalesced", runId: successors[0].id });
       const [owner] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.ownerId));
       expect(owner.resultJson).toEqual(f.resultJson);
-      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      // Preparation can add a separate fresh-thread receipt. Check the seeded
+      // source recovery action, not whichever task receipt PostgreSQL returns first.
+      const [action] = await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, f.companyId), eq(issueRecoveryActions.sourceIssueId, f.issueId),
+        eq(issueRecoveryActions.fingerprint, f.sourceId)));
       expect(action.evidence.automaticRecovery).toMatchObject({ actionOutcome: "unknown", replay: "explicit_user_continuation" });
       const proof = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.sourceId), eq(heartbeatRunEvents.eventType, "native.stopped_conversation_verified")));
       expect(proof).toHaveLength(1);
