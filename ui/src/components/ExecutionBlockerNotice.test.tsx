@@ -44,11 +44,13 @@ describe("ordinary task interruption", () => {
     ["resolved", "This task is Cancelled. Move it to To do to run it."],
     ["waiting_for_user", "This task is assigned to another agent. Reassign it to the previous agent to retry this attempt."],
   ] as const)("names an ineligible task's %s state and the useful action, never Working or Retry: %s", async (state, text) => {
-    await render({ ...failed, state, responsibility: "user", canRetry: false, notice: { code: "task_state", text } });
-    expect(container.textContent).toBe(text);
-    expect(container.textContent).not.toContain("Working");
-    expect(container.querySelector("button")).toBeNull();
-    expect(retry).not.toHaveBeenCalled();
+    for (const options of [{}, { optimistic: true }, { takingLonger: true }, { error: new Error("Old press failed") }]) {
+      await render({ ...failed, state, responsibility: "user", canRetry: false, notice: { code: "task_state", text } }, options);
+      expect(container.textContent).toBe(text);
+      expect(container.textContent).not.toContain("Working");
+      expect(container.querySelector("button")).toBeNull();
+      expect(retry).not.toHaveBeenCalled();
+    }
   });
   it("keeps the failure visible and names the gate while a saved Retry waits on the budget", async () => {
     await render({ ...failed, responsibility: "user", state: "waiting_for_user", userAction: "budget", canRetry: false });

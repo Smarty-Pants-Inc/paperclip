@@ -824,6 +824,20 @@ describe("durable task Retry admission", () => {
     await db.update(issues).set({ status: "blocked", assigneeAgentId: null }).where(eq(issues.id, input.issueId));
     expect(await requestTaskRetry(input)).toMatchObject({ accepted: false, stale: true });
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, input.companyId))).toHaveLength(0);
+    // A lost-response replay must not turn an old accepted receipt into a new
+    // promise of work after the person moved the task out of executable work.
+    const replay = await seed();
+    expect(await requestTaskRetry(replay)).toMatchObject({ accepted: true });
+    const wakes = () => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, replay.companyId));
+    const before = await wakes();
+    for (const [status, message] of [["backlog", "This task is in Backlog. Move it to To do to run it."],
+      ["done", "This task is Done. Move it to To do to run it."],
+      ["cancelled", "This task is Cancelled. Move it to To do to run it."]] as const) {
+      await db.update(issues).set({ status }).where(eq(issues.id, replay.issueId));
+      expect.soft(await requestTaskRetry(replay), `same key after ${status}`).toMatchObject({ accepted: false, requestId: null,
+        refused: { message } });
+      expect(await wakes(), "the existing Retry receipt is untouched").toEqual(before);
+    }
   });
   it.each(["stopped", "running", "owned", "changed_workspace", "changed_source", "missing_stop", "destroyed", "foreign_task"].flatMap(state =>
     ["retry", "message"].map(entry => ({ state, entry }))).concat([{ state: "stopped", entry: "preview" }]))(
