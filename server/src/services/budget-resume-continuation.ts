@@ -305,6 +305,7 @@ async function deliverOne(db: Db, delivery: BudgetResumeDelivery, now: Date, run
   try {
     receipt = await requestTaskRetry({ db, companyId: run.companyId, issueId: run.issueId,
       observedRunId: run.id, idempotencyKey: `budget-resume:${run.id}`, actorId: claim.actorUserId,
+      resumedBy: "budget_resume",
       ...(claim.actorSource ? { actorSource: claim.actorSource } : {}),
       ...(delivery.prepareChatRetry ? { prepareChatRetry: delivery.prepareChatRetry } : {}) });
   } catch (error) {
