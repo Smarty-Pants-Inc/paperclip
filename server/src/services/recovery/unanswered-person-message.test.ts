@@ -20,7 +20,9 @@ import {
   statusDecisions,
   statusDecisionEffects,
   environmentLeases,
+  subscribeDatabaseWork,
 } from "@paperclipai/db";
+import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -1419,7 +1421,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     });
 
   it.each([[true, "waits"], [false, "waits"], [true, "runs"], [false, "runs"]] as const)(
-    "supersedes(pausefix: stale paused note after Resume; RFL record PENDING): pause-resume 2: chat=%s, pause -> message -> resume (the turn %s): the SAME sweep replaces the paused note with ONE note (working while its own run runs, else waiting); the answer supersedes it",
+    "supersedes(pausefix: stale paused note after Resume; RFL record SUPERSEDE-PAUSEFIX-RUNNING-1118): pause-resume 2: chat=%s, pause -> message -> resume (the turn %s): the SAME sweep replaces the paused note with ONE note (working while its own run runs, else waiting); the answer supersedes it",
     async (chat, turn) => {
       const f = await fixture({ chat });
       await pauseRoute(f);
@@ -1559,7 +1561,41 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(JSON.stringify(await f.visible())).not.toMatch(/working on|safe/i);
   });
 
-  it("supersedes(pausefix: stale paused note after Resume; RFL record PENDING): paused agent, then resumed: the saved message's run is the only run (B' starts none), no second note, the answer supersedes it", async () => {
+  // pausefix 3 (rf-5 L1, Paul's event-driven rule): the standing paused note's
+  // own recheck is 5 min again; the RESUME EVENT drives the upgrade. The resume
+  // transition hands the task to the stranded sweep's per-issue entry at commit
+  // (what recovery/work.ts does with the hint is replayed here, once per hint).
+  it.each([[true, "waits"], [false, "waits"], [true, "runs"], [false, "runs"]] as const)(
+    "pausefix3 L1: chat=%s, Resume (the turn %s) upgrades the SAME paused note through the sweep's per-issue entry at commit, not at the 5-min recheck",
+    async (chat, turn) => {
+      const f = await fixture({ chat });
+      await pauseRoute(f);
+      const commentId = await f.message("While paused: are you there?");
+      await f.sweep();
+      const [pausedNote] = await f.visible();
+      expect(pausedNote!.body).toBe(PAUSED_TEXT);
+      const before = Date.now();
+      const standing = await settleAt(f, 0);
+      expect(standing.kind).toBe("pending");
+      expect((standing as { recheckAt: number }).recheckAt, "the standing paused recheck is 5 min").toBeGreaterThanOrEqual(before + 5 * 60_000);
+      const hints: string[] = [];
+      const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.strandedAssignments, (event, set) => {
+        if (event === "settled") hints.push(...(set ?? []));
+      });
+      try { await resumeRoute(f); } finally { unsubscribe(); }
+      if (turn === "runs") await f.run({ commentId, status: "running" });
+      const deadlines: number[] = [];
+      for (const hint of new Set(hints)) {
+        const scope = JSON.parse(hint) as { companyId: string; issueId?: string };
+        if (scope.companyId !== f.companyId || scope.issueId !== f.issueId) continue;
+        await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: scope.companyId, issueId: scope.issueId, unanswered: true,
+          skipExternalConversationSettlement: true, skipRelatedRecovery: true, onDeferredDeadline: at => deadlines.push(at) });
+      }
+      expect(await one(f), "upgraded at the Resume, not at +5 min").toEqual([{ id: pausedNote!.id, body: turn === "runs" ? WORKING : WAITING }]);
+      expect(hints.map(hint => JSON.parse(hint))).toContainEqual({ companyId: f.companyId, issueId: f.issueId });
+    });
+
+  it("supersedes(pausefix: stale paused note after Resume; RFL record SUPERSEDE-PAUSEFIX-RUNNING-1118): paused agent, then resumed: the saved message's run is the only run (B' starts none), no second note, the answer supersedes it", async () => {
     const f = await fixture();
     await pause(f);
     const commentId = await f.message("Are you there?");
