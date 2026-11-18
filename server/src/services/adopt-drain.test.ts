@@ -14,7 +14,7 @@
  * plus the unrelated MCP / wake / usage boundaries (as warm-rebind-recovery-policy.test.ts).
  */
 import { execFile } from "node:child_process";
-import { assertDrainAdmissionReplacement } from "./drain-admission.test-fixture.js";
+import { assertDrainAdmissionReplacement, provenStoppedTurnBox } from "./drain-admission.test-fixture.js";
 import { promises as auditFs } from 'node:fs';
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -369,7 +369,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await stopMidTurn({ edit: true, settled: false, exportFails: false });
     await settleLater(f);
     const h = await holdOneHostCall(f, branch);
-    const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+    const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId, stoppedTurnBox: provenStoppedTurnBox(f.box),
       nativeWorkspaceSync: f.sync, timeoutMs: 3_000 });
     try {
       await Promise.race([h.reached, new Promise((_, reject) => setTimeout(() => reject(new Error('never reached ' + branch)), 15_000))]);
@@ -400,7 +400,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await settleLater(f);
     const h = await holdOneHostCall(f, 'publish-rename');
     const started = Date.now();
-    const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+    const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId, stoppedTurnBox: provenStoppedTurnBox(f.box),
       nativeWorkspaceSync: f.sync, timeoutMs: 3_000 });
     try {
       await Promise.race([h.reached, new Promise((_, reject) => setTimeout(() => reject(new Error('never reached')), 15_000))]);
@@ -454,7 +454,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await settleLater(f);
     const h = await holdOneHostCall(f, 'publish-rename');
     await withLockSessionIdleTimeout('3s', async () => {
-      const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+      const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId, stoppedTurnBox: provenStoppedTurnBox(f.box),
         nativeWorkspaceSync: f.sync, timeoutMs: 30_000 });
       work.catch(() => undefined);
       try {

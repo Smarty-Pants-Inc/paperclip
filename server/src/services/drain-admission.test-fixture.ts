@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
@@ -6,6 +7,20 @@ import { createDb, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclip
 import { currentHostMutationDrain, type HostMutationDrain } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { finishCancelledWarmWorkspaceExport } from "./heartbeat/cancelled-warm-workspace-export.js";
 import { withNativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
+
+/** adopt-stopu-round: ugate2's process-gone check (noStoppedTurnProcessRemains)
+ * now gates every export; a direct call of the export boundary passes a box
+ * whose command path runs the check locally against the fixture's box dir. */
+export const provenStoppedTurnBox = (remoteCwd: string) => async () => ({ remoteCwd, runner: {
+  execute: (input: { command: string; args?: string[]; cwd?: string; timeoutMs?: number }) =>
+    new Promise<{ exitCode: number; signal: string | null; timedOut: boolean; stdout: string; stderr: string; pid: null; startedAt: null }>(resolve => {
+      const child = execFile(input.command, input.args ?? [], { cwd: input.cwd, timeout: input.timeoutMs }, (error, stdout, stderr) =>
+        resolve({ exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0, signal: error?.signal ?? null,
+          timedOut: error?.killed ?? false, stdout, stderr, pid: null, startedAt: null }));
+      child.stdin?.on("error", () => undefined);
+      child.stdin?.end();
+    }),
+} as never });
 
 type Sync = NonNullable<Parameters<typeof finishCancelledWarmWorkspaceExport>[0]["nativeWorkspaceSync"]>;
 type Fixture = { host: string; box: string; runId: string; companyId: string; sync: Sync };
@@ -132,6 +147,7 @@ export async function assertDrainAdmissionReplacement(input: {
       await db.execute(sql.raw(`alter database "${resetDatabase}" set idle_in_transaction_session_timeout = '3s'`));
     }
     work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+      stoppedTurnBox: provenStoppedTurnBox(f.box),
       nativeWorkspaceSync: f.sync, timeoutMs: cause === "deadline" ? 3_000 : 30_000 });
     work.catch(() => undefined);
     await until(() => arrived, `never reached ${branch}`, 15_000);
