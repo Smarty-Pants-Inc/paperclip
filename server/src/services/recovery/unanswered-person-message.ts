@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, unansweredCardAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -8,6 +8,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -25,7 +26,7 @@ import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
-import { senderStoppedWhileAnswering } from "./person-stopped-message.js";
+import { senderStoppedWhileAnswering, stoppedBySender } from "./person-stopped-message.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -95,6 +96,14 @@ export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
+/** The CARD-ANSWER DUTY's words (RFL ruling 4): the same three outcomes as for a typed message, with "your answer"
+ * in place of "your message". The failed-run line is bb/tamin6's (5cddd3d1 unanswered-person-message.ts:111-112). */
+export const UNANSWERED_CARD_ANSWER_TEXT =
+  "Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.";
+export const UNANSWERED_CARD_ANSWER_NO_RUN_TEXT =
+  "Your answer is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
+export const UNANSWERED_CARD_ANSWER_NO_REPLY_TEXT =
+  "This run finished without a reply to your answer. Sending it again is safe.";
 /** The ONE bound (follow-Paperclip B-2, RFL 05:51Z): the fork's K=2 fresh-continuation chain cap. */
 export const FRESH_CONTINUATION_BOUND = 2;
 export const UNANSWERED_MESSAGE_BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, "
@@ -228,6 +237,38 @@ function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }
         or coalesce(w.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text)))`;
 }
 
+/** SQL over an issue_thread_interactions alias: a person's card answer the task OWES (unansweredCardAnswerSql, the
+ * one function with the card answer as the input), given after every typed message: a newer typed message is the
+ * owed input instead (as on bb/tamin6 unanswered-person-message.ts:310-321). */
+function owedCardAnswerSql(alias: string, now: Date): SQL {
+  const ca = sql.raw(alias);
+  return sql`(${unansweredCardAnswerSql(alias, now)}
+    and not exists (select 1 from ${issueComments} later where later.company_id = ${ca}.company_id
+      and later.issue_id = ${ca}.issue_id and later.author_type = 'user' and later.deleted_at is null
+      and later.created_at > ${ca}.resolved_at))`;
+}
+/** SQL over an issue_thread_interactions alias: an owed card answer in the lookback that has no notice yet. */
+function unnoticedOwedCardAnswerSql(alias: string, now: Date): SQL {
+  const ca = sql.raw(alias);
+  const since = new Date(now.getTime() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString();
+  return sql`(${ca}.resolved_at > ${since}::timestamptz and ${owedCardAnswerSql(alias, now)}
+    and not exists (select 1 from ${issueComments} n where n.company_id = ${ca}.company_id and n.issue_id = ${ca}.issue_id
+      and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}) and ${noticeCoversSql("n", sql`${ca}.id`)}
+      and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))`;
+}
+/** SQL: notice row n (alias) covers a person's card answer that the one function now says is answered. */
+function noticeCoversAnsweredCardSql(n: string): SQL {
+  return sql`exists (select 1 from ${issueThreadInteractions} ca where ca.company_id = ${sql.raw(n)}.company_id
+    and ca.issue_id = ${sql.raw(n)}.issue_id and ca.resolved_at is not null and ${noticeCoversSql(n, sql.raw("ca.id"))}
+    and ${answeredSql({ id: sql.raw("ca.id"), companyId: sql.raw("ca.company_id"), issueId: sql.raw("ca.issue_id"),
+      createdAt: sql.raw("ca.resolved_at") })})`;
+}
+/** SQL over issue_thread_interactions rows (the outer table): an owed card answer with no notice yet. The recovery
+ * worker reads it in the SAME batched statement as unansweredPersonMessageCommentCondition (work.ts). */
+export function owedCardAnswerInteractionCondition(now: Date = new Date()): SQL {
+  return unnoticedOwedCardAnswerSql("issue_thread_interactions", now);
+}
+
 /**
  * SQL: this issue row has a person's message within the lookback that no agent
  * answered and that has no notice yet, or an unanswered-message notice that a
@@ -248,7 +289,26 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and ${answeredSql(rawMessage("m"))}))`;
+      and ${answeredSql(rawMessage("m"))})
+    or exists (select 1 from ${issueThreadInteractions} owed_card where owed_card.company_id = ${companyId}
+      and owed_card.issue_id = ${issueId} and ${unnoticedOwedCardAnswerSql("owed_card", new Date())})
+    or exists (select 1 from ${issueComments} n where n.company_id = ${companyId} and n.issue_id = ${issueId}
+      and n.author_type = 'system' and n.deleted_at is null
+      and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+      and ${noticeCoversAnsweredCardSql("n")}))`;
+}
+
+/** SQL: this issue row has a LIVE unanswered-message notice whose inputs the one function now says are ALL answered
+ * (the notice is due to retire). It holds on ANY task status: the recovery worker's page query also loads a task
+ * that is done or cancelled while this is true, so the notice retires (RETIRE_ON_ANY_STATUS, P9-60). */
+export function answeredNoticeToRetireCondition(issueId: AnyPgColumn, companyId: AnyPgColumn): SQL {
+  return sql`exists (select 1 from ${issueComments} n where n.company_id = ${companyId} and n.issue_id = ${issueId}
+    and n.author_type = 'system' and n.deleted_at is null
+    and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+    and (exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
+      and ${noticeCoversSql("n", sql.raw("m.id"))} and ${answeredSql(rawMessage("m"))}) or ${noticeCoversAnsweredCardSql("n")})
+    and not exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
+      and ${noticeCoversSql("n", sql.raw("m.id"))} and not ${answeredSql(rawMessage("m"))}))`;
 }
 
 /**
@@ -270,10 +330,11 @@ export function unansweredPersonMessageCommentCondition(): SQL {
         and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and exists (select 1 from ${issueComments} m
+      and (exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and ${noticeCoversSql(`"issue_comments"`, sql.raw("m.id"))}
-          and ${answeredSql(rawMessage("m"))})))`;
+          and ${answeredSql(rawMessage("m"))})
+        or ${noticeCoversAnsweredCardSql(`"issue_comments"`)})))`;
 }
 
 export type UnansweredMessageOutcome =
@@ -291,6 +352,8 @@ function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean
     ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
     ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : []),
     context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
+    // A person's card answer is the run's own input too: the answer-resume run's interactionId, a carry's interactionIds.
+    context.interactionId, ...(Array.isArray(context.interactionIds) ? context.interactionIds : []),
   ];
   return ids.includes(messageId);
 }
@@ -358,8 +421,9 @@ async function settleOwedPersonMessages(
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
-      and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
+      and (exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and ${noticeCoversSql("n", sql.raw("m.id"))} and ${answeredSql(rawMessage("m"))})
+        or ${noticeCoversAnsweredCardSql("n")})
       and not exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and ${noticeCoversSql("n", sql.raw("m.id"))} and not ${answeredSql(rawMessage("m"))})`);
     // A group notice with an answered member and a still-owed one STAYS and stays true: it names only the still-owed.
@@ -383,11 +447,18 @@ async function settleOwedPersonMessages(
   // Decide every owed message, then ONE notice per owed GROUP: the members share the run that carried them (or
   // have no run, this pass), the code and the standing note to replace. Never two notices for one message.
   const outcomes: UnansweredMessageOutcome[] = [];
-  const groups = new Map<string, Array<{ index: number; messageId: string | undefined; decision: NoticeDecision }>>();
-  for (const messageId of [...earlierOwed.map(row => row.id), undefined]) {
-    const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies, messageId);
+  // The CARD-ANSWER DUTY (RFL ruling 4): a person's answer to a card is owed input too, decided by the SAME
+  // decision after the task's latest typed message (it is owed only when it is the person's newest input).
+  const owedCardAnswers = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
+    owedCardAnswerInteractionCondition(now))).orderBy(issueThreadInteractions.resolvedAt, issueThreadInteractions.id).limit(5);
+  const groups = new Map<string, Array<{ index: number; messageId: string | undefined; cardAnswerId?: string; decision: NoticeDecision }>>();
+  for (const owed of [...earlierOwed.map(row => ({ messageId: row.id as string | undefined, cardAnswerId: undefined as string | undefined })),
+    { messageId: undefined, cardAnswerId: undefined }, ...owedCardAnswers.map(row => ({ messageId: undefined, cardAnswerId: row.id }))]) {
+    const { messageId, cardAnswerId } = owed;
+    const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies, messageId, cardAnswerId);
     if (decision.kind === "notice") {
-      groups.set(groupKey(decision), [...(groups.get(groupKey(decision)) ?? []), { index: outcomes.length, messageId, decision }]);
+      groups.set(groupKey(decision), [...(groups.get(groupKey(decision)) ?? []), { index: outcomes.length, messageId, cardAnswerId, decision }]);
       outcomes.push({ kind: "noticed_before" });
     } else outcomes.push(await recordPendingDecision(db, issue, decision, now, input.nativeBlockedRepairApplies));
   }
@@ -443,7 +514,7 @@ async function recordPendingDecision(db: Db, issue: DecisionIssue, decision: Exc
 
 /** One owed group: write its ONE notice under the fence, keyed to its latest member that is still to be noticed. */
 async function writeGroupNotice(db: Db, issue: DecisionIssue, now: Date, nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined,
-  members: Array<{ messageId: string | undefined; decision: NoticeDecision }>): Promise<UnansweredMessageOutcome> {
+  members: Array<{ messageId: string | undefined; cardAnswerId?: string; decision: NoticeDecision }>): Promise<UnansweredMessageOutcome> {
   const commentId = await db.transaction(async tx => {
     // The issue fence that comment writers, the executor's held-notice writer
     // and execution admission take. The SAME predicate is evaluated again
@@ -453,8 +524,8 @@ async function writeGroupNotice(db: Db, issue: DecisionIssue, now: Date, nativeB
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
     const kept: NoticeDecision[] = [];
-    for (const { messageId, decision } of members) {
-      const again = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies, messageId);
+    for (const { messageId, cardAnswerId, decision } of members) {
+      const again = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies, messageId, cardAnswerId);
       if (again.kind === "notice" && again.reason === decision.reason && groupKey(again) === groupKey(decision)) kept.push(again);
     }
     // Members are oldest first, the task's latest message last: the notice is keyed to the latest one kept.
@@ -510,12 +581,21 @@ export const PENDING_WAIT_BOUND_MS = 2 * 60_000;
 /** The one predicate: run outside the fence to skip the lock in the common
  * case, and again unchanged inside it before writing. Reads only. */
 async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
-  nativeBlockedRepairApplies?: NativeBlockedRepairApplies, messageId?: string): Promise<Decision> {
+  nativeBlockedRepairApplies?: NativeBlockedRepairApplies, messageId?: string, cardAnswerId?: string): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
 
-  const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
+  // The owed input: a typed message, or (cardAnswerId) the person's ANSWER to a card, keyed by the card id and its
+  // answer time and read by the same owed rule (owedCardAnswerSql: the one function with the answer as the input).
+  const cardAnswer = Boolean(cardAnswerId);
+  const [cardAnswerRow] = cardAnswerId ? await q.select({ id: issueThreadInteractions.id, createdAt: issueThreadInteractions.resolvedAt,
+    authorUserId: issueThreadInteractions.resolvedByUserId }).from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
+    eq(issueThreadInteractions.id, cardAnswerId), owedCardAnswerSql("issue_thread_interactions", now))).limit(1) : [];
+  if (cardAnswerId && !cardAnswerRow?.createdAt) return { kind: "answered" };
+  const [message] = cardAnswerRow?.createdAt ? [{ ...cardAnswerRow, createdAt: cardAnswerRow.createdAt }]
+    : await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
     authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), messageId ? eq(issueComments.id, messageId) : undefined))
@@ -556,7 +636,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // message is not owed a notice, and a standing one stops covering it. A stop by anyone else (another user, an
   // agent, the system, a pause, a timeout) or of a run that had not read the message keeps the message owed. The
   // ONE rule (person-stopped-message.ts senderStoppedWhileAnswering), read by this decision and the carry.
-  if (await senderStoppedWhileAnswering(q, issue.companyId, messageRun, message)) {
+  if (!cardAnswer && await senderStoppedWhileAnswering(q, issue.companyId, messageRun, message)) {
     return { kind: "person_stopped", messageId: message.id, noticeId: noticed?.id ?? null };
   }
   // A standing WAITING note is still an open obligation: it must stay true.
@@ -648,10 +728,30 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
 
   // A board-owned hold means nothing moves by itself: queued wakes behind it
   // do not count as a further attempt.
-  const [boardHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+  const [boardHold] = await q.select({ id: issueRecoveryActions.id, evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
+  // STOP_HOLD_YIELDS_TO_SENDER_STOP (review-fleet-5 20:34Z): a person's real Stop (routes/agents.ts
+  // POST /heartbeat-runs/:runId/cancel) leaves the cancelled run AND a board-owned hold on it (active_run_watchdog,
+  // cause native_continuation_requires_reconciliation or legacy_execution_requires_reconciliation, evidence.runId).
+  // That hold must not turn the sender's own Stop into a "no run started" line: a message of the SAME sender whose
+  // own wake still waits in line behind the run they stopped is kept for their Send, by their own Stop. The Stop
+  // line is the one note (ruling 8). A hold from any other stop, or a message with no waiting wake, decides below.
+  if (boardHold && !cardAnswer && !agentPaused && !messageRun && message.authorUserId) {
+    const heldRunId = (boardHold.evidence as Record<string, unknown> | null)?.runId;
+    const [heldRun] = typeof heldRunId === "string" ? await q.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+      resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, heldRunId), eq(heartbeatRuns.agentId, agentId))) : [];
+    if (heldRun && stoppedBySender(heldRun, message.authorUserId)) {
+      const waiting = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+        inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
+      if (waiting.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id))) {
+        return { kind: "person_stopped", messageId: message.id, noticeId: noticed?.id ?? null };
+      }
+    }
+  }
   if (!boardHold && !agentPaused) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
@@ -779,16 +879,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
       >= FRESH_CONTINUATION_BOUND);
   const body = paused ? agentPausedText(pausedName)
+    // The card-answer duty's words follow the run's REAL outcome (rulings 1, 4; bb/tamin6 :1105-1107).
+    : cardAnswer ? !run || code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_CARD_ANSWER_NO_RUN_TEXT
+      : ["failed", "timed_out", "interrupted"].includes(run.status) ? UNANSWERED_CARD_ANSWER_TEXT
+        : UNANSWERED_CARD_ANSWER_NO_REPLY_TEXT
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: paused ? `${pausedName} is paused` : "Your message wasn't answered",
+      title: paused ? `${pausedName} is paused` : cardAnswer ? "Your answer wasn't acted on" : "Your message wasn't answered",
       body,
       tone: "warning",
       nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+        : cardAnswer ? "Retry; if it fails again, assign this agent a new task."
         : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
@@ -799,7 +904,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     failureCode: waiting ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
-  return { kind: "notice", reason, code, notice, group: messageRun?.id ?? UNANSWERED_MESSAGE_NO_RUN_CODE, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
+  // A card answer's notice is its own group: its words are the answer's, never shared with a typed message.
+  return { kind: "notice", reason, code, notice,
+    group: `${cardAnswer ? "card_answer:" : ""}${messageRun?.id ?? UNANSWERED_MESSAGE_NO_RUN_CODE}`, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
 
 

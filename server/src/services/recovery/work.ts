@@ -1,6 +1,7 @@
 import { registerTaskWatchdogWork } from "../task-watchdog-work.js";
 import { and, asc, eq, gt, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
-import { issueComments, issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
+import { unionAll } from "drizzle-orm/pg-core";
+import { issueComments, issueRecoveryActions, issueRelations, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, type DeliveryQueue } from "../delivery-work-notifications.js";
 import { decodeIssueRecoveryHint, ISSUE_RECOVERY_BACKSTOP_MS, ISSUE_RECOVERY_FULL_BACKSTOP_MS, ISSUE_RECOVERY_RELOAD_HINT, issueRecoveryBackstopHint,
@@ -11,7 +12,8 @@ import { workSignalDebug } from "@paperclipai/db/work-signal-debug";
 import { recoveryActionSweepCondition } from "./blocker-stall-wakeups.js";
 import { changedTaskCondition } from "./changed-tasks.js";
 import { createRecoveryPassReads, type RecoveryPassReads } from "./pass-reads.js";
-import { unansweredPersonMessageCommentCondition, unansweredPersonMessageCondition } from "./unanswered-person-message.js";
+import { answeredNoticeToRetireCondition, owedCardAnswerInteractionCondition, unansweredPersonMessageCommentCondition,
+  unansweredPersonMessageCondition } from "./unanswered-person-message.js";
 
 type Entry = { id: string; companyId: string; dueAt: number; fromDeadline?: true;
   origin?: "reload" | "reconnect" | "backstop" | "company" | "every_task" | "agent" | "hint"; unanswered?: boolean };
@@ -290,7 +292,10 @@ export function registerIssueRecoveryWork(
           cursor ? gt(issues.id, cursor) : undefined,
           statuses
             ? alsoBlockedWhen
-              ? or(inArray(issues.status, statuses), and(eq(issues.status, "blocked"), alsoBlockedWhen()))
+              // RETIRE_ON_ANY_STATUS: a done or cancelled task is loaded too while it shows a live unanswered-message
+              // notice whose messages are all answered, so the notice retires (it used to stay on a finished task).
+              ? or(inArray(issues.status, statuses), and(eq(issues.status, "blocked"), alsoBlockedWhen()),
+                and(inArray(issues.status, ["done", "cancelled"]), answeredNoticeToRetireCondition(issues.id, issues.companyId)))
               : inArray(issues.status, statuses)
             : or(isNotNull(issues.checkoutRunId), isNotNull(issues.executionRunId)),
           statuses ? isNull(issues.hiddenAt) : undefined,
@@ -310,9 +315,14 @@ export function registerIssueRecoveryWork(
         // (It reads issue_comments, not issues: it is a comment scan, budgeted
         // on its own in unanswered-person-message.test.ts, not a page load.)
         const flagged = alsoBlockedWhen && rows.length
-          ? new Set((await db.select({ issueId: issueComments.issueId }).from(issueComments)
-            .where(and(inArray(issueComments.issueId, rows.map(row => row.id)), unansweredPersonMessageCommentCondition()))
-            .orderBy(asc(issueComments.issueId)).limit(PAGE_SIZE * 10)).map(row => row.issueId))
+          // The same statement also reads the page's owed CARD ANSWERS (the card-answer duty, RFL ruling 4).
+          ? new Set((await unionAll(
+            db.select({ issueId: issueComments.issueId }).from(issueComments)
+              .where(and(inArray(issueComments.issueId, rows.map(row => row.id)), unansweredPersonMessageCommentCondition()))
+              .orderBy(asc(issueComments.issueId)).limit(PAGE_SIZE * 10),
+            db.select({ issueId: issueThreadInteractions.issueId }).from(issueThreadInteractions)
+              .where(and(inArray(issueThreadInteractions.issueId, rows.map(row => row.id)), owedCardAnswerInteractionCondition()))
+              .limit(PAGE_SIZE))).map(row => row.issueId))
           : null;
         return { rows: rows.map(row => ({ ...row, dueAt: Date.now(), ...(origin ? { origin } : {}),
           ...(flagged ? { unanswered: flagged.has(row.id) } : {}) })), complete, ...keepUnseen };
