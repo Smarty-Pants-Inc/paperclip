@@ -1270,10 +1270,28 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(JSON.stringify(notices)).not.toMatch(/is paused|resume/i);
   });
 
+  // SUPERSEDE-PAUSED-LINE-STOPUNCONFIRMED-1118: this pausing agent's Stop host
+  // step has not completed (lifecycleOperation.hostComplete is not true), so its
+  // previous run's stop is unconfirmed: the paused line with that one sentence.
   it("paused-line control: the pause route's hold on a pausing agent keeps the paused line", async () => {
     const f = await fixture();
     await f.run({ commentId: await f.message("Before Stop"), status: "cancelled", errorCode: "cancelled" });
     await db.update(agents).set({ status: "paused", lifecycleState: "pausing", lifecycleHolds: ["manual"], pauseReason: "manual" })
+      .where(eq(agents.id, f.agentId));
+    await f.message("After Stop, please continue.");
+    await f.sweep();
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    expect((await f.visible()).map(n => n.body)).toEqual(["Managed Pi is paused. We could not confirm that its previous run stopped. "
+      + "Your message is saved, and it will run when Managed Pi is resumed. A board user or Managed Pi's manager can resume Managed Pi."]);
+  });
+
+  // RFL 'D': pausing + manual hold + stop CONFIRMED (the Stop host step
+  // completed: hostComplete true, a plugin step still pending) -> the plain line.
+  it("paused-line: pausing with the manual hold and its stop confirmed -> the plain paused line, unchanged", async () => {
+    const f = await fixture();
+    await f.run({ commentId: await f.message("Before Stop"), status: "cancelled", errorCode: "cancelled" });
+    await db.update(agents).set({ status: "paused", lifecycleState: "pausing", lifecycleHolds: ["manual"], pauseReason: "manual",
+      lifecycleOperation: { id: randomUUID(), hostComplete: true, completedPluginIds: [], attempts: 0, pendingReason: "plugin_step_pending" } as never })
       .where(eq(agents.id, f.agentId));
     await f.message("After Stop, please continue.");
     await f.sweep();
