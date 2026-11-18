@@ -31,6 +31,7 @@ const fixture = vi.hoisted(() => ({
   warm: true,
   calls: [] as string[],
   onFirst: undefined as undefined | ((input: { runId: string }) => Promise<void>),
+  holdCancel: undefined as undefined | Promise<void>,
 }));
 
 vi.mock("../services/heartbeat/runtime-selection.js", async importOriginal => {
@@ -54,6 +55,8 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
     // Provider edge of Stop: the run-only abort reached the live Pi session
     // (dispatched). The durable intent and acknowledgement stay product code.
     cancelNativeSession: (async (runId: string, reason: string, options?: Parameters<typeof actual.cancelNativeSession>[2]) => {
+      // D4: hold the provider edge of the Stop so the stopped run is genuinely still running when Send lands.
+      if (fixture.holdCancel) await fixture.holdCancel;
       const result = await actual.cancelNativeSession(runId, reason, options!);
       if (!options || !fixture.calls.includes(runId) || typeof result !== "object") return result;
       const { db } = options;
@@ -182,6 +185,10 @@ describe.skipIf(!support.supported)("optS-dd: default-DENY stop-acceptance row",
     appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: f.runId, agentId: f.agentId, eventType: "lifecycle", stream: "system",
       level: "info", message: "run.stop.accepted", payload: { schema: "paperclip.stop-acceptance.v1", kind, issueId: f.issueId,
         userId, acceptedAt: new Date(0).toISOString(), ...extra } });
+  const duringRun = async (runId: string, rowId: number) => {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.update(heartbeatRunEvents).set({ createdAt: new Date(run!.finishedAt!.getTime() - 1) }).where(eq(heartbeatRunEvents.id, rowId));
+  };
   const sendOutcome = async (s: Awaited<ReturnType<typeof heldThenStop>>) => {
     const sent = await s.send();
     await s.settle();
@@ -236,7 +243,7 @@ describe.skipIf(!support.supported)("optS-dd: default-DENY stop-acceptance row",
     });
     const held: string[] = [];
     let stopping: Promise<unknown> | undefined;
-    let sendWhileRunning: { status?: string; res: number; body?: unknown } | undefined;
+    let sendWhileRunning: { status?: string; statusAtAccept?: string; res: number; body?: unknown } | undefined;
     fixture.onFirst = async ({ runId }) => {
       // Three person messages while the turn is busy: the chat route holds them.
       for (const body of ["M1 held", "M2 held", "M3 held"])
@@ -251,11 +258,20 @@ describe.skipIf(!support.supported)("optS-dd: default-DENY stop-acceptance row",
       stopping = stopBy === "interrupt" ? interrupt()
         : stopBy === "person" ? routeStop()
         : stopBy === "person_then_send" ? (async () => {
+          let release!: () => void;
+          fixture.holdCancel = new Promise<void>(resolve => { release = resolve; });
           const stop = routeStop(); void stop.then(() => undefined, () => undefined);
-          await waitFor(async () => (await acceptance(runId)).length > 0);
-          // Send pressed while the stopped run is still running: the Send is itself an accepted Interrupt.
+          // The Stop's fence has committed (B and this build both record executionCancellation in it).
+          await waitFor(async () => !!(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.resultJson?.executionCancellation);
           const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-          const r = await interrupt(); sendWhileRunning = { status: row?.status, res: r.status, body: r.body };
+          let answered = false;
+          const sending = interrupt(); void sending.then(() => { answered = true; }, () => { answered = true; });
+          // Its own cancel is held too: wait until the route answered or its Interrupt was accepted.
+          await waitFor(async () => answered || (await kinds(runId)).includes("interrupt"), 5_000).catch(() => undefined);
+          const [atAccept] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+          fixture.holdCancel = undefined; release();
+          const r = await sending;
+          sendWhileRunning = { status: row?.status, statusAtAccept: atAccept?.status, res: r.status, body: r.body };
           return await stop;
         })()
         : heartbeat.cancelRun(runId, "Cancelled by a board operator", {
@@ -345,7 +361,9 @@ describe.skipIf(!support.supported)("optS-dd: default-DENY stop-acceptance row",
   it.each(["stop_then_interrupt", "interrupt_then_stop"] as const)("R8 %s: no dispatch", async order => {
     const s = await heldThenStop(order === "stop_then_interrupt" ? "person" : "interrupt");
     try {
-      await sameShapeRow(s.f, order === "stop_then_interrupt" ? "interrupt" : "person_stop");
+      const { row } = await sameShapeRow(s.f, order === "stop_then_interrupt" ? "interrupt" : "person_stop");
+      // Accepted while the run was live (before finished_at), so only the kind terms can deny it.
+      await duringRun(s.f.runId, row.id);
       expect(await kinds(s.f.runId)).toEqual(["interrupt", "person_stop"]);
       const out = await sendOutcome(s);
       await evidence(`R8-${order}`, out);
@@ -353,18 +371,23 @@ describe.skipIf(!support.supported)("optS-dd: default-DENY stop-acceptance row",
     } finally { s.done(); }
   }, 120_000);
 
-  // D4 (condition 7): Send pressed while the stopped run is still running. DESIGN expected the route
-  // (issues.ts :18155) to accept it as an Interrupt; on this build the route refuses it (409) while the
-  // person Stop's cancellation is pending, so it writes no row and starts nothing: never S from that click.
-  it("D4 Send while the stopped run is still running: refused, no successor, no extra acceptance", async () => {
+  // D4 (condition 7): Send pressed while the stopped run is still running. Two real outcomes, both observed:
+  // the route accepts it as an Interrupt (200, DESIGN's issues.ts :18155) and writes an interrupt row, or it
+  // refuses it (409) while the Stop's cancellation is pending and writes nothing. Either way: never S, no successor.
+  it.each([1, 2, 3, 4])("D4 Send while the stopped run is still running (try %i): never S", async attempt => {
     const s = await heldThenStop("person_then_send");
     try {
-      await evidence("D4-send-while-running", { sendWhileRunning: s.sendWhileRunning(), kinds: await kinds(s.f.runId) });
-      expect(s.sendWhileRunning()?.status).toBe("running");
-      expect(s.sendWhileRunning()?.res).toBe(409);
-      expect(await kinds(s.f.runId)).toEqual(["person_stop"]);
+      const pressed = s.sendWhileRunning();
+      const k = await kinds(s.f.runId);
       await s.settle();
-      expect(turns, "the refused Send starts nothing").toEqual([]);
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, s.f.companyId));
+      await evidence("D4-send-while-running", { attempt, status: pressed?.status, statusAtAccept: pressed?.statusAtAccept, res: pressed?.res, kinds: k, held: s.held, turns: [...turns],
+        wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait?.reason })) });
+      expect(pressed?.status).toBe("running");
+      expect(pressed?.statusAtAccept).toBe("running");
+      expect(turns, "no successor from the Send pressed while running").toEqual([]);
+      if (pressed?.res === 200) expect(k).toEqual(["interrupt", "person_stop"]);
+      else { expect(pressed?.res).toBe(409); expect(k).toEqual(["person_stop"]); }
     } finally { s.done(); }
   }, 120_000);
 
@@ -374,9 +397,10 @@ describe.skipIf(!support.supported)("optS-dd: default-DENY stop-acceptance row",
   it.each(["adapter_stamped", "other_user", "after_finish"] as const)("D3 forged %s row after a system cancel does not admit S", async mode => {
     const s = await heldThenStop("system");
     try {
-      if (mode === "adapter_stamped") await sameShapeRow(s.f, "person_stop", { receivedAt: new Date().toISOString(), adapterEventIndex: 1 });
-      if (mode === "other_user") await sameShapeRow(s.f, "person_stop", { userId: "someone-else" });
-      if (mode === "after_finish") await sameShapeRow(s.f, "person_stop");
+      const { row } = await sameShapeRow(s.f, "person_stop", mode === "adapter_stamped"
+        ? { receivedAt: new Date().toISOString(), adapterEventIndex: 1 } : mode === "other_user" ? { userId: "someone-else" } : {});
+      // A forging writer runs during the run: only after_finish is left outside the window.
+      if (mode !== "after_finish") await duringRun(s.f.runId, row.id);
       // Even a payload-exact row written after the run finished is out of the cancel's window.
       await db.update(heartbeatRuns).set({ resultJson: sql`${heartbeatRuns.resultJson} || ${JSON.stringify({ cancelledByActorType: "user", cancelledByUserId: userId })}::jsonb` })
         .where(eq(heartbeatRuns.id, s.f.runId));
