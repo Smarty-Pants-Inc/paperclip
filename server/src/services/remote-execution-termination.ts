@@ -2,6 +2,7 @@ import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { retiredReusableLeasePredecessors } from "./environment-lease-handoff.js";
 import { OWN_PROCESS_START_EVENT_TYPES } from "./native-process-start-events.js";
+import { NEVER_REUSE_SCOPE } from "./never-reuse-scope.js";
 
 type Lease = typeof environmentLeases.$inferSelect;
 
@@ -54,6 +55,13 @@ export function personStoppedRun(run: ResumeFencePredecessorRun | null | undefin
   return run?.status === "cancelled" && (run.cancelledByActorType === "user" || run.cancelledByActorType === "board");
 }
 
+/** Whether P's ending is inside NEVER_REUSE_SCOPE (never-reuse-scope.ts, the
+ * one switch): no other run ever resumes its box, no window. */
+export function neverReusedAfter(run: ResumeFencePredecessorRun | null | undefined): boolean {
+  if (!run || !RESUME_FENCED_PREDECESSOR_RUN_STATUSES.has(run.status)) return false;
+  return NEVER_REUSE_SCOPE === "not_succeeded" || personStoppedRun(run);
+}
+
 /** B1 (fence a, the judges' joint line, smarty-dev#4605 comment 6992985316):
  * a released lease whose typed termination receipt is "stopped" or
  * "destroyed" (alike, as ownLeaseTerminated reads them) may still hold its
@@ -62,8 +70,10 @@ export function personStoppedRun(run: ResumeFencePredecessorRun | null | undefin
  * memory window). When (B) P's run (the lease's heartbeatRunId) ended NOT
  * succeeded, NO other run may resume that box, whoever it is (the same
  * conversation's later run too):
- * - P stopped by a PERSON (personStoppedRun): never, no window (org purple
- *   cut (2), 2026-11-18 23:11Z: never reuse the fenced box);
+ * - P's ending inside NEVER_REUSE_SCOPE (neverReusedAfter; default
+ *   "person_stop": P stopped by a PERSON, personStoppedRun; "not_succeeded":
+ *   every not-succeeded ending): never, no window (org purple cut (2),
+ *   2026-11-18 23:11Z: never reuse the fenced box);
  * - any other not-succeeded ending: until PREDECESSOR_LONG_STOP_MS after the
  *   receipt was confirmed (RFL). Window-only: c1 records no typed,
  *   lease-bound proof that the Runner was gone before the box froze.
@@ -82,8 +92,9 @@ export function stoppedReceiptFencesOtherRunResume(input: {
   if (!hasResumeFenceReceipt(input.lease)) return false;
   // (B) only a run that did not succeed.
   if (!input.predecessorRun || !RESUME_FENCED_PREDECESSOR_RUN_STATUSES.has(input.predecessorRun.status)) return false;
-  // A person's Stop: never, at any age.
-  if (personStoppedRun(input.predecessorRun)) return true;
+  // Inside NEVER_REUSE_SCOPE (a person's Stop; under "not_succeeded" every
+  // not-succeeded ending): never, at any age.
+  if (neverReusedAfter(input.predecessorRun)) return true;
   const receipt = input.lease.metadata!.remoteExecutionTermination as { confirmedAt?: unknown };
   const confirmedAt = typeof receipt.confirmedAt === "string" ? Date.parse(receipt.confirmedAt) : Number.NaN;
   // A receipt without a readable confirmation time proves no window ended.

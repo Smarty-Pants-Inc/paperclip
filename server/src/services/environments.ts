@@ -1,7 +1,7 @@
 import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY } from "./agent-file-save-hold.js";
 import { notifyEnvironmentConfigChange, withEnvironmentConfigChange } from "./environment-config-revision.js";
 import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
-import { hasResumeFenceReceipt, personStoppedRun, resumeFencePredecessorRunColumns, stoppedReceiptFencesOtherRunResume } from "./remote-execution-termination.js";
+import { hasResumeFenceReceipt, neverReusedAfter, personStoppedRun, resumeFencePredecessorRunColumns, stoppedReceiptFencesOtherRunResume } from "./remote-execution-termination.js";
 import { inheritWarmRetentionMetadata } from "./environment-warm-retention.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { clearRemoteWorkspaceLocationForReleasedLease } from "./remote-workspace-snapshot-retention.js";
@@ -1679,6 +1679,8 @@ export function environmentService(db: Db) {
                   predecessorRun })) {
                   throw conflict(personStoppedRun(predecessorRun)
                     ? "Reusable sandbox lease's run was stopped by a person; another run never resumes it."
+                    : neverReusedAfter(predecessorRun)
+                    ? "Reusable sandbox lease's run did not succeed; another run never resumes it."
                     : "Reusable sandbox lease is inside a stopped or failed run's long-stop window.");
                 }
                 const handoff = createReusableLeaseHandoff(retired[0]!, { ...values, id: replacementLeaseId! });

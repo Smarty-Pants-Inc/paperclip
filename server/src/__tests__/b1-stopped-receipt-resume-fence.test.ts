@@ -21,6 +21,7 @@ import { environmentRuntimeService } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
+import type { NeverReuseScope } from "../services/never-reuse-scope.ts";
 
 // B1 fence (a), the judges' JOINT line (smarty-dev#4605 comment 6992985316):
 // Boat resumes a box stopped for less than ~10 minutes with memory and
@@ -38,6 +39,19 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 // resumes the box, at + 16 min, + 2 h or later. Every other not-succeeded
 // ending (failed, timed_out, interrupted, a cancel no person asked for) keeps
 // the fifteen-minute window, as RFL ruled.
+
+// The ONE scope switch (never-reuse-scope.ts, org 23:18Z): every row below runs
+// under both settings. Production reads the constant; the rows swap its value
+// through this module mock (the predicate reads it on every call).
+//   A "person_stop" (default): never only after a person's Stop; failed,
+//     timed_out, interrupted and an unattributed cancel keep the window.
+//   B "not_succeeded" (rf-4's P3): never after every not-succeeded ending.
+const NEVER_REUSE_SCOPES: NeverReuseScope[] = ["person_stop", "not_succeeded"];
+const scopeUnderTest = vi.hoisted(() => ({ current: undefined as NeverReuseScope | undefined }));
+vi.mock("../services/never-reuse-scope.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/never-reuse-scope.js")>();
+  return { ...actual, get NEVER_REUSE_SCOPE() { return scopeUnderTest.current ?? actual.NEVER_REUSE_SCOPE; } };
+});
 
 vi.mock("../services/native-runtime/native-harness-backup-storage.js", () => ({
   verifyRecoverableNativeHarnessBackup: vi.fn(async (input: { stamp: unknown; providerLeaseId: string }) =>
@@ -210,222 +224,263 @@ describeEmbeddedPostgres("B1 fence (a): a box a stopped or failed run left is no
     expect(acquired.lease.providerLeaseId).toBe(providerLeaseId);
   }
 
-  // ---------------- REFUSED (RED at c1b, GREEN at the head) ----------------
+  // Every row runs under BOTH NEVER_REUSE_SCOPE settings (org 23:18Z); a row
+  // whose outcome depends on the setting asserts each setting's outcome.
+  for (const scope of NEVER_REUSE_SCOPES) {
+  describe(`NEVER_REUSE_SCOPE = ${scope}`, () => {
+    beforeEach(() => { scopeUnderTest.current = scope; });
+    afterAll(() => { scopeUnderTest.current = undefined; });
+    const never = scope === "not_succeeded";
 
-  // PLANTED twin of "REAL: a person's Stop ..." below.
-  for (const minutes of [9, 11]) {
-    it(`refused: a different issue's run at + ${minutes} min after a person-STOPPED P (cancelled) gets a fresh box`, async () => {
+    // ---------------- REFUSED (RED at c1b, GREEN at the head) ----------------
+
+    // PLANTED twin of "REAL: a person's Stop ..." below.
+    for (const minutes of [9, 11]) {
+      it(`refused: a different issue's run at + ${minutes} min after a person-STOPPED P (cancelled) gets a fresh box`, async () => {
+        const seeded = await setup();
+        const confirmedAt = Date.now() - 30 * MINUTE;
+        await plant(seeded, { pStatus: "cancelled", state: "stopped", confirmedAt, person: true });
+        clockAt(confirmedAt, minutes * MINUTE);
+        await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
+      });
+
+      // Paul's d2f6b4fd shape: a FAILED P whose box was kept (retained) with a 'stopped' receipt.
+      it(`refused: a different issue's run at + ${minutes} min after a FAILED P (box retained) gets a fresh box`, async () => {
+        const seeded = await setup();
+        const confirmedAt = Date.now() - 30 * MINUTE;
+        await plant(seeded, { pStatus: "failed", state: "stopped", confirmedAt, leaseStatus: "retained" });
+        clockAt(confirmedAt, minutes * MINUTE);
+        await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
+      });
+
+      it(`refused: a different issue's run at + ${minutes} min after a stopped P whose receipt is 'destroyed' gets a fresh box`, async () => {
+        const seeded = await setup();
+        const confirmedAt = Date.now() - 30 * MINUTE;
+        await plant(seeded, { pStatus: "cancelled", state: "destroyed", confirmedAt, person: true });
+        clockAt(confirmedAt, minutes * MINUTE);
+        await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB), "destroyed");
+      });
+    }
+
+    it("refused: the SAME issue's successor (Send after Stop) at + 2 min gets a fresh box", async () => {
       const seeded = await setup();
       const confirmedAt = Date.now() - 30 * MINUTE;
       await plant(seeded, { pStatus: "cancelled", state: "stopped", confirmedAt, person: true });
-      clockAt(confirmedAt, minutes * MINUTE);
-      await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
+      clockAt(confirmedAt, 2 * MINUTE);
+      const successor = await newRun(seeded, seeded.issueA);
+      await expectRefused(seeded, await acquire(seeded, successor, seeded.issueA));
     });
 
-    // Paul's d2f6b4fd shape: a FAILED P whose box was kept (retained) with a 'stopped' receipt.
-    it(`refused: a different issue's run at + ${minutes} min after a FAILED P (box retained) gets a fresh box`, async () => {
+    // REAL producers: P is stopped by the real cancel service (heartbeat
+    // cancelRun, the person-Stop route's service) and its lease is released by
+    // the real teardown release (run-control releaseEnvironmentLeasesForRun ->
+    // releaseRunLeases -> stop-and-retain -> remoteTerminationReceipt). No
+    // hand-written row.
+    // This row's cancelRun carries no person attribution (as at 6da702b4): it
+    // is a cancel no person asked for, so the window still applies.
+    it(`REAL: a control-plane cancel of P (real cancelRun, no person) + real release refuses a different issue's run right after; + 16 min ${never ? "and + 2 h refused (scope B: never)" : "resumes (scope A: window kept)"}`, async () => {
+      const seeded = await setup();
+      const heartbeat = heartbeatService(db, { pluginWorkerManager: seeded.manager, environmentRuntime: seeded.runtime });
+      await heartbeat.cancelRun(seeded.pRunId, "Stopped by a person");
+      const [pRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.pRunId));
+      expect(pRun?.status).toBe("cancelled");
+      // The run's real teardown release: P was a warm run (keep_running asked);
+      // run-control turns a person's Stop into stop_and_retain, and the real
+      // release path binds the provider's 'stopped' reply into P's receipt.
+      await heartbeat.releaseEnvironmentLeasesForRun({ runId: seeded.pRunId, companyId: seeded.companyId,
+        agentId: seeded.agentId, status: pRun!.status, providerResourceDisposition: "keep_running" });
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
+      const receipt = lease?.metadata?.remoteExecutionTermination as { state?: string; runId?: string; confirmedAt?: string };
+      expect(receipt?.state).toBe("stopped");
+      expect(receipt?.runId).toBe(seeded.pRunId);
+      expect(["released", "retained"]).toContain(lease?.status);
+
+      await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
+
+      clockAt(Date.parse(receipt.confirmedAt!), 16 * MINUTE);
+      const later = await newRun(seeded, seeded.issueB);
+      if (!never) {
+        expectResumed(seeded, await acquire(seeded, later, seeded.issueB));
+        return;
+      }
+      await expectRefused(seeded, await acquire(seeded, later, seeded.issueB));
+      vi.restoreAllMocks();
+      clockAt(Date.parse(receipt.confirmedAt!), 2 * HOUR);
+      await expectRefused(seeded, await acquire(seeded, await newRun(seeded, seeded.issueB), seeded.issueB));
+    });
+
+    // NEVER (org purple (2)): P stopped by a PERSON through the Stop route's
+    // service call (the exact cancelRun options routes/agents.ts passes for a
+    // person) and released by the real teardown release. RED at 6da702b4 (the
+    // window let + 16 min resume), GREEN after.
+    it("REAL NEVER: a person's Stop of P (Stop route's cancelRun + real release): another run is refused at + 16 min and at + 2 h", async () => {
+      const seeded = await setup();
+      const heartbeat = heartbeatService(db, { pluginWorkerManager: seeded.manager, environmentRuntime: seeded.runtime });
+      await heartbeat.cancelRun(seeded.pRunId, "Cancelled by a board operator", { resultJson: { ...PERSON_STOP } });
+      const [pRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.pRunId));
+      expect(pRun?.status).toBe("cancelled");
+      expect(pRun?.resultJson?.cancelledByActorType).toBe("user");
+      await heartbeat.releaseEnvironmentLeasesForRun({ runId: seeded.pRunId, companyId: seeded.companyId,
+        agentId: seeded.agentId, status: pRun!.status, providerResourceDisposition: "keep_running" });
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
+      const receipt = lease?.metadata?.remoteExecutionTermination as { state?: string; runId?: string; confirmedAt?: string };
+      expect(receipt?.state).toBe("stopped");
+      expect(receipt?.runId).toBe(seeded.pRunId);
+
+      clockAt(Date.parse(receipt.confirmedAt!), 16 * MINUTE);
+      await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
+
+      vi.restoreAllMocks();
+      clockAt(Date.parse(receipt.confirmedAt!), 2 * HOUR);
+      const later = await newRun(seeded, seeded.issueB);
+      await expectRefused(seeded, await acquire(seeded, later, seeded.issueB));
+    });
+
+    // FLIPPED BY DESIGN (org purple (2)): at 6da702b4 this row was "allowed: at
+    // + 16 min ... a different issue's run resumes B" for a cancelled P. A
+    // person-stopped P's box is now never resumed by another run.
+    it("refused (was allowed at + 16 min): a person-STOPPED P's box is refused to a different issue's run at + 16 min and at + 2 h", async () => {
+      const seeded = await setup();
+      const confirmedAt = Date.now() - 30 * MINUTE;
+      await plant(seeded, { pStatus: "cancelled", state: "stopped", confirmedAt, person: true });
+      clockAt(confirmedAt, 16 * MINUTE);
+      await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
+      vi.restoreAllMocks();
+      clockAt(confirmedAt, 2 * HOUR);
+      await expectRefused(seeded, await acquire(seeded, await newRun(seeded, seeded.issueB), seeded.issueB));
+    });
+
+    // ---------------- ALLOWED ----------------
+
+    // THE SCOPE ROW. A: a FAILED P keeps the fifteen-minute window (RFL), so
+    // + 16 min resumes. B: a FAILED P's box is never resumed (+ 16 min, + 2 h).
+    it(never
+      ? "refused (scope B: never): at + 16 min and + 2 h after a FAILED P (box retained) a different issue's run gets a fresh box"
+      : "allowed (scope A): at + 16 min after a FAILED P (box retained) a different issue's run resumes B (window kept)", async () => {
       const seeded = await setup();
       const confirmedAt = Date.now() - 30 * MINUTE;
       await plant(seeded, { pStatus: "failed", state: "stopped", confirmedAt, leaseStatus: "retained" });
-      clockAt(confirmedAt, minutes * MINUTE);
+      clockAt(confirmedAt, 16 * MINUTE);
+      if (!never) {
+        expectResumed(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
+        return;
+      }
       await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
+      vi.restoreAllMocks();
+      clockAt(confirmedAt, 2 * HOUR);
+      await expectRefused(seeded, await acquire(seeded, await newRun(seeded, seeded.issueB), seeded.issueB));
     });
 
-    it(`refused: a different issue's run at + ${minutes} min after a stopped P whose receipt is 'destroyed' gets a fresh box`, async () => {
+    // PLANTED twin of "REAL: a SUCCEEDED P ..." below.
+    it("allowed: a SUCCEEDED P's box is resumed by a different issue's run at + 2 min (warm reuse)", async () => {
       const seeded = await setup();
       const confirmedAt = Date.now() - 30 * MINUTE;
-      await plant(seeded, { pStatus: "cancelled", state: "destroyed", confirmedAt, person: true });
-      clockAt(confirmedAt, minutes * MINUTE);
-      await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB), "destroyed");
+      await plant(seeded, { pStatus: "succeeded", state: "stopped", confirmedAt });
+      clockAt(confirmedAt, 2 * MINUTE);
+      expectResumed(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
     });
-  }
 
-  it("refused: the SAME issue's successor (Send after Stop) at + 2 min gets a fresh box", async () => {
-    const seeded = await setup();
-    const confirmedAt = Date.now() - 30 * MINUTE;
-    await plant(seeded, { pStatus: "cancelled", state: "stopped", confirmedAt, person: true });
-    clockAt(confirmedAt, 2 * MINUTE);
-    const successor = await newRun(seeded, seeded.issueA);
-    await expectRefused(seeded, await acquire(seeded, successor, seeded.issueA));
-  });
-
-  // REAL producers: P is stopped by the real cancel service (heartbeat
-  // cancelRun, the person-Stop route's service) and its lease is released by
-  // the real teardown release (run-control releaseEnvironmentLeasesForRun ->
-  // releaseRunLeases -> stop-and-retain -> remoteTerminationReceipt). No
-  // hand-written row.
-  // This row's cancelRun carries no person attribution (as at 6da702b4): it
-  // is a cancel no person asked for, so the window still applies.
-  it("REAL: a control-plane cancel of P (real cancelRun, no person) + real release refuses a different issue's run right after; + 16 min resumes", async () => {
-    const seeded = await setup();
-    const heartbeat = heartbeatService(db, { pluginWorkerManager: seeded.manager, environmentRuntime: seeded.runtime });
-    await heartbeat.cancelRun(seeded.pRunId, "Stopped by a person");
-    const [pRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.pRunId));
-    expect(pRun?.status).toBe("cancelled");
-    // The run's real teardown release: P was a warm run (keep_running asked);
-    // run-control turns a person's Stop into stop_and_retain, and the real
-    // release path binds the provider's 'stopped' reply into P's receipt.
-    await heartbeat.releaseEnvironmentLeasesForRun({ runId: seeded.pRunId, companyId: seeded.companyId,
-      agentId: seeded.agentId, status: pRun!.status, providerResourceDisposition: "keep_running" });
-    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
-    const receipt = lease?.metadata?.remoteExecutionTermination as { state?: string; runId?: string; confirmedAt?: string };
-    expect(receipt?.state).toBe("stopped");
-    expect(receipt?.runId).toBe(seeded.pRunId);
-    expect(["released", "retained"]).toContain(lease?.status);
-
-    await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
-
-    clockAt(Date.parse(receipt.confirmedAt!), 16 * MINUTE);
-    const later = await newRun(seeded, seeded.issueB);
-    expectResumed(seeded, await acquire(seeded, later, seeded.issueB));
-  });
-
-  // NEVER (org purple (2)): P stopped by a PERSON through the Stop route's
-  // service call (the exact cancelRun options routes/agents.ts passes for a
-  // person) and released by the real teardown release. RED at 6da702b4 (the
-  // window let + 16 min resume), GREEN after.
-  it("REAL NEVER: a person's Stop of P (Stop route's cancelRun + real release): another run is refused at + 16 min and at + 2 h", async () => {
-    const seeded = await setup();
-    const heartbeat = heartbeatService(db, { pluginWorkerManager: seeded.manager, environmentRuntime: seeded.runtime });
-    await heartbeat.cancelRun(seeded.pRunId, "Cancelled by a board operator", { resultJson: { ...PERSON_STOP } });
-    const [pRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.pRunId));
-    expect(pRun?.status).toBe("cancelled");
-    expect(pRun?.resultJson?.cancelledByActorType).toBe("user");
-    await heartbeat.releaseEnvironmentLeasesForRun({ runId: seeded.pRunId, companyId: seeded.companyId,
-      agentId: seeded.agentId, status: pRun!.status, providerResourceDisposition: "keep_running" });
-    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
-    const receipt = lease?.metadata?.remoteExecutionTermination as { state?: string; runId?: string; confirmedAt?: string };
-    expect(receipt?.state).toBe("stopped");
-    expect(receipt?.runId).toBe(seeded.pRunId);
-
-    clockAt(Date.parse(receipt.confirmedAt!), 16 * MINUTE);
-    await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
-
-    vi.restoreAllMocks();
-    clockAt(Date.parse(receipt.confirmedAt!), 2 * HOUR);
-    const later = await newRun(seeded, seeded.issueB);
-    await expectRefused(seeded, await acquire(seeded, later, seeded.issueB));
-  });
-
-  // FLIPPED BY DESIGN (org purple (2)): at 6da702b4 this row was "allowed: at
-  // + 16 min ... a different issue's run resumes B" for a cancelled P. A
-  // person-stopped P's box is now never resumed by another run.
-  it("refused (was allowed at + 16 min): a person-STOPPED P's box is refused to a different issue's run at + 16 min and at + 2 h", async () => {
-    const seeded = await setup();
-    const confirmedAt = Date.now() - 30 * MINUTE;
-    await plant(seeded, { pStatus: "cancelled", state: "stopped", confirmedAt, person: true });
-    clockAt(confirmedAt, 16 * MINUTE);
-    await expectRefused(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
-    vi.restoreAllMocks();
-    clockAt(confirmedAt, 2 * HOUR);
-    await expectRefused(seeded, await acquire(seeded, await newRun(seeded, seeded.issueB), seeded.issueB));
-  });
-
-  // ---------------- ALLOWED ----------------
-
-  // Unchanged: a FAILED P keeps the fifteen-minute window (RFL).
-  it("allowed: at + 16 min after a FAILED P (box retained) a different issue's run resumes B (window kept)", async () => {
-    const seeded = await setup();
-    const confirmedAt = Date.now() - 30 * MINUTE;
-    await plant(seeded, { pStatus: "failed", state: "stopped", confirmedAt, leaseStatus: "retained" });
-    clockAt(confirmedAt, 16 * MINUTE);
-    expectResumed(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
-  });
-
-  // PLANTED twin of "REAL: a SUCCEEDED P ..." below.
-  it("allowed: a SUCCEEDED P's box is resumed by a different issue's run at + 2 min (warm reuse)", async () => {
-    const seeded = await setup();
-    const confirmedAt = Date.now() - 30 * MINUTE;
-    await plant(seeded, { pStatus: "succeeded", state: "stopped", confirmedAt });
-    clockAt(confirmedAt, 2 * MINUTE);
-    expectResumed(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
-  });
-
-  it("REAL: a SUCCEEDED P released by the real release path (stop_and_retain receipt) is resumed by a different issue's run right after", async () => {
-    const seeded = await setup();
-    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, seeded.pRunId));
-    // The run's real teardown release (a per-turn run stops and keeps its box).
-    await heartbeatService(db, { pluginWorkerManager: seeded.manager, environmentRuntime: seeded.runtime })
-      .releaseEnvironmentLeasesForRun({ runId: seeded.pRunId, companyId: seeded.companyId, agentId: seeded.agentId,
-        status: "succeeded", providerResourceDisposition: "stop_and_retain" });
-    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
-    expect((lease?.metadata?.remoteExecutionTermination as { state?: string })?.state).toBe("stopped");
-    expectResumed(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
-  });
-
-  // The keep-warm codes (runner-environment-lifecycle.ts :29): a failed turn
-  // with adapter_failed / adapter_error / native_session_interrupted keeps its
-  // box RUNNING for the same conversation. The real release writes NO receipt
-  // for keep_running (environment-runtime.ts releaseRunLeases, 'retained' with
-  // cleanupStatus only), so this fence does not touch that continuation.
-  it("REAL: a keep-warm failure (adapter_error) leaves no receipt; the same conversation's next run still resumes the warm box", async () => {
-    const seeded = await setup();
-    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_error", finishedAt: new Date() })
-      .where(eq(heartbeatRuns.id, seeded.pRunId));
-    await heartbeatService(db, { pluginWorkerManager: seeded.manager, environmentRuntime: seeded.runtime })
-      .releaseEnvironmentLeasesForRun({ runId: seeded.pRunId, companyId: seeded.companyId, agentId: seeded.agentId,
-        status: "failed", providerResourceDisposition: "keep_running" });
-    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
-    expect(lease?.status).toBe("retained");
-    expect(lease?.metadata?.remoteExecutionTermination).toBeUndefined();
-    const next = await newRun(seeded, seeded.issueA);
-    expectResumed(seeded, await acquire(seeded, next, seeded.issueA));
-  });
-
-  it("allowed: P's OWN run resumes its box at + 2 min", async () => {
-    const seeded = await setup();
-    const confirmedAt = Date.now() - 30 * MINUTE;
-    await plant(seeded, { pStatus: "cancelled", state: "stopped", confirmedAt, person: true });
-    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, seeded.pRunId));
-    clockAt(confirmedAt, 2 * MINUTE);
-    expectResumed(seeded, await acquire(seeded, seeded.pRunId, seeded.issueA));
-  });
-
-  // ---------------- The handoff mirror ----------------
-  // A resume that slipped past selection is still refused when the handoff
-  // re-checks eligibility in its transaction; the takeover is rolled back.
-  // FLIPPED BY DESIGN (org purple (2)): at 6da702b4 the + 16 min half admitted
-  // the takeover; a person-stopped P's box is now refused at + 16 min and + 2 h.
-  it("mirror: the handoff refuses a different issue's takeover of B after a person-Stopped P at + 9 min, + 16 min and + 2 h (conflict, rolled back)", async () => {
-    const seeded = await setup();
-    const confirmedAt = Date.now() - 30 * MINUTE;
-    await plant(seeded, { pStatus: "cancelled", state: "stopped", confirmedAt, person: true });
-    const handoff = () => environmentService(db).acquireLease({
-      companyId: seeded.companyId, environmentId: seeded.environment.id, executionWorkspaceId: seeded.executionWorkspaceId,
-      issueId: seeded.issueB, heartbeatRunId: seeded.qRunId, leasePolicy: "reuse_by_environment", provider: "fake-plugin",
-      providerLeaseId, metadata: { agentId: seeded.agentId }, replacesReusableLeaseId: seeded.leaseId,
+    it("REAL: a SUCCEEDED P released by the real release path (stop_and_retain receipt) is resumed by a different issue's run right after", async () => {
+      const seeded = await setup();
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, seeded.pRunId));
+      // The run's real teardown release (a per-turn run stops and keeps its box).
+      await heartbeatService(db, { pluginWorkerManager: seeded.manager, environmentRuntime: seeded.runtime })
+        .releaseEnvironmentLeasesForRun({ runId: seeded.pRunId, companyId: seeded.companyId, agentId: seeded.agentId,
+          status: "succeeded", providerResourceDisposition: "stop_and_retain" });
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
+      expect((lease?.metadata?.remoteExecutionTermination as { state?: string })?.state).toBe("stopped");
+      expectResumed(seeded, await acquire(seeded, seeded.qRunId, seeded.issueB));
     });
-    for (const offset of [9 * MINUTE, 16 * MINUTE, 2 * HOUR]) {
+
+    // The keep-warm codes (runner-environment-lifecycle.ts :29): a failed turn
+    // with adapter_failed / adapter_error / native_session_interrupted keeps its
+    // box RUNNING for the same conversation. The real release writes NO receipt
+    // for keep_running (environment-runtime.ts releaseRunLeases, 'retained' with
+    // cleanupStatus only), so this fence does not touch that continuation.
+    it("REAL: a keep-warm failure (adapter_error) leaves no receipt; the same conversation's next run still resumes the warm box", async () => {
+      const seeded = await setup();
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_error", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, seeded.pRunId));
+      await heartbeatService(db, { pluginWorkerManager: seeded.manager, environmentRuntime: seeded.runtime })
+        .releaseEnvironmentLeasesForRun({ runId: seeded.pRunId, companyId: seeded.companyId, agentId: seeded.agentId,
+          status: "failed", providerResourceDisposition: "keep_running" });
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
+      expect(lease?.status).toBe("retained");
+      expect(lease?.metadata?.remoteExecutionTermination).toBeUndefined();
+      const next = await newRun(seeded, seeded.issueA);
+      expectResumed(seeded, await acquire(seeded, next, seeded.issueA));
+    });
+
+    it("allowed: P's OWN run resumes its box at + 2 min", async () => {
+      const seeded = await setup();
+      const confirmedAt = Date.now() - 30 * MINUTE;
+      await plant(seeded, { pStatus: "cancelled", state: "stopped", confirmedAt, person: true });
+      await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, seeded.pRunId));
+      clockAt(confirmedAt, 2 * MINUTE);
+      expectResumed(seeded, await acquire(seeded, seeded.pRunId, seeded.issueA));
+    });
+
+    // ---------------- The handoff mirror ----------------
+    // A resume that slipped past selection is still refused when the handoff
+    // re-checks eligibility in its transaction; the takeover is rolled back.
+    // FLIPPED BY DESIGN (org purple (2)): at 6da702b4 the + 16 min half admitted
+    // the takeover; a person-stopped P's box is now refused at + 16 min and + 2 h.
+    it("mirror: the handoff refuses a different issue's takeover of B after a person-Stopped P at + 9 min, + 16 min and + 2 h (conflict, rolled back)", async () => {
+      const seeded = await setup();
+      const confirmedAt = Date.now() - 30 * MINUTE;
+      await plant(seeded, { pStatus: "cancelled", state: "stopped", confirmedAt, person: true });
+      const handoff = () => environmentService(db).acquireLease({
+        companyId: seeded.companyId, environmentId: seeded.environment.id, executionWorkspaceId: seeded.executionWorkspaceId,
+        issueId: seeded.issueB, heartbeatRunId: seeded.qRunId, leasePolicy: "reuse_by_environment", provider: "fake-plugin",
+        providerLeaseId, metadata: { agentId: seeded.agentId }, replacesReusableLeaseId: seeded.leaseId,
+      });
+      for (const offset of [9 * MINUTE, 16 * MINUTE, 2 * HOUR]) {
+        vi.restoreAllMocks();
+        clockAt(confirmedAt, offset);
+        await expect(handoff()).rejects.toThrow(/stopped by a person|long-stop window/);
+        const [kept] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
+        expect(kept?.status).toBe("released");
+        expect(kept?.metadata?.reusableLeaseSuccessor).toBeUndefined();
+      }
+    });
+
+    it(never
+      ? "mirror (scope B: never): the handoff refuses a takeover of B after a FAILED P at + 9 min, + 16 min and + 2 h"
+      : "mirror (scope A): the handoff refuses a takeover of B at + 9 min after a FAILED P, and admits it at + 16 min (window kept)", async () => {
+      const seeded = await setup();
+      const confirmedAt = Date.now() - 30 * MINUTE;
+      await plant(seeded, { pStatus: "failed", state: "stopped", confirmedAt });
+      const handoff = () => environmentService(db).acquireLease({
+        companyId: seeded.companyId, environmentId: seeded.environment.id, executionWorkspaceId: seeded.executionWorkspaceId,
+        issueId: seeded.issueB, heartbeatRunId: seeded.qRunId, leasePolicy: "reuse_by_environment", provider: "fake-plugin",
+        providerLeaseId, metadata: { agentId: seeded.agentId }, replacesReusableLeaseId: seeded.leaseId,
+      });
+
+      for (const offset of never ? [9 * MINUTE, 16 * MINUTE, 2 * HOUR] : [9 * MINUTE]) {
+        vi.restoreAllMocks();
+        clockAt(confirmedAt, offset);
+        await expect(handoff()).rejects.toThrow(never ? /did not succeed; another run never resumes it/ : /long-stop window/);
+        const [kept] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
+        expect(kept?.status).toBe("released");
+        expect(kept?.metadata?.reusableLeaseSuccessor).toBeUndefined();
+      }
+      if (never) return;
+
       vi.restoreAllMocks();
-      clockAt(confirmedAt, offset);
-      await expect(handoff()).rejects.toThrow(/stopped by a person|long-stop window/);
-      const [kept] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
-      expect(kept?.status).toBe("released");
-      expect(kept?.metadata?.reusableLeaseSuccessor).toBeUndefined();
-    }
-  });
-
-  it("mirror: the handoff refuses a takeover of B at + 9 min after a FAILED P, and admits it at + 16 min (window kept)", async () => {
-    const seeded = await setup();
-    const confirmedAt = Date.now() - 30 * MINUTE;
-    await plant(seeded, { pStatus: "failed", state: "stopped", confirmedAt });
-    const handoff = () => environmentService(db).acquireLease({
-      companyId: seeded.companyId, environmentId: seeded.environment.id, executionWorkspaceId: seeded.executionWorkspaceId,
-      issueId: seeded.issueB, heartbeatRunId: seeded.qRunId, leasePolicy: "reuse_by_environment", provider: "fake-plugin",
-      providerLeaseId, metadata: { agentId: seeded.agentId }, replacesReusableLeaseId: seeded.leaseId,
+      clockAt(confirmedAt, 16 * MINUTE);
+      const taken = await handoff();
+      expect(taken.heartbeatRunId).toBe(seeded.qRunId);
+      const [retired] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
+      expect(retired?.status).toBe("expired");
     });
+  });
+  }
+});
 
-    clockAt(confirmedAt, 9 * MINUTE);
-    await expect(handoff()).rejects.toThrow(/long-stop window/);
-    const [kept] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
-    expect(kept?.status).toBe("released");
-    expect(kept?.metadata?.reusableLeaseSuccessor).toBeUndefined();
-
-    vi.restoreAllMocks();
-    clockAt(confirmedAt, 16 * MINUTE);
-    const taken = await handoff();
-    expect(taken.heartbeatRunId).toBe(seeded.qRunId);
-    const [retired] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, seeded.leaseId));
-    expect(retired?.status).toBe("expired");
+// The default stays A ("person_stop") until the judges' line picks.
+describe("NEVER_REUSE_SCOPE default", () => {
+  it("is person_stop (setting A) as built", async () => {
+    const actual = await vi.importActual<typeof import("../services/never-reuse-scope.js")>("../services/never-reuse-scope.js");
+    expect(actual.NEVER_REUSE_SCOPE).toBe("person_stop");
   });
 });
