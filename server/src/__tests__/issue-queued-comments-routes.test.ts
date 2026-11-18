@@ -1859,6 +1859,33 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     }
   });
 
+  // SCREEN row 4b: the run-dispatch fallback (deferUnstartedUserComment) saves
+  // a held wake with an execution_recovery wait. After a person's Stop that wait
+  // must not replace the Stop bar; the Send's wait and a non-person stop keep theirs.
+  it.each(["person stop", "person stop then Send", "no person stop"])("SCREEN row 4b: the held bar with an execution_recovery wait after %s", async scenario => {
+    const f = await seedQueue();
+    const stoppedAt = new Date("2026-08-22T15:05:00.000Z");
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: stoppedAt,
+      resultJson: scenario === "no person stop" ? { stopReason: "execution_reconciliation_required" }
+        : { cancelledByActorType: "user", cancelledByUserId: "queue-owner",
+          ...(scenario === "person stop then Send" ? { queuedCommentInterruptQueueId: f.wakeId } : {}) } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    // The exact wait run-dispatch/adapters/postgres.ts writes on the held wake.
+    await db.update(agentWakeupRequests).set({ payload: { ...wake.payload,
+      executionWait: { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." },
+      ...(scenario === "person stop then Send"
+        ? { queuedCommentInterrupt: { actorId: "queue-owner", requestedAt: "2026-08-22T15:06:00.000Z" } } : {}) } })
+      .where(eq(agentWakeupRequests.id, f.wakeId));
+    const queue = (await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+    expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
+    expect(queue.executionWait).toEqual(scenario === "person stop"
+      ? { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." }
+      : scenario === "person stop then Send" ? { reason: "interrupt_handoff", message: "Sending your messages." }
+        : { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." });
+  });
+
   it("Hold50 starts a message sent after a native Stop as soon as the stopped run's teardown ends", async () => {
     const seeded = await seedQueue();
     const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });

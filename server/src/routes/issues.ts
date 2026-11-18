@@ -7905,7 +7905,13 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
-    if (wake && queueState?.state === "deferred" && !input.activeRun && !queue.executionWait && comments.length > 0 &&
+    // The run-dispatch fallback (deferUnstartedUserComment) saves a held wake
+    // with an execution_recovery wait. After a person's Stop that recovery does
+    // not send these messages by itself, so the Stop bar wins over it. Every
+    // other wait (the Send's interrupt_handoff, a running process, a pause)
+    // keeps its own true line.
+    const stopBarMayReplace = !queue.executionWait || queue.executionWait.reason === "execution_recovery";
+    if (wake && queueState?.state === "deferred" && !input.activeRun && stopBarMayReplace && comments.length > 0 &&
         input.issue.assigneeAgentId && !queuedInteractionId(wake.payload)) {
       // Stop means stop (org 11-17): after a person's Stop the waiting messages
       // of every task (Agent Chat or not) are not sent. The person sends them,
