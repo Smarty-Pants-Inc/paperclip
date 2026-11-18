@@ -4,6 +4,7 @@ import { PluginWorkerUnavailableError } from "../services/plugin-worker-unavaila
 import { createSandboxOrphanCleanupSpool } from "../services/sandbox-orphan-cleanup-spool.js";
 import { idleWorkSnapshot } from "../services/task-admission.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
+import { AGENT_FILE_DESTROY_REFUSED_MESSAGE } from "../services/agent-file-save-hold.js";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
@@ -1120,16 +1121,33 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect(done.metadata).not.toHaveProperty("agentFileDestroyClaim");
     });
 
-    // On this image every no-environment plugin teardown that is not stop-only
-    // takes the destroy claim (cleanupPluginRunLease claimDestroy: a teardown
-    // retry can erase the box), so the allocation-wide marker refuses the
-    // release-method teardown too: no provider call, left for retry.
-    it("a release-method teardown takes the same claim and the marker refuses it", async () => {
-      const { runId, call, service } = await seedNoEnvironmentPluginLeases({ method: "release", marked: true });
+    // Every no-environment plugin teardown that is not stop-only takes the
+    // destroy claim (cleanupPluginRunLease claimDestroy). The allocation-wide
+    // marker vetoes only a real destroy (environmentDestroyLease): a release
+    // keeps the disk (Boat release = stop and retain), so a marked allocation's
+    // release-method teardown releases (the box stops, no RUNNING box left for
+    // retry) and the marker stays for the backup.
+    it("a release-method teardown on a marked allocation releases (box stopped) and keeps the marker", async () => {
+      const { runId, predecessor, successor, call, service } = await seedNoEnvironmentPluginLeases({ method: "release", marked: true });
       const errors: string[] = [];
       await service.releaseRunLeases(runId, "released", (_id, error) => { errors.push((error as Error).message); });
-      expect(errors).toEqual(["Native harness backup is missing; destructive cleanup is forbidden."]);
+      expect(errors).toEqual([]);
+      expect(call.mock.calls.map(([, method]) => method)).toEqual(["environmentReleaseLease"]);
+      const done = (await environmentService(db).getLeaseById(successor.id))!;
+      expect(done).toMatchObject({ status: "released", cleanupStatus: "success" });
+      expect(done.metadata).not.toHaveProperty("agentFileDestroyClaim");
+      expect((await environmentService(db).getLeaseById(predecessor.id))!.metadata).toHaveProperty("nativeHarnessBackupMissing");
+    });
+
+    it("a release-method teardown on a marked allocation is still refused by a collection pin (only the marker veto is lifted)", async () => {
+      const { runId, successor, call, service } = await seedNoEnvironmentPluginLeases({ method: "release", marked: true });
+      await db.update(environmentLeases).set({ metadata: { ...successor.metadata, agentFileCollectionPins: { "copy-1": "pin-1" } } })
+        .where(eq(environmentLeases.id, successor.id));
+      const errors: string[] = [];
+      await service.releaseRunLeases(runId, "released", (_id, error) => { errors.push((error as Error).message); });
+      expect(errors).toEqual([AGENT_FILE_DESTROY_REFUSED_MESSAGE]);
       expect(call.mock.calls.map(([, method]) => method)).toEqual([]);
+      expect((await environmentService(db).getLeaseById(successor.id))!.status).toBe("active");
     });
 
     it("a release-method teardown without a marker releases as today", async () => {

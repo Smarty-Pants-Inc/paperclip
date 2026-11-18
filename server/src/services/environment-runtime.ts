@@ -4091,8 +4091,11 @@ function createPluginEnvironmentDriver(
     // teardown retry and non-reusable release takes the destroy claim: release
     // can erase the allocation too. Refuse (throw) before provider IO while a
     // save hold, a collection pin or another destroy protects the allocation.
+    // The allocation-wide harness-missing marker refuses only a real destroy
+    // (environmentDestroyLease): a release keeps the box's disk (stop and
+    // retain), so it runs and the marker stays until a verified backup.
     const receipt = destroying || claimDestroy || lease.leasePolicy !== "reuse_by_environment"
-      ? await withLeaseDestroyClaim(db, lease, call) : await call();
+      ? await withLeaseDestroyClaim(db, lease, call, { harnessMarkerVeto: destroying }) : await call();
     const taskStopped = settled !== false ||
       (lease.metadata?.runnerTaskLease === true && lease.metadata?.runnerTaskDispatched !== true && !lease.metadata?.runnerTaskStartup && !lease.metadata?.runnerTaskStartupCleanup);
     return remoteTerminationReceipt(lease, receipt) ? receipt

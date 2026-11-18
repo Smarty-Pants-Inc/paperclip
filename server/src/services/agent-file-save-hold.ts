@@ -85,6 +85,15 @@ const allocationRows = (leaseId: SQL) => sql`select alloc_lease.id, alloc_lease.
     for update of alloc_lease`;
 
 /**
+ * harnessMarkerVeto (default true): the allocation-wide nativeHarnessBackupMissing
+ * marker refuses the claim. Pass false only when the provider call under the
+ * claim keeps the box's disk (a release/stop, never a destroy): the marker
+ * guards the only copy of the harness state, which a stop retains. Save holds,
+ * collection pins and another destroy's live claim still refuse.
+ */
+export type DestroyClaimOptions = { harnessMarkerVeto?: boolean };
+
+/**
  * Shared exclusion between the save-hold write, the collection pin and every
  * destroy path. Locks every lease row of the provider allocation FOR UPDATE
  * (stable id order), refuses while any of them carries a collection pin (a
@@ -99,9 +108,11 @@ const allocationRows = (leaseId: SQL) => sql`select alloc_lease.id, alloc_lease.
  * Returns the claim token, or null when claimed/pinned/held (or the lease
  * vanished): never destroy then. Release only with the token.
  */
-export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease): Promise<string | null> {
+export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease,
+  options: DestroyClaimOptions = {}): Promise<string | null> {
+  const harnessMarkerVeto = options.harnessMarkerVeto !== false;
   if (typeof (db as Db).transaction !== "function") {
-    if (await nativeHarnessBackupMissingOnAllocation(db, lease)) return null;
+    if (harnessMarkerVeto && await nativeHarnessBackupMissingOnAllocation(db, lease)) return null;
     return (await agentFileSaveHeldOnLease(db, lease)) ? null : randomUUID();
   }
   return await db.transaction(async tx => {
@@ -115,7 +126,7 @@ export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease): 
     if (!Array.isArray(locked) || !locked.some(row => row.id === lease.id)) return null;
     if (locked.some(row => row.claimed === true || row.pinned === true)) return null;
     // Fresh statement after the locks: a marker committed while we waited is visible.
-    if (await nativeHarnessBackupMissingOnAllocation(tx as unknown as Db, lease)) return null;
+    if (harnessMarkerVeto && await nativeHarnessBackupMissingOnAllocation(tx as unknown as Db, lease)) return null;
     if (await agentFileSaveHeldOnLease(tx as unknown as Db, lease)) return null;
     const token = randomUUID();
     await (tx as unknown as Db).execute(sql`update environment_leases set metadata = coalesce(metadata, '{}'::jsonb)
@@ -146,10 +157,10 @@ export async function releaseLeaseDestroyClaim(db: Db, leaseId: string, token: s
  * another destroy's claim protects the allocation.
  */
 export async function withLeaseDestroyClaim<T>(db: Db, lease: HoldLease & { metadata?: Record<string, unknown> | null },
-  run: (claim: string) => Promise<T>): Promise<T> {
-  const claim = await claimLeaseForDestroyUnlessHeld(db, lease);
+  run: (claim: string) => Promise<T>, options: DestroyClaimOptions = {}): Promise<T> {
+  const claim = await claimLeaseForDestroyUnlessHeld(db, lease, options);
   if (!claim) {
-    throw new Error(await nativeHarnessBackupMissingOnAllocation(db, lease)
+    throw new Error(options.harnessMarkerVeto !== false && await nativeHarnessBackupMissingOnAllocation(db, lease)
       ? "Native harness backup is missing; destructive cleanup is forbidden." : AGENT_FILE_DESTROY_REFUSED_MESSAGE);
   }
   try {
