@@ -9,7 +9,25 @@ import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
 export const AGENT_FILES_SAVE_PENDING_INSTRUCTION = "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.";
 export const AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT = "AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT";
 
-type HoldLease = { id: string; companyId: string; providerLeaseId?: string | null };
+type HoldLease = { id: string; companyId: string; provider?: string | null; providerLeaseId?: string | null };
+
+/**
+ * True while ANY lease of this allocation (same company, provider and provider
+ * box), including an expired predecessor, carries nativeHarnessBackupMissing.
+ * The marker sits on the owner row that failed its close, not on the row a
+ * later destroy names, so a row-local check lets a successor destroy past it.
+ * Only a matching verified backup clears it (clearNativeHarnessBackupMissing).
+ */
+export async function nativeHarnessBackupMissingOnAllocation(db: Pick<Db, "execute">, lease: HoldLease): Promise<boolean> {
+  if (typeof (db as Db).execute !== "function") return false;
+  const rows = await (db as Db).execute(sql`select 1 from environment_leases target
+    join environment_leases marked on marked.id = target.id
+      or (target.provider_lease_id is not null and marked.company_id = target.company_id
+        and marked.provider is not distinct from target.provider and marked.provider_lease_id = target.provider_lease_id)
+    where target.id = ${lease.id} and marked.metadata ? 'nativeHarnessBackupMissing'
+    limit 1`);
+  return Array.isArray(rows) && rows.length > 0;
+}
 
 /**
  * True while a stopped agent-file save on this lease (or the same provider
@@ -82,14 +100,22 @@ const allocationRows = (leaseId: SQL) => sql`select alloc_lease.id, alloc_lease.
  * vanished): never destroy then. Release only with the token.
  */
 export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease): Promise<string | null> {
-  if (typeof (db as Db).transaction !== "function") return (await agentFileSaveHeldOnLease(db, lease)) ? null : randomUUID();
+  if (typeof (db as Db).transaction !== "function") {
+    if (await nativeHarnessBackupMissingOnAllocation(db, lease)) return null;
+    return (await agentFileSaveHeldOnLease(db, lease)) ? null : randomUUID();
+  }
   return await db.transaction(async tx => {
+    // Locks this row and every row of its allocation (id order), so a
+    // harness-missing marker write (an UPDATE of one of these rows) either
+    // commits before this claim (seen by the fresh read below) or waits for it.
     const locked = await (tx as unknown as Db).execute(sql`select alloc.id,
         ${liveDestroyClaimSql(sql`alloc.metadata`)} as claimed,
         coalesce(alloc.metadata->${AGENT_FILE_COLLECTION_PINS_KEY}::text, '{}'::jsonb) <> '{}'::jsonb as pinned
       from (${allocationRows(sql`${lease.id}`)}) alloc`) as Array<{ id: string; claimed?: unknown; pinned?: unknown }>;
     if (!Array.isArray(locked) || !locked.some(row => row.id === lease.id)) return null;
     if (locked.some(row => row.claimed === true || row.pinned === true)) return null;
+    // Fresh statement after the locks: a marker committed while we waited is visible.
+    if (await nativeHarnessBackupMissingOnAllocation(tx as unknown as Db, lease)) return null;
     if (await agentFileSaveHeldOnLease(tx as unknown as Db, lease)) return null;
     const token = randomUUID();
     await (tx as unknown as Db).execute(sql`update environment_leases set metadata = coalesce(metadata, '{}'::jsonb)
@@ -122,7 +148,10 @@ export async function releaseLeaseDestroyClaim(db: Db, leaseId: string, token: s
 export async function withLeaseDestroyClaim<T>(db: Db, lease: HoldLease & { metadata?: Record<string, unknown> | null },
   run: (claim: string) => Promise<T>): Promise<T> {
   const claim = await claimLeaseForDestroyUnlessHeld(db, lease);
-  if (!claim) throw new Error(AGENT_FILE_DESTROY_REFUSED_MESSAGE);
+  if (!claim) {
+    throw new Error(await nativeHarnessBackupMissingOnAllocation(db, lease)
+      ? "Native harness backup is missing; destructive cleanup is forbidden." : AGENT_FILE_DESTROY_REFUSED_MESSAGE);
+  }
   try {
     return await run(claim);
   } finally {
