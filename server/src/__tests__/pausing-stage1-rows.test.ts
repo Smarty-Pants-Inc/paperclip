@@ -3,7 +3,10 @@ import { and, eq } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { agentInstructionWorkingCopies, agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentRoutes } from "../routes/agents.js";
 import { errorHandler } from "../middleware/error-handler.js";
@@ -12,7 +15,6 @@ import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
-import { settleRetainedOrphanSandbox } from "../services/environment-retained-orphan-settlement.js";
 import { nextEnvironmentCleanupAt } from "../services/environment-cleanup-state.js";
 import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 
@@ -119,72 +121,98 @@ describe("pausing stage 1 rows", () => {
       if (kind === "unsupported") expect((await agentRow(agent.id)).lifecycleOperation).toMatchObject({ pendingReason: "remote_stop_unsupported" });
     });
 
-  it("row B: a retained orphan's carried stop proof settles the pause; its cleanup is parked and the computer stays in inventory", async () => {
-    const [agent] = await db.insert(agents).values({ companyId, name: "Orphan Lead", adapterType: "process",
-      status: "running", defaultEnvironmentId: environmentId, lifecycleRequiredPluginIds: [] }).returning();
-    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent!.id, status: "cancelled",
-      invocationSource: "on_demand", runtimeMode: "legacy", startedAt: new Date(Date.now() - 120_000),
-      finishedAt: new Date(Date.now() - 100_000) }).returning();
-    const providerLeaseId = `boat-${randomUUID()}`;
-    const identity = { id: randomUUID(), companyId, heartbeatRunId: run!.id, provider: "boat", providerLeaseId };
-    const receipt = remoteTerminationReceipt(identity, { providerLeaseId, state: "stopped" });
-    await db.insert(environmentLeases).values({ ...identity, environmentId, status: "failed", cleanupStatus: "success",
-      leasePolicy: "reuse_by_environment", releasedAt: new Date(Date.now() - 90_000), expiresAt: new Date(Date.now() - 60_000),
-      metadata: { agentId: agent!.id, retainOnDestroy: true, remoteExecutionTermination: receipt } });
-    const settled = await settleRetainedOrphanSandbox(db, { recordId: identity.id, companyId, runId: run!.id, issueId: null,
-      owner: "environment" as never, updatedAt: null }, { now: new Date(), proof: { reason: "owner_gone" } as never });
-    expect(settled).toMatchObject({ settled: true });
-    const after = await leaseRow(identity.id);
-    expect(after).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed", failureReason: "retained_orphan_sandbox_released" });
-    expect((after.metadata as Record<string, any>).cleanupDisposition).toMatchObject({ state: "parked", code: "provider_retains_resource" });
-    // Parked: no automatic destroy deadline wakes the worker for this row.
-    const next = await nextEnvironmentCleanupAt(db, 0);
-    expect(next === null || next > Date.now() + 60 * 60_000).toBe(true);
-    await pause(agent!.id);
-    expect(await agentRow(agent!.id)).toMatchObject({ lifecycleState: "paused", status: "paused" });
-    expect(releaseRunLeases).not.toHaveBeenCalled();
-    expect(await leaseRow(identity.id)).toMatchObject({ status: "pending_cleanup" });
-  });
-
-  /** A Boat lease on a pending destroy (pending_cleanup / failed), then the real pending-destroy sweep. */
-  async function pendingDestroy(metadata: (identity: { id: string; heartbeatRunId: string; providerLeaseId: string }) => Record<string, unknown>) {
+  /** A Boat lease on a pending destroy (pending_cleanup / failed), then the real pending-destroy sweep.
+   * `answer` is the provider's destroy answer (a function may throw, as a refused destroy does). */
+  async function pendingDestroy(metadata: (identity: { id: string; heartbeatRunId: string; providerLeaseId: string }) => Record<string, unknown>,
+    answer: (lease: { providerLeaseId: string | null }) => unknown, held = false) {
     const [agent] = await db.insert(agents).values({ companyId, name: "Boat Lead", adapterType: "process",
       status: "running", defaultEnvironmentId: environmentId, lifecycleRequiredPluginIds: [] }).returning();
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent!.id, status: "cancelled",
       invocationSource: "on_demand", runtimeMode: "legacy", startedAt: new Date(Date.now() - 120_000),
       finishedAt: new Date(Date.now() - 100_000) }).returning();
     const identity = { id: randomUUID(), companyId, heartbeatRunId: run!.id, provider: "boat", providerLeaseId: `boat-${randomUUID()}` };
+    // ephemeral: the sweep tears down through retryPendingSandboxTeardown and reads its answer.
     await db.insert(environmentLeases).values({ ...identity, environmentId, status: "pending_cleanup", cleanupStatus: "failed",
-      leasePolicy: "reuse_by_environment", releasedAt: new Date(Date.now() - 90_000), failureReason: "retained_orphan_sandbox_released",
+      leasePolicy: "ephemeral", releasedAt: new Date(Date.now() - 90_000), failureReason: "retained_orphan_sandbox_released",
       updatedAt: new Date(Date.now() - 3_600_000), metadata: { agentId: agent!.id, ...metadata(identity) } });
-    const destroy = vi.fn(async () => { throw new Error("provider destroy unavailable in this row"); });
+    let copy: { localRoot: string; before: unknown } | undefined;
+    if (held) {
+      // The live stuck copy (gate 4): unavailable + savePending, failures 15, bound to this lease.
+      const localRoot = await fs.mkdtemp(path.join(os.tmpdir(), "pausing-held-"));
+      await fs.writeFile(path.join(localRoot, "unsaved-note.txt"), "unsaved note");
+      const since = new Date(Date.now() - 4 * 3600_000);
+      await db.insert(agentInstructionWorkingCopies).values({ runId: run!.id, companyId, agentId: agent!.id, responsibleUserId: "person-1",
+        entryFile: "AGENTS.md", baseHash: "base", localRoot, executionRoot: "/workspace/.paperclip-runtime/agent-files/held",
+        location: `remote:${environmentId}`, state: "unavailable", processStoppedAt: since, errorCode: "AGENT_FILES_SAVE_FAILED",
+        receipt: { schema: "paperclip.agent-files.v1", warm: true, cleanup: { leaseId: identity.id, remoteCwd: "/workspace" },
+          savePending: { code: "AGENT_FILES_SAVE_FAILED", since: since.toISOString(), reason: "Boat sandbox lease is no longer active.", failures: 15 } } });
+      copy = { localRoot, before: (await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, run!.id)))[0] };
+    }
+    const destroy = vi.fn(async (input: { lease: { providerLeaseId: string | null } }) => answer(input.lease));
     const runtime = environmentRuntimeService(db);
     const sweeper = heartbeatService(db, { environmentRuntime: { ...runtime, inspectLeaseResource: inspect, releaseRunLeases,
-      destroyRunLease: destroy, retryPendingSandboxTeardown: destroy } as never });
+      isPendingCleanupWorkerReady: async () => true, destroyRunLease: destroy, retryPendingSandboxTeardown: destroy } as never });
     await sweeper.sweepPendingCleanupLeases({ backoffMs: 0 }).catch(() => undefined);
-    return { agent: agent!, leaseId: identity.id, destroy };
+    return { agent: agent!, run: run!, leaseId: identity.id, destroy, copy };
   }
+  const carriedStop = (identity: { id: string; heartbeatRunId: string; providerLeaseId: string }) => ({ workspaceRecoveryCleanup: {
+    runId: identity.heartbeatRunId, reason: "retained_orphan_sandbox_released",
+    stopReceipt: remoteTerminationReceipt({ ...identity, companyId, provider: "boat" }, { providerLeaseId: identity.providerLeaseId, state: "stopped" }) } });
+  const disposition = async (leaseId: string) => ((await leaseRow(leaseId)).metadata as Record<string, any>).cleanupDisposition;
 
-  it("row RFL-2: retainOnDestroy true but no proved Stop receipt is NOT parked and keeps the pause blocking", async () => {
-    providerAnswer = () => undefined;
-    const { agent, leaseId } = await pendingDestroy(() => ({ retainOnDestroy: true }));
-    const after = await leaseRow(leaseId);
-    expect((after.metadata as Record<string, any>).cleanupDisposition).toBeUndefined();
-    expect(after.status).toBe("pending_cleanup");
-    await pause(agent.id);
-    expect((await agentRow(agent.id)).lifecycleState).toBe("pausing");
-  });
-
-  it("row RFL-3: an own bound 'stopped' receipt on a pending destroy, retainOnDestroy absent, is parked, never destroyed", async () => {
-    const { agent, leaseId, destroy } = await pendingDestroy(identity => ({ workspaceRecoveryCleanup: { runId: identity.heartbeatRunId,
-      stopReceipt: remoteTerminationReceipt({ ...identity, companyId, provider: "boat" }, { providerLeaseId: identity.providerLeaseId, state: "stopped" }) } }));
-    const after = await leaseRow(leaseId);
-    expect((after.metadata as Record<string, any>).retainOnDestroy).toBeUndefined();
-    expect((after.metadata as Record<string, any>).cleanupDisposition).toMatchObject({ state: "parked", code: "provider_retains_resource" });
-    expect(destroy).not.toHaveBeenCalled();
-    expect(after.status).toBe("pending_cleanup");
+  it("row B (Boat): a proved stop whose destroy answers 'stopped' is parked, stays in inventory, and the pause settles", async () => {
+    const { agent, leaseId, destroy } = await pendingDestroy(carriedStop, lease => ({ providerLeaseId: lease.providerLeaseId, state: "stopped" }));
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(await disposition(leaseId)).toMatchObject({ state: "parked", code: "provider_retains_resource" });
+    expect(((await leaseRow(leaseId)).metadata as Record<string, any>).retainOnDestroy).toBeUndefined();
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "pending_cleanup" });
+    // Parked: no automatic destroy deadline wakes the worker for this row.
+    const next = await nextEnvironmentCleanupAt(db, 0);
+    expect(next === null || next > Date.now() + 60 * 60_000).toBe(true);
     await pause(agent.id);
     expect(await agentRow(agent.id)).toMatchObject({ lifecycleState: "paused", status: "paused" });
+    expect(releaseRunLeases).not.toHaveBeenCalled();
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "pending_cleanup" });
+  });
+
+  it("row B-held (gate 4, 0eb2069c shape): a proved stop held by unsaved files is parked with its debt, never destroyed, files untouched, and the pause settles", async () => {
+    const { agent, run, leaseId, destroy, copy } = await pendingDestroy(identity => ({ retainOnDestroy: true, ...carriedStop(identity) }),
+      lease => ({ providerLeaseId: lease.providerLeaseId, state: "destroyed" }), true);
+    expect(destroy).not.toHaveBeenCalled();
+    expect(await disposition(leaseId)).toMatchObject({ state: "parked", code: "held_for_unsaved_files",
+      debt: "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox." });
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "pending_cleanup" });
+    await pause(agent.id);
+    expect(await agentRow(agent.id)).toMatchObject({ lifecycleState: "paused", status: "paused" });
+    expect(releaseRunLeases).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
+    expect((await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, run.id)))[0]).toEqual(copy!.before);
+    expect(await fs.readFile(path.join(copy!.localRoot, "unsaved-note.txt"), "utf8")).toBe("unsaved note");
+  });
+
+  it("row B-real-destroy: a proved stop on a provider that really destroys, nothing held, is destroyed as before", async () => {
+    const { leaseId, destroy } = await pendingDestroy(carriedStop, lease => ({ providerLeaseId: lease.providerLeaseId, state: "destroyed" }));
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(await disposition(leaseId)).toBeUndefined();
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "expired", cleanupStatus: "success" });
+  });
+
+  it("row B-unproved: no proved stop is neither parked nor destroyed (retainOnDestroy and a save hold alone never park); the pause keeps its true line", async () => {
+    providerAnswer = () => undefined;
+    const { agent, leaseId } = await pendingDestroy(() => ({ retainOnDestroy: true }), () => {
+      throw new Error("Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.");
+    }, true);
+    expect(await disposition(leaseId)).toBeUndefined();
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "pending_cleanup" });
+    await pause(agent.id);
+    expect((await agentRow(agent.id)).lifecycleState).toBe("pausing");
+    const [issue] = await db.insert(issues).values({ companyId, title: "Chat", status: "in_progress",
+      assigneeAgentId: agent.id, createdAt: new Date(Date.now() - 60 * 60_000) }).returning();
+    await db.insert(issueComments).values({ companyId, issueId: issue!.id, body: "Are you there?", authorType: "user",
+      authorUserId: "person-1", createdAt: new Date(Date.now() - 30 * 60_000) });
+    await settleUnansweredPersonMessage(db, { companyId, issueId: issue!.id, now: new Date() });
+    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issue!.id), eq(issueComments.authorType, "system")));
+    expect(notes.map(note => note.body)).toEqual(["Boat Lead is paused for new work. We could not confirm that its previous run stopped. Your message is saved."]);
   });
 
   it("row E: a message to a pausing agent whose old run is unproved gets the true line, never silence", async () => {
