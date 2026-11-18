@@ -196,7 +196,10 @@ export function registerDeferredReceiptWork(
           if (!current) return null;
           // S124: a parked Send keeps its FIRST park time (stored once); its
           // 30 s cadence and its one deadline count from it, not updatedAt.
-          const parked = kind === "deferred" && current.status === "deferred_issue_execution" && !current.interruptedLegacy
+          // S124e (RFL): a receipt named by a cancelled legacy run (the
+          // person's Stop) is the same park: it keeps its immediate retry
+          // below, but its first-park deadline and ONE note + Retry still apply.
+          const parked = kind === "deferred" && current.status === "deferred_issue_execution"
             && parkedWake(current.payload, { actorType: current.requestedByActorType, reason: current.reason });
           const anchor = parked ? parkedWakeAnchor(current.payload) ?? await anchorParkedWake(db, scope0(entry)) : null;
           if (anchor !== null && anchor + parkedWakeDeadlineMs() <= Date.now()) {
