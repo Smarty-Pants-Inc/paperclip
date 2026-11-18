@@ -27,6 +27,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { executionProjectionsForRuns } from "../execution-projection.js";
 import { heartbeatService } from "../heartbeat.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { answeredPersonMessageSql } from "../person-message-answer.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "../continuation-comment-input.js";
@@ -1693,8 +1694,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // earlier message's "finished without a reply" and the latest message's. NEW: 1 notice, the latest (failed)
   // message's: the earlier message's run left a PENDING card the person can still answer, which is its response
   // (ruling 2), so it is not owed. This is rf-5's JUDGE row again, unedited expectations (its title, kept below).
-  it("supersedes(supersedes(JUDGE: a question card from BEFORE the latest failed message does not answer that message; "
-    + "RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118) row 8 -> the JUDGE row; RFL rulings 2, 3: an answerable card answers its own message)", async () => {
+  // am7, record addendum (RFL 20:42Z): ONE notice while the card is answerable, then the earlier message is owed
+  // again after the card EXPIRES. The expiry is the real interaction service's
+  // expirePendingInteractionsForTerminalIssue (the producer answered-stop-and-card.test.ts uses), and it is ASSERTED.
+  it("supersedes(JUDGE: a question card from BEFORE the latest failed message does not answer that message; "
+    + "RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118) row 8: ONE notice while the card is answerable; "
+    + "after the card EXPIRES (asserted) the earlier message is owed again", async () => {
     const f = await fixture({ status: "blocked" });
     const earlier = await f.message("Deploy it.");
     const prior = await f.run({ commentId: earlier, status: "succeeded" });
@@ -1713,7 +1718,20 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notices[0]!.body).toBe(NOT_ANSWERED);
     // Ruling 3 on the same task: the card EXPIRES unanswered -> the earlier message is owed again, its own
     // no_reply notice; the latest message keeps its one notice. Two separate runs: two groups, one notice each.
-    await db.update(issueThreadInteractions).set({ status: "expired", resolvedAt: f.at() }).where(eq(issueThreadInteractions.id, card!.id));
+    const answeredNow = async (id: string) => (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.id, id),
+      answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })))).length === 1;
+    const cardRow = async () => (await db.select({ status: issueThreadInteractions.status, resolvedByUserId: issueThreadInteractions.resolvedByUserId,
+      resolvedAt: issueThreadInteractions.resolvedAt }).from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card!.id)))[0]!;
+    expect(await cardRow(), "before the expiry: the card is still answerable").toMatchObject({ status: "pending", resolvedByUserId: null, resolvedAt: null });
+    expect([await answeredNow(earlier), await answeredNow(message)], "the pending card answers only its own message").toEqual([true, false]);
+    const expired = await issueThreadInteractionService(db).expirePendingInteractionsForTerminalIssue(
+      { id: f.issueId, companyId: f.companyId, status: "cancelled" }, { systemId: "expiry" } as never);
+    expect(expired.map(row => row.id), "the expiry step expired exactly this card").toEqual([card!.id]);
+    const after = await cardRow();
+    expect(after, "the card EXPIRED unanswered: no person resolved it").toMatchObject({ status: "expired", resolvedByUserId: null });
+    expect(after.resolvedAt, "the expiry is stamped").toBeInstanceOf(Date);
+    expect(await answeredNow(earlier), "the expired card no longer answers its message").toBe(false);
     await f.sweep();
     await f.sweep();
     expect((await f.visible()).map(n => [n.metadata?.authorizationReason, n.body]).sort(), "ONE notice per owed message, never two for one").toEqual([
