@@ -18,10 +18,12 @@ import { AsyncLocalStorage } from "node:async_hooks";
  *   its merge lock: owner sidecar + SQLite lock) and returns an idempotent
  *   runner. The work calls the runner from its finally as before; if the drain
  *   closes first, the DRAIN runs it, and the work's late call is a no-op.
- * - `close()`: no new `run` starts, and the drain starts closing: it awaits the
- *   in-flight host fs calls (never remote I/O), then runs the outstanding
- *   registered cleanups itself (tracked, LIFO), and only then is drained.
- *   Idempotent.
+ * - `close(reason)`: no new `run` starts, the drain's `signal` aborts (with
+ *   `reason`), and the drain starts closing: it awaits the in-flight host fs
+ *   calls (never remote I/O), then runs the outstanding registered cleanups
+ *   itself (tracked, LIFO), and only then is drained. Idempotent.
+ * - `signal`: aborted once this drain, or an outer drain it is joined to,
+ *   closes (pl/keepalive6).
  * - `closeAndDrain(capMs)`: close, then wait until that closing finished or
  *   `capMs` passes. Returns `{ drained: true }` or `{ drained: false, inFlight }`.
  *   `drained()` waits without a cap (once closed: for the whole closing,
@@ -35,6 +37,14 @@ import { AsyncLocalStorage } from "node:async_hooks";
  * The current drain is carried by AsyncLocalStorage, so nested/inner work
  * started inside the owner's callback takes the outer drain automatically.
  * Outside any drain, `hostMutation(fn)` is just `fn()`.
+ *
+ * Joined drains (pl/keepalive6, one mechanism with the above): an inner owner
+ * that runs inside an outer owner (e.g. a lifecycle lock taken inside a held
+ * source lock) runs under `joinHostMutationDrains(outer, inner)` (or
+ * `withHostMutationDrain(inner, fn, outer)`). Its host mutations are refused
+ * once EITHER drain is closed and are counted in flight by BOTH; its
+ * registered cleanups are registered with BOTH, so whichever drain closes
+ * first runs them, and the outer drain's closing waits for them too.
  */
 export class HostMutationRefusedError extends Error {
   readonly code = "HOST_MUTATION_REFUSED";
@@ -45,6 +55,8 @@ export class HostMutationRefusedError extends Error {
 
 export type HostMutationDrain = {
   readonly closed: boolean;
+  /** Aborted (with the close reason) once this gate, or an outer gate it is joined to, closes. */
+  readonly signal: AbortSignal;
   readonly inFlight: number;
   run<T>(fn: () => Promise<T>): Promise<T>;
   cleanup<T>(fn: () => Promise<T>): Promise<T>;
@@ -71,6 +83,7 @@ export function createHostMutationDrain(): HostMutationDrain {
   let finished = false;
   let closing: Promise<void> | undefined;
   let waiters: Array<() => void> = [];
+  const gate = new AbortController();
   // Registered cleanups not yet started, in registration order.
   const pending = new Set<HostCleanupHandle>();
   const settle = () => {
@@ -87,6 +100,7 @@ export function createHostMutationDrain(): HostMutationDrain {
   const drain: HostMutationDrain = {
     get closed() { return closed; },
     get inFlight() { return inFlight; },
+    signal: gate.signal,
     run(fn) {
       if (closed) return Promise.reject(new HostMutationRefusedError(closeReason));
       return track(fn);
@@ -126,6 +140,9 @@ export function createHostMutationDrain(): HostMutationDrain {
         }
         finished = true;
       })();
+      // After `closing` exists: an abort listener may call closeAndDrain /
+      // drained / defer synchronously; a cleanup it registers is picked up.
+      gate.abort(reason ?? new HostMutationRefusedError());
     },
     async closeAndDrain(capMs, reason) {
       drain.close(reason);
@@ -149,9 +166,48 @@ const store: AsyncLocalStorage<HostMutationDrain> =
   ((globalThis as Record<symbol, unknown>)[STORE_KEY] as AsyncLocalStorage<HostMutationDrain> | undefined)
   ?? ((globalThis as Record<symbol, unknown>)[STORE_KEY] = new AsyncLocalStorage<HostMutationDrain>()) as AsyncLocalStorage<HostMutationDrain>;
 
-/** Run `fn` (and everything it starts) under `drain`. */
-export function withHostMutationDrain<T>(drain: HostMutationDrain, fn: () => Promise<T>): Promise<T> {
-  return store.run(drain, fn);
+/**
+ * pl/keepalive6 + adopt-drain4: an inner owner's drain JOINED to the drain of
+ * the owner it runs inside. Through the joined view:
+ * - `run` is refused once EITHER drain is closed, and is counted in flight by
+ *   BOTH (the outer's drain waits for the inner's host writes);
+ * - `cleanup` is counted by both;
+ * - `defer` registers the cleanup with the inner drain AND with the outer one:
+ *   whichever closes first runs it (once; the other awaits the same run), so
+ *   the outer's closing also waits for the inner's registered cleanups;
+ * - `signal` aborts with whichever drain closes first (AbortSignal.any);
+ * - `close`/`closeAndDrain`/`drained` act on the inner drain only.
+ */
+export function joinHostMutationDrains(outer: HostMutationDrain, inner: HostMutationDrain): HostMutationDrain {
+  const signal = AbortSignal.any([outer.signal, inner.signal]);
+  const joined: HostMutationDrain = {
+    get closed() { return outer.closed || inner.closed; },
+    get inFlight() { return inner.inFlight; },
+    signal,
+    run(fn) {
+      if (outer.closed) return outer.run(fn);
+      if (inner.closed) return inner.run(fn);
+      return outer.run(() => inner.run(fn));
+    },
+    cleanup: (fn) => outer.cleanup(() => inner.cleanup(fn)),
+    defer(fn) {
+      const innerHandle = inner.defer(fn);
+      // Run by the outer's closing (or the work's late call) under the joined
+      // view, so the cleanup's own hostCleanup calls are counted by both.
+      return outer.defer(() => store.run(joined, innerHandle));
+    },
+    close: (reason) => inner.close(reason),
+    closeAndDrain: (capMs, reason) => inner.closeAndDrain(capMs, reason),
+    drained: () => inner.drained(),
+  };
+  return joined;
+}
+
+/** Run `fn` (and everything it starts) under `drain`. With `parent` (the
+ * owner this work runs inside, captured before any connection callback can
+ * lose the async context), the drain is joined to it: see joinHostMutationDrains. */
+export function withHostMutationDrain<T>(drain: HostMutationDrain, fn: () => Promise<T>, parent?: HostMutationDrain): Promise<T> {
+  return store.run(parent && parent !== drain ? joinHostMutationDrains(parent, drain) : drain, fn);
 }
 
 export function currentHostMutationDrain(): HostMutationDrain | undefined {
