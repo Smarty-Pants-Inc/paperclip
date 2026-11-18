@@ -14783,6 +14783,12 @@ describe("native warm session supervision", () => {
     });
 
     describe("RF4 independent: a person's Stop retained the box; the successor's retirement of its warm owner", () => {
+      // Q5 (test determinism only): the 'unproven' controls would wait the product's full
+      // 30 s warmSessionReleaseWait bound, past vitest's 15 s test timeout. Shorten the bound
+      // for this block only, as the repo's other bounded-wait rows do; the product bound is unchanged.
+      const productReleaseWait = { ...warmSessionReleaseWait };
+      beforeEach(() => { warmSessionReleaseWait.timeoutMs = 200; });
+      afterEach(() => { Object.assign(warmSessionReleaseWait, productReleaseWait); });
       type Receipt = "own-stopped" | "own-destroyed" | "none" | "foreign-stopped" | "foreign-destroyed";
       const boatInactive = () => new Error("Boat sandbox lease is no longer active.");
       const scenario = async (kind: string, opts: { receipt?: Receipt; closeError?: () => Error; closeDelayMs?: number; stoppedTurn?: Record<string, unknown> } = {}) => {
