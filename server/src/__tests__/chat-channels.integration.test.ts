@@ -65531,7 +65531,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // fam-retry3 ITEM A (RFL 20:33Z, R-ONCE; testing-lead's live shape a58a6a19):
     // the chat Retry of failed run A after successor B posted the final answer
     // to the same person message is a no-op with the one authority's line and no
-    // wake (person-message-answer.ts answeredPersonMessageSql decides "answered").
+    // wake (person-message-answer.ts completedPersonMessageAnswerSql decides "answered").
     it("retry-fold / fam-retry3: a chat Retry of a failed run whose person message a later run already answered starts no run and says 'Already answered above.'", async () => {
       const context = await fixture(true);
       try {
@@ -65575,6 +65575,34 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           contextSnapshot: { issueId: context.issue.id, wakeCommentId: carried.wakeCommentId, retryOfRunId: context.runId } });
         await context.service.processFailedChatRunRetry(retry!.id);
         expect(context.wakeup).toHaveBeenCalledTimes(1);
+      } finally {
+        await context.cleanup();
+      }
+    });
+
+    // fam-retry-r3 negative (RFL F1): B carried the message as its own pending
+    // input, posted a PROGRESS comment and then FAILED. That is DELIVERED, not
+    // ANSWERED (completedPersonMessageAnswerSql), so the chat Retry still wakes once.
+    it("retry-fold / fam-retry3: a chat Retry whose person message only a failed run's progress comment replied to still wakes once", async () => {
+      const context = await fixture(true);
+      try {
+        await context.resolve().expect(200);
+        const [retry] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, context.endpoint.id),
+          eq(chatActions.kind, "failed_run_retry")));
+        const [runA] = await readHeartbeatRunsById(context.runId);
+        const carried = runA!.contextSnapshot as Record<string, unknown>;
+        expect(carried.wakeCommentId).toEqual(expect.any(String));
+        const runB = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: runB, companyId: context.fixture.companyId, agentId: context.fixture.assignedAgentId,
+          issueId: context.issue.id, status: "failed", startedAt: new Date(), finishedAt: new Date(),
+          contextSnapshot: { issueId: context.issue.id, wakeCommentId: carried.wakeCommentId,
+            wakeCommentIds: carried.wakeCommentIds ?? [carried.wakeCommentId], retryOfRunId: context.runId } });
+        await db.insert(issueComments).values({ companyId: context.fixture.companyId, issueId: context.issue.id, authorType: "agent",
+          authorAgentId: context.fixture.assignedAgentId, createdByRunId: runB, body: "Looking into it now; answer to follow." });
+        await context.service.processFailedChatRunRetry(retry!.id);
+        expect(context.wakeup).toHaveBeenCalledTimes(1);
+        const [settled] = await db.select().from(chatActions).where(eq(chatActions.id, retry!.id));
+        expect(JSON.stringify(settled?.result ?? null)).not.toContain("Already answered above.");
       } finally {
         await context.cleanup();
       }
