@@ -11,9 +11,12 @@ type LeaseIdentity = {
 
 /** Bind a provider receipt to the exact host-owned lease and run. Old plugins
  * return void; that remains supported but grants no continuation authority. */
-export function remoteTerminationReceipt(lease: LeaseIdentity, value: unknown) {
+export function remoteTerminationReceipt(lease: LeaseIdentity, value: unknown, probeLeaseId?: string | null) {
   const receipt = value as { providerLeaseId?: unknown; state?: unknown } | null;
-  if (!lease.heartbeatRunId || !lease.provider || lease.provider === "local" ||
+  // A setup probe's lease has no run. It binds only when the probe's holder
+  // names that exact lease id; no run-keyed reader can ever select it.
+  const probe = !lease.heartbeatRunId && !!probeLeaseId && probeLeaseId === lease.id;
+  if ((!lease.heartbeatRunId && !probe) || !lease.provider || lease.provider === "local" ||
       !lease.providerLeaseId || receipt?.providerLeaseId !== lease.providerLeaseId ||
       !["stopped", "destroyed"].includes(String(receipt?.state))) return undefined;
   return {
@@ -32,19 +35,52 @@ type ReceiptLease = LeaseIdentity & {
 /** The lease carries a provider stop receipt bound to its exact company, run,
  * lease, provider and physical task. It proves execution there stopped, not
  * that the lease's resources were released. */
-export function hasBoundRemoteStopReceipt(lease: Pick<ReceiptLease, keyof LeaseIdentity | "metadata">): boolean {
+export function hasBoundRemoteStopReceipt(lease: Pick<ReceiptLease, keyof LeaseIdentity | "metadata">, probeLeaseId?: string): boolean {
   const receipt = lease.metadata?.remoteExecutionTermination as Record<string, unknown> | undefined;
   return Boolean(receipt && receipt.schema === "paperclip.remote-termination.v1" &&
     receipt.companyId === lease.companyId && receipt.runId === lease.heartbeatRunId &&
     receipt.leaseId === lease.id && receipt.provider === lease.provider &&
-    remoteTerminationReceipt(lease, receipt));
+    remoteTerminationReceipt(lease, receipt, probeLeaseId));
 }
 
 /** The lease was released with successful cleanup and its bound stop receipt.
  * Resource cleanup gates use this; it never accepts an unreleased lease. */
-export function hasRemoteTerminationReceipt(lease: ReceiptLease): boolean {
+export function hasRemoteTerminationReceipt(lease: ReceiptLease, probeLeaseId?: string): boolean {
   return Boolean(lease.releasedAt && lease.cleanupStatus === "success" &&
-    ["released", "expired", "failed"].includes(lease.status) && hasBoundRemoteStopReceipt(lease));
+    ["released", "expired", "failed"].includes(lease.status) && hasBoundRemoteStopReceipt(lease, probeLeaseId));
+}
+
+/** The owner of a remote session: a run's lease (I, S), or a setup probe's
+ * exact lease (H: no run, its leaseId held by the verifier). */
+export type RemoteLeaseOwner = {
+  companyId: string; environmentId: string | null | undefined; providerLeaseId: string | null | undefined;
+  runId: string | null; leaseId?: string;
+};
+
+/** Boat's typed teardown receipt on the owner's lease: "destroyed" proves the
+ * owner gone anywhere; "stopped" on the owner's own lease proves it only when
+ * the successor is not on that same sandbox. With ownLeaseOnly (the retirement
+ * path), "destroyed" too counts only on the owner's own lease: a destroy
+ * receipt on another lease of the same box (an earlier lifecycle of a box
+ * since resumed) never proves the current owner gone. "Own" is the owner run's
+ * lease, or the probe's exact lease id. No error code or text is ever proof. */
+export async function ownLeaseTerminated(db: Db, owner: RemoteLeaseOwner,
+  scope: { successorOnOwnerSandbox?: boolean; ownLeaseOnly?: boolean } = {}): Promise<boolean> {
+  if (!owner.providerLeaseId || !owner.environmentId) return false;
+  const leases = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, owner.companyId),
+    eq(environmentLeases.environmentId, owner.environmentId),
+    eq(environmentLeases.providerLeaseId, owner.providerLeaseId),
+  ));
+  const resolved = await Promise.all(leases.map(lease => resolveRemoteTerminationLease(db, lease)));
+  return resolved.some(lease => {
+    if (!hasRemoteTerminationReceipt(lease, owner.leaseId)) return false;
+    const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
+    const ownLease = (owner.runId !== null && lease.heartbeatRunId === owner.runId)
+      || (owner.leaseId !== undefined && lease.id === owner.leaseId);
+    return (state === "destroyed" && (ownLease || scope.ownLeaseOnly !== true))
+      || (state === "stopped" && ownLease && scope.successorOnOwnerSandbox !== true);
+  });
 }
 
 /** Release or destroy of this lease has started: plugin release and destroy

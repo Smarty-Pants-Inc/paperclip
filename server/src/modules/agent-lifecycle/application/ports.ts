@@ -43,5 +43,7 @@ export interface LifecycleFailure {
   version?: number;
   attempts?: number;
   verificationFailures?: number;
+  /** The durable start of this transient failure run (lifecycleOperation). */
+  transientFailureSince?: string;
   pluginId?: string;
 }

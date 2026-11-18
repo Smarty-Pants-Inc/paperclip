@@ -157,7 +157,7 @@ import { uploadVerifiedProviderPack } from "./provider-pack-upload.js";
 import { selectRemotePiCompanion } from "./remote-pi-companion.js";
 import { scheduledResumeContinuationAllowed } from "./scheduled-resume-continuation.js";
 import { readNativeLocalProcessStop, recordedLocalExecutionStopped, PRIOR_OWNER_FENCE_REFUSED, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, withReleasedNativeRunProcess } from "../native-local-process-stop.js";
-import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, ownLeaseTerminated, remoteLeaseCleanupScope, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "../reusable-sandbox-kept-marker.js";
 import { connectorToolDefinitionsForSkills } from "../connector-runtime.js";
 import { NATIVE_PREPARATION_FENCING_VERSION, setNativeExecutionActive } from "./native-active-runs.js";
@@ -1271,28 +1271,11 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
   return closeIdleWarmNativeSessions(input);
 }
 
-/** Boat's typed teardown receipt on the owner's lease: "destroyed" proves the
- * owner gone anywhere; "stopped" by the owner's own run proves it only when the
- * successor is not on that same sandbox. With ownLeaseOnly (the retirement
- * path), "destroyed" too counts only on the owner's own run's lease: a destroy
- * receipt on another run's lease of the same box (an earlier lifecycle of a
- * box since resumed) never proves the current owner gone. */
+/** The owner's own-lease receipt (ownLeaseTerminated in remote-execution-termination.ts). */
 async function warmSandboxTerminated(db: Db, entry: WarmNativeSession,
   scope: { successorOnOwnerSandbox?: boolean; ownLeaseOnly?: boolean } = {}): Promise<boolean> {
-  if (!entry.providerLeaseId || !entry.environmentId) return false;
-  const leases = await db.select().from(environmentLeases).where(and(
-    eq(environmentLeases.companyId, entry.companyId),
-    eq(environmentLeases.environmentId, entry.environmentId),
-    eq(environmentLeases.providerLeaseId, entry.providerLeaseId),
-  ));
-  const resolved = await Promise.all(leases.map(lease => resolveRemoteTerminationLease(db, lease)));
-  return resolved.some(lease => {
-    if (!hasRemoteTerminationReceipt(lease)) return false;
-    const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
-    const ownLease = lease.heartbeatRunId === entry.runId;
-    return (state === "destroyed" && (ownLease || scope.ownLeaseOnly !== true))
-      || (state === "stopped" && ownLease && scope.successorOnOwnerSandbox !== true);
-  });
+  return ownLeaseTerminated(db, { companyId: entry.companyId, environmentId: entry.environmentId,
+    providerLeaseId: entry.providerLeaseId, runId: entry.runId }, scope);
 }
 
 async function warmRunnerPortTakenBySuccessor(db: Db, entry: WarmNativeSession): Promise<boolean> {
