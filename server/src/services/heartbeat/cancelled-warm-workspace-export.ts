@@ -63,6 +63,10 @@ export function hasCleanStoppedSessionClose(run: Pick<typeof heartbeatRuns.$infe
     && proof.companyId === run.companyId && proof.issueId === run.nativeIssueId && proof.clean === true;
 }
 
+/** adopt-stopu-round: durable run events for the live grader. */
+export const PROCESSES_VERIFIED_GONE_EVENT = "person_stop.processes_verified_gone";
+export const EXPORT_STARTED_EVENT = "person_stop.export_started";
+
 const RETAINED_IDLE_SCHEMA = "paperclip.native-retained-idle-checkpoint.v1";
 /** adopt-stopu-proof: how often the boundary re-reads the run row while it
  * waits (inside the export's one bound) for NSE's retained/closed decision. */
@@ -226,13 +230,33 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       // table shows no process of the stopped turn remains.
       // Raced with the same abort as the export, so a box that never answers
       // cannot hold the finalization lock past the bound.
-      const proving = (async () => noStoppedTurnProcessRemains(input.stoppedTurnBox
+      let box: StoppedTurnBox | null = null;
+      const proving = (async () => noStoppedTurnProcessRemains(box = input.stoppedTurnBox
         ? await input.stoppedTurnBox(controller.signal).catch(() => null) : null, current.startedAt,
         { retainedSession: decided === "retained", runId: run.id }))();
       proving.catch(() => undefined);
       const proof = await Promise.race([proving, aborted]);
       if (!proof.proven) throw new StoppedTurnProcessesNotProvenGoneError(
         `${proof.detail}${proof.remaining?.length ? `:${proof.remaining.join(",")}` : ""}`);
+      // adopt-stopu-round (stack-lead's live grader): the durable records. The
+      // verified-gone record, then the export-start record (strictly after it,
+      // with the copy path the export takes: the provider's own syncOut when the
+      // box's runner exposes it, else the remote tar capture;
+      // adapter-utils sandbox-managed-runtime.ts nativeSyncOut).
+      const verifiedGoneAt = new Date();
+      await appendHeartbeatRunEvent(input.db, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
+        eventType: PROCESSES_VERIFIED_GONE_EVENT, stream: "system", level: "info",
+        message: "The stopped turn's processes are verified gone from the box.",
+        payload: { at: verifiedGoneAt.toISOString(), killed: proof.killed, remaining: 0, scoped: proof.scoped,
+          decision: decided } });
+      await assertHeld();
+      while (Date.now() <= verifiedGoneAt.getTime()) await new Promise(resolve => setTimeout(resolve, 1));
+      const runner = (box as StoppedTurnBox | null)?.runner as { syncOut?: unknown } | undefined;
+      await appendHeartbeatRunEvent(input.db, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
+        eventType: EXPORT_STARTED_EVENT, stream: "system", level: "info",
+        message: "The stopped turn's workspace export started.",
+        payload: { at: new Date().toISOString(), copyPath: typeof runner?.syncOut === "function" ? "provider_syncOut" : "remote_tar",
+          verifiedGoneAt: verifiedGoneAt.toISOString() } });
       await assertHeld();
       const export_ = sync.restoreWorkspace(assertHeld, { signal: controller.signal });
       export_.catch(() => undefined);
