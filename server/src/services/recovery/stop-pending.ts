@@ -1,5 +1,6 @@
-import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
-import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { heartbeatRuns, issueComments, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { answeredPersonMessageSql } from "../person-message-answer.js";
 import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { logActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
@@ -78,24 +79,27 @@ function stopRequestedAt(run: typeof heartbeatRuns.$inferSelect): number {
   return times.length ? Math.min(...times) : run.updatedAt.getTime();
 }
 
-/** An answer can retire a no-request diagnostic, never prove execution Stop. */
-async function laterSuccessfulTaskRun(tx: Db, input: TaskBinding, options: { evenAfterStop?: boolean } = {}) {
-  if (!input.runIds.length) return null;
-  const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
-  if (!issue || issue.status === "cancelled" || issue.cancelledAt) return null;
-  const runs = await tx.select().from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, input.runIds)));
-  if (runs.length !== input.runIds.length || (!options.evenAfterStop && runs.some(hasRecordedStopRequest))) return null;
-  // Compare in PostgreSQL: JS Date truncates microseconds and could otherwise
-  // misclassify the named succeeded run itself as a later answer.
-  const sourceTime = tx.select({ at: sql<Date>`max(${heartbeatRuns.createdAt})` }).from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, input.runIds)));
-  return (await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.status, "succeeded"),
-    notInArray(heartbeatRuns.id, input.runIds), sql`${heartbeatRuns.createdAt} > (${sourceTime})`,
-    sql`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.nativeIssueId}::text,
-      ${heartbeatRuns.contextSnapshot}->>'issueId') = ${input.issueId}`,
-  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1))[0] ?? null;
+/** C1 fix 4: 'delivered' is the unanswered-message sweep's own rule,
+ * answeredPersonMessageSql (person-message-answer.ts; the sweep's answeredSql,
+ * recovery/unanswered-person-message.ts), applied to the person messages the
+ * bound runs carried on this task. Every carried message must be answered; a
+ * run that merely succeeded (empty result, no comment) delivered nothing, and
+ * runs that carried no person message have nothing delivered. An answer can
+ * retire the card; it never proves execution Stop. */
+async function deliveredToPerson(tx: Db, input: TaskBinding): Promise<boolean> {
+  if (!input.runIds.length) return false;
+  const ids = sql.join([...new Set(input.runIds)].map(id => sql`${id}::uuid`), sql`, `);
+  const m = { id: sql.raw("m.id"), companyId: sql.raw("m.company_id"), issueId: sql.raw("m.issue_id"), createdAt: sql.raw("m.created_at") };
+  const [row] = await tx.execute<{ carried: number; answered: number }>(sql`select count(*)::int as carried,
+      count(*) filter (where ${answeredPersonMessageSql(m)})::int as answered
+    from ${issueComments} m
+    where m.company_id = ${input.companyId} and m.issue_id = ${input.issueId} and m.author_type = 'user' and m.deleted_at is null
+      and exists (select 1 from ${heartbeatRuns} r where r.company_id = m.company_id and r.id in (${ids})
+        and (r.context_snapshot->>'wakeCommentId' = m.id::text or r.context_snapshot->>'commentId' = m.id::text
+          or r.context_snapshot->>'conversationReplyBoundaryCommentId' = m.id::text
+          or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? m.id::text
+          or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? m.id::text))`);
+  return Boolean(row && Number(row.carried) > 0 && Number(row.answered) === Number(row.carried));
 }
 
 /** Ordinary task progress is not evidence that this retained executor stopped. */
@@ -145,8 +149,21 @@ export async function recheckTaskStopPending(tx: Db, input: { companyId: string;
     await clearTaskStopPending(tx, binding, publications);
     return;
   }
-  const answer = await laterSuccessfulTaskRun(tx, binding);
-  if (answer) await clearTaskStopPending(tx, { ...binding, answeredByRunId: answer.id }, publications);
+  // C1 fix 1: retire the card once the person's message was delivered, even
+  // after a person's Stop (RFL 08:00Z: no card once a successor has answered).
+  if (await deliveredToPerson(tx, binding)) {
+    await clearTaskStopPending(tx, { ...binding, reason: "delivered" }, publications);
+    return;
+  }
+  // C1 fix 3: the true late card (b) says this task can't start; it closes when
+  // the task's claims no longer name its runs (Force release, then a new run's checkout).
+  if (pending.code === ENVIRONMENT_UNRELEASED_CODE) {
+    const [issue] = await tx.select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+    if (!issue || ![issue.checkoutRunId, issue.executionRunId].some(id => id !== null && runIds.includes(id))) {
+      await clearTaskStopPending(tx, { ...binding, reason: "released" }, publications);
+    }
+  }
 }
 
 async function notify(tx: Db, input: TaskBinding) {
@@ -188,8 +205,13 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   if (!runIds.length) return;
   // Do not recreate a retired no-Stop card on every tick while the old lease
   // remains held. A later answer does not release either execution claim.
-  // C1 guard 2: no new card once a successor has answered on this task.
-  if (await laterSuccessfulTaskRun(tx, { ...input, runIds }, { evenAfterStop: true })) return;
+  // C1 guard 2 / fix 4: no new card once the person's message was delivered.
+  if (await deliveredToPerson(tx, { ...input, runIds })) return;
+  // C1 fix 2 (receipt race): every caller proves !runExecutionsHaveStopped under
+  // the task and bound-run locks in this same transaction just before calling.
+  // A receipt that commits after that check is retired by the next sweep's
+  // recheck (recheckTaskStopPending: runExecutionsHaveStopped -> clear), which
+  // runs for every open card even after the task's claims moved.
   const actionText = holdAction({ code });
   let existing = await activeAction(tx, input);
   const prior = existing && stopPending(existing);
@@ -234,9 +256,13 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   }, publications);
 }
 
-/** Caller supplies guarded Stop proof, or a checked later answer without any
- * recorded Stop request. Neither resolution mutates execution claims. */
-export async function clearTaskStopPending(tx: Db, input: TaskBinding & { answeredByRunId?: string }, publications: ActivityPublication[]) {
+const RETIRED_NOTE = {
+  delivered: "The person's message on this task was answered; no further hold is shown. This is not Stop proof. Execution claims are unchanged.",
+  released: "This task's claims no longer name these runs (Force release or a new run's checkout); the environment hold no longer applies.",
+} as const;
+/** Caller supplies guarded Stop proof, a delivered answer (fix 4) or, for the
+ * true late card, released task claims (fix 3). None mutates execution claims. */
+export async function clearTaskStopPending(tx: Db, input: TaskBinding & { reason?: "delivered" | "released" }, publications: ActivityPublication[]) {
   const existing = await activeAction(tx, input);
   const pending = existing && stopPending(existing);
   if (!existing || !pending) return;
@@ -246,8 +272,7 @@ export async function clearTaskStopPending(tx: Db, input: TaskBinding & { answer
     const sameBinding = JSON.stringify(pending.runIds) === JSON.stringify([...new Set(input.runIds)].sort());
     await tx.update(issueRecoveryActions).set({ status: sameBinding ? "resolved" : "cancelled",
       outcome: sameBinding ? "restored" : "cancelled", resolvedAt: now, updatedAt: now,
-      resolutionNote: sameBinding ? input.answeredByRunId
-        ? `Later run ${input.answeredByRunId} of this task succeeded; no Stop was requested. Execution claims are unchanged.`
+      resolutionNote: sameBinding ? input.reason ? RETIRED_NOTE[input.reason]
         : "Stop proved under the task and bound-run locks."
         : "Task execution ownership changed; the old Stop inspection is historical.",
     }).where(eq(issueRecoveryActions.id, existing.id));
@@ -259,9 +284,9 @@ export async function clearTaskStopPending(tx: Db, input: TaskBinding & { answer
     }).where(eq(issueRecoveryActions.id, existing.id));
   }
   await logActivity(tx, { companyId: input.companyId, actorType: "system", actorId: "recovery",
-    action: input.answeredByRunId ? "issue.execution_stop_pending_resolved" : "issue.execution_stop_confirmed",
+    action: input.reason ? "issue.execution_stop_pending_resolved" : "issue.execution_stop_confirmed",
     entityType: "issue", entityId: input.issueId,
     details: { runIds: input.runIds, recoveryActionId: existing.id,
-      ...(input.answeredByRunId ? { reason: "later_run_succeeded", answeredByRunId: input.answeredByRunId } : {}) },
+      ...(input.reason ? { reason: input.reason === "delivered" ? "person_message_delivered" : "environment_claims_released" } : {}) },
   }, publications);
 }
