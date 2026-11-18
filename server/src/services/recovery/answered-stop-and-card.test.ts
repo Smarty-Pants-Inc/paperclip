@@ -5,7 +5,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, agentWakeupRequests, companies, companyMemberships, createDb, heartbeatRunEvents,
-  heartbeatRuns, issueComments, issues, issueThreadInteractions, nativeRunFinalizations,
+  heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issues, issueThreadInteractions, nativeRunFinalizations,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { errorHandler } from "../../middleware/index.js";
@@ -14,7 +14,8 @@ import { issueRoutes } from "../../routes/issues.js";
 import { heartbeatService } from "../heartbeat.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { answeredPersonMessageSql } from "../person-message-answer.js";
-import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_NO_REPLY_TEXT, UNANSWERED_MESSAGE_TEXT,
+import { settleUnansweredPersonMessagesForTask, UNANSWERED_CARD_ANSWER_NO_REPLY_TEXT, UNANSWERED_CARD_ANSWER_NO_RUN_TEXT,
+  UNANSWERED_CARD_ANSWER_TEXT, UNANSWERED_MESSAGE_NO_REPLY_TEXT, UNANSWERED_MESSAGE_TEXT,
 } from "./unanswered-person-message.js";
 
 // Keep (never-OK rule: no person message is silently unanswered, and no extra false notice). RFL rulings 8, 2, 3
@@ -142,7 +143,28 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
     /** Every unanswered notice EVER written on the task (retired ones too). */
     const notices = async () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
       eq(issueComments.authorType, "system"), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
-    return { companyId, agentId, issueId, sender, other, send, startRun, readRun, stop, end, card, cardStatus, sweep, answered, notices };
+    /** The person answers the card through the real interaction service. */
+    const answer = async (cardId: string) => {
+      await issueThreadInteractionService(db).answerQuestions({ id: issueId, companyId }, cardId,
+        { answers: [{ questionId: "scope", optionIds: ["first"] }] } as never, { userId: sender });
+      expect(await cardStatus(cardId)).toEqual({ status: "answered", resolvedByUserId: sender });
+    };
+    /** The run that took the person's card answer as its OWN input (the answer-resume wake context, routes/issues.ts). */
+    const resumeRun = async (cardId: string, status: "succeeded" | "failed", reply = false) => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, runtimeMode: "native", nativeIssueId: issueId,
+        scopeKind: "issue", issueId, responsibleUserId: sender, status, startedAt: new Date(), finishedAt: new Date(),
+        ...(status === "failed" ? { errorCode: "adapter_failed", error: "adapter_failed: the model call failed" } : {}),
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented", interactionId: cardId,
+          interactionStatus: "answered", source: "issue.interaction.respond" } });
+      await db.update(issueQuestionResponseDeliveries).set({ targetRunId: runId, status: "fallback_queued", deliveryMode: "wake_fallback" })
+        .where(eq(issueQuestionResponseDeliveries.interactionId, cardId));
+      if (reply) await db.insert(issueComments).values({ companyId, issueId, body: "Done, with the first scope.", authorType: "agent",
+        authorAgentId: agentId, createdByRunId: runId, createdAt: new Date(Date.now() + 1000) });
+      return runId;
+    };
+    return { companyId, agentId, issueId, sender, other, send, startRun, readRun, stop, end, card, cardStatus, sweep, answered, notices,
+      answer, resumeRun };
   }
   const key = (id: string) => ({ authorizationReason: `unanswered_message:${id}` });
   const PASSES = [1, 3, 11, 30];
@@ -234,18 +256,79 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
       expect(await f.notices(), "no notice was ever written").toHaveLength(0);
     }, 60_000);
 
-  it("ruling 2: a card ANSWERED by the person answers M -> no notice", async () => {
+  // RFL ruling 4, the CARD-ANSWER DUTY. Superseded am5 row (old -> new): "ruling 2: a card ANSWERED by the person
+  // answers M -> no notice" asserted NO notice at +1/+3/+11/+30 min although no run ever took the answer. New: M
+  // still gets none (the card answers M), and the ANSWER, which no run started for, gets its ONE no-run line.
+  const cardFixture = async () => {
     const f = await fixture();
     const m = await f.send("M: deploy it.");
     const run = await f.startRun(m);
     const cardId = await f.card(run);
     await f.end(run, "succeeded");
-    await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId }, cardId,
-      { answers: [{ questionId: "scope", optionIds: ["first"] }] } as never, { userId: f.sender });
-    expect(await f.cardStatus(cardId)).toEqual({ status: "answered", resolvedByUserId: f.sender });
+    await f.answer(cardId);
     expect(await f.answered(m), "the card the person answered is M's response").toBe(true);
-    for (const minutes of PASSES) await f.sweep(minutes);
+    return { ...f, m, run, cardId };
+  };
+  it("ruling 4: card answered, the run that took the answer SUCCEEDS with a reply -> no line, at any pass", async () => {
+    const f = await cardFixture();
+    await f.resumeRun(f.cardId, "succeeded", true);
+    for (const minutes of PASSES) expect(await f.sweep(minutes)).toEqual({ noticed: 0, pending: 0 });
     expect(await f.notices(), "no notice was ever written").toHaveLength(0);
+  }, 60_000);
+
+  it("ruling 4: card answered, the run that took the answer FAILS -> exactly one 'your answer' line, none for M", async () => {
+    const f = await cardFixture();
+    const resume = await f.resumeRun(f.cardId, "failed");
+    const counts = [];
+    for (const minutes of PASSES) counts.push((await f.sweep(minutes)).noticed);
+    expect(counts.reduce((a, b) => a + b, 0), "one notice written over all passes").toBe(1);
+    const all = await f.notices();
+    expect(all, "exactly one notice, ever: the answer's, never one for M too").toHaveLength(1);
+    expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_CARD_ANSWER_TEXT, metadata: { ...key(f.cardId), sourceRunId: resume } });
+    expect(all[0]!.body).toBe("Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.");
+    expect((all[0]!.presentation as { title?: string } | null)?.title).toBe("Your answer wasn't acted on");
+    // A later run that takes the answer as its own input and replies retires the line; nothing new is written.
+    await f.resumeRun(f.cardId, "succeeded", true);
+    expect(await f.sweep(31)).toEqual({ noticed: 0, pending: 0 });
+    const after = await f.notices();
+    expect(after).toHaveLength(1);
+    expect(after[0]!.deletedAt, "the answered answer's line is retired").not.toBeNull();
+  }, 60_000);
+
+  it("ruling 4: card answered, the run that took the answer FINISHES WITHOUT A REPLY -> exactly one finished-without-a-reply line", async () => {
+    const f = await cardFixture();
+    const resume = await f.resumeRun(f.cardId, "succeeded");
+    for (const minutes of PASSES) await f.sweep(minutes);
+    const all = await f.notices();
+    expect(all, "exactly one notice, ever").toHaveLength(1);
+    expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_CARD_ANSWER_NO_REPLY_TEXT, metadata: { ...key(f.cardId), sourceRunId: resume } });
+    expect(all[0]!.body).toBe("This run finished without a reply to your answer. Sending it again is safe.");
+  }, 60_000);
+
+  it("ruling 4: card answered, NO RUN starts for the answer -> nothing while its delivery may still start, then exactly one no-run line", async () => {
+    const f = await cardFixture();
+    expect(await db.select({ status: issueQuestionResponseDeliveries.status }).from(issueQuestionResponseDeliveries)
+      .where(eq(issueQuestionResponseDeliveries.interactionId, f.cardId)), "the real answer left its delivery waiting for a run")
+      .toEqual([{ status: "pending" }]);
+    const counts = [];
+    for (const minutes of PASSES) counts.push((await f.sweep(minutes)).noticed);
+    expect(counts, "none at +1 and +3 min; one at +11 min (10 min after the answer); never a second").toEqual([0, 0, 1, 0]);
+    const all = await f.notices();
+    expect(all, "exactly one notice, ever: the answer's, never one for M").toHaveLength(1);
+    expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_CARD_ANSWER_NO_RUN_TEXT, metadata: key(f.cardId) });
+    expect(all[0]!.body).toBe("Your answer is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.");
+  }, 60_000);
+
+  it("ruling 4 edge: a newer typed message after the answer is the owed input, not the answer", async () => {
+    const f = await cardFixture();
+    await f.resumeRun(f.cardId, "failed");
+    const later = await f.send("Hello?");
+    const run2 = await f.startRun(later);
+    await f.end(run2, "failed");
+    for (const minutes of PASSES) await f.sweep(minutes);
+    const all = await f.notices();
+    expect(all, "exactly one notice, ever: the later message's").toHaveLength(1);
+    expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_TEXT, metadata: { ...key(later), sourceRunId: run2 } });
   }, 60_000);
 
   it("ruling 3: a card that EXPIRED unanswered no longer counts -> M is owed again: exactly one no_reply notice", async () => {

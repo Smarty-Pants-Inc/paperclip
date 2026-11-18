@@ -1,5 +1,5 @@
 import { sql, type SQL } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues } from "@paperclipai/db";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
 export const ISSUE_IMPORTED_ACTION = "issue.imported";
@@ -61,6 +61,35 @@ export function answeredPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: 
           or (q.status = 'cancelled' and (q.result->>'outcome' in ('skipped', 'withdrawn') or q.result->>'cancelled' = 'true')))))
         and ${ownInputNamesSql(m.id)})
     or ${importedPersonHistorySql(m)})`;
+}
+
+/** A person's card answer whose delivery to the agent is still pending is a further attempt only this long after
+ * the answer (resolved_at): a dead delivery worker never leaves the answer silent. */
+export const CARD_ANSWER_DELIVERY_BOUND_MS = 10 * 60_000;
+
+/** SQL over an issue_thread_interactions alias: the CARD-ANSWER DUTY (RFL ruling 4; ported from bb/tamin6
+ * person-message-answer.ts:170-187). A person's ANSWER to an agent's card (answered, accepted or rejected by a
+ * person; a withdrawal, a cancel or an expiry is no answer and owes nothing) is person input the next run owes,
+ * like a typed message: it is owed when a run took it as its OWN input (the answer-resume run's interactionId, a
+ * carry's interactionIds) or its delivery to the agent is still waiting for a run, and the ONE function
+ * (answeredPersonMessageSql, keyed by the card id and its answer time; no second reply rule) does not say it is
+ * answered. An answer still being delivered is a pending attempt, not a silent one, until
+ * CARD_ANSWER_DELIVERY_BOUND_MS from the answer time. */
+export function unansweredCardAnswerSql(alias: string, now: Date = new Date()): SQL {
+  const q = sql.identifier(alias);
+  const deliveryCutoff = new Date(now.getTime() - CARD_ANSWER_DELIVERY_BOUND_MS).toISOString();
+  return sql`(${q}.resolved_by_user_id is not null and ${q}.resolved_at is not null
+    and ${q}.status in ('answered', 'accepted', 'rejected')
+    and (exists (select 1 from ${heartbeatRuns} r where r.company_id = ${q}.company_id
+        and (r.native_issue_id = ${q}.issue_id or r.context_snapshot->>'issueId' = ${q}.issue_id::text)
+        and ${ownInputNamesSql(sql`${q}.id`)})
+      or exists (select 1 from ${issueQuestionResponseDeliveries} waiting where waiting.company_id = ${q}.company_id
+        and waiting.interaction_id = ${q}.id and waiting.status in ('pending', 'delivering', 'fallback_queued')))
+    and (${q}.resolved_at <= ${deliveryCutoff}::timestamptz
+      or not exists (select 1 from ${issueQuestionResponseDeliveries} delivery where delivery.company_id = ${q}.company_id
+        and delivery.interaction_id = ${q}.id and delivery.status in ('pending', 'delivering')))
+    and not ${answeredPersonMessageSql({ id: sql`${q}.id`, companyId: sql`${q}.company_id`,
+      issueId: sql`${q}.issue_id`, createdAt: sql`${q}.resolved_at` })})`;
 }
 
 /** SQL: message m is a PERSON comment that arrived by a company import (see answeredPersonMessageSql). */
