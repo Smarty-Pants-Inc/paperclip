@@ -7,7 +7,7 @@ import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, ty
 import { shouldExcludePath } from "./exclude-patterns.js";
 import { runSnapshotThread } from "./workspace-snapshot-thread.js";
 import type { WorkspaceRestoreDiagnostic } from "./workspace-restore-diagnostics.js";
-import { hostCleanup, hostMutation } from "./host-mutation-drain.js";
+import { hostCleanup, hostMutation, hostWork } from "./host-mutation-drain.js";
 
 export type SnapshotEntry =
   | { kind: "dir" }
@@ -441,10 +441,13 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
       throw error;
     })) await waitForLock(path.join(lockDir, "owner.json"));
 
+    // adopt-drain3: the sidecar carries this holder's unique token, so the
+    // release below removes only THIS holder's sidecar.
+    const ownerToken = randomUUID();
     await hostCleanup(async () => {
       const owner = await fs.open(ownerPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW, 0o600);
       try {
-        await owner.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`, "utf8");
+        await owner.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), token: ownerToken })}\n`, "utf8");
       } finally { await owner.close(); }
     });
     activeDirectoryMergeLocks.add(lockDir);
@@ -455,7 +458,10 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
       try {
         // This sidecar is diagnostic only. A failed removal cannot retain
         // ownership, and the next holder replaces it while holding the DB lock.
-        await hostCleanup(() => fs.unlink(ownerPath).catch(() => undefined));
+        // adopt-drain3: still holding the SQLite lock (closed only below), so
+        // no other holder can have written it; unlink it only if it still
+        // carries THIS holder's token (a sidecar of any other holder is kept).
+        await hostCleanup(() => unlinkOwnSidecar(ownerPath, ownerToken));
       } finally {
         activeDirectoryMergeLocks.delete(lockDir);
         database.close();
@@ -468,6 +474,17 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
 }
 
 const DIRECTORY_MERGE_LOCK_ROOT_MODE = 0o700;
+
+/** adopt-drain3: remove the merge owner sidecar only when it is this holder's
+ * (its token matches). Missing, unreadable or another holder's: kept. */
+async function unlinkOwnSidecar(ownerPath: string, ownerToken: string): Promise<void> {
+  const raw = await fs.readFile(ownerPath, { encoding: "utf8", flag: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW }).catch(() => null);
+  if (raw === null) return;
+  let token: unknown;
+  try { token = (JSON.parse(raw) as { token?: unknown }).token; } catch { return; }
+  if (token !== ownerToken) return;
+  await fs.unlink(ownerPath).catch(() => undefined);
+}
 
 function nonEmpty(value: string | undefined): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -591,14 +608,19 @@ async function withCanonicalDirectoryMergeLock<T>(
   diagnosticOperation?: DirectoryMergeLockOperation,
   waitMs: number = LOCK_WAIT_MS,
 ): Promise<T> {
-  const lockRoot = await resolveDirectoryMergeLockRoot(env);
-  const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
-  const releaseLock = await acquireDirectoryMergeLock(path.join(lockRoot, `${lockKey}.lock`), diagnosticOperation, waitMs);
-  try {
-    return await fn(canonicalTargetDir);
-  } finally {
-    await releaseLock();
-  }
+  // adopt-drain3: the held lock, its owner sidecar and the sidecar's removal
+  // are one unit of the current owner's drain: the owner releases only after
+  // this lock (and its sidecar) has been released.
+  return hostWork(async () => {
+    const lockRoot = await resolveDirectoryMergeLockRoot(env);
+    const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
+    const releaseLock = await acquireDirectoryMergeLock(path.join(lockRoot, `${lockKey}.lock`), diagnosticOperation, waitMs);
+    try {
+      return await fn(canonicalTargetDir);
+    } finally {
+      await releaseLock();
+    }
+  });
 }
 
 async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry, signal?: AbortSignal): Promise<void> {
@@ -791,6 +813,12 @@ export async function mergeDirectoryWithBaseline(input: {
    * already written is undone. Omitted: unchanged behaviour. */
   signal?: AbortSignal;
 }): Promise<void> {
+  // adopt-drain3: the whole merge (its private snapshots, its uniquely named
+  // temporaries and their finally-block removal) joins the owner's drain.
+  return hostWork(() => mergeDirectoryWithBaselineUnit(input));
+}
+
+async function mergeDirectoryWithBaselineUnit(input: Parameters<typeof mergeDirectoryWithBaseline>[0]): Promise<void> {
   const signal = input.signal;
   const capture = input.workspaceSnapshotIsolation === "worker" ? captureDirectorySnapshotOffThread : captureDirectorySnapshot;
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
