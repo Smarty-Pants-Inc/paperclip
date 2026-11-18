@@ -13,6 +13,31 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
+const slowWriter = vi.hoisted(() => ({ enabled: false, writes: 0, elapsedMs: 0,
+  observe: undefined as (() => Promise<void>) | undefined }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...original, open: async (...args: Parameters<typeof original.open>) => {
+    const file = await original.open(...args);
+    if (slowWriter.enabled && String(args[0]).endsWith(".sql")) {
+      const originalWrite = file.write.bind(file);
+      file.write = (async (...writeArgs: unknown[]) => {
+        if (String(writeArgs[0]) === "\\.\n" && slowWriter.writes++ === 0) {
+          await slowWriter.observe?.();
+          const started = Date.now();
+          // Delay real disk output, not SQL: the snapshot is idle while the
+          // buffered writer waits. No production delay hook is needed.
+          await new Promise(resolve => setTimeout(resolve, 1_600));
+          slowWriter.elapsedMs = Date.now() - started;
+          await slowWriter.observe?.();
+        }
+        return Reflect.apply(originalWrite, file, writeArgs);
+      }) as typeof file.write;
+    }
+    return file;
+  } };
+});
+
 const cleanups: Array<() => Promise<void> | void> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -133,6 +158,131 @@ describe("createBufferedTextFileWriter", () => {
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it("completes a slow writer despite server transaction timeouts", { timeout: EMBEDDED_POSTGRES_TEST_TIMEOUT_MS }, async () => {
+    const source = await createTempDatabase();
+    const sql = postgres(source, { max: 1, onnotice: () => {} });
+    const backupUrl = new URL(source);
+    backupUrl.searchParams.set("application_name", "backup_timeout_regression");
+    const observations: Array<Array<{ pid: number; state: string; query: string }>> = [];
+    Object.assign(slowWriter, { enabled: true, writes: 0, elapsedMs: 0,
+      observe: async () => {
+        observations.push([...await sql<{ pid: number; state: string; query: string }[]>`SELECT pid, state, query FROM pg_stat_activity
+          WHERE application_name = 'backup_timeout_regression'`]);
+      } });
+    try {
+      await sql`ALTER ROLE CURRENT_USER SET idle_in_transaction_session_timeout = '1s'`;
+      await sql`ALTER ROLE CURRENT_USER SET statement_timeout = '10s'`;
+      await sql`CREATE TABLE public.timeout_row (id integer PRIMARY KEY)`;
+      await sql`INSERT INTO public.timeout_row VALUES (1)`;
+      const probe = postgres(source, { max: 1 });
+      try {
+        expect((await probe`SHOW idle_in_transaction_session_timeout`)[0]?.idle_in_transaction_session_timeout).toBe("1s");
+        expect((await probe`SHOW statement_timeout`)[0]?.statement_timeout).toBe("10s");
+      } finally { await probe.end(); }
+      const backup = await runDatabaseBackup({ connectionString: backupUrl.toString(),
+        backupDir: createTempDir("timeout-backup-"), backupEngine: "auto",
+        excludeTables: ["public.not_backed_up"],
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      expect(observations[0]).toEqual([expect.objectContaining({ state: "idle in transaction" })]);
+      expect(observations[1]).toEqual(observations[0]);
+      expect(slowWriter.elapsedMs).toBeGreaterThan(1_000);
+      expect(slowWriter.writes).toBeGreaterThan(0);
+      expect(gunzipSync(fs.readFileSync(backup.backupFile)).toString()).toContain('COPY "public"."timeout_row" ("id") FROM stdin;\n1\n\\.');
+      console.log("timeout row evidence", { serverIdleTimeout: "1s", serverStatementTimeout: "10s", elapsedMs: slowWriter.elapsedMs, delayedWrites: slowWriter.writes, sizeBytes: backup.sizeBytes });
+      recordRestoreArtifacts("timeout-writer", backup.backupFile, null);
+    } finally {
+      slowWriter.enabled = false;
+      slowWriter.observe = undefined;
+      recordSchemaCatalogs("timeout-observations", { idleTimeout: "1s", statementTimeout: "10s" },
+        { observations, elapsedMs: slowWriter.elapsedMs, delayedWrites: slowWriter.writes });
+      await sql`ALTER ROLE CURRENT_USER RESET idle_in_transaction_session_timeout`;
+      await sql`ALTER ROLE CURRENT_USER RESET statement_timeout`;
+      await sql.end();
+    }
+  });
+  it.for(["javascript", "auto"] as const)("keeps concurrent parent and child writes outside one backup snapshot through %s", { timeout: EMBEDDED_POSTGRES_TEST_TIMEOUT_MS }, async (engine, context) => {
+    if (engine === "auto" && !psqlAvailable) context.skip();
+    const previousPsql = process.env.PAPERCLIP_PSQL_PATH;
+    process.env.PAPERCLIP_PSQL_PATH = engine === "auto" ? testPsqlPath : "/bin/false";
+    cleanups.push(() => {
+      if (previousPsql === undefined) delete process.env.PAPERCLIP_PSQL_PATH;
+      else process.env.PAPERCLIP_PSQL_PATH = previousPsql;
+    });
+    const cluster = await createTempDatabase();
+    const source = await createSiblingDatabase(cluster, "snapshot_source");
+    const target = await createSiblingDatabase(cluster, "snapshot_restore");
+    const sourceSql = postgres(source, { max: 2, onnotice: () => {} });
+    const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+    const backupUrl = new URL(source);
+    backupUrl.searchParams.set("application_name", "backup_snapshot_regression");
+    let backupPromise: ReturnType<typeof runDatabaseBackup> | undefined;
+    let blockedQuery: unknown;
+    try {
+      await sourceSql.unsafe(`
+        CREATE TABLE public.aaa_parent (id integer PRIMARY KEY);
+        CREATE TABLE public.zzz_child (id integer PRIMARY KEY, parent_id integer
+          CONSTRAINT snapshot_fk REFERENCES public.aaa_parent(id));
+        INSERT INTO public.aaa_parent VALUES (1);
+        INSERT INTO public.zzz_child VALUES (1, 1);
+      `);
+      await sourceSql.begin(async writerSql => {
+        // The backup can read A but cannot count/read B until this transaction
+        // commits. No production hooks or mocked SQL: pg_stat_activity proves
+        // the backup reached B after finishing A's data cursor.
+        await writerSql`LOCK TABLE public.zzz_child IN ACCESS EXCLUSIVE MODE`;
+        backupPromise = runDatabaseBackup({ connectionString: backupUrl.toString(),
+          backupDir: createTempDir("snapshot-fidelity-"), backupEngine: engine,
+          // A transform selects the JS engine for auto, using its COPY path.
+          excludeTables: ["public.not_backed_up"],
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+        // Keep a rejection observed while the other connection holds the lock.
+        void backupPromise.catch(() => {});
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const [activity] = await sourceSql`
+            SELECT query, wait_event_type FROM pg_stat_activity
+            WHERE application_name = 'backup_snapshot_regression'
+              AND state = 'active' AND wait_event_type = 'Lock'
+          `;
+          if (activity?.query === 'SELECT count(*)::int AS n FROM "public"."zzz_child"') {
+            blockedQuery = activity;
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        expect(blockedQuery, "backup must finish A and block on B before the write").toBeDefined();
+        await writerSql`INSERT INTO public.aaa_parent VALUES (2)`;
+        await writerSql`INSERT INTO public.zzz_child VALUES (2, 2)`;
+        await writerSql`CREATE STATISTICS public.concurrent_stats ON id, parent_id FROM public.zzz_child`;
+      });
+      const backup = await backupPromise!;
+      const result = await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      const restoredParents = await targetSql`SELECT id FROM public.aaa_parent ORDER BY id`;
+      const restoredChildren = await targetSql`SELECT id, parent_id FROM public.zzz_child ORDER BY id`;
+      const [constraint] = await targetSql`
+        SELECT convalidated FROM pg_constraint WHERE conname = 'snapshot_fk'
+      `;
+      const sourceStatistics = await sourceSql`SELECT stxname FROM pg_statistic_ext WHERE stxname = 'concurrent_stats'`;
+      const restoredStatistics = await targetSql`SELECT stxname FROM pg_statistic_ext WHERE stxname = 'concurrent_stats'`;
+      recordRestoreArtifacts(`snapshot-${engine}`, backup.backupFile, result.violationReportFile);
+      recordSchemaCatalogs(`snapshot-${engine}`, { blockedQuery, parents: [...await sourceSql`SELECT id FROM public.aaa_parent ORDER BY id`],
+        children: [...await sourceSql`SELECT id, parent_id FROM public.zzz_child ORDER BY id`], statistics: [...sourceStatistics] },
+        { result, parents: [...restoredParents], children: [...restoredChildren], constraint, statistics: [...restoredStatistics] });
+      expect.soft(result.constraintViolations).toEqual([]);
+      expect.soft(constraint?.convalidated).toBe(true);
+      expect.soft(restoredParents).toEqual([{ id: 1 }]);
+      expect.soft(restoredChildren).toEqual([{ id: 1, parent_id: 1 }]);
+      expect.soft(sourceStatistics).toEqual([{ stxname: "concurrent_stats" }]);
+      expect.soft(restoredStatistics).toEqual([]);
+    } finally {
+      // The writer transaction has committed/rolled back before awaiting this;
+      // never leave a blocked backup running after a failed assertion.
+      await backupPromise?.catch(() => {});
+      await sourceSql.end();
+      await targetSql.end();
+    }
+  });
+
   it("round-trips CHECK, exclusion, NULLS NOT DISTINCT and extended statistics with data", async () => {
     const cluster = await createTempDatabase();
     const source = await createSiblingDatabase(cluster, "constraint_source");
