@@ -20,21 +20,133 @@ import { redactSensitiveText } from "../redaction.js";
 
 const MAX_LOG_REDACTION_DEPTH = 8;
 const TRUNCATED_LOG_VALUE = `[masked: nested deeper than ${MAX_LOG_REDACTION_DEPTH}]`;
+const UNREADABLE_LOG_VALUE = "[masked: unreadable value]";
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
 
-// Mask credential shapes in every string of a serialized log value. Nested
-// objects are copied, never mutated: they can be live application objects.
-// Past the depth bound a subtree is replaced, never passed through unread.
-function redactLogValue(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
+// Binary values (Buffer, Uint8Array and other typed arrays, DataView,
+// ArrayBuffer) are written as their decoded, masked UTF-8 text, or as a fixed
+// marker with their length when the bytes are not text. Never as raw bytes:
+// JSON would write a Buffer's bytes as a number array no text scan can read.
+function binaryLogBytes(value: object): Uint8Array | null {
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) return new Uint8Array(value);
+  return null;
+}
+
+function binaryLogText(bytes: Uint8Array): string {
+  try {
+    return redactSensitiveText(strictUtf8.decode(bytes));
+  } catch {
+    return `[masked: binary value, ${bytes.byteLength} bytes]`;
+  }
+}
+
+function setLogField(target: Record<string, unknown>, key: string, value: unknown) {
+  // defineProperty, so a "__proto__" key is written as data, not a prototype.
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
+// Mask credential shapes in every string AND every key of a serialized log
+// value, and leave nothing for JSON.stringify to run later: an enumerable
+// toJSON is called here once (guarded) and its result masked; other functions
+// are dropped, as JSON would drop them. Nested objects are copied, never
+// mutated: they can be live application objects. A getter, Proxy trap or
+// toJSON that throws becomes a fixed marker. Past the depth bound a subtree is
+// replaced, never passed through unread. `ancestors` holds the current path
+// only, so a true cycle is "[Circular]" and a shared reference is written twice.
+function redactLogValue(value: unknown, depth = 0, ancestors = new Set<object>()): unknown {
   if (typeof value === "string") return redactSensitiveText(value);
+  if (typeof value === "function") return undefined;
   if (!value || typeof value !== "object") return value;
   if (depth > MAX_LOG_REDACTION_DEPTH) return TRUNCATED_LOG_VALUE;
-  if (seen.has(value)) return "[Circular]";
-  seen.add(value);
-  if (Array.isArray(value)) return value.map((item) => redactLogValue(item, depth + 1, seen));
-  if (value instanceof Date || Buffer.isBuffer(value)) return value;
-  return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [key, redactLogValue(item, depth + 1, seen)]),
-  );
+  if (ancestors.has(value)) return "[Circular]";
+  ancestors.add(value);
+  try {
+    return redactLogObject(value, depth, ancestors);
+  } catch {
+    return UNREADABLE_LOG_VALUE;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function redactLogObject(value: object, depth: number, ancestors: Set<object>): unknown {
+  const bytes = binaryLogBytes(value);
+  if (bytes) return binaryLogText(bytes);
+  // A URL's userinfo and query are credentials the text scan cannot know; the
+  // request-URL policy drops both.
+  if (value instanceof URL) return redactSensitiveText(stripSecretBearingUrlParts(value.href));
+  const toJSON = (value as { toJSON?: unknown }).toJSON;
+  if (typeof toJSON === "function") {
+    // JSON.stringify would call this after masking; call it now, once, and
+    // mask what it returns (a Date's ISO text, an HTTP client error's config).
+    return redactLogValue(toJSON.call(value, ""), depth + 1, ancestors);
+  }
+  if (Array.isArray(value)) return value.map((item) => redactLogValue(item, depth + 1, ancestors));
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    let item: unknown;
+    try {
+      item = (value as Record<string, unknown>)[key];
+    } catch {
+      item = UNREADABLE_LOG_VALUE;
+    }
+    const masked = redactLogValue(item, depth + 1, ancestors);
+    if (masked !== undefined) setLogField(copy, redactSensitiveText(key), masked);
+  }
+  return copy;
+}
+
+// The final backstop (Pino hooks.streamWrite): runs on every finished JSON
+// line, of every child logger (pino-http's included) and for every
+// destination, after all serializers. It decodes each JSON string token, key
+// or value (JSON.parse of the token), masks the decoded text with the same
+// scanner and writes only a changed token back (JSON.stringify). Decoding
+// first matters: in the encoded line a secret after an escape (\n, \t, \",
+// \u0042) follows a letter and the scanner's word-boundary prefixes miss it.
+// A line with nothing to mask is returned as the same string, byte for byte;
+// on a masked line only the masked tokens change, so Pino's key order and
+// duplicate keys are kept (a whole-line JSON.parse/stringify would reorder
+// integer-like keys and collapse duplicates). The scan is a loop, not a
+// recursion: there is no depth limit to fall past.
+export function maskSerializedLogLine(line: string): string {
+  let parts: string[] | null = null;
+  let copied = 0;
+  let index = line.indexOf('"');
+  while (index !== -1) {
+    let end = index + 1;
+    while (end < line.length) {
+      const code = line.charCodeAt(end);
+      if (code === 0x5c) end += 2;
+      else if (code === 0x22) break;
+      else end += 1;
+    }
+    if (end >= line.length) return unparsableLogLine(line);
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(line.slice(index, end + 1));
+    } catch {
+      return unparsableLogLine(line);
+    }
+    const text = decoded as string;
+    const masked = redactSensitiveText(text);
+    if (masked !== text) {
+      parts ??= [];
+      parts.push(line.slice(copied, index), JSON.stringify(masked));
+      copied = end + 1;
+    }
+    index = line.indexOf('"', end + 1);
+  }
+  if (!parts) return line;
+  parts.push(line.slice(copied));
+  return parts.join("");
+}
+
+// Pino only writes JSON.stringify output, so this is not reached; if it ever
+// is, write a fixed record rather than an unscanned line.
+function unparsableLogLine(line: string): string {
+  return `${JSON.stringify({ msg: "[masked: unparsable log line]", length: line.length })}\n`;
 }
 
 /**
@@ -46,11 +158,21 @@ export function redactedErrSerializer(err: unknown): unknown {
   // pino-http hands over an already standard-serialized error; serializing it
   // a second time would rename its type to "Object", so only mask its strings.
   if (!(err instanceof Error)) return redactLogValue(err);
-  const serialized = pino.stdSerializers.err(err) as unknown;
+  let serialized: unknown;
+  try {
+    serialized = pino.stdSerializers.err(err) as unknown;
+  } catch {
+    // A getter or Proxy trap on the error threw while it was read.
+    return { type: "Error", message: UNREADABLE_LOG_VALUE };
+  }
   if (!serialized || typeof serialized !== "object") return redactLogValue(serialized);
+  const record = serialized as Record<string, unknown>;
+  // The standard serializer copies enumerable inherited members, so an HTTP
+  // client error's toJSON (config + headers) lands on the record, and
+  // JSON.stringify would call it after masking. Call it here and mask its result.
+  if (typeof record.toJSON === "function") return redactLogValue(record);
   // The standard serializer returns a fresh object whose prototype carries the
   // non-enumerable `raw` reference; redact its own fields in place.
-  const record = serialized as Record<string, unknown>;
   for (const key of Object.keys(record)) record[key] = redactLogValue(record[key]);
   return record;
 }
@@ -71,6 +193,12 @@ export const logSerializers = {
 export const baseLoggerOptions = {
   redact: [...HTTP_LOG_REDACT_PATHS],
   serializers: logSerializers,
+  // Pino 10 hooks.streamWrite: "manipulating the stringified JSON log data
+  // just before writing". It is the one place that sees every field of every
+  // record, including ones no serializer visits, and it still applies when a
+  // child replaces serializers.msg with identity (Pino's intended override,
+  // which bypasses the msg serializer above). Children inherit hooks.
+  hooks: { streamWrite: maskSerializedLogLine },
 };
 
 const sharedOpts = {

@@ -1089,7 +1089,21 @@ export function redactAgentAdapterConfig(
 const AWS_SECRET_ACCESS_KEY_ASSIGNMENT_RE =
   /(\baws[_-]?secret[_-]?access[_-]?key["']?\s*[=:]\s*["']?)[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/gi;
 
+// A terminal escape sequence (CSI, e.g. an SGR colour code) ends in a letter,
+// so a credential printed right after one ("\u001b[31msk-…") has no word
+// boundary before it. Scan each run between escape sequences on its own too.
+const ANSI_ESCAPE_SPLIT_RE = /(\u001b\[[0-?]*[ -/]*[@-~])/;
+
 export function redactSensitiveText(input: string): string {
+  const masked = redactPlainSensitiveText(input);
+  if (!masked.includes("\u001b")) return masked;
+  return masked
+    .split(ANSI_ESCAPE_SPLIT_RE)
+    .map((part, index) => (index % 2 === 1 ? part : redactPlainSensitiveText(part)))
+    .join("");
+}
+
+function redactPlainSensitiveText(input: string): string {
   const text = input.replace(AWS_SECRET_ACCESS_KEY_ASSIGNMENT_RE, `$1${REDACTED_EVENT_VALUE}`);
   if (!maybeContainsSecretText(text)) return text;
   return redactCommandText(

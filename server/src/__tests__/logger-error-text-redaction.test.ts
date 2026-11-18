@@ -3,7 +3,7 @@ import express from "express";
 import pino from "pino";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
-import { baseLoggerOptions, createHttpLogger } from "../middleware/logger.js";
+import { baseLoggerOptions, createHttpLogger, maskSerializedLogLine } from "../middleware/logger.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { redactSensitiveText } from "../redaction.js";
 
@@ -298,5 +298,283 @@ describe("the log mask fails closed past its depth bound", () => {
     const text = output();
     expectNoCanary(text);
     expect(text).toContain('"[masked: nested deeper than 8]"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RFL errser J1-J3 and the adversarial sweep. Each row runs through three
+// loggers: production (walker + streamWrite backstop), the walker alone
+// (backstop off) and, for the backstop rows, the backstop alone (walker off).
+// A mutation of one layer turns that layer's rows RED.
+// ---------------------------------------------------------------------------
+
+type Layer = "production" | "walker" | "backstop";
+
+function captureLayer(layer: Layer) {
+  const chunks: string[] = [];
+  const stream = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+  const options =
+    layer === "production"
+      ? { ...baseLoggerOptions }
+      : layer === "walker"
+        ? { ...baseLoggerOptions, hooks: {} }
+        : {
+            ...baseLoggerOptions,
+            // The walker disabled: Pino's own err serializer and identity text
+            // serializers, so only the final streamWrite backstop can mask.
+            serializers: {
+              err: pino.stdSerializers.err,
+              msg: (value: unknown) => value,
+              stderr: (value: unknown) => value,
+              stdout: (value: unknown) => value,
+            },
+          };
+  return { log: pino({ ...options, level: "debug" }, stream), output: () => chunks.join("") };
+}
+
+function expectCleanLines(text: string) {
+  expectNoCanary(text);
+  // Every written line is still one valid JSON record.
+  for (const line of text.trim().split("\n")) expect(() => JSON.parse(line)).not.toThrow();
+}
+
+// An HTTP client error (axios-style): an enumerable toJSON on the prototype
+// that returns the request config with its headers.
+function httpClientError(message: string) {
+  function ClientError(this: Error & Record<string, unknown>) {
+    this.message = message;
+    this.name = "AxiosError";
+    this.config = { url: "https://api.example.test/v1/x", headers: { Authorization: `Bearer ${CANARIES[5]}`, "x-api-key": CANARIES[0] } };
+  }
+  ClientError.prototype = Object.create(Error.prototype);
+  ClientError.prototype.toJSON = function toJSON(this: Record<string, unknown>) {
+    return { message: this.message, name: this.name, config: { url: "https://api.example.test/v1/x", headers: { Authorization: `Bearer ${CANARIES[5]}`, token: CANARIES[2] } }, note: CANARY_LINE };
+  };
+  return new (ClientError as unknown as new () => Error)();
+}
+
+describe.each<Layer>(["production", "walker"])("structured values are masked (%s)", (layer) => {
+  it("J1: masks what an enumerable toJSON returns, in msg, stderr and err.details", () => {
+    const { log, output } = captureLayer(layer);
+    log.warn({ msg: { toJSON() { return CANARY_LINE; } } });
+    log.warn({ stderr: { toJSON() { return { inner: CANARY_LINE }; } } }, "box");
+    log.error({ err: Object.assign(new Error("provider failed"), { details: { toJSON: () => CANARY_LINE } }) }, "provider failed");
+    const text = output();
+    expectCleanLines(text);
+    const [first, second, third] = records(text);
+    expect(first.msg).toBe(MASKED_LINE);
+    expect(second.stderr).toEqual({ inner: MASKED_LINE });
+    expect(third.err.details).toBe(MASKED_LINE);
+  });
+
+  it("J1: masks an HTTP-client error whose toJSON returns its config and headers", () => {
+    const { log, output } = captureLayer(layer);
+    log.error({ err: httpClientError(`request failed ${CANARIES[1]}`) }, "upstream failed");
+    log.warn({ err: { toJSON: () => ({ headers: { authorization: `Bearer ${CANARIES[5]}` } }) } }, "plain err");
+    const text = output();
+    expectCleanLines(text);
+    const [first] = records(text);
+    expect(first.err.message).toBe("request failed ***REDACTED***");
+    expect(first.err.config.headers.Authorization).toBe("Bearer ***REDACTED***");
+  });
+
+  it("J1: masks toJSON output through pino-http's req.log and the auto-5xx record", async () => {
+    const { log, output } = captureLayer(layer);
+    const app = express();
+    app.use(createHttpLogger(log));
+    app.get("/api/talk", (req, res) => {
+      req.log.warn({ msg: { toJSON: () => CANARY_LINE } });
+      req.log.error({ err: httpClientError("client error") }, "client failed");
+      res.status(200).json({ ok: true });
+    });
+    app.get("/api/boom", () => { throw httpClientError(`upstream said ${CANARIES[3]}`); });
+    app.get("/api/unavailable", (_req, res) => {
+      (res as unknown as { err: unknown }).err = httpClientError("busy");
+      res.status(503).json({ error: "unavailable" });
+    });
+    app.use(errorHandler);
+    await request(app).get("/api/talk");
+    expect((await request(app).get("/api/boom")).status).toBe(500);
+    expect((await request(app).get("/api/unavailable")).status).toBe(503);
+    const text = output();
+    expectCleanLines(text);
+    const all = records(text);
+    expect(all[0].msg).toBe(MASKED_LINE);
+    expect(all.filter((record) => record.res?.statusCode >= 500)).toHaveLength(2);
+  });
+
+  it("J2: masks object keys in msg, stderr, stdout and err extras", () => {
+    const { log, output } = captureLayer(layer);
+    log.warn({ msg: { [CANARY_LINE]: 1 } });
+    log.warn({ stderr: { [CANARIES[0]]: "x" }, stdout: [{ [`Bearer ${CANARIES[5]}`]: true }] }, "box");
+    log.error({ err: Object.assign(new Error("provider failed"), { details: { nested: { [CANARIES[1]]: CANARIES[2] } } }) }, "x");
+    const text = output();
+    expectCleanLines(text);
+    const [first, second, third] = records(text);
+    expect(Object.keys(first.msg)).toEqual([MASKED_LINE]);
+    expect(second.stderr).toEqual({ "***REDACTED***": "x" });
+    expect(third.err.details.nested).toEqual({ "***REDACTED***": "***REDACTED***" });
+  });
+
+  it("J3: decodes Buffer / Uint8Array / ArrayBuffer as text and masks it, in msg, stderr, stdout and err.details", () => {
+    const { log, output } = captureLayer(layer);
+    const bytes = Buffer.from(CANARY_LINE, "utf8");
+    log.warn({ msg: bytes });
+    log.warn({ stderr: bytes, stdout: new Uint8Array(bytes) }, "box");
+    log.error({ err: Object.assign(new Error("provider failed"), { details: { body: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length) } }) }, "x");
+    const text = output();
+    expectCleanLines(text);
+    const [first, second, third] = records(text);
+    expect(first.msg).toBe(MASKED_LINE);
+    expect(second.stderr).toBe(MASKED_LINE);
+    expect(second.stdout).toBe(MASKED_LINE);
+    expect(third.err.details.body).toBe(MASKED_LINE);
+    // The raw bytes never reach the line, in any encoding.
+    expect(text).not.toContain(String(bytes[0]) + "," + String(bytes[1]));
+  });
+
+  it("J3: replaces bytes that are not valid UTF-8 with a marker and their length", () => {
+    const { log, output } = captureLayer(layer);
+    log.warn({ stderr: Buffer.from([0xff, 0xfe, 0x00, 0x41]) }, "binary");
+    expect(records(output())[0].stderr).toBe("[masked: binary value, 4 bytes]");
+  });
+
+  it("masks each of the six canaries wrapped in a terminal colour code, in stderr and err.message", () => {
+    const { log, output } = captureLayer(layer);
+    const coloured = `${CANARIES.slice(0, 4).map((canary) => `\u001b[31m${canary}\u001b[0m`).join(" ")} aws_secret_access_key=${CANARIES[4]} \u001b[1mBearer ${CANARIES[5]}\u001b[0m`;
+    log.warn({ stderr: coloured }, "box");
+    log.error({ err: new Error(coloured) }, "coloured");
+    expectCleanLines(output());
+  });
+
+  it("sweep: getters, symbol keys, Map / Set, typed arrays, circular, null prototype", () => {
+    const { log, output } = captureLayer(layer);
+    const circular: Record<string, unknown> = { leaf: CANARY_LINE };
+    circular.self = circular;
+    const shared = { leaf: "shared value" };
+    const bare = Object.assign(Object.create(null), { leaf: CANARY_LINE });
+    const even = new Uint8Array(Buffer.from(`${CANARY_LINE} `.length % 2 ? `${CANARY_LINE}  ` : `${CANARY_LINE} `, "utf8"));
+    log.warn({ stderr: { get leak() { return CANARY_LINE; } } }, "getter");
+    log.warn({ stderr: { [Symbol(CANARY_LINE)]: CANARY_LINE, kept: 1 } }, "symbol");
+    log.warn({ stderr: { map: new Map([["k", CANARY_LINE]]), set: new Set([CANARY_LINE]) } }, "map");
+    log.warn({ stderr: new Uint16Array(even.buffer) }, "typed");
+    log.warn({ stderr: circular, stdout: { a: shared, b: shared } }, "circular");
+    log.warn({ stderr: bare }, "null proto");
+    const text = output();
+    expectCleanLines(text);
+    const [getter, symbol, , typed, circ, nullProto] = records(text);
+    expect(getter.stderr.leak).toBe(MASKED_LINE);
+    expect(symbol.stderr).toEqual({ kept: 1 });
+    expect(typed.stderr.startsWith(MASKED_LINE)).toBe(true);
+    expect(circ.stderr).toEqual({ leaf: MASKED_LINE, self: "[Circular]" });
+    // A shared, non-circular reference is written in full both times.
+    expect(circ.stdout).toEqual({ a: { leaf: "shared value" }, b: { leaf: "shared value" } });
+    expect(nullProto.stderr.leaf).toBe(MASKED_LINE);
+  });
+
+  it("sweep: non-enumerable cause, AggregateError inside a cause, getter message", () => {
+    const { log, output } = captureLayer(layer);
+    const hidden = new Error("outer failed");
+    Object.defineProperty(hidden, "cause", { value: new Error(CANARY_LINE), enumerable: false });
+    const aggregate = new AggregateError([new Error("ok"), new Error(CANARY_LINE)], "fan-out failed");
+    const getterMessage = new Error("placeholder");
+    Object.defineProperty(getterMessage, "message", { get: () => CANARY_LINE, enumerable: false, configurable: true });
+    log.error({ err: hidden }, "hidden cause");
+    log.error({ err: new Error("outer", { cause: aggregate }) }, "aggregate cause");
+    log.error({ err: getterMessage });
+    const text = output();
+    expectCleanLines(text);
+    expect(records(text)[2].msg).toBe(MASKED_LINE);
+  });
+
+  it("sweep: URL objects drop userinfo and query; a Date subclass keeps its ISO text", () => {
+    const { log, output } = captureLayer(layer);
+    class SecretDate extends Date { override toString() { return CANARY_LINE; } }
+    class SecretJsonDate extends Date { override toJSON() { return CANARY_LINE; } }
+    const url = new URL(`https://deploy:hunter2-userinfo-pass@git.example.test/repo.git?access_token=${CANARIES[1]}&x=1`);
+    log.warn({ stderr: { url, when: new SecretDate(0), json: new SecretJsonDate(0) } }, "url");
+    const text = output();
+    expectCleanLines(text);
+    expect(text).not.toContain("hunter2-userinfo-pass");
+    const [record] = records(text);
+    expect(record.stderr.url).toBe("https://git.example.test/repo.git");
+    expect(record.stderr.when).toBe("1970-01-01T00:00:00.000Z");
+    expect(record.stderr.json).toBe(MASKED_LINE);
+  });
+
+  it("sweep: a Proxy whose get throws, a throwing toJSON, a BigInt and a 5,000-char string", () => {
+    const { log, output } = captureLayer(layer);
+    const hostile = new Proxy({ leaf: CANARY_LINE }, { get() { throw new Error(CANARY_LINE); } });
+    const long = `${"x".repeat(5_000)} ${CANARIES[0]}`;
+    log.warn({ stderr: hostile }, "proxy");
+    log.warn({ stderr: { toJSON() { throw new Error(CANARY_LINE); } } }, "throwing toJSON");
+    log.warn({ stderr: { count: 10n } }, "bigint");
+    log.warn({ stderr: long, msg: long });
+    const text = output();
+    expectCleanLines(text);
+    const [proxy, throwing, bigint, longRecord] = records(text);
+    expect(JSON.stringify(proxy.stderr)).toContain("[masked: unreadable value]");
+    expect(throwing.stderr).toBe("[masked: unreadable value]");
+    expect(bigint.stderr.count).toBe(10);
+    expect(longRecord.stderr.endsWith(" ***REDACTED***")).toBe(true);
+    expect(longRecord.msg.endsWith(" ***REDACTED***")).toBe(true);
+  });
+});
+
+describe("the streamWrite backstop masks the finished JSON line", () => {
+  // Secrets right after a JSON escape: the escaped form (\n, \t, \", \u0007)
+  // puts a letter before the credential, so a raw-text scan of the line misses it.
+  const AFTER_ESCAPES: Array<[string, string]> = [
+    ["newline", `line one\n${CANARIES[0]}`],
+    ["tab", `col\tBearer ${CANARIES[5]}`],
+    ["quote", `said "${CANARIES[1]}" twice`],
+    ["control \\u0007", `bell\u0007Bearer ${CANARIES[5]}`],
+    ["control \\u001b", `\u001b[31m${CANARIES[3]}\u001b[0m`],
+  ];
+
+  it.each(AFTER_ESCAPES)("masks a secret after an escaped %s in msg, err.message, stderr and a nested field, past the walker", (_kind, value) => {
+    const { log, output } = captureLayer("backstop");
+    log.warn(value);
+    log.error({ err: new Error(value) }, "err");
+    log.warn({ stderr: value }, "stderr");
+    log.warn({ ctx: { nested: [{ deeper: value }] } }, "nested");
+    const text = output();
+    expectCleanLines(text);
+    for (const record of records(text)) expect(JSON.stringify(record)).toContain("***REDACTED***");
+  });
+
+  it("masks a secret behind an escaped \\u0042 (Bearer) and in a key, given the line directly", () => {
+    const line = `{"level":40,"msg":"\\u0042earer ${CANARIES[5]}","ctx":{"${CANARIES[0]}":1}}\n`;
+    const masked = maskSerializedLogLine(line);
+    expect(masked).toBe('{"level":40,"msg":"Bearer ***REDACTED***","ctx":{"***REDACTED***":1}}\n');
+    expect(() => JSON.parse(masked)).not.toThrow();
+  });
+
+  it("masks keys, getters and toJSON output in fields the walker never visits", () => {
+    const { log, output } = captureLayer("production");
+    log.info({ ctx: { [CANARIES[1]]: { get v() { return CANARY_LINE; } }, j: { toJSON: () => CANARY_LINE } } }, "ctx");
+    const text = output();
+    expectCleanLines(text);
+  });
+
+  it("covers a child that replaces serializers.msg with identity (Pino's intended override)", () => {
+    const { log, output } = captureLayer("production");
+    log.child({}, { serializers: { msg: (value: unknown) => value } }).warn(CANARY_LINE);
+    expectCleanLines(output());
+    expect(records(output())[0].msg).toBe(MASKED_LINE);
+  });
+
+  it("returns a clean line byte for byte: no reordering, no reformatting, duplicate keys kept", () => {
+    const clean = [
+      '{"level":30,"time":1763496964512,"b":1,"1":2,"msg":"run finished","module":"a","module":"b","n":1e21,"x":-0}\n',
+      `{"level":50,"msg":${JSON.stringify("429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"},\"request_id\":\"req_011CVBxF6Lr3v9kQ2nT8wYzA\"}\nline two\ttabbed \u2028 é")}}\n`,
+    ];
+    for (const line of clean) expect(maskSerializedLogLine(line)).toBe(line);
+    const { log, output } = captureLayer("walker");
+    const withBackstop = captureLayer("production");
+    const row = '401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_011CVBz9aB3cD5eF7gH9iJkL"}';
+    for (const logger of [log, withBackstop.log]) logger.error({ err: new Error(row) }, row);
+    const strip = (text: string) => text.replace(/"time":\d+,/g, "");
+    expect(strip(withBackstop.output())).toBe(strip(output()));
   });
 });
