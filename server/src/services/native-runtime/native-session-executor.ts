@@ -1011,6 +1011,18 @@ async function warmOwnerStopReceiptWithinBound(entry: WarmNativeSession, success
   }
 }
 
+/** One read, no wait: the typed receipt already on the owner's own lease. */
+async function warmOwnerStopReceiptAlreadyPresent(entry: WarmNativeSession, successor: WarmPredecessorSuccessor): Promise<boolean> {
+  const db = entry.sandboxLeaseDb;
+  if (!db || !entry.providerLeaseId || !entry.environmentId || entry.controllerDetachedForRestart) return false;
+  try {
+    return await warmSandboxTerminated(db, entry, { successorOnOwnerSandbox: successorOnOwnerSandbox(entry, successor), ownLeaseOnly: true });
+  } catch (readError) {
+    logger.warn({ err: readError, runId: entry.runId }, "could not read the warm owner's sandbox lease before its close");
+    return false;
+  }
+}
+
 async function retireWarmPredecessor(entry: WarmNativeSession, reason: string, successor: WarmPredecessorSuccessor,
   options?: Parameters<typeof closeWarmNativeSession>[2]) {
   // Chaos cell SR1U: a sandbox owner whose stop stays unconfirmed even when
@@ -1019,6 +1031,20 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string, s
     entry.retirementUnproven = true;
     throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId,
       new Error("warm Runner stop unconfirmed (injected test fault)"));
+  }
+  // A receipt ALREADY on the owner's own lease (same typed reader, same
+  // own-lease and same-box rules) proves it gone: skip the close attempt, which
+  // only fails against the stopped box. Settled as the close-failure path does.
+  if (await warmOwnerStopReceiptAlreadyPresent(entry, successor)) {
+    await entry.githubAccess?.stop();
+    await entry.instructionWorkingCopy?.retirementFailed?.().catch(receiptError => {
+      logger.warn({ err: receiptError, runId: entry.runId }, "could not keep the predecessor's agent files for later collection");
+    });
+    await markWarmNativeHarnessBackupMissing(entry, "close_failed");
+    logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+      providerLeaseId: entry.providerLeaseId ?? null, reason },
+    "superseded warm owner's sandbox lease already has Boat's stop or destroy receipt; retirement proven without a close attempt");
+    return;
   }
   const directoryWaitDeadline = Date.now() + warmRetirementDirectoryWait.timeoutMs;
   for (;;) {
