@@ -79,13 +79,24 @@ describe.skipIf(!support.supported)("adopt-stopu-compose6 (c): a late export of 
     if (home) await fs.rm(home, { recursive: true, force: true });
   });
 
-  const boxRunner: CommandManagedRuntimeRunner = { execute: async input => new Promise(resolve => {
+  /** One armed delay for the box's next copyback command (not the bound's no-op
+   * probe): the export has already chosen where to write, and the box answers late. */
+  const commandDelay = { armedMs: 0, delayed: [] as string[] };
+  const boxRunner: CommandManagedRuntimeRunner = { execute: async input => {
+    if (commandDelay.armedMs && input.command !== "true") {
+      const ms = commandDelay.armedMs; commandDelay.armedMs = 0;
+      commandDelay.delayed.push(`${input.command} ${(input.args ?? []).join(" ")}`.slice(0, 200));
+      await new Promise(resolve => setTimeout(resolve, ms));
+    }
+    return runOnBox(input);
+  } };
+  const runOnBox: CommandManagedRuntimeRunner["execute"] = async input => new Promise(resolve => {
     const child = execFile(input.command, input.args ?? [], { cwd: input.cwd, env: { ...process.env, ...input.env },
       timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => resolve({
       exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0, signal: error?.signal ?? null,
       timedOut: error?.killed ?? false, stdout, stderr, pid: null, startedAt: null }));
     child.stdin?.end(input.stdin ?? "");
-  }) };
+  });
 
   /** A person-stopped warm turn whose box holds the only copy of its edit to
    * notes.md; the release-site guard has deferred since `failingSince`. */
@@ -193,9 +204,12 @@ describe.skipIf(!support.supported)("adopt-stopu-compose6 (c): a late export of 
   }
 
   it("an export in flight across the bound finishes AFTER a without-files successor would have edited: the successor's edit survives", async () => {
-    // Bound in 3 s. Export A starts before it; the box answers A only after 14 s.
+    // Bound in 3 s. Export A starts before it and resolves the box at once (so
+    // it has already chosen where to write); the box answers A's copyback only
+    // after 14 s. The bound's probe (B) gets no answer.
     const f = await stoppedBox(Date.now() - PERSON_STOP_EXPORT_BOUND_MS + 3_000);
-    boxDelays.set(f.leaseId, [14_000, Infinity]);
+    boxDelays.set(f.leaseId, [0, Infinity]);
+    commandDelay.armedMs = 14_000; commandDelay.delayed.length = 0;
     const provider = getSandboxProvider("fake")!;
     const destroy = vi.spyOn(provider, "destroyLease");
     try {
@@ -213,6 +227,8 @@ describe.skipIf(!support.supported)("adopt-stopu-compose6 (c): a late export of 
       await Promise.race([Promise.all([a, b]), new Promise(resolve => setTimeout(resolve, 5_000))]);
       await f.pump();
       const ev = await f.evidence("in-flight export across the bound");
+      console.log("LATE_EXPORT_DELAYED_COMMAND", JSON.stringify(commandDelay.delayed));
+      expect(commandDelay.delayed).toHaveLength(1);
       expect(destroy.mock.calls.filter(([i]) => i.providerLeaseId === f.providerLeaseId)).toHaveLength(0);
       // Not vacuous: a successor ran and edited the host.
       expect(ev.providerTurns.length).toBeGreaterThan(0);
