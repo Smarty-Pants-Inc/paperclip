@@ -291,7 +291,7 @@ export async function attemptNativeWorkspaceFinalization(input: {
             runId: input.runId,
             assertOwnership: ownership.assertHeld,
             restore: () => resumeNativeWorkspaceSync({
-              db: input.db, runId: input.runId, target, assertOwnership: ownership.assertHeld,
+              db: input.db, runId: input.runId, target, assertOwnership: ownership.assertHeld, signal: ownership.lost,
               onPhase: measureWorkspaceSyncPhase,
             }),
           });

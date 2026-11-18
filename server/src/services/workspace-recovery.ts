@@ -25,7 +25,7 @@ import { requestSandboxAbsenceProof } from "./sandbox-absence-proof.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasVerifiedWorkspaceRepair, readWorkspaceRecovery, type WorkspaceRecovery } from "./workspace-recovery-receipt.js";
-import { withNativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
+import { withNativeWorkspaceFinalizationOwnership, type NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { readNativeWorkspaceSyncReference, readNativeWorkspaceSyncLocalCwd, resumeNativeWorkspaceSync } from "./native-runtime/native-workspace-sync.js";
 import { classifyNativeWorkspaceFailure } from "./native-runtime/native-workspace-failure.js";
 
@@ -226,7 +226,7 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
   }
   if (!initial || initial.state === "complete" ||
       (initial.nextAttemptAt !== null && initial.nextAttemptAt > Date.now())) return;
-  const runAttempt = async (ownership: { token: string; assertHeld(): Promise<void> }) => {
+  const runAttempt = async (ownership: NativeWorkspaceFinalizationOwnership) => {
     let current = await loadSystemRecovery(db, input);
     if (!current) return;
     if (current.state === "exhausted") {
@@ -410,7 +410,8 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
               } }).returning({ id: workspaceOperations.id }))[0]!;
             operationId = operation.id;
           } else if (reference) {
-            const copied = await resumeNativeWorkspaceSync({ db, runId: input.runId, target, assertOwnership: ownership.assertHeld });
+            const copied = await resumeNativeWorkspaceSync({ db, runId: input.runId, target, assertOwnership: ownership.assertHeld,
+              signal: ownership.lost });
             if (!copied) throw new SystemRecoveryFailure("snapshot_verification_failed", "service_required");
             const after = await inspectWorkspaceRecoverySource(db, input);
             const finalized = after.sources.find(item => item.lease.id === lease.id)?.reference;

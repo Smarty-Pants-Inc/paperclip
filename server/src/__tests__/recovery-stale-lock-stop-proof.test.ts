@@ -10,6 +10,7 @@ import { claimCancellationRequest } from "../services/native-runtime/native-canc
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerIssueRecoveryWork } from "../services/recovery/work.js";
 import { nativeUserStopRecoveryHeld } from "../services/native-runtime/native-user-stop-settlement.js";
+import { prepareSandboxStopAndRetain } from "../services/sandbox-stop-and-retain.js";
 
 // Keep reason: #20807 RFL F1's independent PostgreSQL reproduction caught a
 // data-safety failure: the ordinary sweep released a still-executing owner's
@@ -513,10 +514,10 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     expect((await recovery.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId })).cleared).toBe(1);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
   });
-  // Keep reason: adopt-h6-src (S1 card d1bc0612, written 1 ms after the cancel).
-  // A person's Stop on a keep_running warm box hands the box off warm and never
-  // writes a termination receipt. One sweep pass inside that no-receipt window
-  // must accept the executor's settled-turn proof, and only that proof.
+  // adopt-stopu-d4752: d4752b6b's warm-turn handoff proof is reverted on U (a
+  // person's Stop is stop_and_retain, never a warm handoff). These helpers stay:
+  // U's bounded person Stop tests (b152a154) build on them, and the settled-turn
+  // receipt below is now only a control that it is NOT Stop proof.
   async function warmStopFixture(proof: "settled" | "missing" | "generation_mismatch" | "coordinator_owned" | "unacknowledged") {
     const f = await warmFixture();
     const sessionId = randomUUID(), bootId = "boot-1", generation = 3;
@@ -544,27 +545,221 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       held: await nativeUserStopRecoveryHeld(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId }) };
   }
 
-  it("a proved warm-turn handoff Stop with no termination receipt raises no card and holds no owner", async () => {
-    const f = await warmStopFixture("settled");
-    const { cards, held } = await onePass(f);
-    // Base: an escalated execution_stop_pending card that holds the warm owner
-    // (native refusal owner_recovery_action_pending, so a FRESH thread).
-    expect(cards.map(card => card.cause)).toEqual([]);
-    expect(held).toBe(false);
-    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
-    // The warm box stays as it was: no release, no termination.
-    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0]).toEqual(f.lease);
-    // Whole-agent lifecycle Stop is not broadened by the task-scoped proof.
-    expect(await agentExecutionStopBlocker(db, [f.agentId])).toBe("environment_lease_unreleased");
-  });
-
-  it.each(["missing", "generation_mismatch", "coordinator_owned", "unacknowledged"] as const)(
+  it.each(["settled", "missing", "generation_mismatch", "coordinator_owned", "unacknowledged"] as const)(
     "settled-turn proof %s keeps the Stop-pending card", async proof => {
       const f = await warmStopFixture(proof);
       expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
       const { cards, held } = await onePass(f);
       expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
       expect(held).toBe(true);
+    });
+
+  // U owns a real, bound stop-only request, not H6's retained-idle receipt.
+  async function boundedPersonStop(inFlight = true) {
+    const f = await warmStopFixture("missing");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...run!.resultJson,
+      nativeCancellation: { ...(run!.resultJson!.nativeCancellation as Record<string, unknown>), recordedAt: new Date().toISOString() } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata, pluginId: randomUUID() } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    const requested = await prepareSandboxStopAndRetain(db, lease!);
+    expect(requested).not.toBeNull();
+    if (inFlight) await db.update(environmentLeases).set({ metadata: { ...requested!.metadata,
+      pendingCleanupInFlight: true, pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000 } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    return f;
+  }
+
+  it.each([false, true])("U bounded person Stop requested/in-flight=%s: no card until receipt, then claims release", async inFlight => {
+    const f = await boundedPersonStop(inFlight);
+    const before = await task(f.issueId);
+    const deadlines: number[] = [];
+    await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId,
+      onDeferredDeadline: at => deadlines.push(at) });
+    expect(await stopActions(f.issueId)).toEqual([]);
+    expect(await task(f.issueId)).toEqual(before);
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    expect(deadlines.length).toBeGreaterThan(0);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId, state: "stopped" }) } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    expect((await onePass(f)).cards).toEqual([]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
+    expect(await nativeUserStopRecoveryHeld(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId })).toBe(false);
+  });
+
+  it("U no receipt: a renewed cleanup claim cannot extend five minutes from the acknowledged Stop", async () => {
+    const f = await boundedPersonStop();
+    expect((await onePass(f)).cards).toEqual([]);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...run!.resultJson,
+      nativeCancellation: { ...(run!.resultJson!.nativeCancellation as Record<string, unknown>),
+        recordedAt: new Date(Date.now() - 5 * 60_000 - 1).toISOString() } } }).where(eq(heartbeatRuns.id, f.runId));
+    expect((await onePass(f)).cards).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+  });
+
+  it.each(["non-person", "no-stop-request", "unacknowledged", "crash", "no-stop-intent", "expired-claim", "unknown-bound"] as const)(
+    "U control %s still cards", async control => {
+      const f = await boundedPersonStop();
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const result = { ...run!.resultJson };
+      if (control === "non-person") result.cancelledByActorType = "agent";
+      if (control === "no-stop-request") { delete result.nativeCancellation; delete result.executionCancellation;
+        delete result.cancelledByActorType; delete result.cancelledByUserId; }
+      if (control === "unacknowledged") result.nativeCancellation = { ...(result.nativeCancellation as Record<string, unknown>), dispatched: false };
+      if (control === "unknown-bound") result.nativeCancellation = { ...(result.nativeCancellation as Record<string, unknown>), recordedAt: undefined };
+      await db.update(heartbeatRuns).set({ status: control === "crash" ? "failed" : "cancelled", resultJson: result })
+        .where(eq(heartbeatRuns.id, f.runId));
+      if (control === "no-stop-intent" || control === "expired-claim") {
+        const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+        const metadata = { ...lease!.metadata };
+        if (control === "no-stop-intent") delete metadata.sandboxStopAndRetain;
+        else metadata.pendingCleanupLeaseExpiresAtMs = Date.now() - 1;
+        await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, f.lease.id));
+      }
+      expect((await onePass(f)).cards).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+    });
+
+  // adopt-stopu-card2 (rf-4 F12). Live gate 4 (U e02cad41): card 56bcdc6a was written by
+  // owner "recovery.sweep_stale_issue_locks" (service.ts sweepStaleIssueLocks -> recordTaskStopPending)
+  // 3.7 s after a person's Stop, BEFORE the export and the receipt: the warm lease was still
+  // unreleased (the stop_and_retain release follows the export), so the deferral's
+  // pending_cleanup-only predicate returned false. Two writers raise this card for a person's
+  // Stop: (A) that sweep and (B) the cleanup retry (heartbeat/recovery.ts ->
+  // recordPersonStopCleanupPending). Both must read ONE bound. recordedAt stands in for the clock.
+  const PERSON_CARD = "Stop pending: Paperclip cannot confirm that the previous execution stopped. " +
+    "New messages you send start now on a fresh machine; messages waiting from before the Stop still need Send.";
+  async function stopRecordedAgo(f: { runId: string }, ms: number) {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...run!.resultJson,
+      nativeCancellation: { ...(run!.resultJson!.nativeCancellation as Record<string, unknown>),
+        recordedAt: new Date(Date.now() - ms).toISOString() } } }).where(eq(heartbeatRuns.id, f.runId));
+    return (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]!;
+  }
+  const cleanupRetryWriter = async (run: typeof heartbeatRuns.$inferSelect) =>
+    (await import("../services/recovery/stop-pending.js")).recordPersonStopCleanupPending(db, run);
+  // The stop's phases while in flight: lease not yet released (live row), the cancel-finalize
+  // export owning the finalizer, the stop_and_retain request recorded, its cleanup in flight.
+  const PHASES = ["unreleased", "export-owned", "requested", "in-flight"] as const;
+  async function personStopIn(phase: typeof PHASES[number]) {
+    if (phase === "requested" || phase === "in-flight") return boundedPersonStop(phase === "in-flight");
+    return warmStopFixture(phase === "export-owned" ? "coordinator_owned" : "missing");
+  }
+
+  it.each(PHASES)("U card LIVE (%s): the sweep at Stop + 20 s and a failed cleanup retry then raise no card", async phase => {
+    const f = await personStopIn(phase);
+    const before = await task(f.issueId);
+    const run = await stopRecordedAgo(f, 20_000);
+    expect((await onePass(f)).cards).toEqual([]);
+    await cleanupRetryWriter(run);
+    expect((await onePass(f)).cards).toEqual([]);
+    expect(await task(f.issueId)).toEqual(before);
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+  });
+
+  it.each(PHASES.flatMap(phase => (["sweep-first", "retry-first", "sweep-only", "retry-only"] as const)
+    .map(order => [phase, order] as const)))("U card at the bound (%s, %s): exactly one card, with the person's true copy",
+    async (phase, order) => {
+      const f = await personStopIn(phase);
+      const run = await stopRecordedAgo(f, 5 * 60_000 + 1_000);
+      const writers = { "sweep-first": ["sweep", "retry", "sweep"], "retry-first": ["retry", "sweep", "retry"],
+        "sweep-only": ["sweep", "sweep"], "retry-only": ["retry", "retry"] }[order];
+      for (const writer of writers) writer === "sweep" ? await onePass(f) : await cleanupRetryWriter(run);
+      const cards = await stopActions(f.issueId);
+      expect(cards.map(card => [card.cause, card.status])).toEqual([["execution_stop_pending", "escalated"]]);
+      expect(cards[0]!.nextAction).toBe(PERSON_CARD);
+      expect((cards[0]!.evidence as Record<string, any>).stopPending).toMatchObject({ personStop: true });
+      const read = await (await import("../services/issue-recovery-actions.js")).issueRecoveryActionService(db)
+        .getActiveForIssue(f.companyId, f.issueId);
+      expect(read?.nextAction).toBe(PERSON_CARD);
+    });
+
+  it("U card: a late receipt after the card retires it and releases the claims once", async () => {
+    const f = await personStopIn("requested");
+    await stopRecordedAgo(f, 5 * 60_000 + 1_000);
+    expect((await onePass(f)).cards.map(card => card.status)).toEqual(["escalated"]);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId, state: "stopped" }) } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    const { cards } = await onePass(f);
+    expect(cards.map(card => [card.status, card.outcome])).toEqual([["resolved", "restored"]]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
+    expect((await onePass(f)).cards).toHaveLength(1);
+  });
+
+  it("U card: a receipt before the bound means no card ever, from either writer", async () => {
+    const f = await personStopIn("requested");
+    await stopRecordedAgo(f, 2 * 60_000);
+    expect((await onePass(f)).cards).toEqual([]);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId, state: "stopped" }) } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    const run = await stopRecordedAgo(f, 10 * 60_000);
+    await cleanupRetryWriter(run);
+    expect((await onePass(f)).cards).toEqual([]);
+    await cleanupRetryWriter(run);
+    expect(await stopActions(f.issueId)).toEqual([]);
+  });
+
+  it.each(["unreleased", "export-owned"] as const)("U card control (%s): a non-person stop at Stop + 20 s still gets the generic card", async phase => {
+    const f = await personStopIn(phase);
+    const run = await stopRecordedAgo(f, 20_000);
+    await db.update(heartbeatRuns).set({ resultJson: { ...run.resultJson, cancelledByActorType: "agent" } }).where(eq(heartbeatRuns.id, f.runId));
+    const { cards } = await onePass(f);
+    expect(cards.map(card => card.status)).toEqual(["escalated"]);
+    expect(cards[0]!.nextAction).toContain("The task stays held until Stop is proved");
+    expect((cards[0]!.evidence as Record<string, any>).stopPending.personStop).toBeFalsy();
+  });
+
+  // Keep reason: adopt-stopu-d4752 (rf-3). On U a person's Stop is never a warm
+  // handoff: run-control releases the box stop_and_retain (runner-environment-
+  // lifecycle errorCode "cancelled"). U's executor still writes the settled-turn
+  // receipt (nativeRetainedIdleCheckpoint) in the cancellation settle, BEFORE
+  // the release site, so for that window the lease is still active
+  // reuse_by_environment. That receipt must not prove Stop: the sweep clears no
+  // claim (nothing may adopt the lease being stopped), before the release and
+  // while the stop_and_retain request is open; only the stop receipt releases.
+  it.each(["before release", "stop requested", "stop in flight"] as const)(
+    "U real Stop shape with the executor's settled-turn receipt, %s: the sweep clears 0 claims", async shape => {
+      const f = await warmStopFixture("settled");
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(heartbeatRuns).set({ errorCode: "cancelled", resultJson: { ...run!.resultJson,
+        nativeCancellation: { ...(run!.resultJson!.nativeCancellation as Record<string, unknown>), recordedAt: new Date().toISOString() } } })
+        .where(eq(heartbeatRuns.id, f.runId));
+      if (shape !== "before release") {
+        await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata, pluginId: randomUUID() } })
+          .where(eq(environmentLeases.id, f.lease.id));
+        const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+        const requested = await prepareSandboxStopAndRetain(db, lease!);
+        expect(requested).not.toBeNull();
+        if (shape === "stop in flight") await db.update(environmentLeases).set({ metadata: { ...requested!.metadata,
+          pendingCleanupInFlight: true, pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000 } })
+          .where(eq(environmentLeases.id, f.lease.id));
+      }
+      const before = await task(f.issueId);
+      expect(before).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
+      const swept = await recoveryService(db, { enqueueWakeup: vi.fn() })
+        .sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+      expect(swept.cleared).toBe(0);
+      expect(await task(f.issueId)).toEqual(before);
+      expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+      // The receipt-bearing path itself produces no card once U's stop_and_retain
+      // request is open (bounded person Stop); before the release site U's own
+      // no-stop-intent rule applies (as "U control no-stop-intent still cards").
+      if (shape !== "before release") expect(await stopActions(f.issueId)).toEqual([]);
+      // Only the box's stop receipt from the stop_and_retain release releases them.
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+        metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId, state: "stopped" }) } })
+        .where(eq(environmentLeases.id, f.lease.id));
+      expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
     });
 
   it("a stop_and_retain Stop with no receipt yet keeps the card even with a settled-turn receipt", async () => {

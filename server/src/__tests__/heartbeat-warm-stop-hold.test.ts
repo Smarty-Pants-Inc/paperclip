@@ -67,6 +67,23 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
   };
 });
 
+// adopt-stopu: cancel-finalize finishes the stopped warm turn's export before the
+// stop_and_retain release (real export: cancel-finalize-warm-stop.test.ts). This
+// fixture has no live box, so the edge writes only what a finalized export leaves:
+// the run's descriptor reference moves prepared -> finalized.
+vi.mock("../services/heartbeat/cancelled-warm-workspace-export.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/heartbeat/cancelled-warm-workspace-export.js")>(),
+  finishCancelledWarmWorkspaceExport: async (input: { db: any; runId: string }) => {
+    if (!fixture.warm) return { outcome: "not_applicable" };
+    const { heartbeatRuns } = await import("@paperclipai/db");
+    const { eq, sql } = await import("drizzle-orm");
+    await input.db.update(heartbeatRuns).set({ runnerProfileJson: sql`jsonb_set(jsonb_set(${heartbeatRuns.runnerProfileJson},
+      '{nativeWorkspaceSync,state}', '"finalized"'::jsonb), '{nativeWorkspaceSync,finalHostSha256}', ${JSON.stringify("c".repeat(64))}::jsonb)` })
+      .where(eq(heartbeatRuns.id, input.runId));
+    return { outcome: "finalized" };
+  },
+}));
+
 import * as environmentOrchestrator from "../services/environment-run-orchestrator.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
@@ -262,9 +279,12 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
       const r = await stopThenMessage({ warm: true, messageDelay });
       // No native-workspace:<run> recovery hold for the stopped warm turn.
       expect.soft(r.hold).toEqual([]);
-      // The warm box is not stopped: the lease is never released stop_and_retain.
-      expect.soft(r.release).not.toHaveBeenCalledWith(expect.objectContaining({ providerResourceDisposition: "stop_and_retain" }));
-      expect.soft(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "keep_running" }));
+      // Upstream's Stop shape (paperclipai/paperclip master run-control.ts:228-234):
+      // a person's Stop is not a warm handoff. The stopped run's own release asks
+      // the provider to stop and retain the box, so the stop receipt comes with
+      // this teardown, not with the warm-window expiry (~444 s).
+      expect.soft(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "stop_and_retain" }));
+      expect.soft(r.release).not.toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "keep_running" }));
       expect.soft(r.lease).not.toMatchObject({ leasePolicy: "retain_on_failure" });
       // Exactly one run for the message, and it reached the executor (one provider turn).
       expect.soft(r.messageRuns).toHaveLength(1);
@@ -294,7 +314,7 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
       expect(r.windowLease).toMatchObject({ status: "active", leasePolicy: "reuse_by_environment" });
       expect.soft(r.windowHold).toEqual([]);
       expect.soft(r.hold).toEqual([]);
-      expect.soft(r.release).not.toHaveBeenCalledWith(expect.objectContaining({ providerResourceDisposition: "stop_and_retain" }));
+      expect.soft(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "stop_and_retain" }));
       expect.soft(r.lease).not.toMatchObject({ leasePolicy: "retain_on_failure" });
       expect.soft(r.messageRuns).toHaveLength(1);
       expect.soft(r.messageRuns[0]?.errorCode).not.toBe("execution_reconciliation_required");

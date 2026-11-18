@@ -880,6 +880,20 @@ describe("IssueRow", () => {
       },
     );
 
+    it.each((["task", "legacy"] as const).flatMap(presentation => [true, false].map(personStop => ({ presentation, personStop }))))(
+      "inbox $presentation: person-Stop=$personStop does not get another escalation's label", ({ presentation, personStop }) => {
+        const issue = recoveryIssue(at(0));
+        Object.assign(issue.activeRecoveryAction!, { kind: "active_run_watchdog", cause: "execution_stop_pending",
+          status: "escalated", ownerType: "board", wakePolicy: null, evidence: { stopPending: { personStop } } });
+        const root = createRoot(container);
+        act(() => root.render(<IssueRow issue={issue} presentation={presentation} />));
+        const chip = container.querySelector('[data-testid="issue-row-recovery-indicator"]');
+        expect(chip?.getAttribute("aria-label")).toContain(personStop ? "Stop pending" : "Recovery escalated");
+        if (personStop) expect(container.textContent).not.toMatch(/recovery escalated/i);
+        act(() => root.unmount());
+      },
+    );
+
     it("shows native export activity from the action even without a scheduled retry", () => {
       const issue = recoveryIssue(at(-5 * 60_000));
       Object.assign(issue.activeRecoveryAction!, {

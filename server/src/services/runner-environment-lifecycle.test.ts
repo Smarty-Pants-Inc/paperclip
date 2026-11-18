@@ -1,5 +1,5 @@
 import {describe,expect,it} from "vitest";
-import {resolveRunnerEnvironmentForRun,resolveWarmRunnerIdleTimeoutMsForRun,runnerLifecycleDefaultNeedsLeaseProbe} from "./runner-environment-lifecycle.js";
+import {providerResourceDispositionForTerminalRun,resolveRunnerEnvironmentForRun,resolveWarmRunnerIdleTimeoutMsForRun,runnerLifecycleDefaultNeedsLeaseProbe} from "./runner-environment-lifecycle.js";
 
 it.each([undefined,"codex","acpx","opencode"])("defaults plugin Runner execution to warm without provider gates: %s",provider=>{
  const environment={driver:"plugin" as const,config:{pluginKey:"fixture",driverKey:"tasks",driverConfig:{}}};
@@ -110,5 +110,21 @@ describe("native Pi sandbox retention", () => {
   it.each([undefined, { ...managedAi, routing: { ...managedAi.routing, protocol: "chat" } }, { ...managedAi, attribution: { provider: "github", method: "api_key" } }])("keeps unserved managed routes ephemeral: %j", selected => {
     expect(runnerLifecycleDefaultNeedsLeaseProbe(environment, "paperclip_runner", config, undefined, "account:generation", selected)).toBe(false);
     expect(resolveRunnerEnvironmentForRun(environment, "paperclip_runner", config, undefined, "account:generation", { reusableLeaseSupported: true, managedAi: selected })).toBe(environment);
+  });
+});
+
+describe("a person's Stop on a warm run (upstream stop_and_retain)", () => {
+  // run-control.ts cancelRun defaults errorCode "cancelled"; the executor's
+  // stop fence writes native_retry_cancelled. Upstream master stops and retains.
+  it.each(["cancelled", "native_retry_cancelled"])("cancelled/%s -> stop_and_retain", code => {
+    expect(providerResourceDispositionForTerminalRun("keep_running", "cancelled", code)).toBe("stop_and_retain");
+    expect(providerResourceDispositionForTerminalRun("keep_running", "cancelled", code, true)).toBe("stop_and_retain");
+  });
+  it("keeps warm reuse for a succeeded run and ordinary failed turns", () => {
+    expect(providerResourceDispositionForTerminalRun("keep_running", "succeeded", null)).toBe("keep_running");
+    expect(providerResourceDispositionForTerminalRun("keep_running", "failed", "adapter_failed", true)).toBe("keep_running");
+    expect(providerResourceDispositionForTerminalRun("keep_running", "failed", "adapter_error", true)).toBe("keep_running");
+    expect(providerResourceDispositionForTerminalRun("keep_running", "interrupted", "native_session_interrupted")).toBe("keep_running");
+    expect(providerResourceDispositionForTerminalRun("destroy", "cancelled", "cancelled")).toBe("destroy");
   });
 });

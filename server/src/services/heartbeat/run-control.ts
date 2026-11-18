@@ -200,6 +200,13 @@ export interface HeartbeatRunControlDependencies extends Pick<ReturnType<typeof 
     "mergeRunStopMetadataForAgent" | "setRunStatusFromLive" | "setRunStatus" | "setWakeupStatus" | "appendRunEvent">,
   Pick<HeartbeatRetryDependencies, "finalizeAgentStatus"> {
   verifyStartupCleanup?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+  /** adopt-stopu-xpaths: the release-site export of a person-stopped warm turn
+   * (person-stop-release-export.ts). Wired by heartbeat.ts. */
+  exportPersonStoppedWarmWorkspace?: (run: typeof heartbeatRuns.$inferSelect) => Promise<{ outcome: string }>;
+  /** adopt-stopu-compose4: the bounded decision at PERSON_STOP_EXPORT_BOUND_MS
+   * (person-stop-release-export.ts decidePersonStopExportAtBound). Wired by heartbeat.ts. */
+  decidePersonStopExportAtBound?: (run: typeof heartbeatRuns.$inferSelect) => Promise<{ decision: "same_box" | "without_files"; reason: string; decidedNow?: true } | null>;
+  personStopExportBoundAt?: (runId: string, companyId: string) => Promise<number | null>;
   options: {
     closeWarmNativeSessionsForRun?: (input: {
       runId: string;
@@ -374,6 +381,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     timerClaimWasFirstHeartbeat,
     startNextQueuedRunForAgent,
     setRunStatus,
+    exportPersonStoppedWarmWorkspace,
+    decidePersonStopExportAtBound,
+    personStopExportBoundAt,
   } = dependencies;
 
   async function releaseEnvironmentLeasesForRun(input: {
@@ -394,7 +404,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   }) {
     let leaseOwnerRun = await getRunCleanupState(input.runId);
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
-    const cancelledRun = leaseOwnerRun?.runtimeMode === "native" && leaseOwnerRun.status === "cancelled"
+    let cancelledRun = leaseOwnerRun?.runtimeMode === "native" && leaseOwnerRun.status === "cancelled"
       ? await getRun(input.runId) : null;
     if (cancelledRun) leaseOwnerRun = cancelledRun;
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
@@ -411,6 +421,51 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const runnerNeverLaunched = async () => neverLaunched ??= leaseOwnerRun?.runtimeMode === "native"
       && isHeartbeatRunTerminalStatus(status) && await nativeRunNeverLaunchedRunner(db, input.runId, input.companyId);
     const defer = (reason: string) => deferEnvironmentLeaseRelease(input, reason, providerResourceDisposition);
+    // adopt-stopu-xpaths: the ONE choke point for a person's Stop. Whatever path
+    // ended the turn (the in-run cancel-finalize, another error class, a Stop
+    // during finalization, a crash), a box that still holds the only copy of the
+    // turn's edit (descriptor `prepared`) is exported BEFORE it is stopped, here,
+    // outside any DB transaction, under finishCancelledWarmWorkspaceExport's one
+    // aggregate bound. If the export is not proven, the box is KEPT running (no
+    // stop, no stop_and_retain release); the run already carries the true line
+    // and the bounded deferral sweep retries this same release (and export).
+    let personStopExported = false;
+    if (cancelledRun && providerResourceDisposition !== "keep_running" && providerResourceDisposition !== "destroy"
+      && exportPersonStoppedWarmWorkspace && !await runnerNeverLaunched()) {
+      // adopt-stopu-compose4 (RFL 22:25Z, rf-4 22:53Z): the guard is BOUNDED.
+      // Before the bound: export, else keep the box + hold + the deferred line.
+      // At the bound: probe first (an unreachable box is not exported again),
+      // then one more export; still unproven -> the by-line decision.
+      const atBound = decidePersonStopExportAtBound ? await decidePersonStopExportAtBound(cancelledRun).catch(() => null) : null;
+      // adopt-stopu-compose6 (c): the call that DECIDES without_files does not
+      // export again (its probe just failed). A later retry does export: the
+      // decision is durable, so that export saves the old files ASIDE and
+      // never over the successor's host workspace (resumeNativeWorkspaceSync).
+      const exported = atBound?.decision === "without_files" && atBound.decidedNow ? { outcome: "unproven" as const }
+        : await exportPersonStoppedWarmWorkspace(cancelledRun).catch(() => ({ outcome: "unproven" as const }));
+      if ((exported.outcome === "unproven" || exported.outcome === "not_settled") && atBound?.decision === "same_box") {
+        // FIRST choice: the box is reachable and its stopped tools are proven
+        // gone; keep it RUNNING (no stop) and release it to its own successor,
+        // which resumes it and adopts its files in place (the edit is there).
+        logger.warn({ runId: input.runId, reason: atBound.reason },
+          "Person-stopped box export unproven at the bound: the successor resumes the same kept box");
+        providerResourceDisposition = "keep_running";
+        personStopExported = true;
+      } else if (exported.outcome === "unproven" || exported.outcome === "not_settled") {
+        logger.warn({ runId: input.runId, outcome: exported.outcome, bound: atBound?.decision ?? "holding" },
+          "Kept the person-stopped box running: its workspace export is not proven");
+        const boundAt = atBound ? null : await personStopExportBoundAt?.(input.runId, input.companyId).catch(() => null);
+        await deferEnvironmentLeaseRelease(input, "person_stop_export_unproven", providerResourceDisposition,
+          boundAt ?? undefined);
+        // ONLY if unreachable / tools not proven: the held message now runs
+        // once without the files (the hold reads the durable decision).
+        if (atBound?.decision === "without_files") await startNextQueuedRunForAgent(input.agentId).catch(() => undefined);
+        return;
+      } else {
+        if (exported.outcome === "finalized") cancelledRun = await getRun(input.runId) ?? cancelledRun;
+        personStopExported = exported.outcome === "finalized";
+      }
+    }
     // A warm (keep_running) sandbox keeps a cancelled turn's prepared files in
     // place for the next turn, exactly like a succeeded turn; only a sandbox
     // that is about to stop or be destroyed needs its prepared files preserved.
@@ -541,6 +596,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       logger.warn({ runId: input.runId }, "could not wake the agent's stop after its run leases settled");
     });
     await acknowledgeRemoteStop(input.runId, input.companyId);
+    // adopt-stopu-xpaths: the queued message held by personStopExportPendingHoldsAdmission
+    // starts once the export is finalized and the box released (same box or host copy).
+    if (personStopExported && releaseResult?.released.length) await startNextQueuedRunForAgent(input.agentId).catch(() => undefined);
   }
 
   async function wakeAgentAfterRunLeasesSettled(input: { runId: string; companyId: string; agentId: string }) {
@@ -562,7 +620,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   }
 
   async function deferEnvironmentLeaseRelease(input: { runId: string; companyId: string; trigger?: string }, reason: string,
-    providerResourceDisposition: ProviderResourceDisposition | undefined) {
+    providerResourceDisposition: ProviderResourceDisposition | undefined, retryAtCap?: number) {
     const leases = await Promise.resolve().then(() => db.select({ id: environmentLeases.id, metadata: environmentLeases.metadata })
       .from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId),
         eq(environmentLeases.heartbeatRunId, input.runId), eq(environmentLeases.status, "active"))))
@@ -573,8 +631,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     for (const lease of leases) {
       const previous = readLeaseReleaseDeferral(lease.metadata);
       const attempts = (previous?.attempts ?? 0) + 1;
+      const scheduledRetryAt = nextLeaseReleaseRetryAt(previous, attempts);
+      // adopt-stopu-compose4: a person-Stop deferral retries AT its bound at the latest.
+      const retryAt = retryAtCap !== undefined && Number.isFinite(retryAtCap) && Date.parse(scheduledRetryAt) > retryAtCap
+        ? new Date(Math.max(retryAtCap, Date.now())).toISOString() : scheduledRetryAt;
       const deferral: LeaseReleaseDeferral = { reason, attempts,
-        retryAt: nextLeaseReleaseRetryAt(previous, attempts),
+        retryAt,
         failingSince: previous?.failingSince ?? new Date().toISOString(),
         triggers: nextLeaseReleaseTriggers(previous, input.trigger), attemptedByBootIds: nextLeaseReleaseBootIds(previous),
         providerResourceDisposition: providerResourceDisposition ?? null };
@@ -762,7 +824,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         ));
         if (!comment?.body.trim()) continue;
       } else {
-        let wait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+        // pl/no-default-wait: no default wait. Only a gate that names one, or a
+        // real execution blocker, owns a saved wait; otherwise the held wake
+        // stays plain deferred and the person's Stop line with Send stays.
+        let wait: { reason: string; message: string } | null = null;
         const admitted = await admitExplicitNativeContinuation({ db, companyId: run.companyId, issueId,
           agentId: run.agentId, actorType: wake.requestedByActorType, actorId: requestedByActorId,
           reason, commentId, successorRunId: randomUUID(), dryRun: true,
@@ -770,7 +835,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           onBlocked: (reason, message) => { wait = { reason, message }; },
         });
         if (!admitted) {
-          await writeDeferredExecutionWait(db, { companyId: run.companyId, requestId: wake.id }, wait);
+          if (wait || await getExecutionBlocker(db, run.companyId, issueId)) {
+            await writeDeferredExecutionWait(db, { companyId: run.companyId, requestId: wake.id },
+              wait ?? { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." });
+          }
           continue;
         }
       }
