@@ -37,6 +37,8 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
 });
 import { heartbeatService } from "../services/heartbeat.js";
 import { agentRoutes } from "../routes/agents.js";
+import { issueRoutes } from "../routes/issues.js";
+import { agentWakeupRequests } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { hasConfirmedSandboxStopAndRetain } from "../services/sandbox-stop-and-retain.js";
@@ -79,7 +81,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     const app = express(); app.use(express.json());
     app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId: "rf4-person", companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: false }; next(); });
-    app.use("/api", agentRoutes(db, {})); app.use(errorHandler);
+    app.use("/api", agentRoutes(db, {})); app.use("/api", issueRoutes(db, {} as any, {})); app.use(errorHandler);
     let leaseId = "", stopMs = 0, stopResponse: unknown, waitingWakes: unknown;
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never, beforeNativeRuntimeSelection: async id => {
       if (id !== runId) return;
@@ -123,16 +125,77 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       const evidence = { mode, runId, companyId, agentId, issueId, commentId, lease, holds, runs, calls: [...fixture.calls], blocker, projection, interruption,
         stopMs, stopResponse, waitingWakes, stopCalls: stop.mock.calls, observedMs: Date.now() - admittedAt, confirmed: hasConfirmedSandboxStopAndRetain(lease) };
       await fs.writeFile(path.join(process.env.TASK_OUT!, `own-${label}.json`), JSON.stringify(evidence, null, 2));
-      return evidence;
+      return { ...evidence, app, heartbeat };
     } finally { fixture.onFirst = undefined; await heartbeat.drainActiveRunExecutions(); stop.mockRestore(); }
   }
-  it("Q1 person Stop BUTTON with one message waiting releases with receipt and admits exactly one successor", async () => {
-    const r = await exercise("waiting", "q1");
+  // RFL 05:07Z: a message waiting BEFORE the person's Stop is not run by itself
+  // after that Stop. It stays HELD (the deferred wake the queued list shows with
+  // Send) and is answered exactly once on Send or with the next new message.
+  async function sweepRuns(r: { heartbeat: ReturnType<typeof heartbeatService>; issueId: string }, ms: number, stop?: (runs: { id: string; ctx: any }[]) => boolean) {
+    const t0 = Date.now(); let runs: { id: string; status: string; ctx: any }[] = [];
+    do { await r.heartbeat.resumeQueuedRuns(); await r.heartbeat.drainActiveRunExecutions();
+      runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, ctx: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.issueId, r.issueId));
+      if (stop?.(runs)) break; await new Promise(res => setTimeout(res, 250)); } while (Date.now() - t0 < ms);
+    return { runs, ms: Date.now() - t0 };
+  }
+  const carries = (run: { ctx: any }, commentId: string) => [run.ctx?.commentId, ...(run.ctx?.wakeCommentIds ?? [])].includes(commentId);
+  async function heldAfterStop(r: Awaited<ReturnType<typeof exercise>>) {
+    // (i) held for 60 s after the Stop: zero runs, shown in the queued list with Send.
+    const quiet = await sweepRuns(r, 50_000);
+    const queue = (await request(r.app).get(`/api/issues/${r.issueId}/queued-comments`)).body;
     expect.soft(r.confirmed, "released stop_and_retain receipt").toBe(true);
     expect.soft(r.stopMs).toBeLessThan(10_000);
-    expect.soft(r.runs).toHaveLength(1); expect.soft(r.calls).toEqual([r.runId, r.runs[0]?.id]);
+    expect(r.runs, "M1 is not run by itself after the person's Stop").toHaveLength(0);
+    expect(quiet.runs.filter(run => run.id !== r.runId), "zero runs for 60 s").toHaveLength(0);
+    expect(r.calls).toEqual([r.runId]);
     expect.soft(r.blocker).toBeNull();
-  }, 60_000);
+    expect(queue.state, "held").toBe("deferred");
+    expect(queue.targetRunId, "the held list offers Send, not Interrupt").toBeNull();
+    expect(queue.entries.map((e: any) => e.comment.id)).toEqual([r.commentId]);
+    return queue;
+  }
+  it("Q1 person Stop BUTTON with one message waiting releases with receipt and holds it with Send (RFL 05:07Z), zero runs for 60 s", async () => {
+    const r = await exercise("waiting", "q1");
+    await heldAfterStop(r);
+    await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q1-held.json"), JSON.stringify({ wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, r.agentId)) }, null, 2));
+  }, 150_000);
+  it("Q1 Send through the real held-list route answers the held message exactly once, never twice", async () => {
+    const r = await exercise("waiting", "q1-send");
+    const queue = await heldAfterStop(r);
+    const t0 = Date.now();
+    const send = await request(r.app).post(`/api/issues/${r.issueId}/queued-comments/interrupt`).send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
+    expect(send.status).toBe(200);
+    const sent = await sweepRuns(r, 20_000, runs => runs.some(run => run.id !== r.runId) && fixture.calls.length > 1);
+    const answeredMs = Date.now() - t0;
+    // (iv) never twice: keep sweeping after the answer; M1 is not answered again.
+    const later = await sweepRuns(r, 15_000);
+    const m1Runs = later.runs.filter(run => run.id !== r.runId && carries(run, r.commentId));
+    const after = (await request(r.app).get(`/api/issues/${r.issueId}/queued-comments`)).body;
+    await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q1-send.json"), JSON.stringify({ send: { status: send.status, body: send.body }, answeredMs, calls: fixture.calls,
+      runs: later.runs.map(run => ({ id: run.id, status: run.status, commentId: run.ctx?.commentId, wakeCommentIds: run.ctx?.wakeCommentIds })), after }, null, 2));
+    expect(sent.runs.filter(run => run.id !== r.runId)).toHaveLength(1);
+    expect(answeredMs).toBeLessThan(20_000);
+    expect(m1Runs, "exactly one run carries M1").toHaveLength(1);
+    expect(later.runs.filter(run => run.id !== r.runId), "no second answer").toHaveLength(1);
+    expect(fixture.calls).toEqual([r.runId, m1Runs[0]!.id]);
+    expect(after.entries ?? []).toHaveLength(0);
+  }, 180_000);
+  it("Q1 a new message instead of Send carries the held message: one run with M2 + M1", async () => {
+    const r = await exercise("waiting", "q1-m2");
+    await heldAfterStop(r);
+    const m2 = randomUUID();
+    await db.insert(issueComments).values({ id: m2, companyId: r.companyId, issueId: r.issueId, authorType: "user", authorUserId: "rf4-person", body: "And this too." });
+    await r.heartbeat.wakeup(r.agentId, { source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "rf4-person",
+      payload: { issueId: r.issueId, commentId: m2 }, contextSnapshot: { issueId: r.issueId, commentId: m2, wakeReason: "issue_commented" } });
+    await sweepRuns(r, 20_000, runs => runs.some(run => run.id !== r.runId) && fixture.calls.length > 1);
+    const later = await sweepRuns(r, 15_000);
+    const successors = later.runs.filter(run => run.id !== r.runId);
+    await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q1-m2.json"), JSON.stringify({ m1: r.commentId, m2, calls: fixture.calls,
+      runs: later.runs.map(run => ({ id: run.id, status: run.status, commentId: run.ctx?.commentId, wakeCommentIds: run.ctx?.wakeCommentIds })) }, null, 2));
+    expect(successors, "one run").toHaveLength(1);
+    expect(carries(successors[0]!, m2) && carries(successors[0]!, r.commentId), "it carries M2 + M1").toBe(true);
+    expect(fixture.calls).toEqual([r.runId, successors[0]!.id]);
+  }, 180_000);
   it("Q2 MID-TURN person Stop never silently withholds the next message behind prepared-workspace preservation", async () => {
     const r = await exercise("mid_turn", "q2");
     const executedOnce = r.runs.length === 1 && r.calls.includes(r.runs[0].id);
