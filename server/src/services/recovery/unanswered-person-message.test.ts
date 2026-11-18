@@ -871,6 +871,42 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     }
   });
 
+  // S2 (rf5 round 2): the same held messages with NO executionWait on their
+  // wake got N ("no run started… Sending it again is safe"): a retype is
+  // answered twice. After a person's Stop they get R3; after a non-person
+  // cancel (control) the no-run note N stays.
+  it.each([[true, "person stop"], [false, "person stop"], [true, "system cancel"], [false, "system cancel"]] as const)(
+    "SCREEN S2: messages held with no execution wait (chat=%s) after a %s", async (chat, cause) => {
+      const f = await fixture({ chat });
+      const stoppedRunId = await f.run({ commentId: await f.message("Run the long job"), status: "cancelled", errorCode: "cancelled" });
+      if (cause === "person stop") await db.update(heartbeatRuns).set({ resultJson: { cancelledByActorType: "user", cancelledByUserId: f.userId } })
+        .where(eq(heartbeatRuns.id, stoppedRunId));
+      const first = await f.message("A"), second = await f.message("B");
+      const createdAt = new Date(Date.now() - 120_000);
+      for (const id of [first, second]) await db.update(issueComments).set({ createdAt }).where(eq(issueComments.id, id));
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+        reason: "issue_execution_deferred", requestedByActorType: "user", requestedByActorId: f.userId,
+        status: "deferred_issue_execution", createdAt, updatedAt: createdAt,
+        payload: { issueId: f.issueId, commentId: second, _paperclipWakeContext: { issueId: f.issueId, wakeCommentIds: [first, second] } } });
+      await f.sweep();
+      await settleAt(f, PENDING_WAIT_BOUND_MS + 1_000);
+      const notes = await f.visible();
+      const bodies = notes.map(note => note.body);
+      expect(bodies.length).toBeGreaterThan(0);
+      if (cause === "system cancel") {
+        expect(bodies).toContain(NO_RUN);
+        expect(bodies).not.toContain(PERSON_STOP_HELD);
+        return;
+      }
+      expect(bodies).not.toContain(NO_RUN);
+      expect(bodies.every(body => body === PERSON_STOP_HELD)).toBe(true);
+      for (const note of notes) {
+        expect(note.presentation).toMatchObject({ title: "Stopped: your message is waiting" });
+        expect(nextActionOf(note)).toBe("Send it now, or delete it.");
+        expect(JSON.stringify(note.metadata)).not.toMatch(/sending it again is safe|send a new message/i);
+      }
+    });
+
   // SCREEN row 3 control: a NON-Stop held case (a pre-turn refusal, G4's shape)
   // keeps HELD_PREDECESSOR_NOTICE, its title and its "Send a new message" action.
   it.each([true, false])("SCREEN row 3 control: a non-Stop held message keeps HELD_PREDECESSOR_NOTICE (chat=%s)", async chat => {
