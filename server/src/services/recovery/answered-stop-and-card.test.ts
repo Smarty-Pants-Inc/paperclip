@@ -220,4 +220,69 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
     expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_TEXT, metadata: { ...key(m2), sourceRunId: run2 } });
     expect((all[0]!.metadata as { unansweredMessageIds?: string[] }).unansweredMessageIds, "it does not name M1").toBeUndefined();
   }, 60_000);
+
+  it.each(["succeeded", "failed"] as const)(
+    "ruling 2: a PENDING card the agent posted for M answers M, whatever the run's later status (%s) -> no notice", async status => {
+      const f = await fixture();
+      const m = await f.send("M: deploy it.");
+      const run = await f.startRun(m);
+      const cardId = await f.card(run);
+      await f.end(run, status);
+      expect(await f.cardStatus(cardId)).toMatchObject({ status: "pending" });
+      expect(await f.answered(m), "the answerable card is M's response").toBe(true);
+      for (const minutes of PASSES) expect(await f.sweep(minutes)).toEqual({ noticed: 0, pending: 0 });
+      expect(await f.notices(), "no notice was ever written").toHaveLength(0);
+    }, 60_000);
+
+  it("ruling 2: a card ANSWERED by the person answers M -> no notice", async () => {
+    const f = await fixture();
+    const m = await f.send("M: deploy it.");
+    const run = await f.startRun(m);
+    const cardId = await f.card(run);
+    await f.end(run, "succeeded");
+    await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId }, cardId,
+      { answers: [{ questionId: "scope", optionIds: ["first"] }] } as never, { userId: f.sender });
+    expect(await f.cardStatus(cardId)).toEqual({ status: "answered", resolvedByUserId: f.sender });
+    expect(await f.answered(m), "the card the person answered is M's response").toBe(true);
+    for (const minutes of PASSES) await f.sweep(minutes);
+    expect(await f.notices(), "no notice was ever written").toHaveLength(0);
+  }, 60_000);
+
+  it("ruling 3: a card that EXPIRED unanswered no longer counts -> M is owed again: exactly one no_reply notice", async () => {
+    const f = await fixture();
+    const m = await f.send("M: deploy it.");
+    const run = await f.startRun(m);
+    const cardId = await f.card(run);
+    await f.end(run, "succeeded");
+    expect(await f.answered(m)).toBe(true);
+    expect(await f.sweep(3)).toEqual({ noticed: 0, pending: 0 });
+    expect(await f.notices(), "while the card is answerable: no notice").toHaveLength(0);
+    const expired = await issueThreadInteractionService(db).expirePendingInteractionsForTerminalIssue(
+      { id: f.issueId, companyId: f.companyId, status: "cancelled" }, { systemId: "expiry" } as never);
+    expect(expired.map(row => row.id)).toEqual([cardId]);
+    expect(await f.cardStatus(cardId)).toEqual({ status: "expired", resolvedByUserId: null });
+    expect(await f.answered(m), "the visible next step is gone: M is owed again").toBe(false);
+    const counts = [];
+    for (const minutes of [5, 11, 30]) counts.push((await f.sweep(minutes)).noticed);
+    expect(counts, "one notice, on the first pass after the expiry").toEqual([1, 0, 0]);
+    const all = await f.notices();
+    expect(all, "exactly one notice, ever").toHaveLength(1);
+    expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_NO_REPLY_TEXT, metadata: { ...key(m), sourceRunId: run } });
+  }, 60_000);
+
+  it("ruling 2 edge: a card posted for a LATER message, or before M, does not answer M -> M keeps its one notice", async () => {
+    const f = await fixture();
+    const m1 = await f.send("M1: deploy it.");
+    const run1 = await f.startRun(m1);
+    await f.end(run1, "failed");
+    const m2 = await f.send("M2: and the release version?");
+    const run2 = await f.startRun(m2);
+    await f.card(run2);
+    await f.end(run2, "succeeded");
+    expect([await f.answered(m1), await f.answered(m2)], "the card answers only its own run's input").toEqual([false, true]);
+    for (const minutes of PASSES) await f.sweep(minutes);
+    const all = await f.notices();
+    expect(all, "exactly one notice, ever: M1's").toHaveLength(1);
+    expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_TEXT, metadata: { ...key(m1), sourceRunId: run1 } });
+  }, 60_000);
 });

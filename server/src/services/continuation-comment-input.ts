@@ -1,5 +1,5 @@
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { heartbeatRuns, issueComments, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
 import { answeredPersonMessageSql } from "./person-message-answer.js";
 import { runOwnInputIds, senderStoppedWhileAnswering } from "./recovery/person-stopped-message.js";
@@ -27,8 +27,37 @@ function senderStoppedCheck(db: Pick<Db, "select">, input: CarryInput) {
   };
 }
 
-/** Rebind the parent's wake comments and first-turn input ids, not its receipt. */
+/** The predecessor's still-pending person input: its typed messages and the person's answers to its cards. */
 export async function pendingContinuationCommentInput(db: Pick<Db, "select">, input: CarryInput): Promise<Record<string, unknown>> {
+  return { ...await pendingPersonCommentInput(db, input), ...await pendingContinuationInteractionInput(db, input) };
+}
+
+/** The predecessor's interaction references, only those a PERSON resolved for a card an agent asked on this task
+ * (answered, accepted or rejected) that is not ANSWERED yet (the one rule, keyed by the card id and its answer
+ * time) and whose run the sender did not stop while it was answering. The successor's runtime selection
+ * revalidates them (runtime-selection.ts materializeNativeInteractionResponses reads context.interactionIds). */
+async function pendingContinuationInteractionInput(db: Pick<Db, "select">, input: CarryInput): Promise<Record<string, unknown>> {
+  const context = (input.contextSnapshot && typeof input.contextSnapshot === "object" ? input.contextSnapshot : {}) as Record<string, unknown>;
+  const candidates = [...new Set([context.interactionId, ...(Array.isArray(context.interactionIds) ? context.interactionIds : [])]
+    .filter((id): id is string => typeof id === "string" && UUID.test(id)))];
+  if (candidates.length === 0) return {};
+  const senderStopped = senderStoppedCheck(db, input);
+  const rows = await db.select({ id: issueThreadInteractions.id, authorUserId: issueThreadInteractions.resolvedByUserId })
+    .from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, input.companyId), eq(issueThreadInteractions.issueId, input.issueId),
+    inArray(issueThreadInteractions.id, candidates), isNotNull(issueThreadInteractions.createdByAgentId),
+    isNotNull(issueThreadInteractions.resolvedByUserId), isNull(issueThreadInteractions.resolvedByAgentId),
+    isNotNull(issueThreadInteractions.resolvedAt), inArray(issueThreadInteractions.status, ["answered", "accepted", "rejected"]),
+    sql`not ${answeredPersonMessageSql({ id: sql`${issueThreadInteractions.id}`, companyId: sql`${issueThreadInteractions.companyId}`,
+      issueId: sql`${issueThreadInteractions.issueId}`, createdAt: sql`${issueThreadInteractions.resolvedAt}` })}`,
+  )).orderBy(asc(issueThreadInteractions.resolvedAt), asc(issueThreadInteractions.id));
+  const ids: string[] = [];
+  for (const row of rows) if (!await senderStopped(row)) ids.push(row.id);
+  return ids.length ? { interactionIds: ids, interactionId: ids.at(-1) } : {};
+}
+
+/** Rebind the parent's wake comments and first-turn input ids, not its receipt. */
+async function pendingPersonCommentInput(db: Pick<Db, "select">, input: CarryInput): Promise<Record<string, unknown>> {
   const carried = carryContinuationCommentInput(input.contextSnapshot);
   const candidates = (carried.wakeCommentIds as string[] | undefined)?.filter(id => UUID.test(id)) ?? [];
   if (candidates.length === 0) return {};
