@@ -144,9 +144,15 @@ describe.skipIf(!support.supported)("adopt-stopu-proof: a retained person's Stop
     // after releaseWarmNativeSession's ladder).
     const writeDecision = async () => {
       const decision = shape.session ?? "retained";
+      // adopt-stopu-rpcspoof: the retained Pi RPC process (a stand-in in the box
+      // workspace) is identified by the pid + start ticks the runner hands over,
+      // never by its '--mode rpc' text.
+      const pi = decision === "retained" ? onBox(remoteCwd, `exec perl -e "sleep 600" -- --mode rpc`) : null;
+      if (pi) await new Promise(resolve => setTimeout(resolve, 100));
       const patch = decision === "retained"
         ? { nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1", companyId, issueId, runId,
-          sessionId: `pi:${runId}`, bootId: randomUUID(), generation: 1 } }
+          sessionId: `pi:${runId}`, bootId: randomUUID(), generation: 1, processPid: pi!.pid,
+          processStartTicks: (await fs.readFile(`/proc/${pi!.pid}/stat`, "utf8")).split(") ").pop()!.split(" ")[19] } }
         : { nativeStoppedSessionClose: { schema: "paperclip.native-stopped-session-close.v1", companyId, issueId, runId,
           sessionId: `pi:${runId}`, clean: decision === "closed_clean", at: new Date().toISOString() } };
       await db.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)

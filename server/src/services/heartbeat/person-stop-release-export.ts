@@ -7,7 +7,7 @@ import { admittedNativeResourceDisposition } from "../native-runtime/native-fail
 import { readNativeWorkspaceSyncReference, resumeNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
 import { nativeWorkspaceExportPendingForLease } from "../native-runtime/native-workspace-finalization-state.js";
 import { tryLockNativeWorkspaceFinalization } from "../native-runtime/native-workspace-finalization-ownership.js";
-import { finishCancelledWarmWorkspaceExport, stoppedTurnSessionDecision, type CancelledWarmExportOutcome } from "./cancelled-warm-workspace-export.js";
+import { finishCancelledWarmWorkspaceExport, retainedSessionProcessIdentity, stoppedTurnSessionDecision, type CancelledWarmExportOutcome } from "./cancelled-warm-workspace-export.js";
 import { noStoppedTurnProcessRemains } from "./stopped-turn-process-gone.js";
 import { PERSON_STOP_BOUND_KEY, PERSON_STOP_PROBE_TIMEOUT_MS, PERSON_STOP_WITHOUT_FILES_LINE, readPersonStopBoundDecision, personStopExportBoundAt,
   type PersonStopBoundDecision } from "./person-stop-export-bound.js";
@@ -94,7 +94,7 @@ export async function decidePersonStopExportAtBound(input: {
         .catch(() => null);
       if (!target || target.kind !== "remote" || !("runner" in target) || !target.runner) return "box_unreachable_target";
       return await noStoppedTurnProcessRemains({ runner: target.runner, remoteCwd: target.remoteCwd }, run.startedAt,
-        { retainedSession: decided === "retained", runId: run.id, timeoutMs: input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS })
+        { retainedSession: decided === "retained", retainedProcess: retainedSessionProcessIdentity(run), runId: run.id, timeoutMs: input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS })
         .then(proof => proof.proven ? "box_reachable_tools_stopped" : "box_unreachable_probe");
     };
     const probed = await withTimeout(probe(), input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS);

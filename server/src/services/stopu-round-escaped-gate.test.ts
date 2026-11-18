@@ -111,8 +111,10 @@ function classifyF(bytes: Buffer): string {
   return `TORN(len=${bytes.length},head=${JSON.stringify(bytes.subarray(0, 10).toString("utf8"))},tail=${JSON.stringify(bytes.subarray(Math.max(0, bytes.length - 10)).toString("utf8"))})`;
 }
 const escapedWriters: number[] = [];
+const retainedPis: number[] = [];
 function stopEscapedWriters() {
   for (const pid of escapedWriters.splice(0)) { try { process.kill(-pid, "SIGKILL"); } catch { /* gone */ } }
+  for (const pid of retainedPis.splice(0)) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
 }
 const BASE = "base contents\n";
 const EDIT = "edited on the box by the stopped turn\n";
@@ -199,7 +201,12 @@ const support = await getEmbeddedPostgresTestSupport();
     /** adopt-stopu-escaped: after the edit, the turn starts an escaped writer of the same F. */
     writer?: WriterMode;
     /** adopt-stopu-round: NSE RETAINED the session (the idle receipt), no close record. */
-    retained?: boolean };
+    retained?: boolean;
+    /** adopt-stopu-rpcspoof (rf-4): the escaped writer's argv carries '--mode rpc'. */
+    spoof?: boolean;
+    /** adopt-stopu-rpcspoof: the retained receipt carries the retained Pi RPC
+     * process's identity (pid + start ticks), as the runner hands it over. Default: true when retained. */
+    piIdentity?: boolean };
   async function stopMidTurn(variant: Variant) {
     const root = await mkdtemp(join(tmpdir(), "paperclip-cancel-finalize-"));
     roots.push(root);
@@ -262,7 +269,7 @@ const support = await getEmbeddedPostgresTestSupport();
         // so the session close (pgid kill) does not reach it.
         const script = join(root, "writer.py"), counter = join(root, "writer.count");
         await writeFile(script, WRITER);
-        const child = spawn("python3", [script, join(box, "task.txt"), variant.writer, counter],
+        const child = spawn("python3", [script, join(box, "task.txt"), variant.writer, counter, ...(variant.spoof ? ["--mode", "rpc"] : [])],
           { detached: true, stdio: "ignore", cwd: box, env: { ...process.env, PAPERCLIP_RUN_ID: runId } });
         child.unref();
         escapedWriters.push(child.pid!);
@@ -271,6 +278,16 @@ const support = await getEmbeddedPostgresTestSupport();
       // The person's Stop, acknowledged; NSE settles it (coordinator terminal_failure /
       // native_retry_cancelled) after a clean cancellation. adopt-stopu: under
       // stop_and_retain no retained idle receipt is written.
+      let piProcess: { processPid: number; processStartTicks: string } | null = null;
+      if (variant.retained) {
+        // The retained Pi RPC session (a stand-in: started in this turn, in the box workspace, the run's id).
+        const pi = spawn("perl", ["-e", "sleep 300", "--", "--mode", "rpc"], { stdio: "ignore", cwd: box,
+          env: { ...process.env, PAPERCLIP_RUN_ID: runId } });
+        retainedPis.push(pi.pid!);
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (variant.piIdentity ?? true) piProcess = { processPid: pi.pid!,
+          processStartTicks: readFileSync(`/proc/${pi.pid}/stat`, "utf8").split(") ").pop()!.split(" ")[19]! };
+      }
       const stoppedAt = new Date();
       const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", finishedAt: stoppedAt,
@@ -281,7 +298,7 @@ const support = await getEmbeddedPostgresTestSupport();
             intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } },
         runnerProfileJson: { ...current.runnerProfileJson,
           ...(variant.retained ? { nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1",
-            runId, companyId, issueId, sessionId, at: stoppedAt.toISOString() } } : {}),
+            runId, companyId, issueId, sessionId, at: stoppedAt.toISOString(), ...(piProcess ?? {}) } } : {}),
           ...(!variant.retained && (variant.closeProof ?? (variant.settled ? "clean" : "none")) !== "none" ? { nativeStoppedSessionClose: {
             schema: "paperclip.native-stopped-session-close.v1", companyId, issueId, runId, sessionId,
             clean: (variant.closeProof ?? "clean") === "clean",
@@ -373,8 +390,10 @@ const support = await getEmbeddedPostgresTestSupport();
   const rows: Array<[string, WriterMode, boolean, number]> = [];
   for (const retained of [true, false]) for (const writer of ["truncate", "inplace"] as const)
     for (let i = 1; i <= 5; i++) rows.push([`${retained ? "retained" : "closed"} ${writer} #${i}`, writer, retained, i]);
-  it.each(rows)("GATE 1 %s: export starts after the verified-gone record; host F = box F after the kill; the successor finds no process of the turn", async (_label, writer, retained) => {
-    const f = await stopMidTurn({ edit: true, settled: true, exportFails: false, closeProof: "clean", writer, retained });
+  for (let i = 1; i <= 3; i++) rows.push([`retained SPOOF('--mode rpc') truncate #${i}`, "truncate", true, -i]);
+  it.each(rows)("GATE 1 %s: export starts after the verified-gone record; host F = box F after the kill; the successor finds no process of the turn", async (_label, writer, retained, _i) => {
+    const f = await stopMidTurn({ edit: true, settled: true, exportFails: false, closeProof: "clean", writer, retained, spoof: _i < 0 });
+    const piPid = retained ? retainedPis[retainedPis.length - 1]! : null;
     const writerPid = escapedWriters[escapedWriters.length - 1]!;
     const writerAlive = (() => { try { process.kill(writerPid, 0); return true; } catch { return false; } })();
     const gone = f.events.find(event => event.eventType === "person_stop.processes_verified_gone");
@@ -387,12 +406,14 @@ const support = await getEmbeddedPostgresTestSupport();
     const boxLater = await readFile(join(f.box, "task.txt"));
     const { noStoppedTurnProcessRemains } = await import("./heartbeat/stopped-turn-process-gone.js");
     const successorCheck = await noStoppedTurnProcessRemains({ runner: boxRunner({ fail: false, calls: 0 }), remoteCwd: f.box },
-      f.stopped.startedAt, { runId: f.runId });
+      f.stopped.startedAt, { runId: f.runId, ...(piPid !== null ? { retainedSession: true, retainedProcess: {
+        pid: piPid, startTicks: readFileSync(`/proc/${piPid}/stat`, "utf8").split(") ").pop()!.split(" ")[19]! } } : {}) });
     const record = { writer, retained, descriptor: f.reference?.state, writerAlive, goneAt: gone ? new Date(goneAt).toISOString() : null,
       startedAt: started ? new Date(startedAt).toISOString() : null, copyPath: (started?.payload as Record<string, unknown> | null)?.copyPath,
       killed: (gone?.payload as Record<string, unknown> | null)?.killed,
       hostSha: sha(hostF.toString("latin1")), boxSha: sha(boxF.toString("latin1")), boxStable: boxF.equals(boxLater),
-      hostF: classifyF(hostF), successorCheck };
+      hostF: classifyF(hostF), successorCheck,
+      piAlive: piPid === null ? null : (() => { try { process.kill(piPid, 0); return true; } catch { return false; } })() };
     console.info(`[stopu-round-gate1] ${JSON.stringify(record)}`);
     if (process.env.GATE1_RECORDS) await (await import("node:fs/promises")).appendFile(process.env.GATE1_RECORDS, `${JSON.stringify(record)}\n`);
     expect(f.reference?.state).toBe("finalized");
@@ -406,5 +427,23 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(record.hostF).not.toMatch(/^TORN/);
     // (c) the successor on the same box finds NO process of the stopped turn.
     expect(successorCheck).toMatchObject({ proven: true, killed: [] });
+    // adopt-stopu-rpcspoof: the retained Pi (spared by the runner's identity, not by text) survives.
+    if (piPid !== null) expect((() => { try { process.kill(piPid, 0); return true; } catch { return false; } })()).toBe(true);
+  }, 90_000);
+
+  // adopt-stopu-rpcspoof (rf-4 Part A): retained, NO identity handed over, rf-4's spoof writer: NOT proven, no export while it is alive.
+  it("retained SPOOF('--mode rpc') with no handed-over identity: not proven, no export_started, the descriptor stays prepared, the box kept", async () => {
+    const f = await stopMidTurn({ edit: true, settled: true, exportFails: false, closeProof: "clean", writer: "truncate",
+      retained: true, spoof: true, piIdentity: false });
+    const writerPid = escapedWriters[escapedWriters.length - 1]!;
+    const writerAlive = (() => { try { process.kill(writerPid, 0); return true; } catch { return false; } })();
+    const started = f.events.find(event => event.eventType === "person_stop.export_started");
+    const gone = f.events.find(event => event.eventType === "person_stop.processes_verified_gone");
+    console.info(`[stopu-rpcspoof-export] ${JSON.stringify({ descriptor: f.reference?.state, writerAlive, started: !!started, gone: !!gone,
+      hostF: classifyF(await readFile(join(f.host, "task.txt"))) })}`);
+    expect(f.reference?.state).not.toBe("finalized");
+    expect(started).toBeUndefined();
+    expect(gone).toBeUndefined();
+    expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
   }, 90_000);
 });

@@ -30,13 +30,14 @@ export type StoppedTurnProcessProof =
   | { proven: true; killed: string[]; scoped: boolean }
   | { proven: false; detail: string; remaining?: string[] };
 
+export type RetainedSessionProcess = { pid: number; startTicks: string | number };
 export const NO_STOPPED_TURN_PROCESS_TIMEOUT_MS = 15_000;
 export const NO_STOPPED_TURN_PROCESS_KILL_ROUNDS = 10;
 /** Box-clock tolerance: a process started up to this long before the recorded turn start still counts. */
 export const NO_STOPPED_TURN_PROCESS_CLOCK_SLACK_MS = 2_000;
 
 const SCRIPT = String.raw`
-T=$1; ROOT=$2; CB=$3; ROUNDS=$4; KEEP=$5; RID=$6
+T=$1; ROOT=$2; CB=$3; ROUNDS=$4; KEEP=$5; RID=$6; KPID=$7; KST=$8
 ROOT=$(cd "$ROOT" 2>/dev/null && pwd -P) || { echo "ERR no_workspace"; exit 5; }
 BID=; read -r BID < /proc/sys/kernel/random/boot_id 2>/dev/null
 SCOPED=0; [ -n "$CB" ] && [ "$BID" = "$CB" ] && SCOPED=1
@@ -71,7 +72,10 @@ scan() {
     [ "$2" = "$SELF" ] && continue
     start=$((BT + \${20} / HZ))
     [ "$start" -lt "$T" ] && continue
-    if [ "$KEEP" = retained ] && tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q -- '--mode rpc'; then continue; fi
+    # adopt-stopu-rpcspoof: the retained Pi RPC process is spared ONLY by the
+    # identity the runner handed over (its pid AND its /proc start time in
+    # clock ticks), never by command-line text (a turn writer can carry any argv).
+    [ "$KEEP" = retained ] && [ -n "$KPID" ] && [ "$pid" = "$KPID" ] && [ "\${20}" = "$KST" ] && continue
     hit=0; c=$(readlink "$d/cwd" 2>/dev/null) && inroot "$c" && hit=1
     if [ "$hit" = 0 ]; then for f in "$d"/fd/*; do l=$(readlink "$f" 2>/dev/null) && inroot "$l" && { hit=1; break; }; done; fi
     if [ "$SCOPED" = 1 ]; then
@@ -88,6 +92,9 @@ scan() {
   done
 }
 KILLED=; i=0; scan
+# Retained, but no handed-over identity: no process can be told apart from the
+# retained session, so nothing is killed and any candidate means NOT proven.
+if [ "$KEEP" = retained ] && [ -z "$KPID" ] && [ -n "$FOUND" ]; then echo "UNIDENTIFIED$FOUND"; exit 3; fi
 if [ -n "$FOUND" ]; then for k in $FOUND; do kill -TERM "$k" 2>/dev/null && KILLED="$KILLED $k"; done; sleep 0.2; scan; fi
 while [ -n "$FOUND" ] && [ "$i" -lt "$ROUNDS" ]; do
   for k in $FOUND; do kill -KILL "$k" 2>/dev/null && KILLED="$KILLED $k"; done
@@ -109,8 +116,13 @@ function readControllerBootId(): string {
 export async function noStoppedTurnProcessRemains(box: StoppedTurnBox | null | undefined,
   turnStartedAt: Date | string | null | undefined, options?: {
     timeoutMs?: number;
-    /** NSE retained the warm session: its Pi RPC process (--mode rpc) is spared. */
+    /** NSE retained the warm session. Its Pi RPC process is spared ONLY when
+     * retainedProcess (the identity the runner handed over) is given; without
+     * it, no process is killed and any candidate makes the proof fail. */
     retainedSession?: boolean;
+    /** The retained Pi RPC process's identity on the box: pid + /proc/<pid>/stat
+     * starttime (clock ticks since boot), as the runner recorded it. */
+    retainedProcess?: RetainedSessionProcess | null;
     /** The stopped run: processes carrying its PAPERCLIP_RUN_ID are the turn's. */
     runId?: string;
     bypassSession?: boolean;
@@ -120,10 +132,13 @@ export async function noStoppedTurnProcessRemains(box: StoppedTurnBox | null | u
   if (!box?.runner || !box.remoteCwd) return { proven: false, detail: "no_box_command_path" };
   const startedMs = turnStartedAt ? new Date(turnStartedAt).getTime() : NaN;
   if (!Number.isFinite(startedMs)) return { proven: false, detail: "turn_start_unknown" };
+  const keep = options?.retainedSession ? options.retainedProcess : null;
+  const keepPid = keep && Number.isSafeInteger(keep.pid) && keep.pid > 1 && /^\d+$/.test(String(keep.startTicks))
+    ? [String(keep.pid), String(keep.startTicks)] : ["", ""];
   const since = Math.floor((startedMs - NO_STOPPED_TURN_PROCESS_CLOCK_SLACK_MS) / 1000);
   const result = await box.runner.execute({ command: "sh", args: ["-c", SCRIPT, "sh", String(since), box.remoteCwd,
     options?.wholeBox ? "" : readControllerBootId(), String(NO_STOPPED_TURN_PROCESS_KILL_ROUNDS),
-    options?.retainedSession ? "retained" : "closed", options?.runId ?? ""], cwd: box.remoteCwd,
+    options?.retainedSession ? "retained" : "closed", options?.runId ?? "", ...keepPid], cwd: box.remoteCwd,
     timeoutMs: options?.timeoutMs ?? NO_STOPPED_TURN_PROCESS_TIMEOUT_MS,
     ...(options?.bypassSession ? { bypassSession: true } : {}) } as Parameters<StoppedTurnBox["runner"]["execute"]>[0]).catch((error: unknown) => ({
     exitCode: -1, timedOut: false, stdout: "", stderr: error instanceof Error ? error.message : String(error) }));
@@ -133,6 +148,8 @@ export async function noStoppedTurnProcessRemains(box: StoppedTurnBox | null | u
     const killed = (out.split("killed=")[1] ?? "").trim().split(/\s+/).filter(Boolean);
     return { proven: true, killed, scoped };
   }
+  if (out.startsWith("UNIDENTIFIED")) return { proven: false, detail: "retained_session_process_unidentified",
+    remaining: out.slice("UNIDENTIFIED".length).trim().split(/\s+/).filter(Boolean) };
   if (out.startsWith("REMAIN")) return { proven: false, detail: "stopped_turn_process_remains",
     remaining: out.slice("REMAIN".length).trim().split(/\s+/).filter(Boolean) };
   return { proven: false, detail: (result.timedOut ? "process_check_timed_out"

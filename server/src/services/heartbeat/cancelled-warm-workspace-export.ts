@@ -8,7 +8,7 @@ import {
   NativeWorkspaceFinalizationOwnershipLostError,
   withNativeWorkspaceFinalizationOwnership,
 } from "../native-runtime/native-workspace-finalization-ownership.js";
-import { noStoppedTurnProcessRemains, type StoppedTurnBox } from "./stopped-turn-process-gone.js";
+import { noStoppedTurnProcessRemains, type RetainedSessionProcess, type StoppedTurnBox } from "./stopped-turn-process-gone.js";
 
 class StoppedTurnProcessesNotProvenGoneError extends Error {
   constructor(readonly detail: string) { super(`stopped_turn_processes_not_proven_gone:${detail}`); }
@@ -82,6 +82,20 @@ export function hasRetainedIdleReceipt(run: Pick<typeof heartbeatRuns.$inferSele
   return receipt.schema === RETAINED_IDLE_SCHEMA && receipt.runId === run.id
     && receipt.companyId === run.companyId && receipt.issueId === run.nativeIssueId
     && typeof receipt.sessionId === "string" && receipt.sessionId.length > 0;
+}
+
+/** adopt-stopu-rpcspoof: the retained Pi RPC process's identity as the runner
+ * handed it over on the retained receipt (pid + /proc start ticks). Absent
+ * (no record of it): null, and the retained proof spares nothing by text: it
+ * fails if any candidate process remains (no export; the bounded hold). */
+export function retainedSessionProcessIdentity(run: Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "nativeIssueId" | "runnerProfileJson">): RetainedSessionProcess | null {
+  if (!hasRetainedIdleReceipt(run)) return null;
+  const receipt = record(record(run.runnerProfileJson).nativeRetainedIdleCheckpoint);
+  const pid = receipt.processPid, startTicks = receipt.processStartTicks;
+  return typeof pid === "number" && Number.isSafeInteger(pid) && pid > 1
+    && (typeof startTicks === "string" || typeof startTicks === "number") && /^\d+$/.test(String(startTicks))
+    ? { pid, startTicks } : null;
 }
 
 /** NSE's CLOSED decision for THIS run, clean or not (any close record). */
@@ -233,7 +247,7 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       let box: StoppedTurnBox | null = null;
       const proving = (async () => noStoppedTurnProcessRemains(box = input.stoppedTurnBox
         ? await input.stoppedTurnBox(controller.signal).catch(() => null) : null, current.startedAt,
-        { retainedSession: decided === "retained", runId: run.id }))();
+        { retainedSession: decided === "retained", retainedProcess: retainedSessionProcessIdentity(current), runId: run.id }))();
       proving.catch(() => undefined);
       const proof = await Promise.race([proving, aborted]);
       if (!proof.proven) throw new StoppedTurnProcessesNotProvenGoneError(
