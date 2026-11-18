@@ -88,10 +88,18 @@ describe("durable Grok routine qualification", () => {
     const broker = dotRunnerBroker(db);
     const canStart = () => broker.canStartNewWork(f.company.id, f.agent.id, f.pairing.bindingId);
     expect(await canStart()).toBe(false);
+    // RFL 01:00Z (a) writer (grok-bot/routine.ts verify): a run queued behind the external setup hold.
+    const [held] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id, status: "queued",
+      invocationSource: "assignment", contextSnapshot: {} }).returning();
     const row = await verification(f);
     await f.service.send(f.company.id, f.agent.id, row.id);
+    const verifiedFrom = Date.now();
     await f.service.acknowledge(f.principal, acknowledgement(row));
     expect(await canStart()).toBe(true);
+    const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, held!.id));
+    expect(stamped!.startableSince?.getTime(), "the verify acknowledgement stamps the agent's queued run")
+      .toBeGreaterThanOrEqual(verifiedFrom - 1_000);
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, held!.id));
     expect(await broker.canStartNewWork(randomUUID(), f.agent.id, f.pairing.bindingId)).toBe(false);
     expect(await broker.canStartNewWork(f.company.id, f.agent.id, randomUUID())).toBe(false);
     await db.update(grokBotRoutines).set({ recoveryRequiredAt: new Date(), recoveryReason: "work_session" })

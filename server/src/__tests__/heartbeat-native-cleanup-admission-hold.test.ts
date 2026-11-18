@@ -128,10 +128,15 @@ describeEmbeddedPostgres("queued native run behind the task's previous session c
       await heartbeatService(db).resumeQueuedRuns();
       expect(await readRun(run.id)).toMatchObject({ status: "queued", startedAt: null });
 
+      expect((await readRun(run.id)).startableSince, "held: no startable-since stamp yet").toBeNull();
+      const settledFrom = Date.now();
       settle();
       await expect.poll(async () => (await readRun(run.id)).status, { timeout: 15_000 }).not.toBe("queued");
       expect((await readRun(run.id)).errorCode).not.toBe("native_session_cleanup_quarantined");
       expect(worker.wakeFailure).not.toHaveBeenCalled();
+      // RFL 01:00Z (a) writer (native-cleanup-release-wake.ts): the settled listener stamped the run while it was still queued.
+      expect((await readRun(run.id)).startableSince?.getTime(), "the cleanup-settled listener stamps startable_since")
+        .toBeGreaterThanOrEqual(settledFrom - 1_000);
     } finally {
       worker.stop();
     }
