@@ -45,6 +45,19 @@ type AcquireOutcomeReason = "no_ready_spare" | "create_capped" | "refill_in_flig
 type AcquireOutcomeCounts = { spare: number; cold: number; reasons: Partial<Record<AcquireOutcomeReason, number>> };
 type CompanyAcquireOutcomes = Map<string, AcquireOutcomeCounts>;
 const knownSparePools = new Map<string, KnownSparePool>();
+/**
+ * Bumped at every spare setting change (company) and every 'off' applied to a
+ * company environment. An acquire that read the setting before a bump raced
+ * 'off' (or a newer setting) and queues no spares; the newer reader applied it.
+ */
+const spareSettingEpochs = new Map<string, number>();
+function bumpSpareSettingEpoch(...scope: string[]): void {
+  const id = JSON.stringify(scope);
+  spareSettingEpochs.set(id, (spareSettingEpochs.get(id) ?? 0) + 1);
+}
+function spareSettingEpoch(companyId: string, environmentId: string): string {
+  return `${spareSettingEpochs.get(JSON.stringify([companyId])) ?? 0}:${spareSettingEpochs.get(JSON.stringify([companyId, environmentId])) ?? 0}`;
+}
 const companySpareActivity = new Map<string, CompanySpareActivity>();
 const companySpareActivityLoads = new Map<string, Promise<CompanySpareActivity>>();
 const companySpareActivityWrites = new Map<string, Promise<void>>();
@@ -1411,6 +1424,7 @@ function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSecond
   idleMinutes = readySpareIdleMinutes(undefined), policy = { baseDesired: desired, spareMax: desired, demandWindowMinutes: 10 }): void {
   if (shuttingDown) return;
   if (desired <= 0) {
+    bumpSpareSettingEpoch(key.companyId, key.environmentId);
     for (const pool of knownSparePools.values()) {
       if (pool.key.companyId !== key.companyId || pool.key.environmentId !== key.environmentId) continue;
       // Off stays off: wakes and maintenance recompute desired from baseDesired.
@@ -1427,6 +1441,8 @@ function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSecond
   for (const [oldPoolId, oldPool] of knownSparePools) {
     if (oldPool.key.companyId !== key.companyId || oldPool.key.environmentId !== key.environmentId
         || oldPool.key.configHash === key.configHash || oldPool.desired === 0) continue;
+    // A retired config's pool is off: wakes and maintenance must not refill it.
+    oldPool.baseDesired = 0;
     oldPool.desired = 0;
     // A create already in flight under the previous config may finish after the
     // first retire pass. Reconcile again after it settles, but only if it left a
@@ -1701,6 +1717,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     // the source for Boat credentials and create-shaping fields.
     const companyId = context?.companyId;
     if (!companyId) return;
+    bumpSpareSettingEpoch(companyId);
     subscribeCompanyActivity(companyId);
     readySpares.setCreateCeiling(companyId, readyCreateCeilingPerHour(newConfig));
     const configuredCount = readySpareCount(newConfig);
@@ -1868,6 +1885,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const spareKey: ReadySpareKey = { companyId: params.companyId, environmentId: params.environmentId, configHash: spareHash };
     let baseSpares = 0, spareMax = 3, demandWindowMinutes = 10;
     let spareIdleMinutes = readySpareIdleMinutes(undefined), hasSpareSetting = false, listedEnvironment = false;
+    const settingEpoch = spareSettingEpoch(params.companyId, params.environmentId);
     if (pluginContext?.config && typeof pluginContext.config.get === "function") {
       try {
         const companyConfig = await pluginContext.config.get(params.companyId);
@@ -1883,6 +1901,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     const spareOperations = hasSpareSetting ? createReadySpareOperations(c, spareKey, ttl, from) : undefined;
     const policy = { baseDesired: baseSpares, spareMax, demandWindowMinutes };
+    /** Queue spares from this acquire's setting read, unless 'off' or a newer setting landed since. */
+    const queueSpares = (desired: number, operations: ReadySpareOperations) => {
+      if (spareSettingEpoch(params.companyId, params.environmentId) !== settingEpoch) return;
+      queueSpareReconciliation(spareKey, desired, ttl, operations, spareIdleMinutes, policy);
+    };
     const createOrdinaryLease = async (): Promise<PluginEnvironmentLease> => {
       let id: string | undefined;
       if (shuttingDown) throw new Error("Boat provider is shutting down");
@@ -1957,7 +1980,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         const ready = observation ?? { id, state: claimedSpare.state, name: claimName, labels: claimedSpare.labels };
         // Immediately begin the replacement while shared lease preparation
         // runs; no claims can see the transferred ID again.
-        queueSpareReconciliation(spareKey, demandedSpares, ttl, spareOperations, spareIdleMinutes, policy);
+        queueSpares(demandedSpares, spareOperations);
         const lease = await finishAcquisition(params, c, id, ready, claimedSpare.labels, remoteCwd, snapshot, claimName, claimedSpare);
         // The run's acquire is now bound to this box; a step on it proves use.
         bindClaimedSpare(params.companyId, params.environmentId, id);
@@ -1965,8 +1988,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       }
       await recordOutcomeOnce("cold", claimResult.reason);
       if (shuttingDown) throw new Error("Boat provider is shutting down");
-      if (adoptionTask) void adoptionTask.then(() => queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations, spareIdleMinutes, policy));
-      else queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations, spareIdleMinutes, policy);
+      if (adoptionTask) void adoptionTask.then(() => queueSpares(desiredSpares, spareOperations));
+      else queueSpares(desiredSpares, spareOperations);
       return await createOrdinaryLease();
     } else {
       await recordOutcomeOnce("cold", "no_ready_spare");
