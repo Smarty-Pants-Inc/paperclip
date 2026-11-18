@@ -141,6 +141,15 @@ describe("TaskChatLiveRunPill", () => {
     expect(container.textContent).not.toContain("Working");
   });
 
+  // FIX21 (rf-3): the run's execution projection for a fresh run the external-bot gate holds
+  // (fresh-continuation-fallback.test.ts, logged fix21FreshDotExecution): no "Working for 1s".
+  it("names a fresh run's external-agent hold instead of Working for 1s", () => {
+    const execution = { phase: "queued", label: "Waiting for the external agent's connection", cause: "external_agent_setup" } as ExecutionProjection;
+    act(() => root.render(<TaskChatLiveRunPill status="queued" execution={execution} startedAtMs={Date.now() - 1_000} toolSummary={null} />));
+    expect(container.textContent).toContain("Waiting for the external agent's connection");
+    expect(container.textContent).not.toContain("Working");
+  });
+
   it("settles to a static 'Worked' summary once the run is terminal", () => {
     const startedAtMs = 1_000;
     act(() => {

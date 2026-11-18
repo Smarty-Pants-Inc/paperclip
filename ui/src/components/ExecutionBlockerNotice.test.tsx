@@ -106,6 +106,18 @@ describe("ordinary task interruption", () => {
     expect(container.textContent).toBe("Waiting for the budget to allow new work. The task starts automatically when it does.");
     expect(container.querySelector("button")).toBeNull();
   });
+  // FIX21 (rf-3): the server's card for a FRESH person run held by an unready Dot binding
+  // (fresh-continuation-fallback.test.ts "FIX21 fresh unready Dot hold", logged fix21FreshDotCard).
+  it("shows a fresh run's external-agent hold as its waiting line, never Working and never Retry", async () => {
+    const message = "Waiting: this external agent's connection is not ready for new work. Your message is saved and starts when it is reconnected.";
+    for (const options of [{}, { canRetry: false }]) {
+      await render({ ...failed, state: "working", canRetry: false, observedRunId: "queued", sourceRunIds: [],
+        retryWait: { reason: "external_agent_setup", message } }, options);
+      expect(container.textContent).toBe(message);
+      expect(container.textContent).not.toContain("Working");
+      expect(container.querySelector("button")).toBeNull();
+    }
+  });
   it("names and links the readable blockers a saved Retry waits on, with no second Retry (restart chaos t05)", async () => {
     const message = "Retry is waiting on a blocked task this one depends on. Retry or unblock it; this task continues when it is done. Your Retry is saved.";
     const summary = (id: string, identifier: string, title: string, status: string) =>

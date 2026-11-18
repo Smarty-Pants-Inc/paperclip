@@ -806,16 +806,20 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.runId, queuedContinuationIds),
       eq(agentWakeupRequests.requestedByActorType, "user"))),
   ]) : [[], []];
-  // Queued runs past the person start bound: is each one a person asked for?
-  const overdueQueuedIds = runs.filter(run => run.status === "queued" && run.createdAt
-    && run.createdAt.getTime() <= Date.now() - PERSON_QUEUED_RUN_START_BOUND_MS).map(run => run.id);
+  // Queued runs a person asked for, at any age. FIX21 (rf-3): the external-bot
+  // hold names its wait from enqueue, so person origin is read for fresh runs too;
+  // the start bound and the other task-level holds below still read only the
+  // runs past the bound (personQueued).
+  const queuedIds = runs.filter(run => run.status === "queued" && run.createdAt).map(run => run.id);
   const personQueuedRunIds = new Set<string>();
-  if (overdueQueuedIds.length) {
+  if (queuedIds.length) {
     const { personOriginRunSql } = await import("./heartbeat/queued-run-line.js");
     const rows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
-      inArray(heartbeatRuns.id, overdueQueuedIds), personOriginRunSql(sql`${companyId}::uuid`, sql`${heartbeatRuns.id}`)));
+      inArray(heartbeatRuns.id, queuedIds), personOriginRunSql(sql`${companyId}::uuid`, sql`${heartbeatRuns.id}`)));
     for (const row of rows) personQueuedRunIds.add(row.id);
   }
+  const isOverdue = (run: typeof runs[number]) => Boolean(run.createdAt
+    && run.createdAt.getTime() <= Date.now() - PERSON_QUEUED_RUN_START_BOUND_MS);
   // When each such run became startable (RFL S9: the queued-time clock starts at
   // the END of the preceding run, never at enqueue). No new state:
   // - busy is the dispatcher's own rule (heartbeat/queue.ts:2638-2641): the
@@ -832,7 +836,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   //   enqueue (heartbeat_runs.created_at).
   const queuedRunStartableSince = new Map<string, number>();
   const agentRowsForHolds = new Map<string, typeof agents.$inferSelect>();
-  const personQueued = runs.filter(run => personQueuedRunIds.has(run.id) && run.createdAt);
+  const personQueued = runs.filter(run => personQueuedRunIds.has(run.id) && run.createdAt && isOverdue(run));
   if (personQueued.length) {
     const agentIds = [...new Set(personQueued.map(run => run.agentId))];
     const { parseHeartbeatPolicy } = await import("./heartbeat/timer-policy.js");
@@ -927,6 +931,22 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         const hold = await dotRunnerBroker(db).newWorkHold(companyId, agent.id, externalBindingId).catch(() => null);
         if (hold) taskStartHolds.set(run.id, hold);
       }
+    }
+  }
+  // FIX21 (rf-3): the external-bot hold (the dispatcher's canStartNewExternalBotWork,
+  // heartbeat/queue.ts claimQueuedRun) declines a run from enqueue, so a fresh person
+  // run it holds names the wait too, never "Working for 1s". Same read as above.
+  const freshPersonQueued = runs.filter(run => personQueuedRunIds.has(run.id) && run.createdAt && !isOverdue(run));
+  if (freshPersonQueued.length) {
+    const missing = [...new Set(freshPersonQueued.map(run => run.agentId))].filter(id => !agentRowsForHolds.has(id));
+    if (missing.length) for (const agent of await db.select().from(agents)
+      .where(and(eq(agents.companyId, companyId), inArray(agents.id, missing)))) agentRowsForHolds.set(agent.id, agent);
+    for (const run of freshPersonQueued) {
+      const agent = agentRowsForHolds.get(run.agentId);
+      const externalBindingId = agent ? externalBotStartGateBindingId(agent) : null;
+      if (!agent || externalBindingId === null) continue;
+      const hold = await dotRunnerBroker(db).newWorkHold(companyId, agent.id, externalBindingId).catch(() => null);
+      if (hold) taskStartHolds.set(run.id, hold);
     }
   }
   const waitingContinuationRunIds = new Set(continuationRows.map(row => row.runId));

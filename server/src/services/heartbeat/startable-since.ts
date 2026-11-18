@@ -1,5 +1,5 @@
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
-import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { agents, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 
 /**
  * RFL 01:00Z ruling (a): a hold that held a queued run has cleared, so stamp
@@ -23,4 +23,30 @@ export async function stampQueuedRunsStartable(db: Pick<Db, "update" | "select">
       scope.issueIds?.length ? inArray(heartbeatRuns.issueId, scope.issueIds) : undefined,
       scope.projectId ? inArray(heartbeatRuns.issueId, db.select({ id: issues.id }).from(issues)
         .where(and(eq(issues.companyId, scope.companyId), eq(issues.projectId, scope.projectId)))) : undefined));
+}
+
+/** The external-bot provider switch, one rule for the gate (external-bot-authority.ts
+ * externalBotEnabled) and the settings writer's stamp below. */
+export function externalBotProviderOn(experimental: { enablePublicMcp?: boolean; enableOpenAiDot?: boolean; enableGrokBot?: boolean;
+  enableNativeRunner?: boolean }, provider: "openai_dot" | "grok_bot"): boolean {
+  return Boolean(experimental.enablePublicMcp && (provider === "openai_dot"
+    ? experimental.enableOpenAiDot : experimental.enableGrokBot && experimental.enableNativeRunner));
+}
+
+/** FIX21 (rf-3): switching an external provider back on (instance-settings.ts
+ * updateExperimental, the only writer of the experimental settings) clears the
+ * external-bot hold (heartbeat.ts canStartNewExternalBotWork → dot.ts snapshot
+ * `enabled`) for every agent of that provider the gate reads
+ * (dot-runner-broker.ts externalBotStartGateBindingId: paperclip_runner, provider
+ * key, not router mode), in every company: the setting is instance-wide. Same
+ * stamp rule as stampQueuedRunsStartable. */
+export async function stampExternalProviderReenabled(db: Pick<Db, "update" | "select">,
+  providers: Array<"openai_dot" | "grok_bot">, at: Date = new Date()): Promise<void> {
+  if (!providers.length) return;
+  await db.update(heartbeatRuns)
+    .set({ startableSince: sql`greatest(coalesce(${heartbeatRuns.startableSince}, ${at.toISOString()}::timestamptz), ${at.toISOString()}::timestamptz)` })
+    .where(and(eq(heartbeatRuns.status, "queued"), isNull(heartbeatRuns.startedAt),
+      inArray(heartbeatRuns.agentId, db.select({ id: agents.id }).from(agents).where(and(eq(agents.adapterType, "paperclip_runner"),
+        inArray(sql`${agents.adapterConfig}->>'provider'`, providers),
+        sql`coalesce(${agents.runtimeConfig}#>>'{aiConnection,mode}', '') <> 'router'`)))));
 }
