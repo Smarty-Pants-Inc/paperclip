@@ -1424,6 +1424,71 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         : wait);
   });
 
+  // SCREEN row 4b + S7-N (optS-N ebeb1bf9's term, now in the shared wrapper
+  // ownerSendAfterAcknowledgedPersonStop): after an acknowledged owner Stop on
+  // the chat, a typed run of this agent on this chat that is still queued,
+  // scheduled for retry or running means the owner's Send takes the ordinary
+  // path, so the bar must NOT say "will be sent when you send your next
+  // message": the recovery wait keeps its own text. The other run was created
+  // before the stopped one, so the stopped run is still the chat's latest turn
+  // (the bar reads the latest turn) and only the other-run term decides.
+  async function ackOwnerStopOnChat(reason: keyof typeof RECOVERY_WAITS) {
+    const f = await seedQueue();
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date("2026-08-22T15:05:00.000Z"),
+      nativeIssueId: f.issueId, resultJson: { cancelledByActorType: "user", cancelledByUserId: "queue-owner",
+        nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId,
+          issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
+          dispatched: true, intentAuditId: "intent-audit", acknowledgementAuditId: "ack-audit" } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ executionRunId: null, conversationAgentId: f.agentId, conversationUserId: "queue-owner",
+      conversationState: "active" }).where(eq(issues.id, f.issueId));
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    const wait = { reason, message: RECOVERY_WAITS[reason] };
+    await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", payload: { ...wake.payload, executionWait: wait } })
+      .where(eq(agentWakeupRequests.id, f.wakeId));
+    return { f, wait };
+  }
+  const rowsN = (Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>).flatMap(reason =>
+    (["queued", "scheduled_retry", "running"] as const).map(other => [reason, other] as const));
+  it.each(rowsN)("SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with a typed run %s keeps the wait, not the bar",
+    async (reason, other) => {
+      const { f, wait } = await ackOwnerStopOnChat(reason);
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+        triggerDetail: "typed message", status: other, runtimeMode: "native", createdAt: new Date("2026-08-22T14:59:00.000Z"),
+        contextSnapshot: { issueId: f.issueId } });
+      const queue = (await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+      expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
+      expect(queue.executionWait).toEqual(wait);
+      expect(queue.executionWait?.message).not.toBe(R4);
+    });
+
+  it.each(Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>)(
+    "SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with nothing else running shows the bar; the Send answers in the bound",
+    async reason => {
+      const { f } = await ackOwnerStopOnChat(reason);
+      // This agent's run on ANOTHER chat is not "on this chat". It also holds the
+      // successor in the ordinary queue (one slot) without launching a provider.
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running",
+        createdAt: new Date("2026-08-22T14:59:00.000Z"), contextSnapshot: { issueId: randomUUID() } });
+      const client = app(f.companyId);
+      const queue = (await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+      expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: R4 });
+      // The bar's promise: the owner's Send (c3-optS-send-after-stop S10's route)
+      // is admitted at once and one run takes every held message, once.
+      const successors = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+        .filter(run => run.id !== f.runId && run.contextSnapshot?.issueId === f.issueId);
+      const pressedAt = Date.now();
+      await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
+        .send({ queueId: f.wakeId, targetRunId: f.runId, revision: queue.revision }).expect(200);
+      await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, f.wakeId);
+      await vi.waitFor(async () => expect(await successors()).toHaveLength(1), { timeout: 15_000, interval: 50 });
+      expect(Date.now() - pressedAt).toBeLessThan(15_000);
+      const runs = await successors();
+      expect(runs).toHaveLength(1);
+      expect(runs[0].contextSnapshot?.wakeCommentIds).toEqual(f.commentIds);
+    });
+
   it("Hold50 starts a message sent after a native Stop as soon as the stopped run's teardown ends", async () => {
     const seeded = await seedQueue();
     const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
