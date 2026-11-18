@@ -425,13 +425,21 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     )) throw new Error("native_deferred_observer_terminal_required");
     const terminalItem = /^item\.(completed|failed|cancelled)$/.test(event.eventType);
     const terminalTurn = /^(turn|session)\.(completed|failed|cancelled|interrupted|closed)$/.test(event.eventType);
-    if ((event.eventType === "item.delta" || terminalItem || terminalTurn) && this.#identityRedactor.values.length > 0) {
+    // Always on: besides the run's known secrets, the buffer holds a trailing
+    // fragment that may become a strict credential shape (Bearer, a provider
+    // key, a JWT) until the joined text is scanned. It runs before the hash,
+    // the insert and the live publication, so all three see the same bytes.
+    if (event.eventType === "item.delta" || terminalItem || terminalTurn) {
       const key = `${event.sourceInstanceId}:${event.sourceEventId}`;
       const cached = this.#redactedDeltas.get(key);
       const originalSha = nativeSha256(validated.event);
-      if (cached) {
-        if (cached.originalSha !== originalSha) throw new Error("native_event_source_payload_conflict");
+      if (cached?.originalSha === originalSha) {
         event = cached.event;
+      } else if (cached) {
+        // A run without known secrets keeps the store's replay decision: the
+        // committed form is a duplicate, any other payload a replay conflict.
+        // The buffer does not read a source event twice either way.
+        if (this.#identityRedactor.values.length > 0) throw new Error("native_event_source_payload_conflict");
       } else {
         const stream = `${event.sourceInstanceId}:${event.turnId}:${event.itemId}`;
         event = { ...event, payload: event.eventType === "item.delta"

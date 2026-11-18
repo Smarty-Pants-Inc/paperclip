@@ -1,4 +1,4 @@
-import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, STRICT_CREDENTIAL_SHAPES, redactSensitiveText } from "../redaction.js";
 import { isDigitValue, redactRegisteredSecretValues } from "./run-secret-redaction.js";
 
 const MATERIAL_WINDOW = 32;
@@ -32,6 +32,103 @@ const heldMarkerLength = (tail: string) => {
   }
   return 0;
 };
+
+/**
+ * Most characters of one delta text field held back because they may still
+ * become a strict credential shape. Past it the joined text is scanned and
+ * released, and the rest of a credential the scanner already masked is dropped
+ * up to the next whitespace, so a longer value cannot print its remainder.
+ */
+export const CREDENTIAL_SHAPE_HOLD_CAP = 16_384;
+const SHAPE_HEADER = STRICT_CREDENTIAL_SHAPES.headerWord.toLowerCase();
+const SHAPE_SCHEMES = STRICT_CREDENTIAL_SHAPES.schemeWords.map(word => word.toLowerCase());
+const SHAPE_TOKEN_PREFIXES: readonly string[] = STRICT_CREDENTIAL_SHAPES.tokenPrefixes;
+const SHAPE_WORDS = new RegExp(`${SHAPE_HEADER}|${SHAPE_SCHEMES[0]}`, "gi");
+const SHAPE_HEADER_VALUE = /[A-Za-z0-9_-]*(?:\\*["'])?\s*[:=]?\s*(?:\\*["'])?\s*/y;
+const SHAPE_SPACE = /\s+/y;
+const SHAPE_TOKEN = /\S+/y;
+const SHAPE_AFTER_TOKEN = /(?:[^\S\r\n]|[.,;:!?)\]])*/y;
+const isInlineSpace = (char: string | undefined) => char !== undefined && /[^\S\r\n]/.test(char);
+const isQuote = (char: string | undefined) => char === '"' || char === "'" || char === "`";
+const sticky = (pattern: RegExp, text: string, at: number) => {
+  pattern.lastIndex = at;
+  return at + (pattern.exec(text)?.[0].length ?? 0);
+};
+/** A quote before the scheme word (same line) decides whether the scanner masks: keep it with the word. */
+const beforeQuote = (text: string, at: number) => {
+  let index = at;
+  while (index > 0 && isInlineSpace(text[index - 1])) index--;
+  return index > 0 && isQuote(text[index - 1]) ? index - 1 : at;
+};
+/** True while the scanner's answer for the header or scheme word at `at` can still change with more text. */
+const shapeWordOpen = (text: string, at: number, header: boolean) => {
+  let quoted = false;
+  if (header) {
+    const value = sticky(SHAPE_HEADER_VALUE, text, at);
+    quoted = /["']/.test(text.slice(at, value));
+    at = value;
+    // A trailing backslash may still open an escaped quote (`\"Bearer ...`).
+    if (at >= text.length || /^\\+$/.test(text.slice(at))) return true;
+    const rest = text.slice(at, at + 8).toLowerCase();
+    const scheme = SHAPE_SCHEMES.find(word => rest.startsWith(word));
+    if (!scheme) return at + rest.length >= text.length && SHAPE_SCHEMES.some(word => word.startsWith(rest));
+    at += scheme.length;
+  }
+  if (at >= text.length) return true;
+  const credential = sticky(SHAPE_SPACE, text, at);
+  if (credential === at) return false;
+  if (credential >= text.length) return true;
+  // A quoted credential ends where the scanner finds its closing quote: wait for the line to end.
+  if (quoted || text[credential] === '"' || text[credential] === "'" || text[credential] === "\\") {
+    return !/[\r\n]/.test(text.slice(credential));
+  }
+  const token = sticky(SHAPE_TOKEN, text, credential);
+  if (token >= text.length) return true;
+  // The scanner also reads the first character after the word's closing punctuation.
+  return sticky(SHAPE_AFTER_TOKEN, text, token) >= text.length;
+};
+/**
+ * Start of the trailing fragment that could still become a strict credential
+ * shape (see STRICT_CREDENTIAL_SHAPES), or `text.length` when none can. Text
+ * before it scans the same whatever follows.
+ */
+export function credentialShapeHoldStart(text: string): number {
+  let start = text.length;
+  // A bare token still running at the end, or a piece of its prefix.
+  let run = text.length;
+  while (run > 0 && /[A-Za-z0-9_.-]/.test(text[run - 1]!)) run--;
+  for (let index = run; index < text.length; index++) {
+    if (index > run && /[A-Za-z0-9_]/.test(text[index - 1]!)) continue;
+    const left = text.length - index;
+    if (SHAPE_TOKEN_PREFIXES.some(prefix => left >= prefix.length
+      ? text.startsWith(prefix, index) : prefix.startsWith(text.slice(index)))) { start = index; break; }
+  }
+  // A header or scheme word whose credential, or the context after it, is not complete.
+  for (const match of text.matchAll(SHAPE_WORDS)) {
+    if (match.index >= start) break;
+    const header = match[0].length === SHAPE_HEADER.length;
+    if (!shapeWordOpen(text, match.index + match[0].length, header)) continue;
+    start = Math.min(start, header ? match.index : beforeQuote(text, match.index));
+    break;
+  }
+  // A trailing piece of the header or scheme word itself.
+  let word = text.length;
+  while (word > 0 && text.length - word < SHAPE_HEADER.length && /[A-Za-z]/.test(text[word - 1]!)) word--;
+  for (let index = word; index < Math.min(start, text.length); index++) {
+    const piece = text.slice(index).toLowerCase();
+    if (SHAPE_HEADER.startsWith(piece)) { start = index; break; }
+    if (SHAPE_SCHEMES[0]!.startsWith(piece)) { start = Math.min(start, beforeQuote(text, index)); break; }
+  }
+  // A trailing quote: a scheme word after it is masked where plain prose is not.
+  let quote = text.length;
+  while (quote > 0 && isInlineSpace(text[quote - 1])) quote--;
+  if (quote > 0 && isQuote(text[quote - 1])) start = Math.min(start, quote - 1);
+  // A terminal colour sequence still being written: the scanner reads a
+  // complete one before a scheme word, and cannot see a cut one.
+  const escape = /\u001b(?:\[[0-?]*[ -/]*)?$/.exec(text);
+  if (escape) start = Math.min(start, escape.index);
+  return start;
+}
 
 type MaterialStream = { context: boolean; token: string; suppressed: boolean; marker: string };
 const newMaterialStream = (): MaterialStream => ({ context: false, token: "", suppressed: false, marker: "" });
@@ -216,6 +313,48 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       Object.entries(value).map(([key, child]) => [key, redactMaterial(child)]));
     return value;
   };
+  // Strict credential shapes (Bearer, Authorization, provider key, GitHub
+  // token, AWS key id, JWT) split across deltas. Each delta text field keeps
+  // the fragment that could still become one; the joined text is scanned by
+  // the strict scanner before any of it is released. Text with no such
+  // fragment passes through untouched, so known-secret output is unchanged.
+  const shapeHeld = new Map<string, string>();
+  const shapeSuppressed = new Set<string>();
+  const shapePending = (key: string) => shapeHeld.has(key) || shapeSuppressed.has(key);
+  const shapeChunk = (key: string, chunk: string): string => {
+    if (shapeSuppressed.has(key)) {
+      const space = chunk.search(/\s/);
+      if (space < 0) return "";
+      chunk = chunk.slice(space);
+      shapeSuppressed.delete(key);
+    }
+    const held = shapeHeld.get(key);
+    const text = (held ?? "") + chunk;
+    const start = credentialShapeHoldStart(text);
+    if (start >= text.length) {
+      shapeHeld.delete(key);
+      return held === undefined ? text : redactSensitiveText(text);
+    }
+    // The scanner reads one character past a word's end; give it the first held one.
+    const scanned = redactSensitiveText(text.slice(0, start + 1));
+    const safe = scanned.endsWith(text[start]!);
+    const keep = safe ? text.slice(start) : text;
+    if (keep.length <= CREDENTIAL_SHAPE_HOLD_CAP) {
+      shapeHeld.set(key, keep);
+      return safe ? scanned.slice(0, -1) : "";
+    }
+    shapeHeld.delete(key);
+    const released = redactSensitiveText(text);
+    if (released.endsWith(REDACTED_EVENT_VALUE) && !/\s$/.test(text)) shapeSuppressed.add(key);
+    return released;
+  };
+  /** The held fragment joined with the known-secret tail, scanned whole: never released unmasked. */
+  const shapeFinish = (key: string, tail: string): string => {
+    const held = shapeHeld.get(key);
+    shapeHeld.delete(key);
+    shapeSuppressed.delete(key);
+    return held === undefined ? tail : redactSensitiveText(held + tail);
+  };
   const deltaStreams = new Map<string, {
     scope: string; itemId?: string; payload: Record<string, unknown>; paths: string[];
   }>();
@@ -290,8 +429,8 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
         if (typeof entry === "string") {
           if (!/^(text|delta|output|patch)$/.test(field)) return redactor.redact(entry);
           const key = `${stream}:${path}`;
-          const output = redactor.chunk(key, entry);
-          if (hasPending(key)) paths.push(key);
+          const output = shapeChunk(key, redactor.chunk(key, entry));
+          if (hasPending(key) || shapePending(key)) paths.push(key);
           return output;
         }
         if (Array.isArray(entry)) return entry.map((child, index) => visit(child, `${path}.${index}`, field));
@@ -302,7 +441,7 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       };
       const result = visit(value, "", "") as T;
       for (const previous of deltaStreams.get(stream)?.paths ?? []) {
-        if (hasPending(previous) && !paths.includes(previous)) paths.push(previous);
+        if ((hasPending(previous) || shapePending(previous)) && !paths.includes(previous)) paths.push(previous);
       }
       if (paths.length) deltaStreams.set(stream, { scope, itemId, paths,
         payload: Object.fromEntries(["itemId", "providerItemId", "kind", "channel", "stream"]
@@ -320,7 +459,7 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
         const primary = descriptor.paths.find(path => path === `${stream}:.text`) ?? descriptor.paths[0];
         let text = "";
         for (const path of descriptor.paths) {
-          const tail = redactor.finish(path);
+          const tail = shapeFinish(path, redactor.finish(path));
           if (path === primary) text = tail;
         }
         deltaStreams.delete(stream);
