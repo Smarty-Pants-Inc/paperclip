@@ -1861,10 +1861,11 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
 
   // SCREEN row 4b + S3/S7 (RFL 14:32Z): a held wake can carry a well-formed
   // recovery wait (execution_recovery, remote_cleanup, execution_settling). The
-  // Stop bar R4 replaces it ONLY when Option S's predicate holds (the owner's
-  // Agent Chat, an ACKNOWLEDGED person Stop, not an Interrupt, no reconciliation
-  // source or blocker): then the owner's Send is admitted at once. Every other
-  // case keeps its wait text; the Send's own wait keeps "Sending your messages.".
+  // Stop bar R4 replaces it ONLY when admission on this base would admit the
+  // owner's Send (routes/issues.ts sendAdmitted). tA-noS eee74ebb has no Option S:
+  // after a native person Stop admission holds the Send
+  // (nativeStopRequiresReconciliation), so every case keeps its wait text; the
+  // Send's own wait keeps "Sending your messages.".
   const R4 = "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.";
   const RECOVERY_WAITS = {
     execution_recovery: "Waiting for execution recovery. Your message is saved.",
@@ -1875,7 +1876,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     "no person stop", "acknowledged person stop + blocker", "acknowledged person stop + unrelated recovery action"] as const;
   const rows4b = (Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>).flatMap(reason =>
     [true, false].flatMap(chat => SCENARIOS.map(scenario => [reason, chat ? "chat" : "task", scenario] as const)));
-  it.each(rows4b)("SCREEN row 4b: a %s wait on the %s after %s", async (reason, surface, scenario) => {
+  it.each(rows4b)("SCREEN row 4b: a %s wait on the %s after %s (no Option S on eee74ebb)", async (reason, surface, scenario) => {
     const f = await seedQueue();
     const stoppedAt = new Date("2026-08-22T15:05:00.000Z");
     const acknowledged = scenario.startsWith("acknowledged") || scenario === "interrupt stop";
@@ -1911,15 +1912,15 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       .where(eq(agentWakeupRequests.id, f.wakeId));
     const queue = (await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
     expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
-    const optionS = surface === "chat" && (scenario === "acknowledged person stop"
-      || scenario === "acknowledged person stop + unrelated recovery action");
-    expect(queue.executionWait).toEqual(optionS ? { reason: "stopped_by_person", message: R4 }
-      : scenario === "person stop then Send" ? { reason: "interrupt_handoff", message: "Sending your messages." }
+    // tA-noS eee74ebb has no Option S: admission holds the owner's Send after a
+    // native person Stop (nativeStopRequiresReconciliation), so no row here may
+    // show R4 over a recovery wait; every recovery wait keeps its own text.
+    expect(queue.executionWait).toEqual(scenario === "person stop then Send" ? { reason: "interrupt_handoff", message: "Sending your messages." }
         : wait);
   });
 
-  // SCREEN row 4b + S7-N (optS-N ebeb1bf9's term, now in the shared wrapper
-  // ownerSendAfterAcknowledgedPersonStop): after an acknowledged owner Stop on
+  // SCREEN row 4b + S7-N (optS-N ebeb1bf9's term; no Option S wrapper on
+  // eee74ebb, the bar reads admission's own rule): after an acknowledged owner Stop on
   // the chat, a typed run of this agent on this chat that is still queued,
   // scheduled for retry or running means the owner's Send takes the ordinary
   // path, so the bar must NOT say "will be sent when you send your next
@@ -1957,9 +1958,9 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     });
 
   it.each(Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>)(
-    "SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with nothing else running shows the bar; the Send answers in the bound",
+    "SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with nothing else running keeps the wait; the Send is held (no Option S on eee74ebb)",
     async reason => {
-      const { f } = await ackOwnerStopOnChat(reason);
+      const { f, wait } = await ackOwnerStopOnChat(reason);
       // This agent's run on ANOTHER chat is not "on this chat". It also holds the
       // successor in the ordinary queue (one slot) without launching a provider.
       await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
@@ -1967,20 +1968,20 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         createdAt: new Date("2026-08-22T14:59:00.000Z"), contextSnapshot: { issueId: randomUUID() } });
       const client = app(f.companyId);
       const queue = (await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
-      expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: R4 });
-      // The bar's promise: the owner's Send (c3-optS-send-after-stop S10's route)
-      // is admitted at once and one run takes every held message, once.
+      // eee74ebb: admission holds this Send (nativeStopRequiresReconciliation adds
+      // native_continuation_requires_reconciliation), so the bar does not promise it.
+      expect(queue.executionWait).toEqual(wait);
       const successors = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
         .filter(run => run.id !== f.runId && run.contextSnapshot?.issueId === f.issueId);
-      const pressedAt = Date.now();
       await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
         .send({ queueId: f.wakeId, targetRunId: f.runId, revision: queue.revision }).expect(200);
       await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, f.wakeId);
-      await vi.waitFor(async () => expect(await successors()).toHaveLength(1), { timeout: 15_000, interval: 50 });
-      expect(Date.now() - pressedAt).toBeLessThan(15_000);
-      const runs = await successors();
-      expect(runs).toHaveLength(1);
-      expect(runs[0].contextSnapshot?.wakeCommentIds).toEqual(f.commentIds);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      // OBSERVED on eee74ebb: the Send stays held with admission's own wait; no run starts.
+      const [held] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      expect(held?.status).toBe("deferred_issue_execution");
+      expect((held?.payload as Record<string, unknown> | null)?.executionWait).toMatchObject({ reason: "process_identity_missing" });
+      expect(await successors()).toHaveLength(0);
     });
 
   it("Hold50 starts a message sent after a native Stop as soon as the stopped run's teardown ends", async () => {
