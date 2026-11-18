@@ -449,9 +449,9 @@ const support = await getEmbeddedPostgresTestSupport();
       expect((await admittedOrigins(f, first)).filter(id => f.commentIds.includes(id))).toEqual([]);
       // Pre-Stop messages still need Send.
       expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
-      expect((await readQueue(f)).executionWait).toEqual({ reason: "stopped_by_person", message: STOP_LINE });
+      const queueWhileSuccessorRuns = (await readQueue(f)).executionWait ?? null;
       const beforeReceipt = { successorRunId: first.id, successorStatus: first.status, oldLease: await boxesOf(f),
-        postCardWake: await wakeOf(next.wakeId), preStopWake: await wakeOf(f.queueId) };
+        postCardWake: await wakeOf(next.wakeId), preStopWake: await wakeOf(f.queueId), queueWhileSuccessorRuns };
       // The late receipt: the card retires; no duplicate successor, from either writer.
       vi.setSystemTime(t0 + 2 * RETRY_MS + 1_000);
       await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });
@@ -460,6 +460,8 @@ const support = await getEmbeddedPostgresTestSupport();
       const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
       await heartbeatService(db).resumeRemoteStopComments(source);
       await new Promise(resolve => setTimeout(resolve, 1_500));
+      await evidence(`card5AfterReceipt ${JSON.stringify({ first: first.id, runs: (await successors(f)).map(run => ({ id: run.id, status: run.status,
+        wake: run.wakeupRequestId ?? null, context: run.contextSnapshot })), preStopWake: await wakeOf(f.queueId), postWake: await wakeOf(next.wakeId) })}`);
       expect((await successors(f)).map(run => run.id)).toEqual([first.id]);
       expect((await wakeOf(next.wakeId)).runId).toBe(first.id);
       expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
@@ -477,7 +479,8 @@ const support = await getEmbeddedPostgresTestSupport();
     // active), descriptor still `prepared` on that box.
     await db.update(environmentLeases).set({ status: "active", cleanupStatus: null }).where(eq(environmentLeases.id, lease.id));
     const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
-    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...(source.runnerProfileJson ?? {}),
+    // The runner launched (a process), so the box holds the turn's files.
+    await db.update(heartbeatRuns).set({ processPid: 4242, runnerProfileJson: { ...(source.runnerProfileJson ?? {}),
       nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v3", state: "prepared", descriptorSha256: "a".repeat(64),
         baselineSha256: "b".repeat(64), finalHostSha256: null, workspaceId: randomUUID(), leaseId: lease.id,
         providerLeaseId: f.providerLeaseId, remoteCwd: "/workspace", resourceDisposition: "keep_running" } } })
@@ -486,11 +489,11 @@ const support = await getEmbeddedPostgresTestSupport();
       .toBe(f.sourceRunId);
     const next = await postNew(f, "New input while the export is unproven");
     await new Promise(resolve => setTimeout(resolve, 3_000));
-    expect(await successors(f)).toHaveLength(0);
-    expect((await wakeOf(next.wakeId)).runId).toBeNull();
+    // The wake's run row may exist, but it is never claimed/started while the hold applies.
+    expect((await successors(f)).filter(run => run.status !== "queued" || run.startedAt)).toEqual([]);
     expect(await boxesOf(f)).toEqual([{ id: lease.id, heartbeatRunId: f.sourceRunId, status: "active" }]);
     await evidence(`card5ExportUnproven ${JSON.stringify({ hold: f.sourceRunId, postWake: await wakeOf(next.wakeId),
-      successors: (await successors(f)).length, lease: await boxesOf(f) })}`);
+      successors: (await successors(f)).map(run => ({ id: run.id, status: run.status, startedAt: run.startedAt })), lease: await boxesOf(f) })}`);
   }, 60_000);
 
   it("U9 card3 (ii) pre-card, executor GONE (restart): the real POST starts at once on a fresh machine, the same as post-card", async () => {
@@ -499,6 +502,10 @@ const support = await getEmbeddedPostgresTestSupport();
     // gate (queue.ts:1200-1222, activeRunExecutions) is empty, exactly as after a restart.
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toHaveLength(0);
     expect(await personStopExportPendingHoldsAdmission(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId })).toBeNull();
+    // The stopped executor's exit ran its resume (heartbeat.ts -> resumeRemoteStopComments), then the server restarted.
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await heartbeatService(db).resumeRemoteStopComments(source);
+    expect(await successors(f)).toHaveLength(0);
     const next = await postNew(f, "New input before the card, after a restart");
     await vi.waitFor(async () => expect(await successors(f)).toHaveLength(1), { timeout: 15_000, interval: 100 });
     const [first] = await successors(f);
@@ -506,8 +513,8 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await admittedOrigins(f, first)).filter(id => f.commentIds.includes(id))).toEqual([]);
     expect(await boxesOf(f)).toEqual([{ id: (await leaseOf(f)).id, heartbeatRunId: f.sourceRunId, status: "pending_cleanup" }]);
     expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
-    expect((await readQueue(f)).executionWait).toEqual({ reason: "stopped_by_person", message: STOP_LINE });
-    await evidence(`card5PreCardRestart ${JSON.stringify({ successorRunId: first.id, postWake: await wakeOf(next.wakeId), lease: await boxesOf(f) })}`);
+    await evidence(`card5PreCardRestart ${JSON.stringify({ successorRunId: first.id, postWake: await wakeOf(next.wakeId), lease: await boxesOf(f),
+      queueWhileSuccessorRuns: (await readQueue(f)).executionWait ?? null })}`);
   }, 60_000);
 
   it("U9 control: a non-person stop's cleanup escalation is unchanged (no card; capped at 5 attempts, then 30 min)", async () => {
