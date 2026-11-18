@@ -6157,7 +6157,7 @@ export function agentRoutes(
     }
     // Section D: Resume is recorded intent; it completes only after the old run is proved stopped.
     const resumeDisposition = agent.lifecycleState === "pausing" || "pauseStopPending" in agent ? "waiting_for_stop"
-      : agent.lifecycleHolds.length ? "held" : agent.lifecycleState;
+      : agent.lifecycleHolds?.length ? "held" : agent.lifecycleState;
 
     const actor = getActorInfo(req);
     await logActivity(db, {
