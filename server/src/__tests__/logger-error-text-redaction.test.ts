@@ -359,9 +359,12 @@ describe.each<Layer>(["production", "walker"])("structured values are masked (%s
     log.warn({ msg: { toJSON() { return CANARY_LINE; } } });
     log.warn({ stderr: { toJSON() { return { inner: CANARY_LINE }; } } }, "box");
     log.error({ err: Object.assign(new Error("provider failed"), { details: { toJSON: () => CANARY_LINE } }) }, "provider failed");
+    // A function is dropped, not kept: JSON.stringify calls a toJSON found on a function too.
+    log.warn({ stderr: { callback: Object.assign(() => 1, { toJSON: () => CANARY_LINE }) } }, "callback");
     const text = output();
     expectCleanLines(text);
-    const [first, second, third] = records(text);
+    const [first, second, third, fourth] = records(text);
+    expect(fourth.stderr).toEqual({});
     expect(first.msg).toBe(MASKED_LINE);
     expect(second.stderr).toEqual({ inner: MASKED_LINE });
     expect(third.err.details).toBe(MASKED_LINE);
@@ -376,6 +379,9 @@ describe.each<Layer>(["production", "walker"])("structured values are masked (%s
     const [first] = records(text);
     expect(first.err.message).toBe("request failed ***REDACTED***");
     expect(first.err.config.headers.Authorization).toBe("Bearer ***REDACTED***");
+    // The record is what the error's toJSON returns (as JSON.stringify would
+    // write it at c2), masked: not a callable left for the serializer.
+    expect(first.err.note).toBe(MASKED_LINE);
   });
 
   it("J1: masks toJSON output through pino-http's req.log and the auto-5xx record", async () => {

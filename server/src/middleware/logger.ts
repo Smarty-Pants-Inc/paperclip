@@ -18,6 +18,32 @@ import {
 } from "./redact-sensitive.js";
 import { redactSensitiveText } from "../redaction.js";
 
+/*
+ * Credential masking in server logs: two layers, one scanner (redactSensitiveText).
+ *
+ * 1. The walker (redactLogValue) runs in the err, stderr, stdout and msg
+ *    serializers. It gives the record its structure: it calls toJSON itself and
+ *    masks the result, drops functions, masks keys, writes binary values as
+ *    masked text, and fails closed (fixed markers) on depth, throwing getters,
+ *    Proxy traps and toJSON.
+ * 2. The backstop (maskSerializedLogLine, Pino hooks.streamWrite) runs on every
+ *    finished line, after every serializer, for every child and destination. It
+ *    masks the decoded text of every JSON string, key or value, in every field.
+ *
+ * Boundaries, named:
+ * - A child logger that replaces serializers.msg (for example with identity)
+ *   overrides the msg mask: that is Pino's intended serializer override. No app
+ *   call site does it. The streamWrite backstop still masks that msg, since
+ *   hooks are inherited and children cannot replace them.
+ * - The backstop sees text. Bytes in a field no serializer visits are written
+ *   by JSON as a number array ({"type":"Buffer","data":[...]}) and are not
+ *   decoded there; only err, stderr, stdout and msg decode binary values.
+ * - A credential split across two fields, or across two log lines, is in no
+ *   single string either layer scans.
+ * - Masking is by credential shape. A plain value under a sensitive key name
+ *   ({"x-api-key": "abc"}) is masked only where a redact path or
+ *   redactSensitive covers that key.
+ */
 const MAX_LOG_REDACTION_DEPTH = 8;
 const TRUNCATED_LOG_VALUE = `[masked: nested deeper than ${MAX_LOG_REDACTION_DEPTH}]`;
 const UNREADABLE_LOG_VALUE = "[masked: unreadable value]";
