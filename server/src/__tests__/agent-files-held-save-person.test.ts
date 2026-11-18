@@ -8,24 +8,25 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agents, authUsers, companies, companyMemberships, createDb,
-  heartbeatRuns, issueComments, issues, principalPermissionGrants,
+  issues, principalPermissionGrants,
 } from "@paperclipai/db";
 import { characterStateForAgent } from "@paperclipai/shared";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { errorHandler } from "../middleware/index.js";
 import { environmentRoutes } from "../routes/environments.js";
-import { issueRoutes } from "../routes/issues.js";
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
 import { agentFileSaveHeld } from "../services/agent-directory-working-copies.js";
 import * as fileStoreModule from "../services/agent-file-store.js";
 import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { heartbeatService } from "../services/heartbeat.js";
-import { getStorageService } from "../storage/index.js";
+import { createHeartbeatAgentStatus } from "../services/heartbeat/agent-status.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 // Keep reason: explicit BRIEF-crp2 / RFL SUPERSEDE-CLAIM-REMOVE-ENTRY-HELD-1118
-// person-side integration row. The filesystem, store, DB, dispatcher and HTTP
-// routers are real; only the model adapter is a deterministic process boundary.
+// person-side integration row: (c) no phantom 'working' (normal finalize and
+// after a crash) and (d) the named HTTP discard. The filesystem, store, DB,
+// dispatcher and HTTP routers are real; only the model adapter is a
+// deterministic process boundary. (a)/(b) live in the native harness.
 describe("permanent-4xx held agent-file save: the person's next actions", () => {
   const adapterType = "held_save_person_test";
   const originalHome = process.env.PAPERCLIP_HOME;
@@ -35,13 +36,8 @@ describe("permanent-4xx held agent-file save: the person's next actions", () => 
   let db: ReturnType<typeof createDb>;
   let heartbeat: ReturnType<typeof heartbeatService>;
   let copies: ReturnType<typeof agentInstructionWorkingCopyService>;
-  const seen = new Map<string, { entry: string; before: string; issueId: string; markdown: string; priorSaveHeld: boolean }>();
   const applyFailures: Array<{ status: number; message: string }> = [];
   let heldRunId: string | undefined;
-  let nextRunId: string | undefined;
-  let releaseNext: (() => void) | undefined;
-  let nextEntered = false;
-  let blockNext = false;
 
   beforeAll(async () => {
     home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "held-save-person-")));
@@ -68,21 +64,12 @@ describe("permanent-4xx held agent-file save: the person's next actions", () => 
     registerServerAdapter({
       type: adapterType, supportsLocalAgentJwt: false, supportsInstructionsBundle: true,
       execute: async input => {
-        console.log("ADAPTER_ENTER", JSON.stringify({ runId: input.runId, issueId: input.context.issueId, blockNext }));
         const entry = String(input.config.instructionsFilePath);
-        seen.set(input.runId, { entry, before: await fs.readFile(entry, "utf8"),
-          issueId: String(input.context.issueId), markdown: String(input.context.paperclipTaskMarkdown),
-          priorSaveHeld: heldRunId ? agentFileSaveHeld(await copies.get(input.agent.companyId, heldRunId)) : false });
         if (!heldRunId) {
           heldRunId = input.runId;
           // Genuine permanent 422: canonical AGENTS.md exists, this run deletes it.
           await fs.unlink(entry);
           await fs.writeFile(path.join(path.dirname(entry), "unsaved-note.txt"), "Keep these exact held bytes\n");
-        } else if (blockNext && !nextRunId) {
-          nextRunId = input.runId;
-          const gate = new Promise<void>(resolve => { releaseNext = resolve; });
-          nextEntered = true;
-          await gate;
         }
         await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, String(input.context.issueId)));
         await input.onProviderStopped?.();
@@ -93,7 +80,6 @@ describe("permanent-4xx held agent-file save: the person's next actions", () => 
   }, 90_000);
 
   afterAll(async () => {
-    releaseNext?.();
     await heartbeat?.drainActiveRunExecutions();
     unregisterServerAdapter(adapterType);
     vi.restoreAllMocks();
@@ -113,7 +99,7 @@ describe("permanent-4xx held agent-file save: the person's next actions", () => 
     }
   });
 
-  it("runs again, accepts a chat message, shows no phantom work, and offers named operator discard while a real 422 save is held", async () => {
+  it("shows no phantom work and offers named operator discard while a real 422 save is held", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), userId = randomUUID(), issueId = randomUUID();
     const now = new Date();
     await db.insert(companies).values({ id: companyId, name: "Held save person", issuePrefix: `P${companyId.slice(0, 6)}`, defaultResponsibleUserId: userId });
@@ -161,52 +147,27 @@ describe("permanent-4xx held agent-file save: the person's next actions", () => 
       expect.soft(agent!.status, `${phase}: agent idle`).toBe("idle");
       expect.soft(pose, `${phase}: UI does not say working`).not.toBe("working");
     };
-    await assertQuiet("held before next run");
+    await assertQuiet("held, normally finalized");
+    // (c) after a crash: the agent is left flagged running with no live run and
+    // only this real held save outstanding. Stranded-status recovery settles it;
+    // the hold stays exactly as it was (rf-3, smarty-dev#20787 C1 required 2).
+    await heartbeat.drainActiveRunExecutions();
+    await db.update(agents).set({ status: "running", updatedAt: new Date(Date.now() - 60 * 60_000) }).where(eq(agents.id, agentId));
+    const reconciled = await createHeartbeatAgentStatus(db).reconcileStrandedAgentStatuses(() => new Set(), { companyId, agentId });
+    const heldAfterCrash = await copies.get(companyId, first!.id);
+    console.log("PERSON_C_CRASH", JSON.stringify({ reconciled, held: agentFileSaveHeld(heldAfterCrash), state: heldAfterCrash?.state }));
+    expect.soft(reconciled, "a held save alone never keeps the agent running").toEqual([agentId]);
+    expect.soft(agentFileSaveHeld(heldAfterCrash), "the hold stays visible as a hold").toBe(true);
+    expect.soft(heldAfterCrash?.nextAttemptAt).toEqual(held.nextAttemptAt);
+    await assertQuiet("held, after a crash left the agent running");
 
-    // (a) Real dispatcher and adapter execute while the first hold remains.
-    blockNext = true;
-    const next = await wake();
-    try {
-      await vi.waitFor(() => expect(nextEntered).toBe(true), { timeout: 10_000 });
-      expect.soft((await heartbeat.getRun(next!.id))?.status).toBe("running");
-      expect.soft(agentFileSaveHeld(await copies.get(companyId, first!.id))).toBe(true);
-      expect.soft(seen.get(next!.id)?.before).toBe(initial);
-      expect.soft(seen.get(next!.id)?.priorSaveHeld).toBe(true);
-    } finally { releaseNext?.(); await heartbeat.drainActiveRunExecutions(); }
-    expect.soft((await heartbeat.getRun(next!.id))?.status).toBe("succeeded");
-    // The dispatcher may already have admitted a follow-up during the first
-    // drain. Check that literal first successor too, not just the manual wake.
-    const immediateNext = [...seen.entries()].find(([id]) => id !== first!.id)!;
-    expect.soft(immediateNext[1].priorSaveHeld).toBe(true);
-    expect.soft((await heartbeat.getRun(immediateNext[0]))?.status).toBe("succeeded");
-    console.log("PERSON_A", JSON.stringify({ heldRunId: first!.id, immediateNextRunId: immediateNext[0],
-      immediateNextSawHold: immediateNext[1].priorSaveHeld, nextRunId: next!.id,
-      executed: seen.has(next!.id), status: (await heartbeat.getRun(next!.id))?.status }));
-
-    // (b) A person's NEW chat message goes through the production comments router.
-    const chatId = randomUUID();
-    await db.insert(issues).values({ id: chatId, companyId, title: "Chat with Editor", status: "in_progress", issueNumber: 2,
-      assigneeAgentId: agentId, responsibleUserId: userId, createdByUserId: userId,
-      conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" });
+    // (a) next run and (b) chat answer moved to the native harness, where Paul's
+    // agents run: native-session-executor.test.ts "claim-remove-entry-held-person"
+    // (rf-3, smarty-dev#20787 C1 required 3). (c) and (d) stay here: the
+    // avatar helper and the documented HTTP discard route with its authority.
     const app = express(); app.use(express.json());
     app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId, companyIds: [companyId], isInstanceAdmin: true }; next(); });
-    app.use("/api", issueRoutes(db, getStorageService())); app.use("/api", environmentRoutes(db)); app.use(errorHandler);
-    const message = "Can you answer a new message while the previous file save is held?";
-    const response = await request(app).post(`/api/issues/${chatId}/comments`).send({ body: message, clientRequestId: randomUUID() });
-    expect.soft(response.status, JSON.stringify(response.body)).toBe(201);
-    await heartbeat.drainActiveRunExecutions();
-    const chatRun = [...seen.entries()].find(([, input]) => input.issueId === chatId);
-    expect.soft(chatRun, "chat message reaches the adapter while the old hold persists").toBeDefined();
-    if (chatRun) {
-      expect.soft((await heartbeat.getRun(chatRun[0]))?.status).toBe("succeeded");
-      expect.soft(chatRun[1].priorSaveHeld).toBe(true);
-      expect.soft(chatRun[1].markdown).toContain(message);
-    }
-    const [storedMessage] = await db.select().from(issueComments).where(eq(issueComments.id, String(response.body.id)));
-    expect.soft(storedMessage?.body).toBe(message);
-    expect.soft(agentFileSaveHeld(await copies.get(companyId, first!.id))).toBe(true);
-    console.log("PERSON_B", JSON.stringify({ route: `POST /api/issues/${chatId}/comments`, status: response.status, commentId: response.body.id, chatRunId: chatRun?.[0] }));
-    await assertQuiet("held after next run and chat");
+    app.use("/api", environmentRoutes(db)); app.use(errorHandler);
 
     // (d) Documented named route, real authorization and discard implementation.
     const discardPath = `/api/companies/${companyId}/agent-file-holds/${first!.id}/discard`;
