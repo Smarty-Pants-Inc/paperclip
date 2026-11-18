@@ -905,7 +905,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           : await heldStep(() => unchangedCheckpoint(row), signal).then(() => ({
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null, conflicts: [],
           }));
-        live();
+        // pl/keepalive8: the combined held-lock signal is checked again AFTER the awaited save, immediately before
+        // the success receipt patch: a lock lost during the save writes no success receipt (the caller fails).
+        assertHeld(signal);
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
