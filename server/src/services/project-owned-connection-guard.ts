@@ -1,9 +1,9 @@
-import { and, eq, sql, type SQL } from "drizzle-orm";
+import { and, eq, or, sql, type SQL } from "drizzle-orm";
 import { projects, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
 import { forbidden, HttpError } from "../errors.js";
 import { assertProjectConnectionAdmission, assertProjectConnectionRecipients, currentAuthority } from "./project-connection-admission.js";
 import type { DbTransaction } from "./tool-access/types.js";
-import { PROJECT_APP_APPROVAL_CONSUMED_BY } from "./project-app-custody.js";
+import { PROJECT_APP_APPROVAL_CONSUMED_BY, PROJECT_APP_APPROVAL_SOURCE } from "./project-app-custody.js";
 import { z } from "zod";
 
 /**
@@ -158,22 +158,29 @@ function approvalSourceConsumedBy(connection: OwnedShape): { consumed: boolean; 
   return { consumed, consumerId };
 }
 
-export async function canReadProjectOwnedConnectionDetails(db: Database, connection: OwnedShape & { companyId: string }, reader: ProjectOwnedConnectionReader): Promise<boolean> {
-  // #20717 RFL round 3: a consumed project-App approval source (an ordinary
-  // company row, archived or kept as predecessor) still carries the SAME vault
-  // reference its consumer now holds. Its details follow the consumed-by link:
-  // readable only by whoever can read the connection it became. A dangling or
-  // ambiguous link has no reader but the board (fail closed).
-  const source = approvalSourceConsumedBy(connection);
-  if (source.consumed) {
-    if (reader.type === "board") return true;
-    if (!source.consumerId || !z.string().uuid().safeParse(source.consumerId).success) return false;
-    const [consumer] = await db.select({ id: toolConnections.id, companyId: toolConnections.companyId, projectId: toolConnections.projectId,
-      config: toolConnections.config, transportConfig: toolConnections.transportConfig }).from(toolConnections)
-      .where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.id, source.consumerId)));
-    if (!consumer || approvalSourceConsumedBy(consumer).consumed) return false;
-    return canReadProjectOwnedConnectionDetails(db, consumer, reader);
-  }
+/**
+ * The ONE connection a consumed source became, counted only when the link is
+ * MUTUAL and UNIQUE: exactly one row in the company names the source (as its
+ * `projectAppApprovalSourceId`, or as its make-before-break
+ * `projectScope.legacyConnectionId`, in config or transportConfig), and the
+ * source's consumed-by marker names that same row. Otherwise null.
+ */
+async function uniqueMutualConsumer(db: Database, connection: OwnedShape & { companyId: string }, consumerId: string | null) {
+  if (!connection.id || !consumerId || !z.string().uuid().safeParse(consumerId).success) return null;
+  const named = (column: typeof toolConnections.config | typeof toolConnections.transportConfig) => or(
+    sql`${column}->>${PROJECT_APP_APPROVAL_SOURCE} = ${connection.id}`,
+    sql`${column}->'projectScope'->>'legacyConnectionId' = ${connection.id}`,
+  );
+  const consumers = await db.select({ id: toolConnections.id, companyId: toolConnections.companyId, projectId: toolConnections.projectId,
+    config: toolConnections.config, transportConfig: toolConnections.transportConfig }).from(toolConnections)
+    .where(and(eq(toolConnections.companyId, connection.companyId), or(named(toolConnections.config), named(toolConnections.transportConfig))))
+    .limit(2);
+  if (consumers.length !== 1 || consumers[0]!.id !== consumerId) return null;
+  return consumers[0]!;
+}
+
+/** The base decision for one row on its own ownership, ignoring any consumed-by link. */
+async function canReadOwnRowDetails(db: Database, connection: OwnedShape & { companyId: string }, reader: ProjectOwnedConnectionReader): Promise<boolean> {
   if (!isProjectOwnedToolConnection(connection)) return true;
   if (reader.type === "board") return true;
   if (!connection.projectId || !reader.agentId) return false;
@@ -183,6 +190,24 @@ export async function canReadProjectOwnedConnectionDetails(db: Database, connect
     throw error;
   });
   return Boolean(authority?.primary && authority.primary.id === reader.agentId);
+}
+
+export async function canReadProjectOwnedConnectionDetails(db: Database, connection: OwnedShape & { companyId: string }, reader: ProjectOwnedConnectionReader): Promise<boolean> {
+  // The board can always read.
+  if (reader.type === "board") return true;
+  // The row's own ownership decision always applies; a consumed-by link can
+  // only NARROW it, never replace or widen it (#20717 RFL round 4).
+  if (!await canReadOwnRowDetails(db, connection, reader)) return false;
+  // #20717 RFL round 3: a consumed project-App approval source (archived or
+  // kept as predecessor) still carries the SAME vault reference its consumer
+  // now holds, so its details also require reading the connection it became.
+  // The link counts only when it is mutual and unique; a dangling, ambiguous,
+  // duplicated or one-sided link leaves the source's details board-only.
+  const source = approvalSourceConsumedBy(connection);
+  if (!source.consumed) return true;
+  const consumer = await uniqueMutualConsumer(db, connection, source.consumerId);
+  if (!consumer || approvalSourceConsumedBy(consumer).consumed) return false;
+  return canReadOwnRowDetails(db, consumer, reader);
 }
 
 /** What everyone else sees of an owned row: identity, status and ownership only. */

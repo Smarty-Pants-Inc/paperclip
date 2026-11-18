@@ -9,7 +9,8 @@
 import "./helpers/project-connections-approval-http.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import request from "supertest";
-import { createDb } from "@paperclipai/db";
+import { createDb, toolConnections } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { storedConnection } from "./helpers/project-connections-fixture.js";
 import { projectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
@@ -53,5 +54,26 @@ describe("#20717 consumed approval source: details follow the connection it beca
       expect({ who: who === "board" ? who : "agent", status: byId.status, ...shape(byId.body) })
         .toMatchObject({ who: who === "board" ? who : "agent", status: 200, present: true, config: true, refs: true, redacted: false });
     }
+  });
+
+  // #20717 RFL round 4: the follow may only NARROW. Even a MUTUAL, UNIQUE link
+  // from an A-owned row to a B-owned consumer keeps A's own audience as a
+  // floor: B's lead (reads B, not A) and A's lead (reads A, not B) both stay
+  // redacted; only a reader of BOTH rows (the company primary) and the board read.
+  it("a mutual unique consumed-by link on an owned row is AND-ed with the row's own decision, never OR-ed or replaced", async () => {
+    const f = await projectConnectionFixture(db);
+    const a = (await f.seedConnection(f.a)).connection;
+    const b = (await f.seedConnection(f.b)).connection;
+    await db.update(toolConnections).set({ config: { ...a.config, projectAppApprovalConsumedBy: b.id }, transportConfig: { ...a.transportConfig, projectAppApprovalConsumedBy: b.id } }).where(eq(toolConnections.id, a.id));
+    await db.update(toolConnections).set({ config: { ...b.config, projectAppApprovalSourceId: a.id }, transportConfig: { ...b.transportConfig, projectAppApprovalSourceId: a.id } }).where(eq(toolConnections.id, b.id));
+    const read = async (who: string) => {
+      const r = await request(f.route(who)).get(`/api/tool-connections/${a.id}`);
+      const s = shape(r.body);
+      return { status: r.status, details: s.config || s.refs || s.transportConfig };
+    };
+    expect.soft({ leadB: await read(f.leadB.id) }).toEqual({ leadB: { status: 200, details: false } });
+    expect.soft({ leadA: await read(f.leadA.id) }).toEqual({ leadA: { status: 200, details: false } });
+    expect.soft({ primary: await read(f.primary.id) }).toEqual({ primary: { status: 200, details: true } });
+    expect.soft({ board: await read("board") }).toEqual({ board: { status: 200, details: true } });
   });
 });
