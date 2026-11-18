@@ -1042,6 +1042,27 @@ describe("ANSI-stripped credential view", () => {
   const corpus = JSON.parse(readFileSync(
     new URL("./fixtures/redact-store-corpus.json", import.meta.url), "utf8",
   )) as Array<{ input: string; expected: string }>;
+  it.each(corpus)("keeps the range-aware scanner in parity with the shared patterns: $input", ({ input, expected }) => {
+    expect(redactSensitiveText(`${colour}${input}${reset}`)).toBe(`${colour}${expected}${reset}`);
+  });
+
+  it.each([`API_KEY=""`, `API_KEY=''`, String.raw`API_KEY=\"\"`])("maps an empty credential without consuming adjacent codes: %s", input => {
+    expect(redactSensitiveText(`${colour}${input}${reset}`))
+      .toBe(`${colour}${redactSensitiveText(input)}${reset}`);
+  });
+
+  it("keeps colour codes between quoted credentials containing repeated text", () => {
+    const input = `Bearer "first1\" foo c Bearer \"middle2",${colour} foo c Bearer ${reset}"second3\" foo c Bearer \"last4"`;
+    expect(redactSensitiveText(input))
+      .toBe(`Bearer "${REDACTED_EVENT_VALUE}",${colour} foo c Bearer ${reset}"${REDACTED_EVENT_VALUE}"`);
+  });
+
+  it("preserves literal masks, Unicode context and separate colour boundaries around two secrets", () => {
+    const input = `🙂 ${REDACTED_EVENT_VALUE} ${colour}sk-proj-rf2SyntheticOnly0123456789ABCDEF${reset} middle \u001b[32mgithub_pat_rf2SyntheticOnly0123456789ABCDEF${reset}`;
+    expect(redactSensitiveText(input))
+      .toBe(`🙂 ${REDACTED_EVENT_VALUE} ${colour}${REDACTED_EVENT_VALUE}${reset} middle \u001b[32m${REDACTED_EVENT_VALUE}${reset}`);
+  });
+
   const sweep = [
     ...corpus.filter(row => row.input === row.expected).map(row => `${colour}${row.input}${reset}`),
     `the ${colour}bearer of${reset} good news`,
