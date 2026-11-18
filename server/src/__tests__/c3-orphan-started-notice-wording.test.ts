@@ -130,7 +130,7 @@ describe("RFL started-run notice wording: real typed-chat orphan", () => {
       unanswered: true, skipExternalConversationSettlement: true, skipRelatedRecovery: true });
   }
 
-  it("M1 STARTED and FAILED, later run answers only M2: ONE true started-run notice within 60s, no Retry, no double", async () => {
+  it("supersedes(M1 STARTED and FAILED, later run answers only M2: ONE true started-run notice within 60s, no Retry, no double; RFL R2-1 rulings 11-18 12:06Z: the card and notice read decideRetryAuthority)", async () => {
     const c = await chat();
     fixture.calls = []; fixture.failNext = 1;
     let m2 = "";
@@ -163,11 +163,16 @@ describe("RFL started-run notice wording: real typed-chat orphan", () => {
     expect(visible[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${m1}`);
     expect(visible[0]!.body).toBe(STARTED);
     expect(visible.filter(n => n.metadata?.authorizationReason === `unanswered_message:${m2}`)).toEqual([]);
-    // No Retry action in the note; the task's authoritative interruption
-    // also disables Retry controls (ExecutionBlockerNotice.tsx:69,157).
-    expect(JSON.stringify({ presentation: visible[0]!.presentation, metadata: visible[0]!.metadata })).not.toMatch(/\bretry\b/i);
+    // supersedes("No Retry action in the note; the interruption disables Retry controls";
+    // RFL record PENDING: rf-5 R2-1, e7cac008): the started-run BODY is unchanged
+    // (asserted above); the note's Next action and the card are the one Retry
+    // authority's personMessageOwed decision (orphan-m2-held-retry-surface.test.ts).
+    const nextAction = ((visible[0]!.metadata as any)?.sections ?? []).flatMap((section: any) => section.rows ?? [])
+      .find((entry: any) => entry.label === "Next action")?.value ?? null;
+    expect(nextAction).toBe("Press Retry to answer it.");
     expect(view.status).toBe(200);
-    expect(view.body.interruption.canRetry).toBe(false);
+    expect(view.body.interruption.canRetry).toBe(true);
+    expect(view.body.interruption.notice?.text).toBe("An earlier message wasn't answered. Press Retry to answer it.");
     expect(view.body.interruption.userAction).toBeNull();
     const id = visible[0]!.id;
     await tick(c, t0 + 120_000);
