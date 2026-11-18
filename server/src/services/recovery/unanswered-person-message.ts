@@ -200,6 +200,38 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
   // No run-status rule of its own here: ANSWERED already requires the completed final answer.
   return completedPersonMessageAnswerSql(m);
 }
+/**
+ * compose (fam-long + ANSWERED). SQL: message m is EXPLAINED by the ONE true
+ * note of unit 1's cut lane. A cut run's reply is DELIVERED only and owes ONE
+ * true notice (RFL F1); here the failed run published that notice itself as
+ * its FINAL reply (the recorded final comment receipt, never a progress
+ * comment): the exhausted note of the ONE automatic successor, an account
+ * rejection's own text, or the refusal note. Not ANSWERED: Retry and the carry
+ * still read completedPersonMessageAnswerSql. All of:
+ * - the run's turn failed with a Pi provider cut code (native-mid-stream-cut.ts);
+ * - R-ONCE: the run holds m as its OWN pending input (wake ids, or the cut-lane
+ *   successor's attributionCommentIds), never through ancestry;
+ * - nothing follows it by itself (no retry of that run exists).
+ * Discovery and the decision read this one predicate, so a task whose message
+ * has its true note is neither noticed again nor revisited.
+ */
+function explainedByOwnFinalFailureNoteSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
+  return sql`exists (select 1 from ${heartbeatRuns} cut
+    join ${issueComments} note on note.company_id = cut.company_id and note.created_by_run_id = cut.id
+    where cut.company_id = ${m.companyId} and cut.native_issue_id = ${m.issueId}
+      and cut.status in ('failed', 'timed_out')
+      and note.issue_id = ${m.issueId} and note.author_type = 'agent' and note.deleted_at is null
+      and note.created_at > ${m.createdAt}
+      and cut.result_json#>>'{presentationDecision,commentId}' = note.id::text
+      and (cut.context_snapshot->>'wakeCommentId' = ${m.id}::text or cut.context_snapshot->>'commentId' = ${m.id}::text
+        or coalesce(cut.context_snapshot->'attributionCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(cut.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(cut.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${m.id}::text)
+      and exists (select 1 from ${heartbeatRunEvents} failed where failed.company_id = cut.company_id and failed.run_id = cut.id
+        and failed.event_type = 'turn.failed'
+        and failed.payload#>>'{prpEvent,payload,error,code}' in ('pi_output_truncated', 'pi_provider_error', 'pi_rpc_transport_failed'))
+      and not exists (select 1 from ${heartbeatRuns} next where next.company_id = cut.company_id and next.retry_of_run_id = cut.id))`;
+}
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 
@@ -236,6 +268,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where m.company_id = ${companyId} and m.issue_id = ${issueId} and m.author_type = 'user'
         and m.deleted_at is null and ${inScopeSql(rawMessage("m"), since)}
         and not ${answeredSql(rawMessage("m"))}
+        and not ${explainedByOwnFinalFailureNoteSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
           and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
@@ -260,6 +293,8 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and ${inScopeSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }, since)}
       and not ${answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
+      and not ${explainedByOwnFinalFailureNoteSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
@@ -453,6 +488,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
   // A standing WAITING note is still an open obligation: it must stay true.
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
+  // compose: the cut lane's ONE true note, published by the failed run itself.
+  const [ownNote] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.id, message.id), explainedByOwnFinalFailureNoteSql({ id: sql`${issueComments.id}`,
+      companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
+  if (ownNote) return { kind: "explained" };
   const upgrading = noticed?.waiting ? noticed.id : null;
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode ?? UNANSWERED_MESSAGE_WAITING_CODE : null;
 
