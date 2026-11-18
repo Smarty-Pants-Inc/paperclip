@@ -44,7 +44,7 @@ const support = await getEmbeddedPostgresTestSupport();
   });
 
   type Variant = { pReceipt?: boolean; s0Receipt?: boolean; laterHolderOn?: "p" | "s0"; successorBox?: string;
-    s0Result?: boolean; pointer?: "p" | "none"; s0LiveLease?: boolean };
+    s0Result?: boolean; pointer?: "p" | "none"; s0LiveLease?: boolean; successorEnvironment?: "other" };
 
   async function seed(v: Variant = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), commentId = randomUUID();
@@ -71,11 +71,13 @@ const support = await getEmbeddedPostgresTestSupport();
       { runId: S0, companyId, issueId, phase: "terminal_failure", attempt: 0, controllerGeneration: 0, recoveryState: "blocked",
         failureCode: "native_continuation_requires_reconciliation" },
     ]);
-    const lease = async (runId: string, box: string, acquired: Date, released: Date | null, receipt: boolean, policy = "retain_on_failure") => {
+    const [otherEnvironment] = await db.insert(environments).values({ companyId, name: `boat-other-${issueId}`, driver: "sandbox" }).returning();
+    const lease = async (runId: string, box: string, acquired: Date, released: Date | null, receipt: boolean, policy = "retain_on_failure",
+      environmentId = environment!.id) => {
       const identity = { id: randomUUID(), companyId, heartbeatRunId: runId, provider: "boat", providerLeaseId: box };
       const stop = receipt ? remoteTerminationReceipt(identity, { providerLeaseId: box, state: "stopped" }) : undefined;
       if (stop) stop.confirmedAt = (released ?? acquired).toISOString();
-      await db.insert(environmentLeases).values({ ...identity, environmentId: environment!.id, issueId,
+      await db.insert(environmentLeases).values({ ...identity, environmentId, issueId,
         status: released ? "released" : "active", leasePolicy: policy, acquiredAt: acquired, releasedAt: released,
         cleanupStatus: released ? "success" : null, metadata: stop ? { remoteExecutionTermination: stop } : {} });
     };
@@ -97,7 +99,8 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(heartbeatRuns).values({ id: S, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native", status: "running",
       invocationSource: "on_demand", createdAt: at(71), startedAt: at(71),
       contextSnapshot: { issueId, wakeCommentId: commentId, explicitUserContinuation: { commentId, actorId: "board" } } });
-    await lease(S, v.successorBox ?? "bx_third", at(71), null, false, "reuse_by_environment");
+    await lease(S, v.successorBox ?? "bx_third", at(71), null, false, "reuse_by_environment",
+      v.successorEnvironment === "other" ? otherEnvironment!.id : environment!.id);
     if (v.pointer !== "none") await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner",
       taskKey: issueId, lastRunId: P, sessionParamsJson: { sessionId, [PI_CONVERSATION_KEY]: { schema: "paperclip.pi-conversation.v1",
         id: sessionId, generation: 1, boundary: { provider: "pi_rpc", cwd: "/workspace", remoteCwd: null, workspaceId: null, trust: "t" },
@@ -172,6 +175,9 @@ const support = await getEmbeddedPostgresTestSupport();
   });
   it("refuses when S sits on a predecessor's stopped box (same-box 'stopped')", async () => {
     await expectRefused(await seed({ successorBox: "bx_ngxpne73" }));
+  });
+  it("refuses when S sits on a predecessor's physical box recorded under another environment (provider + providerLeaseId, not the reader's scope)", async () => {
+    await expectRefused(await seed({ successorBox: "bx_c2m2nuhj", successorEnvironment: "other" }));
   });
   it("refuses when either predecessor has an accepted result row", async () => {
     await expectRefused(await seed({ s0Result: true }));
