@@ -1071,6 +1071,20 @@ describe("buildIssueChatMessages", () => {
     });
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605
+  it("fast-response R3: an acknowledgement is not a confirmation handoff barrier", () => {
+    const receipt = createComment({ id: "receipt", origin: "fast_response", authorAgentId: "agent-1", authorUserId: null,
+      createdAt: new Date("2026-04-06T12:02:00Z") });
+    const reply = createComment({ id: "reply", runId: "run-1", authorAgentId: "agent-1", authorUserId: null,
+      createdAt: new Date("2026-04-06T12:03:00Z") });
+    const build = (comments: IssueChatComment[]) => buildIssueChatMessages({ comments,
+      interactions: [createRequestConfirmation({ sourceRunId: "run-1" })], timelineEvents: [], linkedRuns: [], liveRuns: [],
+    }).map(message => message.id);
+    expect(build([reply])).toEqual(["reply", "interaction:confirmation-1"]);
+    expect(build([receipt, reply])).toEqual(["receipt", "reply", "interaction:confirmation-1"]);
+    expect(build([{ ...receipt, origin: "comment" }, reply])).toEqual(["interaction:confirmation-1", "receipt", "reply"]);
+  });
+
   it("places request confirmations after later same-run handoff status and comment", () => {
     const messages = buildIssueChatMessages({
       comments: [
