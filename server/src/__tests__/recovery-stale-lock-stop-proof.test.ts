@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { activityLog, agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { expectPersonSeesInsteadOfCard } from "./helpers/c1-no-card-surface.js";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -397,14 +397,28 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       createdAt: new Date(Date.now() + 1_000) });
     return id;
   }
+  /** C1 r4: a later answer DELIVERED by the sweep's rule (answeredPersonMessageSql): the
+   * stopped run carried the person's message and the later run posted the reply. */
+  async function deliveredAnswer(f: Awaited<ReturnType<typeof warmFixture>>) {
+    const messageId = randomUUID();
+    await db.insert(issueComments).values({ id: messageId, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: "board-user", body: "Where is the report?", createdAt: new Date(Date.now() - 120_000) });
+    await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb)
+      || jsonb_build_object('wakeCommentId', ${messageId}::text)` }).where(eq(heartbeatRuns.id, f.runId));
+    const id = await laterAnswer(f);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: messageId } }).where(eq(heartbeatRuns.id, id));
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: id, body: "Here is the report." });
+    return id;
+  }
   it.each([false, true])("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): resolves an existing card after a later same-task answer, even when old locks are gone=%s", async noLocks => {
     const f = await warmFixture();
     await existingCard(f);
-    await laterAnswer(f);
+    await deliveredAnswer(f);
     if (noLocks) await db.update(issues).set({ checkoutRunId: null, executionRunId: null }).where(eq(issues.id, f.issueId));
     await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
     expect(await stopActions(f.issueId)).toMatchObject([{ status: "resolved", outcome: "restored",
-      resolutionNote: expect.stringContaining("succeeded") }]);
+      resolutionNote: expect.stringContaining("message on this task was answered") }]);
     // Resolving stale copy is NOT Stop proof and must not release the old executor.
     expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
     if (!noLocks) expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
@@ -414,7 +428,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
   it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): the normal recovery worker discovers a card even without stale lock columns", async () => {
     const f = await warmFixture();
     await existingCard(f);
-    await laterAnswer(f);
+    await deliveredAnswer(f);
     await db.update(issues).set({ checkoutRunId: null, executionRunId: null }).where(eq(issues.id, f.issueId));
     const errors: unknown[] = [];
     const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, canReconcile: () => true,
@@ -455,7 +469,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       independentProof: "preserve", stopPending: { ...(action!.evidence.stopPending as Record<string, unknown>),
         standalone: false, previousNextAction: "Old independent instruction" } },
       nextAction: `${action!.nextAction}\n\nKeep current independent instruction` }).where(eq(issueRecoveryActions.id, action!.id));
-    await laterAnswer(f);
+    await deliveredAnswer(f);
     await inspect(f, "sweep");
     await inspect(f, "sweep");
     const [after] = await stopActions(f.issueId);

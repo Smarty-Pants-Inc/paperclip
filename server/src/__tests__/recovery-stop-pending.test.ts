@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import request from "supertest";
-import { agents, createDb, environmentLeases, heartbeatRuns, issueRecoveryActions, issues, activityLog, type Db } from "@paperclipai/db";
+import { agents, createDb, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, activityLog, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -266,12 +266,110 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
       evidence: { stopPending: { code: "execution_stop_pending", runIds: [f.runId] } } }]);
   });
 
+  // ---- C1 round 4 (RFL FAIL on round 3; rf-5 rows (a)-(c)) ----
+  // 'Delivered' is the unanswered-message sweep's rule (answeredPersonMessageSql)
+  // for the person message the stopped run carried; a successor carries it too.
+  const RETIRED_DELIVERED = "The person's message on this task was answered; no further hold is shown. This is not Stop proof. Execution claims are unchanged.";
+  async function successor(f: Awaited<ReturnType<typeof fixture>>, delivers: "nothing" | "answer" | "card") {
+    const messageId = randomUUID(), runId = randomUUID();
+    await db.insert(issueComments).values({ id: messageId, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: "board-user", body: "Please send me the final report.", createdAt: new Date(Date.now() - 120_000) });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: messageId } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      invocationSource: "on_demand", issueId: f.issueId, contextSnapshot: { issueId: f.issueId, wakeCommentId: messageId },
+      resultJson: {}, createdAt: new Date(Date.now() + 1_000), startedAt: new Date(Date.now() - 19_300), finishedAt: new Date(Date.now() - 5_000) });
+    if (delivers === "answer") await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: runId, body: "Here is the final report." });
+    if (delivers === "card") await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "pending", sourceRunId: runId, createdByAgentId: f.agentId,
+      title: "Which format do you want for the report?", payload: { questions: [] } as never });
+    return { messageId, runId };
+  }
+  async function personStopCard() {
+    const f = await fixture(PERSON_STOP);
+    await finishedAgo(f.runId, 61_000);
+    expect(await sweep()).toBe(0);
+    const [card] = await stopCards(f.issueId);
+    expect(card).toMatchObject({ cause: "execution_stop_pending", status: "escalated" });
+    return { ...f, card: card! };
+  }
+
+  it("C1 r4 (a): a succeeded successor with an EMPTY result and ZERO comments delivered nothing; the person Stop card stays", async () => {
+    const f = await personStopCard();
+    await successor(f, "nothing");
+    const before = await task(f.issueId);
+    for (let tick = 0; tick < 2; tick++) expect(await sweep()).toBe(0);
+    expect(await stopCards(f.issueId)).toMatchObject([{ id: f.card.id, cause: "execution_stop_pending", status: "escalated" }]);
+    expect(await task(f.issueId)).toEqual(before);
+  });
+  it("C1 r4 (a): with nobody's Stop, an EMPTY succeeded successor does not suppress the true late card", async () => {
+    const f = await unreleasedFailedRun();
+    await finishedAgo(f.runId, 16 * 60_000);
+    await successor(f, "nothing");
+    expect(await sweep()).toBe(0);
+    expect(await stopCards(f.issueId)).toMatchObject([{ cause: "execution_environment_unreleased", status: "escalated" }]);
+  });
+  it("C1 r4 (b): the successor posted the final answer; the existing card retires on the next recheck", async () => {
+    const f = await personStopCard();
+    await successor(f, "answer");
+    const before = await task(f.issueId);
+    expect(await sweep()).toBe(0);
+    expect(await stopCards(f.issueId)).toMatchObject([{ id: f.card.id, status: "resolved", outcome: "restored",
+      resolutionNote: RETIRED_DELIVERED }]);
+    expect(await task(f.issueId)).toEqual(before);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_stop_pending_resolved")))
+      .toMatchObject([{ details: { reason: "person_message_delivered" } }]);
+    expect(await sweep()).toBe(0);
+    expect(await stopCards(f.issueId)).toHaveLength(1);
+  });
+  it("C1 r4 (c): a successor that only opened a card asking the person delivered by the sweep's rule; the Stop card retires, the person sees the agent's question", async () => {
+    const f = await personStopCard();
+    await successor(f, "card");
+    expect(await sweep()).toBe(0);
+    expect(await stopCards(f.issueId)).toMatchObject([{ id: f.card.id, status: "resolved", resolutionNote: RETIRED_DELIVERED }]);
+    expect(await db.select({ title: issueThreadInteractions.title, status: issueThreadInteractions.status })
+      .from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId)))
+      .toEqual([{ title: "Which format do you want for the report?", status: "pending" }]);
+  });
+  it("C1 r4 fix 2: a card written in the receipt race (receipt landed after the caller's check) retires on the next sweep, even with the claims gone", async () => {
+    const f = await fixture(PERSON_STOP);
+    await finishedAgo(f.runId, 61_000);
+    // The receipt lands between the caller's Stop check and the card write.
+    await db.update(heartbeatRuns).set({ resultJson: { ...PERSON_STOP, executionCancellation: { state: "acknowledged" } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await writer(f);
+    const [card] = await stopCards(f.issueId);
+    expect(card).toMatchObject({ cause: "execution_stop_pending", status: "escalated" });
+    await db.update(issues).set({ checkoutRunId: null, executionRunId: null, executionLockedAt: null }).where(eq(issues.id, f.issueId));
+    expect(await sweep()).toBe(0);
+    expect(await stopCards(f.issueId)).toMatchObject([{ id: card!.id, status: "resolved", outcome: "restored",
+      resolutionNote: "Stop proved under the task and bound-run locks." }]);
+  });
+  it("C1 r4 fix 3: the true late card closes once its condition is gone: Force release, then a new run's checkout", async () => {
+    const f = await unreleasedFailedRun();
+    await finishedAgo(f.runId, 16 * 60_000);
+    expect(await sweep()).toBe(0);
+    const [card] = await stopCards(f.issueId);
+    expect(card).toMatchObject({ cause: "execution_environment_unreleased", status: "escalated" });
+    const app = routeApp(db, f.actor, issueRoutes);
+    await request(app).post(`/api/issues/${f.issueId}/admin/force-release`).send({}).expect(200);
+    const nextRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: nextRunId, companyId: f.companyId, agentId: f.agentId, status: "queued",
+      invocationSource: "on_demand", issueId: f.issueId, contextSnapshot: { issueId: f.issueId } });
+    await db.update(issues).set({ checkoutRunId: nextRunId, executionRunId: nextRunId, executionLockedAt: new Date() })
+      .where(eq(issues.id, f.issueId));
+    await sweep();
+    expect(await stopCards(f.issueId)).toMatchObject([{ id: card!.id, status: "resolved",
+      resolutionNote: expect.stringContaining("Force release") }]);
+    expect((await request(app).get(`/api/issues/${f.issueId}`).expect(200)).body.activeRecoveryAction ?? null).toBeNull();
+  });
+
   it("C1 guard 2 (live shape): a person Stop answered by a successor 41.7 s later gets no card after the answer", async () => {
     const f = await fixture(PERSON_STOP);
     await finishedAgo(f.runId, 61_000);
-    await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: f.companyId, agentId: f.agentId, status: "succeeded",
-      invocationSource: "on_demand", issueId: f.issueId, contextSnapshot: { issueId: f.issueId },
-      createdAt: new Date(Date.now() + 1_000), startedAt: new Date(Date.now() - 19_300), finishedAt: new Date(Date.now() - 5_000) });
+    // C1 r4: the successor DELIVERED (posted its answer), not merely succeeded.
+    await successor(f, "answer");
     const before = await task(f.issueId);
     for (let tick = 0; tick < 2; tick++) expect(await sweep()).toBe(0);
     expect(await stopCards(f.issueId)).toEqual([]);
