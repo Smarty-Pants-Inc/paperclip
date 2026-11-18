@@ -405,7 +405,17 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     expect(classifyNativeMidStreamCut([{ seq: 1, payload: { prpEvent: { eventType: "turn.completed", turnId: "t", payload: {} } } }])).toBeNull();
     expect(classifyNativeMidStreamCut(failed({ code: "pi_provider_error", message: "unexpected EOF" }))).toBe("provider_error");
 
-    const { isNativeProviderRefusal } = await import("./native-mid-stream-cut.js");
+    // compose (unit 1 + dl-refusal2): an ordinary 429/529 status rejection with no
+    // answer text is not a cut that takes the recovery lane (it keeps the generic
+    // failed-turn retry); a real cut still does. Its cut kind is unchanged.
+    const { classifyNativeMidStreamCutRecovery, isNativeProviderRefusal } = await import("./native-mid-stream-cut.js");
+    const overloaded = failed({ code: "pi_provider_error", message: '529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}' });
+    expect(classifyNativeMidStreamCut(overloaded)).toBe("provider_error");
+    expect(classifyNativeMidStreamCutRecovery(overloaded)).toBeNull();
+    expect(classifyNativeMidStreamCutRecovery(failed({ code: "pi_provider_error", message: "429 rate_limit_error: This request triggered rate limit restrictions." }))).toBeNull();
+    expect(classifyNativeMidStreamCutRecovery(failed({ code: "pi_provider_error", message: "unexpected EOF" }))).toBe("provider_error");
+    expect(classifyNativeMidStreamCutRecovery(failed({ code: "pi_rpc_transport_failed", message: "upstream connect error: stream reset" }))).toBe("provider_error");
+    expect(classifyNativeMidStreamCutRecovery(failed({ code: "pi_output_truncated" }))).toBe("output_cap");
     // compose: an account or key rejection that names the Terms of Service is an
     // ordinary provider error; a request the provider says violates them is a refusal.
     expect(isNativeProviderRefusal({ code: "pi_provider_error", message: "400 invalid_request_error: Account blocked until Terms of Service are accepted. See https://www.anthropic.com/legal/commercial-terms." })).toBe(false);

@@ -53,6 +53,42 @@ export async function readNativeMidStreamCut(db: Pick<Db, "select">, input: { co
   return classifyNativeMidStreamCut(await readRunAnswerEvents(db, input.companyId, input.runId));
 }
 
+const ORDINARY_STATUS_REJECTION = /^\s*(?:429|529)\b/u;
+
+/**
+ * compose (unit 1 + dl-refusal2): the provider answered the request with an
+ * ordinary capacity status (HTTP 429 rate limit, 529 overloaded) and no answer
+ * text was streamed. Nothing was cut mid-stream: the request was turned away.
+ */
+export function isOrdinaryProviderStatusRejection(rows: readonly { seq: number; payload: unknown }[]): boolean {
+  let last: Record<string, unknown> | null = null;
+  for (const row of [...rows].sort((a, b) => a.seq - b.seq)) {
+    const event = record(record(row.payload).prpEvent);
+    if (typeof event.eventType === "string" && /^turn\.(completed|failed|cancelled|interrupted)$/u.test(event.eventType)) last = event;
+  }
+  if (!last || last.eventType !== "turn.failed") return false;
+  const error = record(record(last.payload).error);
+  return error.code === "pi_provider_error" && typeof error.message === "string"
+    && ORDINARY_STATUS_REJECTION.test(error.message) && !isNativeProviderRefusal(error)
+    && readFailedTurnStreamedAnswer(rows) === null;
+}
+
+/**
+ * The cut that takes the recovery lane. An ordinary 429/529 status rejection
+ * is not one: it keeps the generic failed-turn retry (`native_run_failed`,
+ * the refusal family's judged control), which the arbiter bounds to one
+ * continuation exactly as before. `classifyNativeMidStreamCut` is unchanged,
+ * so a cut successor that then meets a 429/529 still gets its own true
+ * exhausted note, never the generic resend line.
+ */
+export function classifyNativeMidStreamCutRecovery(rows: readonly { seq: number; payload: unknown }[]): NativeMidStreamCut | null {
+  return isOrdinaryProviderStatusRejection(rows) ? null : classifyNativeMidStreamCut(rows);
+}
+
+export async function readNativeMidStreamCutRecovery(db: Pick<Db, "select">, input: { companyId: string; runId: string }) {
+  return classifyNativeMidStreamCutRecovery(await readRunAnswerEvents(db, input.companyId, input.runId));
+}
+
 /** A cap stop with no text needs a new process on the SAME conversation; the cut turn is not sent. */
 export function nativeMidStreamCutStartsFresh(cut: NativeMidStreamCut | null): boolean {
   return cut === "output_cap_no_text";

@@ -89,7 +89,7 @@ import {
 } from "../activity-log.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { materializeNativeEnvironmentBlockerRetry, materializeNativeMidStreamCutRetry, materializeNativeProviderCapacityRetry } from "./native-provider-capacity-retry.js";
-import { NATIVE_MID_STREAM_CUT_CODE, readNativeMidStreamCut } from "./native-mid-stream-cut.js";
+import { NATIVE_MID_STREAM_CUT_CODE, readNativeMidStreamCutRecovery } from "./native-mid-stream-cut.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE } from "./native-environment-blocker.js";
 import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
@@ -836,7 +836,7 @@ async function materializeDecisionEffect(input: {
     // mid-stream is that cut's recovery: one successor, through the same
     // materializer as schedule_retry, never the generic wake as well.
     const cut = effect.continuationKind === "same_agent" && effect.agentId === input.actorAgentId
-      ? await readNativeMidStreamCut(input.tx, { companyId: input.companyId, runId: input.runId }) : null;
+      ? await readNativeMidStreamCutRecovery(input.tx, { companyId: input.companyId, runId: input.runId }) : null;
     if (cut && cut !== "provider_refusal") {
       const retryId = await materializeNativeMidStreamCutRetry({
         tx: input.tx as unknown as Db, companyId: input.companyId,

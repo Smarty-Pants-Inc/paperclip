@@ -31,7 +31,7 @@ import { hasPendingNativeChildCompletion } from "./native-child-completion-deliv
 import { settleExternalConversation } from "../slack-conversation-lifecycle.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { isFailedTurnContinuationRun } from "./native-failed-turn-continuation.js";
-import { isNativeMidStreamCutRecoveryRun, readNativeMidStreamCut } from "./native-mid-stream-cut.js";
+import { isNativeMidStreamCutRecoveryRun, readNativeMidStreamCut, readNativeMidStreamCutRecovery } from "./native-mid-stream-cut.js";
 import { readPersistedNativeFailureEvidence } from "./native-provider-failure-evidence.js";
 import { PROVIDER_POLICY_REFUSAL_FAILURE } from "./native-provider-failure.js";
 // Fork: upstream reads nativeRunHasStopRequest from native-tool-receipt-limit.ts (#21913, not carried).
@@ -1844,6 +1844,10 @@ async function finalizeNativeRunAndProject(input: {
     const { providerExplanation } = persistedFailure;
     const midStreamCut = terminalState === "failed"
       ? await readNativeMidStreamCut(input.db, { companyId: run.companyId, runId: run.id }) : null;
+    // compose: an ordinary 429/529 status rejection is not a mid-stream cut; it
+    // keeps the generic failed-turn retry instead of the cut's recovery lane.
+    const midStreamCutRecovery = terminalState === "failed"
+      ? await readNativeMidStreamCutRecovery(input.db, { companyId: run.companyId, runId: run.id }) : null;
     // A cut the cut lane reads as a provider refusal defers to the refusal
     // path: its code, its terminal decision and its one neutral note. The cut
     // lane has no refusal code or note of its own.
@@ -1902,7 +1906,8 @@ async function finalizeNativeRunAndProject(input: {
       // The recovery successor of a mid-stream cut is that one continuation too.
       failedTurnContinuationUsed: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext
         && (isNativeMidStreamCutRecoveryRun(run) || await isFailedTurnContinuationRun(input.db, run, authoritativeIssue.id)),
-      midStreamCut: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext ? midStreamCut : null,
+      midStreamCut: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext
+        ? (midStreamCut === "provider_refusal" ? midStreamCut : midStreamCutRecovery) : null,
       ...(addressedOutcome ? { nativeAddressedInteractionOutcome: addressedOutcome } : {}),
       ...(reviewContext ? { nativeReviewOutcome: nativeReview
         ? nativeReview.interaction.status === "pending" ? "pending" as const : "resolved" as const
