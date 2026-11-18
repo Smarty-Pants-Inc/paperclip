@@ -28,6 +28,7 @@ import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
+import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -410,6 +411,16 @@ export const PENDING_WAIT_BOUND_MS = 2 * 60_000;
 
 /** The one predicate: run outside the fence to skip the lock in the common
  * case, and again unchanged inside it before writing. Reads only. */
+/** adopt-stopu-proof: the agent's most recent finished run on this task was
+ * stopped by a person (cancelled, acknowledged run-only Stop). */
+async function lastTerminalRunWasPersonStop(q: Db, input: { companyId: string; agentId: string; issueId: string }) {
+  const [last] = await q.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+    inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "interrupted", "timed_out"])))
+    .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt)).limit(1);
+  return !!last && last.status === "cancelled" && hasAcknowledgedNativeRunStopRequest(last);
+}
+
 async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
@@ -620,6 +631,14 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     if (continuationWaiting || startDeadline > now.getTime()) {
       if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_WAITING_CODE) {
         return { kind: "pending", recheckAt: continuationWaiting ? now.getTime() + 30_000 : startDeadline };
+      }
+      // adopt-stopu-proof (rf-4 F21 (4), never-OK): after a PERSON's Stop the
+      // waiting note ('waiting for the agent to be free; it will start by
+      // itself') is false: the person-Stop truth lines own that window (the
+      // export-hold line, the card, or 'Stopped. These messages are waiting:
+      // Send them...'). Re-check later instead of posting it.
+      if (await lastTerminalRunWasPersonStop(q, { companyId: issue.companyId, agentId, issueId: issue.id })) {
+        return { kind: "pending", recheckAt: now.getTime() + 30_000 };
       }
       code = UNANSWERED_MESSAGE_WAITING_CODE;
     } else {
