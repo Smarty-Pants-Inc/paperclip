@@ -392,10 +392,6 @@ export function registerCancelledWorkspacePreservationWork(db: Db,
         && await settleUnchangedNativeWorkspace(db, run.id, run.companyId)) return null;
       return { ...entry, dueAt: Date.now() + 30_000 };
     }
-    // C3: an acknowledged person Stop with no accepted result owes no restore
-    // (preserveNativeFailedWorkspace returns early), so there is nothing left to
-    // watch; never re-check it every 30 s.
-    if (!finalization.resultId) return null;
     if (await cancelledWorkspaceSource(db, run)) await preserveNativeFailedWorkspace(db, run, { allowPreterminal: true, requireCancelledStop: true });
     else if (await nativeRunNeverLaunchedRunner(db, run.id, run.companyId)
       && await settleUnchangedNativeWorkspace(db, run.id, run.companyId)) return null;
