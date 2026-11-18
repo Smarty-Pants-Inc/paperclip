@@ -591,6 +591,118 @@ const support = await getEmbeddedPostgresTestSupport();
     } finally { vi.useRealTimers(); }
   }, 60_000);
 
+  // adopt-stopu-f3split (RFL 03:00Z, cluster-lead F3): a post-Stop message posted while
+  // another run holds the task must NOT merge into the person-Stop-held pre-Stop wake
+  // (findExistingDeferredWake, wake-queue/adapters/postgres.ts). It gets its own wake,
+  // which runs with ONLY that message; the pre-Stop messages stay saved for Send.
+  const holdTask = async (f: Awaited<ReturnType<typeof seed>>) => {
+    const holderId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: holderId, companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "legacy", status: "running", startedAt: new Date(), contextSnapshot: { issueId: f.issueId } });
+    await db.update(issues).set({ executionRunId: holderId, executionAgentNameKey: "native", executionLockedAt: new Date() })
+      .where(eq(issues.id, f.issueId));
+    return holderId;
+  };
+  const finishHolder = async (holderId: string) => {
+    // The holder's turn ends and its lock is released (as its finalize does); the stranded
+    // pass (heartbeat/queue.ts:2277 releaseIssueExecutionAndPromote) then promotes the next
+    // deferred wake through findNextDeferredWake, the same drain a run's release uses.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, holderId));
+    await db.update(issues).set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.executionRunId, holderId));
+    await heartbeatService(db).resumeQueuedRuns();
+  };
+  it("F3 split: after Stop, a message posted while another run holds the task gets its OWN wake and runs alone; the pre-Stop wake stays saved for Send", async () => {
+    // A task (not a chat): chat turns never merge deferred wakes (queue.ts allowRunCoalescing false).
+    const f = await seed({ conversation: false });
+    const holderId = await holdTask(f);
+    const next = await postNew(f, "M5 after the Stop");
+    const preStop = await wakeOf(f.queueId);
+    const preStopIds = ((preStop.payload?._paperclipWakeContext as { wakeCommentIds?: string[] } | undefined)?.wakeCommentIds ?? []);
+    await evidence(`f3splitAdmission ${JSON.stringify({ holderId, nextWakeId: next.wakeId, preStopWakeId: f.queueId, preStopIds,
+      preStopRequestedAt: preStop.requestedAt, nextWake: await wakeOf(next.wakeId) })}`);
+    // RED at base: M5 joined the held pre-Stop wake (its id IS the pre-Stop wake).
+    expect(next.wakeId).not.toBe(f.queueId);
+    expect(preStopIds).not.toContain(next.commentId);
+    expect(preStopIds).toEqual(f.commentIds);
+    expect((await wakeOf(next.wakeId)).status).toBe("deferred_issue_execution");
+    await finishHolder(holderId);
+    await evidence(`f3splitAfterRelease ${JSON.stringify({ issue: (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.executionRunId ?? null,
+      wakes: (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).map(w => ({ id: w.id, status: w.status, runId: w.runId, reason: w.reason })),
+      runs: (await successors(f)).map(r => ({ id: r.id, status: r.status, wake: r.wakeupRequestId })) })}`);
+    let started: typeof heartbeatRuns.$inferSelect | undefined;
+    await vi.waitFor(async () => {
+      started = (await successors(f)).find(run => run.id !== holderId && run.wakeupRequestId === next.wakeId);
+      expect(started).toBeDefined();
+    }, { timeout: 15_000, interval: 200 });
+    if (!started) throw new Error("M5 never started");
+    expect(await admittedOrigins(f, started)).toEqual([next.commentId]);
+    // M1 (the pre-Stop messages) is not run, not lost: saved, waiting for Send.
+    expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    for (const run of await successors(f)) expect((await admittedOrigins(f, run)).filter(id => f.commentIds.includes(id))).toEqual([]);
+    const queueWhileM5Runs = await readQueue(f);
+    // Control: Send after M5 ran admits the pre-Stop messages once, in order.
+    await vi.waitFor(async () => expect(["queued", "running", "scheduled_retry"])
+      .not.toContain((await successors(f)).find(run => run.id === started!.id)?.status), { timeout: 15_000, interval: 100 });
+    const fresh = await readQueue(f);
+    const queue = fresh;
+    // A task (not a chat) has no chat Stop line (routes/issues.ts:7889 is chat-only); the
+    // pre-Stop messages are still listed in the queue, waiting for Send.
+    expect(fresh.queueId).toBe(f.queueId);
+    expect(fresh.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
+    const sent = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
+      .send({ queueId: fresh.queueId, revision: fresh.revision, targetRunId: null });
+    expect(sent.status, JSON.stringify(sent.body)).toBeLessThan(300);
+    let sendRun: typeof heartbeatRuns.$inferSelect | undefined;
+    await vi.waitFor(async () => {
+      const runId = (await wakeOf(f.queueId)).runId;
+      sendRun = (await successors(f)).find(run => run.id === runId);
+      expect(sendRun).toBeDefined();
+    }, { timeout: 20_000, interval: 200 });
+    if (!sendRun) throw new Error("no Send run");
+    const sendEnvelope = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+      runId: sendRun.id, context: sendRun.contextSnapshot!, summary: null, exposeLowTrustRaw: false });
+    expect(sendEnvelope.messages.filter(m => f.commentIds.includes(m.id)).map(m => m.body)).toEqual(["M2", "M3", "M4"]);
+    expect(sendEnvelope.originCommentIds).not.toContain(next.commentId);
+    await heartbeatService(db).resumeQueuedRuns();
+    const carriers: string[] = [];
+    for (const run of await successors(f))
+      if ((await admittedOrigins(f, run)).some(id => f.commentIds.includes(id))) carriers.push(run.id);
+    expect(carriers).toEqual([sendRun.id]);
+    await evidence(`f3splitRun ${JSON.stringify({ m5Run: { id: started.id, wake: started.wakeupRequestId, origins: await admittedOrigins(f, started) },
+      sendLine: queue.executionWait, queueWhileM5Runs: { executionWait: queueWhileM5Runs.executionWait ?? null,
+        entries: queueWhileM5Runs.entries?.map((entry: { comment: { id: string } }) => entry.comment.id) ?? null }, send: { runId: sendRun.id, origins: sendEnvelope.originCommentIds }, carriers })}`);
+  }, 60_000);
+
+  it("F3 split (proceed): after Stop with no run holding the task, the new message's run adopts ONLY it, never the Stop-held wake", async () => {
+    const f = await seed({ conversation: false });
+    const next = await postNew(f, "M5 after the Stop, task idle");
+    let started: typeof heartbeatRuns.$inferSelect | undefined;
+    await vi.waitFor(async () => {
+      started = (await successors(f)).find(run => run.wakeupRequestId === next.wakeId);
+      expect(started).toBeDefined();
+    }, { timeout: 15_000, interval: 200 });
+    if (!started) throw new Error("M5 never started");
+    const origins = await admittedOrigins(f, started);
+    await evidence(`f3splitProceed ${JSON.stringify({ m5Run: started.id, origins, preStopIds: f.commentIds,
+      runContextQueued: started.contextSnapshot?.wakeCommentIds ?? null, preStopWake: await wakeOf(f.queueId) })}`);
+    expect(origins).toEqual([next.commentId]);
+    expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+  }, 60_000);
+
+  it("F3 split control: with NO Stop, a message posted behind a running turn still joins the saved wake (coalesces as today)", async () => {
+    const f = await seed({ person: false, conversation: false });
+    const holderId = await holdTask(f);
+    const next = await postNew(f, "M5 no Stop");
+    const merged = await wakeOf(f.queueId);
+    await evidence(`f3splitControl ${JSON.stringify({ holderId, nextWakeId: next.wakeId, preStopWakeId: f.queueId,
+      wakeCommentIds: (merged.payload?._paperclipWakeContext as { wakeCommentIds?: string[] } | undefined)?.wakeCommentIds })}`);
+    expect(next.wakeId).toBe(f.queueId);
+    expect(merged.coalescedCount).toBeGreaterThanOrEqual(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))
+      .then(rows => rows.filter(row => row.status === "deferred_issue_execution").map(row => row.id))).toEqual([f.queueId]);
+  }, 60_000);
+
   // adopt-stopu PAUSE row (unit): after a Stop + a successor, the agent's pause is not
   // held by remote_stop_unconfirmed (agent-execution-stop.ts executionStopBlocker): the
   // stop_and_retain release wrote the receipt. RED at c1x (the warm handoff has none).
