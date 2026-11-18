@@ -13,6 +13,6 @@ export const HELD_PREDECESSOR_SEND_NOTICE = `${HELD_PREDECESSOR_STATE} ${HELD_PR
  * Both the sweep (recovery/unanswered-person-message.ts) and the executor's
  * held-predecessor writer (S6) use it. */
 export const PERSON_STOP_HELD_MESSAGE_TEXT =
-  "Stopped. This message is waiting and will be sent when you send your next message. Send it now, or delete it.";
+  "Stopped. This message is waiting: Send it, or delete it.";
 export const PERSON_STOP_HELD_MESSAGE_TITLE = "Stopped: your message is waiting";
-export const PERSON_STOP_HELD_MESSAGE_NEXT_ACTION = "Send it now, or delete it.";
+export const PERSON_STOP_HELD_MESSAGE_NEXT_ACTION = "Send it, or delete it.";

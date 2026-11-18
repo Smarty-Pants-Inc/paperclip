@@ -863,7 +863,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // retype is answered twice: the held one is sent right after the new one).
   // The S10-1 case above (a cancel with no person's Stop record) and the
   // non-Stop held control below are unchanged.
-  const PERSON_STOP_HELD = "Stopped. This message is waiting and will be sent when you send your next message. Send it now, or delete it.";
+  const PERSON_STOP_HELD = "Stopped. This message is waiting: Send it, or delete it.";
   const nextActionOf = (comment: { metadata: unknown }) => {
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
     return sections.flatMap(section => section.rows).find(row => row.label === "Next action")?.value;
@@ -890,7 +890,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(bodies.every(body => body === PERSON_STOP_HELD)).toBe(true);
     for (const note of await f.visible()) {
       expect(note.presentation).toMatchObject({ title: "Stopped: your message is waiting" });
-      expect(nextActionOf(note)).toBe("Send it now, or delete it.");
+      expect(nextActionOf(note)).toBe("Send it, or delete it.");
       expect(JSON.stringify(note.metadata)).not.toMatch(/send a new message/i);
     }
   });
@@ -926,7 +926,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(bodies.every(body => body === PERSON_STOP_HELD)).toBe(true);
       for (const note of notes) {
         expect(note.presentation).toMatchObject({ title: "Stopped: your message is waiting" });
-        expect(nextActionOf(note)).toBe("Send it now, or delete it.");
+        expect(nextActionOf(note)).toBe("Send it, or delete it.");
         expect(JSON.stringify(note.metadata)).not.toMatch(/sending it again is safe|send a new message/i);
       }
     });

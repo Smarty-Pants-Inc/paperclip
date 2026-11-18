@@ -748,11 +748,11 @@ describe("TaskChatQueuedMessages", () => {
   // stay listed with ONE line and ONE Send; Send sends them all, once.
   it("after a person's Stop lists the waiting messages with one line and one Send", async () => {
     const stopped: IssueQueuedCommentQueue = { ...queue, targetRunId: null, protocol: "legacy", steeringDisposition: "unsupported",
-      executionWait: { reason: "stopped_by_person", message: "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first." } };
+      executionWait: { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." } };
     const onInterrupt = vi.fn().mockResolvedValue(undefined);
     render({ queue: stopped, onInterrupt });
     const line = container.querySelector('[data-testid="task-chat-queued-stopped"]');
-    expect(line?.querySelector('p[role="status"]')?.textContent).toBe("Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.");
+    expect(line?.querySelector('p[role="status"]')?.textContent).toBe("Stopped. These messages are waiting: Send them, or delete any first.");
     expect(container.textContent).toContain("First queued message");
     expect(container.textContent).toContain("Second queued message");
     // One Send, on the line; each row keeps its delete.
@@ -770,7 +770,7 @@ describe("TaskChatQueuedMessages", () => {
   });
   it("says why Send is refused while the chat is paused, and keeps the messages", async () => {
     const stopped: IssueQueuedCommentQueue = { ...queue, targetRunId: null, protocol: "legacy", steeringDisposition: "unsupported",
-      executionWait: { reason: "stopped_by_person", message: "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first." } };
+      executionWait: { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." } };
     const refusal = Object.assign(new Error("Conflict"), { status: 409, body: {
       error: "This agent is paused. Resume it to send these messages.", details: { code: "queued_comment_chat_paused" } } });
     render({ queue: stopped, onInterrupt: vi.fn().mockRejectedValue(refusal) });

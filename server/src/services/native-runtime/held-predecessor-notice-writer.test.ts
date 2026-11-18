@@ -90,7 +90,7 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
         === `native_prior_owner_held:${sessionId}`);
     expect(notices).toHaveLength(1);
     expect(notices[0]!.body).toBe(cause === "person stop"
-      ? "Stopped. This message is waiting and will be sent when you send your next message. Send it now, or delete it."
+      ? "Stopped. This message is waiting: Send it, or delete it."
       : HELD_PREDECESSOR_NOTICE);
     expect(notices[0]!.body.toLowerCase().includes("send a new message")).toBe(cause !== "person stop");
   });

@@ -43,7 +43,7 @@ import { isQueuedInterruptHandoff, QueuedMessagesChangedError } from "@/lib/issu
 
 type QueueAction = "steer" | "interrupt" | "discard" | "intent" | null;
 export const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
-export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.";
+export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting: Send them, or delete any first.";
 
 /** Preserve the server's actionable refusal (for example, a paused chat). */
 function queueActionErrorText(error: unknown): string | null {
