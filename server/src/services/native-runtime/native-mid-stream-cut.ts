@@ -43,6 +43,7 @@ export function isNativeProviderAccountFailure(error: unknown): boolean {
   // Transport identity wins over any account-looking text or nested metadata.
   if (codes.some(code => typeof code === "string"
     && /^(?:pi_rpc_transport_failed|(?:unexpected_|transport_)?EOF|ECONNRESET|EPIPE|ERR_STREAM_PREMATURE_CLOSE)$/iu.test(code))) return false;
+  if (codes.some(code => typeof code === "string" && /^(insufficient_quota|billing_hard_limit(_reached)?)$/iu.test(code))) return true;
   const statuses = [detail.httpStatus, detail.statusCode, detail.status, failure?.httpStatus].map(Number);
   const message = typeof detail.message === "string" ? detail.message : "";
   // Capacity/rate failures retain their ordinary retry, even if their text
