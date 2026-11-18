@@ -18,6 +18,13 @@ import { Textarea } from "./ui/textarea";
 
 /** Reports whether this surface owns the task's next recovery action. The task's
  * generic Retry stays hidden only while this surface offers its own control. */
+/** The LOST case (native_workspace_sync_out_unrecoverable): the box is gone, so
+ * nothing was or can be "recovered" from it. Pending RFL's final words. */
+export const WORKSPACE_CHANGES_NOT_SAVED_STATUS = "This run could not save its workspace changes. Task recovery is still being checked.";
+/** The same case while this panel offers no action: it must not ask the person for a recovery they cannot start. */
+export const WORKSPACE_CHANGES_NOT_SAVED = "This run could not save its workspace changes.";
+const WORKSPACE_SYNC_OUT_UNRECOVERABLE = "native_workspace_sync_out_unrecoverable";
+
 function ReportRecoverButton({ issueId, shown }: { issueId: string; shown: boolean }) {
   useLayoutEffect(() => {
     reportRecoverSavedFilesShown(issueId, shown);
@@ -372,14 +379,17 @@ function RetainedFilesRecovery({ action, issueId, companyId, className, onRecove
   const unverified = Boolean(current && !verified && !saved && !waiting);
   const recoverButtonShown = Boolean(canMutate && current && verified && retryable && !waiting && !diskFullRest
     && (!pending || unconfirmed && checkedUnconfirmed || confirmedFailedAttempt));
+  const lost = action.cause === WORKSPACE_SYNC_OUT_UNRECOVERABLE;
   return <div className={cn("flex flex-col gap-2 text-sm", className)} data-testid="retained-file-recovery">
     <ReportRecoveryControl owns={ownsRecoveryControl} onChange={onRecoveryControlChange} />
     <ReportRecoverButton issueId={issueId} shown={recoverButtonShown} />
-    <p role="status">{saved ? "Saved files recovered. Task recovery is still being checked."
+    <p role="status">{saved && lost ? WORKSPACE_CHANGES_NOT_SAVED_STATUS
+      : saved ? "Saved files recovered. Task recovery is still being checked."
       : diskFullRest && !waiting ? "The sandbox disk was full when Paperclip saved the files. Free space, then use Retry to save them and finish the task."
       : failedReceipt ? "File recovery has not finished. The saved source remains protected."
       : restoring ? "Recovering saved files. Work remains paused until recovery is verified."
         : waiting ? "File recovery is queued. Waiting for verified saved files."
+          : lost && !recoverButtonShown ? WORKSPACE_CHANGES_NOT_SAVED
           : "The saved files need recovery before work can continue."}</p>
     {canMutate ? <>
       {recoverButtonShown ? <Button variant="outline" size="sm"
