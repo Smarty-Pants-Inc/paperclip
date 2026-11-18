@@ -596,3 +596,58 @@ describe("the streamWrite backstop masks the finished JSON line", () => {
     expect(strip(withBackstop.output())).toBe(strip(output()));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Gap (iv): a password in a URL's userinfo, inside plain text. DB / driver
+// errors print their connection string. The scheme, the user and `@host` stay;
+// only the password is masked.
+// ---------------------------------------------------------------------------
+
+describe("a password in a URL's userinfo inside text is masked", () => {
+  const POSITIVE: Array<[kind: string, input: string, expected: string, password: string]> = [
+    ["postgres", "connect ECONNREFUSED postgres://app:S3cretPw@db:5432/x", "connect ECONNREFUSED postgres://app:***REDACTED***@db:5432/x", "S3cretPw"],
+    ["mysql", "Access denied for mysql://root:Hunter2Mysql@10.0.0.5:3306/app (ER_ACCESS_DENIED_ERROR)", "Access denied for mysql://root:***REDACTED***@10.0.0.5:3306/app (ER_ACCESS_DENIED_ERROR)", "Hunter2Mysql"],
+    ["redis, empty user", "Error: connect ETIMEDOUT redis://:R3disOnlyPw@cache:6379/0", "Error: connect ETIMEDOUT redis://:***REDACTED***@cache:6379/0", "R3disOnlyPw"],
+    ["amqp", "Socket closed during handshake to amqp://guest:Gu3stRabbitPw@rabbit:5672/vhost", "Socket closed during handshake to amqp://guest:***REDACTED***@rabbit:5672/vhost", "Gu3stRabbitPw"],
+    ["https", "request to https://deploy:Dep10yHttpsPw@git.example.test/repo.git failed", "request to https://deploy:***REDACTED***@git.example.test/repo.git failed", "Dep10yHttpsPw"],
+    ["%40-encoded password", "pool error postgresql://app:S3cret%40Encoded@db/x", "pool error postgresql://app:***REDACTED***@db/x", "S3cret%40Encoded"],
+    ["%-escapes and a literal :", "connect postgres://app:p%2Fa:ss%3Aw0rdX@db:5432/x refused", "connect postgres://app:***REDACTED***@db:5432/x refused", "p%2Fa:ss%3Aw0rdX"],
+    ["scheme with + and .", "sqlalchemy postgresql+asyncpg://svc:Plus.Scheme-Pw@db/x down", "sqlalchemy postgresql+asyncpg://svc:***REDACTED***@db/x down", "Plus.Scheme-Pw"],
+  ];
+  const NEGATIVE: Array<[kind: string, input: string]> = [
+    ["a URL with a user and no password", "fetch https://user@host.example.test/path failed"],
+    ["a plain https URL with a port and query", "fetch https://api.example.test:8443/v1/x?x=1&y=2 failed"],
+    ["an email address", "notify paul@example.com and ops@example.org failed"],
+    ["a git sha after @ (pip/npm git spec)", "install git+https://github.com/org/repo.git@a3c8a95e04a2758bf91c7980f999c2ceb10c8075 failed"],
+    ["a git sha after @ (ssh user, no password)", "clone ssh://git@github.com/org/repo.git@523dfe753 failed"],
+    ["a host:port then a path with @", "GET https://host.example.test:8443/pkg/@scope/name@1.2.3 failed"],
+  ];
+
+  it.each(POSITIVE)("masks the %s password, given the text directly", (_kind, input, expected) => {
+    expect(redactSensitiveText(input)).toBe(expected);
+    // Idempotent: a masked line is left as it is.
+    expect(redactSensitiveText(expected)).toBe(expected);
+  });
+
+  it.each(POSITIVE)("masks the %s password inside an Error logged through the production Pino logger", (_kind, input, expected, password) => {
+    const { log, output } = capture();
+    const err = new Error(input);
+    err.stack = `Error: ${input}\n    at connect (driver.ts:10:5)`;
+    log.error({ err }, input);
+    const text = output();
+    expect(text).not.toContain(password);
+    const [record] = records(text);
+    expect(record.err.message).toBe(expected);
+    expect(record.err.stack.split("\n")[0]).toBe(`Error: ${expected}`);
+    expect(record.msg).toBe(expected);
+  });
+
+  it.each(NEGATIVE)("keeps %s as written", (_kind, input) => {
+    expect(redactSensitiveText(input)).toBe(input);
+    const { log, output } = capture();
+    log.error({ err: new Error(input) }, input);
+    const [record] = records(output());
+    expect(record.err.message).toBe(input);
+    expect(record.msg).toBe(input);
+  });
+});

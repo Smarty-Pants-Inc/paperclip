@@ -1089,6 +1089,19 @@ export function redactAgentAdapterConfig(
 const AWS_SECRET_ACCESS_KEY_ASSIGNMENT_RE =
   /(\baws[_-]?secret[_-]?access[_-]?key["']?\s*[=:]\s*["']?)[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/gi;
 
+// A password in a URL's userinfo, inside text: a DB / driver error prints its
+// connection string (`connect ECONNREFUSED postgres://app:S3cret@db:5432/x`).
+// Keep the scheme, the user and `@host`; mask the password only. The password
+// runs to the last `@` before the path, query, fragment, whitespace or a quote,
+// so `%40`-escapes, a literal `:` and an unescaped `@` stay inside it. A URL
+// with no password (`https://user@host`, `https://host:8443/x`) and an email
+// have no `scheme://user:…@` and are not matched. Applied before the hint gate:
+// such a line need hold no hint word and no dot. The scheme starts only where
+// a run of scheme characters starts, so a long `a-a-a-…` run is scanned once
+// (linear), not once per letter.
+const URL_USERINFO_PASSWORD_RE =
+  /((?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s:/?#@"'<>`]*:)[^\s/?#"'<>`]+(?=@)/gi;
+
 // A terminal escape sequence (CSI, e.g. an SGR colour code) ends in a letter,
 // so a credential printed right after one ("\u001b[31msk-…") has no word
 // boundary before it. Scan each run between escape sequences on its own too.
@@ -1104,7 +1117,9 @@ export function redactSensitiveText(input: string): string {
 }
 
 function redactPlainSensitiveText(input: string): string {
-  const text = input.replace(AWS_SECRET_ACCESS_KEY_ASSIGNMENT_RE, `$1${REDACTED_EVENT_VALUE}`);
+  const text = input
+    .replace(AWS_SECRET_ACCESS_KEY_ASSIGNMENT_RE, `$1${REDACTED_EVENT_VALUE}`)
+    .replace(URL_USERINFO_PASSWORD_RE, `$1${REDACTED_EVENT_VALUE}`);
   if (!maybeContainsSecretText(text)) return text;
   return redactCommandText(
     redactStandaloneBearerCredentials(redactAuthorizationCredentials(text))
