@@ -1956,7 +1956,8 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     return { f, wait };
   }
   const rowsN = (Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>).flatMap(reason =>
-    (["queued", "scheduled_retry", "running"] as const).map(other => [reason, other] as const));
+    (["queued", "scheduled_retry", "running"] as const).map(other => [reason, other] as const))
+    .filter(([reason, other]) => !(reason === "execution_recovery" && other === "running"));
   it.each(rowsN)("SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with a typed run %s keeps the wait, not the bar",
     async (reason, other) => {
       const { f, wait } = await ackOwnerStopOnChat(reason);
@@ -1967,6 +1968,35 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
       expect(queue.executionWait).toEqual(wait);
       expect(queue.executionWait?.message).not.toBe(R4);
+    });
+  // RFL record SUPERSEDE-C2B-S7N-RUNNING-CELL-1118 (rf-5's stricter form): behind
+  // a RUNNING typed run the unnamed execution_recovery wait is the ordinary busy
+  // turn (buildQueuedCommentQueue, UNNAMED_EXECUTION_WAIT, routes/issues.ts:7885-7889
+  // @242c9eda), so the GET shows no wait. The real claim stays: never R4. And the
+  // busy turn the GET returns IS that running typed run, matched by its id
+  // (targetRunId), so a wait that vanished for any other reason fails here.
+  it("supersedes(S7-N recovery wait + typed run running: busy turn, not R4; RFL record SUPERSEDE-C2B-S7N-RUNNING-CELL-1118) SCREEN row 4b S7-N: a execution_recovery wait on the chat after an acknowledged owner Stop with a typed run running keeps the wait, not the bar",
+    async () => {
+      const { f } = await ackOwnerStopOnChat("execution_recovery");
+      const [typed] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        invocationSource: "on_demand", triggerDetail: "typed message", status: "running", runtimeMode: "native",
+        createdAt: new Date("2026-08-22T14:59:00.000Z"), contextSnapshot: { issueId: f.issueId } }).returning();
+      const queue = (await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+      expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
+      // (1) no wait at all: the field is absent, not a recovery wait.
+      expect(queue.executionWait).toBeUndefined();
+      expect(Object.keys(queue)).not.toContain("executionWait");
+      // (2) not R4.
+      expect(queue.executionWait?.message).not.toBe(R4);
+      expect(JSON.stringify(queue)).not.toContain(R4);
+      // (3) the exact busy turn the GET returns, pinned whole: the deferred queue
+      // behind the running typed run, whose busy field (targetRunId) carries that
+      // run's id as the full string (not the stopped run, not null).
+      const { entries: _entries, ...busyTurn } = queue;
+      expect(busyTurn).toStrictEqual({ issueId: f.issueId, queueId: f.wakeId, state: "deferred", targetRunId: typed.id,
+        revision: expect.any(String), protocol: "paperclip_runner_v1", steeringDisposition: "temporarily_unavailable" });
+      expect(queue.targetRunId).toBe(typed.id);
+      expect(queue.targetRunId).not.toBe(f.runId);
     });
 
   it.each(Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>)(
