@@ -832,6 +832,31 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(history[0]!.deletedAt).not.toBeNull();
     });
 
+  // SCREEN row 3 (Stop means stop): two messages saved behind a PERSON's Stop
+  // are held (nothing promotes them), on an Agent Chat and on its task twin.
+  // They get the HELD notice, never "it will start by itself". The S10-1 case
+  // above (a cancel with no person's Stop record) is the unchanged control.
+  it.each([true, false])("SCREEN row 3: two messages held behind a person's Stop get the HELD notice (chat=%s)", async chat => {
+    const f = await fixture({ chat });
+    const stoppedRunId = await f.run({ commentId: await f.message("Run the long job"), status: "cancelled", errorCode: "cancelled" });
+    await db.update(heartbeatRuns).set({ resultJson: { cancelledByActorType: "user", cancelledByUserId: f.userId } })
+      .where(eq(heartbeatRuns.id, stoppedRunId));
+    const first = await f.message("A"), second = await f.message("B");
+    const createdAt = new Date(Date.now() - 120_000);
+    for (const id of [first, second]) await db.update(issueComments).set({ createdAt }).where(eq(issueComments.id, id));
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+      reason: "issue_execution_deferred", requestedByActorType: "user", requestedByActorId: f.userId,
+      status: "deferred_issue_execution", createdAt, updatedAt: createdAt,
+      payload: { issueId: f.issueId, commentId: second, _paperclipWakeContext: { issueId: f.issueId, wakeCommentIds: [first, second] },
+        executionWait: { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." } } });
+    await f.sweep();
+    await settleAt(f, PENDING_WAIT_BOUND_MS + 1_000);
+    const bodies = (await f.visible()).map(note => note.body);
+    expect(bodies).not.toContain(WAITING);
+    expect(bodies.length).toBeGreaterThan(0);
+    expect(bodies.every(body => body === HELD)).toBe(true);
+  });
+
   it("waitnote: execution_recovery uses the existing start bound and upgrades the SAME waiting note after it", async () => {
     const f = await stoppedMessageWithWait("deferred_issue_execution", { reason: "execution_recovery", message: "Recovery will retry automatically." });
     await f.sweep();

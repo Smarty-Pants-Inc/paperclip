@@ -580,6 +580,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   }
   let waitingToStart = false;
   let continuationWaiting = false;
+  let heldByPersonStop = false;
   if (liveRuns.length && !agentPaused && !settingUp) {
     const wait = await bounded(now.getTime() + 30_000);
     if (wait) return wait;
@@ -627,7 +628,22 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       if (wait) return wait;
       // After the short pending grace, use the existing waiting note and its
       // start bound below instead of telling the person to duplicate input.
-      if (pendingExecutionWait) waitingToStart = true;
+      // Stop means stop: behind a person's Stop (the agent's latest turn on
+      // this task is cancelled with cancelledByActorType "user", the record
+      // routes/issues.ts reads for the held bar) nothing promotes the wake
+      // (wake-queue/adapters/postgres.ts releasePreDrain), so it is held.
+      // A person's Send (queuedCommentInterrupt) is delivering it: still waiting.
+      const sendRequested = wakes.some(wake => wakeCarriesMessage(wake.payload, message.id)
+        && wake.payload?.queuedCommentInterrupt != null);
+      if (pendingExecutionWait && !sendRequested) {
+        const [lastTurn] = await q.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+          .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun))
+          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+        const stop = (lastTurn?.resultJson ?? {}) as Record<string, unknown>;
+        heldByPersonStop = lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user"
+          && !stop.queuedCommentInterruptQueueId;
+        if (!heldByPersonStop) waitingToStart = true;
+      } else if (pendingExecutionWait) waitingToStart = true;
     }
   }
 
@@ -636,6 +652,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     code = UNANSWERED_MESSAGE_AGENT_SETUP_CODE;
   } else if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
+  } else if (heldByPersonStop) {
+    code = "cancelled";
   } else if (waitingToStart) {
     // The ordinary carrying-run start bound is unchanged. A known queued
     // continuation keeps the waiting note until it starts or terminates;
@@ -769,7 +787,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // its own (#20925): never the held-conversation "send a new message" note,
   // as isNativeContinuationRefusal already decides for its own patterns.
   const policyRefused = code === PROVIDER_POLICY_REFUSAL_CODE;
-  const held = (isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run));
+  const held = heldByPersonStop
+    || ((isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run)));
   const supervisionUnconfirmed = code === REMOTE_RUNNER_SUPERVISION_EXHAUSTED && !held;
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
