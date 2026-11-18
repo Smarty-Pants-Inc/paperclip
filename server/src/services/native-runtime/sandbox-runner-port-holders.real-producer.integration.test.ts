@@ -12,7 +12,7 @@ import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { and, eq } from "drizzle-orm";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { activityLog, heartbeatRuns } from "@paperclipai/db";
 import { describeEmbeddedPostgres, nativeRestartFixture } from "../../__tests__/helpers/native-restart.js";
 import { REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT } from "./native-session-executor.js";
@@ -34,7 +34,10 @@ async function proc(pid: number): Promise<Proc | null> {
 }
 const gone = async (pid: number) => { const p = await proc(pid); return p === null || p.state === "Z"; };
 
-describeEmbeddedPostgres.skipIf(process.platform !== "linux" || !existsSync(PRODUCER))(
+// Runs only on Linux with the producer built (cargo build -p paperclip-runner-core --example reaper_real_producer).
+const describeRealProducer = process.platform === "linux" && existsSync(PRODUCER) ? describeEmbeddedPostgres : describe.skip;
+
+describeRealProducer(
   "B1 fence (b): reaping a Runner stops every process group it recorded (real producer)", () => {
   const environment = nativeRestartFixture();
   const launched: ChildProcess[] = [];
