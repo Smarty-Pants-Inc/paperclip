@@ -3,6 +3,8 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { closeIdleWarmNativeSessionsForRestart } from "../services/native-runtime/native-session-executor.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
+import { completedPersonMessageAnswerSql } from "../services/person-message-answer.js";
+import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   costEvents,
@@ -398,12 +400,21 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         idempotencyKey: wakeInput.idempotencyKey, payload: { cause: "native_run_failed" }, deliveryState: "delivered", deliveredAt: new Date() });
       return wake!;
     }
-    async function successor(link: "column" | "restore-context" | "none", answer: boolean) {
+    // compose (fam-long x ANSWERED, stack tA): ANSWERED attributes a reply only through the replying run's OWN
+    // pending input, never ancestry (RFL F2). `own` puts the origin's pending input into the later run's OWN input
+    // the way a real recovery successor holds it: the fresh-session retry lanes as attributionCommentIds /
+    // attributionInteractionIds (native-provider-capacity-retry.ts), a restored run as its wake ids
+    // (readContinuationCommentInput). The default ("ancestry") is the fixture every other caller always had.
+    async function successor(link: "column" | "restore-context" | "none", answer: boolean,
+      own: "ancestry" | "typed" | "typed+card" = "ancestry", cardId?: string) {
       const id = randomUUID();
       await db.insert(heartbeatRuns).values({ id, companyId, agentId, issueId, nativeIssueId: issueId,
         invocationSource: "automation", triggerDetail: "system", status: "succeeded", runtimeMode: "native", finishedAt: new Date(),
         ...(link === "column" ? { retryOfRunId: failedRunId } : {}),
         contextSnapshot: { issueId, ...(link === "none" ? { wakeCommentId: commentId } : {}),
+          ...(own !== "ancestry" && link === "column" ? { attributionCommentIds: [commentId] } : {}),
+          ...(own !== "ancestry" && link === "restore-context" ? { wakeCommentId: commentId, wakeCommentIds: [commentId] } : {}),
+          ...(own === "typed+card" && cardId ? { attributionInteractionIds: [cardId] } : {}),
           ...(link === "restore-context" ? { previousRunId: failedRunId, wakeReason: "issue_recovery_action_restored", source: "execution.reconciled" } : {}) } });
       if (answer) await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId,
         createdByRunId: id, body: "Here is the final answer." });
@@ -416,7 +427,21 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Here is the final answer.", provider: "test", model: "test-model" };
     });
-    return { companyId, agentId, issueId, failedRunId, commentId, decisionId, assessmentId, resultId, intent, successor, wakeInput };
+    /** A person's answer to the agent's card, pending on the failed run as its own input (card variant). */
+    async function pendingCardAnswer() {
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId, issueId, kind: "ask_user_questions", status: "answered",
+        createdByAgentId: agentId, resolvedByUserId: "responsible-user", resolvedAt: new Date(Date.now() - 5_000), idempotencyKey: randomUUID(),
+        payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", selectionMode: "single", options: [{ id: "yes", label: "YES" }] }] },
+        result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }] } } as never).returning();
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, wakeReason: "retry_failed_run",
+        firstTurnQueuedInput: { commentIds: [commentId] }, interactionId: card!.id } }).where(eq(heartbeatRuns.id, failedRunId));
+      return card!;
+    }
+    const answeredState = async (id: string, at: Date) => (await db.select({ answered: completedPersonMessageAnswerSql({ id: sql`${id}::uuid`,
+      companyId: sql`${companyId}::uuid`, issueId: sql`${issueId}::uuid`, createdAt: sql`${at.toISOString()}::timestamptz` }) })
+      .from(issues).where(eq(issues.id, issueId)))[0]!.answered;
+    return { companyId, agentId, issueId, failedRunId, commentId, decisionId, assessmentId, resultId, intent, successor, wakeInput,
+      messageAt, pendingCardAnswer, answeredState };
   }
 
   it.each(["promotion-race"] as const)("JUDGE_NATIVE real committer queue dispatch executor (%s)", async scenario => {
@@ -514,10 +539,11 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId,f.issueId),eq(issueComments.authorType,"agent")))).toHaveLength(2);
   });
 
-  it.each(["column", "restore-context", "none"] as const)("R-ONCE skips a generic retry after a later run answered (%s)", async link => {
+  // Reason: the later run answers M only when M is that run's OWN pending input (RFL F2); the fixture now holds it there.
+  it.each(["column", "restore-context", "none"] as const)("supersedes(R-ONCE later-run-answered by ancestry; RFL F2 own-input attribution): R-ONCE skips a generic retry after a later run answered (%s)", async link => {
     const f = await seedFailedPersonRetry();
     const intent = await f.intent(); // Intent predates recovery: decision-time checks alone cannot fix this.
-    await f.successor(link, true);
+    await f.successor(link, true, "typed");
     const result = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
     await heartbeat.drainActiveRunExecutions();
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
@@ -529,6 +555,50 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(saved).toMatchObject({ status: "skipped", runId: null, error: "person_message_already_answered" });
     expect(saved!.finishedAt).not.toBeNull();
     await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
+  });
+
+  // ONE legacy control (RFL F2): the later run is linked only by ancestry (retryOfRunId / previousRunId) and M is
+  // NOT in its own input. Its reply does not answer M. The failed run still has its ONE successor, so the generic
+  // retry is not a second one (never more than one generic dispatch), and M gets ONE true notice, never two.
+  it.each(["column", "restore-context"] as const)("legacy control (RFL F2): a later run linked only by ancestry, M not in its own input, does not answer M; at most one generic dispatch, no double notice (%s)", async link => {
+    const f = await seedFailedPersonRetry();
+    const intent = await f.intent();
+    await f.successor(link, true);
+    expect(await f.answeredState(f.commentId, f.messageAt), "M is NOT answered by ancestry").toBe(false);
+    const first = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    const second = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.id));
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    for (const minutes of [20, 40]) await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId,
+      now: new Date(Date.now() + minutes * 60_000) });
+    const notices = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+      .filter(comment => String((comment.metadata as Record<string, unknown> | null)?.authorizationReason ?? "").startsWith("unanswered_message:"));
+    console.log("LEGACY_ANCESTRY_CONTROL", JSON.stringify({ link, dispatched: [first.dispatched, second.dispatched], runs: runs.length,
+      wake: { status: saved?.status, error: saved?.error }, notices: notices.map(n => n.body) }));
+    expect(first.dispatched + second.dispatched, "never a second generic dispatch").toBeLessThanOrEqual(1);
+    expect(saved).toMatchObject({ status: "skipped", runId: null, error: "failed_run_has_successor" }); // never "already answered"
+    expect(runs).toHaveLength(2);
+    expect(notices, "ONE true notice, no double notice").toHaveLength(1);
+  });
+
+  // Card variant (RFL F2 own-input attribution + the 5c guard): the failed run also holds a person's CARD answer.
+  // The generic retry is skipped as already answered only when the later run answered BOTH through its OWN input.
+  it.each([{ own: "typed" as const, error: "failed_run_has_successor" }, { own: "typed+card" as const, error: "person_message_already_answered" }])(
+    "card variant (RFL F2 own-input attribution): a pending card answer counts; later run own input $own -> $error", async ({ own, error }) => {
+    const f = await seedFailedPersonRetry();
+    const card = await f.pendingCardAnswer();
+    const intent = await f.intent();
+    await f.successor("column", true, own, card.id);
+    expect(await f.answeredState(f.commentId, f.messageAt)).toBe(true);
+    expect(await f.answeredState(card.id, card.resolvedAt!), "the card answer is ANSWERED only through the later run's own input").toBe(own === "typed+card");
+    const result = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect(result.dispatched).toBe(0);
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.id));
+    expect(saved).toMatchObject({ status: "skipped", runId: null, error });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
   });
 
