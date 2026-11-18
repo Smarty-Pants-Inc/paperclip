@@ -3670,10 +3670,18 @@ suite("fresh-continuation fallback", () => {
 
   // F4 migration: old U5 notes are history, not current instructions. Exercise
   // the upgrade executor, continuation card and the API's comment read service.
+  // The 0495 receipt by its file hash (the executor's own key, packages/db/src/client.ts
+  // mapHashesToMigrationFiles). A later migration (0496 onward) keeps its own receipt, so the rewind
+  // never re-runs a non-idempotent later file (fix15c: 0496's ADD COLUMN re-ran and failed).
+  async function legacyNotesReceipt() {
+    const [{ readFile }, { createHash }] = await Promise.all([import("node:fs/promises"), import("node:crypto")]);
+    return createHash("sha256").update(await readFile(new URL("../../../packages/db/src/migrations/0495_retire_legacy_message_notes.sql",
+      import.meta.url), "utf8")).digest("hex");
+  }
   async function migrateLegacyNotes() {
     // The fixture starts at head. Rewind ONLY the new data-migration receipt
     // so its persisted rows have the same shape as an upgraded database.
-    await db.execute(sql`delete from drizzle.__drizzle_migrations where created_at > 1794877714216`);
+    await db.execute(sql`delete from drizzle.__drizzle_migrations where hash = ${await legacyNotesReceipt()}`);
     await applyPendingMigrations(temporary!.connectionString);
   }
 
@@ -3785,7 +3793,7 @@ suite("fresh-continuation fallback", () => {
     await db.$client.unsafe(await readFile(new URL("../../../packages/db/src/migrations/0495_retire_legacy_message_notes.sql", import.meta.url), "utf8"));
     const again = await comments();
     expect(again.sort((a, b) => a.id.localeCompare(b.id))).toEqual(after.sort((a, b) => a.id.localeCompare(b.id)));
-    const receipt = await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations where created_at > 1794877714216`);
+    const receipt = await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations where hash = ${await legacyNotesReceipt()}`);
     expect(receipt[0]!.count).toBe(1);
     console.info(JSON.stringify({ migrationScope: { marked: before.length, untouched: current.length, receipts: receipt[0]!.count } }));
   }, 60_000);
