@@ -84,6 +84,15 @@ export function warmSandboxExpiryCandidateCondition() {
     sql`coalesce(${environmentLeases.metadata}#>>'{legacyShutdownWorkspaceSettlement,state}', '') <> 'pending'`,
     sql`not exists (select 1 from heartbeat_runs run where run.id = ${environmentLeases.heartbeatRunId}
       and run.status not in ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))`,
+    // adopt-stopu-ugate (3), never-OK: the release-site guard's rule
+    // (person-stop-release-export.ts exportPersonStoppedWarmWorkspaceBeforeRelease)
+    // covers this enqueue too. A box whose person-stopped run's workspace
+    // descriptor for THIS lease is still `prepared` holds the only copy of the
+    // turn's edit; the pending_cleanup sweep skips its export-pending check for
+    // stop-only rows (heartbeat/recovery.ts), so no stop-only cleanup is
+    // enqueued here before the export. The box is kept; the person already has
+    // the guard's true line (deferred / tools not proven stopped).
+    personStopPreparedSourceExcludedSql(),
     sql`not exists (select 1 from environment_leases other where other.id <> ${environmentLeases.id}
       and other.provider = ${environmentLeases.provider} and other.provider_lease_id = ${environmentLeases.providerLeaseId}
       and other.status in ('active', 'retained', 'pending_cleanup'))`,
@@ -92,6 +101,18 @@ export function warmSandboxExpiryCandidateCondition() {
       and ${environmentLeases.issueId} is not null
       and (other.issue_id = ${environmentLeases.issueId} or other.native_issue_id = ${environmentLeases.issueId}))`,
   );
+}
+
+/** A person-stopped (acknowledged run-only Stop) native run whose workspace
+ * descriptor for this lease is still `prepared`: its export is owed. */
+export function personStopPreparedSourceExcludedSql() {
+  return sql`not exists (select 1 from heartbeat_runs run where run.id = ${environmentLeases.heartbeatRunId}
+    and run.runtime_mode = 'native' and run.status = 'cancelled'
+    and run.result_json #>> '{nativeCancellation,scope}' = 'run'
+    and run.result_json #>> '{nativeCancellation,reasonCode}' = 'cancellation_run_only'
+    and run.result_json #>> '{nativeCancellation,dispatchState}' = 'acknowledged'
+    and run.runner_profile_json #>> '{nativeWorkspaceSync,state}' = 'prepared'
+    and run.runner_profile_json #>> '{nativeWorkspaceSync,leaseId}' = ${environmentLeases.id}::text)`;
 }
 
 /** When the next retained warm sandbox's window ends, or null when none waits. */
