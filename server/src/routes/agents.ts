@@ -1,4 +1,5 @@
 import { PI_THINKING_LEVELS } from "../vendor/paperclip-runner/index.js";
+import { pausingAgentsReport } from "../services/agent-execution-stop.js";
 import { resolveLoginEnvironmentTarget } from "../services/login-environment.js";
 import { checkAgentProtectedEnvironmentKeys } from "../services/protected-environment-keys.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
@@ -4114,6 +4115,15 @@ export function agentRoutes(
       res.json(annotateConnectorSkills(withAssignedSkillVersions(snapshot, nextAdapterConfig), connectorAssignments));
     },
   );
+
+  // PAUSING-DESIGN-R2 F, report only: pausing agents, their Stop blocker and
+  // leases. No repair, no dispatch, no write.
+  router.get("/companies/:companyId/agents/pausing-report", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    res.json({ reportOnly: true, agents: await pausingAgentsReport(db, companyId) });
+  });
 
   router.get("/companies/:companyId/agents", async (req, res) => {
     const companyId = req.params.companyId as string;

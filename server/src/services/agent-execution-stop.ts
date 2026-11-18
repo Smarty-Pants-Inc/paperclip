@@ -2,9 +2,9 @@ import { readProcessStartedAt } from "./hot-restart.js";
 import { readLeaseReleaseDeferral } from "./environment-lease-release-deferral.js";
 import { runUsedConversationAdapter } from "./conversation-continuation.js";
 import { and, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agents, environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
-import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, ownLeaseTerminated } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { hasAcknowledgedNativeStopIntent } from "./acknowledged-native-stop.js";
 import { hasStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
@@ -79,7 +79,15 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
   const leases = allLeases.filter(lease => !lease.heartbeatRunId || !handedOff.has(lease.heartbeatRunId));
   const deferred = leases.find(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata));
   if (deferred) return `environment_lease_release_deferred:${readLeaseReleaseDeferral(deferred.metadata)!.reason}`;
-  if (leases.some(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed")) return "environment_lease_unreleased";
+  // C1: execution proof per remote lease through the one owner-scoped reader.
+  const proved = new Set<string>();
+  for (const lease of leases) {
+    if (!lease.provider || lease.provider === "local" || !lease.heartbeatRunId) continue;
+    if (hasRemoteTerminationReceipt(lease) || await ownLeaseTerminated(db, { companyId: lease.companyId,
+      environmentId: lease.environmentId, providerLeaseId: lease.providerLeaseId, runId: lease.heartbeatRunId, leaseId: lease.id },
+    { carriedCleanupStop: true })) proved.add(lease.id);
+  }
+  if (leases.some(lease => !proved.has(lease.id) && ((!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed"))) return "environment_lease_unreleased";
   const coordinators = await db.select().from(nativeRunFinalizations)
     .where(inArray(nativeRunFinalizations.runId, runIds));
   const now = new Date();
@@ -102,7 +110,7 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
     if (handedOff.has(run.id)) continue;
     const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
     if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
-      if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return "remote_stop_unconfirmed";
+      if (run.status === "cancelled" && !runLeases.every(lease => proved.has(lease.id))) return "remote_stop_unconfirmed";
       continue;
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
@@ -139,4 +147,22 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
     if (!cleared) return "native_finalization_release_raced";
   }
   return null;
+}
+
+/** Section F, report only: each pausing agent's Stop blocker, runs and leases.
+ * Reads with the task-scoped (write-free) proof mode; it never writes. */
+export async function pausingAgentsReport(db: Db, companyId: string) {
+  const rows = await db.select({ id: agents.id }).from(agents)
+    .where(and(eq(agents.companyId, companyId), eq(agents.lifecycleState, "pausing"))).limit(100);
+  return Promise.all(rows.map(async ({ id }) => {
+    const condition = and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, id))!;
+    const runIds = (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition)).map(run => run.id);
+    const leases = runIds.length ? await db.select({ id: environmentLeases.id, runId: environmentLeases.heartbeatRunId,
+      status: environmentLeases.status, cleanupStatus: environmentLeases.cleanupStatus, provider: environmentLeases.provider,
+      cleanupDisposition: sql`${environmentLeases.metadata}->'cleanupDisposition'` }).from(environmentLeases)
+      .where(and(eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, runIds))) : [];
+    const blocker = await executionStopBlocker(db, condition, runIds.length ? and(eq(environmentLeases.companyId, companyId),
+      inArray(environmentLeases.heartbeatRunId, runIds))! : sql`false`, undefined, false);
+    return { agentId: id, blocker, runIds, leases };
+  }));
 }

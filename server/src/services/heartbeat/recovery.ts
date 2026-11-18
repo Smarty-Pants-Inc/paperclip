@@ -19,6 +19,7 @@ import { createScheduledRetryCancellationRecovery } from "./scheduled-retry-canc
 import {
   PENDING_CLEANUP_ATTEMPTS_METADATA_KEY,
   PENDING_CLEANUP_SWEEP_ATTEMPT_CAP,
+  cleanupNotParkedSql,
   pendingCleanupAttemptsSql,
   pendingCleanupDeadlineSql,
   pendingCleanupMetadataObjectSql,
@@ -1891,7 +1892,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       .from(environmentLeases)
       .where(
         and(
-          eq(environmentLeases.status, "pending_cleanup"),
+          eq(environmentLeases.status, "pending_cleanup"), cleanupNotParkedSql(),
           opts?.explicitRetry ? eq(environmentLeases.companyId, opts.explicitRetry.companyId) : undefined,
           opts?.explicitRetry ? eq(environmentLeases.heartbeatRunId, opts.explicitRetry.runId) : undefined,
           opts?.environmentRetry ? eq(environmentLeases.environmentId, opts.environmentRetry.environmentId) : undefined,

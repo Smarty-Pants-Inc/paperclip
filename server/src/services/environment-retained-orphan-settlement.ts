@@ -219,6 +219,11 @@ export async function settleRetainedOrphanSandbox(db: Db, record: InProgressReco
       metadata: sql`(${environmentLeases.metadata} - 'remoteExecutionTermination') || ${JSON.stringify({
         workspaceRecoveryCleanup: { runId, stopReceipt: lease.metadata?.remoteExecutionTermination,
           reason: RETAINED_ORPHAN_RELEASED_REASON, releasedAt: now.toISOString(), ownerProof: context.proof.reason },
+        // C2: a provider that declares stop-and-retain keeps the computer on
+        // destroy; park it with its carried Stop proof, never queue a destroy.
+        ...(lease.metadata?.retainOnDestroy === true ? { cleanupDisposition: { state: "parked",
+          code: "provider_retains_resource", observedAt: now.toISOString(), provider: lease.provider,
+          providerLeaseId: lease.providerLeaseId, sourcePolicyRef: "lease.metadata.retainOnDestroy" } } : {}),
         pendingCleanupInFlight: false, pendingCleanupRetryAfterMs: 0, pendingCleanupRetryAttempts: 0,
         pendingCleanupLeaseExpiresAtMs: 0 })}::jsonb`,
     }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.heartbeatRunId, runId),

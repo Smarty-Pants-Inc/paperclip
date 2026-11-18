@@ -13,9 +13,9 @@ import { agentHarnessVerificationService } from "./agent-harness-verification.js
 import { agentInstanceSecretService } from "./agent-instance-secrets.js";
 import { AGENT_LIFECYCLE_STOP_REASON, COMPANY_ARCHIVED_STOP_REASON } from "./governance-pause-stop.js";
 
-export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): LifecycleDriver {
+export function createLifecycleDriver(db: Db, manager: PluginWorkerManager,
+  heartbeat = heartbeatService(db, { pluginWorkerManager: manager })): LifecycleDriver {
   const { verify } = agentHarnessVerificationService(db, manager);
-  const heartbeat = heartbeatService(db, { pluginWorkerManager: manager });
 
   async function resolveAgentEnvironment(agent: { id: string; companyId: string }) {
     const [placement] = await db.select({ environmentId: agents.defaultEnvironmentId }).from(agents)
