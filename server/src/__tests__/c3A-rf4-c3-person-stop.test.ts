@@ -153,7 +153,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       return response.body as Array<Record<string, unknown>>;
     };
     const snapshots: Record<string, Array<Record<string, unknown>>> = {};
-    let failStop = opts.silentWait !== "confirmed";
+    const failStop = opts.silentWait !== "confirmed";
     const realSetTimeout = globalThis.setTimeout;
     // Timing-only injection: spend the real nine-attempt retry budget without
     // waiting six minutes. No gate/attempt counter is assigned by the fixture.
@@ -197,16 +197,9 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
           snapshots.operatorRequiredPoll = await readThread();
         }
         await fs.writeFile(path.join(process.env.TASK_OUT!, `sw-${opts.silentWait}-thread.json`), JSON.stringify({ companyId, issueId, runId, commentId, snapshots }, null, 2));
-        // End the injected outage through the real provider/teardown boundary;
-        // never clear a cleanup gate or plant a stop receipt in the database.
-        failStop = false;
-        const stopped = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-        await heartbeat.releaseEnvironmentLeasesForRun({ runId, companyId, agentId, status: stopped[0]!.status, providerResourceDisposition: "stop_and_retain" });
-        await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
-        await heartbeat.releaseEnvironmentLeasesForRun({ runId, companyId, agentId, status: stopped[0]!.status, providerResourceDisposition: "stop_and_retain" });
       }
       const admittedAt = Date.now();
-      do { await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions(); if (fixture.calls.length > 1) break; await new Promise(r => setTimeout(r, 100)); } while (Date.now() - admittedAt < 10_000);
+      do { await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions(); if (fixture.calls.length > 1 || (opts.silentWait && failStop)) break; await new Promise(r => setTimeout(r, 100)); } while (Date.now() - admittedAt < 10_000);
       const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
       const allLeases = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
       const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
@@ -231,8 +224,10 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     expect.soft(bodies(r.snapshots.operatorRequired).filter(body => body === operatorLine), "R2 exhausted line").toHaveLength(1);
     expect.soft(bodies(r.snapshots.operatorRequiredPoll).filter(body => body === operatorLine), "R2 dedupe on later polls").toHaveLength(1);
     expect(r.snapshots.settling.some(comment => comment.id === r.commentId && comment.body === "Please answer next."), "typed message saved").toBe(true);
-    expect(r.runs, "one successor after a confirmed provider stop").toHaveLength(1);
-    expect(r.calls).toEqual([r.runId, r.runs[0]!.id]);
+    expect(r.runs, "one saved successor, still held without a confirmed stop").toHaveLength(1);
+    expect(r.runs[0]).toMatchObject({ status: "queued", startedAt: null });
+    expect(r.confirmed).toBe(false);
+    expect(r.calls).toEqual([r.runId]);
   }, 60_000);
   it("SW R3: pending cleanup keeps the existing wait line once", async () => {
     const r = await exercise("mid_turn", "sw-pending", { chat: true, silentWait: "pending" });
