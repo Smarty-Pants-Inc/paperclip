@@ -6908,10 +6908,14 @@ async function ownerStopAwaitingAcknowledgement(input: { db: Db; execution: Nati
  * no held lease (NULL) -> its tools are not yet confirmed exited. */
 async function stoppedRunWaitMessage(input: { db: Db; execution: NativeExecutionInput }, stoppedRunId: unknown): Promise<string> {
   if (typeof stoppedRunId !== "string") return STOPPED_RUN_TOOLS_WAIT_MESSAGE;
+  return await stoppedRunHoldsActiveLease(input, stoppedRunId) ? RETAINED_OWNER_LEASE_WAIT_MESSAGE : STOPPED_RUN_TOOLS_WAIT_MESSAGE;
+}
+
+async function stoppedRunHoldsActiveLease(input: { db: Db; execution: NativeExecutionInput }, stoppedRunId: string) {
   const [held] = await input.db.select({ id: environmentLeases.id }).from(environmentLeases)
     .where(and(eq(environmentLeases.companyId, input.execution.binding.companyId),
       eq(environmentLeases.heartbeatRunId, stoppedRunId), eq(environmentLeases.status, "active"))).limit(1);
-  return held ? RETAINED_OWNER_LEASE_WAIT_MESSAGE : STOPPED_RUN_TOOLS_WAIT_MESSAGE;
+  return Boolean(held);
 }
 
 /** Waits within warmSessionReleaseWait (outside any transaction) for the
@@ -7052,15 +7056,17 @@ async function readStoppedRunToolsWait(input: Parameters<typeof inspectFinishedP
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId))).limit(1);
   const wait = record(record(run?.contextSnapshot)[STOPPED_RUN_TOOLS_WAIT_KEY]);
   const same = wait.stoppedRunId === stoppedRunId;
-  let retryOfWaited = false;
+  let retryOfWaited = false, retryAfterCap = false;
   if (run?.retryOfRunId) {
-    const [retried] = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.id, run.retryOfRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+    const [retried] = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.retryOfRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
     retryOfWaited = record(record(retried?.contextSnapshot)[STOPPED_RUN_TOOLS_WAIT_KEY]).stoppedRunId === stoppedRunId;
+    // The heartbeat records the cap's terminal note as the failed run's failureCause.
+    retryAfterCap = retryOfWaited && record(retried?.resultJson).failureCause === STOPPED_RUN_TOOLS_UNCONFIRMED;
   }
   const firstDeferredAt = same && typeof wait.firstDeferredAt === "string" ? Date.parse(wait.firstDeferredAt) : Number.NaN;
   return { deferrals: same && typeof wait.deferrals === "number" ? wait.deferrals : 0,
-    firstDeferredAt: Number.isFinite(firstDeferredAt) ? firstDeferredAt : null, retryOfWaited };
+    firstDeferredAt: Number.isFinite(firstDeferredAt) ? firstDeferredAt : null, retryOfWaited, retryAfterCap };
 }
 
 /** The same stop a person's Stop releases with: releaseRunLeases'
@@ -7101,9 +7107,14 @@ async function retireAfterStopIssuedTurnCommands(input: Parameters<typeof inspec
   if (!refused.startsWith("journal_commands_unsettled(")) return { retired: false, refused };
   let exempt = await stopIssuedTurnCommandsOfDirectSuccessor(input);
   if (!exempt) return { retired: false, refused };
-  if (!exempt.generationGone) {
-    const stoppedRunId = String(input.identity.runId);
-    const wait = await readStoppedRunToolsWait(input, stoppedRunId);
+  const stoppedRunId = String(input.identity.runId);
+  const wait = exempt.generationGone ? null : await readStoppedRunToolsWait(input, stoppedRunId);
+  // S095 step 3: the person's Retry after the cap's terminal note, with no
+  // ACTIVE lease of the stopped run (none, or released without a receipt):
+  // there is no box left to stop, so it is admitted, not deferred again.
+  const retryWithoutBox = wait?.retryAfterCap === true && !(await stoppedRunHoldsActiveLease(input, stoppedRunId));
+  if (retryWithoutBox) await input.onLog?.("stderr", `[paperclip-runner] Retry after the stopped run's tools could not be confirmed: run ${stoppedRunId} holds no active box; admitting\n`);
+  if (wait && !retryWithoutBox) {
     if (wait.deferrals >= STOPPED_RUN_TOOLS_STOP_AFTER_DEFERRALS || wait.retryOfWaited) {
       await requestStoppedRunStopAndRetain(input, stoppedRunId);
     }
@@ -7122,7 +7133,7 @@ async function retireAfterStopIssuedTurnCommands(input: Parameters<typeof inspec
         { message: await stoppedRunWaitMessage(input, input.identity.runId), stoppedRunToolsWait: { stoppedRunId } });
     }
   }
-  await input.onLog?.("stderr", `[paperclip-runner] run ${String(input.identity.runId)}'s Runner is gone; `
+  if (!retryWithoutBox) await input.onLog?.("stderr", `[paperclip-runner] run ${String(input.identity.runId)}'s Runner is gone; `
     + "its unanswered turn commands issued after the person's acknowledged Stop no longer hold this conversation\n");
   return retireFinishedPerTurnRunnerdOwner({ ...input, projectedControlBytes: exempt.projected });
 }

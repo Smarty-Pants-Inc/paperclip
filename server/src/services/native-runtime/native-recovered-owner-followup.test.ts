@@ -2032,6 +2032,60 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await quarantined()).toEqual([]);
   }, 120_000);
 
+  /** S095 step 3: 2 deferral cycles, then the cap's terminal note; the heartbeat
+   * fails the run with the note's code as failureCause (run-completion.ts
+   * failureCauseFromError) and the person presses Retry. */
+  async function retryAfterCap(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
+    followUp: Awaited<ReturnType<typeof admitFollowUp>>) {
+    await deferCycles(prior, followUp, 2);
+    await ageFirstDeferral(followUp.runId, STOPPED_RUN_TOOLS_WAIT_CAP_MS);
+    const capped = await executeFollowUp(prior, followUp, 300);
+    expect(capped.outcome).toBeInstanceOf(NativeStoppedRunToolsUnconfirmedError);
+    expect(failureText(capped.outcome)).toBe("Couldn't confirm the stopped run's tools exited. Your message is saved. Press Retry to try again.");
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "adapter_failed",
+      error: failureText(capped.outcome), resultJson: { failureCause: "native_stopped_run_tools_unconfirmed" } })
+      .where(eq(heartbeatRuns.id, followUp.runId));
+    const retry = await admitFollowUp(prior);
+    await db.update(heartbeatRuns).set({ retryOfRunId: followUp.runId }).where(eq(heartbeatRuns.id, retry.runId));
+    return retry;
+  }
+
+  it.each([
+    ["no lease of the stopped run (NULL)", false],
+    ["the stopped run's lease released without a receipt", true],
+  ])("S095 step 3: after the cap's terminal note, a Retry with %s is admitted once and answers", async (_label, released) => {
+    const { prior, followUp } = await stopTurnShape({ receipt: false });
+    if (released) {
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() })
+        .where(eq(environmentLeases.id, await holdOldBoxLease(prior)));
+    }
+    const retry = await retryAfterCap(prior, followUp);
+    const { outcome } = await executeFollowUp(prior, retry, 5_000);
+    expect.soft(outcome, "no further deferral").not.toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect.soft(failureText(outcome), "the Retry is admitted").toContain(ADMITTED);
+    expect.soft(toolDefinitions, "admitted once").toHaveBeenCalledTimes(1);
+    expect.soft(retry.logs.join("")).toContain(`run ${prior.runId} holds no active box; admitting`);
+    expect(await quarantined()).toEqual([]);
+  }, 120_000);
+
+  it("S095 step 3: after the cap's terminal note, a Retry whose stopped run still holds an ACTIVE lease requests the stop and waits for the receipt",
+    async () => {
+      const { prior, followUp } = await stopTurnShape({ receipt: false });
+      const leaseId = await holdOldBoxLease(prior);
+      const retry = await retryAfterCap(prior, followUp);
+      // The cap's own cycle already requested the stop; the sweep gave the lease back.
+      await db.update(environmentLeases).set({ status: "active", releasedAt: null, metadata: { remoteCwd: "/workspace" } })
+        .where(eq(environmentLeases.id, leaseId));
+      const first = await executeFollowUp(prior, retry, 300);
+      expect.soft(first.outcome, "not admitted without the receipt").toBeInstanceOf(NativeControllerRecoveryWaitingError);
+      expect.soft(toolDefinitions).not.toHaveBeenCalled();
+      expect.soft(retry.logs.join("")).toContain(`${STOP_REQUEST_LINE} ${prior.runId}`);
+      expect.soft(retry.logs.join("")).not.toContain("holds no active box");
+      await retryOwnerClaims(retry.runId);
+      await landStopReceipt(prior, leaseId);
+      expect(failureText((await executeFollowUp(prior, retry, 5_000)).outcome), "admitted on the receipt").toContain(ADMITTED);
+    }, 120_000);
+
   it("S095 rf-3: the acknowledgement wait's deferral with no lease of the stopped run does not claim a lease", async () => {
     const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm", pendingCommands: STOP_TURN_COMMANDS });
     const followUp = await admitFollowUp(prior);
