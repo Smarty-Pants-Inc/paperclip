@@ -655,19 +655,35 @@ export async function prepareManagedAiRuntime(
  * receipt its release wrote on the probe's EXACT lease (the verifier's target
  * holds that id); it is read once per same-account retry, never an error code. */
 export function retainManagedAiProbeCleanup(db: Db, runtime: { retainedCleanupScope?: { companyId: string; accountKey: string } | null; home?: string | null; cleanup: () => Promise<void> },
-  input: { companyId: string; agentId: string; executionTarget?: unknown }, error: InstanceType<typeof NativeEnvironmentProbeCleanupError>): never {
+  input: { companyId: string; agentId: string; executionTarget?: unknown; confirmProbeRetirement?: ProbeRetirementConfirmation },
+  error: InstanceType<typeof NativeEnvironmentProbeCleanupError>): never {
   const retryCleanup = (error as { retryCleanup?: () => Promise<void> }).retryCleanup;
   const target = input.executionTarget as { kind?: unknown; transport?: unknown; leaseId?: unknown } | null | undefined;
   const probeLeaseId = target?.kind === "remote" && target.transport === "sandbox" && typeof target.leaseId === "string" ? target.leaseId : null;
   retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home ? path.join(runtime.home, "provider") : undefined, cleanup: runtime.cleanup, retired: error.retired,
     agentId: input.agentId,
     ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}),
-    ...(probeLeaseId ? { proveRetired: () => probeLeaseTerminated(db, input.companyId, probeLeaseId) } : {}) });
+    ...(probeLeaseId ? { proveRetired: () => probeRetired(db, input, probeLeaseId) } : {}) });
   try {
     warnNativeProbeCleanupPending({ accountKeyHash: retainedAiAccountKeyHash(runtime.retainedCleanupScope!.accountKey),
       agentId: input.agentId, cleanupErrors: error.cleanupErrors, operationError: error.operationError });
   } catch { /* Diagnostics must not change the HTTP response. */ }
   throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
+}
+
+/** Re-reads the provider's typed state for the probe's OWN closed setup-test
+ * lease and writes its receipt (environment runtime confirmProbeLeaseTermination). */
+export type ProbeRetirementConfirmation = (input: { companyId: string; leaseId: string }) => Promise<boolean>;
+
+/** F5: a "destroyed" receipt already on the probe's own lease proves it; else
+ * the runtime re-reads the provider's TYPED state for THAT closed one-off lease
+ * and writes the receipt only on stopped/destroyed. A slow or failing read is
+ * no proof (the entry stays; the transport retry runs as before). */
+async function probeRetired(db: Db, input: { companyId: string; confirmProbeRetirement?: ProbeRetirementConfirmation }, leaseId: string): Promise<boolean> {
+  if (await probeLeaseTerminated(db, input.companyId, leaseId)) return true;
+  if (!input.confirmProbeRetirement) return false;
+  try { return await input.confirmProbeRetirement({ companyId: input.companyId, leaseId }) === true; }
+  catch { return false; }
 }
 
 /** The probe's own lease (no run, exact id) carries Boat's typed "destroyed"
@@ -682,7 +698,7 @@ async function probeLeaseTerminated(db: Db, companyId: string, leaseId: string):
 
 export async function withManagedAiProbe<T>(
   db: Db,
-  input: Parameters<typeof prepareManagedAiRuntime>[1] & { executionTarget?: unknown },
+  input: Parameters<typeof prepareManagedAiRuntime>[1] & { executionTarget?: unknown; confirmProbeRetirement?: ProbeRetirementConfirmation },
   probe: (runtime: Awaited<ReturnType<typeof prepareManagedAiRuntime>>) => Promise<T>,
 ): Promise<T> {
   const runtime = await prepareManagedAiRuntime(db, input);
