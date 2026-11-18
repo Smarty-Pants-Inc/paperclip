@@ -111,7 +111,9 @@ describe("redact-store G1/G4 durable boundaries", () => {
     expect(comment!.body).not.toContain(secret);
     if (name === "live-bearer") {
       expect(final.text).toBe('the Bearer [REDACTED] bad news arrived\n\"Bearer [REDACTED]\"');
-      expect(stored.filter(row => row.eventType === "item.delta").map(row => row.text).join("")).toBe(final.text);
+      // The closing quoted credential is held until the terminal event settles it (outputTails).
+      const settled = rows.flatMap(row => ((row.payload!.prpEvent as unknown as PrpEvent).payload.outputTails ?? []) as { payload: { text: string } }[]);
+      expect(stored.filter(row => row.eventType === "item.delta").map(row => row.text).join("") + settled.map(tail => tail.payload.text).join("")).toBe(final.text);
     }
     if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `durable-${name}.json`), JSON.stringify({
       name, runId: f.runId, issueId: f.issueId, parts, stored, comment: comment!.body, syntheticOccurrences: JSON.stringify(rows).split(secret).length - 1,
@@ -151,7 +153,15 @@ describe("redact-store G1/G4 durable boundaries", () => {
     await f.port.appendEvent(event);
     const [row] = await f.stored();
     const committed = row!.payload!.prpEvent as unknown as PrpEvent;
-    expect(committed.payload).toEqual({ text: redactSensitiveText(echo), content: [{ text: redactSensitiveText(echo) }], inputTokens: 123 });
+    // A delta that ends inside a key cannot know the key is complete: the last
+    // key waits for the next delta or the terminal event (see split-credential-shape.test.ts).
+    const masked = eventType === "item.delta" ? redactSensitiveText(keys.slice(0, -1).join("\n")) + "\n" : redactSensitiveText(echo);
+    expect(committed.payload).toEqual({ text: masked, content: [{ text: masked }], inputTokens: 123 });
+    if (eventType === "item.delta") {
+      await f.port.appendEvent({ ...f.event("", 2), payload: { kind: "commandExecution" } });
+      const terminal = (await f.stored()).map(stored => stored.payload!.prpEvent as unknown as PrpEvent).find(stored => stored.eventType === "item.completed")!;
+      expect(terminal.payload.outputTails).toEqual([{ itemId: "item", payload: { text: "***REDACTED***" } }]);
+    }
     expect(committed.debug).toEqual({ message: redactSensitiveText(echo) });
     expect({ ...committed, payload: event.payload, debug: event.debug }).toEqual(event);
     expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
