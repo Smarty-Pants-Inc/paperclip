@@ -37,6 +37,55 @@ function post(base: string, token: string, headers: Record<string, string> = {},
 }
 
 describe("provider loopback broker", () => {
+  // KEEP: never-OK routing/header custody boundary; rf-2 caught Pi's affinity
+  // header being lost between the authenticated loopback broker and gateway.
+  it.each([messagesLoopbackAdapter, chatLoopbackAdapter, responsesLoopbackAdapter])(
+    "forwards only validated x-session-id routing tokens on $protocol", async adapter => {
+      const received: IncomingHttpHeaders[] = [];
+      const baseUrl = await listen(createServer((req, res) => {
+        req.resume(); received.push(req.headers); res.end("ok");
+      }));
+      const broker = await startProviderLoopbackBroker({ adapter,
+        baseUrl: `${baseUrl}${adapter.protocol === "messages" ? "" : "/v1"}`,
+        key: "routing-upstream-key", auth: "bearer", environment: {} });
+      cleanups.push(broker.close);
+      const call = async (sessionId?: string | string[]) => {
+        const body = JSON.stringify({ model: "offline", messages: [] });
+        const response = await new Promise<number | undefined>((resolve, reject) => {
+          const outgoing = request(`${new URL(broker.baseURL).origin}${adapter.localPath}`, {
+            method: "POST", headers: {
+              authorization: `Bearer ${broker.token}`, "x-api-key": broker.token,
+              "content-type": "application/json", "content-length": Buffer.byteLength(body),
+              ...(sessionId === undefined ? {} : { "x-session-id": sessionId }),
+              "x-untrusted": "ignored", "x-request-id": "not-a-routing-header",
+              "x-session-other": "ignored", cookie: "private=not-forwarded",
+              "x-forwarded-for": "192.0.2.1", "x-api-key-other": "not-forwarded",
+            },
+          }, incoming => { incoming.resume(); incoming.once("end", () => resolve(incoming.statusCode)); });
+          outgoing.once("error", reject); outgoing.end(body);
+        });
+        expect(response).toBe(200);
+        return received.at(-1)!;
+      };
+      for (const sessionId of ["eb79cf62-d8bb-4b6d-b6f2-a1b5d21aae44", "session_A.2-hello", "a", "a".repeat(128)]) {
+        expect((await call(sessionId))["x-session-id"]).toBe(sessionId);
+      }
+      for (const invalid of [undefined, "", "bad token", "bad,second", "bad:token", "/path", "-prefix", "a".repeat(129), ["first", "second"]]) {
+        expect((await call(invalid))["x-session-id"]).toBeUndefined();
+      }
+      for (const headers of received) {
+        expect(headers.authorization).toBe("Bearer routing-upstream-key");
+        for (const name of ["x-api-key", "x-untrusted", "x-request-id", "x-session-other", "cookie", "x-forwarded-for", "x-api-key-other"]) {
+          expect(headers[name]).toBeUndefined();
+        }
+      }
+      // Node rejects wire-level header injection before even opening a socket.
+      for (const invalid of ["valid\r\nx-untrusted: injected", "valid\n", "valid\r"]) {
+        expect(() => request(`${new URL(broker.baseURL).origin}${adapter.localPath}`, { headers: { "x-session-id": invalid } }))
+          .toThrow(/Invalid character in header/);
+      }
+    },
+  );
   // Keep reason: real streaming HTTP boundary; simulate wall time rather than
   // spending ten minutes to reproduce a total-vs-idle provider cutoff.
   it("keeps a stream alive past ten minutes when bytes arrive within the default 120-second idle deadline", async () => {

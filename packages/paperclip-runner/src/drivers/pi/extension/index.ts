@@ -77,15 +77,21 @@ export interface PiBindHooks {
 }
 export interface PiBindOptions { socketPath: string; initial: PiBindInitial; hooks?: PiBindHooks; timeoutMs?: number }
 
+/** The boundary is stable for a whole native session (and visible to its model), so host
+ * instructions may never carry it: a copy inside them could close the segment early. */
 export function piHostInstructionSegment(instructions: string, boundary: string): string {
-  return `<!-- ${boundary}:start -->\n${instructions}\n<!-- ${boundary}:end -->`;
+  const body = instructions.split(boundary).join("paperclip-host-boundary-redacted");
+  return `<!-- ${boundary}:start -->\n${body}\n<!-- ${boundary}:end -->`;
 }
 
-/** Replace only the host-owned CLI append, keeping native AGENTS/home context. */
+/** Replace only the host-owned CLI append, keeping native AGENTS/home context.
+ * Pi renders the append (addendum) BEFORE project context, skills and cwd, so the host
+ * segment is the FIRST start and the first end after it. Markers copied into later
+ * content (an AGENTS.md written by an earlier launch of the same session) are inert. */
 export function replacePiHostInstructions(prompt: string, instructions: string, boundary?: string): string {
   if (!boundary) return instructions ? `${prompt}\n\n${instructions}` : prompt;
   const start = `<!-- ${boundary}:start -->`, end = `<!-- ${boundary}:end -->`;
-  const first = prompt.indexOf(start), last = prompt.lastIndexOf(end);
+  const first = prompt.indexOf(start), last = first < 0 ? -1 : prompt.indexOf(end, first + start.length);
   if (first < 0 || last < first) throw new Error("Pi host instruction segment unavailable");
   return prompt.slice(0, first) + piHostInstructionSegment(instructions, boundary) + prompt.slice(last + end.length);
 }
