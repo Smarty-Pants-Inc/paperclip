@@ -1,6 +1,7 @@
 import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal, type FreshThreadRefusalCode,
   RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE, RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON, restoreUnavailableOnNewBoxCode,
   LAUNCH_PROFILE_MISMATCH_CODE, LAUNCH_PROFILE_CHANGED_REASON } from "./runner-reconciliation-refusal.js";
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
@@ -14634,6 +14635,7 @@ async function executePaperclipNativeSessionAttempt(
           })
           .where(eq(heartbeatRuns.id, input.execution.binding.runId))
           .returning();
+        if (updatedRun && runBeforeWrite) publishTerminalRunLifecyclePluginEventAfterCommit(tx, runBeforeWrite, updatedRun);
         if (updatedRun && exhausted && !ownershipUnverified && !updated.resultId) {
           updatedRun = await preserveNativeFailedWorkspace(tx as unknown as Db, updatedRun) ?? updatedRun;
         }

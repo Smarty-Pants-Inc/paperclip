@@ -92,6 +92,7 @@ import {
   readNativeBoardResponseWaitSource,
 } from "./native-board-response-wait.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report.js";
 import { isPublishedGitHubReviewCompletionContinuation, readPublishedGitHubReviewCompletionContinuation, resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
 import {
@@ -425,7 +426,10 @@ export async function endSupersededNativeFinalizationRuns(db: Db, runIds?: reado
           error: terminalFinalizationFailureMessage(NATIVE_FINALIZATION_SUPERSEDED, workspace ? "workspace" : "provider") }),
         updatedAt: now,
       }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running"))).returning();
-      if (updated) await settleNativeTerminalWake(tx as unknown as Db, updated);
+      if (updated) {
+        publishTerminalRunLifecyclePluginEventAfterCommit(tx, run, updated);
+        await settleNativeTerminalWake(tx as unknown as Db, updated);
+      }
       return updated ?? null;
     });
     if (!updatedRun) continue;
@@ -683,6 +687,11 @@ async function recordRetryableFailure(input: {
     if (projectsTerminalStatus) await notifyCancelledWorkspacePreservation(tx, { companyId: input.run.companyId, runId: input.run.id });
     if (projectsTerminalStatus) await notifyUnsafeWorkspaceExportRunChange(tx, input.run);
     const terminalRunStatus = input.failureScope === "workspace" ? "failed" : exhaustedRunStatus;
+    // The admission snapshot can predate a concurrent Stop/live completion.
+    // Lock after the issue, matching the coordinator -> issue -> run order.
+    const [before] = await tx.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId)))
+      .for("update").limit(1);
     const [updatedRun] = await tx
       .update(heartbeatRuns)
       .set({
@@ -708,7 +717,10 @@ async function recordRetryableFailure(input: {
       })
       .where(eq(heartbeatRuns.id, input.run.id))
       .returning();
-    if (projectsTerminalStatus && updatedRun) await settleNativeTerminalWake(tx as unknown as Db, updatedRun);
+    if (projectsTerminalStatus && updatedRun) {
+      if (before) publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, updatedRun);
+      await settleNativeTerminalWake(tx as unknown as Db, updatedRun);
+    }
     if (projectsTerminalStatus) terminalRunToEmit = updatedRun ?? null;
     let workspaceFinalizationBlock: Record<string, unknown> | undefined;
     if (supersededByNewerRun) {
@@ -2193,7 +2205,10 @@ async function finalizeNativeRunAndProject(input: {
         await notifyExecutionRunWork(tx, { companyId: run.companyId });
         await notifyChatRunMilestones(tx, { companyId: run.companyId, issueId: coordinator.issueId });
         const [after] = await projectRun(tx);
-        if (after && input.projectRunStatus) await settleNativeTerminalWake(tx, after);
+        if (after && input.projectRunStatus) {
+          publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, after);
+          await settleNativeTerminalWake(tx, after);
+        }
         return after ? { before, after } : null;
       });
       const updatedRun = projection?.after;

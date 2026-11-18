@@ -1043,6 +1043,27 @@ Each event must include:
 - primary entity metadata
 - typed payload
 
+Run lifecycle events follow run-status transitions, not task-status decisions.
+Native result finalization and committed-run projection publish the same event
+as live heartbeat completion when they win a non-terminal → terminal status
+write. Exhausted/permanent finalization and superseded-run retirement use the
+same publisher, including retained provider success/failure/cancellation.
+Native execution and recovery failures, queue/dispatch cancellations, and the
+watchdog/recovery backstops register at their status writes too. Native
+`interrupted` runs use `agent.run.failed`, preserving `status: "interrupted"` in
+the payload; legacy event mapping is unchanged. A late live completion,
+unchanged projection, or repair of an already-terminal
+run (for example failed → succeeded) does not publish a second lifecycle end.
+Publication is registered inside the status transaction through the database's
+post-commit context: releasing a savepoint does not publish, and an outer
+rollback discards its publications. Callers need no optional effect collector.
+The payload includes `runId`, `agentId`, `status`, `issueId`, `startedAt`, and
+`finishedAt`.
+The separate `heartbeat.run.status` live event invalidates client caches and is
+not a plugin domain event. The current domain-event bus is in-process, not a
+durable replay queue; consumers that must recover missed events need a bounded
+reconciliation path.
+
 ### 16.1 Event Filtering
 
 Plugins may provide an optional filter when subscribing to events. The filter is evaluated by the host before dispatching to the worker, so filtered-out events never cross the process boundary.

@@ -15,6 +15,8 @@ export type QueuedRunEvent = {
 
 export type RunStatusEvent = {
   kind: "run_status_published";
+  /** Native domain events are transaction-owned; absent on older legacy effects. */
+  runtimeMode?: string;
   companyId: string;
   runId: string;
   agentId: string;
