@@ -3,6 +3,8 @@ import { projects, toolConnectionInstalls, toolConnections, type Db } from "@pap
 import { forbidden, HttpError } from "../errors.js";
 import { assertProjectConnectionAdmission, assertProjectConnectionRecipients, currentAuthority } from "./project-connection-admission.js";
 import type { DbTransaction } from "./tool-access/types.js";
+import { PROJECT_APP_APPROVAL_CONSUMED_BY } from "./project-app-custody.js";
+import { z } from "zod";
 
 /**
  * Project-owned tool connections: one guard for every agent-serving seam
@@ -142,7 +144,36 @@ export async function filterProjectOwnedConnectionsForAgent<T extends OwnedShape
  */
 export type ProjectOwnedConnectionReader = { type: "board" } | { type: "agent"; agentId: string | null | undefined };
 
+/** The connection a consumed project-App approval source BECAME (project-app-custody.ts PROJECT_APP_APPROVAL_CONSUMED_BY), or null. */
+function approvalSourceConsumedBy(connection: OwnedShape): { consumed: boolean; consumerId: string | null } {
+  let consumed = false;
+  let consumerId: string | null = null;
+  for (const value of [connection.config, connection.transportConfig]) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, PROJECT_APP_APPROVAL_CONSUMED_BY)) continue;
+    consumed = true;
+    const id = (value as Record<string, unknown>)[PROJECT_APP_APPROVAL_CONSUMED_BY];
+    if (typeof id !== "string" || (consumerId !== null && consumerId !== id)) return { consumed, consumerId: null };
+    consumerId = id;
+  }
+  return { consumed, consumerId };
+}
+
 export async function canReadProjectOwnedConnectionDetails(db: Database, connection: OwnedShape & { companyId: string }, reader: ProjectOwnedConnectionReader): Promise<boolean> {
+  // #20717 RFL round 3: a consumed project-App approval source (an ordinary
+  // company row, archived or kept as predecessor) still carries the SAME vault
+  // reference its consumer now holds. Its details follow the consumed-by link:
+  // readable only by whoever can read the connection it became. A dangling or
+  // ambiguous link has no reader but the board (fail closed).
+  const source = approvalSourceConsumedBy(connection);
+  if (source.consumed) {
+    if (reader.type === "board") return true;
+    if (!source.consumerId || !z.string().uuid().safeParse(source.consumerId).success) return false;
+    const [consumer] = await db.select({ id: toolConnections.id, companyId: toolConnections.companyId, projectId: toolConnections.projectId,
+      config: toolConnections.config, transportConfig: toolConnections.transportConfig }).from(toolConnections)
+      .where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.id, source.consumerId)));
+    if (!consumer || approvalSourceConsumedBy(consumer).consumed) return false;
+    return canReadProjectOwnedConnectionDetails(db, consumer, reader);
+  }
   if (!isProjectOwnedToolConnection(connection)) return true;
   if (reader.type === "board") return true;
   if (!connection.projectId || !reader.agentId) return false;

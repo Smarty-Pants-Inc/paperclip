@@ -78,7 +78,7 @@ describe("merged #20717 reader+writer: a project-owned connection is never compa
     }
     expect(provider.secret).not.toHaveBeenCalled();
     expect(provider.acquire).not.toHaveBeenCalled();
-    expect((await resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id)).token).toBe("synthetic-restricted-token");
+    expect((await resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id)).token === "synthetic-restricted-token").toBe(true);
   });
 
   it("S1: an A team member WITHOUT an explicit install is not admitted by a company install", async () => {
@@ -222,12 +222,15 @@ describe("merged #20717 reader+writer: a project-owned connection is never compa
         .where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
       return original();
     });
-    const outcome = await resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id).then(value => ({ token: value.token }), (error: unknown) => ({ error }));
+    // #20717 RFL round 3 item 2: reduce the outcome to value-free facts BEFORE
+    // asserting, so a regression that releases a token never prints it.
+    const outcome = await resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id).then(
+      value => ({ tokenReturned: Boolean(value?.token), refused: false, status: null as number | null }),
+      (error: unknown) => ({ tokenReturned: false, refused: true, status: typeof (error as { status?: unknown })?.status === "number" ? (error as { status: number }).status : null }));
     expect(provider.acquire).toHaveBeenCalledTimes(1);
-    expect(outcome).not.toHaveProperty("token");
     // The provider boundary's value-free failure contract (422) or a 403 refusal; never a token.
-    expect(outcome).toHaveProperty("error");
-    expect([403, 422]).toContain((outcome as { error: { status?: number } }).error.status);
+    expect({ tokenReturned: outcome.tokenReturned, refused: outcome.refused, refusalStatusOk: outcome.status === 403 || outcome.status === 422 })
+      .toEqual({ tokenReturned: false, refused: true, refusalStatusOk: true });
   });
 
   // RFL #20717 round 2 item 2 (pair R5 survived): finish entry admission
