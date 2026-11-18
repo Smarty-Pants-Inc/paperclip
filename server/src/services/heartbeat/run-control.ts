@@ -51,6 +51,7 @@ import {
   isAcknowledgedNativeStop,
   acknowledgedNativeApiStopExecutionHasStopped,
   acknowledgedNativeStopExecutionHasStopped,
+  hasAcknowledgedNativeRunStopRequest,
 } from "../acknowledged-native-stop.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../../vendor/paperclip-runner/index.js";
 import {
@@ -104,6 +105,7 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { hasConfirmedSandboxStopAndRetain, PERSON_STOP_RETAINED_NOTE } from "../sandbox-stop-and-retain.js";
 import {
   type EnvironmentLeaseStatus,
 } from "@paperclipai/shared";
@@ -385,6 +387,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     providerResourceDisposition?: ProviderResourceDisposition;
     respectCleanupDeadlines?: boolean;
     trigger?: string;
+    /** The orphan-lease sweep after a crash finishes a release nobody is watching. */
+    personStopNote?: false;
     nativeLifecycleTelemetry?: {
       provider: string;
       harness: string;
@@ -537,10 +541,38 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         logger.warn({ runId: input.runId }, "could not record that a stopped run left no files to recover");
       });
     }
+    if (cancelledRun && status === "cancelled" && input.personStopNote !== false && releaseResult?.released.length) await recordPersonStopRetainedNote(cancelledRun).catch(err => {
+      logger.warn({ err, runId: input.runId }, "could not record the stopped turn's retained-sandbox note");
+    });
     if (isHeartbeatRunTerminalStatus(status) && releaseResult?.released.length) await wakeAgentAfterRunLeasesSettled(input).catch(() => {
       logger.warn({ runId: input.runId }, "could not wake the agent's stop after its run leases settled");
     });
     await acknowledgeRemoteStop(input.runId, input.companyId);
+  }
+
+  /** The ONE true note after a person's acknowledged Stop: only when the
+   * provider confirmed stop_and_retain for this run's sandbox. It is recorded
+   * resolved, so it never blocks or holds the next message. */
+  async function recordPersonStopRetainedNote(run: NonNullable<Awaited<ReturnType<typeof getRun>>>) {
+    if (!run.issueId || !hasAcknowledgedNativeRunStopRequest(run)) return;
+    const leases = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id)));
+    if (!leases.some(lease => hasConfirmedSandboxStopAndRetain(lease))) return;
+    const fingerprint = `person-stop-retained:${run.id}`;
+    await db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${fingerprint}))`);
+      const [existing] = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, run.issueId!),
+        eq(issueRecoveryActions.fingerprint, fingerprint))).limit(1);
+      if (existing) return;
+      const now = new Date();
+      await tx.insert(issueRecoveryActions).values({
+        companyId: run.companyId, sourceIssueId: run.issueId!, kind: "active_run_watchdog", ownerType: "system",
+        cause: "person_stop_retained_sandbox", fingerprint, status: "resolved", outcome: "cancelled", resolvedAt: now,
+        nextAction: PERSON_STOP_RETAINED_NOTE,
+        evidence: { runId: run.id, personStopRetainedSandbox: { leaseIds: leases.filter(lease => hasConfirmedSandboxStopAndRetain(lease)).map(lease => lease.id), recordedAt: now.toISOString() } },
+      });
+    });
   }
 
   async function wakeAgentAfterRunLeasesSettled(input: { runId: string; companyId: string; agentId: string }) {
