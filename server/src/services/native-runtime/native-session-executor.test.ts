@@ -13571,6 +13571,143 @@ describe("native warm session supervision", () => {
     );
   });
 
+  // Keep: never-OK trace loss (custody-gaps a). A warm owner's close fails and
+  // proves the owner gone; its "owner gone" marker (nativeHarnessBackupMissing)
+  // must commit before a successor's release of the same box can take the final
+  // destroy claim. The release waits for the owner's tracked close; that wait
+  // must also cover the marker write, or the claim commits first and the box
+  // (with the only copy of the harness) is destroyed unmarked.
+  describe("custody-gaps a: the owner-gone marker commits before a release's destroy claim", () => {
+    let proofDb: Db;
+    let cleanup: (() => Promise<void>) | undefined;
+    beforeAll(async () => {
+      const { startRecoveryPostgres } = await import("../../__tests__/helpers/recovery-postgres.js");
+      const { createDb } = await import("@paperclipai/db");
+      const database = await startRecoveryPostgres("custody-gaps-a-");
+      cleanup = database.cleanup;
+      proofDb = createDb(database.connectionString);
+    }, 180_000);
+    afterAll(async () => { await proofDb?.$client.end(); await cleanup?.(); });
+
+    it.each([
+      { trigger: "idle timer" as const },
+      { trigger: "restart sweep" as const },
+      // The retries_exhausted marker, written after the sweep (no close in flight then).
+      { trigger: "retries exhausted at restart sweep" as const },
+    ])("a failed close's marker is committed before the successor's destroy claim ($trigger)", async ({ trigger }) => {
+      const { companies, agents, environments, plugins } = await import("@paperclipai/db");
+      const { logger } = await import("../../middleware/logger.js");
+      const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), successorRunId = randomUUID();
+      const environmentId = randomUUID(), pluginId = randomUUID(), sessionId = randomUUID(), leaseId = randomUUID();
+      const providerLeaseId = `box-${randomUUID()}`;
+      await proofDb.insert(companies).values({ id: companyId, name: "Custody gaps a", issuePrefix: `G${companyId.slice(0, 7)}` });
+      await proofDb.insert(agents).values({ id: agentId, companyId, name: "Fixture", adapterType: "paperclip_runner" });
+      await proofDb.insert(heartbeatRuns).values([{ id: runId, companyId, agentId, status: "succeeded", nativeSessionId: sessionId },
+        { id: successorRunId, companyId, agentId, status: "running" }]);
+      await proofDb.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox", config: { provider: "boat" } });
+      await proofDb.insert(plugins).values({ id: pluginId, pluginKey: pluginId, packageName: "boat-fixture", version: "1", status: "ready",
+        manifestJson: { capabilities: ["environment.drivers.register"], environmentDrivers: [{ driverKey: "boat", kind: "sandbox_provider",
+          sandboxCapabilities: { reusableLeases: true } }] } as never });
+      const pin = { pluginId, provider: "boat", sandboxProviderPlugin: true, driver: "sandbox" };
+      // The old owner's row and the successor's row on the same box.
+      await proofDb.insert(environmentLeases).values([
+        { id: leaseId, companyId, environmentId, heartbeatRunId: runId, provider: "boat", providerLeaseId,
+          status: "retained", leasePolicy: "ephemeral", metadata: pin },
+        { companyId, environmentId, heartbeatRunId: successorRunId, provider: "boat", providerLeaseId,
+          status: "active", leasePolicy: "ephemeral", metadata: pin },
+      ]);
+      const order: string[] = [];
+      const call = vi.fn(async (_id: string, method: string, params: { providerLeaseId?: string }) => {
+        order.push(`provider:${method}`);
+        return { providerLeaseId: params.providerLeaseId, state: method === "environmentDestroyLease" ? "destroyed" : "stopped" };
+      });
+      const workers = { isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentReleaseLease", "environmentStopLease",
+        "environmentDestroyLease", "environmentResumeLease"] }) } as unknown as import("../plugin-worker-manager.js").PluginWorkerManager;
+      const { environmentRuntimeService } = await import("../environment-runtime.js");
+      const runtime = environmentRuntimeService(proofDb, { pluginWorkerManager: workers });
+
+      const current = { ...execution, binding: { ...execution.binding, companyId, agentId, runId, executionWorkspaceId: runId },
+        session: { ...execution.session, normalizedSessionId: sessionId,
+          lifecyclePolicy: { mode: "warm", idleTimeoutMs: trigger === "restart sweep" ? 60 * 60_000 : 20 } },
+      } as NativeExecutionInputV1;
+      const base = leaseDb(current), finished = leaseDb(current, {}, {}, [], {}, "succeeded");
+      let executionFinished = false;
+      // A slow marker write (a busy database): the commit lands 500 ms after it starts.
+      let slowMarker = false;
+      const markerOnRow = async () => Boolean((await proofDb.select().from(environmentLeases)
+        .where(eq(environmentLeases.id, leaseId)))[0]?.metadata?.nativeHarnessBackupMissing);
+      const wrap = (handle: Db): Db => ({ ...handle,
+        select: ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => table === environmentLeases
+          ? proofDb.select(fields as never).from(environmentLeases)
+          : (executionFinished && table === heartbeatRuns ? finished : handle).select(fields as never).from(table as never) })) as unknown as Db["select"],
+        update: ((table: unknown) => table === environmentLeases ? proofDb.update(environmentLeases) : handle.update(table as never)) as Db["update"],
+        transaction: (async (operation: (tx: Db) => Promise<unknown>) => {
+          if (slowMarker) await new Promise(resolve => setTimeout(resolve, 500));
+          const result = await handle.transaction(tx => operation(wrap(tx as unknown as Db)));
+          if (slowMarker && !order.includes("marker:committed") && await markerOnRow()) order.push("marker:committed");
+          return result;
+        }) as unknown as Db["transaction"],
+      }) as Db;
+      const db = wrap(base);
+      let closeStarted!: () => void, failClose!: () => void;
+      const started = new Promise<void>(resolve => { closeStarted = resolve; });
+      const failing = new Promise<void>(resolve => { failClose = resolve; });
+      const exhausting = trigger === "retries exhausted at restart sweep";
+      const close = vi.fn<() => Promise<void>>(async () => {
+        // Exhausting: the idle timer's close and its retries fail at once first.
+        if (exhausting && close.mock.calls.length <= WARM_IDLE_CLOSE_MAX_RETRIES) throw new Error("native_runner_checkpoint_owner_lost");
+        closeStarted();
+        await failing;
+        if (exhausting) throw new Error("native_runner_checkpoint_owner_lost");
+        throw new RemoteRunnerRecoveryError({ stage: "process_verification", reason: "process_not_running" });
+      });
+      const fake = fakeRetainedRunnerSandbox({ runId, normalizedSessionId: sessionId, remoteCwd: `/tmp/${sessionId}` });
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        await options.onSession?.({ close });
+        return { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" },
+          turnId: runId, normalizedSessionId: sessionId, providerSessionId: sessionId, driverKind: "test", driverVersion: "1",
+          nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+      });
+      const warning = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+      try {
+        // Entry: executePaperclipNativeSession (the old owner's warm turn on the box).
+        await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: sessionId,
+          runnerExecutionTarget: { kind: "remote", transport: "sandbox", environmentId, leaseId,
+            remoteCwd: `/tmp/${sessionId}`, sandboxLeaseAcquisition: { outcome: "created", providerLeaseId }, runner: fake.runner } as never });
+        executionFinished = true;
+        if (exhausting) {
+          await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(WARM_IDLE_CLOSE_MAX_RETRIES), { timeout: 20_000, interval: 25 });
+          await new Promise(resolve => setTimeout(resolve, 200)); // the last retry is armed
+        }
+        // The owner's close: the idle timer, or the controller restart sweep.
+        const sweeping = trigger === "idle timer" ? Promise.resolve() : closeIdleWarmNativeSessionsForRestart();
+        await started;
+        // Entry: releaseRunLeases of the successor's lease on the same box, destroy.
+        const errors: unknown[] = [];
+        const releasing = runtime.releaseRunLeases(successorRunId, "released", (_id, error) => { errors.push(error); }, "destroy");
+        await new Promise(resolve => setTimeout(resolve, 300));
+        expect(call).not.toHaveBeenCalled(); // the release waits for the owner's close
+        slowMarker = true;
+        failClose();
+        await releasing;
+        await sweeping;
+        await vi.waitFor(async () => expect(await markerOnRow()).toBe(true), { timeout: 10_000, interval: 25 });
+        // RED on base: ["provider:environmentDestroyLease", "marker:committed"].
+        expect(order).toEqual(["marker:committed"]);
+        expect(call).not.toHaveBeenCalled();
+        expect(close).toHaveBeenCalledTimes(exhausting ? WARM_IDLE_CLOSE_MAX_RETRIES + 1 : 1);
+        if (exhausting) {
+          expect((await proofDb.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0]?.metadata?.nativeHarnessBackupMissing)
+            .toMatchObject({ reason: "retries_exhausted" });
+        }
+      } finally {
+        warning.mockRestore();
+        close.mockReset().mockResolvedValue(undefined);
+        await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "test cleanup", db });
+      }
+    }, 45_000);
+  });
+
   it("retries a failed idle warm close a bounded number of times", async () => {
     const name = "warm-idle-close-retry";
     const current = { ...execution,

@@ -1064,6 +1064,71 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
+  // Keep: never-OK trace loss (custody-gaps c). releaseRunLeases' no-environment
+  // plugin path (a driver:"plugin" lease whose environment row is gone) runs the
+  // plugin driver's teardown, which calls environmentDestroyLease when the lease's
+  // cleanup method is "destroy". It must take the same final destroy claim.
+  describe("custody-gaps c: releaseRunLeases' no-environment plugin destroy takes the final destroy claim", () => {
+    async function seedNoEnvironmentPluginLeases(input: { method: "destroy" | "release"; marked: boolean }) {
+      const pluginId = randomUUID();
+      const { companyId, environment, runId } = await seedEnvironment();
+      await insertSandboxProviderPlugin(pluginId, { pluginKey: `acme.custody-gaps-${pluginId.slice(0, 8)}`,
+        environmentDrivers: [{ driverKey: "fake-plugin", kind: "environment", displayName: "Fake Plugin" }] });
+      const box = `custody-gaps-box-${randomUUID().slice(0, 8)}`;
+      const pin = { driver: "plugin", pluginId, driverKey: "fake-plugin", environmentId: environment.id };
+      const [predecessor] = await db.insert(environmentLeases).values({ companyId, environmentId: null, heartbeatRunId: runId,
+        status: "expired", leasePolicy: "ephemeral", provider: "fake-plugin", providerLeaseId: box, releasedAt: new Date(),
+        cleanupStatus: "success", metadata: pin }).returning();
+      const [successor] = await db.insert(environmentLeases).values({ companyId, environmentId: null, heartbeatRunId: runId,
+        status: "active", leasePolicy: "ephemeral", provider: "fake-plugin", providerLeaseId: box,
+        metadata: { ...pin, pluginLeaseCleanupMethod: input.method } }).returning();
+      if (input.marked) {
+        const { markNativeHarnessBackupMissing } = await import("../services/native-runtime/native-harness-backup-missing.ts");
+        await db.update(environmentLeases).set({ environmentId: environment.id }).where(eq(environmentLeases.id, predecessor!.id));
+        await markNativeHarnessBackupMissing(db, { companyId, environmentId: environment.id, providerLeaseId: box,
+          runId, leaseId: predecessor!.id, sessionId: "pi-predecessor-session", reason: "close_failed" });
+      }
+      const call = vi.fn(async (_pluginId: string, method: string) => ({ providerLeaseId: box,
+        state: method === "environmentDestroyLease" ? "destroyed" : "released" }));
+      const service = environmentRuntimeService(db, { pluginWorkerManager: {
+        isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentDestroyLease", "environmentReleaseLease"] }),
+      } as unknown as PluginWorkerManager });
+      return { runId, predecessor: predecessor!, successor: successor!, call, service };
+    }
+
+    it("a marker on a predecessor lease of the same box refuses the destroy: no provider call", async () => {
+      const { runId, predecessor, successor, call, service } = await seedNoEnvironmentPluginLeases({ method: "destroy", marked: true });
+      const errors: string[] = [];
+      // Entry: releaseRunLeases (environment-runtime.ts, the `if (!environment)` plugin branch).
+      await service.releaseRunLeases(runId, "released", (_id, error) => { errors.push((error as Error).message); });
+      expect(call.mock.calls.map(([, method]) => method)).not.toContain("environmentDestroyLease");
+      expect(errors).toEqual(["Native harness backup is missing; destructive cleanup is forbidden."]);
+      const kept = (await environmentService(db).getLeaseById(successor.id))!;
+      expect(kept.status).toBe("active");
+      expect(kept.metadata).not.toHaveProperty("agentFileDestroyClaim");
+      expect((await environmentService(db).getLeaseById(predecessor.id))!.metadata).toHaveProperty("nativeHarnessBackupMissing");
+    });
+
+    it("no marker on the allocation destroys as today", async () => {
+      const { runId, successor, call, service } = await seedNoEnvironmentPluginLeases({ method: "destroy", marked: false });
+      const errors: unknown[] = [];
+      await service.releaseRunLeases(runId, "released", (_id, error) => { errors.push(error); });
+      expect(errors).toEqual([]);
+      expect(call.mock.calls.map(([, method]) => method)).toEqual(["environmentDestroyLease"]);
+      const done = (await environmentService(db).getLeaseById(successor.id))!;
+      expect(done).toMatchObject({ status: "released", cleanupStatus: "success" });
+      expect(done.metadata).not.toHaveProperty("agentFileDestroyClaim");
+    });
+
+    it("a release-method cleanup is not a destroy and is unchanged by the marker", async () => {
+      const { runId, call, service } = await seedNoEnvironmentPluginLeases({ method: "release", marked: true });
+      const errors: unknown[] = [];
+      await service.releaseRunLeases(runId, "released", (_id, error) => { errors.push(error); });
+      expect(errors).toEqual([]);
+      expect(call.mock.calls.map(([, method]) => method)).toEqual(["environmentReleaseLease"]);
+    });
+  });
+
   it.each([true, false])("nativeHarnessBackupMissing guards the reusable driver's expiry destroy (flagged=%s)", async flagged => {
     // Expiry delegates straight to destroyReusableSandboxLease, not the public
     // destroy or scoped cleanup guards exercised above.
