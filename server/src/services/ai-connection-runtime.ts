@@ -680,7 +680,7 @@ export const PROBE_CLEANUP_BEFORE_RELEASE_MS = 10_000;
  * receipt its release wrote on the probe's EXACT lease (the verifier's target
  * holds that id); it is read once per same-account retry, never an error code. */
 export function retainManagedAiProbeCleanup(db: Db, runtime: { retainedCleanupScope?: { companyId: string; accountKey: string } | null; home?: string | null; cleanup: () => Promise<void> },
-  input: { companyId: string; agentId?: string; executionTarget?: unknown }, error: NativeEnvironmentProbeCleanupError): never {
+  input: { companyId: string; agentId: string; executionTarget?: unknown }, error: InstanceType<typeof NativeEnvironmentProbeCleanupError>): never {
   const retryCleanup = (error as { retryCleanup?: () => Promise<void> }).retryCleanup;
   const target = input.executionTarget as { kind?: unknown; transport?: unknown; leaseId?: unknown } | null | undefined;
   const probeLeaseId = target?.kind === "remote" && target.transport === "sandbox" && typeof target.leaseId === "string" ? target.leaseId : null;
