@@ -335,7 +335,7 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
   }, 120_000);
 
   it("S10: three held, Stop, Send => one run carries all three IDs once at once (not answers)", async () => {
-    const s = await heldThenStop();
+    const s = await heldThenStop("route"); // rf-4 ruling 14:39Z: Stop through POST /api/heartbeat-runs/:runId/cancel
     try {
       const [r1] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, s.f.runId));
       console.log("OPTS RUN1", JSON.stringify({ calls: fixture.calls, held: s.held, status: r1?.status, err: r1?.error, code: r1?.errorCode, lease: await s.lease() }));
@@ -362,7 +362,7 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
         wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait })) });
       expect(turns).toHaveLength(1);
       expect(turns[0]!.commentIds).toEqual(s.held);
-      expect([...s.answered().values()]).toEqual([1, 1, 1]);
+      expect([...s.answered().values()]).toEqual(s.held.map(() => 1));
       expect(Date.now() - pressedAt).toBeLessThan(15_000);
     } finally { s.done(); }
   }, 120_000);
