@@ -9,6 +9,7 @@ import { recoveryService } from "../services/recovery/service.js";
 import { claimCancellationRequest } from "../services/native-runtime/native-cancellation-request.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerIssueRecoveryWork } from "../services/recovery/work.js";
+import { nativeUserStopRecoveryHeld } from "../services/native-runtime/native-user-stop-settlement.js";
 
 // Keep reason: #20807 RFL F1's independent PostgreSQL reproduction caught a
 // data-safety failure: the ordinary sweep released a still-executing owner's
@@ -511,5 +512,68 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     await acknowledgeStop(executionRunId);
     expect((await recovery.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId })).cleared).toBe(1);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
+  });
+  // Keep reason: adopt-h6-src (S1 card d1bc0612, written 1 ms after the cancel).
+  // A person's Stop on a keep_running warm box hands the box off warm and never
+  // writes a termination receipt. One sweep pass inside that no-receipt window
+  // must accept the executor's settled-turn proof, and only that proof.
+  async function warmStopFixture(proof: "settled" | "missing" | "generation_mismatch" | "coordinator_owned" | "unacknowledged") {
+    const f = await warmFixture();
+    const sessionId = randomUUID(), bootId = "boot-1", generation = 3;
+    const nativeCancellation = { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId,
+      issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
+      dispatched: proof !== "unacknowledged", intentAuditId: "intent-1", acknowledgementAuditId: "ack-1" };
+    const receipt = { schema: "paperclip.native-retained-idle-checkpoint.v1", companyId: f.companyId, issueId: f.issueId,
+      runId: f.runId, sessionId, bootId, generation: proof === "generation_mismatch" ? generation + 1 : generation };
+    await db.update(heartbeatRuns).set({ status: "cancelled", nativeSessionId: sessionId,
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-user",
+        executionCancellation: { state: "acknowledged" }, nativeCancellation },
+      runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" },
+        ...(proof === "missing" ? {} : { nativeRetainedIdleCheckpoint: receipt }) } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
+    await db.insert(nativeRunFinalizations).values({ runId: f.runId, companyId: f.companyId, issueId: f.issueId,
+      phase: proof === "coordinator_owned" ? "observed" : "terminal_failure", failureCode: "native_retry_cancelled",
+      controllerBootId: bootId, controllerGeneration: generation,
+      ...(proof === "coordinator_owned" ? { leaseOwner: "executor", leaseExpiresAt: new Date(Date.now() + 60_000) } : {}) });
+    return f;
+  }
+  async function onePass(f: { companyId: string; issueId: string; runId: string }) {
+    // Deterministic race: one direct sweep pass, no termination receipt yet.
+    await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+    return { cards: await stopActions(f.issueId),
+      held: await nativeUserStopRecoveryHeld(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId }) };
+  }
+
+  it("a proved warm-turn handoff Stop with no termination receipt raises no card and holds no owner", async () => {
+    const f = await warmStopFixture("settled");
+    const { cards, held } = await onePass(f);
+    // Base: an escalated execution_stop_pending card that holds the warm owner
+    // (native refusal owner_recovery_action_pending, so a FRESH thread).
+    expect(cards.map(card => card.cause)).toEqual([]);
+    expect(held).toBe(false);
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
+    // The warm box stays as it was: no release, no termination.
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0]).toEqual(f.lease);
+    // Whole-agent lifecycle Stop is not broadened by the task-scoped proof.
+    expect(await agentExecutionStopBlocker(db, [f.agentId])).toBe("environment_lease_unreleased");
+  });
+
+  it.each(["missing", "generation_mismatch", "coordinator_owned", "unacknowledged"] as const)(
+    "settled-turn proof %s keeps the Stop-pending card", async proof => {
+      const f = await warmStopFixture(proof);
+      expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+      const { cards, held } = await onePass(f);
+      expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+      expect(held).toBe(true);
+    });
+
+  it("a stop_and_retain Stop with no receipt yet keeps the card even with a settled-turn receipt", async () => {
+    const f = await warmStopFixture("settled");
+    await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata, sandboxStopAndRetain: { requestedAt: new Date().toISOString() } } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    const { cards, held } = await onePass(f);
+    expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+    expect(held).toBe(true);
   });
 });
