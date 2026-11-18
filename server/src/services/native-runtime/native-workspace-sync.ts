@@ -1409,8 +1409,22 @@ async function personStopWithoutFilesAsideDir(db: Db, runId: string, leaseId: st
   // decision is recorded under this run's finalization lock BEFORE admission,
   // so it revokes the old run's host-export authority: an old retry that
   // starts after it saves its files aside, never over the successor's host.
-  return (decision?.decision === "without_files" || decision?.decision === "same_box") && decision.runId === runId
+  if (!decision || decision.runId !== runId) return null;
+  if (decision.decision === "without_files") return personStopAsideDirectory(runId);
+  return decision.decision === "same_box" && await personStopSameBoxSuccessorAdmitted(db, runId, decision.decidedAt)
     ? personStopAsideDirectory(runId) : null;
+}
+
+/** adopt-stopu-fvc8 (Q-C): a later run of the same agent and task started after
+ * the `same_box` decision: the kept box (and the host) now belong to it. */
+async function personStopSameBoxSuccessorAdmitted(db: Db, runId: string, decidedAt: string): Promise<boolean> {
+  const [row] = await db.select({ admitted: sql<boolean>`exists (select 1 from heartbeat_runs s
+      where s.company_id = heartbeat_runs.company_id and s.agent_id = heartbeat_runs.agent_id and s.id <> heartbeat_runs.id
+        and coalesce(s.issue_id, (s.context_snapshot->>'issueId')::uuid) = coalesce(heartbeat_runs.issue_id, heartbeat_runs.native_issue_id)
+        and s.created_at > heartbeat_runs.created_at and s.status <> 'queued'
+        and coalesce(s.started_at, s.updated_at) >= ${decidedAt}::timestamptz)` })
+    .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1);
+  return row?.admitted === true;
 }
 
 export async function cleanupNativeWorkspaceSync(runId: string): Promise<void> {
