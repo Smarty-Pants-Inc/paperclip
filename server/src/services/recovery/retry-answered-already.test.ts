@@ -93,6 +93,63 @@ describe("fam-retry3: Retry of a failed run whose person message is already answ
       retryWait: { reason: "person_message_already_answered", message: ALREADY_ANSWERED } });
   });
 
+  /** rf-5 tA-min finding 3: M1's run R fails while M2 is held; a later run S
+   * carries ONLY M2 and answers it (answer "m2-only"), or carries both and
+   * answers both (control, "both"). */
+  async function seedHeld(answer: "m2-only" | "both") {
+    const f = await seed("none");
+    const m2 = randomUUID(), runS = randomUUID(), t1 = Date.now() - 8 * 60_000;
+    await db.insert(issueComments).values({ id: m2, companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: "board",
+      body: "And also list the open questions.", createdAt: new Date(t1) });
+    const ids = answer === "both" ? [f.messageId, m2] : [m2];
+    await db.insert(heartbeatRuns).values({ id: runS, companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, status: "succeeded",
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: ids.at(-1), wakeCommentIds: ids }, createdAt: new Date(t1 + 120_000),
+      startedAt: new Date(t1 + 120_000), finishedAt: new Date(t1 + 240_000), resultJson: {} });
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: runS, body: "Here are the open questions.", createdAt: new Date(t1 + 200_000) });
+    return { ...f, m2, runS, latestRunId: runS };
+  }
+
+  it("rf-5 tA-min finding 3: failed run R's M1 is NOT 'already answered' because a later run answered only the held M2", async () => {
+    const f = await seedHeld("m2-only");
+    for (const sourceRunId of [f.runA, f.runS, null]) {
+      const authority = await readRetryAdmissionAuthority(db, { companyId: f.companyId, issueId: f.issueId, sourceRunId });
+      expect(authority.reason, String(sourceRunId)).not.toBe("person_message_already_answered");
+      expect(authority.cardText ?? "", String(sourceRunId)).not.toContain(ALREADY_ANSWERED);
+    }
+    // The task's Retry names the latest run (the one that answered only M2): never the false no-op.
+    const answer = await retry(f).catch(error => ({ error: String(error?.message ?? error) }));
+    expect(answer).not.toMatchObject({ alreadyAnswered: true });
+    expect(JSON.stringify(answer)).not.toContain(ALREADY_ANSWERED);
+  });
+
+  it("control (finding 3): once R's own M1 is ANSWERED too, the same Retry is 'Already answered above.'", async () => {
+    const f = await seedHeld("both");
+    for (const sourceRunId of [f.runA, f.runS, null]) {
+      expect(await readRetryAdmissionAuthority(db, { companyId: f.companyId, issueId: f.issueId, sourceRunId }), String(sourceRunId))
+        .toMatchObject({ canRetry: false, reason: "person_message_already_answered", cardText: ALREADY_ANSWERED });
+    }
+    expect(await retry(f)).toMatchObject({ accepted: false, alreadyAnswered: true,
+      refused: { reason: "person_message_already_answered", message: ALREADY_ANSWERED } });
+    expect(await f.wakes()).toEqual([]);
+  });
+
+  it("control (finding 3): a Retry run that answered R's M1 as attribution-only input makes the next Retry 'Already answered above.'", async () => {
+    const f = await seedHeld("m2-only");
+    const runT = randomUUID(), t2 = Date.now() - 3 * 60_000;
+    await db.insert(heartbeatRuns).values({ id: runT, companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, status: "succeeded",
+      contextSnapshot: { issueId: f.issueId, wakeReason: "task_retry", attributionCommentIds: [f.messageId] }, createdAt: new Date(t2),
+      startedAt: new Date(t2), finishedAt: new Date(t2 + 60_000), resultJson: {} });
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: runT, body: "Here is the summary of the report.", createdAt: new Date(t2 + 30_000) });
+    for (const sourceRunId of [f.runA, f.runS, runT, null]) {
+      expect(await readRetryAdmissionAuthority(db, { companyId: f.companyId, issueId: f.issueId, sourceRunId }), String(sourceRunId))
+        .toMatchObject({ canRetry: false, reason: "person_message_already_answered", cardText: ALREADY_ANSWERED });
+    }
+    expect(await retry(f, runT)).toMatchObject({ accepted: false, alreadyAnswered: true });
+    expect(await f.wakes()).toEqual([]);
+  });
+
   it("negative: an unanswered message still retries (accepted, a Retry saved)", async () => {
     const f = await seed("none");
     expect(await retry(f)).toMatchObject({ accepted: true });
