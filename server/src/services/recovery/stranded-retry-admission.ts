@@ -1,38 +1,38 @@
 import { and, eq } from "drizzle-orm";
-import { agents, heartbeatRuns, type Db } from "@paperclipai/db";
-import { canRetryStoppedRun } from "../cancelled-native-startup.js";
-import { heldRetryOffersRetry, heldTaskRetryRefusals } from "../task-retry-eligibility.js";
-import { hasVerifiedWorkspaceRepair } from "../workspace-recovery-receipt.js";
-import { hasRequiredWorkspaceRecovery } from "../workspace-restore-recovery-state.js";
+import { agents, issues, type Db } from "@paperclipai/db";
+import { taskInterruptionPresentation } from "../task-interruption-presentation.js";
 import type { StrandedRetryAdmission } from "./stranded-notice.js";
 
 /**
- * Whether the Retry a stranded notice would point to (`POST /issues/:id/retry`)
- * can start the task now. It reads the same predicates Retry's admission and
- * dispatch use: the persisted dispatch refusal (`heldRetryOffersRetry`), the
- * stopped-run eligibility (`canRetryStoppedRun`) and the required workspace
- * repair (`hasRequiredWorkspaceRecovery` + `hasVerifiedWorkspaceRepair`), plus
- * the assignee's pause, which holds every start.
+ * Whether the stranded notice may say "Press Retry". It does not decide this
+ * itself: it asks `taskInterruptionPresentation` (task-interruption-presentation.ts),
+ * the one function that decides `canRetry` for the task screen's Retry button
+ * and that `POST /issues/:id/retry` returns as its `presentation`. A refusal
+ * only selects the copy for the action that screen offers instead
+ * (`userAction` / `retryWait.reason`); no predicate is repeated here.
  */
 export async function decideStrandedRetryAdmission(db: Db, input: {
   companyId: string;
   issueId: string;
-  runId: string | null | undefined;
+  runId?: string | null | undefined;
 }): Promise<StrandedRetryAdmission> {
-  const [run] = input.runId ? await db.select().from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId))).limit(1) : [];
-  if (!run) return { admits: false, refusal: "none" };
-  const [agent] = await db.select({ name: agents.name, status: agents.status }).from(agents)
-    .where(and(eq(agents.companyId, input.companyId), eq(agents.id, run.agentId))).limit(1);
-  if (agent?.status === "paused") return { admits: false, refusal: "agent_paused", agentName: agent.name };
-  if (hasRequiredWorkspaceRecovery(run.resultJson) && !await hasVerifiedWorkspaceRepair(db, run))
-    return { admits: false, refusal: "workspace_repair_required" };
-  const held = (await heldTaskRetryRefusals(db, input.companyId, [input.issueId])).get(input.issueId);
-  // Swap point: code-lead's `decideRetryAuthority` (task-retry-eligibility.ts)
-  // replaces this one predicate call when that line lands.
-  const offered = heldRetryOffersRetry(held);
-  if (!offered) return held === "previous_execution_unverified" || held === "workspace_owner_stop_required"
-    ? { admits: false, refusal: "previous_execution_unverified" } : { admits: false, refusal: "none" };
-  if (!await canRetryStoppedRun(db, run)) return { admits: false, refusal: "previous_execution_unverified" };
-  return { admits: true };
+  const [issue] = await db.select({ id: issues.id, companyId: issues.companyId, status: issues.status,
+    assigneeAgentId: issues.assigneeAgentId, projectId: issues.projectId }).from(issues)
+    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).limit(1);
+  const presentation = issue ? await taskInterruptionPresentation(db, issue) : null;
+  return strandedRetryAdmissionFromPresentation(presentation, issue?.assigneeAgentId
+    ? (await db.select({ name: agents.name }).from(agents).where(and(eq(agents.companyId, input.companyId),
+      eq(agents.id, issue.assigneeAgentId))).limit(1))[0]?.name ?? null : null);
+}
+
+type Presentation = Awaited<ReturnType<typeof taskInterruptionPresentation>>;
+
+/** Maps the screen's decision to notice copy. `canRetry` is the decision. */
+export function strandedRetryAdmissionFromPresentation(presentation: Presentation, agentName: string | null): StrandedRetryAdmission {
+  if (presentation?.canRetry) return { admits: true };
+  if (presentation?.userAction === "resume") return { admits: false, refusal: "agent_paused", agentName };
+  if (presentation?.userAction === "confirm_run_stopped" || presentation?.retryWait?.reason === "previous_execution_unverified")
+    return { admits: false, refusal: "previous_execution_unverified" };
+  if (presentation?.retryWait?.reason === "workspace_repair_required") return { admits: false, refusal: "workspace_repair_required" };
+  return { admits: false, refusal: "none" };
 }

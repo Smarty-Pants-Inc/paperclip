@@ -184,6 +184,32 @@ describe("Task Retry recovery-card refresh", () => {
     }
   });
 
+  // Judge row (rf-5 r2b, workspace recovery): the stranded notice asks the
+  // screen's Retry decision; compare it with the real route + dispatch.
+  it("JUDGE workspace recovery (system already recovering): the notice offers no Retry, and the real Retry starts no run", async () => {
+    const f = await fixture();
+    const { decideStrandedRetryAdmission } = await import("../services/recovery/stranded-retry-admission.js");
+    const { buildStrandedRecoveryEscalationNotice } = await import("../services/recovery/stranded-notice.js");
+    const retry = await decideStrandedRetryAdmission(db, { companyId: f.companyId, issueId: f.issueId, runId: f.failed.id });
+    const notice = buildStrandedRecoveryEscalationNotice({ retry, recoveryActionId: f.board.id, recoveryOwner: null,
+      sourceRun: { id: f.failed.id, status: f.failed.status } });
+    const runsBefore = await runRows(f.issueId);
+    const res = await request(f.app).post(`/api/issues/${f.issueId}/retry`).send({ idempotencyKey: randomUUID(), observedRunId: f.failed.id });
+    let dispatchError: string | null = null;
+    if (res.body.requestId) await heartbeatService(db).resumeTaskRetry(f.companyId, res.body.requestId)
+      .catch((error: Error) => { dispatchError = error.message; });
+    const runsAfter = await runRows(f.issueId);
+    const row = { admits: retry.admits, refusal: retry.admits ? null : retry.refusal, pressRetry: /Press Retry/.test(JSON.stringify(notice)),
+      status: res.status, runStarted: runsAfter.length > runsBefore.length, dispatchError, body: notice.body };
+    const { taskInterruptionPresentation } = await import("../services/task-interruption-presentation.js");
+    console.info("JUDGE_ROW workspace", JSON.stringify(row), JSON.stringify(await taskInterruptionPresentation(db, await issueRow(f.issueId))),
+      JSON.stringify(await getExecutionBlocker(db, f.companyId, f.issueId)));
+    // The screen withholds Retry while the saved files are already being
+    // recovered (no person action exists yet), so the notice names none.
+    expect(row).toMatchObject({ admits: false, refusal: "none", pressRetry: false, status: 202, runStarted: false });
+    expect(notice.body).toContain("Your message is saved.");
+  });
+
   it("quota-failure refresh creates no scheduled run, quota wake, comment, or hold mutation", async () => {
     const f = await fixture();
     const newer = await addNewerFailedRun(f);
