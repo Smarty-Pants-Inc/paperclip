@@ -11,6 +11,7 @@ import { CodexSubscriptionPanel } from "./CodexSubscriptionPanel";
 import {
   billingTypeDisplayName,
   formatCents,
+  formatConfiguredCents,
   formatTokens,
   providerDisplayName,
   quotaSourceDisplayName,
@@ -183,7 +184,7 @@ export function ProviderQuotaCard({
               label="This week"
               percentUsed={weekPct}
               leftLabel={formatCents(weekSpendCents)}
-              rightLabel={`~${formatCents(Math.round(weeklyBudgetShare))} / wk`}
+              rightLabel={`~${formatConfiguredCents(Math.round(weeklyBudgetShare))} / wk`}
               showDeficitNotch={weekPct >= 100}
             />
           </div>
