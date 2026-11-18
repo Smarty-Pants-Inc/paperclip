@@ -188,7 +188,7 @@ fn listener_controller_pings_keep_an_idle_connection() {
         }
     });
     connected.recv().unwrap();
-    let (mut transport, _) = AuthenticatedTransport::connect(
+    let (mut transport, _) = connect_when_ready(
         &endpoint,
         &config,
         &state,
@@ -248,7 +248,7 @@ fn listener_welcome_timeout_is_not_reported_as_controller_silence() {
         finished.recv_timeout(Duration::from_secs(10)).unwrap();
     });
     connected.recv().unwrap();
-    let failure = match AuthenticatedTransport::connect(
+    let failure = match connect_when_ready(
         &endpoint,
         &config,
         &state,
@@ -288,5 +288,24 @@ fn controller_silence_must_be_a_plausible_window() {
     ] {
         config.controller_silence = silence;
         config.validate().unwrap();
+    }
+}
+
+/// Fork: a listener endpoint's connect is a poll through ListenerIngress and
+/// returns Ok(None) until a controller's upgrade is ready; upstream's blocking
+/// accept returned the controller directly. Poll until ready or the deadline.
+fn connect_when_ready(
+    endpoint: &RunnerTransportEndpoint,
+    config: &DurableRunnerConfig,
+    state: &DurableState,
+    ticket: Option<&BootstrapTicket>,
+    lease: Option<&LeaseCredential>,
+    deadline: Instant,
+) -> Result<Option<(AuthenticatedTransport, Welcome)>, ConnectFailure> {
+    loop {
+        match AuthenticatedTransport::connect(endpoint, config, state, ticket, lease, deadline) {
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            other => return other,
+        }
     }
 }
