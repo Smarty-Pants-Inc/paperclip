@@ -706,7 +706,10 @@ describe("resolveExecutionRunAdapterConfig codex_local credential pre-dispatch g
     });
   });
 
-  it("surfaces a configuration-incomplete blocker when a managed home has no auth and OPENAI_API_KEY is empty", async () => {
+  it.each([
+    { scenario: "without a leaked env value", leakedValue: null },
+    { scenario: "with a leaked env value outside the fixture path", leakedValue: "sk-" + "A1b2C3d4E5f6G7h8I9j0K1l2" },
+  ])("surfaces a configuration-incomplete blocker when a managed home has no auth and OPENAI_API_KEY is empty ($scenario)", async ({ leakedValue }) => {
     const { managedAgentHome } = await stubManagedCodexEnv({ seedSharedAuth: false });
     const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
       config: { command: "codex", env: { CODEX_HOME: managedAgentHome, OPENAI_API_KEY: "" } },
@@ -744,8 +747,9 @@ describe("resolveExecutionRunAdapterConfig codex_local credential pre-dispatch g
         },
       },
     });
-    // The blocker message must not leak any secret value.
-    await expect(
+    // The blocker message must not leak any secret value. Its known fixture
+    // path is not a secret: a TMPDIR such as "sl-task-..." contains "sk-".
+    const noSecretPrefixGuard = expect(
       resolveExecutionRunAdapterConfig({
         companyId: "company-1",
         agentId: "agent-1",
@@ -757,8 +761,19 @@ describe("resolveExecutionRunAdapterConfig codex_local credential pre-dispatch g
           resolveEnvBindings: vi.fn(),
           collectMissingRuntimeBindings: vi.fn().mockResolvedValue([]),
         } as any,
-      }).catch((err) => err.message),
+      }).catch((err) => {
+        expect(err.code).toBe("configuration_incomplete");
+        // Plant an env-value leak outside the known path to prove that only
+        // the fixture path is excluded; the same guard must still flag it.
+        const message = leakedValue ? `${err.message} OPENAI_API_KEY=${leakedValue}` : err.message;
+        return message.replace(managedAgentHome, "<managed Codex home>");
+      }),
     ).resolves.not.toContain("sk-");
+    if (leakedValue) {
+      await expect(noSecretPrefixGuard).rejects.toThrow();
+    } else {
+      await noSecretPrefixGuard;
+    }
   });
 
   it("dispatches normally when a per-agent OPENAI_API_KEY is resolved", async () => {
