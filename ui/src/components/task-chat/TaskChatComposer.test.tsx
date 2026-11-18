@@ -2600,8 +2600,8 @@ describe("TaskChatComposer", () => {
       });
       typeText("Please outline the launch.");
       await act(async () => sendButton().click());
-      // While the agent works the message also carries its mode (Paul NOTE 6: Steer by default).
-      expect(onAdd.mock.calls.at(-1)!.slice(0, 6)).toEqual(["Please outline the launch.", undefined, undefined, undefined, expect.any(String), { model: "gpt-6-astra", effort: "high", fast: false }]);
+      // No onStop is supplied, so send modes are inactive and deliveryIntent is undefined.
+      expect(onAdd).toHaveBeenCalledWith("Please outline the launch.", undefined, undefined, undefined, expect.any(String), { model: "gpt-6-astra", effort: "high", fast: false }, undefined);
     } finally {
       render(<></>); client.clear(); catalog.mockRestore(); vi.unstubAllGlobals();
     }
