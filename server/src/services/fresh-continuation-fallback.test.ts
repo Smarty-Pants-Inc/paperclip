@@ -1366,6 +1366,93 @@ suite("fresh-continuation fallback", () => {
     }
   }, 120_000);
 
+  // FIX20 (rf-3 03:07Z/03:09Z): the same gate for a Dot agent (adapterType paperclip_runner, provider
+  // openai_dot, adapterConfig.dotBindingId). While the Dot binding is not ready the dispatcher keeps the
+  // aged person run queued and the card shows the Grok hold's waiting line, never Retry (the UI shows
+  // retryWait.message, ExecutionBlockerNotice.tsx:94-99, not 'Working'). The real readiness writer
+  // (external-agents/dot.ts confirmChallenge) stamps startable_since; working only inside stamp + 10 min,
+  // then failed + Retry, one run. Dropping the Dot case of externalBotStartGateBindingId turns this red.
+  it("FIX20 Dot binding not ready: the card shows the external-agent wait, then the readiness stamp starts the 10-min bound", async () => {
+    const f = await judgeQueued(), heartbeat = heartbeatService(db);
+    const { createHash } = await import("node:crypto");
+    const { dotAgentBindings, mcpEventSubscriptions, mcpOauthClients, mcpOauthGrants } = await import("@paperclipai/db");
+    const { dotRunnerBroker } = await import("./dot-runner-broker.js");
+    await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "owner" });
+    const settings = instanceSettingsService(db), experimentalBefore = await settings.getExperimental();
+    await settings.updateExperimental({ enablePublicMcp: true, enableOpenAiDot: true });
+    const [agentBefore] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const clientId = `fix20-${randomUUID()}`;
+    await db.insert(mcpOauthClients).values({ id: clientId, name: "Dedicated Dot", redirectUris: ["https://chatgpt.com/connector_platform/oauth/callback"] });
+    const [grant] = await db.insert(mcpOauthGrants).values({ companyId, userId, clientId, resource: "https://paperclip.example/mcp/runner",
+      purpose: "agent", agentId, scopes: ["paperclip:agent"] }).returning();
+    // Paired (dot.ts pair: status connected, grant bound, dotBindingId written); its event test is not done.
+    const [binding] = await db.insert(dotAgentBindings).values({ companyId, agentId, operatorId: userId, providerKind: "openai_dot",
+      status: "connected", grantId: grant!.id }).returning();
+    await db.update(agents).set({ adapterConfig: { provider: "openai_dot", dotBindingId: binding!.id, allowUnmeteredProvider: true } }).where(eq(agents.id, agentId));
+    const card = async () => taskInterruptionPresentation(db, await issue(f.issueId));
+    try {
+      await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+      const [held] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      console.info(JSON.stringify({ fix20DotDispatch: { status: held!.status, startedAt: held!.startedAt, errorCode: held!.errorCode, startableSince: held!.startableSince } }));
+      expect(held, "the dispatcher's external-bot gate keeps the Dot run queued").toMatchObject({ status: "queued", startedAt: null });
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const base = Date.now(), during: unknown[] = [];
+      for (const later of [0, 600_001, 3_600_000]) {
+        vi.setSystemTime(base + later);
+        const c = await card();
+        during.push({ later, state: c?.state, canRetry: c?.canRetry, retryWait: c?.retryWait });
+        expect(c, `the Dot hold's waiting line, no Retry (+${later})`).toMatchObject({ state: "working", canRetry: false, observedRunId: f.queued.id,
+          retryWait: { reason: "external_agent_setup",
+            message: "Waiting: this external agent's connection is not ready for new work. Your message is saved and starts when it is reconnected." } });
+      }
+      console.info(JSON.stringify({ fix20DotDuringHold: during }));
+      vi.useRealTimers();
+      // The binding becomes ready through its real writer: subscription verified, event test confirmed.
+      const nonce = randomUUID();
+      await db.insert(mcpEventSubscriptions).values({ id: `fix20-${randomUUID()}`, companyId, grantId: grant!.id, name: "paperclip.dot.mailbox_updated",
+        bindingId: binding!.id, arguments: { companyId, bindingId: binding!.id }, deliveryMaterial: {}, verifiedAt: new Date(), expiresAt: new Date(Date.now() + 3_600_000) });
+      await db.update(dotAgentBindings).set({ challengeHash: createHash("sha256").update(nonce).digest("hex"), challengeExpiresAt: new Date(Date.now() + 600_000) })
+        .where(eq(dotAgentBindings.id, binding!.id));
+      const [grantRow] = await db.select().from(mcpOauthGrants).where(eq(mcpOauthGrants.id, grant!.id));
+      const principal = { grant: grantRow, actor: { type: "agent", agentId, companyId } } as unknown as Parameters<ReturnType<typeof dotRunnerBroker>["confirmChallenge"]>[0];
+      const confirmedFrom = Date.now();
+      expect(await dotRunnerBroker(db).confirmChallenge(principal, nonce)).toEqual({ status: "ready" });
+      const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      expect(stamped!.startableSince?.getTime(), "the readiness writer stamped the held run at the clear").toBeGreaterThanOrEqual(confirmedFrom);
+      const stamp = stamped!.startableSince!.getTime();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const seen: Array<{ after: number; state: string | undefined; canRetry: boolean | undefined; retryWait: unknown }> = [];
+      for (const after of [1, 300_000, 599_999]) {
+        vi.setSystemTime(stamp + after);
+        const c = await card();
+        seen.push({ after, state: c?.state, canRetry: c?.canRetry, retryWait: c?.retryWait ?? null });
+      }
+      vi.setSystemTime(stamp + 1_000);
+      const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+      const startQueuedRunId = "startQueuedRunId" in receipt ? receipt.startQueuedRunId : undefined;
+      vi.setSystemTime(stamp + 600_000);
+      const lapsed = await card();
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).filter(r => r.id !== f.source.id);
+      console.info(JSON.stringify({ fix20DotAfterReady: { stamp: stamped!.startableSince, seen, retry: startQueuedRunId ?? null,
+        lapsed: lapsed && { state: lapsed.state, canRetry: lapsed.canRetry }, runs: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+      expect(seen.map(s => s.state), "working at stamp + 1 ms, +300 s, +599.999 s").toEqual(["working", "working", "working"]);
+      expect(seen.map(s => s.canRetry ?? false), "no Retry inside the window").toEqual([false, false, false]);
+      expect(seen.map(s => s.retryWait), "the hold has cleared").toEqual([null, null, null]);
+      expect(startQueuedRunId, "a Retry inside the window starts nothing").toBeUndefined();
+      expect(runs.map(r => ({ id: r.id, startedAt: r.startedAt })), "exactly one run, nothing extra").toEqual([{ id: f.queued.id, startedAt: null }]);
+      expect(lapsed, "still untaken at stamp + 10 min: failed + Retry").toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
+    } finally {
+      vi.useRealTimers();
+      await db.update(agents).set({ adapterConfig: agentBefore!.adapterConfig }).where(eq(agents.id, agentId));
+      await db.delete(mcpEventSubscriptions).where(eq(mcpEventSubscriptions.grantId, grant!.id));
+      await db.delete(dotAgentBindings).where(eq(dotAgentBindings.id, binding!.id));
+      await db.delete(mcpOauthGrants).where(eq(mcpOauthGrants.id, grant!.id));
+      await db.delete(mcpOauthClients).where(eq(mcpOauthClients.id, clientId));
+      await settings.updateExperimental({ enablePublicMcp: experimentalBefore.enablePublicMcp, enableOpenAiDot: experimentalBefore.enableOpenAiDot });
+    }
+  }, 120_000);
+
   // fix12 item 2b clock (rf-3 22:23Z): a 20-min hold (the task's previous run, on another agent, still
   // running, its sandbox cleanup pending) clears; the dispatcher is slow. Superseded by replacement (RFL
   // record SUPERSEDE-B-STARTABLE-SINCE-1117, ruling (a)): the cleanup success is the clear and stamps
