@@ -221,7 +221,17 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
   // The ONE shared definition (person-message-answer.ts), so B's notice and the continuation carry never
   // disagree on a message (RFL 20:22Z: run-less agent comments never answer; org 20:29Z: imported history).
   // No run-status rule of its own here: ANSWERED already requires the completed final answer.
-  return completedPersonMessageAnswerSql(m);
+  // compose (C3-2 x the R-ONCE earlier-message duty): a card's RECORDED asking origin (sourceCommentId /
+  // originCommentIds) was replied to by that card, also for a legacy card with no source run. The carry never
+  // re-sends such an origin beside the card answer (continuation-comment-input.ts), so the sweep must not call it
+  // unanswered either: the person's input is then the card answer, with its own duty (unansweredCardAnswerSql).
+  return sql`(${completedPersonMessageAnswerSql(m)} or exists (select 1 from ${issueThreadInteractions} asked
+    where asked.company_id = ${m.companyId} and asked.issue_id = ${m.issueId} and asked.created_by_agent_id is not null
+      and asked.created_at > ${m.createdAt}
+      and (asked.status in ('pending', 'answered', 'accepted', 'rejected')
+        or (asked.status = 'cancelled' and asked.resolved_by_user_id is not null))
+      and (asked.source_comment_id::text = ${m.id}::text
+        or coalesce(asked.origin_comment_ids, '[]'::jsonb) ? ${m.id}::text)))`;
 }
 /**
  * compose (fam-long + ANSWERED). SQL: message m is EXPLAINED by the ONE true
