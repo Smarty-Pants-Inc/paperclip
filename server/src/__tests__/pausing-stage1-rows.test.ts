@@ -101,7 +101,9 @@ describe("pausing stage 1 rows", () => {
     expect((lease!.metadata as Record<string, unknown>).remoteExecutionTermination).toMatchObject({ state: "stopped", providerLeaseId });
     const resume = await request(app()).post(`/api/agents/${agent.id}/resume`).send({});
     expect(resume.status, JSON.stringify(resume.body)).toBe(200);
-    const ready = worker();
+    // The resume route schedules a pass on the configured worker (scheduleAgentLifecycle).
+    // Join that in-flight pass: a second worker's claim finds the lease held and returns at once.
+    const ready = workers.at(-1)!;
     for (let pass = 0; pass < 3 && (await agentRow(agent.id)).lifecycleState !== "ready"; pass += 1) await ready.process(agent.id);
     expect((await agentRow(agent.id)), JSON.stringify((await agentRow(agent.id)).lifecycleOperation)).toMatchObject({ lifecycleState: "ready" });
   });
