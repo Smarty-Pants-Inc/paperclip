@@ -151,7 +151,7 @@ import { uploadVerifiedProviderPack } from "./provider-pack-upload.js";
 import { selectRemotePiCompanion } from "./remote-pi-companion.js";
 import { scheduledResumeContinuationAllowed } from "./scheduled-resume-continuation.js";
 import { readNativeLocalProcessStop, recordedLocalExecutionStopped, PRIOR_OWNER_FENCE_REFUSED, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, withReleasedNativeRunProcess } from "../native-local-process-stop.js";
-import { hasRemoteTerminationReceipt, ownLeaseTerminated, remoteLeaseCleanupScope, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, ownLeaseTerminated, PREDECESSOR_LONG_STOP_MS, remoteLeaseCleanupScope, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "../reusable-sandbox-kept-marker.js";
 import { connectorToolDefinitionsForSkills } from "../connector-runtime.js";
 import { NATIVE_PREPARATION_FENCING_VERSION, setNativeExecutionActive } from "./native-active-runs.js";
@@ -17181,8 +17181,9 @@ export async function verifyRemoteRunnerReattachment(input: {
 
 /** Boat (docs.boat.dev/snapshots/stop.md, "Resume within 10 minutes"): after
  * 10 minutes stopped, a resume always starts a new machine from the snapshot.
- * Core requires 15. */
-export const PREDECESSOR_LONG_STOP_MS = 15 * 60_000;
+ * Core requires 15. Defined once in remote-execution-termination.ts, which
+ * the reusable-lease resume fence (B1) also reads. */
+export { PREDECESSOR_LONG_STOP_MS };
 /** Whether a predecessor sandbox stopped for at least PREDECESSOR_LONG_STOP_MS
  * proves its Runner gone by itself. RFL ruled yes (2026-11-13) under exact
  * conditions: a fresh provider read at decision time, the provider-neutral

@@ -41,7 +41,7 @@ import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/nati
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSandboxStop, preparePreviousBootClosedTipStop, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
-import { hasBoundRemoteStopReceipt, ownLeaseTerminated, remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, ownLeaseTerminated, remoteTerminationReceipt, stoppedReceiptFencesOtherRunResume } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -1224,6 +1224,8 @@ function reusableLeaseCanBeResumed(input: {
   heartbeatRunId: string | null;
 }): boolean {
   if (abandonedWorkspaceFilesParked(input.lease)) return false;
+  // B1: another run's 'stopped' box may still hold that run's processes in memory.
+  if (stoppedReceiptFencesOtherRunResume({ lease: input.lease, heartbeatRunId: input.heartbeatRunId })) return false;
   if (input.lease.status === "released" || input.lease.status === "retained") return true;
   return input.lease.status === "active" && input.heartbeatRunId !== null && input.lease.heartbeatRunId === input.heartbeatRunId;
 }

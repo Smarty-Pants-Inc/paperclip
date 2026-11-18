@@ -28,6 +28,36 @@ export function remoteTerminationReceipt(lease: LeaseIdentity, value: unknown, p
   };
 }
 
+/** Boat (docs.boat.dev/snapshots/stop.md, "Resume within 10 minutes"): after
+ * 10 minutes stopped, a resume always starts a new machine from the snapshot.
+ * Core requires 15. (Re-exported by native-session-executor.ts.) */
+export const PREDECESSOR_LONG_STOP_MS = 15 * 60_000;
+
+/** B1: a released lease whose typed termination receipt is "stopped" (the
+ * box was kept, not destroyed) may still hold its run's provider and tool
+ * processes frozen in memory: a short-stopped box resumes with memory and
+ * processes alive (environment-execution-target.ts, Boat's memory window).
+ * A DIFFERENT run must not resume it until PREDECESSOR_LONG_STOP_MS after the
+ * receipt was confirmed. The receipt itself is no proof the run's Runner was
+ * gone: a memory resume defeats it. c1 records no typed, lease-bound proof
+ * that the Runner was gone before the box froze, so this fence is window-only.
+ * The same run's own resume is unaffected; a "destroyed" receipt is not this
+ * case. Selection (reusableLeaseCanBeResumed) and the handoff (environments
+ * acquireLease replacesReusableLeaseId) both use this one predicate. */
+export function stoppedReceiptFencesOtherRunResume(input: {
+  lease: { heartbeatRunId: string | null; metadata: Record<string, unknown> | null };
+  heartbeatRunId: string | null;
+  now?: number;
+}): boolean {
+  if (input.heartbeatRunId !== null && input.lease.heartbeatRunId === input.heartbeatRunId) return false;
+  const receipt = input.lease.metadata?.remoteExecutionTermination as { state?: unknown; confirmedAt?: unknown } | undefined;
+  if (receipt?.state !== "stopped") return false;
+  const confirmedAt = typeof receipt.confirmedAt === "string" ? Date.parse(receipt.confirmedAt) : Number.NaN;
+  // A stopped receipt without a readable confirmation time proves no window ended.
+  if (!Number.isFinite(confirmedAt)) return true;
+  return (input.now ?? Date.now()) < confirmedAt + PREDECESSOR_LONG_STOP_MS;
+}
+
 type ReceiptLease = LeaseIdentity & {
   releasedAt: unknown; cleanupStatus: string | null; status: string;
   metadata: Record<string, unknown> | null;
