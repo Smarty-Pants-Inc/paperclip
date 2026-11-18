@@ -17,7 +17,7 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun, QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, userStopBoundaryAt } from "./run-cancellation.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { isCancelledNativeStartup, isFailedNativePreparation, isFailedNativePreparationRetryAncestor } from "./cancelled-native-startup.js";
-import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession, nativeGatedRunNeverLaunched, nativeRunNeverLaunched, recordedLocalExecutionStopped, recordUnidentifiedLocalRunnerStop } from "./native-local-process-stop.js";
+import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession, nativeGatedRunNeverLaunched, nativeRunNeverLaunched, recordedLocalExecutionStopped, recordUnidentifiedLocalRunnerStop, serverRecordedNativeLaunch } from "./native-local-process-stop.js";
 import { completeTerminatedLocalNativeSessionCleanup, completeTerminatedRemoteNativeSessionCleanup, nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
 import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
 import { z } from "zod";
@@ -362,8 +362,12 @@ export async function admitExplicitNativeContinuation(input: {
     // below admits (committedFailure). Admit it as that native source, so every
     // stop proof below still applies and this Retry's workspace decision and
     // fresh-thread record are taken here, before native selection.
+    // compose (H3 x fam-long): only a run the SERVER recorded a launch, process or lease for has something of its
+    // own for those stop proofs to judge. A committed failure with none keeps the admission it had before h3-ii-live
+    // (unit 1's exhausted cut successor after a person's Retry).
     const [committedFailure] = source?.runtimeMode === "native" && source.status === "failed" && source.finishedAt
       && coordinator?.phase === "committed" && coordinator.resultId && !coordinator.leaseOwner
+      && await serverRecordedNativeLaunch(db, source)
       ? await db.select({ id: nativeRunResults.id }).from(nativeRunResults).where(and(
           eq(nativeRunResults.companyId, companyId), eq(nativeRunResults.issueId, issueId),
           eq(nativeRunResults.runId, source.id), eq(nativeRunResults.id, coordinator.resultId),

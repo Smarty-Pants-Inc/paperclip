@@ -34,7 +34,6 @@ import { issueService } from "../issues.js";
 import * as usageReceipts from "../usage-receipts.js";
 import { settleUnansweredPersonMessagesForTask, unansweredPersonMessageCondition } from "../recovery/unanswered-person-message.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
-import { recordNativeLocalProcessStopInTransaction } from "../native-local-process-stop.js";
 
 // dl famlong-u1. Live (review-fleet-2): after a mid-stream cut the recovery
 // path never ran. The status arbiter's GENERIC successor ran instead (context
@@ -226,13 +225,6 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     await applyNativeMidStreamCutOpening(db, { run, issueId, context });
     return context;
   }
-  /** compose (H3 h3-ii-live x fam-long): a person's Retry of a committed failed native run is admitted as its
-   * native source, so the stop proofs apply. A real local runner leaves the host's verified stop record when its
-   * process exits; the simulated cut turn has no process, so the fixture records that same server-authored event. */
-  async function recordLocalStopProof(runId: string) {
-    expect(await db.transaction(tx => recordNativeLocalProcessStopInTransaction(tx as unknown as typeof db, { id: runId, companyId, agentId,
-      runtimeMode: "native", processPid: 2147483646, processGroupId: null, processStartedAt: new Date() }))).toBe(true);
-  }
   /** Every dispatcher that could start a successor runs; returns the task's successor runs after them. */
   async function dispatchEverything(issueId: string, cutRunId: string) {
     const heartbeat = heartbeatService(db, { runtimeEnv: {} });
@@ -299,7 +291,6 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     expect(NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION).not.toMatch(/continuing|Sending it again is safe/u);
     await assertOnePublishedNoteAfterSweep(issueId, second.runId);
     // A real Retry: accepted, and it starts one run of the task.
-    await recordLocalStopProof(second.runId);
     const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: "board-user", actorSource: "session",
       idempotencyKey: randomUUID(), observedRunId: second.runId });
     expect(receipt).toMatchObject({ accepted: true, stale: false });
@@ -319,7 +310,6 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     const after = await dispatchEverything(issueId, first.runId);
     expect(after.successors.map(run => run.id)).toEqual([second.runId]);
     await assertOnePublishedNoteAfterSweep(issueId, second.runId);
-    await recordLocalStopProof(second.runId);
     const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: "board-user", actorSource: "session",
       idempotencyKey: randomUUID(), observedRunId: second.runId });
     expect(receipt).toMatchObject({ accepted: true, stale: false });

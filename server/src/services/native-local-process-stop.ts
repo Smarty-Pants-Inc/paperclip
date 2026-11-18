@@ -111,6 +111,21 @@ export async function hasNativeLocalProcessStop(db: Db, companyId: string, runId
   return event?.eventType === LOCAL_PROCESS_STOPPED && (!after || event.createdAt > after);
 }
 
+/** Server-authored evidence that this run launched (or was bound to) an execution the server must see stopped:
+ * a process identity on the row, a launch/identity/stop event, or an environment lease. A run with none of them
+ * has nothing of its own for a stop proof to judge. */
+export async function serverRecordedNativeLaunch(db: Db, run: { id: string; companyId: string;
+  processPid?: number | null; processGroupId?: number | null }): Promise<boolean> {
+  if (run.processPid || run.processGroupId) return true;
+  const [event] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id), isNull(heartbeatRunEvents.sourceEventId),
+    inArray(heartbeatRunEvents.eventType, [PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED, LOCAL_PROCESS_STOPPED]))).limit(1);
+  if (event) return true;
+  const [lease] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id))).limit(1);
+  return Boolean(lease);
+}
+
 /**
  * A local runner launch can be requested and the server killed before the
  * runner's process identity is recorded. With no PID to check, prove on this
