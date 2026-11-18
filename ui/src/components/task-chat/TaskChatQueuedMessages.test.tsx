@@ -1,5 +1,11 @@
 // @vitest-environment jsdom
 
+import { createServer } from "node:http";
+import { once } from "node:events";
+import type { AddressInfo } from "node:net";
+import type { DragEndEvent } from "@dnd-kit/core";
+import { issuesApi } from "@/api/issues";
+import { ApiError } from "@/api/client";
 import { act, type ComponentProps } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
@@ -12,6 +18,49 @@ import {
   reorderQueuedMessageEntries,
   TaskChatQueuedMessages,
 } from "./TaskChatQueuedMessages";
+
+// Substitute only the browser sensor; HTTP rows below use the real API client
+// and a loopback HTTP response, not a rejected onReorder promise.
+const dragSensor = vi.hoisted(() => ({ end: null as null | ((event: DragEndEvent) => void) }));
+vi.mock("@dnd-kit/core", async importOriginal => {
+  const actual = await importOriginal<typeof import("@dnd-kit/core")>();
+  return { ...actual, DndContext: (props: ComponentProps<typeof actual.DndContext>) => {
+    dragSensor.end = props.onDragEnd ?? null;
+    return <actual.DndContext {...props} />;
+  } };
+});
+
+async function withReorderHttp(
+  status: number,
+  response: unknown,
+  run: (requests: Array<{ method?: string; path?: string; body: unknown }>, statuses: number[]) => Promise<void>,
+) {
+  const requests: Array<{ method?: string; path?: string; body: unknown }> = [];
+  const statuses: number[] = [];
+  const server = createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    requests.push({ method: req.method, path: req.url, body: JSON.parse(body) });
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(response));
+  });
+  const nativeFetch = globalThis.fetch;
+  try {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    vi.stubGlobal("fetch", async (path: string, init?: RequestInit) => {
+      const result = await nativeFetch(new URL(path, origin), init);
+      statuses.push(result.status);
+      return result;
+    });
+    await run(requests, statuses);
+  } finally {
+    vi.unstubAllGlobals();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -145,9 +194,82 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.disabled).toBe(false);
   });
 
-  it("does not offer a reorder across distinct chat wakes", () => {
-    const entries = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" }];
+  // SUPERSEDE: "does not offer a reorder across distinct chat wakes".
+  // Paul NOTE 6 #20994 / PART B permits ordinary per-message wakes; only
+  // an explicit /new boundary keeps the old refusal. The assertion is retained.
+  it("refuses a reorder across /new, not across ordinary per-message wakes", () => {
+    const entries = [queue.entries[0], { ...queue.entries[1], behindReset: true, queueId: "wake-2", queueRevision: "rev-2" }];
     expect(reorderQueuedMessageEntries(entries, "comment-1", "comment-2")).toBeNull();
+  });
+
+  it("saves a within-Stop-side cross-wake drag through HTTP 200 and renders exactly the submitted order", async () => {
+    const candidate: IssueQueuedCommentQueue = { ...queue, entries: [
+      { ...queue.entries[0], deliveryIntent: "queue" },
+      { ...queue.entries[1], deliveryIntent: "queue", queueId: "wake-2", queueRevision: "rev-2" },
+    ] };
+    const orderedIds = ["comment-2", "comment-1"];
+    const completed = deferred<void>();
+    await withReorderHttp(200, { ...candidate, entries: [...candidate.entries].reverse() }, async (requests, statuses) => {
+      render({ queue: candidate, onReorder: async (ids, revision) => {
+        try {
+          await issuesApi.reorderQueuedComments(candidate.issueId, { orderedCommentIds: ids, revision, queueId: candidate.queueId! });
+        } finally { completed.resolve(); }
+      } });
+      await act(async () => {
+        dragSensor.end!({ active: { id: "comment-2" }, over: { id: "comment-1" } } as DragEndEvent);
+        await completed.promise;
+      });
+      expect(statuses).toEqual([200]);
+      expect(requests).toEqual([{ method: "PUT", path: "/api/issues/issue-1/queued-comments/order", body: {
+        orderedCommentIds: orderedIds, queueId: "wake-1", revision: "rev-1",
+      } }]);
+      expect([...container.querySelectorAll('[data-testid^="task-chat-queued-message-"]')]
+        .map(row => row.getAttribute("data-testid")!.replace("task-chat-queued-message-", ""))).toEqual(orderedIds);
+      expect(container.textContent).not.toContain("Previous order restored");
+    });
+  });
+
+  it.each(["chat", "task"] as const)("restores the order and exact rollback bytes after a Stop-crossing HTTP 409 for %s", async kind => {
+    const stop = new Date("2026-11-18T08:00:00.000Z").getTime();
+    const candidate: IssueQueuedCommentQueue = { ...queue, targetRunId: null, entries: queue.entries.map((entry, position) => ({
+      ...entry, deliveryIntent: "queue",
+      comment: { ...entry.comment, createdAt: new Date(stop + (position === 0 ? -1000 : 100)) },
+      ...(kind === "chat" && position === 1 ? { queueId: "wake-2", queueRevision: "rev-2" } : {}),
+    })) };
+    // Exact wire contract from 4c's real route rows. The UI test uses actual
+    // loopback HTTP + the production API client; server/Postgres no-write and
+    // native-admission checks remain in issue-queued-comments-routes.test.ts.
+    const body = { error: "Queued messages cannot be moved across the Stop line",
+      details: { code: "queued_comment_stop_line_crossing" } };
+    const completed = deferred<void>();
+    let refusal: unknown;
+    const shown = () => [...container.querySelectorAll('[data-testid^="task-chat-queued-message-"]')]
+      .map(row => row.getAttribute("data-testid")!.replace("task-chat-queued-message-", ""));
+    await withReorderHttp(409, body, async (requests, statuses) => {
+      render({ queue: candidate, onReorder: async (ids, revision) => {
+        try {
+          await issuesApi.reorderQueuedComments(candidate.issueId, { orderedCommentIds: ids, revision, queueId: candidate.queueId! });
+        } catch (error) { refusal = error; throw error; }
+        finally { completed.resolve(); }
+      } });
+      expect(shown()).toEqual(["comment-1", "comment-2"]);
+      flushSync(() => dragSensor.end!({ active: { id: "comment-2" }, over: { id: "comment-1" } } as DragEndEvent));
+      expect(shown()).toEqual(["comment-2", "comment-1"]);
+      await act(async () => { await completed.promise; });
+      expect(statuses).toEqual([409]);
+      expect(refusal).toBeInstanceOf(ApiError);
+      expect(refusal).toMatchObject({ status: 409, body });
+      expect(requests).toEqual([{ method: "PUT", path: "/api/issues/issue-1/queued-comments/order", body: {
+        orderedCommentIds: ["comment-2", "comment-1"], queueId: "wake-1", revision: "rev-1",
+      } }]);
+      expect(shown()).toEqual(["comment-1", "comment-2"]);
+      const rollback = [...container.querySelectorAll('[role="status"]')]
+        .find(node => node.textContent === "Couldn’t reorder. Previous order restored.");
+      expect(rollback?.textContent).toBe("Couldn’t reorder. Previous order restored.");
+      expect(Buffer.from(rollback!.textContent!, "utf8").toString("hex")).toBe(
+        "436f756c646ee28099742072656f726465722e2050726576696f7573206f7264657220726573746f7265642e");
+      expect(container.textContent).not.toContain("The queue changed in another session");
+    });
   });
 
   it("renders queued Markdown and screenshot thumbnails without showing image syntax", () => {

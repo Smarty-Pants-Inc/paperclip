@@ -61,9 +61,9 @@ export function reorderQueuedMessageEntries(
   const from = entries.findIndex((entry) => entry.comment.id === activeId);
   const to = entries.findIndex((entry) => entry.comment.id === overId);
   if (from < 0 || to < 0 || from === to) return null;
-  // A /new owns a separate wake. Reordering is confined to one wake even
-  // though the waiting list displays all of them together.
-  if (entries[from].queueId !== entries[to].queueId) return null;
+  // Agent Chat has a wake per message, not just per /new. Only the reset
+  // boundary blocks a drag; the server enforces the separate Stop boundary.
+  if (entries.slice(Math.min(from, to), Math.max(from, to) + 1).some(atOrBehindReset)) return null;
   return arrayMove(entries, from, to).map((entry, position) => ({
     ...entry,
     position,
@@ -144,7 +144,7 @@ const atOrBehindReset = (entry: IssueQueuedCommentEntry) => isResetEntry(entry) 
 export function steeringCount(entries: IssueQueuedCommentEntry[]): number {
   let count = 0;
   for (const entry of entries) {
-    if (intentOf(entry) !== "steer" || atOrBehindReset(entry) || entry.queueId) break;
+    if (intentOf(entry) !== "steer" || atOrBehindReset(entry)) break;
     count += 1;
   }
   return count;
@@ -215,7 +215,7 @@ function SortableQueuedMessage({
   const label = stripStandaloneImageEmbeds(body);
   const dragDisabledReason = readOnly ? "Only the conversation owner can reorder"
     : immutableResponse ? "A saved response keeps its place"
-      : tail ? "Waits behind /new; it moves after /new starts"
+      : atOrBehindReset(entry) ? "Waits behind /new; it moves after /new starts"
         : !queue.queueId ? "Saving… reorder in a moment" : null;
   const sortable = useSortable({
     id: entry.comment.id,
@@ -530,8 +530,9 @@ export function TaskChatQueuedMessages({
     const next = intentChange
       ? reordered.map((entry) => entry.comment.id === activeCommentId ? { ...entry, deliveryIntent: intentChange } : entry)
       : reordered;
-    // The order route reorders the queue's own wake; rows behind a /new keep their wakes.
-    const orderedIds = next.filter((entry) => !entry.queueId).map((entry) => entry.comment.id);
+    // The reorder route validates and saves the whole displayed order, including
+    // ordinary per-message wakes. A /new cannot move; Stop crossings roll back.
+    const orderedIds = next.map((entry) => entry.comment.id);
     const to = next.findIndex((entry) => entry.comment.id === activeCommentId);
     setEntries(next);
     setReordering(true);
@@ -580,8 +581,8 @@ export function TaskChatQueuedMessages({
     const insertAt = intent === "steer" ? steeringRows : steeringRows - 1;
     const next = [...others.slice(0, insertAt), { ...entry, deliveryIntent: intent }, ...others.slice(insertAt)]
       .map((candidate, position) => ({ ...candidate, position }));
-    const orderedIds = next.filter((candidate) => !candidate.queueId).map((candidate) => candidate.comment.id);
-    const orderChanged = orderedIds.join() !== previous.filter((candidate) => !candidate.queueId).map((candidate) => candidate.comment.id).join();
+    const orderedIds = next.map((candidate) => candidate.comment.id);
+    const orderChanged = orderedIds.join() !== previous.map((candidate) => candidate.comment.id).join();
     setEntries(next);
     setPending({ commentId, action: "intent" });
     setVisibleError(null);
