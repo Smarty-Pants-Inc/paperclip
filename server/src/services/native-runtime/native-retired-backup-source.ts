@@ -66,7 +66,7 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   if (!chain) return false;
   const lease = chain.tip;
   // Retirement and the supersession claim belong exclusively to the tip.
-  const stamp = newestNativeHarnessBackupStampOnChain(chain, input.normalizedSessionId, "restore");
+  const stamp = newestNativeHarnessBackupStampOnChain(chain, input.normalizedSessionId);
   if (!stamp) return false;
   if (stamp.manifestSha256 !== input.manifestSha256
     || stamp.normalizedSessionId !== input.normalizedSessionId
@@ -89,7 +89,7 @@ type NativeHarnessBackupLeaseChain = { tip: SourceLease; predecessors: SourceLea
  * from (`retiredReusableLeasePredecessors`). Null when the rows do not form one
  * verified chain; callers then keep their single-row rule.
  */
-export async function loadNativeHarnessBackupLeaseChain(db: Db, input: {
+async function loadNativeHarnessBackupLeaseChain(db: Db, input: {
   companyId: string; providerLeaseId: string;
 }): Promise<NativeHarnessBackupLeaseChain | null> {
   if (!input.providerLeaseId) return null;
@@ -102,7 +102,7 @@ export async function loadNativeHarnessBackupLeaseChain(db: Db, input: {
 }
 
 /** Every lease row of one allocation in one company (the chain's own query). */
-export async function loadNativeHarnessBackupLeaseRows(db: Db, input: {
+async function loadNativeHarnessBackupLeaseRows(db: Db, input: {
   companyId: string; providerLeaseId: string;
 }): Promise<SourceLease[]> {
   if (!input.providerLeaseId) return [];
@@ -119,7 +119,7 @@ export async function loadNativeHarnessBackupLeaseRows(db: Db, input: {
  * `native_session_id`, else its `nativeExecutionInput` session. The reuse
  * scope has no session, so one allocation can serve several sessions in turn.
  */
-export async function nativeSessionOfLeaseRun(db: Db, lease: Pick<SourceLease, "companyId" | "heartbeatRunId">): Promise<string | null> {
+async function nativeSessionOfLeaseRun(db: Db, lease: Pick<SourceLease, "companyId" | "heartbeatRunId">): Promise<string | null> {
   if (!lease.heartbeatRunId) return null;
   const [run] = await db.select({ nativeSessionId: heartbeatRuns.nativeSessionId, profile: heartbeatRuns.runnerProfileJson })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId))).limit(1);
@@ -134,20 +134,17 @@ export async function nativeSessionOfLeaseRun(db: Db, lease: Pick<SourceLease, "
  * session on the chain's allocation by completion time; another session's stamp
  * never stands in for it. Conflicting latest-time stamps are ambiguous.
  *
- * `cleanup` (obsolete-box custody) reads only the given session's stamps: an
- * older or newer stamp of another session does not hold custody of this box.
- * `restore` stays fail-closed: the newest stamp across the whole chain must be
- * the recalling session's, so a NEWER or TIED stamp from another session
- * refuses. Otherwise an older session could claim the shared source row first
+ * Fail-closed: the newest stamp across the whole chain must be the recalling
+ * session's, so a NEWER or TIED stamp from another session refuses. Otherwise
+ * an older session could claim the shared source row first
  * (supersedeIdleWarmSource) and lock out the session whose stamp is newer.
  */
-export function newestNativeHarnessBackupStampOnChain(chain: NativeHarnessBackupLeaseChain,
-  normalizedSessionId: string | null, mode: "restore" | "cleanup") {
+function newestNativeHarnessBackupStampOnChain(chain: NativeHarnessBackupLeaseChain,
+  normalizedSessionId: string | null) {
   if (!normalizedSessionId) return null;
   const stamps = [chain.tip, ...chain.predecessors]
     .map(row => readNativeHarnessBackupStamp(row.metadata?.nativeHarnessBackup, chain.tip.providerLeaseId!))
-    .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null
-      && (mode === "restore" || candidate.normalizedSessionId === normalizedSessionId))
+    .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null)
     .sort((left, right) => Date.parse(right.completedAt) - Date.parse(left.completedAt));
   const stamp = stamps[0];
   if (!stamp || stamps.some(candidate => Date.parse(candidate.completedAt) === Date.parse(stamp.completedAt)
@@ -224,7 +221,7 @@ export async function recordNativeHarnessBackupStampOnLeaseChain(db: Db, input: 
   return write(input.leaseId, input.runId, false);
 }
 
-/** Shared by backup restore and compatible environment draining: a valid old
+/** Shared by backup restore and obsolete-box custody: a valid old
  * archive is not a checkpoint of provider work that happened after it. */
 export async function nativeHarnessBackupHasLaterProviderWork(db: Db, input: {
   /** Omitted when no run is excluded (custody for destroying a source). */
@@ -305,9 +302,8 @@ async function idleWarmSourceRetiresBackup(db: Db, lease: typeof environmentLeas
   return !await nativeWorkspaceExportPendingForResource(db, lease, currentRunId);
 }
 
-/** A restore hold or a pending shutdown settlement still protects the files; reuse skips these too.
- * Also gates the recall's retirement of a previous boot's closed ACTIVE tip (J3-26). */
-export function sourceFilesHeld(lease: SourceLease): boolean {
+/** A restore hold or a pending shutdown settlement still protects the files; reuse skips these too. */
+function sourceFilesHeld(lease: SourceLease): boolean {
   return Object.hasOwn(lease.metadata ?? {}, LEGACY_WORKSPACE_RECOVERY_KEY)
     || (lease.metadata?.legacyShutdownWorkspaceSettlement as { state?: unknown } | undefined)?.state === "pending";
 }

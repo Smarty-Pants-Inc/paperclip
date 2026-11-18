@@ -2,11 +2,14 @@
 // RED first, test-only: these pin the behaviour the two cuts must reach, through the real acquisition,
 // the real fresh-continuation fallback and delivery, and the real unanswered-message sweep. Only provider
 // I/O is a controlled peer (the Boat plugin worker).
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns,
+  activityLog, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns,
   issueComments, issueRecoveryActions, issues, nativeRunFinalizations, plugins,
 } from "@paperclipai/db";
 import type { Environment } from "@paperclipai/shared";
@@ -23,15 +26,28 @@ import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { createNativeHarnessBackupStamp, readNativeHarnessBackupStamp, verifyNativeHarnessBackupStampAsync } from "./native-runtime/native-harness-backup-stamp.js";
+import { persistNativeHarnessBackup, verifyDurableNativeHarnessBackup } from "./native-runtime/native-harness-backup-storage.js";
+import { obsoleteWorkspaceCustodyRefusal } from "./native-runtime/native-workspace-finalization-state.js";
+import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
+import { createStorageService } from "../storage/service.js";
+import type { StorageService } from "../storage/types.js";
 import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_SETTLE_MS } from "./recovery/unanswered-person-message.js";
 
-// Custody peer, the same rule as environment-runtime-reusable-resume-replacement.test.ts: a lease's backup verifies only when
-// its stamp authorizes that exact provider lease. Everything else in the module is the real implementation.
+// Only the durable storage backend selector is a peer: real encrypted objects,
+// publication, download/hash verification and local tree verification run below.
+const custodyPeer = vi.hoisted(() => ({ storage: null as StorageService | null }));
 vi.mock("./native-runtime/native-harness-backup-storage.js", async importOriginal => ({
   ...await importOriginal<typeof import("./native-runtime/native-harness-backup-storage.js")>(),
-  verifyRecoverableNativeHarnessBackup: vi.fn(async (input: { stamp: unknown; providerLeaseId: string }) =>
-    Boolean(input.stamp && (input.stamp as { authorizedProviderLeaseId?: unknown }).authorizedProviderLeaseId === input.providerLeaseId)),
+  durableNativeHarnessStorage: () => custodyPeer.storage,
 }));
+// Positive destroy outcome tests isolate the workspace receipt boundary. There
+// is NO production receipt integration yet: the default real function refuses.
+// The separate workspace_unverified row exercises that real refusal end-to-end.
+vi.mock("./native-runtime/native-workspace-finalization-state.js", async importOriginal => {
+  const original = await importOriginal<typeof import("./native-runtime/native-workspace-finalization-state.js")>();
+  return { ...original, obsoleteWorkspaceCustodyRefusal: vi.fn(original.obsoleteWorkspaceCustodyRefusal) };
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -41,26 +57,39 @@ const TYPED = "runner_remote_state_unavailable";
 // reached. "Press Retry" only where the task view proves a Retry control in that state, so the ruled default applies.
 const BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, and both attempts failed. "
   + "Your message and the saved work are kept. Send a new message to try again.";
+// Synthetic fixture identities, NOT production hold-outs. Full IDs are deployment config.
+const paulId = "29b216c4-0000-4000-8000-000000000001", kateId = "46a1dae4-0000-4000-8000-000000000001";
+const fullIds = `${paulId},${kateId}`;
 
 suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
   let db!: ReturnType<typeof createDb>;
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;
   let companyId = "", agentId = "", userId = "";
+  const ownedRoots: string[] = [];
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-follow-paperclip-");
     db = createDb(temporary.connectionString);
   }, 60_000);
+  beforeEach(() => {
+    vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS", fullIds);
+  });
   afterEach(async () => {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
+    vi.mocked(obsoleteWorkspaceCustodyRefusal).mockReset();
+    vi.mocked(obsoleteWorkspaceCustodyRefusal).mockImplementation(
+      (await vi.importActual<typeof import("./native-runtime/native-workspace-finalization-state.js")>("./native-runtime/native-workspace-finalization-state.js")).obsoleteWorkspaceCustodyRefusal);
+    custodyPeer.storage = null;
+    for (const root of ownedRoots.splice(0)) await rm(root, { recursive: true, force: true });
     resetBacklogContinuationPacingForTests(db);
     await heartbeatService(db).drainActiveRunExecutions();
     await truncateTablesWithDeadlockRetry(db, "truncate table companies, environments, plugins cascade");
   });
   afterAll(async () => { await db?.$client.end(); await temporary?.cleanup(); });
 
-  async function company() {
-    companyId = randomUUID(); agentId = randomUUID(); userId = randomUUID();
+  async function company(overrideAgentId?: string) {
+    companyId = randomUUID(); agentId = overrideAgentId ?? randomUUID(); userId = randomUUID();
     await db.insert(authUsers).values({ id: userId, name: "Paul", email: `${userId}@example.test`,
       emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companies).values({ id: companyId, name: "Follow Paperclip", issuePrefix: `FP${companyId.slice(0, 4)}`,
@@ -105,6 +134,38 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
     await deliverReconciledExecutions(database, heartbeat.wakeup);
   }
 
+  async function custodyFixture(input: { issueId: string; runId: string; providerLeaseId: string; completedAt: Date }, durable = true) {
+    const base = await mkdtemp(join(tmpdir(), "paperclip-a5-custody-")); ownedRoots.push(base);
+    vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", base);
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "51".repeat(32));
+    const sessionScopeId = randomUUID(), normalizedSessionId = randomUUID(), runnerInstanceId = randomUUID();
+    const scopeDigest = createHash("sha256").update(sessionScopeId).digest("hex");
+    const root = join(base, scopeDigest, "failover-backups", "current");
+    await mkdir(join(root, "pi"), { recursive: true });
+    const history = Buffer.from('{"message":"copper orchard"}\n');
+    await writeFile(join(root, "pi", "history.jsonl"), history, { mode: 0o600 });
+    const directorySha = `sha256:${createHash("sha256").update(`file:history.jsonl:384:${history.length}\0`).update(history).digest("hex")}`;
+    const manifest = { schema: "paperclip.native-harness-backup.v1", normalizedSessionId, runnerInstanceId,
+      sourceProviderLeaseId: input.providerLeaseId, completedAt: input.completedAt.toISOString(),
+      directories: [{ name: "pi", sha256: directorySha, bytes: history.length }] };
+    const manifestPath = join(root, "manifest.json"); await writeFile(manifestPath, JSON.stringify(manifest));
+    const stamp = createNativeHarnessBackupStamp({ manifestPath, sessionScopeId, authorizedProviderLeaseId: input.providerLeaseId,
+      normalizedSessionId, runnerInstanceId, completedAt: manifest.completedAt });
+    expect(readNativeHarnessBackupStamp(stamp, input.providerLeaseId)).toEqual(stamp);
+    expect(await verifyNativeHarnessBackupStampAsync(stamp, input.providerLeaseId, AbortSignal.timeout(5000))).toBe(true);
+    custodyPeer.storage = createStorageService(createLocalDiskStorageProvider(join(base, "durable")));
+    if (durable) {
+      // Offline capture is fenced by the ended run and a quiescent coordinator.
+      await db.insert(nativeRunFinalizations).values({ companyId, issueId: input.issueId, runId: input.runId,
+        phase: "observed", leaseOwner: null });
+      await persistNativeHarnessBackup({ db, storage: custodyPeer.storage, root, scopeDigest,
+        owner: { kind: "offline_migration", companyId, issueId: input.issueId, runId: input.runId, writersStopped: true } });
+      expect(await verifyDurableNativeHarnessBackup({ db, storage: custodyPeer.storage, companyId, scopeDigest,
+        manifestSha256: stamp.manifestSha256 })).toBe(true);
+    }
+    return { stamp, root };
+  }
+
   // ---------------------------------------------------------------- A-5
   // The person's next message wakes a follow-up run on the SAME task (reuse leases are scoped to the task). After the image
   // change its acquisition finds the old boot-source lease obsolete. After Cut A that is upstream's guarded destroy
@@ -115,7 +176,17 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
   // the follow-up, which then fails with a typed fresh-thread refusal, is still continued within upstream's bound and
   // delivered once, carrying the message (RFL A-5: A and B ship together).
   describe("A-5: a follow-up acquisition with boot-source drift; the held message is still answered", () => {
-    it.each(["destroyed", "failed", "void", "no_custody"] as const)("%s", async variant => {
+    it.each([
+      ...(["destroyed", "failed", "void"] as const).flatMap(variant =>
+        (["two_copies", "no_durable", "no_local"] as const).map(custody => ({ variant, custody }))),
+      { variant: "destroyed", custody: "workspace_unverified" },
+      { variant: "destroyed", custody: "no_custody" },
+      { variant: "destroyed", custody: "dry_run" },
+      { variant: "destroyed", custody: "unconfigured_destroy" },
+      { variant: "destroyed", custody: "unconfigured_dry_run" },
+      { variant: "destroyed", custody: "malformed_destroy" },
+      { variant: "destroyed", custody: "malformed_dry_run" },
+    ] as const)("$variant / $custody", async ({ variant, custody }) => {
       await company();
       expect(isFreshThreadRefusal({ errorCode: TYPED })).toBe(true);
       const issueId = randomUUID(), messageId = randomUUID(), oldRunId = randomUUID(), followUpId = randomUUID();
@@ -135,12 +206,19 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
       await db.insert(heartbeatRuns).values({ id: oldRunId, companyId, agentId, issueId, nativeIssueId: issueId, runtimeMode: "native",
         status: "succeeded", createdAt: t0, startedAt: t0, finishedAt: new Date(t0.getTime() + 60_000), contextSnapshot: { issueId } });
       const releasedAt = new Date(t0.getTime() + 61_000), providerLeaseId = `bx-old-${oldLeaseId.slice(0, 8)}`;
+      vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY", custody === "dry_run" || custody.endsWith("_dry_run") ? "" : "destroy");
+      if (custody.startsWith("unconfigured_")) vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS", undefined);
+      if (custody.startsWith("malformed_")) vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS", `${fullIds},bad-id`);
+      if (custody !== "workspace_unverified") vi.mocked(obsoleteWorkspaceCustodyRefusal).mockResolvedValue(null);
+      const backup = custody === "no_custody" ? null : await custodyFixture({ issueId, runId: oldRunId,
+        providerLeaseId, completedAt: releasedAt }, custody !== "no_durable");
+      if (custody === "no_local") await rm(backup!.root, { recursive: true });
       await db.insert(environmentLeases).values({ id: oldLeaseId, companyId, environmentId, issueId, heartbeatRunId: oldRunId,
         provider: "boat", providerLeaseId, leasePolicy: "reuse_by_environment", status: "released", cleanupStatus: "success",
-        acquiredAt: t0, releasedAt,
+        acquiredAt: t0, releasedAt, lastUsedAt: releasedAt,
         metadata: { driver: "sandbox", sandboxProviderPlugin: true, pluginId, pluginKey: "paperclip.boat", agentId, ...environment!.config,
           reusableSandboxLease: { adapterType: "paperclip_runner" }, pendingCleanupInFlight: false,
-          ...(variant === "no_custody" ? {} : { nativeHarnessBackup: { authorizedProviderLeaseId: providerLeaseId } }),
+          ...(backup ? { nativeHarnessBackup: backup.stamp } : {}),
           remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", state: "stopped", companyId, runId: oldRunId,
             leaseId: oldLeaseId, provider: "boat", providerLeaseId, confirmedAt: releasedAt.toISOString() } } });
       const [oldBefore] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLeaseId));
@@ -171,18 +249,29 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
       const destroys = call.mock.calls.filter(([, method]) => method === "environmentDestroyLease").map(([, , params]) => params.providerLeaseId);
       expect.soft(call.mock.calls.some(([, method]) => method === "environmentStopLease"), "no acquisition-issued stop").toBe(false);
       const [oldAfter] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLeaseId));
-      if (variant === "no_custody") {
-        // Never-OK guard: no verified custody of the box's session, no destroy. The lease is kept as it was.
-        expect.soft(destroys, "no verified custody -> no destroy").toEqual([]);
-        expect.soft(oldAfter, "the lease is kept unchanged").toEqual(oldBefore);
+      const decisions = await db.select().from(activityLog).where(and(eq(activityLog.entityId, oldLeaseId),
+        eq(activityLog.companyId, companyId)));
+      const decision = decisions.find(row => row.action.startsWith("environment.lease.obsolete_"));
+      if (custody !== "two_copies") {
+        expect.soft(destroys, "unverified copy/workspace or dry-run -> no destroy").toEqual([]);
+        expect.soft(oldAfter, "the box and its stop receipt are kept unchanged").toEqual(oldBefore);
+        if (custody === "dry_run") expect.soft(decision?.action).toBe("environment.lease.obsolete_would_destroy");
+        else {
+          expect.soft(decision?.action).toBe("environment.lease.obsolete_destroy_refused");
+          expect.soft(decision?.details).toMatchObject({ reason: custody.startsWith("unconfigured_") || custody.startsWith("malformed_")
+            ? "excluded_agent_ids_unconfigured" : custody === "no_custody" ? "no_custody_stamp"
+            : custody === "no_durable" ? "durable_custody_copy_unverified"
+            : custody === "no_local" ? "local_custody_copy_unverified" : "workspace_custody_unverified" });
+        }
       } else {
-        expect.soft(destroys, "the drifted source is destroyed through upstream's guarded path").toEqual([providerLeaseId]);
+        expect.soft(destroys).toEqual([providerLeaseId]);
+        expect.soft(decision?.action).toBe(variant === "destroyed" ? "environment.lease.obsolete_destroyed" : "environment.lease.obsolete_destroy_pending");
         if (variant === "destroyed") {
           expect.soft(oldAfter).toMatchObject({ status: "expired", cleanupStatus: "success",
             metadata: { remoteExecutionTermination: { state: "destroyed", leaseId: oldLeaseId, runId: oldRunId, providerLeaseId } } });
           expect.soft(hasRemoteTerminationReceipt(oldAfter!)).toBe(true);
         } else {
-          expect.soft(oldAfter!.metadata?.remoteExecutionTermination, "a failed or void destroy is no termination receipt").toBeUndefined();
+          expect.soft(oldAfter!.metadata?.remoteExecutionTermination, "failed/void is never a termination receipt").toBeUndefined();
           expect.soft(oldAfter!.status).toBe(variant === "failed" ? "pending_cleanup" : "expired");
         }
       }
@@ -220,10 +309,30 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
     }, 60_000);
   });
 
-  // RFL 06:33Z: the custody guard FAILS CLOSED. Only a lease whose recorded adapter is KNOWN non-native skips it; an
-  // older lease with no adapterType in its metadata, acquired by a caller with no adapter type, is guarded.
-  it("fail closed: a pre-metadata warm lease (no adapterType) and a caller with no adapter type, no custody -> stopped and kept, never destroyed", async () => {
-    await company();
+  // Every adapter is guarded; full-id config distinguishes prefix collisions.
+  it.each([
+    { name: "pre-metadata adapter", adapterType: null, id: undefined, ids: fullIds, reason: "no_custody_stamp" },
+    { name: "known non-native adapter", adapterType: "claude_local", id: undefined, ids: fullIds, reason: "no_custody_stamp" },
+    { name: "Paul full id", adapterType: null, id: paulId, ids: fullIds, reason: "agent_excluded_until_paul_says" },
+    { name: "Kate full id", adapterType: null, id: kateId, ids: fullIds, reason: "agent_excluded_until_paul_says" },
+    { name: "different agent sharing Paul prefix", adapterType: null, id: "29b216c4-0000-4000-8000-000000000002", ids: fullIds, reason: "no_custody_stamp" },
+    { name: "different agent sharing Kate prefix", adapterType: null, id: "46a1dae4-0000-4000-8000-000000000002", ids: fullIds, reason: "no_custody_stamp" },
+    { name: "absent config, unrelated agent", adapterType: null, id: undefined, ids: undefined, reason: "excluded_agent_ids_unconfigured" },
+    { name: "empty config, unrelated agent", adapterType: null, id: undefined, ids: "", reason: "excluded_agent_ids_unconfigured" },
+    { name: "empty config, prefix agent", adapterType: null, id: paulId, ids: "", reason: "excluded_agent_ids_unconfigured" },
+    { name: "whitespace config", adapterType: null, id: undefined, ids: "  ", reason: "excluded_agent_ids_unconfigured" },
+    { name: "partial config", adapterType: null, id: kateId, ids: paulId, reason: "excluded_agent_ids_unconfigured" },
+    { name: "duplicate-only config", adapterType: null, id: undefined, ids: `${paulId},${paulId}`, reason: "excluded_agent_ids_unconfigured" },
+    { name: "malformed config", adapterType: null, id: undefined, ids: `${fullIds},29b216c4`, reason: "excluded_agent_ids_unconfigured" },
+    { name: "empty list element", adapterType: null, id: undefined, ids: `${fullIds},`, reason: "excluded_agent_ids_unconfigured" },
+    { name: "arbitrary full-id hold-out", adapterType: null, id: "aaaaaaaa-1111-4111-8111-111111111111",
+      ids: "aaaaaaaa-1111-4111-8111-111111111111,bbbbbbbb-2222-4222-8222-222222222222", reason: "agent_excluded_until_paul_says" },
+    { name: "arbitrary full-id list, unrelated agent", adapterType: null, id: undefined,
+      ids: "aaaaaaaa-1111-4111-8111-111111111111,bbbbbbbb-2222-4222-8222-222222222222", reason: "no_custody_stamp" },
+  ].flatMap(row => ["destroy", "dry_run"].map(mode => ({ ...row, mode }))))("fail closed: $name / $mode", async ({ adapterType, id, ids, reason, mode }) => {
+    await company(id);
+    vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY", mode === "destroy" ? "destroy" : "");
+    vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY_EXCLUDED_AGENT_IDS", ids);
     const issueId = randomUUID(), oldRunId = randomUUID(), followUpId = randomUUID();
     const environmentId = randomUUID(), pluginId = randomUUID(), oldLeaseId = randomUUID();
     const t0 = new Date(Date.now() - 3600_000);
@@ -241,9 +350,10 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
     const providerLeaseId = `bx-old-${oldLeaseId.slice(0, 8)}`;
     // A warm box from an older release: retained (still running), and no reusableSandboxLease.adapterType recorded.
     await db.insert(environmentLeases).values({ id: oldLeaseId, companyId, environmentId, issueId, heartbeatRunId: oldRunId,
-      provider: "boat", providerLeaseId, leasePolicy: "reuse_by_environment", status: "retained", acquiredAt: t0,
+      provider: "boat", providerLeaseId, leasePolicy: "reuse_by_environment", status: "retained", acquiredAt: t0, lastUsedAt: t0,
       metadata: { driver: "sandbox", sandboxProviderPlugin: true, pluginId, pluginKey: "paperclip.boat", agentId, ...environment!.config,
-        pendingCleanupInFlight: false } });
+        pendingCleanupInFlight: false, ...(adapterType ? { reusableSandboxLease: { adapterType } } : {}) } });
+    const [oldBefore] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLeaseId));
     await db.insert(heartbeatRuns).values({ id: followUpId, companyId, agentId, issueId, nativeIssueId: issueId, runtimeMode: "native",
       status: "running", createdAt: new Date(Date.now() - 60_000), startedAt: new Date(Date.now() - 60_000), contextSnapshot: { issueId } });
     const drifted = { ...environment!.config, image: "boot-source-after-upgrade" };
@@ -257,13 +367,14 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
       getWorker: () => ({ supportedMethods: ["environmentAcquireLease", "environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentStopLease"] }),
     } as unknown as PluginWorkerManager });
     const acquired = await runtime.acquireRunLease({ companyId, environment: { ...environment!, config: drifted, envVars: {} } as unknown as Environment,
-      issueId, agentId, heartbeatRunId: followUpId, adapterType: null, persistedExecutionWorkspace: null } as never);
+      issueId, agentId, heartbeatRunId: followUpId, adapterType, persistedExecutionWorkspace: null } as never);
     expect(acquired.lease.providerLeaseId).toBe("bx-fresh");
-    expect.soft(call.mock.calls.filter(([, method]) => method === "environmentDestroyLease"), "unknown adapter, no custody -> never destroyed")
+    expect.soft(call.mock.calls.filter(([, method]) => method === "environmentDestroyLease"), "every adapter, no custody -> never destroyed")
       .toEqual([]);
-    const [old] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLeaseId));
-    expect.soft(old, "stopped and kept through the stop-only owner: billing stops, the disk stays").toMatchObject({
-      status: "pending_cleanup", metadata: { sandboxStopAndRetain: { schema: "paperclip.sandbox-stop-and-retain.v1", providerLeaseId } } });
+    const [oldAfter] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLeaseId));
+    expect.soft(oldAfter).toEqual(oldBefore);
+    const decisions = await db.select().from(activityLog).where(and(eq(activityLog.entityId, oldLeaseId), eq(activityLog.companyId, companyId)));
+    expect.soft(decisions.find(row => row.action === "environment.lease.obsolete_destroy_refused")?.details).toMatchObject({ reason });
   }, 60_000);
 
   // ---------------------------------------------------------------- B-5 + B-2

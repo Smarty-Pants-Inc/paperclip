@@ -1,6 +1,5 @@
 import { notifyEnvironmentConfigChange, withEnvironmentConfigChange } from "./environment-config-revision.js";
-import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
-import { inheritWarmRetentionMetadata } from "./environment-warm-retention.js";
+import { createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { clearRemoteWorkspaceLocationForReleasedLease } from "./remote-workspace-snapshot-retention.js";
 import { notifyNativeEnvironmentSettlement } from "./native-environment-settlement-notifications.js";
@@ -1585,8 +1584,7 @@ export function environmentService(db: Db) {
         failureReason: null,
         cleanupStatus: null,
         // The holder stamp is written with the row that makes the lease active.
-        metadata: withEnvironmentLeaseController(inheritWarmRetentionMetadata(null,
-          withoutReusableLeaseHandoff(withoutCleanupVerification(input.metadata)))),
+        metadata: withEnvironmentLeaseController(withoutReusableLeaseHandoff(withoutCleanupVerification(input.metadata))),
         createdAt: now,
         updatedAt: now,
       };
@@ -1666,14 +1664,13 @@ export function environmentService(db: Db) {
                   );
                 }
                 const handoff = createReusableLeaseHandoff(retired[0]!, { ...values, id: replacementLeaseId! });
-                values.metadata = { ...inheritWarmRetentionMetadata(retired[0]!.metadata, carryReusableLeasePreparation(retired[0]!, { ...values, id: replacementLeaseId! })),
-                  reusableLeasePredecessor: handoff };
+                values.metadata = { ...values.metadata, reusableLeasePredecessor: handoff };
                 await tx.update(environmentLeases).set({ metadata: {
                   ...retired[0]!.metadata, reusableLeaseSuccessor: handoff,
                 } }).where(eq(environmentLeases.id, retired[0]!.id));
               }
               if (input.reusesReusableLeaseId) {
-                const [previous] = await tx.select().from(environmentLeases)
+                const [previous] = await tx.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
                   .where(and(eq(environmentLeases.id, input.reusesReusableLeaseId), eq(environmentLeases.companyId, input.companyId))).for("update");
                 const reacquired = await tx
                   .update(environmentLeases)
@@ -1685,9 +1682,7 @@ export function environmentService(db: Db) {
                     failureReason: null,
                     cleanupStatus: null,
                     metadata: withEnvironmentLeaseController(
-                      preserveReusableLeaseHandoff(previous?.metadata ?? null, previous
-                        ? inheritWarmRetentionMetadata(previous.metadata, carryReusableLeasePreparation(previous, { ...values, id: input.reusesReusableLeaseId! }))
-                        : withoutCleanupVerification(input.metadata))),
+                      preserveReusableLeaseHandoff(previous?.metadata ?? null, withoutCleanupVerification(input.metadata))),
                     updatedAt: now,
                   })
                   .where(
