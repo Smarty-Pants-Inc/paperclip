@@ -272,7 +272,9 @@ function buildContext(root: string, overrides: Partial<AdapterExecutionContext> 
   };
 }
 
-describe("claude_local ACP lane", () => {
+// bridge.stop() waits out an in-flight 5 s callback long-poll (9fbf1eb77/2c4cb9889) for a
+// bridge without managed run state, so a start+stop test exceeds the 5 s default.
+describe("claude_local ACP lane", { timeout: 20_000 }, () => {
   it("uses the same default model in ACP startup and session identity", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-default-");
     const meta: AdapterInvocationMeta[] = [];
