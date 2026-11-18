@@ -118,7 +118,10 @@ describe("withheld accepted reply in the person's thread", () => {
     expect(fixture.issueStatus).toBe("blocked");
   });
 
-  it.each([["the task thread", {}], ["the chat thread", { conversationMode: true }]] as const)(
+  // The page passes the board's handlers; the card then offers its resolve menu.
+  const board = { onResolveRecoveryAction: async () => {}, canFalsePositiveRecoveryAction: true };
+  it.each([["the task thread", {}], ["the chat thread", { conversationMode: true }],
+    ["the task thread with the board's handlers", board]] as const)(
     "%s shows the reply and its file line, and the card beside it gives no false next step", async (_name, mode) => {
       await paint(mode);
       const text = host.textContent ?? "";
@@ -129,7 +132,7 @@ describe("withheld accepted reply in the person's thread", () => {
       // The card is beside the reply (not hidden to make this pass).
       const card = host.querySelector('[data-testid="task-chat-recovery-action-card"]');
       expect(card?.textContent).toContain("Board");
-      if (process.env.WH_RENDER_DUMP) (await import("node:fs")).writeFileSync(`${process.env.WH_RENDER_DUMP}.${mode && "conversationMode" in mode ? "chat" : "task"}.txt`, `${text}\n`);
+      if (process.env.WH_RENDER_DUMP) (await import("node:fs")).writeFileSync(`${process.env.WH_RENDER_DUMP}.${_name.replace(/[^a-z]+/g, "-")}.txt`, `${text}\n`);
       // The operator's next action is true for an operator, and a false next
       // step for the person: it must not be rendered anywhere on the thread.
       expect(fixture.recoveryAction.nextAction).toMatch(/sandbox/i);
