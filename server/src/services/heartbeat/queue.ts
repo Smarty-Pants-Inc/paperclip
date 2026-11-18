@@ -113,7 +113,9 @@ import {
   notInArray,
   or,
   sql,
+  type SQL,
 } from "drizzle-orm";
+import { answeredPersonMessageSql, carriedInLiveRunSql, completedPersonMessageAnswerSql } from "../person-message-answer.js";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -292,7 +294,8 @@ export const DEFERRED_BEHIND_INTERRUPT_KEY = "deferredBehindInterruptId";
  * this queue id, stopped by the press's own actor no earlier than the press,
  * and its named target when it named one), the same proof as
  * deferred-receipt-work's interruptedNativeReleased without its teardown
- * clause; and its queue still holds a person's undeleted plain message.
+ * clause; and its queue still holds a person's undeleted plain message that
+ * is not consumed (consumedQueuedPersonMessageSql).
  */
 export function liveQueuedCommentInterruptSql(companyId: string, issueId: string) {
   return sql`(agent_wakeup_requests.status = 'deferred_issue_execution'
@@ -308,12 +311,42 @@ export function liveQueuedCommentInterruptSql(companyId: string, issueId: string
         and latest.finished_at is not null
         and to_char(latest.finished_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
           >= agent_wakeup_requests.payload -> 'queuedCommentInterrupt' ->> 'requestedAt')
-    and exists (select 1 from issue_comments c
-      where c.company_id = ${companyId} and c.issue_id::text = ${issueId}
-        and c.deleted_at is null and c.author_user_id is not null and c.author_agent_id is null
-        and c.id::text in (select jsonb_array_elements_text(case
+    and exists (select 1 from issue_comments press_comment
+      where press_comment.company_id = ${companyId} and press_comment.issue_id::text = ${issueId}
+        and press_comment.deleted_at is null and press_comment.author_user_id is not null and press_comment.author_agent_id is null
+        and not ${consumedQueuedPersonMessageSql({ id: sql`press_comment.id`, companyId: sql`press_comment.company_id`, issueId: sql`press_comment.issue_id`,
+          createdAt: sql`press_comment.created_at`, agentId: sql`agent_wakeup_requests.agent_id` })}
+        and press_comment.id::text in (select jsonb_array_elements_text(case
           when jsonb_typeof(agent_wakeup_requests.payload #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'
           then agent_wakeup_requests.payload #> '{_paperclipWakeContext,wakeCommentIds}' else '[]'::jsonb end))))`;
+}
+
+/**
+ * S8 order phase 2 (RFL F1 blocker): a queued person message that is already
+ * CONSUMED, so an Interrupt's batch (fix B) never re-presents it and it never
+ * keeps a press live (fix A). Composed ONLY of the shared person-message-answer.ts
+ * functions, no rule of its own about answers or carries:
+ * - ANSWERED: completedPersonMessageAnswerSql (a completed run's final answer);
+ * - carriedInLiveRun: carriedInLiveRunSql (a live run already owns it);
+ * - personStopped: a run its sender stopped (a person's Stop, the run
+ *   `cancelled` with cancelledByActorType 'user', as gatherPersonStoppedChatMessages
+ *   reads it), started after the message was written, and the message was
+ *   answered (answeredPersonMessageSql, DELIVERED, attributed through the
+ *   replying run's own pending input) after that run started. Stop means stop:
+ *   the stopped turn's answer is not repeated.
+ */
+export function consumedQueuedPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL; agentId: SQL }): SQL {
+  return sql`(${completedPersonMessageAnswerSql(m)}
+    or ${carriedInLiveRunSql(m)}
+    or exists (select 1 from ${heartbeatRuns} person_stopped
+      where person_stopped.company_id = ${m.companyId} and person_stopped.agent_id = ${m.agentId}
+        and (person_stopped.issue_id = ${m.issueId} or person_stopped.native_issue_id = ${m.issueId}
+          or person_stopped.context_snapshot->>'issueId' = ${m.issueId}::text)
+        and person_stopped.status = 'cancelled'
+        and person_stopped.result_json->>'cancelledByActorType' = 'user'
+        and person_stopped.started_at > ${m.createdAt}
+        and ${answeredPersonMessageSql({ id: m.id, companyId: m.companyId, issueId: m.issueId,
+          createdAt: sql`person_stopped.started_at` })}))`;
 }
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [

@@ -433,6 +433,7 @@ import {
   queuedCommentQueueRevision,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
+import { consumedQueuedPersonMessageSql } from "../services/heartbeat/queue.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -18150,19 +18151,11 @@ export function issueRoutes(
         // S8 order (Paul note 6): in a chat the press sends everything waiting,
         // in the order written. The person's plain messages from the oldest on
         // join this wake, as after a person's Stop (gatherPersonStoppedChatMessages).
-        // TODO(pl/s8-order phase 2, RFL F1 blocker; waits for app-lead's ANSWERED
-        // port, al-answered3's final person-message-answer.ts): B must never
-        // re-present consumed input. Exclude every message that is ANSWERED (a
-        // completed final), carriedInLiveRun or personStopped, through the ONE
-        // shared functions in services/person-message-answer.ts, never a local
-        // copy. Call sites, all inside this issue-locked transaction:
-        //   1. the `byId` issue_comments read below: filter by the shared SQL
-        //      predicates so a consumed message is known as excluded;
-        //   2. the `wakeIds.every(...)` check in the `for (const wake of waiting)`
-        //      loop: a waiting wake with a consumed message is not joined;
-        //   3. the joined id union passed to withQueuedCommentIdsInWakePayload
-        //      (pressedPayload), including locked.wake's own ids.
-        // Red until then: RFL's 'JUDGE a stopped' row (it.fails in phase 1).
+        // S8 phase 2 (RFL F1 blocker): the batch never re-presents consumed input.
+        // A message that is ANSWERED, carriedInLiveRun or personStopped
+        // (consumedQueuedPersonMessageSql: the shared person-message-answer.ts
+        // functions only) is left out of the press's ids; a waiting wake whose
+        // messages are all consumed is passed over, neither joined nor ending the queue.
         let pressedPayload = readObject(locked.wake.payload);
         if (issue.conversationAgentId) {
           const waiting = await tx.select().from(agentWakeupRequests).where(and(
@@ -18174,19 +18167,28 @@ export function issueRoutes(
           const ids = waiting.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload));
           const byId = new Map((ids.length ? await tx.select().from(issueComments).where(and(eq(issueComments.companyId,
             issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids))) : []).map((c) => [c.id, c]));
+          const consumed = new Set((ids.length ? await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+            eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids),
+            consumedQueuedPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+              issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}`,
+              agentId: sql`${locked.wake.agentId}::uuid` }))) : []).map((c) => c.id));
           const joined: typeof waiting = [];
           for (const wake of waiting) {
             const payload = readObject(wake.payload), wakeIds = queuedCommentIdsFromWakePayload(wake.payload);
+            if (wake.id !== locked.wake.id && wakeIds.length && wakeIds.every((id) => consumed.has(id))) continue;
             if (wake.id !== locked.wake.id && (payload.queuedCommentInterrupt || queuedInteractionId(wake.payload) ||
                 readObject(payload._paperclipWakeContext).forceFreshSession === true || !wakeIds.length ||
                 !wakeIds.every((id) => { const c = byId.get(id);
                   return c && !c.deletedAt && c.authorUserId && !c.authorAgentId && !isConversationReset(c.body); }))) break;
             joined.push(wake);
           }
-          if (joined.length > 1 && joined.some((wake) => wake.id === locked.wake.id)) {
+          const kept = [...new Set(joined.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))]
+            .filter((id) => !consumed.has(id));
+          const ownIds = queuedCommentIdsFromWakePayload(locked.wake.payload);
+          if (kept.length && joined.some((wake) => wake.id === locked.wake.id) &&
+              (joined.length > 1 || ownIds.some((id) => consumed.has(id)))) {
             const rest = joined.filter((wake) => wake.id !== locked.wake.id);
-            pressedPayload = withQueuedCommentIdsInWakePayload(pressedPayload,
-              [...new Set(joined.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))]);
+            pressedPayload = withQueuedCommentIdsInWakePayload(pressedPayload, kept);
             await tx.update(agentWakeupRequests).set({ coalescedCount: (locked.wake.coalescedCount ?? 0) + rest.length })
               .where(eq(agentWakeupRequests.id, locked.wake.id));
             await tx.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: new Date(), updatedAt: new Date(),
