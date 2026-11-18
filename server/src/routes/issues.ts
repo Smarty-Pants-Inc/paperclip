@@ -434,7 +434,7 @@ import {
   queuedCommentQueueRevision,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
-import { consumedQueuedPersonMessageSql } from "../services/heartbeat/queue.js";
+import { consumedQueuedCommentIds } from "../services/consumed-person-message.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -18124,7 +18124,7 @@ export function issueRoutes(
       const untargeted = !req.body.targetRunId;
       const nothingWaiting = () => conflict("Nothing is waiting.", {
         code: "queued_comment_not_pending", reason: "nothing_waiting" });
-      const interruptPlan = await db.transaction(async (tx): Promise<{ firstTurnRunId: string } | { runToInterrupt: string | null }> => {
+      const interruptPlan = await db.transaction(async (tx): Promise<{ firstTurnRunId: string } | { runToInterrupt: string | null } | { pressedNothing: true; runToInterrupt: string | null }> => {
         const locked = await lockQueuedCommentState({
           tx, issue, actor, queueId: req.body.queueId, targetRunId: req.body.targetRunId ?? undefined,
           allowStoppedTarget: true,
@@ -18164,27 +18164,40 @@ export function issueRoutes(
         // A message that is ANSWERED, carriedInLiveRun or personStopped
         // (consumedQueuedPersonMessageSql: the shared person-message-answer.ts
         // functions only) is left out of the press's ids; a waiting wake whose
-        // messages are all consumed is passed over, neither joined nor ending the queue.
+        // messages are all consumed is SETTLED (cancelled, never deleted; R-ONCE),
+        // so no later release promotes it; an Interrupt whose whole batch is
+        // consumed presses NOTHING (no successor, no run stopped; its wakes settled).
         let pressedPayload = readObject(locked.wake.payload);
         if (issue.conversationAgentId) {
           const waiting = await tx.select().from(agentWakeupRequests).where(and(
             eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, locked.wake.agentId),
             eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.requestedByActorType, "user"),
+            // Only the presser's own messages join; another person's stay waiting, Send-able.
+            or(eq(agentWakeupRequests.id, locked.wake.id), eq(agentWakeupRequests.requestedByActorId, actor.actorId)),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
           )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).for("update");
           const ids = waiting.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload));
           const byId = new Map((ids.length ? await tx.select().from(issueComments).where(and(eq(issueComments.companyId,
             issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids))) : []).map((c) => [c.id, c]));
-          const consumed = new Set((ids.length ? await tx.select({ id: issueComments.id }).from(issueComments).where(and(
-            eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids),
-            consumedQueuedPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-              issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}`,
-              agentId: sql`${locked.wake.agentId}::uuid` }))) : []).map((c) => c.id));
+          const consumed = await consumedQueuedCommentIds(tx, { companyId: issue.companyId, issueId: issue.id,
+            agentId: locked.wake.agentId, commentIds: ids });
+          const settleConsumed = async (wakeIds: string[]) => {
+            if (!wakeIds.length) return;
+            const now = new Date();
+            await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now,
+              error: "Already answered or stopped by its sender; not sent again" }).where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId), inArray(agentWakeupRequests.id, wakeIds),
+              eq(agentWakeupRequests.status, "deferred_issue_execution")));
+          };
           const joined: typeof waiting = [];
+          const settled: string[] = [];
           for (const wake of waiting) {
             const payload = readObject(wake.payload), wakeIds = queuedCommentIdsFromWakePayload(wake.payload);
-            if (wake.id !== locked.wake.id && wakeIds.length && wakeIds.every((id) => consumed.has(id))) continue;
+            if (wake.id !== locked.wake.id && wakeIds.length && wakeIds.every((id) => consumed.has(id))) {
+              settled.push(wake.id);
+              continue;
+            }
             if (wake.id !== locked.wake.id && (payload.queuedCommentInterrupt || queuedInteractionId(wake.payload) ||
                 readObject(payload._paperclipWakeContext).forceFreshSession === true || !wakeIds.length ||
                 !wakeIds.every((id) => { const c = byId.get(id);
@@ -18194,6 +18207,13 @@ export function issueRoutes(
           const kept = [...new Set(joined.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))]
             .filter((id) => !consumed.has(id));
           const ownIds = queuedCommentIdsFromWakePayload(locked.wake.payload);
+          await settleConsumed(settled);
+          if (!kept.length && ownIds.length && ownIds.every((id) => consumed.has(id))) {
+            // F1b: everything this press would send is consumed. Press nothing.
+            await settleConsumed([...new Set([locked.wake.id, ...joined.map((wake) => wake.id)])]);
+            return { pressedNothing: true as const,
+              runToInterrupt: locked.activeRun?.status === "running" ? locked.activeRun.id : null };
+          }
           if (kept.length && joined.some((wake) => wake.id === locked.wake.id) &&
               (joined.length > 1 || ownIds.some((id) => consumed.has(id)))) {
             const rest = joined.filter((wake) => wake.id !== locked.wake.id);
@@ -18219,6 +18239,7 @@ export function issueRoutes(
       });
       const firstTurnRunId = "firstTurnRunId" in interruptPlan ? interruptPlan.firstTurnRunId : null;
       const runToInterrupt = "runToInterrupt" in interruptPlan ? interruptPlan.runToInterrupt : null;
+      const pressedNothing = "pressedNothing" in interruptPlan;
       // Never hold the issue lock while joining the adapter. Queue edits and
       // discards stay authoritative until the dispatcher claims the successor.
       const options = operatorInterruptCancelOptions({ issueId: issue.id, actor });
@@ -18227,13 +18248,14 @@ export function issueRoutes(
         suppressImmediateRecovery: true,
         resultJson: { ...options.resultJson, queuedCommentInterruptQueueId: req.body.queueId },
       });
-      if (!firstTurnRunId) await heartbeat.resumeQueuedCommentInterrupt(issue.companyId, req.body.queueId, { retryCleanup: true });
+      if (!firstTurnRunId && !pressedNothing) await heartbeat.resumeQueuedCommentInterrupt(issue.companyId, req.body.queueId, { retryCleanup: true });
       await logActivity(db, {
         companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
         agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
         action: "issue.queued_comments_interrupted", entityType: "issue", entityId: issue.id,
         details: { queueId: req.body.queueId, targetRunId: req.body.targetRunId,
-          ...(firstTurnRunId ? { deliveredWithFirstTurnOfRunId: firstTurnRunId } : {}) },
+          ...(firstTurnRunId ? { deliveredWithFirstTurnOfRunId: firstTurnRunId } : {}),
+          ...(pressedNothing ? { pressedNothing: "all_consumed" } : {}) },
       });
       const currentIssue = await svc.getById(issue.id);
       const queue = await buildQueuedCommentQueue({

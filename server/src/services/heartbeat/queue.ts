@@ -116,7 +116,8 @@ import {
   type SQL,
 } from "drizzle-orm";
 import { personStopExportPendingHoldsAdmission } from "./person-stop-release-export.js";
-import { answeredPersonMessageSql, carriedInLiveRunSql, completedPersonMessageAnswerSql } from "../person-message-answer.js";
+import { consumedQueuedPersonMessageSql } from "../consumed-person-message.js";
+export { consumedQueuedCommentIds, consumedQueuedPersonMessageSql, senderStoppedWhileAnsweringSql } from "../consumed-person-message.js";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -320,34 +321,6 @@ export function liveQueuedCommentInterruptSql(companyId: string, issueId: string
         and press_comment.id::text in (select jsonb_array_elements_text(case
           when jsonb_typeof(agent_wakeup_requests.payload #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'
           then agent_wakeup_requests.payload #> '{_paperclipWakeContext,wakeCommentIds}' else '[]'::jsonb end))))`;
-}
-
-/**
- * S8 order phase 2 (RFL F1 blocker): a queued person message that is already
- * CONSUMED, so an Interrupt's batch (fix B) never re-presents it and it never
- * keeps a press live (fix A). Composed ONLY of the shared person-message-answer.ts
- * functions, no rule of its own about answers or carries:
- * - ANSWERED: completedPersonMessageAnswerSql (a completed run's final answer);
- * - carriedInLiveRun: carriedInLiveRunSql (a live run already owns it);
- * - personStopped: a run its sender stopped (a person's Stop, the run
- *   `cancelled` with cancelledByActorType 'user', as gatherPersonStoppedChatMessages
- *   reads it), started after the message was written, and the message was
- *   answered (answeredPersonMessageSql, DELIVERED, attributed through the
- *   replying run's own pending input) after that run started. Stop means stop:
- *   the stopped turn's answer is not repeated.
- */
-export function consumedQueuedPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL; agentId: SQL }): SQL {
-  return sql`(${completedPersonMessageAnswerSql(m)}
-    or ${carriedInLiveRunSql(m)}
-    or exists (select 1 from ${heartbeatRuns} person_stopped
-      where person_stopped.company_id = ${m.companyId} and person_stopped.agent_id = ${m.agentId}
-        and (person_stopped.issue_id = ${m.issueId} or person_stopped.native_issue_id = ${m.issueId}
-          or person_stopped.context_snapshot->>'issueId' = ${m.issueId}::text)
-        and person_stopped.status = 'cancelled'
-        and person_stopped.result_json->>'cancelledByActorType' = 'user'
-        and person_stopped.started_at > ${m.createdAt}
-        and ${answeredPersonMessageSql({ id: m.id, companyId: m.companyId, issueId: m.issueId,
-          createdAt: sql`person_stopped.started_at` })}))`;
 }
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
