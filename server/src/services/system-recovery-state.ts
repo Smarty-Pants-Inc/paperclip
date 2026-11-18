@@ -3,6 +3,7 @@ import { z } from "zod";
 import { ENVIRONMENT_LEASE_POLICIES, WORKSPACE_SOURCE_VERIFICATION_REASONS,
   type WorkspaceSourceVerificationFailure } from "@paperclipai/shared";
 import { REMOTE_WORKSPACE_CAPTURE_POLICY_VERSION } from "./remote-workspace-snapshot-archive.js";
+import { recordedUserStop } from "./run-cancellation.js";
 
 export const SYSTEM_RECOVERY_POLICY_VERSION = 1;
 export const SYSTEM_RECOVERY_MAX_RETRIES = 5;
@@ -235,6 +236,23 @@ export function unrecoverableSavedFilesFailure(state: SystemRecoveryState | null
 
 export function savedFilesUnrecoverable(state: SystemRecoveryState | null | undefined) {
   return unrecoverableSavedFilesFailure(state) !== null;
+}
+
+export const PERSON_STOP_NOTE = "You stopped this turn. Changes it had not saved are on the previous sandbox and can be recovered. Send a message to continue.";
+
+/** The one note for a run a person stopped with the Stop button: its recorded
+ * cancellation is source "operator" from a "user" (run-cancellation
+ * requestedRunCancellation). Other causes keep their text. When the old box was
+ * destroyed (saved-work recovery proved its unsaved files gone, or its lease
+ * records a destroyed termination) the truthful "cannot recover" text stays. */
+export function personStopNote(
+  run: { status: string; resultJson: Record<string, unknown> | null } | null | undefined,
+  evidence: Record<string, unknown> | null | undefined,
+  options?: { boxDestroyed?: boolean },
+): string | null {
+  if (!run || recordedUserStop(run)?.source !== "operator") return null;
+  if (options?.boxDestroyed || savedFilesUnrecoverable(readSystemRecovery(evidence))) return null;
+  return PERSON_STOP_NOTE;
 }
 
 function unrecoverableSavedFilesReason(failure: RecoveryFailure) {

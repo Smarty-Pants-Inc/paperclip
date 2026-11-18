@@ -7,6 +7,7 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { z } from "zod";
 import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, toolConnections, workspaceOperations, type Db } from "@paperclipai/db";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
+import { personStopNote } from "./system-recovery-state.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { heldRetryOffersRetry, heldTaskRetryRefusals } from "./task-retry-eligibility.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -409,8 +410,9 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run!.id), eq(environmentLeases.id, exportSource.leaseId),
     eq(environmentLeases.providerLeaseId, exportSource.providerLeaseId),
   )).limit(1) : [];
-  const canReconstructWorkspace = Boolean(exportLease && hasRemoteTerminationReceipt(exportLease)
-    && (exportLease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed"
+  const exportBoxDestroyed = Boolean(exportLease && hasRemoteTerminationReceipt(exportLease)
+    && (exportLease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed");
+  const canReconstructWorkspace = Boolean(exportBoxDestroyed
     && !action.evidence.executionReconciliation && conversation && ["blocked", "in_progress"].includes(conversation.status)
     && !conversation.executionRunId && !conversation.checkoutRunId && conversation.assigneeAgentId === run?.agentId);
   const reconstructionPending = Boolean((action.evidence.executionReconciliation as { workspaceReconstruction?: unknown } | undefined)?.workspaceReconstruction
@@ -469,9 +471,12 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   )).limit(1) : [];
   const heldRefusal = canRetry ? (await heldTaskRetryRefusals(db, companyId, [issueId])).get(issueId) : undefined;
   const retryOffered = canRetry && (!chatBinding || recoveredFailure) && heldRetryOffersRetry(heldRefusal);
-  const workspaceRecovery = workspaceRecoveryState?.status === "recovered"
+  // A person's recorded Stop has ONE note on every surface that reads this blocker.
+  const stopNote = personStopNote(run, action.evidence, { boxDestroyed: exportBoxDestroyed });
+  const recoveryState = workspaceRecoveryState?.status === "recovered"
     ? { ...workspaceRecoveryState, message: recoveredWorkMessage(run?.status, retryOffered) }
     : workspaceRecoveryState && { ...workspaceRecoveryState, canRetry: workspaceRecoveryState.canRetry && retryOffered };
+  const workspaceRecovery = recoveryState && stopNote ? { ...recoveryState, message: stopNote } : recoveryState;
   let nextAction = action.status === "active" && action.cause === EXECUTION_FINALIZATION_DEADLINE_EXCEEDED
     ? EXECUTION_FINALIZATION_DEADLINE_MESSAGE : action.nextAction;
   // Retry is a person's control on this task. Say so, so an agent reading this
@@ -506,7 +511,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     // A stopped reviewer can differ from the task owner who receives the work back.
     agentId: run?.agentId ?? null,
     cause: action.cause,
-    nextAction: withoutUnavailableRetry(workspaceRecovery?.message
+    nextAction: stopNote ?? withoutUnavailableRetry(workspaceRecovery?.message
       ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
       retryOffered),
 

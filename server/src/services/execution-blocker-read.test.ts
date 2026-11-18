@@ -7,6 +7,8 @@ import { EXECUTION_BLOCKER_PERSON_RETRY_ACTION, getExecutionBlocker } from "./ex
 import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
 import { readUnsupersededHeldConversationNotice, writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
 import { EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
+import { PERSON_STOP_NOTE } from "./system-recovery-state.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("execution blocker PostgreSQL read projection", () => {
@@ -232,6 +234,46 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
     expect(blocker).toMatchObject({ canRetry: false, canContinue: false, workspaceRecovery: { status: "recovered" } });
     expect(blocker!.nextAction).toBe(generic);
+  });
+
+  describe("the one note for a run a person stopped (C2)", () => {
+    const stopped = (initiator: "user" | "agent", source: string) => ({ status: "cancelled" as const, runtimeMode: "native" as const,
+      errorCode: initiator === "agent" ? "operator_interrupted" : "cancelled", error: "Cancelled",
+      resultJson: { cancellation: { source, expected: true, initiator: { type: initiator }, reason: "Cancelled by a board operator",
+        recordedAt: "2020-01-01T00:00:30Z" }, cancelledByActorType: initiator } });
+    const gone = { systemRecovery: { schema: "paperclip.system-recovery.v1", policyVersion: 1, capturePolicyVersion: 2, phase: "verify_execution",
+      state: "exhausted", failure: { code: "source_unavailable", retryClass: "use_alternative_strategy", evidenceFingerprint: "a".repeat(64) },
+      attempts: 1, intentId: null, revision: 1, attemptId: randomUUID(), deadlineAt: null, retriesUsed: 0,
+      sourceRunId: randomUUID(), generationId: randomUUID(), nextAttemptAt: null, firstFailureAt: 1, freshAttemptRunId: null,
+      providerCooldownAt: null, preservationOperationIds: [] } };
+    const surfaces = async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+      const action = await issueRecoveryActionService(db).getActiveForIssue(f.companyId, f.issueId);
+      const listed = (await issueRecoveryActionService(db).listActiveForIssues(f.companyId, [f.issueId])).get(f.issueId);
+      return [blocker!.nextAction, action!.nextAction, listed!.nextAction];
+    };
+
+    it("RED: a person's recorded Stop shows exactly the one note on the blocker and the recovery card", async () => {
+      const f = await fixture(stopped("user", "operator"));
+      expect(await surfaces(f)).toEqual([PERSON_STOP_NOTE, PERSON_STOP_NOTE, PERSON_STOP_NOTE]);
+      expect(PERSON_STOP_NOTE).toBe("You stopped this turn. Changes it had not saved are on the previous sandbox and can be recovered. Send a message to continue.");
+    });
+
+    it("CONTROL: a stop no person recorded (a managing agent; a failure) keeps its text", async () => {
+      for (const f of [await fixture(stopped("agent", "control_plane")), await fixture()]) {
+        const texts = await surfaces(f);
+        expect(texts).not.toContain(PERSON_STOP_NOTE);
+        expect(texts[1]).toBe("Inspect the source run.");
+      }
+    });
+
+    it("CONTROL: the old box is destroyed, so the existing 'gone' text stays and nothing claims 'can be recovered'", async () => {
+      const f = await fixture(stopped("user", "operator"), gone);
+      const texts = await surfaces(f);
+      expect(texts).not.toContain(PERSON_STOP_NOTE);
+      expect(texts[1]).toBe("Inspect the source run.");
+      expect(JSON.stringify(texts)).not.toMatch(/can be recovered/);
+    });
   });
 
   it.each([null, [], "scalar", 42, { issueId: 42, taskId: false }].map(context => ({ context })))("preserves decisions for malformed context $context", async ({ context }) => {
