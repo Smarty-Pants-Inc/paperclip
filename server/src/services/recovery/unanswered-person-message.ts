@@ -71,8 +71,8 @@ export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
 /** The run that carries the message is queued or scheduled and has not started. */
 export const UNANSWERED_MESSAGE_WAITING_CODE = "waiting_to_start";
 /** A waiting note stays true only this long: if the carrying run still has not
- * started by T0 + this bound, the SAME note becomes the failure text. For the
- * system's own automatic recovery the bound runs from the failed run's END. */
+ * started by T0 + this bound, the SAME note becomes the failure text. For a
+ * HELD refusal's automatic recovery the bound runs from the failed run's END. */
 export { PENDING_WAIT_START_BOUND_MS };
 /** The non-failure marker row of a waiting note (no "Failure code" row). */
 const WAITING_ROW_LABEL = "Waiting code";
@@ -642,7 +642,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const held = (isNativeContinuationRefusal(run) || (runCode !== null && HELD_CODES.has(runCode)))
     && !(run && isFreshThreadRefusal(run));
   // The system's own automatic recovery of the message's failed run
-  // (automaticRecoveryPending) is bounded from that run's END: its finishedAt,
+  // (automaticRecoveryPending). Only for the HELD class (heldRecoveryDeadline
+  // below; RFL 00:10Z (b)) is its wait bounded from that run's END: its finishedAt,
   // or its coordinator's terminal failure when that came earlier. Never from
   // the first sweep, so a late first sweep cannot start a new wait.
   let recoveryDeadline: number | null | undefined;
@@ -820,13 +821,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     const pendingExecutionWait = wakes.some(wake => ["deferred", "deferred_issue_execution"].includes(wake.status)
       && isWellFormedExecutionWait(wake.payload?.executionWait)
       && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
-    const issueWakes = wakes.filter(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id));
-    if (pendingExecutionWait || issueWakes.length) {
-      // Only the restored wakes of the run's own automatic recovery: that
-      // recovery's run-end deadline caps the wait.
-      const recoveryWakesOnly = !pendingExecutionWait
-        && issueWakes.every(wake => typeof ((wake.payload ?? {}) as Record<string, unknown>).recoveryActionId === "string");
-      const wait = await bounded(now.getTime() + 30_000, false, recoveryWakesOnly ? await automaticRecoveryDeadline() : null);
+    if (pendingExecutionWait || wakes.some(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id))) {
+      // The run-END cap belongs to the HELD class only (RFL 00:10Z (b)):
+      // bounded() applies heldRecoveryDeadline itself. A non-held restored
+      // wake keeps the base first-sweep T0 wait.
+      const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
       // After the short pending grace, use the existing waiting note and its
       // start bound below instead of telling the person to duplicate input.
@@ -880,11 +879,14 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // The system's own automatic recovery of this run is on its way: no
     // resend advice. The same short grace, then the true waiting note, and
     // the existing start bound: past it, today's notice below.
-    // Its bound runs from the failed run's END (automaticRecoveryDeadline).
-    const startDeadline = await automaticRecoveryDeadline();
-    if (startDeadline !== null) {
-      const wait = await bounded(now.getTime() + 30_000, false, startDeadline);
+    // Only a HELD recovery's bound runs from the failed run's END
+    // (heldRecoveryDeadline, RFL 00:10Z (b)); every non-held recovery keeps
+    // the base start bound from the sweep's first durable wait record (T0).
+    const recoveryPending = await automaticRecoveryDeadline() !== null;
+    if (recoveryPending) {
+      const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
+      const startDeadline = heldRecoveryDeadline ?? (waitT0 ?? now.getTime()) + PENDING_WAIT_START_BOUND_MS;
       if (startDeadline > now.getTime()) {
         if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_RECOVERING_CODE) {
           return { kind: "pending", recheckAt: startDeadline };

@@ -325,9 +325,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   // Keep: recorded D10 F0 catch. One continuation must not abort the ordinary conversations behind it.
-  // Reason (rf5 autorec F1, run-end bound): the held run ended on the fixture clock 15 min ago, past the
-  // 10-min bound from its END, so its never-delivered continuation now gets ONE true notice, stable across passes.
-  it("supersedes(rf5 autorec F1, run-end bound): supersedes(RFL round4 F0; /srv/scratch/paul/rfl-verdicts/SUPERSEDE-RFL-ROUND4-F0-1117.md): RFL round4 F0 sweeps a continued conversation with five ordinary unanswered ones without throwing", async () => {
+  // Reason (RFL 00:10Z option (b)): runend's END bound applies ONLY to the HELD class. This run's code
+  // (runner_remote_state_unavailable) is not held, so its pending continuation keeps the base first-sweep T0 wait.
+  it("supersedes(RFL 00:10Z (b), run-end bound is held-only): supersedes(RFL round4 F0; /srv/scratch/paul/rfl-verdicts/SUPERSEDE-RFL-ROUND4-F0-1117.md): RFL round4 F0 sweeps a continued conversation with five ordinary unanswered ones without throwing", async () => {
     const held = await fixture();
     const heldRunId = await held.run({ commentId: await held.message(), status: "failed", errorCode: "runner_remote_state_unavailable" });
     await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, heldRunId));
@@ -343,7 +343,6 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed" });
       ordinary.push(f);
     }
-    let heldNoteId: string | undefined;
     for (let pass = 0; pass < 3; pass++) {
       await expect(heartbeatService(db).reconcileStrandedAssignedIssues()).resolves.toBeDefined();
       for (const f of ordinary) {
@@ -352,12 +351,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         expect(notices[0]!.body).toBe(NOT_ANSWERED);
       }
       // RFL 17:18Z: its fresh continuation is recorded and its delivery is
-      // pending (automaticRecoveryPending (b)); the bound runs from the held
-      // run's END (15 min ago), so the sweep posts ONE true notice, never a second.
-      const heldNotes = await held.visible();
-      expect(heldNotes.map(note => note.body)).toEqual([NOT_ANSWERED]);
-      heldNoteId ??= heldNotes[0]!.id;
-      expect(heldNotes[0]!.id).toBe(heldNoteId);
+      // pending (automaticRecoveryPending (b)), so no resend advice for it;
+      // the sweep's own bound still posts one note if it never delivers.
+      expect(await held.visible()).toHaveLength(0);
     }
   });
 
@@ -2983,9 +2979,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
     // Keep: gate 3 s1 refusal (adca2f56), with the held writer's notice removed (#21066).
     // If its automatic recovery never delivers, the SWEEP alone must own the bound and the one notice.
-    // Reason: rf5 autorec F1 (RFL 17:27Z, binding): the ten minutes run from the failed run's END (finishedAt),
-    // not from the sweep's first durable wait record; the record is still written once and never reset.
-    it("supersedes(rf5 autorec F1, run-end bound): gate 3 bound: refused message, no held-writer notice, recovery never delivers -> one true notice at ten minutes, never a second", async () => {
+    // Reason (RFL 00:10Z option (b)): runend's END bound applies ONLY to the HELD class. This refusal
+    // (native_session_supervisor_busy) is not held: its ten minutes run from the sweep's first durable wait record.
+    it("supersedes(RFL 00:10Z (b), run-end bound is held-only): gate 3 bound: refused message, no held-writer notice, recovery never delivers -> one true notice at ten minutes, never a second", async () => {
       const f = await fixture();
       const base = Date.now() - 90_000;
       const messageId = await f.message("Please continue.");
@@ -3009,14 +3005,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const recorded = await waits();
       expect(recorded).toHaveLength(1);
       expect(recorded[0]!.details).toMatchObject({ messageId, runId });
-      // The bound runs from the failed run's END (finishedAt = base + 5 885 ms), so +10 min is EXACTLY the bound.
-      const t0 = 5_885;
+      // The writer stamps T0 with the database clock, not the injected decision clock.
+      // Read that durable start so +10 min is EXACTLY the bound, without a timing cushion.
+      const t0 = recorded[0]!.createdAt.getTime() - base;
       let waitingId: string | undefined;
-      for (const minutes of [2, 5, 9]) {
+      for (const minutes of [1, 5, 9]) {
         await at(g, t0 + minutes * 60_000);
         const notes = await systemNotes();
         expect(notes.map(note => note.body).join(" ")).not.toMatch(/send(?:ing)? it again/i);
-        if (minutes === 2) {
+        if (minutes === 1) {
           expect(notes).toHaveLength(0); // Still inside the short grace.
         } else {
           expect((await g.visible()).map(note => note.body)).toEqual([recoveringText()]);
@@ -3042,8 +3039,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         .toEqual(recorded.map(wait => ({ id: wait.id, createdAt: wait.createdAt })));
     });
 
-    // rf5 autorec F1 (binding, RFL 17:27Z): the bound runs from the failed run's END for all three pending shapes:
-    // (a) no action yet, (b) restored with no delivery, (c) a deferred restored wake. Adapted from rf5's BOUND rows.
+    // RFL 00:10Z option (b): runend's END bound applies ONLY to the HELD class. gate1's run
+    // (native_session_supervisor_busy) is NOT held, so for all three pending shapes, (a) no action yet,
+    // (b) restored with no delivery, (c) a deferred restored wake, the base first-sweep T0 wait holds:
+    // never a failure or resend notice at END+10 while recovery is owed. Adapted from rf5's BOUND rows.
     const endShapes = ["a-no-action", "b-restored-no-delivery", "c-deferred-wake"] as const;
     const END = 5_885; // gate1's failed run finishedAt, relative to base
     async function endShape(shape: (typeof endShapes)[number], firstSweepMs: number) {
@@ -3064,29 +3063,34 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const waitsOf = (g: G) => db.select().from(activityLog).where(and(eq(activityLog.entityId, g.issueId),
       eq(activityLog.action, PENDING_WAIT_ACTION)));
     for (const shape of endShapes) {
-      it(`RED (rf5 autorec F1, run-end bound) ${shape}: first sweep at END+1 min; END+9 no failure notice; END+10 ONE true failure notice (the same comment)`, async () => {
+      it(`${"supersedes(RFL 00:10Z (b), run-end bound is held-only): "}${shape}: first sweep at END+1 min; END+10 still no failure notice; ONE true failure notice at T0+10 (the same comment)`, async () => {
         const g = await endShape(shape, END + 60_000);
         await at(g, END + 60_000);
         expect(await systemNotesOf(g)).toHaveLength(0);
         const firstWaits = await waitsOf(g);
-        await at(g, END + 9 * 60_000);
+        expect(firstWaits).toHaveLength(1);
+        const t0 = firstWaits[0]!.createdAt.getTime() - g.base; // the durable first-sweep T0 (database clock)
+        for (const ms of [END + 9 * 60_000, END + 10 * 60_000, t0 + 9 * 60_000]) {
+          await at(g, ms); // may post the true waiting note, never the failure notice
+          const notes = await systemNotesOf(g);
+          expect(notes.filter(note => note.body === NOT_ANSWERED || codeOf(note) !== undefined), "no failure notice before T0+10").toEqual([]);
+          expect(notes.map(note => note.body).join(" ")).not.toMatch(/send(?:ing)? it again/i);
+          for (const note of notes) expect(note.body).toBe(recoveringText()); // the true waiting note may stand
+        }
         const nine = await systemNotesOf(g);
-        expect(nine.filter(note => note.body === NOT_ANSWERED || codeOf(note) !== undefined), "+9 min: no failure notice").toEqual([]);
-        expect(nine.map(note => note.body).join(" ")).not.toMatch(/send(?:ing)? it again/i);
-        for (const note of nine) expect(note.body).toBe(recoveringText()); // the true waiting note may stand
-        expect(await at(g, END + 10 * 60_000)).toMatchObject({ kind: "noticed", code: "native_session_supervisor_busy" });
+        expect(await at(g, t0 + 10 * 60_000)).toMatchObject({ kind: "noticed", code: "native_session_supervisor_busy" });
         const ten = await systemNotesOf(g);
         expect(ten.map(note => note.body)).toEqual([NOT_ANSWERED]);
         if (nine[0]) expect(ten[0]!.id).toBe(nine[0].id);
-        await at(g, END + 11 * 60_000);
+        await at(g, t0 + 11 * 60_000);
         expect((await systemNotesOf(g)).map(note => note.id)).toEqual(ten.map(note => note.id));
         expect((await waitsOf(g)).map(wait => wait.id)).toEqual(firstWaits.map(wait => wait.id));
       });
-      it(`RED (rf5 autorec F1, run-end bound) ${shape}: a delayed FIRST sweep at END+11 min -> ONE true failure notice at once, no new wait`, async () => {
+      it(`${"supersedes(RFL 00:10Z (b), run-end bound is held-only): "}${shape}: a delayed FIRST sweep at END+11 min -> no failure notice yet; it starts the base T0 wait`, async () => {
         const g = await endShape(shape, END + 11 * 60_000);
-        expect(await at(g, END + 11 * 60_000)).toMatchObject({ kind: "noticed" });
-        expect((await systemNotesOf(g)).map(note => note.body)).toEqual([NOT_ANSWERED]);
-        expect(await waitsOf(g)).toHaveLength(0);
+        expect(await at(g, END + 11 * 60_000)).toMatchObject({ kind: "pending" });
+        expect(await systemNotesOf(g)).toHaveLength(0);
+        expect(await waitsOf(g)).toHaveLength(1);
       });
     }
 
@@ -3121,7 +3125,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     });
 
     // Keep: gate 3 s1's 7ae251e4 predecessor stop must not veto adca2f56's recovery.
-    it("veto3b RED: an older predecessor's escalated board stop does not veto the current run's bounded automatic recovery", async () => {
+    it("supersedes(RFL 00:10Z (b), run-end bound is held-only): veto3b RED: an older predecessor's escalated board stop does not veto the current run's bounded automatic recovery", async () => {
       const g = await gate1(60_000);
       const predecessor = await g.run({ status: "cancelled", errorCode: "cancelled" });
       await db.update(heartbeatRuns).set({ createdAt: new Date(g.base - 10_000), finishedAt: new Date(g.base - 5_000) })
@@ -3140,9 +3144,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const [waiting] = await systemNotesOf(g);
       expect(waiting?.body).toBe(recoveringText());
       expect(codeOf(waiting!)).toBeUndefined();
-      expect(await at(g, END + 9 * 60_000)).toMatchObject({ kind: "pending" });
+      // RFL 00:10Z option (b): gate1's run is not held, so its bound is the base first-sweep T0 wait, not its END.
+      const [firstWait] = await waitsOf(g);
+      const t0 = firstWait!.createdAt.getTime() - g.base;
+      expect(await at(g, END + PENDING_WAIT_START_BOUND_MS)).toMatchObject({ kind: "pending" });
+      expect(await at(g, t0 + 9 * 60_000)).toMatchObject({ kind: "pending" });
       expect((await systemNotesOf(g)).map(note => note.body)).toEqual([recoveringText()]);
-      expect(await at(g, END + PENDING_WAIT_START_BOUND_MS)).toMatchObject({ kind: "noticed" });
+      expect(await at(g, t0 + PENDING_WAIT_START_BOUND_MS)).toMatchObject({ kind: "noticed" });
       expect((await systemNotesOf(g)).map(note => ({ id: note.id, body: note.body })))
         .toEqual([{ id: waiting!.id, body: NOT_ANSWERED }]);
     });
