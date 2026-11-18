@@ -273,6 +273,66 @@ describe("redact-store G1/G4 durable boundaries", () => {
     expect((row!.payload!.prpEvent as unknown as PrpEvent).payload.input).toBe(redactSensitiveText(input));
   });
 
+  it.each(["sandbox.metric", "usage.reported", "auth.credentials.updated"] as const)("J1 %s masks payload and debug before storage and hashing", async eventType => {
+    const f = await fixture();
+    const text = "sk-proj-" + "J".repeat(40);
+    // auth.credentials.updated has a closed schema: use its permitted string
+    // field rather than inventing a text property the real append rejects.
+    const payload = eventType === "auth.credentials.updated"
+      ? { schema: "paperclip.auth.credentials.updated.v1", provider: text, bindingId: "harness-auth", revision: 1, detection: "credential_store" }
+      : { text, count: 7 };
+    const event: PrpEvent = { ...f.event(""), schema: "paperclip.prp.event.v2", schemaVersion: 2,
+      eventType, payload, debug: { message: text } };
+    await f.port.appendEvent(event);
+    const [row] = await f.stored();
+    const committed = row!.payload!.prpEvent as unknown as PrpEvent;
+    expect(committed.payload).toEqual(eventType === "auth.credentials.updated"
+      ? { ...payload, provider: "***REDACTED***" } : { text: "***REDACTED***", count: 7 });
+    expect(committed.debug).toEqual({ message: "***REDACTED***" });
+    expect({ ...committed, payload: event.payload, debug: event.debug }).toEqual(event);
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
+  });
+
+  it("J2 a JSON string-literal leaf decodes escaped newlines and stays valid JSON", async () => {
+    const f = await fixture();
+    const input = JSON.stringify("line1\n" + "sk-proj-" + "K".repeat(40));
+    const event: PrpEvent = { ...f.event(""), eventType: "semantic_tool.input", payload: { input }, debug: { input } };
+    await f.port.appendEvent(event);
+    const [row] = await f.stored();
+    const committed = row!.payload!.prpEvent as unknown as PrpEvent;
+    expect(JSON.parse(String(committed.payload.input))).toBe("line1\n***REDACTED***");
+    expect(committed.payload.input).toBe(JSON.stringify("line1\n***REDACTED***"));
+    expect(committed.debug).toEqual({ input: committed.payload.input });
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
+  });
+
+  it("J3 a 6000-deep JSON array leaf is stored without throwing and masks its key", async () => {
+    const f = await fixture();
+    const key = "sk-proj-" + "L".repeat(40);
+    const input = "[".repeat(6000) + JSON.stringify(key) + "]".repeat(6000);
+    const event = f.event("", 1, { input });
+    await expect(f.port.appendEvent(event)).resolves.toMatchObject({ disposition: "committed" });
+    const [row] = await f.stored();
+    const committed = row!.payload!.prpEvent as unknown as PrpEvent;
+    expect(committed.payload.input).toBe(input.replace(key, "***REDACTED***"));
+    expect(String(committed.payload.input)).not.toContain(key);
+    expect(() => JSON.parse(String(committed.payload.input))).not.toThrow();
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
+  });
+
+  it("J1-J3 an ordinary credential-free event and JSON string keep their exact bytes", async () => {
+    const f = await fixture();
+    const event: PrpEvent = { ...f.event(""), schema: "paperclip.prp.event.v2", schemaVersion: 2,
+      eventType: "sandbox.metric", payload: { text: '  "line1\\nno key \\u0061"  ', status: "ready", count: 7 },
+      debug: { message: "ordinary diagnostic\nunchanged" } };
+    await f.port.appendEvent(event);
+    const [row] = await f.stored();
+    expect(row!.payload!.prpEvent).toEqual(event);
+    expect((row!.payload!.prpEvent as unknown as PrpEvent).payload.text).toBe(event.payload.text);
+    expect((row!.payload!.prpEvent as unknown as PrpEvent).debug).toEqual(event.debug);
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(event));
+  });
+
   it("r2 agent comments echoing every provider key are stored and returned masked with run attribution and dedupe", async () => {
     const f = await fixture();
     const svc = issueService(db);
