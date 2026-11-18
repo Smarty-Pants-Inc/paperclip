@@ -20,7 +20,7 @@ function carriesCommentSql(alias: string, commentId: SQL): SQL {
 /** A reply/card can belong to a later run without copying the original input
  * ids. Follow durable continuation and answered-interaction edges, never mere
  * session identity or a later run's timestamp. UNION makes cycles terminate. */
-function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageSql): SQL {
+export function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageSql): SQL {
   return sql`(${carriesCommentSql(alias, commentId)} or exists (
     ${freshContinuationSourceChainSql({ companyId: m.companyId, issueId: m.issueId,
       runId: sql`${sql.identifier(alias)}.id` }, true)}
