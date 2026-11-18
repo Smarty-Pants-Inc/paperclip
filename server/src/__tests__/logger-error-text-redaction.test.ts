@@ -772,3 +772,74 @@ describe.each<Layer>(["production", "walker"])("values under sensitive key names
     expect(second.err.details).toEqual(kept);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Gap (iii): every ArrayBuffer view takes the Buffer / Uint8Array path:
+// decoded as UTF-8 from its underlying bytes and masked, or a length marker.
+// ---------------------------------------------------------------------------
+
+// CANARY_LINE padded with spaces to a multiple of 8 bytes, so every element
+// width (1, 2, 4, 8) views the same bytes.
+function paddedCanaryBytes() {
+  let line = CANARY_LINE;
+  while (Buffer.byteLength(line, "utf8") % 8) line += " ";
+  const bytes = Buffer.from(line, "utf8");
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length);
+}
+
+describe("every ArrayBuffer view is decoded and masked", () => {
+  it.each<Layer>(["production", "walker"])("walker (%s): Uint16Array, Int32Array, Float64Array and DataView in stderr, stdout and err.details", (layer) => {
+    const { log, output } = captureLayer(layer);
+    const buffer = paddedCanaryBytes();
+    log.warn({ stderr: new Uint16Array(buffer), stdout: new DataView(buffer) }, "views");
+    log.error({ err: Object.assign(new Error("x"), { details: { i32: new Int32Array(buffer), f64: new Float64Array(buffer) } }) }, "x");
+    const text = output();
+    expectCleanLines(text);
+    const [views, err] = records(text);
+    expect(views.stderr.trimEnd()).toBe(MASKED_LINE);
+    expect(views.stdout.trimEnd()).toBe(MASKED_LINE);
+    expect(err.err.details.i32.trimEnd()).toBe(MASKED_LINE);
+    expect(err.err.details.f64.trimEnd()).toBe(MASKED_LINE);
+  });
+
+  it("walker: a non-UTF-8 Uint16Array or DataView is a marker with its byte length", () => {
+    const { log, output } = captureLayer("walker");
+    const raw = new Uint8Array([0xff, 0xfe, 0x00, 0x41]).buffer;
+    log.warn({ stderr: new Uint16Array(raw), stdout: new DataView(raw) }, "binary");
+    const [record] = records(output());
+    expect(record.stderr).toBe("[masked: binary value, 4 bytes]");
+    expect(record.stdout).toBe("[masked: binary value, 4 bytes]");
+  });
+
+  it.each<Layer>(["production", "backstop"])("backstop (%s): Uint16Array, Int16Array, Int32Array, Float32Array, Float64Array and DataView in a field no serializer visits", (layer) => {
+    const { log, output } = captureLayer(layer);
+    const buffer = paddedCanaryBytes();
+    log.info({
+      ctx: {
+        u16: new Uint16Array(buffer),
+        i16: new Int16Array(buffer),
+        i32: new Int32Array(buffer),
+        f32: new Float32Array(buffer),
+        f64: new Float64Array(buffer),
+        dv: new DataView(buffer),
+        clean: new Uint16Array(new Uint8Array(Buffer.from("hi  ", "utf8")).buffer),
+      },
+    }, "views");
+    const text = output();
+    expectCleanLines(text);
+    const [record] = records(text);
+    for (const key of ["u16", "i16", "i32", "f32", "f64"]) expect(record.ctx[key].trimEnd()).toBe(MASKED_LINE);
+    // JSON writes a DataView as {}: its bytes never reach the line.
+    expect(record.ctx.dv).toEqual({});
+    // A view whose bytes hold no credential is left as JSON wrote it.
+    expect(record.ctx.clean).toEqual({ 0: 26984, 1: 8224 });
+  });
+
+  it("backstop: given the line directly, a Uint16Array's index object decodes; a clean or non-text one is unchanged", () => {
+    const buffer = paddedCanaryBytes();
+    const u16 = JSON.stringify({ msg: "x", ctx: new Uint16Array(buffer) });
+    expect(JSON.parse(maskSerializedLogLine(`${u16}\n`)).ctx.trimEnd()).toBe(MASKED_LINE);
+    const clean = '{"msg":"x","ctx":{"0":26984,"1":8224},"n":{"0":-1.5,"1":1e300}}\n';
+    expect(maskSerializedLogLine(clean)).toBe(clean);
+  });
+});

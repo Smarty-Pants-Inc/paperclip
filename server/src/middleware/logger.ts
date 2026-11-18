@@ -35,11 +35,13 @@ import { redactSensitiveText } from "../redaction.js";
  *   overrides the msg mask: that is Pino's intended serializer override. No app
  *   call site does it. The streamWrite backstop still masks that msg, since
  *   hooks are inherited and children cannot replace them.
- * - Bytes in a field no serializer visits reach the line as JSON number
- *   arrays. The backstop decodes a Buffer ({"type":"Buffer","data":[...]}) and
- *   a Uint8Array ({"0":n,...}); other typed arrays (Uint16Array, ...) and a
- *   DataView or ArrayBuffer there (written as {}) are not decoded. In err,
- *   stderr, stdout and msg the walker decodes every binary value.
+ * - Bytes in a field no serializer visits reach the line as JSON numbers.
+ *   The backstop decodes a Buffer ({"type":"Buffer","data":[...]}) and every
+ *   typed array ({"0":n,...}: Uint8Array, Uint16Array, Int32Array,
+ *   Float64Array, ...) from its underlying bytes. A DataView or ArrayBuffer
+ *   there is written as {}: no byte of it reaches the line. In err, stderr,
+ *   stdout and msg the walker decodes every ArrayBuffer view (DataView
+ *   included) and ArrayBuffer.
  * - A credential split across two fields, or across two log lines, is in no
  *   single string either layer scans.
  * - The walker also masks by key name: a value of any type under a key in
@@ -162,22 +164,50 @@ export function maskSerializedLogLine(line: string): string {
   return maskSerializedLogStrings(maskSerializedLogBytes(line));
 }
 
-// JSON writes bytes in a field no serializer visits as a number array: a
-// Buffer as {"type":"Buffer","data":[...]}, a Uint8Array as {"0":n,"1":n,...}.
-// Those structural shapes (never inside a string: there the quotes are escaped)
-// are decoded; one whose UTF-8 text holds a credential is replaced with the
-// masked text. Bytes that are not text, or hold none, are left as written.
+// JSON writes the bytes of a view in a field no serializer visits as numbers:
+// a Buffer as {"type":"Buffer","data":[...]}, and every other ArrayBuffer view
+// with elements (Uint8Array, Uint16Array, Int32Array, Float64Array, ...) as an
+// index object {"0":n,"1":n,...} of its ELEMENTS, not its bytes. Those
+// structural shapes (never inside a string: there the quotes are escaped) are
+// decoded the walker's way, as UTF-8 from the underlying bytes: the line does
+// not say which view wrote the elements, so the bytes are rebuilt under each
+// element type whose values the elements fit exactly, and one whose UTF-8 text
+// holds a credential is replaced with the masked text. Bytes that are not
+// text, or hold none, are left as written. A DataView or ArrayBuffer is written
+// as {}: none of its bytes reach the line.
 const SERIALIZED_BUFFER_RE = /\{"type":"Buffer","data":\[([0-9,]*)\]\}/g;
-const SERIALIZED_BYTE_INDEX_RE = /\{"0":\d{1,3}(?:,"\d+":\d{1,3})*\}/g;
+const JSON_NUMBER = String.raw`-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?`;
+const SERIALIZED_INDEX_OBJECT_RE = new RegExp(String.raw`\{"0":${JSON_NUMBER}(?:,"\d+":${JSON_NUMBER})*\}`, "g");
+// Same-endian as the process that wrote the line (the line is written here).
+const SERIALIZED_VIEW_TYPES = [
+  Uint8Array, Int8Array, Uint16Array, Int16Array, Uint32Array, Int32Array, Float32Array, Float64Array,
+] as const;
+
+function decodedLogText(bytes: Uint8Array): string | null {
+  try {
+    return strictUtf8.decode(bytes);
+  } catch {
+    return null;
+  }
+}
 
 function maskedSerializedBytes(match: string, values: number[]): string {
-  if (values.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 255)) return match;
-  let text: string;
-  try {
-    text = strictUtf8.decode(Uint8Array.from(values));
-  } catch {
-    return match;
+  for (const ViewType of SERIALIZED_VIEW_TYPES) {
+    const view = ViewType.from(values);
+    if (values.some((value, index) => view[index] !== value)) continue;
+    const text = decodedLogText(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+    if (text === null) continue;
+    const masked = redactSensitiveText(text);
+    if (masked !== text) return JSON.stringify(masked);
   }
+  return match;
+}
+
+// A Buffer's data array is its bytes: decoded as bytes only.
+function maskedSerializedBuffer(match: string, values: number[]): string {
+  if (values.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 255)) return match;
+  const text = decodedLogText(Uint8Array.from(values));
+  if (text === null) return match;
   const masked = redactSensitiveText(text);
   return masked === text ? match : JSON.stringify(masked);
 }
@@ -186,8 +216,8 @@ function maskSerializedLogBytes(line: string): string {
   if (!line.includes('"data":[') && !line.includes('{"0":')) return line;
   return line
     .replace(SERIALIZED_BUFFER_RE, (match, data: string) =>
-      data ? maskedSerializedBytes(match, data.split(",").map(Number)) : match)
-    .replace(SERIALIZED_BYTE_INDEX_RE, (match) => {
+      data ? maskedSerializedBuffer(match, data.split(",").map(Number)) : match)
+    .replace(SERIALIZED_INDEX_OBJECT_RE, (match) => {
       const entries = Object.entries(JSON.parse(match) as Record<string, number>);
       if (entries.some(([key], index) => key !== String(index))) return match;
       return maskedSerializedBytes(match, entries.map(([, byte]) => byte));
