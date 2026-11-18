@@ -24,8 +24,8 @@ import { activityService } from "../services/activity.js";
 import { listIssueNavigationState, listIssueSummaries } from "../services/issue-summaries.js";
 import { listIssueStatusBlockerAttention } from "../services/issue-status-presentation.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
-import { PARKED_WAKE_NOT_STARTED_WAIT, PARKED_WAKE_STOPPING_WAIT, parkedWakeNoticed, parkedWakeNoticedSql,
-  parkedWakeStopping } from "../services/heartbeat/parked-wake-deadline.js";
+import { PARKED_WAKE_NOT_STARTED_WAIT, parkedWakeNoticed, parkedWakeNoticedSql,
+  parkedWakeStopping, parkedWakeStoppingWait } from "../services/heartbeat/parked-wake-deadline.js";
 import { assertHandedOffRunTaskOwnership } from "../run-task-ownership.js";
 import { recordNativeHumanSelfHandoff } from "../services/native-runtime/native-human-self-handoff.js";
 import { recordChildTaskRead, recordChildTaskReads } from "../services/native-runtime/native-child-completion-delivery.js";
@@ -7711,6 +7711,8 @@ export function issueRoutes(
           'externalChatContinuation', ${agentWakeupRequests.payload}->'externalChatContinuation',
           -- S124e: true once this park has its one note; the queue line then reads the noted state.
           'parkedNoticed', ${parkedWakeNoticedSql(agentWakeupRequests.payload)},
+          -- RFL C2: set once the stopping note was rewritten at 30 min (the line follows it).
+          'parkedUnconfirmedAt', ${agentWakeupRequests.payload}->'parkedUnconfirmedAt',
           'executionWait', jsonb_build_object(
             'reason', ${agentWakeupRequests.payload}->'executionWait'->'reason',
             'message', ${agentWakeupRequests.payload}->'executionWait'->'message'),
@@ -7890,7 +7892,7 @@ export function issueRoutes(
       // RFL 11:12Z: while no run can start yet (admission's persisted wait),
       // the line says it will be sent; otherwise it says Retry sends it now.
       executionWait: parkedNoticed ? { ...(parkedWakeStopping(readObject(wake?.payload))
-          ? PARKED_WAKE_STOPPING_WAIT : PARKED_WAKE_NOT_STARTED_WAIT) }
+          ? parkedWakeStoppingWait(readObject(wake?.payload)) : PARKED_WAKE_NOT_STARTED_WAIT) }
         : interruptHandoff ? QUEUED_INTERRUPT_HANDOFF_WAIT
         : executionWaitForPerson(wait, wake?.requestedAt),
       queueId: wake?.id ?? null,
