@@ -74,7 +74,9 @@ export type RemoteLeaseOwner = {
  * path), "destroyed" too counts only on the owner's own lease: a destroy
  * receipt on another lease of the same box (an earlier lifecycle of a box
  * since resumed) never proves the current owner gone. "Own" is the owner run's
- * lease, or the probe's exact lease id. No error code or text is ever proof. */
+ * lease, or the probe's exact lease id; with ownLeaseOnly and both a run and a
+ * lease id (the park key), only that exact lease of that run: no sibling lease's
+ * receipt, carried or direct, is ever its proof. No error code or text is ever proof. */
 export async function ownLeaseTerminated(db: Db, owner: RemoteLeaseOwner,
   scope: { successorOnOwnerSandbox?: boolean; ownLeaseOnly?: boolean; carriedCleanupStop?: boolean } = {}): Promise<boolean> {
   if (!owner.providerLeaseId || !owner.environmentId) return false;
@@ -85,8 +87,9 @@ export async function ownLeaseTerminated(db: Db, owner: RemoteLeaseOwner,
   ));
   const resolved = await Promise.all(leases.map(lease => resolveRemoteTerminationLease(db, lease)));
   return resolved.some(lease => {
-    const ownLease = (owner.runId !== null && lease.heartbeatRunId === owner.runId)
-      || (owner.leaseId !== undefined && lease.id === owner.leaseId);
+    const ownLease = scope.ownLeaseOnly === true && owner.runId !== null && owner.leaseId !== undefined
+      ? lease.id === owner.leaseId && lease.heartbeatRunId === owner.runId
+      : (owner.runId !== null && lease.heartbeatRunId === owner.runId) || (owner.leaseId !== undefined && lease.id === owner.leaseId);
     // Execution-only readers (pause, task settlement): the own lease's Stop
     // receipt carried into pending destroy proves execution, not destruction.
     if (scope.carriedCleanupStop && ownLease && scope.successorOnOwnerSandbox !== true
