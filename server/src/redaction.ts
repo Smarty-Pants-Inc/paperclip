@@ -703,7 +703,10 @@ function authorizationCredentialRange(
   return { start: valueStart, end, replacement: REDACTED_EVENT_VALUE };
 }
 
-function redactAuthorizationCredentials(input: string): string {
+type ReplaceCredential = (start: number, end: number, replacement: string) => string;
+const replaceCredential: ReplaceCredential = (_start, _end, replacement) => replacement;
+
+function redactAuthorizationCredentials(input: string, replace: ReplaceCredential = replaceCredential): string {
   // Include compound diagnostic labels such as proxyAuthorization while the
   // value parser still requires a Basic/Bearer scheme before redacting.
   const authorizationWord = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]*Authorization[A-Za-z0-9_-]*\b/gi;
@@ -717,7 +720,7 @@ function redactAuthorizationCredentials(input: string): string {
       match.index + match[0].length,
     );
     if (!range || range.start < copiedThrough) continue;
-    parts.push(input.slice(copiedThrough, range.start), range.replacement);
+    parts.push(input.slice(copiedThrough, range.start), replace(range.start, range.end, range.replacement));
     copiedThrough = range.end;
     authorizationWord.lastIndex = range.end;
   }
@@ -727,10 +730,8 @@ function redactAuthorizationCredentials(input: string): string {
   return parts.join("");
 }
 
-function redactStandaloneBearerCredentials(input: string, quotedLeaf = false): string {
-  // A terminal colour sequence ends in a letter, which hides the word
-  // boundary: `ESC[31mBearer <token>` is still a scheme word.
-  const bearerWord = /(?:\b|(?<=\u001b\[[0-?]*[ -\/]*[@-~]))Bearer\b/gi;
+function redactStandaloneBearerCredentials(input: string, quotedLeaf = false, replace: ReplaceCredential = replaceCredential): string {
+  const bearerWord = /\bBearer\b/gi;
   const parts: string[] = [];
   let copiedThrough = 0;
   let match: RegExpExecArray | null;
@@ -810,7 +811,7 @@ function redactStandaloneBearerCredentials(input: string, quotedLeaf = false): s
       /^[A-Za-z][a-z]*(?:-[a-z]+)?$/.test(proseWord)
     ) continue;
     if (credentialStart < copiedThrough) continue;
-    parts.push(input.slice(copiedThrough, credentialStart), replacement);
+    parts.push(input.slice(copiedThrough, credentialStart), replace(credentialStart, end, replacement));
     copiedThrough = end;
     bearerWord.lastIndex = end;
   }
@@ -1086,21 +1087,140 @@ export function redactAgentAdapterConfig(
   return { ...(redactEventPayload(rest) ?? {}), env: redactedEnv };
 }
 
+// CSI includes SGR colours and erase-line sequences emitted by grep --color.
+const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+type RedactionStage = (text: string, replace: ReplaceCredential) => string;
+type ApplyRedactionStage = (text: string, stage: RedactionStage) => string;
+
 /**
  * `quotedLeaf`: `input` is the decoded content of a JSON string literal, so
  * its start and end stand for the literal's opening and closing quote.
  */
 export function redactSensitiveText(input: string, context?: { quotedLeaf?: boolean }): string {
+  if (!input.includes("\u001b")) return redactPlainSensitiveText(input, context);
+
+  const originalIndices: number[] = [];
+  const runs: string[] = [];
+  let copiedThrough = 0;
+  for (const match of input.matchAll(ANSI_ESCAPE_RE)) {
+    runs.push(input.slice(copiedThrough, match.index));
+    for (let index = copiedThrough; index < match.index; index += 1) originalIndices.push(index);
+    copiedThrough = match.index + match[0].length;
+  }
+  if (copiedThrough === 0) return redactPlainSensitiveText(input, context);
+  runs.push(input.slice(copiedThrough));
+  for (let index = copiedThrough; index < input.length; index += 1) originalIndices.push(index);
+  const view = runs.join("");
+
+  // Track the source interval of every UTF-16 code unit as existing scanner
+  // stages replace values. A later stage may cover a prior mask; all its
+  // replacement bytes then inherit the complete original credential interval.
+  let starts = originalIndices.map((_index, index) => index);
+  let ends = starts.map(index => index + 1);
+  const apply: ApplyRedactionStage = (text, stage) => {
+    const edits: Array<{ start: number; end: number; replacement: string }> = [];
+    const output = stage(text, (start, end, replacement) => {
+      edits.push({ start, end, replacement });
+      return replacement;
+    });
+    if (edits.length === 0) return output;
+    const nextStarts: number[] = [];
+    const nextEnds: number[] = [];
+    let cursor = 0;
+    for (const edit of edits) {
+      for (; cursor < edit.start; cursor += 1) {
+        nextStarts.push(starts[cursor]);
+        nextEnds.push(ends[cursor]);
+      }
+      const sourceStart = starts[edit.start] ?? view.length;
+      const sourceEnd = edit.end === edit.start ? sourceStart : ends[edit.end - 1];
+      for (let index = 0; index < edit.replacement.length; index += 1) {
+        nextStarts.push(sourceStart);
+        nextEnds.push(sourceEnd);
+      }
+      cursor = edit.end;
+    }
+    for (; cursor < text.length; cursor += 1) {
+      nextStarts.push(starts[cursor]);
+      nextEnds.push(ends[cursor]);
+    }
+    starts = nextStarts;
+    ends = nextEnds;
+    return output;
+  };
+  const masked = redactPlainSensitiveText(view, context, apply);
+  if (masked === view) return input;
+
+  const parts: string[] = [];
+  copiedThrough = 0;
+  for (let index = 0; index < masked.length;) {
+    let end = index + 1;
+    while (end < masked.length && starts[end] === starts[index] && ends[end] === ends[index]) end += 1;
+    const originalStart = originalIndices[starts[index]] ?? input.length;
+    const originalEnd = ends[index] === starts[index]
+      ? originalStart : originalIndices[ends[index] - 1] + 1;
+    if (originalStart > copiedThrough) parts.push(input.slice(copiedThrough, originalStart));
+    parts.push(masked.slice(index, end));
+    copiedThrough = Math.max(copiedThrough, originalEnd);
+    index = end;
+  }
+  parts.push(input.slice(copiedThrough));
+  return parts.join("");
+}
+
+// The shared command scanner exposes rewritten text, not source intervals.
+// These are its existing patterns, unchanged; the ANSI path needs their exact
+// replacement spans (not a diff/alignment guess, which is ambiguous for quoted
+// credentials). Keep this range-aware application in parity with
+// packages/adapter-utils/src/command-redaction.ts.
+const RANGE_COMMAND_SECRET_NAME_WORDS = String.raw`(?:api[-_]?key|(?:access[-_]?|auth[-_]?)?token|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*`;
+const RANGE_COMMAND_SECRET_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*${RANGE_COMMAND_SECRET_NAME_WORDS}`;
+const RANGE_COMMAND_SECRET_OPTION_NAME_PATTERN = String.raw`(?:[A-Za-z0-9_]|-(?!-))*${RANGE_COMMAND_SECRET_NAME_WORDS}`;
+const RANGE_COMMAND_CLI_SECRET_OPTION_RE = new RegExp(
+  String.raw`(\B-{1,2}${RANGE_COMMAND_SECRET_OPTION_NAME_PATTERN}(?:\s+|=)(["']?))[^\s"'` +
+    "`" + String.raw`]+(\2)`, "gi",
+);
+const RANGE_COMMAND_ENV_SECRET_ASSIGNMENT_RE = new RegExp(
+  String.raw`((?<![A-Za-z0-9_-])${RANGE_COMMAND_SECRET_NAME_PATTERN}\s*=\s*)(?:(\\["'])([\s\S]*?)\2|(["'])([^"'` +
+    "`" + String.raw`\r\n]*)\4|([^\s"'` + "`" + String.raw`]+))`, "gi",
+);
+const RANGE_COMMAND_AUTHORIZATION_BEARER_RE = /(\bAuthorization\s*:\s*Bearer\s+)[^\s"'`]+/gi;
+const RANGE_COMMAND_OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{12,}(?![A-Za-z0-9_-])/g;
+const RANGE_COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g;
+const RANGE_COMMAND_JWT_RE = /\b(?<![A-Za-z0-9_]-*)[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,}){2}(?:\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})?\b/g;
+
+function redactCommandTextRanges(input: string, apply: ApplyRedactionStage): string {
+  let text = apply(input, (value, replace) => value.replace(RANGE_COMMAND_AUTHORIZATION_BEARER_RE,
+    (match: string, prefix: string, index: number) => prefix + replace(index + prefix.length, index + match.length, REDACTED_EVENT_VALUE)));
+  text = apply(text, (value, replace) => value.replace(RANGE_COMMAND_CLI_SECRET_OPTION_RE,
+    (match: string, prefix: string, _quote: string, suffix: string, index: number) =>
+      prefix + replace(index + prefix.length, index + match.length - suffix.length, REDACTED_EVENT_VALUE) + suffix));
+  text = apply(text, (value, replace) => value.replace(RANGE_COMMAND_ENV_SECRET_ASSIGNMENT_RE,
+    (match: string, prefix: string, escapedQuote: string | undefined, _escapedValue: string | undefined, rawQuote: string | undefined, _rawValue: string | undefined, _unquotedValue: string | undefined, index: number) => {
+      const quote = escapedQuote ?? rawQuote ?? "";
+      return prefix + quote + replace(index + prefix.length + quote.length, index + match.length - quote.length, REDACTED_EVENT_VALUE) + quote;
+    }));
+  for (const pattern of [RANGE_COMMAND_OPENAI_KEY_RE, RANGE_COMMAND_GITHUB_TOKEN_RE, RANGE_COMMAND_JWT_RE]) {
+    text = apply(text, (value, replace) => value.replace(pattern, (match: string, index: number) =>
+      pattern === RANGE_COMMAND_JWT_RE && !looksLikeCredentialJwt(match)
+        ? match : replace(index, index + match.length, REDACTED_EVENT_VALUE)));
+  }
+  return text;
+}
+
+function redactPlainSensitiveText(input: string, context?: { quotedLeaf?: boolean }, track?: ApplyRedactionStage): string {
+  const apply: ApplyRedactionStage = track ?? ((text, stage) => stage(text, replaceCredential));
   if (!maybeContainsSecretText(input)) return input;
-  return redactCommandText(
-    redactStandaloneBearerCredentials(redactAuthorizationCredentials(input), context?.quotedLeaf === true)
-      .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
-      .replace(
-        ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
-        `$1${REDACTED_EVENT_VALUE}$2`,
-      ),
-    REDACTED_EVENT_VALUE,
-  )
-    .replace(GITHUB_FINE_GRAINED_TOKEN_RE, REDACTED_EVENT_VALUE)
-    .replace(AWS_ACCESS_KEY_ID_RE, REDACTED_EVENT_VALUE);
+  let text = apply(input, redactAuthorizationCredentials);
+  text = apply(text, (value, replace) => redactStandaloneBearerCredentials(value, context?.quotedLeaf === true, replace));
+  for (const pattern of [JSON_SECRET_FIELD_TEXT_RE, ESCAPED_JSON_SECRET_FIELD_TEXT_RE]) {
+    text = apply(text, (value, replace) => value.replace(pattern,
+      (match: string, prefix: string, suffix: string, index: number) => prefix + replace(index + prefix.length, index + match.length - suffix.length, REDACTED_EVENT_VALUE) + suffix));
+  }
+  text = track ? redactCommandTextRanges(text, apply) : redactCommandText(text, REDACTED_EVENT_VALUE);
+  for (const pattern of [GITHUB_FINE_GRAINED_TOKEN_RE, AWS_ACCESS_KEY_ID_RE]) {
+    text = apply(text, (value, replace) => value.replace(pattern,
+      (match: string, index: number) => replace(index, index + match.length, REDACTED_EVENT_VALUE)));
+  }
+  return text;
 }
