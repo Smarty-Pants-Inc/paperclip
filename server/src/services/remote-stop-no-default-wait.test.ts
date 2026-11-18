@@ -25,6 +25,10 @@ const { heartbeatService } = await import("./heartbeat.js");
 const { issueRoutes } = await import("../routes/issues.js");
 const { errorHandler } = await import("../middleware/index.js");
 const { buildExecutionContinuation } = await import("./execution-continuation.js");
+const { createWakeQueue } = await import("../modules/wake-queue/index.js");
+const { shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake } = await import("./heartbeat/queue.js");
+const { mergeCoalescedContextSnapshot } = await import("./heartbeat/run-preparation.js");
+const { createHeartbeatQueueTestDependencies } = await import("../__tests__/helpers/heartbeat-queue.js");
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("pl/no-default-wait (U shape): Stop with held messages on a warm box released stop_and_retain", () => {
@@ -689,6 +693,131 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(origins).toEqual([next.commentId]);
     expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
   }, 60_000);
+
+  // adopt-stopu-f3native (F3SPLIT item 5): the same shape with a NATIVE run holding the task.
+  // M2 (the post-Stop message) has its own deferred wake; when the native holder ends
+  // (succeeded / failed / cancelled), M2 must run once with only M2 as input, and the
+  // Stop-held pre-Stop wake stays saved for Send.
+  // Only "succeeded" is driven here (cancel: cancelRun needs the native cancellation coordinator; failed: see the direct-release characterization).
+  for (const ending of ["succeeded"] as ("succeeded" | "failed" | "cancelled")[]) {
+    it(`F3 native: after Stop, a message posted while a NATIVE run holds the task runs once alone when that run ${ending}`, async () => {
+      const f = await seed({ conversation: false });
+      const holderId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: holderId, companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+        runtimeMode: "native", status: "running", startedAt: new Date(), contextSnapshot: { issueId: f.issueId } });
+      await db.update(issues).set({ executionRunId: holderId, executionAgentNameKey: "native", executionLockedAt: new Date() })
+        .where(eq(issues.id, f.issueId));
+      const next = await postNew(f, `M5 after the Stop, native holder ${ending}`);
+      expect(next.wakeId).not.toBe(f.queueId);
+      expect((await wakeOf(next.wakeId)).status).toBe("deferred_issue_execution");
+      if (ending === "cancelled") {
+        // The real cancel path (heartbeat.ts cancelRun -> run-control release).
+        await heartbeatService(db).cancelRun(holderId);
+      } else {
+        await db.update(heartbeatRuns).set({ status: ending, finishedAt: new Date(),
+          ...(ending === "failed" ? { errorCode: "adapter_failed" } : {}) }).where(eq(heartbeatRuns.id, holderId));
+        // The native finalizer commits its finalization before the release (the stranded pass
+        // promotes behind a native run only with phase committed, wake-queue/adapters/postgres.ts).
+        await db.insert(nativeRunFinalizations).values({ runId: holderId, companyId: f.companyId, issueId: f.issueId,
+          phase: ending === "succeeded" ? "committed" : "terminal_failure" });
+        // The native finalize's release: the real releaseIssueExecutionAndPromote through the
+        // stranded pass, once the lock is gone (heartbeat/queue.ts:2257-2278 takes native runs).
+        await db.update(issues).set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+          .where(eq(issues.executionRunId, holderId));
+      }
+      await heartbeatService(db).resumeQueuedRuns();
+      const snapshot = async () => ({
+        issue: (await db.select().from(issues).where(eq(issues.id, f.issueId))).map(i => ({ status: i.status, executionRunId: i.executionRunId }))[0],
+        holder: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, holderId))).map(r => ({ status: r.status, errorCode: r.errorCode, resultJson: r.resultJson }))[0],
+        wakes: (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+          .map(w => ({ id: w.id, status: w.status, runId: w.runId, wait: (w.payload as Record<string, any> | null)?.executionWait?.reason ?? null })),
+        cards: (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(c => `${c.cause}:${c.status}`),
+        runs: (await successors(f)).filter(r => r.id !== holderId).map(r => ({ id: r.id, status: r.status, wake: r.wakeupRequestId })),
+        blocker: await getExecutionBlocker(db, f.companyId, f.issueId),
+      });
+      let started: typeof heartbeatRuns.$inferSelect | undefined;
+      try {
+        await vi.waitFor(async () => {
+          started = (await successors(f)).find(run => run.id !== holderId && run.wakeupRequestId === next.wakeId);
+          expect(started).toBeDefined();
+        }, { timeout: 10_000, interval: 200 });
+      } finally {
+        await evidence(`f3native ${ending} ${JSON.stringify({ holderId, m2Wake: next.wakeId, preStopWake: f.queueId, ...(await snapshot()) })}`);
+      }
+      if (!started) throw new Error(`M2 never started after the native holder ${ending}`);
+      expect(await admittedOrigins(f, started)).toEqual([next.commentId]);
+      expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      const m2Runs = (await successors(f)).filter(run => run.id !== holderId && run.wakeupRequestId === next.wakeId);
+      expect(m2Runs).toHaveLength(1);
+    }, 60_000);
+  }
+
+  // adopt-stopu-f3native: the native finalizer's own release (lock still held by the native run),
+  // through the real wake-queue release use case releaseIssueExecutionAndPromote delegates to.
+  for (const ending of ["succeeded", "failed"] as const) {
+    it(`F3 native (direct release): the native holder ${ending}, its own release decides M2`, async () => {
+      const f = await seed({ conversation: false });
+      const holderId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: holderId, companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+        runtimeMode: "native", status: "running", startedAt: new Date(), contextSnapshot: { issueId: f.issueId } });
+      await db.update(issues).set({ executionRunId: holderId, executionAgentNameKey: "native", executionLockedAt: new Date() })
+        .where(eq(issues.id, f.issueId));
+      const next = await postNew(f, `M5 after the Stop, native holder ${ending} (direct)`);
+      expect(next.wakeId).not.toBe(f.queueId);
+      await db.update(heartbeatRuns).set({ status: ending, finishedAt: new Date(),
+        ...(ending === "failed" ? { errorCode: "adapter_failed" } : {}) }).where(eq(heartbeatRuns.id, holderId));
+      await db.insert(nativeRunFinalizations).values({ runId: holderId, companyId: f.companyId, issueId: f.issueId,
+        phase: ending === "succeeded" ? "committed" : "terminal_failure" });
+      const scaffold = createHeartbeatQueueTestDependencies(db);
+      const wakeQueue = createWakeQueue(db, {
+        resolveResponsibleUserId: async () => "board",
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+        wakeAdmissionHelpers: { filterZombieCoalesceTarget: scaffold.filterZombieCoalesceTarget, mergeCoalescedContextSnapshot,
+          shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
+        recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+      } as any);
+      const released = await wakeQueue.releaseIssueExecution({ companyId: f.companyId, runId: holderId, now: new Date() });
+      await heartbeatService(db).resumeQueuedRuns();
+      const state = async () => ({
+        outcome: (released as any).outcome ?? null,
+        issue: (await db.select().from(issues).where(eq(issues.id, f.issueId))).map(i => ({ status: i.status, executionRunId: i.executionRunId }))[0],
+        wakes: (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+          .map(w => ({ id: w.id, status: w.status, runId: w.runId, wait: (w.payload as Record<string, any> | null)?.executionWait?.reason ?? null })),
+        cards: (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(c => `${c.cause}:${c.status}`),
+        runs: (await successors(f)).filter(r => r.id !== holderId).map(r => ({ id: r.id, status: r.status, wake: r.wakeupRequestId })),
+        blocker: (await getExecutionBlocker(db, f.companyId, f.issueId))?.nextAction ?? null,
+        queueLine: (await readQueue(f)).executionWait ?? null,
+      });
+      if (ending === "failed") {
+        // Characterization (not Stop-specific): a failed native run's release records the
+        // reconciliation incident and blocks the task (postgres.ts recordNativeTerminalRecoveryIfNeeded,
+        // which reads no Stop fact). M2 is not run automatically; it stays saved, the task shows
+        // Retry / send a new message. M1 stays held for Send.
+        const seen = await state();
+        await evidence(`f3nativeDirect ${ending} ${JSON.stringify({ holderId, m2Wake: next.wakeId, preStopWake: f.queueId, ...seen })}`);
+        expect(seen.outcome).toEqual({ kind: "released" });
+        expect(seen.issue?.status).toBe("blocked");
+        expect(seen.cards).toEqual(["native_continuation_requires_reconciliation:active"]);
+        expect(seen.runs).toEqual([]);
+        expect(await wakeOf(next.wakeId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+        expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+        return;
+      }
+      let started: typeof heartbeatRuns.$inferSelect | undefined;
+      try {
+        await vi.waitFor(async () => {
+          started = (await successors(f)).find(run => run.id !== holderId && run.wakeupRequestId === next.wakeId);
+          expect(started).toBeDefined();
+        }, { timeout: 8_000, interval: 200 });
+      } finally {
+        await evidence(`f3nativeDirect ${ending} ${JSON.stringify({ holderId, m2Wake: next.wakeId, preStopWake: f.queueId, ...(await state()) })}`);
+      }
+      if (!started) throw new Error("M2 never started");
+      expect(await admittedOrigins(f, started)).toEqual([next.commentId]);
+      expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    }, 60_000);
+  }
 
   it("F3 split control: with NO Stop, a message posted behind a running turn still joins the saved wake (coalesces as today)", async () => {
     const f = await seed({ person: false, conversation: false });
