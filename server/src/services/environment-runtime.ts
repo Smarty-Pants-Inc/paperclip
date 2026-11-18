@@ -1,5 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
-import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY, agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, holdUncollectedAgentFileCopy, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
+import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY, agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, holdUncollectedAgentFileCopy, rearmAgentFileHoldsOnLeaseActive, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -2594,6 +2594,13 @@ function createSandboxEnvironmentDriver(
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
             });
           }
+        }
+        // B0b: the provider resumed this box (its lease is active again): re-arm
+        // the agent-file saves held only because its lease was gone. Event, not timer.
+        if (providerLease && reusableLease) {
+          await rearmAgentFileHoldsOnLeaseActive(db, { id: reusableLease.id, companyId: reusableLease.companyId,
+            providerLeaseId: reusableLease.providerLeaseId, heartbeatRunId: reusableLease.heartbeatRunId })
+            .catch(error => logger.warn({ err: error, leaseId: reusableLease.id }, "Agent-file LEASE-GONE holds not re-armed on resume"));
         }
         return recordedLease;
       }

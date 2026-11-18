@@ -17,7 +17,10 @@ const waitingCopyState = sql`(
     or (state = 'unavailable' and process_stopped_at is null and location like 'remote:%'
       and receipt->>'schema' = 'paperclip.agent-files.v1')
     or (receipt ? 'savePending' and state not in ('saved', 'unchanged', 'resolved') and process_stopped_at is not null
-      and receipt->>'schema' = 'paperclip.agent-files.v1')))
+      and receipt->>'schema' = 'paperclip.agent-files.v1'
+      -- A parked hold (permanent, or waiting for its lease) is not timer work.
+      and receipt->'savePending'->>'permanent' is distinct from 'true'
+      and receipt->'savePending'->>'retryOn' is distinct from 'lease_active')))
   or (state in ('saved', 'unchanged', 'resolved', 'unavailable') and process_stopped_at is not null
     and receipt->>'schema' = 'paperclip.agent-files.v1' and coalesce(receipt->>'retainedByRunId', '') = ''
     and not (state = 'unavailable' and receipt ? 'savePending')

@@ -1,7 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { conflict, notFound } from "../errors.js";
+import { HttpError, conflict, notFound } from "../errors.js";
+import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
@@ -12,6 +15,87 @@ export const AGENT_FILES_RETIREMENT_COLLECTION_TIMEOUT = "AGENT_FILES_RETIREMENT
 type HoldLease = { id: string; companyId: string; providerLeaseId?: string | null };
 
 /**
+ * A held save whose store.apply refusal can never succeed against its pinned
+ * bytes. store.apply (agent-file-store.ts) refuses those bytes with 422
+ * (unprocessable): a reserved name (:82), links or special files (:139, :190),
+ * a deleted configured instruction entry (:380, :427, :430). Everything else
+ * stays transient and keeps the timed retry: storage limits
+ * (AgentFileLimitError), 409 conflicts, 429, 5xx and network errors.
+ */
+export const AGENT_FILE_PERMANENT_REFUSAL_STATUSES: ReadonlySet<number> = new Set([422]);
+export function permanentAgentFileRefusalStatus(error: unknown): number | null {
+  return error instanceof HttpError && AGENT_FILE_PERMANENT_REFUSAL_STATUSES.has(error.status) ? error.status : null;
+}
+/** The sandbox plugin's LEASE-GONE refusal (source unavailable, not a refusal of the bytes). */
+export function agentFileSourceLeaseGone(error: unknown): boolean {
+  return error instanceof Error && /sandbox lease is no longer active/i.test(error.message);
+}
+/** savePending.retryOn for a LEASE-GONE hold: retried by the resume event, never by the timer. */
+export const AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE = "lease_active";
+/** A permanent hold stops blocking its box's destroy this long after it became
+ * permanent, and only once every held file is proven byte-equal in the mirror. */
+export const AGENT_FILE_PERMANENT_HOLD_DESTROY_BOUND_MS = 24 * 60 * 60_000;
+/** A hold no timer retries: permanent, or waiting for its lease to be active again. */
+export function agentFileHoldParked(savePending: unknown): boolean {
+  const pending = savePending as { permanent?: unknown; retryOn?: unknown } | null | undefined;
+  return pending?.permanent === true || pending?.retryOn === AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE;
+}
+export type AgentFileHeldFile = { path: string; sha256: string };
+export type AgentFileDurableCheck = { durable: boolean; checkedAt: string; files: number; changed: string[]; missing: string[]; detail?: string };
+/** Re-reads every held file from the controller mirror and compares path + sha256. */
+export async function verifyHeldFilesDurable(root: string, heldFiles: unknown): Promise<AgentFileDurableCheck> {
+  const checkedAt = new Date().toISOString();
+  if (!Array.isArray(heldFiles) || heldFiles.length === 0) return { durable: false, checkedAt, files: 0, changed: [], missing: [], detail: "The hold has no held-file manifest" };
+  const changed: string[] = [], missing: string[] = [];
+  for (const file of heldFiles as AgentFileHeldFile[]) {
+    const bytes = await fs.readFile(path.join(root, file.path)).catch(() => null);
+    if (bytes === null) missing.push(file.path);
+    else if (createHash("sha256").update(bytes).digest("hex") !== file.sha256) changed.push(file.path);
+  }
+  return { durable: changed.length === 0 && missing.length === 0, checkedAt, files: heldFiles.length, changed, missing };
+}
+type HeldCopyRow = { company_id: string; run_id: string; local_root: string; receipt: Record<string, unknown> | null };
+/**
+ * B2: a permanent hold past AGENT_FILE_PERMANENT_HOLD_DESTROY_BOUND_MS no
+ * longer blocks its box's destroy, but only while every held file is byte-equal
+ * in the controller mirror the hold points at (savePending.heldFiles, path +
+ * sha256). The check is written to the hold (savePending.durableCheck).
+ */
+async function permanentHoldReleasedForDestroy(db: Pick<Db, "execute">, row: HeldCopyRow): Promise<boolean> {
+  const pending = row.receipt?.savePending as { permanent?: unknown; permanentAt?: unknown; since?: unknown; heldFiles?: unknown } | undefined;
+  if (pending?.permanent !== true) return false;
+  const permanentAt = Date.parse(String(pending.permanentAt ?? pending.since ?? ""));
+  if (!Number.isFinite(permanentAt) || Date.now() - permanentAt < AGENT_FILE_PERMANENT_HOLD_DESTROY_BOUND_MS) return false;
+  const check = await verifyHeldFilesDurable(row.local_root, pending.heldFiles);
+  await (db as Db).execute(sql`update agent_instruction_working_copies
+    set receipt = jsonb_set(receipt, '{savePending,durableCheck}', ${JSON.stringify(check)}::jsonb)
+    where company_id = ${row.company_id} and run_id::text = ${row.run_id}::text and receipt ? 'savePending'`);
+  return check.durable;
+}
+
+/**
+ * B0b: the box's lease is active again (a resume). Every LEASE-GONE hold bound
+ * to it (or its run) is re-armed for collection now; nothing else polls them.
+ */
+export async function rearmAgentFileHoldsOnLeaseActive(db: Db, lease: HoldLease & { heartbeatRunId?: string | null }): Promise<string[]> {
+  return db.transaction(async tx => {
+    const rows = await (tx as unknown as Db).execute(sql`update agent_instruction_working_copies held_copy
+      set receipt = held_copy.receipt #- '{savePending,retryOn}', next_attempt_at = now(), updated_at = now()
+      where held_copy.company_id = ${lease.companyId}
+        and held_copy.receipt->>'schema' = 'paperclip.agent-files.v1'
+        and held_copy.receipt->'savePending'->>'retryOn' = ${AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE}
+        and (held_copy.run_id::text = ${lease.heartbeatRunId ?? null}::text
+          or held_copy.receipt->'cleanup'->>'leaseId' = ${lease.id}::text
+          or (${lease.providerLeaseId ?? null}::text is not null and exists (select 1 from environment_leases bound
+            where bound.company_id = held_copy.company_id and bound.id::text = held_copy.receipt->'cleanup'->>'leaseId'
+              and bound.provider_lease_id = ${lease.providerLeaseId ?? null}::text)))
+      returning held_copy.run_id::text as run_id`) as Array<{ run_id: string }>;
+    for (const row of rows) await notifyInstructionCollection(tx, { companyId: lease.companyId, runId: row.run_id });
+    return rows.map(row => row.run_id);
+  });
+}
+
+/**
  * True while a stopped agent-file save on this lease (or the same provider
  * resource) is unverified. The held tree is the only copy of those changes, so
  * no destroy, expiry or teardown may run until the save verifies or a loss is
@@ -19,7 +103,8 @@ type HoldLease = { id: string; companyId: string; providerLeaseId?: string | nul
  */
 export async function agentFileSaveHeldOnLease(db: Pick<Db, "execute">, lease: HoldLease): Promise<boolean> {
   if (typeof (db as Db).execute !== "function") return false;
-  const rows = await (db as Db).execute(sql`select 1 from agent_instruction_working_copies held_copy
+  const rows = await (db as Db).execute(sql`select held_copy.company_id::text as company_id, held_copy.run_id::text as run_id,
+      held_copy.local_root, held_copy.receipt from agent_instruction_working_copies held_copy
     join environment_leases held_lease on held_lease.company_id = held_copy.company_id
       and held_lease.id::text = held_copy.receipt->'cleanup'->>'leaseId'
     where held_copy.company_id = ${lease.companyId}
@@ -27,9 +112,10 @@ export async function agentFileSaveHeldOnLease(db: Pick<Db, "execute">, lease: H
       and held_copy.receipt ? 'savePending'
       and held_copy.state not in ('saved', 'unchanged', 'resolved')
       and (held_lease.id = ${lease.id}
-        or (${lease.providerLeaseId ?? null}::text is not null and held_lease.provider_lease_id = ${lease.providerLeaseId ?? null}::text))
-    limit 1`);
-  return Array.isArray(rows) && rows.length > 0;
+        or (${lease.providerLeaseId ?? null}::text is not null and held_lease.provider_lease_id = ${lease.providerLeaseId ?? null}::text))`);
+  if (!Array.isArray(rows)) return false;
+  for (const row of rows as unknown as HeldCopyRow[]) if (!await permanentHoldReleasedForDestroy(db, row)) return true;
+  return false;
 }
 
 export const AGENT_FILE_DESTROY_CLAIM_KEY = "agentFileDestroyClaim";
@@ -212,14 +298,18 @@ export function agentFileCopyRetirementSettled(row: { state: string; receipt?: R
  */
 export async function agentFileCopiesToCollectOnLease(db: Pick<Db, "execute">, lease: HoldLease & { heartbeatRunId?: string | null }): Promise<string[]> {
   if (typeof (db as Db).execute !== "function") return [];
-  const rows = await (db as Db).execute(sql`select run_id::text as run_id from agent_instruction_working_copies
+  const rows = await (db as Db).execute(sql`select company_id::text as company_id, run_id::text as run_id, local_root, receipt from agent_instruction_working_copies
     where company_id = ${lease.companyId}
       and receipt->>'schema' = 'paperclip.agent-files.v1'
       and (run_id::text = ${lease.heartbeatRunId ?? null}::text or receipt->'cleanup'->>'leaseId' = ${lease.id}::text)
       and not (state in ('saved', 'unchanged', 'resolved')
         or (not (receipt ? 'savePending') and (state = 'superseded' or coalesce(receipt->>'retainedByRunId', '') <> ''
           or (state = 'unavailable' and process_stopped_at is not null))))`);
-  return Array.isArray(rows) ? rows.map(row => String((row as { run_id: unknown }).run_id)) : [];
+  if (!Array.isArray(rows)) return [];
+  const collect: string[] = [];
+  // A permanent hold released for destroy (B2) needs no collection: its bytes are verified in the mirror.
+  for (const row of rows as unknown as HeldCopyRow[]) if (!await permanentHoldReleasedForDestroy(db, row)) collect.push(String(row.run_id));
+  return collect;
 }
 
 /**

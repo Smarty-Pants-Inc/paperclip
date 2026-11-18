@@ -3,7 +3,8 @@ import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
 import { notifyDirectoryCleanup } from "./directory-cleanup-notifications.js";
 import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
-import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, agentFileHoldWriteCondition, pinLeaseForCollection, unpinLeaseForCollection } from "./agent-file-save-hold.js";
+import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE, agentFileHoldParked, agentFileHoldWriteCondition, agentFileSourceLeaseGone,
+  permanentAgentFileRefusalStatus, pinLeaseForCollection, unpinLeaseForCollection, type AgentFileHeldFile } from "./agent-file-save-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -51,7 +52,11 @@ export function agentFileSaveHeld(row: Pick<Copy, "state" | "receipt"> | null | 
 export const AGENT_FILES_ASIDE_UNSURFACED = "AGENT_FILES_ASIDE_UNSURFACED";
 /** The one operator instruction for a held stopped copy, keyed on the hold's
  * own code (receipt.savePending.code), not on the row's last error. */
-export function agentFileHoldInstruction(row: Pick<Copy, "receipt" | "executionRoot" | "location"> | null | undefined): string {
+export function agentFileHoldInstruction(row: (Pick<Copy, "receipt" | "executionRoot" | "location"> & Partial<Pick<Copy, "companyId" | "runId">>) | null | undefined): string {
+  const pending = row?.receipt?.savePending as { permanent?: unknown; reason?: unknown; retryOn?: unknown } | undefined;
+  if (pending?.permanent === true) return `Agent-file changes cannot be saved: ${String(pending.reason ?? "the save was refused")}. They are kept on the server and will not be retried. `
+    + `An instance operator can discard them: POST /api/companies/${row?.companyId}/agent-file-holds/${row?.runId}/discard.`;
+  if (pending?.retryOn === AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE) return `${AGENT_FILES_SAVE_PENDING_INSTRUCTION} The sandbox lease is no longer active; the save is retried when the sandbox resumes.`;
   if ((row?.receipt?.savePending as { code?: unknown } | undefined)?.code !== AGENT_FILES_ASIDE_UNSURFACED) return AGENT_FILES_SAVE_PENDING_INSTRUCTION;
   const asideRoot = path.posix.join(row!.executionRoot, ".paperclip-runtime", "notes-aside");
   return `Agent note copies retained during note delivery could not be checked, so this agent directory was not released. To keep them, copy ${asideRoot} from the sandbox (${row!.location}) into the agent's folder, and any ${path.posix.join(row!.executionRoot, ".paperclip-runtime", "notes-*", "aside")} a failed retention left behind.`;
@@ -973,6 +978,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   /** Re-arms an existing hold (failed save OR unsurfaced aside copies) with the
    * shared instruction-copy backoff, keeping the hold's own operator text. */
   function retryHeldSave(row: Copy) {
+    // A parked hold (permanent, or waiting for its lease) is never re-armed by a timer.
+    if (agentFileHoldParked(row.receipt?.savePending)) return patch(row, { errorMessage: agentFileHoldInstruction(row), nextAttemptAt: null });
     const since = (row.receipt?.savePending as { since?: string } | undefined)?.since;
     return patch(row, { errorMessage: agentFileHoldInstruction(row),
       nextAttemptAt: instructionCopyRetryAt(typeof since === "string" ? new Date(since) : row.processStoppedAt ?? row.createdAt) });
@@ -980,20 +987,70 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   /** The one durable stopped-copy hold (receipt.savePending): a failed save
    * (state unavailable) and unsurfaced aside copies (state pending_collection,
    * code AGENT_FILES_ASIDE_UNSURFACED) both write it here. */
-  function holdUnsaved(row: Copy, errorCode: string, failure: unknown, storageWarning: string | null, mirrorHash?: string,
-    state: "unavailable" | "pending_collection" = "unavailable") {
-    const stoppedAt = row.processStoppedAt ?? new Date();
-    const previous = row.receipt?.savePending as { since?: string; failures?: number } | undefined;
-    const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
+  async function holdUnsaved(row: Copy, errorCode: string, failure: unknown, storageWarning: string | null, mirrorHash?: string,
+    state: "unavailable" | "pending_collection" = "unavailable", snapshot?: DirectorySnapshot) {
     const reason = failure instanceof HttpError || failure instanceof AgentFileLimitError || failure instanceof Error ? failure.message : String(failure);
+    // B0a: a refused save of a copy with nothing to save is never held.
+    if (errorCode !== AGENT_FILES_ASIDE_UNSURFACED && nothingToSave(row)) return settleNothingToSave(row, reason);
+    const stoppedAt = row.processStoppedAt ?? new Date();
+    const previous = row.receipt?.savePending as { since?: string; failures?: number; permanentAt?: string; heldFiles?: AgentFileHeldFile[]; noticeActivityId?: string } | undefined;
+    const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
+    // B1: a permanent refusal of these pinned bytes is never retried.
+    const permanentStatus = errorCode === "AGENT_FILES_SAVE_FAILED" ? permanentAgentFileRefusalStatus(failure) : null;
+    // B0b: LEASE-GONE (source unavailable) waits for the lease to be active again.
+    const leaseGone = errorCode === "AGENT_FILES_SAVE_FAILED" && permanentStatus === null && agentFileSourceLeaseGone(failure);
+    const heldFiles = snapshot ? [...snapshot.entries].filter(([name, entry]) => entry.kind === "file" && !name.startsWith(".paperclip-runtime/"))
+      .map(([name, entry]) => ({ path: name, sha256: (entry as { hash: string }).hash })).sort((a, b) => a.path.localeCompare(b.path)) : previous?.heldFiles;
     const savePending = { since: since.toISOString(), code: errorCode, reason: reason.slice(0, 500),
-      failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}) };
-    return patch(row, { state, processStoppedAt: stoppedAt, errorCode,
+      failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}),
+      ...(permanentStatus !== null ? { permanent: true, permanentStatus, permanentAt: previous?.permanentAt ?? new Date().toISOString(),
+        ...(heldFiles ? { heldFiles } : {}), ...(previous?.noticeActivityId ? { noticeActivityId: previous.noticeActivityId } : {}) } : {}),
+      ...(leaseGone ? { retryOn: AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE } : {}) };
+    const held = await patch(row, { state, processStoppedAt: stoppedAt, errorCode,
       errorMessage: agentFileHoldInstruction({ ...row, receipt: { ...row.receipt, savePending } }),
-      nextAttemptAt: instructionCopyRetryAt(since),
+      nextAttemptAt: permanentStatus !== null || leaseGone ? null : instructionCopyRetryAt(since),
       receipt: { ...row.receipt, storageWarning, savePending } },
       // Same lease row lock as every destroy claim; refused once a destroy is claimed.
       agentFileHoldWriteCondition);
+    return noticePermanentHold(held);
+  }
+  /** B0a: the copy's last verified checkpoint recorded no change (candidate ==
+   * base, checkpointState unchanged, no copied files, no conflicts). */
+  function nothingToSave(row: Copy) {
+    const stats = row.receipt?.checkpointStats as { copiedFiles?: unknown } | undefined;
+    return row.receipt?.checkpointState === "unchanged" && row.candidateHash === row.baseHash
+      && (stats?.copiedFiles === undefined || stats.copiedFiles === 0)
+      && !(Array.isArray(row.receipt?.conflicts) && row.receipt.conflicts.length) && pendingConflicts(row).length === 0;
+  }
+  async function settleNothingToSave(row: Copy, reason: string) {
+    logger.warn({ runId: row.runId, reason }, "Agent-file save refused on an unchanged copy; nothing to save, no hold");
+    return patch(row, { state: "unchanged", processStoppedAt: row.processStoppedAt ?? new Date(), errorCode: null,
+      errorMessage: `Nothing to save: the last verified checkpoint was unchanged. The refusal (${reason.slice(0, 200)}) needs no retry.`,
+      nextAttemptAt: null, receipt: { ...withoutSaveHold(row.receipt), nothingToSave: { reason: reason.slice(0, 500), at: new Date().toISOString() } } });
+  }
+  /** B3: exactly one owner notice per permanent hold (CAS on savePending.noticeActivityId). */
+  async function noticePermanentHold(row: Copy): Promise<Copy> {
+    const pending = row.receipt?.savePending as { permanent?: unknown; permanentStatus?: number; reason?: string; noticeActivityId?: unknown } | undefined;
+    if (pending?.permanent !== true || pending.noticeActivityId) return row;
+    const [agent] = await db.select({ name: agents.name }).from(agents).where(and(eq(agents.companyId, row.companyId), eq(agents.id, row.agentId)));
+    const activityId = randomUUID();
+    const discardRoute = `POST /api/companies/${row.companyId}/agent-file-holds/${row.runId}/discard`;
+    const agentName = agent?.name ?? row.agentId;
+    const message = `${agentName}'s agent-file changes from run ${row.runId} cannot be saved: ${pending.reason ?? "the save was refused"}. `
+      + `They will not be retried. The changed files are kept on the server. To give them up, an instance operator can discard the held save: ${discardRoute}.`;
+    const publication = await db.transaction(async tx => {
+      const [claimed] = await tx.update(copies).set({ receipt: sql`jsonb_set(${copies.receipt}, '{savePending,noticeActivityId}', ${JSON.stringify(activityId)}::jsonb)` })
+        .where(and(eq(copies.companyId, row.companyId), eq(copies.runId, row.runId),
+          sql`${copies.receipt}->'savePending'->>'permanent' = 'true' AND NOT (${copies.receipt}->'savePending' ? 'noticeActivityId')`)).returning({ runId: copies.runId });
+      if (!claimed) return null;
+      return (await persistActivity(tx as unknown as Db, { companyId: row.companyId, actorType: "system", actorId: "agent-files",
+        action: "agent_files.save_held_permanent", entityType: "agent", entityId: row.agentId, agentId: row.agentId, runId: row.runId,
+        responsibleUserIdOverride: row.responsibleUserId,
+        details: { agentName, ownerUserId: row.responsibleUserId, status: pending.permanentStatus, reason: pending.reason, discardRoute, message } },
+        { id: activityId })).publication;
+    });
+    if (publication) publishActivity(publication);
+    return (await get(row.companyId, row.runId))!;
   }
   async function collectStopped(row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) {
     // AF-ABORT: re-checked before every remote command and every write.
@@ -1003,6 +1060,12 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (row.receipt?.retainedByRunId) return row;
     if (!await owns(row) || row.state === "superseded") return row;
     const held = agentFileSaveHeld(row);
+    // B0a: an existing hold on a copy with nothing to save settles; no retry.
+    if (held && (row.receipt?.savePending as { code?: unknown } | undefined)?.code !== AGENT_FILES_ASIDE_UNSURFACED && nothingToSave(row))
+      return settleNothingToSave(row, String((row.receipt?.savePending as { reason?: unknown }).reason ?? "refused"));
+    // B1/B0b: a parked hold is never retried here (only its notice is ensured);
+    // a LEASE-GONE hold is re-armed by rearmAgentFileHoldsOnLeaseActive.
+    if (held && agentFileHoldParked(row.receipt?.savePending)) return noticePermanentHold(row);
     // A held remote save without its exact collector keeps the source until
     // that collector returns; only exact destruction proof settles it.
     if (held && row.location !== "local" && !transports.has(key(row)) && target?.kind !== "remote"
@@ -1065,7 +1128,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         // lease. The collection worker retries this save; nothing is discarded.
         row = await holdUnsaved(row, error instanceof AgentFileLimitError ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED", error,
           error instanceof AgentFileLimitError ? agentStorageWarning(error.message) : (row.receipt?.storageWarning as string | null | undefined) ?? null,
-          inspected ? directorySnapshotSha256(inspected.snapshot) : (typeof mirrorHash === "string" ? mirrorHash : undefined));
+          inspected ? directorySnapshotSha256(inspected.snapshot) : (typeof mirrorHash === "string" ? mirrorHash : undefined),
+          "unavailable", inspected?.snapshot);
         break;
       }
     }
@@ -1241,6 +1305,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const lease = await ownedRemoteLease(row);
     const destroyed = lease && hasRemoteTerminationReceipt(lease)
       && (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed";
+    // A permanent hold keeps its verified mirror bytes through the box's destroy.
+    if (agentFileSaveHeld(row) && (row.receipt?.savePending as { permanent?: unknown }).permanent === true) return retryHeldSave(row);
     if (!destroyed) {
       if (agentFileSaveHeld(row)) return retryHeldSave(row);
       // execute (including bypassSession) may restart a stopped sandbox. Keep
