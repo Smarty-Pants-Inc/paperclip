@@ -3730,7 +3730,7 @@ describe("composer Stop", () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it("switches Stop to Send with text, whitespace back to Stop, without interrupting on keyboard submit", async () => {
+  it("supersedes(switches Stop to Send with text, whitespace back to Stop, without interrupting on keyboard submit; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — working Send defaults to Steer", async () => {
     const onStop = vi.fn(async () => {});
     const onAdd = vi.fn(async () => {});
     render(<TaskChatComposer workMode="standard" onAdd={onAdd} onStop={onStop} stopScope="subtree" />);
