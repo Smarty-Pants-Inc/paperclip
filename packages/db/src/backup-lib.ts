@@ -628,12 +628,15 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const canUsePgDump = !hasBackupTransforms(opts);
   const excludedTableNames = normalizeTableNameSet(opts.excludeTables);
   const nullifiedColumnsByTable = normalizeNullifyColumnMap(opts.nullifyColumns);
-  let sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+  let client = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+  let sql = client;
+  let snapshotConnection: postgres.ReservedSql | undefined;
+  let snapshotOpen = false;
   let sqlClosed = false;
   const closeSql = async () => {
     if (sqlClosed) return;
     sqlClosed = true;
-    await sql.end();
+    await client.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
   // Initial and final sleep checks can run within the same second. A failed
@@ -663,7 +666,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           throw error;
         }
         effectiveBackupEngine = "javascript";
-        sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+        client = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+        sql = client;
         sqlClosed = false;
       }
       if (dumped) {
@@ -678,8 +682,20 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       }
     }
 
+    // Reserve one connection for every catalog and data read, including COPY.
+    // REPEATABLE READ keeps later tables on the first query's snapshot.
+    snapshotConnection = await client.reserve();
+    sql = snapshotConnection;
+    await sql`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`;
+    snapshotOpen = true;
     await sql`SELECT 1`;
-    await sql`SET search_path = pg_catalog`;
+    await sql`SET LOCAL search_path = pg_catalog`;
+    // PostgreSQL docs (fetched 2026-11-18), both: "A value of zero (the default) disables the timeout."
+    // https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT
+    // https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-STATEMENT-TIMEOUT
+    // SET LOCAL lasts only until COMMIT/ROLLBACK: https://www.postgresql.org/docs/current/sql-set.html
+    await sql`SET LOCAL idle_in_transaction_session_timeout = 0`;
+    await sql`SET LOCAL statement_timeout = 0`;
 
     const emit = (line: string) => writer.emit(line);
     const emitStatement = (statement: string) => {
@@ -1066,16 +1082,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       if (effectiveBackupEngine !== "javascript" && nullifiedColumns.size === 0) {
         emit(`COPY ${qualifiedTableName} (${colNames}) FROM stdin;`);
         await writer.writeRaw("\n");
-        const copySql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
-        try {
-          const copyStream = await copySql
-            .unsafe(`COPY ${qualifiedTableName} (${colNames}) TO STDOUT`)
-            .readable();
-          for await (const chunk of copyStream) {
-            await writer.writeRaw(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
-          }
-        } finally {
-          await copySql.end();
+        const copyStream = await sql
+          .unsafe(`COPY ${qualifiedTableName} (${colNames}) TO STDOUT`)
+          .readable();
+        for await (const chunk of copyStream) {
+          await writer.writeRaw(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
         }
         await writer.writeRaw("\\.\n");
         emitStatementBoundary();
@@ -1216,6 +1227,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emitStatement("COMMIT;");
     emit("");
 
+    await sql`COMMIT`;
+    snapshotOpen = false;
     await writer.close();
 
     // Compress the SQL file with gzip
@@ -1234,6 +1247,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       prunedCount,
     };
   } catch (error) {
+    if (snapshotOpen) {
+      await sql`ROLLBACK`.catch(() => {});
+      snapshotOpen = false;
+    }
     await writer.abort();
     if (existsSync(backupFile)) {
       try { unlinkSync(backupFile); } catch { /* ignore */ }
@@ -1243,6 +1260,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     }
     throw error;
   } finally {
+    snapshotConnection?.release();
     await closeSql();
   }
 }
