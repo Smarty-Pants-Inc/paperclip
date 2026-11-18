@@ -7,14 +7,16 @@ import { assignmentWakePayloadSql, type DeferredExecutionScope, type DeferredRec
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { dependencyResolvedWakePayloadSql } from "../issue-dependency-wakeups.js";
 import { DEFERRED_CHAT_WAKE_RETRY_KEY, deferredChatWakeNextAttemptAt } from "../durable-chat-wakeup.js";
-import { anchorParkedWake, noticeParkedWakeDeadline, PARKED_WAKE_CARRIER_ACTIVE, PARKED_WAKE_RETRY_MS, parkedWakeAnchor, parkedWakeDeadlineMs,
-  parkedWake, parkedWakeNoticedSql, parkedWakeSql, personSendSql } from "./parked-wake-deadline.js";
+import { anchorParkedWake, noticeParkedWakeDeadline, PARKED_WAKE_CARRIER_ACTIVE, PARKED_WAKE_RETRY_MS, PARKED_WAKE_STOPPING, parkedWakeAnchor, parkedWakeDeadlineMs,
+  parkedWake, parkedWakeHeldForRetrySql, parkedWakeSql, personSendSql } from "./parked-wake-deadline.js";
 
 type Entry = { id: string; companyId: string; dueAt: number; immediate: boolean; operatorRetry?: boolean; forced?: boolean };
 /** S124: 30 s after the last attempt, never past the first park's deadline. */
 function parkedDue(updatedAt: Date, anchor: number | null) {
   const cadence = updatedAt.getTime() + PARKED_WAKE_RETRY_MS;
-  return anchor === null ? cadence : Math.min(cadence, anchor + parkedWakeDeadlineMs());
+  // Past the deadline only a stopping park is still retried: on its cadence.
+  return anchor === null || anchor + parkedWakeDeadlineMs() <= Date.now() ? cadence
+    : Math.min(cadence, anchor + parkedWakeDeadlineMs());
 }
 const scope0 = (entry: Entry) => ({ companyId: entry.companyId, requestId: entry.id });
 type NativeIntentOptions = DeferredExecutionScope & {
@@ -128,7 +130,7 @@ export function registerDeferredReceiptWork(
           scope ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
           // S124: a parked Send whose one note is written waits for the
           // person's Retry (a new press), never for another silent retry.
-          kind === "deferred" ? sql`not ${parkedWakeNoticedSql(agentWakeupRequests.payload)}` : undefined,
+          kind === "deferred" ? sql`not ${parkedWakeHeldForRetrySql(agentWakeupRequests.payload)}` : undefined,
           scope?.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
           kind === "native" ? and(
             eq(agentWakeupRequests.requestedByActorType, "system"),
@@ -212,9 +214,13 @@ export function registerDeferredReceiptWork(
           if (anchor !== null && anchor + parkedWakeDeadlineMs() <= Date.now()) {
             // Past the deadline: ONE true note (+ Retry), no further silent retry.
             // A run carrying a held message is still live: no note yet, next pass.
-            if (await noticeParkedWakeDeadline(db, scope0(entry)) === PARKED_WAKE_CARRIER_ACTIVE)
+            const noticed = await noticeParkedWakeDeadline(db, scope0(entry));
+            if (noticed === PARKED_WAKE_CARRIER_ACTIVE)
               return { ...entry, dueAt: Date.now() + PARKED_WAKE_RETRY_MS, immediate: false };
-            return null;
+            // RFL 11:12Z: no run can start yet (the previous run's stop is not
+            // confirmed): the note says it will be sent, so keep the cadence and
+            // send it when admission lets it start.
+            if (noticed !== PARKED_WAKE_STOPPING) return null;
           }
           const delayedDue = kind === "native" && current.status === "claimed" && current.claimedAt
             ? current.claimedAt.getTime() + 60_000
@@ -261,7 +267,9 @@ export function registerDeferredReceiptWork(
             .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
               eq(agentWakeupRequests.id, entry.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
           const stillAnchor = still ? parkedWakeAnchor(still.payload) : null;
-          if (still && stillAnchor !== null) next = parkedDue(still.updatedAt, stillAnchor);
+          if (still && stillAnchor !== null) next = stillAnchor + parkedWakeDeadlineMs() <= Date.now()
+            ? Math.max(parkedDue(still.updatedAt, stillAnchor), Date.now() + PARKED_WAKE_RETRY_MS)
+            : parkedDue(still.updatedAt, stillAnchor);
         }
         return next === null ? null : { ...entry, dueAt: next, immediate: false, forced: false };
       },

@@ -238,7 +238,6 @@ describe("S124 parked wake: monotonic first-park deadline", () => {
   // messages." for 5+ min with no run) is exactly the silent loop S124 bounds.
   it.each([
     ["interrupt_handoff", "Sending your messages."],
-    ["remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically."],
   ])("a Send parked in executionWait %s whose re-dispatch keeps failing gets ONE note at first park + deadline", async (reason, message) => {
     const f = await fixture(), parkedAt = new Date();
     const wake = await park(f, parkedAt, { executionWait: { reason, message } });
@@ -261,6 +260,31 @@ describe("S124 parked wake: monotonic first-park deadline", () => {
     expect(note.body).toMatch(/Retry/);
     for (let i = 1; i <= 6; i++) await tick(queue, at + DEADLINE_MS + 1_000 + i * RETRY_MS);
     expect(deps.resumeQueuedCommentInterrupt).toHaveBeenCalledTimes(atDeadline);
+    expect(await notes(f.issue.id)).toHaveLength(1);
+  });
+
+  // RFL 11:12Z: no run can start yet (admission's remote_cleanup: the previous
+  // run's remote stop is unconfirmed). ONE note in the new words, no Retry, and
+  // the park keeps its cadence so the Send goes out when the stop is confirmed.
+  it("a Send parked in executionWait remote_cleanup gets ONE 'will be sent' note at first park + deadline and keeps retrying", async () => {
+    const f = await fixture(), parkedAt = new Date();
+    const wake = await park(f, parkedAt, { executionWait: { reason: "remote_cleanup",
+      message: "Waiting for the previous environment to stop. Your message will start automatically." } });
+    const deps = createHeartbeatQueueTestDependencies(db), queue = createHeartbeatQueue(db, deps);
+    await registerDeferredReceiptWork(db, coordinator, { resume: scope => queue.resumeDeferredExecutionReceipts(scope),
+      settleTaskChat: async () => {}, createNativeBatch: () => async () => {}, schedulingSuppressed: async () => false }, () => true).ready;
+    const at = parkedAt.getTime();
+    for (let t = at + 5_000; t <= at + DEADLINE_MS - 5_000; t += 5_000) await tick(queue, t);
+    expect(await notes(f.issue.id)).toHaveLength(0);
+    for (let t = at + DEADLINE_MS - 4_000; t <= at + DEADLINE_MS + 1_000; t += 1_000) await tick(queue, t);
+    await waitForReal(async () => expect(await notes(f.issue.id)).toHaveLength(1));
+    const atDeadline = deps.resumeQueuedCommentInterrupt.mock.calls.length;
+    expect(typeof (await readWake(wake.id)).payload?.parkedNoticeAt).toBe("string");
+    const [note] = await notes(f.issue.id);
+    expect(note.body).toBe("Your message is saved and will be sent when the previous run has finished stopping, usually within ten minutes.");
+    expect(JSON.stringify(note.metadata)).not.toMatch(/Retry/);
+    for (let i = 1; i <= 6; i++) await tick(queue, at + DEADLINE_MS + 1_000 + i * RETRY_MS);
+    expect(deps.resumeQueuedCommentInterrupt.mock.calls.length).toBeGreaterThan(atDeadline);
     expect(await notes(f.issue.id)).toHaveLength(1);
   });
 
