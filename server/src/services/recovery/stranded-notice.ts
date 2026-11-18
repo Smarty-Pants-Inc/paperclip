@@ -280,6 +280,12 @@ export function buildStrandedRecoveryEscalationNotice(input: {
   recoveryResponsibility?: "system" | "user";
   /** The allowlisted code when there is no source run. */
   failureCode?: string | null;
+  /**
+   * The issue's current Retry decision (its execution blocker projection). When
+   * Retry cannot admit, the notice keeps the blocker's own next action and never
+   * tells the person to press Retry (#21914). Absent: no blocker holds the task.
+   */
+  retryDecision?: { offered: boolean; nextAction: string; withoutRetry: (text: string) => string } | null;
   sourceRun: {
     id: string;
     agentId?: string | null;
@@ -301,7 +307,13 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     tone: "danger" as const,
   } : SETUP_FAILURE_NOTICES[input.sourceRun?.errorCode ?? ""] ?? input.seed;
   const fallbackBody = input.fallbackBody?.trim();
-  const body = seed?.body ?? (fallbackBody || DEFAULT_STRANDED_RECOVERY_NOTICE_BODY);
+  const retryRefused = input.retryDecision?.offered === false ? input.retryDecision : null;
+  const offeredBody = seed?.body ?? (fallbackBody || DEFAULT_STRANDED_RECOVERY_NOTICE_BODY);
+  const body = retryRefused ? retryRefused.withoutRetry(offeredBody) : offeredBody;
+  const offeredNextAction = seed?.nextAction ?? (input.recoveryOwner
+    ? "The assigned agent continues the task from the saved work"
+    : RETRY_FROM_SAVED_WORK_NEXT_ACTION);
+  const nextAction = retryRefused && /\bRetry\b/.test(offeredNextAction) ? retryRefused.nextAction : offeredNextAction;
   const title =
     STRANDED_RECOVERY_NOTICE_TITLES_BY_RUN_ERROR_CODE[input.sourceRun?.errorCode?.trim() ?? ""] ??
     seed?.title ??
@@ -319,12 +331,7 @@ export function buildStrandedRecoveryEscalationNotice(input: {
             input.recoveryCause === ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE ? "Retry when ready" : "Waiting for you",
           ),
     ]),
-    keyValueRow(
-      "Next action",
-      seed?.nextAction ?? (input.recoveryOwner
-        ? "The assigned agent continues the task from the saved work"
-        : RETRY_FROM_SAVED_WORK_NEXT_ACTION),
-    ),
+    keyValueRow("Next action", nextAction),
   ];
 
   const runRows: NoticeMetadataRow[] = [];
