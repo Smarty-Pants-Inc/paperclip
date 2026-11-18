@@ -80,14 +80,14 @@ export async function materializeNativeEnvironmentBlockerRetry(input: NativeRetr
  * still-pending person input ids as attributionCommentIds (typed) and
  * attributionInteractionIds (card answers), the SAME arrays the
  * committer's native-status continuation wake carries
- * (nativeContinuationAttributionContext). ATTRIBUTION ONLY: read by
+ * (nativeContinuationAttributionContext), ONCE in the shared
+ * materializeNativeFreshSessionRetry below. ATTRIBUTION ONLY: read by
  * carriesCommentSql and the sweep's runCarriesMessage/inScopeSql, by no prompt
  * builder. The turn boundary (conversationReplyBoundaryCommentId) is left as
  * the cut run had it.
  */
 export async function materializeNativeMidStreamCutRetry(input: NativeRetryTarget) {
   const cut = await readNativeMidStreamCut(input.tx, { companyId: input.companyId, runId: input.runId });
-  const attribution = await nativeMidStreamCutAttributionIds(input);
   return materializeNativeFreshSessionRetry(input, {
     reason: NATIVE_MID_STREAM_CUT_CODE,
     maxRetries: Number.MAX_SAFE_INTEGER,
@@ -104,25 +104,8 @@ export async function materializeNativeMidStreamCutRetry(input: NativeRetryTarge
       nativeMidStreamCut: cut,
       livenessContinuationSourceRunId: run.id,
       livenessContinuationReason: NATIVE_MID_STREAM_CUT_CODE,
-      ...attribution,
     }),
   });
-}
-
-/** The cut run's own still-pending person input (not ANSWERED, not
- * live-carried), through the committer's one collector: typed messages as
- * attributionCommentIds and card answers as attributionInteractionIds. Only
- * the two attribution-only arrays; no prompt builder reads them. */
-async function nativeMidStreamCutAttributionIds(input: NativeRetryTarget): Promise<{
-  attributionCommentIds?: string[]; attributionInteractionIds?: string[] }> {
-  const { attributionCommentIds, attributionInteractionIds } = await nativeContinuationAttributionContext(input.tx, {
-    companyId: input.companyId, issueId: input.issueId, originRunId: input.runId });
-  return {
-    ...(Array.isArray(attributionCommentIds) && attributionCommentIds.length > 0
-      ? { attributionCommentIds: attributionCommentIds as string[] } : {}),
-    ...(Array.isArray(attributionInteractionIds) && attributionInteractionIds.length > 0
-      ? { attributionInteractionIds: attributionInteractionIds as string[] } : {}),
-  };
 }
 
 async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane: NativeRetryLane) {
@@ -142,6 +125,20 @@ async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane
   const now = new Date();
   const dueAt = new Date(now.getTime() + lane.delayMs(attempt));
   const retryId = randomUUID();
+  // R3-1 (ANSWERED, rf-5), ONCE for every lane of this function (provider
+  // capacity, environment blocker, mid-stream cut). Each follows a provider
+  // turn the failed run already consumed; it is not a never-started bootstrap
+  // retry, which keeps the SAME run and its own undelivered input. The origin's
+  // own still-pending input (typed and card; not ANSWERED, not live-carried)
+  // rides for ANSWERED attribution ONLY, through the committer's one collector:
+  // attributionCommentIds / attributionInteractionIds. No wake comments, card
+  // responses or first-turn receipt may replay it, and no prompt reads them.
+  const { attributionCommentIds, attributionInteractionIds } = await nativeContinuationAttributionContext(input.tx, {
+    companyId: input.companyId, issueId: input.issueId, originRunId: run.id });
+  const attribution = {
+    ...(Array.isArray(attributionCommentIds) && attributionCommentIds.length > 0 ? { attributionCommentIds } : {}),
+    ...(Array.isArray(attributionInteractionIds) && attributionInteractionIds.length > 0 ? { attributionInteractionIds } : {}),
+  };
   const predecessorContext = { ...run.contextSnapshot };
   // Resume receipts and delivered wake input belong to the failed run. The
   // new turn has ordinary task authority; history comes from retryOfRunId.
@@ -149,6 +146,8 @@ async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane
   for (const key of [
     "explicitUserContinuation", "wakeCommentId", "wakeCommentIds", "commentId",
     "commentIds", "latestCommentId", "resumeIntent", "followUpRequested",
+    "commentContinuation", "firstTurnQueuedInput", "queuedCommentSourceWakeIds",
+    "interactionId", "interactionIds", "interactionStatus",
     "paperclipWake", "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTaskMarkdownCompact",
     "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownAssignmentCompact", "paperclipTurnContext",
     // A resumed recovery is not the generic status wake and not a fresh start.
@@ -156,6 +155,7 @@ async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane
   ]) delete predecessorContext[key];
   const contextSnapshot = {
     ...predecessorContext,
+    ...attribution,
     issueId: input.issueId,
     taskId: input.issueId,
     ...(lane.resumeSession ? {} : { forceFreshSession: true }),
