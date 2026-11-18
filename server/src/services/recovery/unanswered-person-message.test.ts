@@ -9,7 +9,6 @@ import {
   agents,
   approvals,
   companies,
-  companyMemberships,
   createDb,
   heartbeatRuns,
   issueApprovals,
@@ -171,7 +170,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         agentId, decisionId: decision!.id, originRunId: sourceRunId, cause: "native_run_failed", summary: "Resume the persisted native run." }));
       const target = await run({ status, wakeReason: "issue_status_changed" });
       const [wake] = await db.update(agentWakeupRequests).set({ status: "coalesced", runId: target })
-        .where(eq(agentWakeupRequests.id, wakeId)).returning();
+        .where(eq(agentWakeupRequests.id, wakeId!)).returning();
       await db.insert(statusDecisionEffects).values({ companyId, issueId, decisionId: decision!.id, ordinal: 0,
         effectKind: "schedule_retry", targetType: "agent_wakeup_request", targetId: wake!.id,
         idempotencyKey: `native-status:${decision!.id}:retry`, payload: {} });
