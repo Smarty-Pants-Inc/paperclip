@@ -925,6 +925,7 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
       await writeFile(join(host, "task.txt"), "before the turn\n");
       await db.insert(heartbeatRuns).values({ id: runId, companyId: company.id, agentId: agent.id,
         issueId: issue.id, nativeIssueId: issue.id, runtimeMode: "native", status: "cancelled", finishedAt: new Date(),
+        startedAt: new Date(Date.now() - 1_000), // adopt-stopu-round: the turn start the process-gone check counts from
         errorCode: "cancelled", runnerProfileJson: { nativeResourceDisposition: "keep_running",
           // pl/r4-work3 (a): NSE's settle recorded the closed session's clean close.
           nativeStoppedSessionClose: { schema: "paperclip.native-stopped-session-close.v1", companyId: company.id,
@@ -967,7 +968,9 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
         return { released: [], errors: [] };
       });
       // The runtime cancellation boundary finishes copyback before run-control releases the lease.
-      expect(await finishCancelledWarmWorkspaceExport({ db, runId, companyId: company.id, nativeWorkspaceSync: sync }))
+      expect(await finishCancelledWarmWorkspaceExport({ db, runId, companyId: company.id, nativeWorkspaceSync: sync,
+        // adopt-stopu-round: the export is gated by ugate2's process-gone check on the same box.
+        stoppedTurnBox: async () => ({ runner: target.runner!, remoteCwd: box }) }))
         .toEqual({ outcome: "finalized" });
       await control.releaseEnvironmentLeasesForRun({ runId, companyId: company.id, agentId: agent.id,
         status: "cancelled", providerResourceDisposition: "keep_running" });
