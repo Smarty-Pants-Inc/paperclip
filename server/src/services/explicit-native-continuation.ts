@@ -175,6 +175,21 @@ export async function pendingContinuationDecisionWaits(db: Db, companyId: string
   return new Set(rows.map(row => row.id));
 }
 
+/** The admission rule for a Send after the agent's latest native turn ended
+ * cancelled or failed (eee74ebb, no Option S): unless a reconciliation source
+ * already names that run, the Send gets a synthetic
+ * native_continuation_requires_reconciliation source and waits. Admission
+ * decides with it; the queued-comment GET's Stop bar reads the same rule so the
+ * bar never says "will be sent when you send your next message" while
+ * admission would hold the Send. */
+export function nativeStopRequiresReconciliation(
+  latest: { id: string; status: string; runtimeMode: string | null } | null | undefined,
+  sourceChecks: ReadonlyArray<{ evidence: Record<string, unknown> }>,
+): boolean {
+  return latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) &&
+    !sourceChecks.some(source => (source.evidence.runId ?? source.evidence.sourceRunId) === latest.id);
+}
+
 /** Called under the issue lock, in the transaction that creates the new turn.
  * A user request authorizes a new conversation, not replay of the failed run.
  * Unknown action outcomes and all prior records stay intact.
@@ -343,8 +358,7 @@ export async function admitExplicitNativeContinuation(input: {
       if (!result || await hasPendingRunCleanup(db, companyId, latest.id))
         return blocked("cleanup_pending", "Waiting for the previous run to finish cleanup. Your message is saved.");
     }
-    if (latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) &&
-        !sourceChecks.some(source => (source.evidence.runId ?? source.evidence.sourceRunId) === latest.id)) {
+    if (latest && nativeStopRequiresReconciliation(latest, sourceChecks)) {
       sourceChecks.push({ cause: "native_continuation_requires_reconciliation", evidence: { runId: latest.id } });
     }
   }

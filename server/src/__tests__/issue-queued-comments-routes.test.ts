@@ -1859,31 +1859,55 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     }
   });
 
-  // SCREEN row 4b: the run-dispatch fallback (deferUnstartedUserComment) saves
-  // a held wake with an execution_recovery wait. After a person's Stop that wait
-  // must not replace the Stop bar; the Send's wait and a non-person stop keep theirs.
-  it.each(["person stop", "person stop then Send", "no person stop"])("SCREEN row 4b: the held bar with an execution_recovery wait after %s", async scenario => {
+  // SCREEN row 4b + S3/S7 (RFL 14:32Z): a held wake can carry a well-formed
+  // recovery wait (execution_recovery, remote_cleanup, execution_settling). The
+  // Stop bar R4 replaces it ONLY when Option S's predicate holds (the owner's
+  // Agent Chat, an ACKNOWLEDGED person Stop, not an Interrupt, no reconciliation
+  // source or blocker): then the owner's Send is admitted at once. Every other
+  // case keeps its wait text; the Send's own wait keeps "Sending your messages.".
+  const R4 = "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.";
+  const RECOVERY_WAITS = {
+    execution_recovery: "Waiting for execution recovery. Your message is saved.",
+    remote_cleanup: "Waiting for the previous environment to stop. Your message will start automatically.",
+    execution_settling: "Waiting for the previous run to settle. Your message is saved.",
+  } as const;
+  const SCENARIOS = ["acknowledged person stop", "unacknowledged person stop", "interrupt stop", "person stop then Send",
+    "no person stop", "acknowledged person stop + blocker"] as const;
+  const rows4b = (Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>).flatMap(reason =>
+    [true, false].flatMap(chat => SCENARIOS.map(scenario => [reason, chat ? "chat" : "task", scenario] as const)));
+  it.each(rows4b)("SCREEN row 4b: a %s wait on the %s after %s", async (reason, surface, scenario) => {
     const f = await seedQueue();
     const stoppedAt = new Date("2026-08-22T15:05:00.000Z");
-    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: stoppedAt,
+    const acknowledged = scenario.startsWith("acknowledged") || scenario === "interrupt stop";
+    const nativeCancellation = { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId,
+      issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+      intentAuditId: "intent-audit", acknowledgementAuditId: "ack-audit" };
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: stoppedAt, nativeIssueId: f.issueId,
       resultJson: scenario === "no person stop" ? { stopReason: "execution_reconciliation_required" }
         : { cancelledByActorType: "user", cancelledByUserId: "queue-owner",
-          ...(scenario === "person stop then Send" ? { queuedCommentInterruptQueueId: f.wakeId } : {}) } })
+          ...(acknowledged ? { nativeCancellation } : {}),
+          ...(scenario === "person stop then Send" || scenario === "interrupt stop" ? { queuedCommentInterruptQueueId: f.wakeId } : {}) } })
       .where(eq(heartbeatRuns.id, f.runId));
-    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
+    await db.update(issues).set({ executionRunId: null,
+      ...(surface === "chat" ? { conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" as const } : {}) })
+      .where(eq(issues.id, f.issueId));
+    if (scenario === "acknowledged person stop + blocker") {
+      await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: f.runId,
+        status: "active", nextAction: "Automatic recovery stopped.", evidence: { runId: f.runId } });
+    }
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
-    // The exact wait run-dispatch/adapters/postgres.ts writes on the held wake.
-    await db.update(agentWakeupRequests).set({ payload: { ...wake.payload,
-      executionWait: { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." },
+    const wait = { reason, message: RECOVERY_WAITS[reason] };
+    await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", payload: { ...wake.payload, executionWait: wait,
       ...(scenario === "person stop then Send"
         ? { queuedCommentInterrupt: { actorId: "queue-owner", requestedAt: "2026-08-22T15:06:00.000Z" } } : {}) } })
       .where(eq(agentWakeupRequests.id, f.wakeId));
     const queue = (await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
     expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
-    expect(queue.executionWait).toEqual(scenario === "person stop"
-      ? { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." }
+    const optionS = surface === "chat" && scenario === "acknowledged person stop";
+    expect(queue.executionWait).toEqual(optionS ? { reason: "stopped_by_person", message: R4 }
       : scenario === "person stop then Send" ? { reason: "interrupt_handoff", message: "Sending your messages." }
-        : { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." });
+        : wait);
   });
 
   it("Hold50 starts a message sent after a native Stop as soon as the stopped run's teardown ends", async () => {
