@@ -11,7 +11,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -832,8 +832,10 @@ import {
           errorCode: run.errorCode, result: run.resultJson })), wakes: wakes.map((wake) => ({ status: wake.status,
           runId: wake.runId, payload: wake.payload })), actions: actions.map((action) => action.cause) })}`);
       };
+      // supersedes(fixture: unordered heldIds SELECT, Postgres order unspecified; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)
       const heldIds = async () => (await db.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.agentId, runtimeAgent), eq(agentWakeupRequests.status, "deferred_issue_execution"))))
+        eq(agentWakeupRequests.agentId, runtimeAgent), eq(agentWakeupRequests.status, "deferred_issue_execution")))
+        .orderBy(asc(agentWakeupRequests.requestedAt)))
         .flatMap((wake) => {
           const ids = (wake.payload as Record<string, any>)?._paperclipWakeContext?.wakeCommentIds;
           return Array.isArray(ids) ? ids : [];
