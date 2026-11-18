@@ -41,6 +41,7 @@ vi.mock("./native-workspace-sync.js", async importOriginal => ({
 }));
 import { agentRoutes } from "../../routes/agents.js";
 import { issueRoutes } from "../../routes/issues.js";
+import { instanceSettingsService } from "../instance-settings.js";
 import { errorHandler } from "../../middleware/index.js";
 import { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { answeredPersonMessageSql } from "../person-message-answer.js";
@@ -78,6 +79,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await db.insert(authUsers).values({ id: PERSON, name: "Person", email: "withheld@example.invalid", emailVerified: true,
       createdAt: new Date(), updatedAt: new Date() });
     await db.insert(environments).values({ id: environmentId, name: `Box ${environmentId}`, driver: "sandbox" });
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
   }, 120_000);
   afterEach(() => { vi.useRealTimers(); box.resume.mockReset(); });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); });
@@ -86,7 +88,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
   const STREAM = ["Done. I renamed the helper ", "and updated its two callers.\n\n", "- `src/util.ts`\n- `src/app.ts`  \n", "Tests pass ✅"];
   const ANSWER = STREAM.join("");
 
-  async function scenario() {
+  async function scenario(options: { chat?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const sessionId = randomUUID(), runnerId = randomUUID(), leaseId = randomUUID(), providerLeaseId = `sandbox-${randomUUID()}`;
     await db.insert(companies).values({ id: companyId, name: "Withheld reply", issuePrefix: `W${companyId.slice(0, 6)}`,
@@ -95,7 +97,10 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer", status: "idle", adapterType: "paperclip_runner",
       adapterConfig: { provider: "codex", model: "fixture" }, runtimeConfig: { heartbeat: { wakeOnDemand: false } }, permissions: {} });
     await db.insert(issues).values({ id: issueId, companyId, title: "Rename the helper", status: "in_progress", priority: "medium",
-      assigneeAgentId: agentId, responsibleUserId: PERSON, issueNumber: 1, identifier: `W${companyId.slice(0, 6)}-1` });
+      assigneeAgentId: agentId, responsibleUserId: PERSON, issueNumber: 1, identifier: `W${companyId.slice(0, 6)}-1`,
+      // An Agent Chat conversation: the person's own thread with this agent.
+      ...(options.chat ? { conversationAgentId: agentId, conversationUserId: PERSON, conversationState: "active" } : {}) });
+    const [{ generation }] = await db.select({ generation: issues.conversationSessionGeneration }).from(issues).where(eq(issues.id, issueId));
     const app = express(); app.use(express.json());
     app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: PERSON, companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: true }; next(); });
@@ -114,12 +119,13 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, nativeSessionId: sessionId,
       runnerInstanceId: runnerId, completionContractId: contract.id, completionContractSha256: contract.canonicalSha256,
       status: "running", runtimeMode: "native", responsibleUserId: PERSON, startedAt: new Date(),
-      contextSnapshot: { issueId, source: "assignment", wakeReason: "issue_commented", wakeCommentId: messageId, commentId: messageId },
+      contextSnapshot: { issueId, source: "assignment", wakeReason: "issue_commented", wakeCommentId: messageId, commentId: messageId,
+        ...(options.chat ? { conversationSessionGeneration: generation } : {}) },
       runnerProfileJson: { nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v1", state: "prepared",
         descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null, workspaceId: randomUUID(),
         leaseId, providerLeaseId, remoteCwd: "/work", resourceDisposition: "destroy" } } });
     await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, issueId, heartbeatRunId: runId, provider: "daytona",
-      providerLeaseId, status: "active", leasePolicy: "ephemeral", metadata: { pluginId: "plugin-test" } });
+      providerLeaseId, status: "active", leasePolicy: "ephemeral", metadata: { pluginId: "plugin-test", remoteCwd: "/work" } });
     await db.update(issues).set({ executionRunId: runId, status: "in_progress" }).where(eq(issues.id, issueId));
 
     const store = new NativeRunCoordinatorStore(db, { companyId, issueId, runId, agentId, normalizedSessionId: sessionId,
@@ -203,7 +209,17 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
       await copyBack();
       expect(await coordinator()).toMatchObject({ phase: "committed" });
     }
-    return { app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
+    /** REAL: the saved-files source that the board's "Recover saved files" control reads
+     * (GET /api/issues/:id/recovery-actions?inspectSourceRunId=..., ui WorkspaceExportRecovery.tsx). */
+    async function savedFilesSource(cause: string) {
+      const [action] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, issueId),
+        eq(issueRecoveryActions.cause, cause)));
+      const got = await request(app).get(`/api/issues/${issueId}/recovery-actions`)
+        .query({ inspectSourceRunId: runId, inspectSourceActionId: action.id });
+      expect(got.status, JSON.stringify(got.body)).toBe(200);
+      return { active: got.body.active?.cause as string | undefined, inspection: got.body.sourceInspection?.status as string | undefined };
+    }
+    return { savedFilesSource, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
       thread, replies, answered, expectAnsweredOnceAndNoNotice, failCopyBackThreeTimes, boardRetrySucceeds };
   }
 
@@ -233,6 +249,9 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
       nativeWithheldReply: { state: "published", fileLine: "kept", commentId: reply.id,
         resultId: (await s.coordinator()).resultId, canonicalSha256: expect.any(String),
         failureCode: "native_workspace_sync_out_retry_exhausted" } });
+    // The board's open recovery for this run names the retained files, and their recorded source verifies.
+    expect(await s.savedFilesSource("native_workspace_sync_out_retry_exhausted"))
+      .toEqual({ active: "native_workspace_sync_out_retry_exhausted", inspection: "verified" });
     await s.expectAnsweredOnceAndNoNotice();
     // A restarted worker finds nothing left to publish.
     await s.presentationWorker(); await s.presentationWorker();
@@ -256,6 +275,8 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     expect(await s.coordinator()).toMatchObject({ phase: "terminal_failure", failureCode: "native_workspace_sync_out_unrecoverable",
       failureDetail: { workspaceFinalizeAttempt: 1 } });
     expect(box.resume).not.toHaveBeenCalled();
+    // Until the worker publishes, the one answered rule says M is unanswered.
+    expect(await s.answered()).toEqual([false]);
     await s.presentationWorker();
     timing("R2 start of the first copy-back -> published reply (one worker pass)", startedAt);
     const replies = await s.replies();
@@ -265,6 +286,25 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     expect(Buffer.from(replies[0].body.slice(0, ANSWER.length)).equals(Buffer.from(STREAM.join("")))).toBe(true);
     expect((await s.run()).resultJson).toMatchObject({ nativeWithheldReply: { state: "published", fileLine: "lost",
       failureCode: "native_workspace_sync_out_unrecoverable" } });
+    await s.expectAnsweredOnceAndNoNotice();
+    await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+    expect(await s.replies()).toHaveLength(1);
+  }, 120_000);
+
+  it("R2c: the same pause cancel in an Agent Chat conversation: the person's chat gets exactly 1 reply + the LOST line", async () => {
+    const s = await scenario({ chat: true });
+    await s.streamAndAccept();
+    const paused = await request(s.app).post(`/api/agents/${s.agentId}/pause`).send({});
+    expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+    expect(await s.run()).toMatchObject({ status: "cancelled", errorCode: "agent_paused" });
+    await db.update(environmentLeases).set({ status: "expired", releasedAt: new Date() }).where(eq(environmentLeases.id, s.leaseId));
+    await s.copyBack();
+    expect(await s.coordinator()).toMatchObject({ phase: "terminal_failure", failureCode: "native_workspace_sync_out_unrecoverable" });
+    await s.presentationWorker();
+    const replies = await s.replies();
+    expect(replies).toHaveLength(1);
+    expect(replies[0].body).toBe(`${ANSWER}\n\n${FILE_LINE_LOST}`);
+    expect((await db.select().from(agents).where(eq(agents.id, s.agentId)))[0].status).toBe("paused");
     await s.expectAnsweredOnceAndNoNotice();
     await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
     expect(await s.replies()).toHaveLength(1);

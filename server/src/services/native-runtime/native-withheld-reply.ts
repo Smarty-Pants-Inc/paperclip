@@ -143,10 +143,19 @@ export async function publishWithheldAcceptedReply(
     }
     if (!(await acceptedResponseDigestMatches(tx, run, accepted))) return false;
     const conversation = isConversation(issue);
-    // The committed path's own selection. A conversation reply may carry the
-    // compatible `unknown` channel only for the conversation's own agent and person.
+    // The committed path's own eligibility for an ordinary reply, without the
+    // parts that need a committed decision: a conversation reply belongs to
+    // the conversation's own agent, person and session, and a run that answers
+    // an external chat (Slack, email) keeps its own presentation path.
     const currentConversation = conversation
-      && issue.conversationAgentId === run.agentId && issue.conversationUserId === run.responsibleUserId;
+      && issue.conversationAgentId === run.agentId && issue.conversationUserId === run.responsibleUserId
+      && record(run.contextSnapshot).issueId === issue.id
+      && record(run.contextSnapshot).conversationSessionGeneration === issue.conversationSessionGeneration;
+    const authorizationReason = await resolveChatRunPresentationAuthorizationReason(tx, input);
+    if ((conversation && !currentConversation) || authorizationReason !== "internal_agent_write") {
+      await settle("skipped", conversation && !currentConversation ? "conversation_not_current" : "external_chat_context");
+      return false;
+    }
     const finalAgentMessage = await selectAcceptedFinalAgentMessage(tx, {
       companyId: input.companyId, runId: run.id, agentId: run.agentId, nativeSessionId: run.nativeSessionId,
       turnId: accepted.turnId, conversation, currentConversation,
@@ -183,7 +192,6 @@ export async function publishWithheldAcceptedReply(
     const fileLine = !terminal ? null : await exportIsRetained(tx, run, coordinator) ? "kept" as const : "lost" as const;
     const body = fileLine === null ? resolved.text
       : `${resolved.text}\n\n${fileLine === "kept" ? FILE_LINE_KEPT : FILE_LINE_LOST}`;
-    const authorizationReason = await resolveChatRunPresentationAuthorizationReason(tx, input);
     await notifyChatRunMilestones(tx, input);
     const comment = await issueService(db).addComment(input.issueId, body,
       { agentId: run.agentId, runId: run.id }, { authorizationReason, completionReply: true, withheldAcceptedReply: true }, tx);
