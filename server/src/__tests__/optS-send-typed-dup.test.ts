@@ -343,6 +343,12 @@ describe.skipIf(!support.supported)("optS: Send after a person's Stop on a warm 
       console.log("R1306", JSON.stringify(r, null, 1));
       await evidence("r1306", r);
       for (const id of s.held) expect(s.answered().get(id) ?? 0).toBeLessThanOrEqual(1);
+      // optS-dd: with the person_stop row present, the kept other-run term still holds the Send: exactly one held
+      // (deferred) wake carries the held messages, all of them.
+      const heldWakes = wakes.filter(w => w.status === "deferred_issue_execution"
+        && (((w.payload as any)?._paperclipWakeContext?.wakeCommentIds ?? []) as string[]).some(id => s.held.includes(id)));
+      expect(heldWakes, "one held wake").toHaveLength(1);
+      expect([...((heldWakes[0]!.payload as any)._paperclipWakeContext.wakeCommentIds as string[])].sort()).toEqual([...s.held].sort());
       // dupwake: each held message is listed ONCE.
       for (const id of s.held) expect.soft(listed.filter(x => x === id)).toHaveLength(1);
       // dupwake: no run's admitted set holds an id twice, and no id is admitted twice across runs.
