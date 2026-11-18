@@ -5,6 +5,7 @@ import { logger } from "../middleware/logger.js";
 import { registerIdleLocalWorkProbe } from "./idle-local-work.js";
 import { RetiredCredentialRecoveryError } from "./quota-credential-recovery.js";
 import { boundDiagnosticFields, summarizeDiagnosticError } from "./native-runtime/diagnostic-error-summary.js";
+import { LIFECYCLE_PROBE_CLEANUP_BOUND_MS } from "../modules/agent-lifecycle/application/retry.js";
 
 export type RetainedAiCleanupScope = { companyId: string; accountKey: string };
 export function retainedAiAccountKeyHash(accountKey: string): string {
@@ -15,7 +16,11 @@ type Cleanup = {
   home?: string;
   cleanup: () => Promise<void>;
   retryRetirement?: () => Promise<void>;
+  /** The probe lease's own durable receipt (one indexed read); never an error code. */
+  proveRetired?: () => Promise<boolean>;
   retired: "pending" | "confirmed" | "failed";
+  failedAt?: number;
+  expired?: boolean;
   running?: Promise<void>;
   executing?: boolean;
   warned?: boolean;
@@ -27,8 +32,21 @@ const active = new AsyncLocalStorage<ReadonlySet<Cleanup>>();
 const key = (scope: RetainedAiCleanupScope) => JSON.stringify([scope.companyId, scope.accountKey]);
 registerIdleLocalWorkProbe(() => retained.size ? "present" : "none");
 
-function pending() {
-  return unprocessable("This runtime still has unfinished credential cleanup.", { code: "ai_credential_cleanup_pending" });
+function pending(expired = false) {
+  return unprocessable("This runtime still has unfinished credential cleanup.", { code: "ai_credential_cleanup_pending", ...(expired ? { expired: true } : {}) });
+}
+/** Past the bound an unproven retirement is expired: the hire parks. Expiry
+ * never cleans up, never removes the entry and never touches a box. */
+function expire(entry: Cleanup): boolean {
+  if (entry.expired || entry.retired !== "failed" || entry.failedAt === undefined) return entry.expired === true;
+  if (Date.now() - entry.failedAt < LIFECYCLE_PROBE_CLEANUP_BOUND_MS) return false;
+  entry.expired = true;
+  try {
+    logger.warn({ companyId: entry.scope.companyId, code: "AI_CREDENTIAL_CLEANUP_EXPIRED",
+      accountKeyHash: retainedAiAccountKeyHash(entry.scope.accountKey), ...(entry.agentId ? { agentId: entry.agentId } : {}) },
+    "Selected AI credential cleanup is still unproven after its bound; the hire waits for Retry");
+  } catch { /* Diagnostics must not change cleanup behavior. */ }
+  return true;
 }
 function remove(entry: Cleanup) {
   const entries = retained.get(key(entry.scope));
@@ -51,12 +69,15 @@ function cleaningScope(scope: RetainedAiCleanupScope) {
 
 function attempt(entry: Cleanup): Promise<void> {
   if (!retained.get(key(entry.scope))?.has(entry)) return Promise.resolve();
-  if (entry.retired === "pending" || (entry.retired === "failed" && !entry.retryRetirement)) return Promise.reject(pending());
+  if (entry.retired === "pending" || (entry.retired === "failed" && !entry.retryRetirement && !entry.proveRetired)) return Promise.reject(pending());
   return entry.running ??= active.run(new Set([...(active.getStore() ?? []), entry]), async () => {
     entry.executing = true;
     try {
       if (entry.retired === "failed") {
-        await entry.retryRetirement!();
+        if (await entry.proveRetired?.() !== true) {
+          if (!entry.retryRetirement) throw pending();
+          await entry.retryRetirement();
+        }
         entry.retired = "confirmed";
       }
       await entry.cleanup(); remove(entry);
@@ -66,7 +87,7 @@ function attempt(entry: Cleanup): Promise<void> {
       // reads it before it can launch another provider.
       if (entry.retired === "confirmed" && error instanceof RetiredCredentialRecoveryError) { remove(entry); return; }
       warn(entry, "cleanup_threw");
-      throw pending();
+      throw pending(expire(entry));
     } finally { entry.executing = false; }
   }).finally(() => { entry.running = undefined; });
 }
@@ -77,19 +98,19 @@ export function retainAiCredentialCleanup(input: {
   // Accept legacy Google home metadata for compatibility. Only the explicit
   // bindRetainedAiCredentialHome mapping grants home-to-account authority.
   scope: RetainedAiCleanupScope; cleanup: () => Promise<void>; retired?: Promise<void>; retryRetirement?: () => Promise<void>; home?: string;
-  agentId?: string;
+  agentId?: string; proveRetired?: () => Promise<boolean>;
 }): void {
   const scopeKey = key(input.scope);
   const entries = retained.get(scopeKey) ?? new Set<Cleanup>();
   if ([...entries].some(entry => entry.cleanup === input.cleanup)) return;
   const entry: Cleanup = { scope: { ...input.scope }, home: input.home, cleanup: input.cleanup, retryRetirement: input.retryRetirement,
-    agentId: input.agentId, retired: input.retired ? "pending" : "confirmed" };
+    proveRetired: input.proveRetired, agentId: input.agentId, retired: input.retired ? "pending" : "confirmed" };
   entries.add(entry); retained.set(scopeKey, entries);
   if (input.retired) void input.retired.then(() => {
     entry.retired = "confirmed";
     return attempt(entry).catch(() => undefined);
   }, (reason: unknown) => {
-    entry.retired = "failed"; warn(entry, "retirement_rejected");
+    entry.retired = "failed"; entry.failedAt = Date.now(); warn(entry, "retirement_rejected");
     // DIAGNOSTIC (log only): why retirement rejected, as a sanitized summary.
     try {
       const message = "Retained AI credential retirement rejected";

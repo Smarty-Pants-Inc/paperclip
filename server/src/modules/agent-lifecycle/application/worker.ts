@@ -89,13 +89,16 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
         const verificationFailures = failureContext.stage === "host" && agent.lifecycleState === "verifying"
           && lifecycleFailureCode(error) === "harness_test_failed"
           ? (agent.lifecycleOperation?.verificationFailures ?? 0) + 1 : undefined;
-        failureContext = { ...failureContext, verificationFailures };
+        failureContext = { ...failureContext, verificationFailures,
+          transientFailureSince: agent.lifecycleOperation?.transientFailureSince };
         const message = lifecycleFailureMessage(failureContext, error);
         const retryRequired = lifecycleVerificationNeedsRetry(failureContext, error);
         const transientFailure = verificationHost && verificationFailures === undefined && !retryRequired;
         if (!await runStep("defer", () => retryRequired || verificationFailures !== undefined || transientFailure
           ? store.defer(agent, owner, message, new Date(), { retryRequired, ...(verificationFailures !== undefined ? { verificationFailures } : {}),
-            ...(transientFailure ? { transientFailure: true } : {}) })
+            ...(transientFailure ? { transientFailure: true } : {}),
+            // The one true line shows from the first deferral, not after ten minutes.
+            ...(transientFailure && lifecycleFailureCode(error) === "native_probe_cleanup_pending" ? { showTransientError: true } : {}) })
           : store.defer(agent, owner, message, new Date()))) continue;
         return;
       } finally {
