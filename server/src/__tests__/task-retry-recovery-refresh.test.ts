@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import express from "express";
@@ -8,7 +8,7 @@ import request from "supertest";
 import { and, eq, ne } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  agents, authUsers, agentWakeupRequests, budgetPolicies, closeRegisteredClients, companies, costEvents, createDb,
+  agents, authUsers, agentWakeupRequests, budgetPolicies, closeRegisteredClients, companies, companyMemberships, costEvents, createDb,
   environments, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issueRelations, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -195,6 +195,7 @@ describe("Task Retry recovery-card refresh", () => {
     const f = await fixture();
     const { decideStrandedRetryAdmission } = await import("../services/recovery/stranded-retry-admission.js");
     const { buildStrandedRecoveryEscalationNotice } = await import("../services/recovery/stranded-notice.js");
+    console.info("JUDGE_PRE workspace", JSON.stringify(await getExecutionBlocker(db, f.companyId, f.issueId)));
     const retry = await decideStrandedRetryAdmission(db, { companyId: f.companyId, issueId: f.issueId, runId: f.failed.id });
     const notice = buildStrandedRecoveryEscalationNotice({ retry, recoveryActionId: f.board.id, recoveryOwner: null,
       sourceRun: { id: f.failed.id, status: f.failed.status } });
@@ -207,6 +208,7 @@ describe("Task Retry recovery-card refresh", () => {
     const row = { admits: retry.admits, refusal: retry.admits ? null : retry.refusal, pressRetry: /Press Retry/.test(JSON.stringify(notice)),
       status: res.status, runStarted: runsAfter.length > runsBefore.length, dispatchError, body: notice.body };
     const { taskInterruptionPresentation } = await import("../services/task-interruption-presentation.js");
+    if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: expect.getState().currentTestName, ...row, nextAction: JSON.stringify(notice.metadata.sections[0]!.rows.find(r => "label" in r && r.label === "Next action") ?? null) })}\n`);
     console.info("JUDGE_ROW workspace", JSON.stringify(row), JSON.stringify(await taskInterruptionPresentation(db, await issueRow(f.issueId))),
       JSON.stringify(await getExecutionBlocker(db, f.companyId, f.issueId)));
     // The screen withholds Retry while the saved files are already being
@@ -227,6 +229,8 @@ describe("Task Retry recovery-card refresh", () => {
     heartbeat?: Record<string, unknown>; legacy?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Stranded judge", issuePrefix: `SJ${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
+    // The Retry presser is the person the run acts for; they must be an active member for the executor to start.
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
     const adapterType = opts.adapterType ?? "process";
     await db.insert(agents).values({ id: agentId, companyId, name: "Judge agent", role: "engineer", status: opts.paused ? "paused" : "idle",
       adapterType, adapterConfig: adapterType === "process" ? { command: "/bin/sh",
@@ -256,17 +260,18 @@ describe("Task Retry recovery-card refresh", () => {
     resetProcessRunAdmissionForTests();
     let res: Awaited<ReturnType<ReturnType<typeof request>["post"]>>;
     let dispatchError: string | null = null;
-    let started: { id: string; status: string; startedAt: Date | null }[] = [];
+    let started: { id: string; status: string; startedAt: Date | null; error: string | null; errorCode: string | null }[] = [];
     try {
       res = await request(appForBoard()).post(`/api/issues/${f.issueId}/retry`).send({ idempotencyKey: randomUUID(), observedRunId: f.run.id });
       // The route nudges dispatch with `void resumeTaskRetry(...)`; await the same call to read its outcome.
       if (res.body.requestId) await heartbeatService(db).resumeTaskRetry(f.companyId, res.body.requestId)
         .catch((error: Error) => { dispatchError = error.message; });
-      const successors = () => db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
+      const successors = () => db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt,
+        error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode })
         .from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId, f.issueId), ne(heartbeatRuns.id, f.run.id)));
-      for (let i = 0; i < 40; i++) {
+      for (let i = 0; i < 60; i++) {
         started = await successors();
-        if (!started.some(run => ["queued", "running"].includes(run.status) && run.startedAt)) break;
+        if (!started.some(run => ["queued", "running"].includes(run.status))) break;
         await new Promise(resolve => setTimeout(resolve, 250));
       }
       started = await successors();
@@ -283,9 +288,11 @@ describe("Task Retry recovery-card refresh", () => {
       status: res.status, routeCanRetry: res.body.presentation?.canRetry ?? null, runStarted: executed.length > 0, dispatchError,
       successorRows: started.length, successorStartedAt: started.map(run => run.startedAt?.toISOString() ?? null),
       successorStatus: started.map(run => run.status), executorMarker: executed.map(run => run.id),
+      successorError: started.map(run => `${run.errorCode ?? ""}:${run.error ?? ""}`.slice(0, 300)),
       savedWait: (saved?.payload as Record<string, any> | undefined)?.executionWait?.reason ?? saved?.status ?? null,
       body: notice.body, nextAction: JSON.stringify(notice.metadata.sections[0]!.rows.find(r => "label" in r && r.label === "Next action") ?? null) };
     console.info("JUDGE_ROW", JSON.stringify(row));
+    if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: expect.getState().currentTestName, ...row })}\n`);
     return row;
   }
 
@@ -336,6 +343,7 @@ describe("Task Retry recovery-card refresh", () => {
     const row = await judge(f);
     expect(row.status).toBe(202);
     expect(row.pressRetry).toBe(row.runStarted);
+    expect(row.screenCanRetry).toBe(row.runStarted);
   }, 60_000);
 
   // r2d ST5: the agent is busy (its one concurrency slot is occupied by a

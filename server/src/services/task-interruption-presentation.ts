@@ -976,7 +976,7 @@ async function withholdRetryDispatchRefuses(db: Db, companyId: string, selected:
     const blocker = await getExecutionBlocker(db, companyId, issue.id);
     if (blocker?.runId) {
       let refusal: { reason: string; message: string } | null = null;
-      await admitExplicitNativeContinuation({ db, companyId, issueId: issue.id, agentId: agent.id,
+      const admitted = await admitExplicitNativeContinuation({ db, companyId, issueId: issue.id, agentId: agent.id,
         actorType: "user", actorId: RETRY_PREVIEW_ACTOR, reason: "retry_failed_run", failedRunId: blocker.runId,
         commentId: null, successorRunId: randomUUID(), dryRun: true,
         onBlocked: (reason, message) => { refusal = { reason, message }; } });
@@ -984,7 +984,12 @@ async function withholdRetryDispatchRefuses(db: Db, companyId: string, selected:
       // press. Settling and stop-proof refusals (process_identity_missing,
       // execution_settling, ...) keep Retry: the press itself saves that wait
       // and the projection above shows it (retryWait.executionWaitReason).
-      if ((refusal as { reason: string } | null)?.reason === "previous_execution_unverified") {
+      // r2d: a falsy answer with no reason is dispatch's own deferral too
+      // (queue.ts: `executionBlocker && !admitExplicitNativeContinuation(...)`).
+      // It is reached when the agent's adapter is neither a conversation nor
+      // paperclip_runner (explicit-native-continuation.ts: such adapters keep
+      // their reconciliation contract), so Retry can never continue that hold.
+      if ((refusal as { reason: string } | null)?.reason === "previous_execution_unverified" || (!admitted && !refusal)) {
         withhold({ retryWait: { reason: "previous_execution_unverified", message: retryWaitMessages.previous_execution_unverified! } });
         continue;
       }

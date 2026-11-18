@@ -20,9 +20,21 @@ export async function decideStrandedRetryAdmission(db: Db, input: {
     assigneeAgentId: issues.assigneeAgentId, projectId: issues.projectId }).from(issues)
     .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).limit(1);
   const presentation = issue ? await taskInterruptionPresentation(db, issue) : null;
-  return strandedRetryAdmissionFromPresentation(presentation, issue?.assigneeAgentId
+  const admission = strandedRetryAdmissionFromPresentation(presentation, issue?.assigneeAgentId
     ? (await db.select({ name: agents.name }).from(agents).where(and(eq(agents.companyId, input.companyId),
       eq(agents.id, issue.assigneeAgentId))).limit(1))[0]?.name ?? null : null);
+  if (admission.admits || admission.refusal !== "none" || !issue) return admission;
+  // The task screen's execution blocker shows Paperclip recovering the saved
+  // work ("Recovering saved work…", workspaceRecoveryDisplay; or the hold's
+  // RECOVERING_SAVED_WORK_NEXT_ACTION) with no button.
+  // Say that; do not say nothing restarts it.
+  const { getExecutionBlocker } = await import("../execution-blocker.js");
+  const blocker = await getExecutionBlocker(db, issue.companyId, issue.id);
+  const { RECOVERING_SAVED_WORK_NEXT_ACTION } = await import("../legacy-execution-recovery.js");
+  if (blocker?.workspaceRecovery && ["queued", "recovering"].includes(blocker.workspaceRecovery.status)
+    || blocker?.nextAction === RECOVERING_SAVED_WORK_NEXT_ACTION)
+    return { admits: false, refusal: "system_waiting", waitMessage: "Paperclip is recovering the saved work first. Your message is saved." };
+  return admission;
 }
 
 type Presentation = Awaited<ReturnType<typeof taskInterruptionPresentation>>;
