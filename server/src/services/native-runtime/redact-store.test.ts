@@ -118,6 +118,109 @@ describe("redact-store G1/G4 durable boundaries", () => {
     expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
   });
 
+  it("F1 turn.completed text/message are masked before storage, hashing, retry, replay and exporter recovery", async () => {
+    const f = await fixture();
+    const text = "sk-proj-" + "A".repeat(40);
+    const event: PrpEvent = { ...f.event(text), eventType: "turn.completed", payload: { text, message: text }, debug: { message: text } };
+    const receipt = await f.port.appendEvent(event);
+    const [row] = await f.stored();
+    const committed = row!.payload!.prpEvent as unknown as PrpEvent;
+    expect(committed.payload).toEqual({ text: "***REDACTED***", message: "***REDACTED***" });
+    expect(committed.debug).toEqual({ message: "***REDACTED***" });
+    expect({ ...committed, payload: event.payload, debug: event.debug }).toEqual(event);
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
+    expect(await f.port.appendEvent(event)).toEqual({ ...receipt, disposition: "duplicate" });
+    expect(await f.port.appendEvent(committed)).toEqual({ ...receipt, disposition: "duplicate" });
+    const replay = await f.port.replayEvents({ runId: f.runId, sourceInstanceId: f.sourceInstanceId, afterSourceSeq: 0, limit: 100 });
+    expect(replay.events).toEqual([committed]);
+    const chunks: string[] = [];
+    await createNativeRunLogExporter({ db, companyId, runId: f.runId, afterCursor: 0,
+      enqueue: async (_cursor, chunk) => { chunks.push(chunk); }, flush: async () => {} }).recover();
+    expect(chunks.map(chunk => JSON.parse(chunk).event)).toEqual([committed]);
+  });
+
+  it.each([
+    "runner.diagnostic", "runtime.phase.changed", "workspace.ready", "harness.diagnostic", "plan.updated",
+    "research.completed", "delegation.completed", "model.route.changed", "context.compacted", "artifact.generated",
+    "review.mode.changed", "hook.completed", "memory.citation.referenced", "safety.review.completed", "terminal.input.sent",
+    "wait.completed", "provider.notice.recorded", "session.failed", "mcp_app.tool_result", "runtime_request.created",
+    "interaction.response.resolved", "run.result.accepted", "attention.request.proposed", "work.assessment.recorded",
+    "issue.status.decision.recorded",
+  ] as const)("F1 %s content/debug leaves are masked without changing the envelope", async eventType => {
+    const f = await fixture();
+    // V2 permits extensible content for these kinds, including diagnostic text.
+    const event: PrpEvent = { ...f.event(echo), schema: "paperclip.prp.event.v2", schemaVersion: 2,
+      eventType, payload: { text: echo, count: 7 }, debug: { message: echo } };
+    await f.port.appendEvent(event);
+    const [row] = await f.stored();
+    const committed = row!.payload!.prpEvent as unknown as PrpEvent;
+    expect(committed.payload).toEqual({ text: redactSensitiveText(echo), count: 7 });
+    expect(committed.debug).toEqual({ message: redactSensitiveText(echo) });
+    expect({ ...committed, payload: event.payload, debug: event.debug }).toEqual(event);
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
+  });
+
+  it("F1 v3 external_provider dispatch text/instructions are masked before storage and hash", async () => {
+    const f = await fixture();
+    const original = f.event(echo);
+    const event: PrpEvent = { ...original, schema: "paperclip.prp.event.v3", schemaVersion: 3,
+      eventType: "external_provider.dispatch_requested", payload: {
+        binding: { companyId, agentId, bindingId: "external", runId: f.runId, normalizedSessionId: original.normalizedSessionId,
+          turnId: original.turnId, bindingGeneration: 1, assignmentRevision: 1 },
+        text: echo, instructions: echo, acceptByUnixMs: 1, expiresAtUnixMs: 2,
+        completionContract: { revision: "1", criterionIds: ["done"] }, tools: [],
+      } };
+    await f.port.appendEvent(event);
+    const [row] = await f.stored();
+    const committed = row!.payload!.prpEvent as unknown as PrpEvent;
+    expect(committed.payload).toEqual({ ...event.payload, text: redactSensitiveText(echo), instructions: redactSensitiveText(echo) });
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
+  });
+
+  it("F2 serialized tool input decodes escaped newlines and recursively masks JSON string leaves", async () => {
+    const f = await fixture();
+    const providerKey = "sk-proj-" + "B".repeat(40), githubKey = "ghp_" + "C".repeat(36);
+    const input = JSON.stringify({ output: "line1\n" + providerKey + "\n" + githubKey,
+      nested: [{ text: "line1\n" + providerKey }, JSON.stringify({ output: "line1\n" + githubKey })],
+      unchanged: "a \\\"quote\\\" and slash / é", count: 42, enabled: true, nothing: null });
+    const expected = input.replaceAll(providerKey, "***REDACTED***").replaceAll(githubKey, "***REDACTED***");
+    const event: PrpEvent = { ...f.event(""), eventType: "semantic_tool.input", payload: { input }, debug: { input } };
+    const receipt = await f.port.appendEvent(event);
+    const [row] = await f.stored();
+    const committed = row!.payload!.prpEvent as unknown as PrpEvent;
+    expect(committed.payload.input).toBe(expected);
+    expect(committed.debug).toEqual({ input: expected });
+    expect(JSON.parse(String(committed.payload.input))).toEqual({ ...JSON.parse(input),
+      output: "line1\n***REDACTED***\n***REDACTED***",
+      nested: [{ text: "line1\n***REDACTED***" }, JSON.stringify({ output: "line1\n***REDACTED***" })] });
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
+    expect(f.port.normalizeReplayPayload(event.payload)).toEqual(committed.payload);
+    expect(await f.port.appendEvent(event)).toEqual({ ...receipt, disposition: "duplicate" });
+    expect(await f.port.appendEvent(committed)).toEqual({ ...receipt, disposition: "duplicate" });
+  });
+
+  it.each([
+    '  { "text" : "line1\\nno key", "number": 1.00, "escaped": "\\u0061" }\n',
+    ' \n[ { "text": "line1\\nno key" }, 1.00, null, true ]  ',
+    '{not JSON: line1\\nno key',
+  ])("F2 unchanged JSON-looking input remains byte-identical: %s", async input => {
+    const f = await fixture();
+    const event: PrpEvent = { ...f.event(""), eventType: "semantic_tool.input", payload: { input } };
+    await f.port.appendEvent(event);
+    const [row] = await f.stored();
+    const committed = row!.payload!.prpEvent as unknown as PrpEvent;
+    expect(committed.payload.input).toBe(input);
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
+  });
+
+  it("F2 invalid JSON starting with a brace retains the plain-text redaction path", async () => {
+    const f = await fixture();
+    const input = "{not JSON: line1\n" + keys[0];
+    await f.port.appendEvent(f.event("", 1, { input }));
+    const [row] = await f.stored();
+    expect((row!.payload!.prpEvent as unknown as PrpEvent).payload.input).toBe(redactSensitiveText(input));
+  });
+
   it("r2 agent comments echoing every provider key are stored and returned masked with run attribution and dedupe", async () => {
     const f = await fixture();
     const svc = issueService(db);
