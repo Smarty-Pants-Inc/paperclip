@@ -240,9 +240,12 @@ const support = await getEmbeddedPostgresTestSupport();
     const [probeRow] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, probe.lease.id));
     expect(probeRow!.metadata?.remoteExecutionTermination, "the probe holder's exact id binds it")
       .toMatchObject({ runId: null, leaseId: probe.lease.id, state: "destroyed" });
-    expect((termination as unknown as { hasProbeLeaseTerminationReceipt: Function }).hasProbeLeaseTerminationReceipt(probeRow!, probe.lease.id), "read by its exact id").toBe(true);
+    // The one proof reader, ownLeaseTerminated, on the probe's exact lease (H1: no second reader).
+    const probeOwner = (leaseId: string) => ({ companyId: f.companyId, environmentId: f.environment.id,
+      providerLeaseId: probeRow!.providerLeaseId, runId: null, leaseId });
+    expect(await termination.ownLeaseTerminated(db, probeOwner(probe.lease.id), { ownLeaseOnly: true }), "read by its exact id").toBe(true);
     expect(termination.hasRemoteTerminationReceipt(probeRow!), "the shared reader without the exact id refuses it").toBe(false);
-    expect((termination as unknown as { hasProbeLeaseTerminationReceipt: Function }).hasProbeLeaseTerminationReceipt(probeRow!, plain.lease.id), "another lease's id never reads it").toBe(false);
+    expect(await termination.ownLeaseTerminated(db, probeOwner(plain.lease.id), { ownLeaseOnly: true }), "another lease's id never reads it").toBe(false);
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agent.id, invocationSource: "manual", status: "running" } as never);
     const [runLease] = await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: f.environment.id, heartbeatRunId: runId,
