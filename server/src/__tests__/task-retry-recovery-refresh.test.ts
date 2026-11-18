@@ -15,6 +15,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { costRoutes } from "../routes/costs.js";
+import { agentRoutes } from "../routes/agents.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { closeProcessRunAdmission, resetProcessRunAdmissionForTests } from "../services/heartbeat/run-admission.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -74,8 +75,29 @@ describe("Task Retry recovery-card refresh", () => {
     app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId }; next(); });
     app.use("/api", issueRoutes(db, {} as never));
     app.use("/api", costRoutes(db));
+    app.use("/api", agentRoutes(db));
     app.use(errorHandler);
     return app;
+  }
+  // r2g: the two AGENT-facing texts (the wake-skip message of POST
+  // /agents/:id/wakeup and GET /issues/:id/heartbeat-context's recovery action)
+  // with the board's escalated stranded recovery (process_lost) active.
+  async function agentSurfaces(f: { companyId: string; agentId: string; issueId: string; run: { id: string } }) {
+    const { RETRY_FROM_SAVED_WORK_NEXT_ACTION } = await import("../services/recovery/stranded-notice.js");
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "stranded_assigned_issue", cause: "process_lost", ownerType: "board", fingerprint: randomUUID(),
+      status: "escalated", nextAction: RETRY_FROM_SAVED_WORK_NEXT_ACTION, evidence: { latestRunId: f.run.id } } as never);
+    const app = appForBoard();
+    const wake = await request(app).post(`/api/agents/${f.agentId}/wakeup`)
+      .send({ source: "on_demand", reason: "r2g_agent_surface", payload: { issueId: f.issueId } });
+    const context = (await request(app).get(`/api/issues/${f.issueId}/heartbeat-context`).expect(200)).body;
+    const shown = (await request(app).get(`/api/issues/${f.issueId}`).expect(200)).body;
+    const surfaces = { canRetry: shown.interruption?.canRetry ?? null, wakeStatus: wake.status, wakeReason: wake.body.reason ?? null,
+      wakeMessage: wake.body.message ?? null, contextRecovery: context.issue?.activeRecoveryAction?.nextAction ?? null,
+      screenBlocker: shown.executionBlocker?.nextAction ?? null };
+    console.info("JUDGE_AGENT_SURFACES", JSON.stringify(surfaces));
+    if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: expect.getState().currentTestName, agentSurfaces: surfaces })}\n`);
+    return surfaces;
   }
   const runRows = (issueId: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, issueId));
   const wakeRows = (agentId: string) => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
@@ -356,7 +378,7 @@ describe("Task Retry recovery-card refresh", () => {
     expect(shown.interruption).toMatchObject({ canRetry: false });
     expect(shown.executionBlocker.nextAction).not.toMatch(/\bRetry\b/);
     expect(shown.executionBlocker).toMatchObject({ canRetry: false,
-      nextAction: "It continues once a board user records that the previous attempt stopped; there is no button for this on the task yet." });
+      nextAction: "To continue now, create a new task for Judge agent; your message here is saved. This task continues once a board user records that the previous attempt stopped; there is no button for that on the task yet." });
     // r2f SD2: the recovery card (IssueRecoveryActionCard renders activeRecoveryAction.nextAction)
     // follows the same projection: no Retry sentence while presentation.canRetry is false.
     console.info("JUDGE_CARD_SHOWN", JSON.stringify(shown.activeRecoveryAction));
@@ -390,11 +412,100 @@ describe("Task Retry recovery-card refresh", () => {
     expect(cardRow.cardStatus).toBe("escalated");
     expect(cardRow.canRetry).toBe(false);
     expect(cardRow.card).not.toMatch(/\bRetry\b/);
-    expect(cardRow.card).toBe("This attempt could not be finished. It continues once a board user records that the previous attempt stopped; there is no button for this on the task yet.");
+    expect(cardRow.card).toBe("This attempt could not be finished. To continue now, create a new task for Judge agent; your message here is saved. This task continues once a board user records that the previous attempt stopped; there is no button for that on the task yet.");
     // The press the card no longer offers starts nothing (route 202, no executor marker).
     const row = await judge(f);
     expect(row).toMatchObject({ status: 202, runStarted: false });
   }, 60_000);
+
+  // r2g: the AGENT-facing texts follow the same Retry decision as the screen.
+  const legacyHold = (f: { companyId: string; issueId: string; run: { id: string } }) => db.insert(issueRecoveryActions).values({
+    companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation",
+    ownerType: "board", fingerprint: randomUUID(), status: "resolved", outcome: "blocked", nextAction: "Press Retry to continue.",
+    evidence: { runId: f.run.id, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+  for (const [label, opts] of [["process-blocker row", { legacy: true }], ["(u) legacy row", { adapterType: "paperclip_runner" }]] as const) {
+    it(`JUDGE r2g ${label}: the wake-skip message and heartbeat-context carry no Retry sentence while canRetry is false`, async () => {
+      const f = await judgeFixture(opts);
+      await legacyHold(f);
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true });
+      const s = await agentSurfaces(f);
+      expect(s.canRetry).toBe(false);
+      expect(s).toMatchObject({ wakeStatus: 202, wakeReason: "execution_reconciliation_required" });
+      expect(s.wakeMessage).not.toMatch(/\bRetry\b/);
+      // It carries the projection's own action (the same text the screen's blocker says).
+      expect(s.wakeMessage).toBe(s.screenBlocker);
+      expect(s.wakeMessage).toContain("To continue now, create a new task for Judge agent");
+      expect(s.contextRecovery).not.toMatch(/\bRetry\b/);
+      expect(s.contextRecovery).toContain("To continue now, create a new task for Judge agent");
+    }, 60_000);
+  }
+
+  it("JUDGE r2g CONTROL: an admissible state keeps the Retry text on both agent-facing surfaces", async () => {
+    // Admissible: the same hold on a conversation adapter, whose continuation gate admits Retry.
+    const f = await judgeFixture({ legacy: true });
+    await db.update(agents).set({ adapterType: "claude_local", adapterConfig: {} }).where(eq(agents.id, f.agentId));
+    await legacyHold(f);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true });
+    const s = await agentSurfaces(f);
+    expect(s.canRetry).toBe(true);
+    expect(s).toMatchObject({ wakeStatus: 202, wakeReason: "execution_reconciliation_required" });
+    expect(s.wakeMessage).toMatch(/\bRetry\b/);
+    expect(s.contextRecovery).toMatch(/\bRetry\b/);
+  }, 60_000);
+
+  // r2g SD3 probe: the person creates a NEW task for the SAME agent through the
+  // real create route (as the board does) and asks the same thing. Does that
+  // task's run start (startedAt + the executor's marker), admitted by dispatch?
+  async function newTaskForSameAgent(f: Awaited<ReturnType<typeof judgeFixture>>) {
+    resetProcessRunAdmissionForTests();
+    let created: Awaited<ReturnType<ReturnType<typeof request>["post"]>>;
+    let runs: { id: string; issueId: string | null; status: string; startedAt: Date | null; error: string | null; errorCode: string | null }[] = [];
+    try {
+      created = await request(appForBoard()).post(`/api/companies/${f.companyId}/issues`)
+        .send({ title: "Same question, new task", description: "Please continue the stranded work.", assigneeAgentId: f.agentId, status: "todo" });
+      const newRuns = () => db.select({ id: heartbeatRuns.id, issueId: heartbeatRuns.issueId, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt,
+        error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, f.agentId), ne(heartbeatRuns.id, f.run.id)));
+      for (let i = 0; i < 80; i++) {
+        runs = await newRuns();
+        if (runs.length && !runs.some(run => ["queued", "running"].includes(run.status))) break;
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      runs = await newRuns();
+    } finally {
+      await heartbeatService(db).drainActiveRunExecutions();
+      closeProcessRunAdmission();
+    }
+    const executed = runs.filter(run => run.startedAt && existsSync(path.join(markerDir, run.id))
+      && readFileSync(path.join(markerDir, run.id), "utf8") === run.id);
+    const wakes = (await wakeRows(f.agentId)).filter(row => (row.payload as Record<string, unknown> | null)?.issueId === created.body.id
+      || row.reason === "issue_assigned");
+    const probe = { createStatus: created.status, newIssueId: created.body.id ?? null, runs: runs.length, runIssue: runs.map(run => run.issueId),
+      runStatus: runs.map(run => run.status), runStartedAt: runs.map(run => run.startedAt?.toISOString() ?? null),
+      runError: runs.map(run => `${run.errorCode ?? ""}:${run.error ?? ""}`.slice(0, 300)), executorMarker: executed.map(run => run.id),
+      runStarted: executed.length > 0, wakeStatus: wakes.map(row => `${row.reason}:${row.status}`) };
+    console.info("JUDGE_SD3_NEW_TASK", JSON.stringify(probe));
+    if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: expect.getState().currentTestName, sd3NewTask: probe })}\n`);
+    return probe;
+  }
+  for (const [label, opts] of [["process-blocker row", { legacy: true }], ["(u) legacy row", { adapterType: "paperclip_runner" }]] as const) {
+    it(`JUDGE r2g SD3 ${label}: a new task for the same agent, created on the real route`, async () => {
+      const f = await judgeFixture(opts);
+      await legacyHold(f);
+      expect((await agentSurfaces(f)).canRetry).toBe(false);
+      const probe = await newTaskForSameAgent(f);
+      expect(probe).toMatchObject({ createStatus: 201 });
+      // Dispatch admits the new task's run: it is claimed and started (startedAt),
+      // not held by the old task's unverified source.
+      expect(probe.runIssue).toContain(probe.newIssueId);
+      expect(probe.runStartedAt.filter(Boolean).length).toBeGreaterThan(0);
+      expect(probe.runError.join(" ")).not.toMatch(/previous_execution_unverified|execution_reconciliation/);
+      // The process executor really runs it (its own marker). The paperclip_runner
+      // executor has no local runtime API listener in this test server, so only
+      // dispatch's admission (claimed + startedAt) is observable for the (u) row.
+      if (opts.adapterType !== "paperclip_runner") expect(probe.runStarted).toBe(true);
+    }, 60_000);
+  }
 
   // r2d ST5: the agent is busy (its one concurrency slot is occupied by a
   // running run on another task). Record what Retry does at press time.

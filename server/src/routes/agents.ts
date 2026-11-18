@@ -56,6 +56,8 @@ import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent
 import { isAiConnectionCompatible } from "@paperclipai/shared";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { executionBlockerFollowingPresentation } from "../services/recovery/stranded-retry-admission.js";
+import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import { canRetryStoppedRun } from "../services/cancelled-native-startup.js";
 import { rejectedModelRetryRefusal } from "../services/native-runtime/model-rejected-retry.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "../services/native-runtime/native-review-participant.js";
@@ -1782,13 +1784,21 @@ export function agentRoutes(
     const issue = await db
       .select({
         id: issuesTable.id,
+        companyId: issuesTable.companyId,
+        status: issuesTable.status,
+        assigneeAgentId: issuesTable.assigneeAgentId,
+        projectId: issuesTable.projectId,
         executionRunId: issuesTable.executionRunId,
       })
       .from(issuesTable)
       .where(and(eq(issuesTable.id, issueId), eq(issuesTable.companyId, agent.companyId)))
       .then((rows) => rows[0] ?? null);
 
-    const blocker = issue ? await getExecutionBlocker(db, agent.companyId, issueId) : null;
+    // r2g: the agent's wake-skip message follows the screen's one Retry decision
+    // (taskInterruptionPresentation.canRetry), like GET /issues/:id executionBlocker.
+    const rawBlocker = issue ? await getExecutionBlocker(db, agent.companyId, issueId) : null;
+    const blocker = issue && rawBlocker ? await executionBlockerFollowingPresentation(db, issue, rawBlocker,
+      await taskInterruptionPresentation(db, issue)) : null;
     if (blocker) return {
       status: "skipped" as const, reason: "execution_reconciliation_required",
       message: blocker.nextAction, issueId,

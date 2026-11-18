@@ -106,7 +106,7 @@ export function strandedRetryAdmissionFromPresentation(presentation: Presentatio
   // Confirm it stopped is named only under the screen's own condition for its button
   // (ExecutionBlockerNotice.tsx: userAction === "confirm_run_stopped").
   if (presentation?.userAction === "confirm_run_stopped") return { admits: false, refusal: "confirm_run_stopped" };
-  if (presentation?.retryWait?.reason === "previous_execution_unverified") return { admits: false, refusal: "previous_execution_unverified" };
+  if (presentation?.retryWait?.reason === "previous_execution_unverified") return { admits: false, refusal: "previous_execution_unverified", agentName };
   if (presentation?.retryWait?.reason === "workspace_repair_required") return { admits: false, refusal: "workspace_repair_required" };
   if (presentation?.userAction === "budget" || presentation?.retryWait?.reason === "budget.blocked")
     return { admits: false, refusal: "budget_blocked" };

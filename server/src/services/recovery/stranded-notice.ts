@@ -47,7 +47,7 @@ export type StrandedRetryAdmission =
   | { admits: false; refusal: "agent_paused"; agentName?: string | null }
   | { admits: false; refusal: "workspace_repair_required" }
   | { admits: false; refusal: "confirm_run_stopped" }
-  | { admits: false; refusal: "previous_execution_unverified" }
+  | { admits: false; refusal: "previous_execution_unverified"; agentName?: string | null }
   | { admits: false; refusal: "system_waiting"; waitMessage: string }
   | { admits: false; refusal: "saved_work_recovering" }
   | { admits: false; refusal: "budget_blocked" }
@@ -110,11 +110,16 @@ export function strandedRetryRefusalCopy(retry: Exclude<StrandedRetryAdmission, 
     // confirm route refuses it (409 run_not_finished). Dispatch lifts it only
     // when the previous attempt is reconciled, its workspace repair is verified,
     // or a fresh workspace is chosen (explicit-native-continuation.ts legacy gate).
-    case "previous_execution_unverified":
+    // r2g SD3: the hold belongs to this task's previous attempt only; a new task
+    // created for the same agent (POST /companies/:companyId/issues) is admitted
+    // by dispatch and its run starts (task-retry-recovery-refresh "r2g SD3").
+    case "previous_execution_unverified": {
+      const name = retry.agentName?.trim() || "this agent";
       return {
         body: "This attempt could not be finished automatically. Paperclip could not confirm that the previous attempt stopped, so Retry could not continue from it. Your message is saved.",
-        nextAction: "It continues once a board user records that the previous attempt stopped; there is no button for this on the task yet.",
+        nextAction: `To continue now, create a new task for ${name}; your message here is saved. This task continues once a board user records that the previous attempt stopped; there is no button for that on the task yet.`,
       };
+    }
     // A system-owned wait the screen names itself (retryWait.message, no button).
     case "system_waiting":
       return {
