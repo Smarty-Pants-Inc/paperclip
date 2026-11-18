@@ -24,7 +24,7 @@ import { canonicalExecutionUuid } from "./execution-identity.js";
 import { chatActionDeadline } from "./chat-action-work.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { isAcknowledgedLegacyUserStop, isQueuedDependencyWait, runStopPresentationJson } from "./run-cancellation.js";
-import { heldRetryOffersRetry } from "./task-retry-eligibility.js";
+import { heldRetryOffersRetry, taskRetryStateRefusal } from "./task-retry-eligibility.js";
 import { exhaustedNativeFinalizationCondition, savedResultRetryPendingCondition } from "./native-runtime/exhausted-finalization-retry.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON } from "../modules/run-dispatch/index.js";
@@ -291,7 +291,12 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   const base: TaskInterruptionPresentation = { intentId: wait?.id ?? null, responsibility: "system",
     state: "resolved", nextRetryAt: null, canRetry: false, userAction: null,
     sourceRunIds: [run.id], observedRunId: run.id };
-  if (["done", "cancelled"].includes(issue.status)) return base;
+  const stateRefusal = taskRetryStateRefusal(issue, run.agentId);
+  if (stateRefusal) return { ...base, responsibility: "user",
+    state: ["done", "cancelled"].includes(issue.status) ? "resolved" : "waiting_for_user",
+    userAction: ["task_reassigned", "task_unassigned"].includes(stateRefusal.reason) ? "assign_agent" : null,
+    notice: { code: stateRefusal.reason, text: stateRefusal.message },
+    retryWait: stateRefusal };
   // Retry took effect: the saved result is being applied again.
   if (run.status === "succeeded" && run.nativeFinalizationRetryPending)
     return { ...base, state: "working", recoveryStep: "finishing_recovery" };

@@ -29,6 +29,7 @@ import { rearmExhaustedNativeFinalization } from "./native-runtime/exhausted-fin
 import { NativeChatReviewPresentationContentionError } from "./native-runtime/native-chat-review-presentation.js";
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
 import { selectTaskRetryInput } from "./chat-channels/task-retry-input.js";
+import { taskRetryStateRefusal } from "./task-retry-eligibility.js";
 
 export async function taskRetryMutationAllowed(db: Db, input: {
   companyId: string; issueId: string; actorId: string; actorSource: TaskRetryIntent["actorSource"];
@@ -297,6 +298,15 @@ function admitTaskRetry(input: TaskRetryRequest) {
       eq(issues.id, input.issueId))).for("update");
     if (!issue) throw notFound("Task not found");
     await assertTaskRetryConversationAllowed(db, issue, input.actorId);
+    const [latest] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
+      or(eq(heartbeatRuns.issueId, issue.id), eq(heartbeatRuns.nativeIssueId, issue.id),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`)))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+    const refused = taskRetryStateRefusal(issue, latest?.agentId);
+    // Before idempotency or any mutation: a former accepted press cannot
+    // queue/cancel work after the task moved to Backlog, closed or changed owner.
+    if (refused) return { requestId: null, accepted: false, stale: true,
+      observedRunId: latest?.id ?? null, chatActionId: undefined, refused };
     const key = `task-retry:${input.idempotencyKey}`;
     const [sameRequest] = await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
@@ -312,11 +322,7 @@ function admitTaskRetry(input: TaskRetryRequest) {
         observedRunId: intent?.sourceRunId ?? null, chatActionId: intent?.chatActionId,
         ...(coalescedRun?.status === "scheduled_retry" ? { scheduledRetryRunId: coalescedRun.id } : {}) };
     }
-    const [latest] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
-      or(eq(heartbeatRuns.issueId, issue.id), eq(heartbeatRuns.nativeIssueId, issue.id),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`)))
-      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-    if (["done", "cancelled"].includes(issue.status) || !issue.assigneeAgentId || !latest ||
+    if (!issue.assigneeAgentId || !latest ||
         latest.agentId !== issue.assigneeAgentId || input.observedRunId !== latest.id) {
       return { requestId: null, accepted: false, stale: true, observedRunId: latest?.id ?? null, chatActionId: undefined };
     }
@@ -749,6 +755,11 @@ export async function startPersonQueuedRunFresh(db: Db, heartbeat: {
   const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "queued")));
   if (!run) return null;
+  // Repeat the current-task gate at the cancellation boundary, including runs
+  // carrying comments; a state change after admission must not replace old work.
+  const [task] = await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId }).from(issues)
+    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  if (!task || taskRetryStateRefusal(task, run.agentId)) return null;
   const context = (run.contextSnapshot ?? {}) as Record<string, unknown>;
   const carried = [...new Set([...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
     context.wakeCommentId, context.commentId].filter((id): id is string => typeof id === "string" && id.length > 0))];
@@ -757,9 +768,6 @@ export async function startPersonQueuedRunFresh(db: Db, heartbeat: {
     eq(issueComments.issueId, input.issueId), inArray(issueComments.id, carried), isNull(issueComments.deletedAt),
     isNull(issueComments.authorAgentId), sql`${issueComments.authorUserId} is not null`)).orderBy(issueComments.createdAt) : [];
   if (!messages.length) {
-    const [task] = await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId }).from(issues)
-      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
-    if (!task || task.assigneeAgentId !== run.agentId || ["done", "cancelled", "backlog"].includes(task.status)) return null;
     const cancelled = await heartbeat.cancelStuckQueuedRunForRetry(run.id);
     if (!cancelled) return null;
     await heartbeat.wakeup(run.agentId, {

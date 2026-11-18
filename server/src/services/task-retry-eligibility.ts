@@ -1,6 +1,23 @@
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, type Db } from "@paperclipai/db";
 
+/** The task's current lifecycle and owner are authoritative, even for an
+ * idempotent repeat of a previously accepted Retry. No new run state is needed. */
+export function taskRetryStateRefusal(issue: { status: string; assigneeAgentId: string | null },
+  runAgentId?: string | null): { reason: string; message: string } | null {
+  if (issue.status === "backlog") return { reason: "task_backlog",
+    message: "This task is in Backlog. Move it to To do to run it." };
+  if (issue.status === "done") return { reason: "task_closed",
+    message: "This task is Done. Move it to To do to run it." };
+  if (issue.status === "cancelled") return { reason: "task_closed",
+    message: "This task is Cancelled. Move it to To do to run it." };
+  if (!issue.assigneeAgentId) return { reason: "task_unassigned",
+    message: "This task has no assigned agent. Assign an agent to run it." };
+  if (runAgentId && issue.assigneeAgentId !== runAgentId) return { reason: "task_reassigned",
+    message: "This task is assigned to another agent. Reassign it to the previous agent to retry this attempt." };
+  return null;
+}
+
 const REFUSALS_A_CLICK_CANNOT_CHANGE: ReadonlySet<string> = new Set([
   "cancelled_by_operator", "retry_source_changed", "workspace_owner_stop_required", "previous_execution_unverified",
 ]);
