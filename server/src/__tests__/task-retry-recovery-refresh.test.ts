@@ -213,6 +213,23 @@ describe("Task Retry recovery-card refresh", () => {
     }
   });
 
+  // G1: GET /issues/:id as the board sees it; the card's text vs the notice's one decision.
+  async function g1Card(f: { companyId: string; issueId: string; app: ReturnType<typeof appForBoard>; failed: { id: string } }, when: string) {
+    const { decideStrandedRetryAdmission } = await import("../services/recovery/stranded-retry-admission.js");
+    const { strandedRetryRefusalCopy } = await import("../services/recovery/stranded-notice.js");
+    const shown = (await request(f.app).get(`/api/issues/${f.issueId}`).expect(200)).body;
+    const retry = await decideStrandedRetryAdmission(db, { companyId: f.companyId, issueId: f.issueId, runId: f.failed.id });
+    const card = { when, blocker: shown.executionBlocker?.nextAction ?? null, canRetry: shown.interruption?.canRetry ?? null,
+      decidedRefusal: retry.admits ? null : retry.refusal, decided: retry.admits ? "" : strandedRetryRefusalCopy(retry).nextAction,
+      nextAction: shown.activeRecoveryAction?.nextAction ?? null, wakePolicy: shown.activeRecoveryAction?.wakePolicy ?? null };
+    console.info("JUDGE_G1_CARD", JSON.stringify(card));
+    if (process.env.G1_GET_FILE) appendFileSync(process.env.G1_GET_FILE, `${JSON.stringify({ when, activeRecoveryAction: shown.activeRecoveryAction, executionBlocker: shown.executionBlocker, interruption: shown.interruption })}\n`);
+    expect(card.canRetry).toBe(false);
+    expect(card.nextAction).not.toContain("Nothing restarts");
+    expect(card.wakePolicy).toMatchObject({ type: "system_recovery" });
+    return card;
+  }
+
   // Judge row (rf-5 r2b, workspace recovery): the stranded notice asks the
   // screen's Retry decision; compare it with the real route + dispatch.
   it("JUDGE workspace recovery (system already recovering): the notice offers no Retry, and the real Retry starts no run", async () => {
@@ -220,6 +237,12 @@ describe("Task Retry recovery-card refresh", () => {
     const { decideStrandedRetryAdmission } = await import("../services/recovery/stranded-retry-admission.js");
     const { buildStrandedRecoveryEscalationNotice } = await import("../services/recovery/stranded-notice.js");
     console.info("JUDGE_PRE workspace", JSON.stringify(await getExecutionBlocker(db, f.companyId, f.issueId)));
+    // G1 (rf-5 2g §2): before any press the projection has canRetry=false and no
+    // retryWait; the recovery card from the SAME GET as the blocker must say what the
+    // notice says (Paperclip is recovering the saved work), not "Nothing restarts".
+    const before = await g1Card(f, "before-press");
+    expect(before.decidedRefusal).toBe("saved_work_recovering");
+    expect(before.nextAction).toContain("Nothing is needed from you while Paperclip recovers the saved work");
     const retry = await decideStrandedRetryAdmission(db, { companyId: f.companyId, issueId: f.issueId, runId: f.failed.id });
     const notice = buildStrandedRecoveryEscalationNotice({ retry, recoveryActionId: f.board.id, recoveryOwner: null,
       sourceRun: { id: f.failed.id, status: f.failed.status } });
@@ -245,6 +268,9 @@ describe("Task Retry recovery-card refresh", () => {
     expect(JSON.stringify(notice)).not.toContain("Recover saved files");
     expect(notice.body).toContain("Your message is saved.");
     expect(JSON.stringify(notice)).not.toContain("Nothing restarts it by itself");
+    // G1 (rf-5 2g §2), after the press: the card follows the same decision as the notice.
+    const after = await g1Card(f, "after-press");
+    expect(after.nextAction).toContain(after.decided);
   });
 
   // Judge rows (rf-5 bar): the stranded notice says "Press Retry" IFF the

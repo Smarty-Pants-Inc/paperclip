@@ -20,8 +20,21 @@ export async function decideStrandedRetryAdmission(db: Db, input: {
     assigneeAgentId: issues.assigneeAgentId, projectId: issues.projectId }).from(issues)
     .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).limit(1);
   const presentation = issue ? await taskInterruptionPresentation(db, issue) : null;
-  const admission = strandedRetryAdmissionFromPresentation(presentation, issue ? await assigneeOf(db, issue) : null);
-  if (admission.admits || !issue) return admission;
+  if (!issue) return strandedRetryAdmissionFromPresentation(presentation, null);
+  return admissionFollowingPresentation(db, issue, presentation);
+}
+
+/**
+ * The one mapping from the screen's decision to the refusal the notice, the
+ * execution blocker and the recovery card all say (stranded2g G1: the card used
+ * the bare presentation mapping and missed the system-held saved-work recovery,
+ * so it said "Nothing restarts it by itself" while the blocker and the notice
+ * said Paperclip was recovering the saved work).
+ */
+async function admissionFollowingPresentation(db: Db, issue: { id: string; companyId: string; assigneeAgentId: string | null },
+  presentation: Presentation): Promise<StrandedRetryAdmission> {
+  const admission = strandedRetryAdmissionFromPresentation(presentation, await assigneeOf(db, issue));
+  if (admission.admits) return admission;
   // r2f SD5: while Paperclip itself holds the saved-work recovery (the task
   // screen's execution blocker shows "Recovering saved work…",
   // workspaceRecoveryDisplay; or the hold's RECOVERING_SAVED_WORK_NEXT_ACTION),
@@ -35,6 +48,11 @@ export async function decideStrandedRetryAdmission(db: Db, input: {
     || blocker?.nextAction === RECOVERING_SAVED_WORK_NEXT_ACTION)
     return { admits: false, refusal: "saved_work_recovering" };
   return admission;
+}
+
+/** A refusal whose wait Paperclip itself owns: nothing is needed from the person. */
+function systemHolds(admission: StrandedRetryAdmission): boolean {
+  return !admission.admits && (admission.refusal === "saved_work_recovering" || admission.refusal === "system_waiting");
 }
 
 type Assignee = { name: string | null; maxDailyRuns: number | null; maxDailyCostCents: number | null };
@@ -61,10 +79,11 @@ type Presentation = Awaited<ReturnType<typeof taskInterruptionPresentation>>;
  * is said instead. No predicate is repeated: `presentation.canRetry` decides.
  */
 export async function executionBlockerFollowingPresentation<B extends { nextAction: string; canRetry?: boolean }>(
-  db: Db, issue: { companyId: string; assigneeAgentId: string | null }, blocker: B | null, presentation: Presentation,
+  db: Db, issue: { id: string; companyId: string; assigneeAgentId: string | null }, blocker: B | null, presentation: Presentation,
 ): Promise<B | null> {
   if (!blocker?.canRetry || !presentation || presentation.canRetry) return blocker;
-  const nextAction = await textFollowingPresentation(db, issue, blocker.nextAction, presentation, true);
+  const nextAction = textFollowingAdmission(blocker.nextAction,
+    await admissionFollowingPresentation(db, issue, presentation), true);
   return nextAction === null ? blocker : { ...blocker, canRetry: false, nextAction };
 }
 
@@ -74,12 +93,18 @@ export async function executionBlockerFollowingPresentation<B extends { nextActi
  * IssueRecoveryActionCard renders (IssueRecoveryActionCard.tsx, "Next action").
  * The card says "Retry" only where `presentation.canRetry` offers it.
  */
-export async function recoveryActionFollowingPresentation<A extends { nextAction?: string | null }>(
-  db: Db, issue: { companyId: string; assigneeAgentId: string | null }, action: A | null, presentation: Presentation,
+export async function recoveryActionFollowingPresentation<A extends { nextAction?: string | null; wakePolicy?: Record<string, unknown> | null }>(
+  db: Db, issue: { id: string; companyId: string; assigneeAgentId: string | null }, action: A | null, presentation: Presentation,
 ): Promise<A | null> {
   if (!action?.nextAction || !presentation || presentation.canRetry) return action;
-  const nextAction = await textFollowingPresentation(db, issue, action.nextAction, presentation, false);
-  return nextAction === null ? action : { ...action, nextAction };
+  const admission = await admissionFollowingPresentation(db, issue, presentation);
+  const nextAction = textFollowingAdmission(action.nextAction, admission, false);
+  // G1: while Paperclip itself holds the task, the card's wake line says the
+  // system continues it, not the board escalation's "Waiting for you".
+  const wakePolicy = systemHolds(admission) && action.wakePolicy?.type === "board_escalation"
+    ? { ...action.wakePolicy, type: "system_recovery" } : action.wakePolicy;
+  return nextAction === null && wakePolicy === action.wakePolicy ? action
+    : { ...action, nextAction: nextAction ?? action.nextAction, wakePolicy };
 }
 
 /**
@@ -87,11 +112,9 @@ export async function recoveryActionFollowingPresentation<A extends { nextAction
  * dropped and the projection's own next action (the stranded notice's refusal
  * copy) is said instead. `presentation.canRetry` is the only rule.
  */
-async function textFollowingPresentation(db: Db, issue: { companyId: string; assigneeAgentId: string | null },
-  text: string, presentation: NonNullable<Presentation>, blockerSaysRetry: boolean): Promise<string | null> {
+function textFollowingAdmission(text: string, admission: StrandedRetryAdmission, blockerSaysRetry: boolean): string | null {
   // null: unchanged. The blocker's canRetry=true is itself a Retry offer.
-  if (presentation.canRetry || !blockerSaysRetry && !/\bretry\b/i.test(text)) return null;
-  const admission = strandedRetryAdmissionFromPresentation(presentation, await assigneeOf(db, issue));
+  if (!blockerSaysRetry && !/\bretry\b/i.test(text)) return null;
   if (admission.admits) return null;
   const kept = (text.match(/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g) ?? [])
     .map(sentence => sentence.trim()).filter(sentence => sentence && !/\bretry\b/i.test(sentence));

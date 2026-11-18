@@ -787,6 +787,8 @@ function readWakePolicySummary(action: IssueRecoveryAction): string | null {
   }
   if (type === "bounded_recovery_owner") return "An agent is choosing the next step";
   if (type === "board_escalation") return "Waiting for you";
+  // The server marks a board escalation Paperclip itself now holds (saved-work recovery, a system wait).
+  if (type === "system_recovery") return "Paperclip continues it by itself";
   if (type === "manual") return "Manual follow-up needed";
   if (type === "manual_repair_required") return "Needs a fix before Retry";
   if (type === "monitor") {

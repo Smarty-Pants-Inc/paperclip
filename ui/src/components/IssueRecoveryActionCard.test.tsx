@@ -1191,6 +1191,20 @@ describe("IssueRecoveryActionCard owner-sticky retry lineage", () => {
   });
 });
 
+// G1 (rf-5 2g §2): the activeRecoveryAction of the real GET /issues/:id captured by
+// task-retry-recovery-refresh.test.ts "JUDGE workspace recovery" (before any press; same GET
+// whose blocker says "Recovering your saved work; your message is kept and runs when it's back.").
+const G1_SYSTEM_HELD_GET_ACTION = {"id": "aed9b2c7-91e4-47df-b8b6-3948aa326721", "companyId": "43e83f3c-76a7-4ef5-9c83-b25ed2ed4110", "sourceIssueId": "2d97cc04-a20f-4d69-b450-091cb15d77f8", "recoveryIssueId": null, "kind": "stranded_assigned_issue", "status": "active", "ownerType": "board", "ownerAgentId": null, "ownerUserId": null, "previousOwnerAgentId": "5623a452-ee07-481b-abd1-85cd14e95d67", "returnOwnerAgentId": "5623a452-ee07-481b-abd1-85cd14e95d67", "cause": "stranded_assigned_issue", "fingerprint": "source_scoped_recovery:43e83f3c-76a7-4ef5-9c83-b25ed2ed4110:2d97cc04-a20f-4d69-b450-091cb15d77f8:stranded_assigned_issue", "evidence": {"latestRunId": "6e700960-5c04-4e7f-9f26-2e6edea9cb06", "retryReason": null, "sourceRunId": null, "recoveryCause": "stranded_assigned_issue", "routingPolicy": "board_escalation_no_takeover_v1", "sourceIssueId": "2d97cc04-a20f-4d69-b450-091cb15d77f8", "failureSummary": "The failure details are kept with the run.", "handoffAttempt": null, "previousStatus": "in_progress", "correctiveRunId": null, "latestRunStatus": "failed", "sourceIdentifier": "RR43E83F-1", "latestIssueStatus": "in_progress", "latestRunErrorCode": "adapter_failed", "maxHandoffAttempts": null, "missingDisposition": null}, "nextAction": "This attempt could not be finished. Nothing is needed from you while Paperclip recovers the saved work; Retry is offered on the task once it finishes.", "wakePolicy": {"type": "system_recovery", "reason": "stranded_assigned_issue", "preservesSourceAssignee": true}, "monitorPolicy": null, "attemptCount": 1, "maxAttempts": null, "timeoutAt": null, "lastAttemptAt": "2026-11-18T14:18:05.333Z", "outcome": null, "resolutionNote": null, "resolvedAt": null, "createdAt": "2026-11-18T14:18:05.329Z", "updatedAt": "2026-11-18T14:18:05.329Z"} as unknown as IssueRecoveryAction;
+
+it("G1: a system-held saved-work recovery card says Paperclip continues it, not 'Nothing restarts' or 'Waiting for you'", () => {
+  const node = render(<IssueRecoveryActionCard action={G1_SYSTEM_HELD_GET_ACTION} agentMap={new Map([[ownerAgent.id, ownerAgent]])} onResolve={() => {}} />);
+  const text = node.textContent ?? "";
+  expect(text).toContain("Nothing is needed from you while Paperclip recovers the saved work");
+  expect(text).toContain("Paperclip continues it by itself");
+  expect(text).not.toContain("Nothing restarts");
+  expect(text).not.toContain("Waiting for you");
+});
+
 it.each(["active", "escalated", "resolved"] as const)("does not show a historical unsafe-export repair card: %s", status => {
   const node = render(<IssueRecoveryActionCard action={buildAction({ status, kind: "active_run_watchdog",
     cause: "native_workspace_sync_out_unsafe_archive", ownerType: "board", nextAction: "Repair the unsafe link manually" })} onResolve={() => {}} />);
