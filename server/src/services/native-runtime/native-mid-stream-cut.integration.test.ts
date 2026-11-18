@@ -82,12 +82,13 @@ describe("native mid-stream cut: one successor, through recovery", () => {
   }
 
   /** The runner events of one cut turn, as the Pi driver emits them (pi-rpc-driver.ts :1705-1710). */
-  function cutEvents(shape: CutShape, base: Omit<PrpEvent, "sourceEventId" | "sourceSeq" | "eventType" | "payload">): PrpEvent[] {
+  function cutEvents(shape: CutShape | Record<string, unknown>, base: Omit<PrpEvent, "sourceEventId" | "sourceSeq" | "eventType" | "payload">): PrpEvent[] {
     const item = (seq: number, kind: "reasoning" | "agentMessage", text: string): PrpEvent => ({ ...base, sourceEventId: `item-${seq}`,
       sourceSeq: seq, eventType: "item.delta", itemId: `${base.turnId}:${kind === "reasoning" ? "pi-thinking" : "pi-message"}:1`,
       payload: { kind, text } } as PrpEvent);
     const failed = (seq: number, error: Record<string, unknown>): PrpEvent => ({ ...base, sourceEventId: "turn-terminal", sourceSeq: seq,
       eventType: "turn.failed", payload: { status: "failed", error } } as PrpEvent);
+    if (typeof shape !== "string") return [failed(1, shape)];
     if (shape === "cap_no_text") return [item(1, "reasoning", "thinking only ".repeat(400)),
       failed(2, { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false })];
     if (shape === "eof_mid_thinking") return [item(1, "reasoning", "considering the tables ".repeat(50)),
@@ -103,7 +104,7 @@ describe("native mid-stream cut: one successor, through recovery", () => {
   }
 
   /** One cut turn through the real executor and finalizer. `existingRunId` is an already-materialized successor. */
-  async function cutTurn(issueId: string, shape: CutShape, existingRunId?: string) {
+  async function cutTurn(issueId: string, shape: CutShape | Record<string, unknown>, existingRunId?: string) {
     const runId = existingRunId ?? randomUUID();
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     const [message] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "user")));
@@ -340,6 +341,42 @@ describe("native mid-stream cut: one successor, through recovery", () => {
       await heartbeat.drainActiveRunExecutions();
     }, 180_000,
   );
+
+  it.each([
+    { name: "typed insufficient_quota", account: true,
+      detail: { providerCode: "insufficient_quota", message: "429 You exceeded your current quota, please check your plan and billing details" } },
+    { name: "typed rate_limit_exceeded", account: false,
+      detail: { providerCode: "rate_limit_exceeded", message: "429 Rate limit reached; try again later" } },
+    { name: "untyped quota text", account: false,
+      detail: { message: "429 You exceeded your current quota, please check your plan and billing details" } },
+    { name: "RESOURCE_EXHAUSTED category without typed quota code", account: false,
+      detail: { message: "429 RESOURCE_EXHAUSTED",
+        providerFailure: { schema: "paperclip.provider-failure.v1", provider: "pi", phase: "turn", category: "quota_exhausted",
+          httpStatus: 429, message: "429 RESOURCE_EXHAUSTED", retryability: "requires_action" } } },
+  ])("429 real path: $name", async ({ detail, account }) => {
+    const error = { code: "pi_provider_error", httpStatus: 429, ...detail };
+    const issueId = await task();
+    const first = await cutTurn(issueId, error);
+    const after = await dispatchEverything(issueId, first.runId);
+    const cutSuccessors = after.successors.filter(run => run.scheduledRetryReason === "native_mid_stream_cut");
+    if (account) {
+      expect(cutSuccessors).toEqual([]);
+      expect(isNativeProviderAccountFailure(error)).toBe(true);
+      expect(first.effects.filter(effect => effect.effectKind === "schedule_retry"
+        && effect.payload?.cause === "native_mid_stream_cut")).toEqual([]);
+      await assertOnePublishedNoteAfterSweep(issueId, first.runId, detail.message);
+      expect((await successorsOf(issueId, first.runId)).filter(run => run.scheduledRetryReason === "native_mid_stream_cut")).toEqual([]);
+    } else {
+      expect(isNativeProviderAccountFailure(error)).toBe(false);
+      expect(cutSuccessors).toHaveLength(1);
+      expect(first.effects).toEqual(expect.arrayContaining([
+        expect.objectContaining({ effectKind: "schedule_retry", payload: expect.objectContaining({ cause: "native_mid_stream_cut" }) }),
+      ]));
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(comment => comment.authorType !== "user" && !comment.deletedAt)).toEqual([]);
+    }
+    await after.heartbeat.drainActiveRunExecutions();
+  }, 180_000);
 
   // A small pure classifier guard is needed: a generic provider-error note alone
   // could hide an account rejection incorrectly admitted to the automatic cut lane.
