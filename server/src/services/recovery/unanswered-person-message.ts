@@ -18,7 +18,8 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
-import { heldConversationRemedy } from "../held-conversation-remedy.js";
+import { heldConversationRemedy, newMessageWouldRun } from "../held-conversation-remedy.js";
+import { HELD_PREDECESSOR_NEW_TASK_ACTION } from "../native-runtime/held-predecessor-notice-text.js";
 import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
@@ -98,6 +99,11 @@ export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
+// The same notices where a new message would not run (newMessageWouldRun):
+// never "safe", never "send it again"; the remedy is the new task.
+export const UNANSWERED_MESSAGE_NEW_TASK_TEXT = `Your message wasn't answered. ${HELD_PREDECESSOR_NEW_TASK_ACTION}`;
+export const UNANSWERED_MESSAGE_NO_RUN_NEW_TASK_TEXT = `Your message is saved, but no run started for it. ${HELD_PREDECESSOR_NEW_TASK_ACTION}`;
+export const UNANSWERED_MESSAGE_NO_REPLY_NEW_TASK_TEXT = `This run finished without a reply to your message. ${HELD_PREDECESSOR_NEW_TASK_ACTION}`;
 /** The ONE bound (follow-Paperclip B-2, RFL 05:51Z): the fork's K=2 fresh-continuation chain cap. */
 export const FRESH_CONTINUATION_BOUND = 2;
 export const UNANSWERED_MESSAGE_BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, "
@@ -780,15 +786,20 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const boundReached = Boolean(!paused && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
     && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
       >= FRESH_CONTINUATION_BOUND);
+  // "Sending it again is safe" only where a new message would run: the ONE
+  // helper asks the admission that decides it (native: the pure-read
+  // explicit continuation; legacy: dispatch's execution blocker).
+  const sendAgainForm = !policyRefused && !settingUp && !paused && !waiting && !supervisionUnconfirmed && !boundReached && !heldRemedy;
+  const sendAgainRuns = !sendAgainForm || await newMessageWouldRun(q, { companyId: issue.companyId, issueId: issue.id });
   // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
-    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
-    : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
-      : heldRemedy ? heldRemedy.body : UNANSWERED_MESSAGE_TEXT;
+    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? sendAgainRuns ? UNANSWERED_MESSAGE_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_NEW_TASK_TEXT
+    : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? sendAgainRuns ? UNANSWERED_MESSAGE_NO_RUN_TEXT : UNANSWERED_MESSAGE_NO_RUN_NEW_TASK_TEXT
+      : heldRemedy ? heldRemedy.body : sendAgainRuns ? UNANSWERED_MESSAGE_TEXT : UNANSWERED_MESSAGE_NEW_TASK_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
@@ -800,6 +811,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : boundReached ? "Send a new message to try again." : heldRemedy ? heldRemedy.nextAction
+        : !sendAgainRuns ? HELD_PREDECESSOR_NEW_TASK_ACTION
         : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,

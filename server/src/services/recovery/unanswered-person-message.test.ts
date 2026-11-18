@@ -34,8 +34,11 @@ import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTE
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
+import { getExecutionBlocker } from "../execution-blocker.js";
+import { heldConversationRemedy } from "../held-conversation-remedy.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
+  UNANSWERED_MESSAGE_NEW_TASK_TEXT as NOT_ANSWERED_NEW_TASK, UNANSWERED_MESSAGE_NO_RUN_NEW_TASK_TEXT as NO_RUN_NEW_TASK,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
 
@@ -57,6 +60,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   }, 60_000);
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
+  // RF2 (RFL 14:57Z): where dispatch defers a new message (its execution blocker stands and the explicit
+  // continuation admission refuses, queue.ts:4205-4218), the notice never says "Sending it again is safe".
+  const dispatchDefersNewMessage = async (f: { companyId: string; issueId: string }) => {
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId), "dispatch's execution blocker").not.toBeNull();
+    expect((await heldConversationRemedy(db, f)).newMessageAdmitted, "the admission refuses a new message").toBe(false);
+  };
   async function fixture(input: { status?: string; chat?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = `user-${randomUUID()}`;
     await db.insert(companies).values({ id: companyId, name: "Unanswered fixture", issuePrefix: companyId.slice(0, 8) });
@@ -386,7 +395,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleUnrecoverableExecutions(db);
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    // RF2: the hold defers a new message here, so the remedy is the new task (listed expectation change).
+    expect(notices[0]!.body).toBe(NOT_ANSWERED_NEW_TASK);
+    await dispatchDefersNewMessage(f);
     expect(notices[0]!.body).not.toMatch(/native_|runner_|backup_without/);
     expect(codeOf(notices[0]!)).toBe("runner_harness_state_mismatch");
     await f.sweep();
@@ -428,7 +439,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    // RF2: the hold defers a new message here, so the remedy is the new task (listed expectation change).
+    expect(notices[0]!.body).toBe(NOT_ANSWERED_NEW_TASK);
+    await dispatchDefersNewMessage(f);
     expect(codeOf(notices[0]!)).toBe("adapter_failed");
     const rows = (notices[0]!.metadata?.sections ?? []).flatMap(section => section.rows) as Array<{ label?: string }>;
     expect(rows.some(row => row.label === "Recovery action")).toBe(true);
@@ -442,7 +455,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    // RF2: the hold defers a new message here, so the remedy is the new task (listed expectation change).
+    expect(notices[0]!.body).toBe(NOT_ANSWERED_NEW_TASK);
+    await dispatchDefersNewMessage(f);
     expect(notices[0]!.body).not.toContain("runnerd");
     expect(codeOf(notices[0]!)).toBe("native_session_retry_exhausted");
   });
@@ -459,7 +474,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(2);
-    expect(notices.map(notice => notice.body)).toContain(NO_RUN);
+    // RF2: this very row shows the deferral (deferred_issue_execution): the remedy is the new task (listed expectation change).
+    expect(notices.map(notice => notice.body)).toContain(NO_RUN_NEW_TASK);
+    await dispatchDefersNewMessage(f);
   });
 
   it("SMAA-501 (RFL 20:37Z): a comment coalesced into a remote_cleanup execution wait whose wake FAILED -> exactly one notice, at the failure (no timer)", async () => {
