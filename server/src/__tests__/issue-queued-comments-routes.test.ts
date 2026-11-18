@@ -1878,7 +1878,8 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   // The Send is held, so "Sending your messages." is not true here; gold
   // smarty-dev#21194 tracks the fix, and this pin changes with it.
   const HELD_SEND_WAIT = { reason: "interrupt_handoff", message: "Sending your messages." };
-  const R4 = "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.";
+  // The old predicting bar (R4) is gone from the product; no row may show it. Matched by its promise, not pinned.
+  const R4 = /when you send your next/i;
   // Option Z (org 21:56Z; RFL record SUPERSEDE-C4-BAR-REAL-REFUSAL-1118 amended): after a person's Stop the bar
   // PREDICTS NOTHING. It is the ONE line (or, where the screen has the fact for free, the paused line); what
   // Send does is told by the Send's own answer: admitted -> it runs; held -> the wait that Send's dispatch
@@ -1943,7 +1944,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     // queuedCommentInterruptQueueId): not a Stop-held list, so its handoff wait is unchanged.
     const personStop = scenario.startsWith("acknowledged person stop") || scenario === "unacknowledged person stop";
     expect(queue.executionWait).toEqual(personStop ? Z_BAR : scenario === "person stop then Send" ? HELD_SEND_WAIT : wait);
-    expect(JSON.stringify(queue)).not.toContain(R4);
+    expect(JSON.stringify(queue)).not.toMatch(R4);
   });
 
   // SCREEN row 4b + S7-N (optS-N ebeb1bf9's term; no Option S wrapper on
@@ -1989,7 +1990,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       const queue = (await request(client).get(path).expect(200)).body;
       expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
       expect(queue.executionWait).toEqual(other === "running" ? wait : Z_BAR);
-      expect(queue.executionWait?.message).not.toBe(R4);
+      expect(queue.executionWait?.message ?? "").not.toMatch(R4);
       if (other === "running") return;
       const runsBefore = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).length;
       const sent = await request(client).post(`${path}/interrupt`).send({ queueId: f.wakeId, targetRunId: null, revision: queue.revision });
@@ -2026,8 +2027,8 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       expect(queue.executionWait).toBeUndefined();
       expect(Object.keys(queue)).not.toContain("executionWait");
       // (2) not R4.
-      expect(queue.executionWait?.message).not.toBe(R4);
-      expect(JSON.stringify(queue)).not.toContain(R4);
+      expect(queue.executionWait?.message ?? "").not.toMatch(R4);
+      expect(JSON.stringify(queue)).not.toMatch(R4);
       // (3) the exact busy turn the GET returns, pinned whole: the deferred queue
       // behind the running typed run, whose busy field (targetRunId) carries that
       // run's id as the full string (not the stopped run, not null).
@@ -2343,7 +2344,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const storedWait = (stored?.payload as any)?.executionWait;
     expect(after.executionWait ?? null).toEqual(after.entries?.length && storedWait?.reason
       ? { reason: storedWait.reason, message: storedWait.message } : null);
-    expect(JSON.stringify(after)).not.toContain(R4);
+    expect(JSON.stringify(after)).not.toMatch(R4);
     expect(JSON.stringify(after)).not.toContain("Sending your messages.");
   });
 
