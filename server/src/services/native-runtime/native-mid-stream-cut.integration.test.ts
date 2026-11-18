@@ -404,5 +404,13 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     expect(classifyNativeMidStreamCut(failed({ code: "opencode_server_exited" }))).toBeNull();
     expect(classifyNativeMidStreamCut([{ seq: 1, payload: { prpEvent: { eventType: "turn.completed", turnId: "t", payload: {} } } }])).toBeNull();
     expect(classifyNativeMidStreamCut(failed({ code: "pi_provider_error", message: "unexpected EOF" }))).toBe("provider_error");
+
+    const { isNativeProviderRefusal } = await import("./native-mid-stream-cut.js");
+    // compose: an account or key rejection that names the Terms of Service is an
+    // ordinary provider error; a request the provider says violates them is a refusal.
+    expect(isNativeProviderRefusal({ code: "pi_provider_error", message: "400 invalid_request_error: Account blocked until Terms of Service are accepted. See https://www.anthropic.com/legal/commercial-terms." })).toBe(false);
+    expect(isNativeProviderRefusal({ code: "pi_provider_error", message: "400 invalid_request_error: Your API key was rejected because your account has not accepted the Terms of Service. See https://www.anthropic.com/legal/commercial-terms." })).toBe(false);
+    expect(isNativeProviderRefusal({ code: "pi_provider_error", message: "This request appears to violate our Terms of Service. Please see the Usage Policies." })).toBe(true);
+    expect(isNativeProviderRefusal({ code: "pi_provider_error", message: "Provider refused this request" })).toBe(true);
   });
 });

@@ -12,7 +12,11 @@ import { isPiPolicyRefusal, PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSA
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 
-const REFUSAL_PATTERN = /reasoning_extraction|terms of service|\bprovider refused (?:this |the )?request\b/iu;
+// compose (unit 1 + dl-refusal2 round 6): Terms-of-Service text is a refusal only
+// when it is about THE REQUEST. An account or key rejection that merely names
+// the Terms of Service ("your account has not accepted the Terms of Service")
+// is an ordinary provider error and keeps its retry.
+const REFUSAL_PATTERN = /reasoning_extraction|\b(?:this|your|the) request\b[^\n]*\bterms of service\b|\bprovider refused (?:this |the )?request\b/iu;
 
 /**
  * The provider's own refusal. The refusal path's classifier decides first
