@@ -231,7 +231,7 @@ fn runtime_context_session_identity(context: &Value) -> Option<Value> {
 
 // Mirrors only the canonical asset suffix from composeNativeSystemInstructions.
 // No replacement is allowed inside the prompt or a user's custom entry.
-fn registered_asset_suffix(context: &Value) -> Option<String> {
+pub(crate) fn registered_asset_suffix(context: &Value) -> Option<String> {
     let instructions = context.get("instructions")?;
     let root = instructions.pointer("/bundle/rootPath")?.as_str()?;
     if root.is_empty() {
