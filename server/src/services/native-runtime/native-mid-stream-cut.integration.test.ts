@@ -33,6 +33,7 @@ import { buildEffectiveRunSessionConfigMetadata } from "../heartbeat/workspaces.
 import { issueService } from "../issues.js";
 import * as usageReceipts from "../usage-receipts.js";
 import { settleUnansweredPersonMessagesForTask, unansweredPersonMessageCondition } from "../recovery/unanswered-person-message.js";
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 
 // dl famlong-u1. Live (review-fleet-2): after a mid-stream cut the recovery
 // path never ran. The status arbiter's GENERIC successor ran instead (context
@@ -492,6 +493,91 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     expect(await issueWakes(issueId)).toEqual([]);
     // No re-send; the task takes dl-refusal2's board hold (unit 1 alone left it in_progress).
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+    await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  // fam-long + ANSWERED (u1k, RFL 23:38Z). ANSWERED attributes a completed reply
+  // only through the replying run's OWN pending input, and the cut lane drops
+  // the cut run's wakeCommentId(s) (the cut turn is not re-sent). The ONE
+  // successor carries the origin's pending ids as attributionCommentIds, for
+  // attribution only. Mutation (r4): drop `...attribution` in
+  // materializeNativeMidStreamCutRetry -> the answered message gets a false
+  // "wasn't answered" notice and r1/r2 go red.
+  const PROMPT_INPUT_KEYS = ["wakeCommentId", "wakeCommentIds", "commentId", "commentIds", "latestCommentId", "paperclipWake",
+    "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTurnContext", "commentContinuation", "explicitUserContinuation"];
+  it.each([
+    { name: "r1 a cap with no text", shape: "cap_no_text" as const, fresh: true },
+    { name: "r2 an EOF mid-thinking", shape: "eof_mid_thinking" as const, fresh: false },
+  ])("$name -> the ONE cut-lane successor answers M: no unanswered notice and no carry at +1 min and +1 h; the user turn is not re-sent", async ({ shape, fresh }) => {
+    const issueId = await task();
+    const [message] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "user")));
+    const cut = await cutTurn(issueId, shape);
+    const { heartbeat, generic, successors } = await dispatchEverything(issueId, cut.runId);
+    expect(generic).toMatchObject({ dispatched: 0 });
+    expect(await genericWakes(issueId)).toEqual([]);
+    expect(successors).toHaveLength(1);
+    const successor = successors[0]!;
+    expect(successor).toMatchObject({ retryOfRunId: cut.runId, scheduledRetryReason: "native_mid_stream_cut" });
+    // ATTRIBUTION ONLY: the origin's pending ids, in the one field no prompt builder reads.
+    expect.soft(successor.contextSnapshot).toMatchObject({ attributionCommentIds: [message.id] });
+    for (const key of PROMPT_INPUT_KEYS) expect(successor.contextSnapshot, key).not.toHaveProperty(key);
+    expect((successor.contextSnapshot as Record<string, unknown>).firstTurnQueuedInput ?? null).toBeNull();
+    // The same array is on the durable wake, and nowhere as a wake comment.
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, successor.wakeupRequestId!));
+    expect.soft(wake.payload).toMatchObject({ attributionCommentIds: [message.id] });
+    for (const key of PROMPT_INPUT_KEYS) expect(wake.payload, key).not.toHaveProperty(key);
+    // The provider input: a fresh process opens with the ask ONCE (the cut
+    // turn is not sent); a resumed session gets no user turn again at all.
+    const opened = await opening(successor, issueId);
+    const instruction = opened.livenessContinuationInstruction;
+    if (fresh) expect(String(instruction).split(ASK)).toHaveLength(2);
+    else expect(instruction).toBeUndefined();
+    for (const key of PROMPT_INPUT_KEYS) expect(opened, key).not.toHaveProperty(key);
+    expect(JSON.stringify({ ...opened, livenessContinuationInstruction: undefined })).not.toContain(ASK);
+    await heartbeat.drainActiveRunExecutions();
+
+    // The successor completes with its published final answer.
+    const answeredAt = new Date();
+    await db.update(heartbeatRuns).set({ status: "succeeded", runtimeMode: "native", nativeIssueId: issueId, error: null, errorCode: null,
+      startedAt: answeredAt, finishedAt: answeredAt, updatedAt: answeredAt }).where(eq(heartbeatRuns.id, successor.id));
+    await db.insert(issueComments).values({ companyId, issueId, authorAgentId: agentId, authorType: "agent", createdByRunId: successor.id,
+      body: "Step 1: snapshot the invoices table. Step 2: migrate. Step 3: verify.", createdAt: new Date(answeredAt.getTime() + 1) });
+    await db.update(issues).set({ status: "in_review", executionRunId: null }).where(eq(issues.id, issueId));
+
+    // Both sweeps run before either is judged, so a false notice at +1 h is
+    // reported as a notice (mutation r4), not hidden behind the +1 min wait.
+    const sweeps: unknown[] = [];
+    const carries: unknown[] = [];
+    for (const delay of [60_000, 60 * 60_000]) {
+      sweeps.push(await settleUnansweredPersonMessagesForTask(db, { companyId, issueId, now: new Date(Date.now() + delay) }));
+      // No carry: M is ANSWERED, so no later successor is seeded with it again.
+      for (const runId of [cut.runId, successor.id]) carries.push(await readContinuationCommentInput(db, { companyId, issueId, runId }));
+    }
+    expect({ sweeps, carries }).toEqual({ sweeps: [{ noticed: 0, pending: 0 }, { noticed: 0, pending: 0 }], carries: [{}, {}, {}, {}] });
+    const agentComments = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+      .filter(comment => comment.authorType !== "user" && !comment.deletedAt);
+    expect(agentComments.map(comment => comment.createdByRunId)).toEqual([successor.id]);
+    expect(agentComments[0]!.body).not.toMatch(/wasn't answered|Sending it again is safe|Press Retry/u);
+    expect(await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, issueId),
+      unansweredPersonMessageCondition(issues.id, issues.companyId)))).toEqual([]);
+    expect((await successorsOf(issueId, cut.runId)).map(run => run.id)).toEqual([successor.id]);
+    expect(await genericWakes(issueId)).toEqual([]);
+  }, 180_000);
+
+  it("r3 CONTROL: the attribution-carrying successor is itself cut and exhausted -> exactly ONE true exhausted note, no unanswered notice", async () => {
+    const issueId = await task();
+    const [message] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "user")));
+    const first = await cutTurn(issueId, "cap_no_text");
+    const { heartbeat, successors } = await dispatchEverything(issueId, first.runId);
+    expect(successors).toHaveLength(1);
+    expect(successors[0]!.contextSnapshot).toMatchObject({ attributionCommentIds: [message.id] });
+    const second = await cutTurn(issueId, "cap_no_text", successors[0]!.id);
+    expect(second.decision).toMatchObject({ reasonCode: "native_run_failed_continuation_exhausted", toStatus: "blocked" });
+    const after = await dispatchEverything(issueId, first.runId);
+    expect(after.successors.map(run => run.id)).toEqual([second.runId]);
+    expect(await genericWakes(issueId)).toEqual([]);
+    // Exactly one agent comment, the true exhausted note, after sweeps at +1 min and +1 h.
+    await assertOnePublishedNoteAfterSweep(issueId, second.runId, CAP_EXHAUSTED_NOTE);
     await heartbeat.drainActiveRunExecutions();
   }, 180_000);
 

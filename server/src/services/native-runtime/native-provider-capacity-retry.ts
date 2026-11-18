@@ -10,7 +10,7 @@ import { NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, 
 import { nativeRunHasStopRequest } from "./native-run-stop-request.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_HINT, NATIVE_ENVIRONMENT_BLOCKER_MAX_RETRIES, NATIVE_ENVIRONMENT_BLOCKER_MESSAGE,
   NATIVE_ENVIRONMENT_BLOCKER_RETRY_DELAY_MS } from "./native-environment-blocker.js";
-import { NativeStatusRaceError } from "./status-decision-committer.js";
+import { NativeStatusRaceError, nativeContinuationAttributionContext } from "./status-decision-committer.js";
 import { NATIVE_MID_STREAM_CUT_CODE, NATIVE_MID_STREAM_CUT_MESSAGE, nativeMidStreamCutStartsFresh, readNativeMidStreamCut } from "./native-mid-stream-cut.js";
 
 type NativeRetryTarget = {
@@ -72,9 +72,21 @@ export async function materializeNativeEnvironmentBlockerRetry(input: NativeRetr
  * An EOF or other provider error, and a cap
  * stop that had started its answer, resume the session. A second cut is
  * bounded by the arbiter (failedTurnContinuationUsed), not by this lane.
+ *
+ * fam-long + ANSWERED (RFL 23:38Z): ANSWERED attributes a reply only through
+ * the replying run's OWN pending input (person-message-answer.ts
+ * carriesCommentSql), and this lane drops the cut run's wakeCommentId(s) so the
+ * cut turn is never re-sent. The successor therefore carries the origin run's
+ * still-pending person input ids as attributionCommentIds, the SAME array the
+ * committer's native-status continuation wake carries
+ * (nativeContinuationAttributionContext). ATTRIBUTION ONLY: read by
+ * carriesCommentSql and the sweep's runCarriesMessage/inScopeSql, by no prompt
+ * builder. The turn boundary (conversationReplyBoundaryCommentId) is left as
+ * the cut run had it.
  */
 export async function materializeNativeMidStreamCutRetry(input: NativeRetryTarget) {
   const cut = await readNativeMidStreamCut(input.tx, { companyId: input.companyId, runId: input.runId });
+  const attribution = await nativeMidStreamCutAttributionIds(input);
   return materializeNativeFreshSessionRetry(input, {
     reason: NATIVE_MID_STREAM_CUT_CODE,
     maxRetries: Number.MAX_SAFE_INTEGER,
@@ -91,8 +103,18 @@ export async function materializeNativeMidStreamCutRetry(input: NativeRetryTarge
       nativeMidStreamCut: cut,
       livenessContinuationSourceRunId: run.id,
       livenessContinuationReason: NATIVE_MID_STREAM_CUT_CODE,
+      ...attribution,
     }),
   });
+}
+
+/** The cut run's still-pending person input (not ANSWERED, not live-carried),
+ * through the committer's one collector. Only the attribution-only array. */
+async function nativeMidStreamCutAttributionIds(input: NativeRetryTarget): Promise<{ attributionCommentIds?: string[] }> {
+  const { attributionCommentIds } = await nativeContinuationAttributionContext(input.tx, {
+    companyId: input.companyId, issueId: input.issueId, originRunId: input.runId });
+  return Array.isArray(attributionCommentIds) && attributionCommentIds.length > 0
+    ? { attributionCommentIds: attributionCommentIds as string[] } : {};
 }
 
 async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane: NativeRetryLane) {
