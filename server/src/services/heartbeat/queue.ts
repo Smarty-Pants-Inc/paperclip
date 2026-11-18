@@ -1,4 +1,6 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { anchorParkedWakePayloadSql, parkedWakeExpiredSql, parkedWakeNoticedSql, personControlledWait, personSend,
+  personSendSql } from "./parked-wake-deadline.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
@@ -2053,10 +2055,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(companies.status, "active"),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
         stoppedInterrupt ? undefined : lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
+        // S124: past its first park's deadline a parked Send is not retried
+        // silently; the receipt worker writes its one note instead.
+        sql`not ${parkedWakeExpiredSql(agentWakeupRequests.payload)}`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const wake of pendingInterrupts) {
-      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+      // This rewrite moves updatedAt (the 30 s cadence); the park's first
+      // time is kept once in payload.firstParkedAt (S124).
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(),
+        payload: anchorParkedWakePayloadSql(agentWakeupRequests.payload, agentWakeupRequests.updatedAt) }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
       await resumeQueuedCommentInterrupt(wake.companyId, wake.id).catch(err => {
@@ -2179,6 +2187,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           and ${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.payload}->>'pluginId')`,
         dependencyResolvedWakePayloadSql, assignmentWakePayloadSql),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        // S124e (RFL): as the interrupt scan above, past its first park's
+        // deadline a parked Send is never released automatically: its one
+        // note told the person it did not start, and their Retry owns it.
+        sql`not ${parkedWakeExpiredSql(agentWakeupRequests.payload)}`,
+        sql`not ${parkedWakeNoticedSql(agentWakeupRequests.payload)}`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
             AND (live_issue_run.context_snapshot->>'issueId' = ${issues.id}::text
@@ -2212,7 +2225,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
         or(isNull(heartbeatRuns.nativeIssueId), sql`${heartbeatRuns.nativeIssueId}::text = ${String(wake.payload?.issueId)}`),
       )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+      // S124d: this rewrite moves updatedAt; a person's Send deferred in a
+      // non-person executionWait keeps its FIRST deferral in firstParkedAt.
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(),
+        payload: anchorParkedWakePayloadSql(agentWakeupRequests.payload, agentWakeupRequests.updatedAt,
+          personSendSql()) }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
       if (!latest || !latest.finishedAt || !isHeartbeatRunTerminalStatus(latest.status)) continue;
@@ -2264,6 +2281,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(heartbeatRuns.status, "cancelled"),
         eq(heartbeatRuns.runtimeMode, "legacy"),
         eq(companies.status, "active"),
+        // S124e: the same bound for a Stop-named legacy receipt; after its
+        // deadline (and note) only the person's Retry sends it.
+        sql`not ${parkedWakeExpiredSql(agentWakeupRequests.payload)}`,
+        sql`not ${parkedWakeNoticedSql(agentWakeupRequests.payload)}`,
         cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
       ));
     for (const run of interruptedQueues) {
@@ -4131,6 +4152,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   issueId: issue.id,
                   [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
                   executionWait: condition,
+                  // S124d: a person's saved Send deferred here is anchored at
+                  // this first deferral (set once; later rewrites keep it).
+                  ...(personSend(opts.requestedByActorType, reason) && !personControlledWait({ executionWait: condition })
+                    ? { firstParkedAt: new Date().toISOString() } : {}),
                 }, [...new Set([
                   ...queuedCommentIdsFromRunContext(enrichedContextSnapshot),
                   ...(wakeCommentId ? [wakeCommentId] : []),
