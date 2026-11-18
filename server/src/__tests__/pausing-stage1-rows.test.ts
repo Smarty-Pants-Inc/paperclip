@@ -146,6 +146,47 @@ describe("pausing stage 1 rows", () => {
     expect(await leaseRow(identity.id)).toMatchObject({ status: "pending_cleanup" });
   });
 
+  /** A Boat lease on a pending destroy (pending_cleanup / failed), then the real pending-destroy sweep. */
+  async function pendingDestroy(metadata: (identity: { id: string; heartbeatRunId: string; providerLeaseId: string }) => Record<string, unknown>) {
+    const [agent] = await db.insert(agents).values({ companyId, name: "Boat Lead", adapterType: "process",
+      status: "running", defaultEnvironmentId: environmentId, lifecycleRequiredPluginIds: [] }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent!.id, status: "cancelled",
+      invocationSource: "on_demand", runtimeMode: "legacy", startedAt: new Date(Date.now() - 120_000),
+      finishedAt: new Date(Date.now() - 100_000) }).returning();
+    const identity = { id: randomUUID(), companyId, heartbeatRunId: run!.id, provider: "boat", providerLeaseId: `boat-${randomUUID()}` };
+    await db.insert(environmentLeases).values({ ...identity, environmentId, status: "pending_cleanup", cleanupStatus: "failed",
+      leasePolicy: "reuse_by_environment", releasedAt: new Date(Date.now() - 90_000), failureReason: "retained_orphan_sandbox_released",
+      updatedAt: new Date(Date.now() - 3_600_000), metadata: { agentId: agent!.id, ...metadata(identity) } });
+    const destroy = vi.fn(async () => { throw new Error("provider destroy unavailable in this row"); });
+    const runtime = environmentRuntimeService(db);
+    const sweeper = heartbeatService(db, { environmentRuntime: { ...runtime, inspectLeaseResource: inspect, releaseRunLeases,
+      destroyRunLease: destroy, retryPendingSandboxTeardown: destroy } as never });
+    await sweeper.sweepPendingCleanupLeases({ backoffMs: 0 }).catch(() => undefined);
+    return { agent: agent!, leaseId: identity.id, destroy };
+  }
+
+  it("row RFL-2: retainOnDestroy true but no proved Stop receipt is NOT parked and keeps the pause blocking", async () => {
+    providerAnswer = () => undefined;
+    const { agent, leaseId } = await pendingDestroy(() => ({ retainOnDestroy: true }));
+    const after = await leaseRow(leaseId);
+    expect((after.metadata as Record<string, any>).cleanupDisposition).toBeUndefined();
+    expect(after.status).toBe("pending_cleanup");
+    await pause(agent.id);
+    expect((await agentRow(agent.id)).lifecycleState).toBe("pausing");
+  });
+
+  it("row RFL-3: an own bound 'stopped' receipt on a pending destroy, retainOnDestroy absent, is parked, never destroyed", async () => {
+    const { agent, leaseId, destroy } = await pendingDestroy(identity => ({ workspaceRecoveryCleanup: { runId: identity.heartbeatRunId,
+      stopReceipt: remoteTerminationReceipt({ ...identity, companyId, provider: "boat" }, { providerLeaseId: identity.providerLeaseId, state: "stopped" }) } }));
+    const after = await leaseRow(leaseId);
+    expect((after.metadata as Record<string, any>).retainOnDestroy).toBeUndefined();
+    expect((after.metadata as Record<string, any>).cleanupDisposition).toMatchObject({ state: "parked", code: "provider_retains_resource" });
+    expect(destroy).not.toHaveBeenCalled();
+    expect(after.status).toBe("pending_cleanup");
+    await pause(agent.id);
+    expect(await agentRow(agent.id)).toMatchObject({ lifecycleState: "paused", status: "paused" });
+  });
+
   it("row E: a message to a pausing agent whose old run is unproved gets the true line, never silence", async () => {
     const { agent } = await stoppedRemoteAgent();
     providerAnswer = () => undefined;
