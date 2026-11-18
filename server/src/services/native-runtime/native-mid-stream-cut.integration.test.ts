@@ -18,7 +18,7 @@ import { buildNativeCompletionContract } from "./completion-contracts.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { finalizeNativeRun } from "./native-run-finalizer.js";
 import { projectPaperclipRunnerTaskConfig, resolvePaperclipRunnerNativeProviderInput } from "./provider-profile.js";
-import { applyNativeMidStreamCutOpening, classifyNativeMidStreamCut, readExhaustedNativeMidStreamCutCandidate } from "./native-mid-stream-cut.js";
+import { applyNativeMidStreamCutOpening, classifyNativeMidStreamCut, isNativeProviderAccountFailure, readExhaustedNativeMidStreamCutCandidate } from "./native-mid-stream-cut.js";
 import { NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION } from "./status-arbiter.js";
 import { heartbeatService } from "../heartbeat.js";
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
@@ -346,7 +346,7 @@ describe("native mid-stream cut: one successor, through recovery", () => {
   it.each([
     { message: "insufficient_quota: billing hard limit reached" },
     { message: "Provider quota exceeded for this model." },
-    { message: "Account billing requires attention." },
+    { message: "Billing hard limit reached." },
     { message: "401 Unauthorized" },
     { message: "403 Forbidden" },
     { message: "authentication_error: invalid credentials" },
@@ -356,6 +356,9 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     { status: 402 },
     { code: "pi_auth_required" },
     { providerCode: "pi_auth_required" },
+    { code: "insufficient_quota" },
+    { providerCode: "quota_exhausted" },
+    { providerCode: "invalid_api_key" },
     ...["quota_exhausted", "authentication", "permission"].map(category => ({
       providerFailure: { schema: "paperclip.provider-failure.v1", provider: "pi", phase: "turn", category,
         message: "Account action required", retryability: "requires_action" },
@@ -364,8 +367,39 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     const rows = [{ seq: 1, payload: { prpEvent: { eventType: "turn.failed", payload: {
       status: "failed", error: { code: "pi_provider_error", ...detail },
     } } } }];
+    expect(isNativeProviderAccountFailure({ code: "pi_provider_error", ...detail })).toBe(true);
     expect(classifyNativeMidStreamCut(rows)).toBeNull();
     expect(await readExhaustedNativeMidStreamCutCandidate(db, { companyId, runId: randomUUID() }, rows)).toBeNull();
+  });
+
+  it.each([
+    { message: "unexpected EOF while fetching billing tables" },
+    { message: "Account billing requires attention." },
+    { message: "unexpected EOF while checking quota" },
+    { message: "connection reset while checking auth" },
+    { message: "unexpected EOF while reading the credit balance table" },
+    { message: "unexpected EOF fetching table 401" },
+    ...["pi_rpc_transport_failed", "EOF", "unexpected_eof", "transport_eof", "ECONNRESET", "EPIPE", "ERR_STREAM_PREMATURE_CLOSE"].map(code => ({
+      code, httpStatus: 401, providerCode: "pi_auth_required",
+      message: "insufficient_quota: billing hard limit reached; 401 Unauthorized",
+      providerFailure: { schema: "paperclip.provider-failure.v1", provider: "pi", phase: "turn", category: "authentication",
+        message: "Account action required", retryability: "requires_action" },
+    })),
+    ...[429, 529].flatMap(status => [
+      { httpStatus: status, message: "insufficient_quota: billing hard limit reached" },
+      { statusCode: status, providerCode: "pi_auth_required" },
+      { status, message: "401 Unauthorized" },
+      { message: `HTTP ${status}: insufficient_quota: billing hard limit reached` },
+      { providerFailure: { schema: "paperclip.provider-failure.v1", provider: "pi", phase: "turn", category: "quota_exhausted",
+        httpStatus: status, message: "Account action required", retryability: "requires_action" } },
+    ]),
+    ...["rate_limit", "overloaded"].map(category => ({
+      message: "insufficient_quota: billing hard limit reached",
+      providerFailure: { schema: "paperclip.provider-failure.v1", provider: "pi", phase: "turn", category,
+        message: "Try again later", retryability: "transient" },
+    })),
+  ])("topics, transport and capacity are never account failures: %j", detail => {
+    expect(isNativeProviderAccountFailure({ code: "pi_provider_error", ...detail })).toBe(false);
   });
 
   it("RED gate 5 (6490dd70 -> 3a301e73): an EOF mid-thinking has ONE successor through recovery, resuming the session, and no generic wake", async () => {

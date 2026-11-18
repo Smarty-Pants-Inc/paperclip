@@ -26,16 +26,24 @@ export function isNativeProviderRefusal(error: unknown): boolean {
 /** Account rejections keep their existing failure/recovery owner, never the cut lane. */
 export function isNativeProviderAccountFailure(error: unknown): boolean {
   const detail = record(error);
-  const category = readProviderFailure(detail.providerFailure)?.category;
-  if (category === "quota_exhausted" || category === "authentication" || category === "permission") return true;
-  if ([detail.code, detail.providerCode].some(code =>
-    isAiAuthenticationFailure(typeof code === "string" ? code : null))) return true;
-  const status = Number(detail.httpStatus ?? detail.statusCode ?? detail.status);
-  if (status === 401 || status === 402 || status === 403) return true;
-  // Pi's untyped provider terminals carry only code + message, not ProviderFailure.
-  // Typed quota/auth categories above reuse the existing provider classifier.
+  const failure = readProviderFailure(detail.providerFailure);
+  const codes = [detail.code, detail.providerCode, failure?.providerCode];
+  // Transport identity wins over any account-looking text or nested metadata.
+  if (codes.some(code => typeof code === "string"
+    && /^(?:pi_rpc_transport_failed|(?:unexpected_|transport_)?EOF|ECONNRESET|EPIPE|ERR_STREAM_PREMATURE_CLOSE)$/iu.test(code))) return false;
+  const statuses = [detail.httpStatus, detail.statusCode, detail.status, failure?.httpStatus].map(Number);
   const message = typeof detail.message === "string" ? detail.message : "";
-  return /insufficient[_ ]quota|\bbilling\b|\bquota (?:limit )?(?:exceeded|exhausted)|\b(?:credit balance|account on hold)\b|\b(?:401|402|403)\b|\b(?:authentication[_ ](?:error|failed|required)|unauthorized|forbidden|invalid[_ ]api[_ ]key)\b/iu.test(message);
+  // Capacity/rate failures retain their ordinary retry, even if their text
+  // mentions quota or billing. Pi may expose the HTTP status only in its text.
+  if (statuses.some(status => status === 429 || status === 529) || /\b(?:429|529)\b/u.test(message)
+    || failure?.category === "rate_limit" || failure?.category === "overloaded") return false;
+  const category = failure?.category;
+  if (category === "quota_exhausted" || category === "authentication" || category === "permission") return true;
+  if (codes.some(code => typeof code === "string" && (isAiAuthenticationFailure(code)
+    || /^(?:insufficient_quota|quota_(?:limit_)?(?:exceeded|exhausted)|billing_hard_limit|authentication_(?:error|failed|required)|permission_error|unauthorized|forbidden|invalid_api_key)$/iu.test(code)))) return true;
+  if (statuses.some(status => status === 401 || status === 402 || status === 403)) return true;
+  // Pi's untyped terminals need an actual rejection, never a topic word.
+  return /\binsufficient[_ ]quota\b|\bbilling hard limit\b|\bquota (?:limit )?(?:exceeded|exhausted)\b|\b(?:credit balance (?:is )?(?:too low|exhausted)|account on hold)\b|\bHTTP(?: status)?[ :=]+(?:401|402|403)\b|\b402 payment required\b|\b(?:authentication[_ ](?:error|failed|required)|unauthorized|forbidden|invalid[_ ]api[_ ]key)\b/iu.test(message);
 }
 
 /** An account rejection is a normal provider failure, not an exhausted-cut reply. */
