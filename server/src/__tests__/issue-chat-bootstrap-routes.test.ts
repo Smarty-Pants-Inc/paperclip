@@ -298,4 +298,54 @@ describeEmbeddedPostgres("task chat bootstrap", () => {
       return row!.livenessState;
     }, { timeout: 5_000 }).not.toBeNull();
   });
+
+  // SCREEN S5: the chat's cancelled marker reads `cancelledByActorType` from the
+  // run the bootstrap serves. A person's Stop must reach the chat (and an
+  // ordinary task) with its actor; a non-person cancel (control) must not read
+  // as a person's Stop. The person row is the one the Stop route
+  // (POST /heartbeat-runs/:runId/cancel, routes/agents.ts) settles: its
+  // `cancelledByActorType: "user"` and `cancelledByUserId` attribution.
+  it.each([
+    ["chat", true, "person"],
+    ["task", false, "person"],
+    ["chat", true, "system"],
+    ["task", false, "system"],
+  ] as const)("SCREEN S5: the bootstrap carries who stopped the run (%s, conversation=%s, %s Stop)", async (_surface, conversation, stoppedBy) => {
+    const f = await seedCompanyWithBoardAccess(ctx.db, `S5 ${_surface} ${stoppedBy}`);
+    const task = await seedTask(f.companyId, { userId: f.userId, conversation });
+    const server = app(f.actor);
+    await ctx.db.update(heartbeatRuns).set({
+      status: "cancelled", finishedAt: new Date("2026-11-09T11:59:30.000Z"),
+      resultJson: stoppedBy === "person"
+        ? { cancelledByActorType: "user", cancelledByUserId: f.userId }
+        : { cancelledByActorType: "system", stopReason: "cancelled" },
+    }).where(eq(heartbeatRuns.id, task.runId));
+    const [stored] = await ctx.db.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, task.runId));
+    expect(stored!.status).toBe("cancelled");
+
+    const res = await request(server).get(url(f.companyId)).query({ ids: task.issueId });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const run = (res.body.items[0].recentRuns as Array<{ runId: string; status: string; resultJson: Record<string, unknown> | null }>)
+      .find((entry) => entry.runId === task.runId);
+    expect(run?.status).toBe("cancelled");
+    if (stoppedBy === "person") {
+      expect(stored!.resultJson).toMatchObject({ cancelledByActorType: "user" });
+      expect(run?.resultJson?.cancelledByActorType).toBe("user");
+      // The actor type only: the stopping person's id stays on the server.
+      expect(run?.resultJson).not.toHaveProperty("cancelledByUserId");
+    } else {
+      expect(run?.resultJson?.cancelledByActorType).not.toBe("user");
+    }
+    // The single-task bootstrap and the chat's own window read agree.
+    const single = await request(server).get(`/api/issues/${task.issueId}/chat-bootstrap`);
+    expect(single.body.recentRuns).toEqual(res.body.items[0].recentRuns);
+    const window = await request(server).get(`/api/issues/${task.issueId}/runs`).query({ view: "recent" });
+    expect(window.body).toEqual(res.body.items[0].recentRuns);
+    if (process.env.SCREEN_S5_EVIDENCE_DIR) {
+      const { writeFile } = await import("node:fs/promises");
+      await writeFile(`${process.env.SCREEN_S5_EVIDENCE_DIR}/s5-bootstrap-run-${_surface}-${stoppedBy}.json`,
+        JSON.stringify({ stored: stored!.resultJson, bootstrapRun: run }, null, 2));
+    }
+  });
 });
