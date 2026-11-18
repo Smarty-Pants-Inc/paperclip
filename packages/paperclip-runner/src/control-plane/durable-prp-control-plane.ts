@@ -1963,6 +1963,22 @@ class DurableCoreStore {
 }
 
 /** Why an authenticated runner connection lost its lease authority. */
+/** Why a run's PRP credentials were revoked outside recovery rotation (RFL rf-4 fence (c)). */
+export type DurablePrpCredentialRevocationReason = "run_finalized" | "run_superseded";
+
+/** The typed reason a frame or resume was refused after its run's credential was revoked. */
+export interface DurablePrpCredentialRefusal {
+  readonly code: "connection_lease_revoked";
+  readonly reason: DurablePrpCredentialRevocationReason;
+  readonly leaseId: string;
+  readonly observedAtUnixMs: number;
+}
+
+/** The single lease revoke: recovery rotation and run finalization/supersession. */
+function revokeConnectionLease(candidate: StoredCoreState, credentialId: string): void {
+  candidate.leases[credentialId]!.revokedAt = new Date().toISOString();
+}
+
 export interface DurablePrpConnectionLeaseFailure {
   readonly code: "connection_lease_expired";
   readonly leaseId: string;
@@ -2223,6 +2239,9 @@ export class DurablePrpControlPlane {
   #runnerDisconnectedAt: number | null = null;
   #connectionProcessing = new Map<AuthorityConnection, Promise<void>>();
   #connectionLeaseFailure: DurablePrpConnectionLeaseFailure | null = null;
+  /** Credentials revoked by finalization or supersession, kept past pruning so a refusal stays typed. */
+  #revokedRunCredentials = new Map<string, { reason: DurablePrpCredentialRevocationReason; leaseId: string }>();
+  #credentialRefusal: DurablePrpCredentialRefusal | null = null;
   #pendingSemanticCalls = new Set<string>();
   /** Result command ids whose callback this instance dispatched live and has
    * not journaled a result for. A queued result removes its id, so only
@@ -2658,6 +2677,67 @@ export class DurablePrpControlPlane {
       throw new Error("Semantic callback retirement requires drained, stopped ingress.");
     }
     this.#semanticCallbacksRetired = true;
+  }
+
+  /**
+   * Revoke every live connection lease bound to `runId` because that run is
+   * finalized (terminal) or superseded (RFL rf-4 fence (c)), so a revived
+   * runner can neither keep sending frames nor resume. It is the recovery
+   * rotation's own revoke; the frame and hello checks already refuse it.
+   *
+   * No committed event is lost: the revoke first waits until every frame this
+   * authority already received has been processed under the still-valid lease.
+   * If that does not settle within `drainTimeoutMs` it revokes nothing and
+   * throws (the trace wins). Leases of another run are untouched. Idempotent;
+   * returns how many leases this call revoked. The journal is never deleted.
+   */
+  async revokeRunCredentials(
+    runId: string,
+    reason: DurablePrpCredentialRevocationReason,
+    drainTimeoutMs = 30_000,
+  ): Promise<number> {
+    const deadline = Date.now() + drainTimeoutMs;
+    while (this.#connectionProcessing.size > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const settled = await Promise.race([
+          Promise.allSettled([...this.#connectionProcessing.values()]).then(() => true),
+          new Promise<false>((resolveTimeout) => {
+            timer = setTimeout(() => resolveTimeout(false), Math.max(0, deadline - Date.now()));
+          }),
+        ]);
+        if (!settled) throw new Error("runner_prp_revocation_drain_timeout");
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    const revoked = Object.entries(this.#store.state.leases)
+      .filter(([, lease]) => lease.revokedAt === null && lease.identity.runId === runId);
+    if (revoked.length === 0) return 0;
+    const candidate = structuredClone(this.#store.state);
+    for (const [credentialId] of revoked) revokeConnectionLease(candidate, credentialId);
+    this.#store.commit(candidate);
+    for (const [credentialId, lease] of revoked) {
+      this.#revokedRunCredentials.set(credentialId, { reason, leaseId: lease.leaseId });
+    }
+    for (const connection of [...this.#connections]) {
+      if (connection.lease !== null && this.#revokedRunCredentials.has(connection.lease.credentialId)) {
+        this.#recordCredentialRefusal(connection.lease.credentialId);
+        connection.close();
+      }
+    }
+    return revoked.length;
+  }
+
+  #recordCredentialRefusal(credentialId: unknown): void {
+    const revoked = typeof credentialId === "string" ? this.#revokedRunCredentials.get(credentialId) : undefined;
+    if (revoked === undefined) return;
+    this.#credentialRefusal = { code: "connection_lease_revoked", ...revoked, observedAtUnixMs: Date.now() };
+  }
+
+  /** The typed reason the last frame or resume was refused for a revoked run credential, or null. */
+  get credentialRefusal(): DurablePrpCredentialRefusal | null {
+    return this.#credentialRefusal === null ? null : { ...this.#credentialRefusal };
   }
 
   /** Forces a resumable re-authentication after an immutable run attachment rotates. */
@@ -3487,6 +3567,7 @@ export class DurablePrpControlPlane {
       connection.lease.expiresAtUnixMs <= Date.now()
     ) {
       this.#recordLeaseFailureIfLapsed(connection);
+      this.#recordCredentialRefusal(connection.lease?.credentialId);
       connection.close();
       return false;
     }
@@ -3893,6 +3974,7 @@ export class DurablePrpControlPlane {
     }
     const authorization = this.#authorizeHello(payload);
     if (authorization === null) {
+      this.#recordCredentialRefusal(payload.credentialId);
       connection.close();
       return;
     }
@@ -4095,8 +4177,7 @@ export class DurablePrpControlPlane {
         new Date().toISOString();
       candidate.leases[material.credentialId] = lease;
       if (recovering) {
-        candidate.leases[recovering.credentialId]!.revokedAt =
-          new Date().toISOString();
+        revokeConnectionLease(candidate, recovering.credentialId);
         candidate.warmTransition!.credentialId = material.credentialId;
       }
       this.#store.commit(candidate);

@@ -7,6 +7,7 @@ import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-co
 import { RUNNER_PRP_PROTOCOL_MIN, RUNNER_PRP_PROTOCOL_MAX, type RunnerProcessHandle, type RunnerProcessLaunchSpec,
   type DurablePrpControlPlane, type RunnerExecutionDriver, type RunnerLaunchPreparer, type DurableRecoveryIdentity, type PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { connectRunnerPrpIngress } from "../../realtime/runner-prp-outbound.js";
+import { revokeRunnerPrpRunCredentials } from "../../realtime/runner-prp-ws.js";
 import type { NativeExecutionContext } from "./native-execution-context.js";
 
 export async function verifyPluginRunnerTaskReattachment(
@@ -354,12 +355,15 @@ export function createPluginRunnerTaskOwner(input: {
       },
       // The Runner is about to exit (its close suspend completed), as on release.
       quiesce: () => { outbound?.quiesce(); },
-      release: async (reason?: "detach") => {
+      release: async (reason?: "detach" | "finalize") => {
         registrationReleased = true;
         if (generation === registrationGeneration) released = true;
         if (reason === "detach") { released = true; detached = true; }
         // Closing WSS does not retire the provider process or release its lease.
         await outbound?.close();
+        // This route bypasses the registry: a finalized session revokes its
+        // run's PRP credentials here (RFL rf-4 fence (c)).
+        if (reason === "finalize" && runId) await revokeRunnerPrpRunCredentials(authority, runId, "run_finalized");
       },
     };
   };

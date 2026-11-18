@@ -5,7 +5,7 @@ import type { SandboxRunnerRetention } from "./sandbox-runner-retention.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { resolvePaperclipRunnerTransport, type PaperclipRunnerTransport } from "@paperclipai/adapter-utils/runner-connectivity";
 import type { RunnerExecutionDriver } from "../../vendor/paperclip-runner/index.js";
-import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
+import { registerRunnerPrpAuthority, revokeRunnerPrpRunCredentials } from "../../realtime/runner-prp-ws.js";
 import { connectRunnerPrpIngress } from "../../realtime/runner-prp-outbound.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import type { Db } from "@paperclipai/db";
@@ -281,7 +281,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
               startupFailureCode: "runner_direct_wss_failed" as const,
               checkpoint,
               ready: input.processIdentityReady ? async () => { await input.processIdentityReady; } : undefined,
-              release: async reason => { if (reason === "detach") input.sandboxRetention?.detach(); await inbound.release(); },
+              release: async reason => { if (reason === "detach") input.sandboxRetention?.detach(); await inbound.release(reason); },
             };
           }
 
@@ -415,6 +415,13 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
             release: async reason => {
               if (reason === "detach") input.sandboxRetention?.detach();
               await closeRoute();
+              // This route bypasses the registry, so finalize here (RFL rf-4
+              // fence (c)); only this binding's own run, never a warm
+              // transition's source identity, which its rotation revokes.
+              const routedRunId = attachmentIdentity?.runId ?? input.binding.runId;
+              if (reason === "finalize" && routedRunId === input.binding.runId) {
+                await revokeRunnerPrpRunCredentials(authority, routedRunId, "run_finalized");
+              }
             },
           };
         },

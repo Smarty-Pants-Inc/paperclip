@@ -56,7 +56,11 @@ export interface RunnerExecutionDriver {
      * treating a dropped connection as transport loss, so a Core-dialed route
      * neither redials nor fails; keep the established receive/ACK path. */
     quiesce?: () => void;
-    release: (reason?: "detach") => Promise<void> | void;
+    /** "finalize": the run's session ended with its trace proven drained, so
+     * its PRP credentials are revoked (RFL rf-4 fence (c)). "detach" hands the
+     * live runner to a restarted controller. No reason releases the route
+     * only (startup/attach failure, warm park); the credential is kept. */
+    release: (reason?: "detach" | "finalize") => Promise<void> | void;
   }>;
   /** Register source and target checkpoint ownership before staging changes the stored run. */
   onStagedRunAttachment?: (authority: DurablePrpControlPlane, proof: {

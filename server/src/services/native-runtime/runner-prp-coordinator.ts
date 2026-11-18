@@ -452,7 +452,10 @@ export function runnerPrpCoordinator(
           released = true;
           releaseQuestionTarget();
           authority.disconnectActiveRunner();
-          await registration.release();
+          // Finalize (revoke the run's PRP credentials, RFL rf-4 fence (c))
+          // only once the server holds the runner's run.terminal event, its
+          // last committed event; otherwise keep it for recovery.
+          await registration.release(completedRun ? "finalize" : undefined);
         },
       };
     },

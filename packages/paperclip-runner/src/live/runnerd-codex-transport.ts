@@ -4423,7 +4423,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #controlPlaneCheckpoint:
     ((settlement: "settled" | "unsettled") => Promise<void> | void) | null =
     null;
-  #controlPlaneRelease: ((reason?: "detach") => Promise<void> | void) | null = null;
+  #controlPlaneRelease: ((reason?: "detach" | "finalize") => Promise<void> | void) | null = null;
   #controlPlaneEnsureConnected: ((input: { deadline: number; signal: AbortSignal }) => Promise<void>) | null = null;
   /** Quiesce hooks of the registered routes that have not been released yet. */
   readonly #controlPlaneQuiesces = new Set<() => void>();
@@ -5062,7 +5062,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ...Object.getOwnPropertyDescriptors(registration),
       release: {
         enumerable: true,
-        value: (reason?: "detach") => {
+        value: (reason?: "detach" | "finalize") => {
           this.#controlPlaneQuiesces.delete(quiesce);
           return release.call(registration, reason);
         },
@@ -6375,7 +6375,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         release: release && (async () => {
           const releaseStartedAt = Date.now();
           try {
-            await release();
+            // Finalization revokes the run's PRP credentials only once its
+            // trace is proven drained: the runner.drain round trip above
+            // (#drainSettledProviderEventsBeforeSuspend) and no pending
+            // provider events. Otherwise the credential is kept for the
+            // recovery that may still deliver those events (RFL rf-4 (c), R5).
+            await release(settledApartFromSuspension() ? "finalize" : undefined);
           } catch (error) {
             releaseFailed = true;
             throw error;
@@ -10140,8 +10145,10 @@ export async function probeNativeRunnerEnvironment(options: {
         controller.signal.throwIfAborted();
         registrationCleanupConfirmed = false;
         const registration = await options.transportOptions!.controlPlaneRegistration!(authority, identity, controller.signal);
-        const release = () => registrationReleaseOperation ??= Promise.resolve()
-          .then(() => registration.release())
+        // Forward only finalization (RFL rf-4 fence (c)); other reasons keep
+        // this wrapper's prior route-only release.
+        const release = (reason?: "detach" | "finalize") => registrationReleaseOperation ??= Promise.resolve()
+          .then(() => registration.release(reason === "finalize" ? "finalize" : undefined))
           .then(() => { registrationCleanupConfirmed = true; }, error => {
             registrationReleaseFailed = true;
             registrationTeardownError = error;

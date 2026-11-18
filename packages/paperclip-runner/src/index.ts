@@ -48,6 +48,8 @@ export {
   type DurablePrpControlPlaneOptions,
   type DurablePrpCheckpoint,
   type DurablePrpConnectionLeaseFailure,
+  type DurablePrpCredentialRefusal,
+  type DurablePrpCredentialRevocationReason,
   decodeDurablePrpCheckpoint,
   captureLegacyDurablePrpCheckpoint,
   inspectDurablePrpCheckpointHeader,

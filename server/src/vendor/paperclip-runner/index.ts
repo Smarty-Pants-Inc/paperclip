@@ -75,6 +75,8 @@ export type {
   RunnerLaunchPreparer,
   DurableRecoveryIdentity,
   DurablePrpCheckpoint,
+  DurablePrpCredentialRefusal,
+  DurablePrpCredentialRevocationReason,
   RunnerProcessHandle,
   RunnerProcessLaunchSpec,
   StrictCompletionContractInput,

@@ -3,6 +3,7 @@ import type { Duplex } from "node:stream";
 
 import type {
   DurablePrpControlPlane,
+  DurablePrpCredentialRevocationReason,
   HarnessRuntimeRequestResolution,
 } from "../vendor/paperclip-runner/index.js";
 import {
@@ -106,13 +107,51 @@ export function setupRunnerPrpWebSocketServer(
   );
 }
 
+/**
+ * Why a route is released. Only "finalize" (the run's session ended with its
+ * trace drained) revokes the run's PRP credentials. No reason (startup and
+ * attach failures, a warm park, a retired transition source) and "detach" (a
+ * controller restart) keep the credential: a recovery rotation or a successor
+ * claim may still need it, and that rotation revokes it.
+ */
+export type RunnerPrpRouteReleaseReason = "detach" | "finalize";
+
+/**
+ * Revoke a finalized or superseded run's PRP credentials (RFL rf-4 fence (c))
+ * through the authority's own revoke, which first lets every frame it already
+ * received commit. An authority another registered run still routes (a warm
+ * transition on one shared core) is left to its own rotation. Route-only test
+ * doubles have no revoke. A failure keeps the credential (it still expires)
+ * and is logged; it never fails the release.
+ */
+export async function revokeRunnerPrpRunCredentials(
+  authority: DurablePrpControlPlane,
+  runId: string,
+  reason: DurablePrpCredentialRevocationReason,
+): Promise<void> {
+  for (const [registeredRunId, registration] of registrations) {
+    if (registeredRunId !== runId && registration.authority === authority) return;
+  }
+  if (typeof authority.revokeRunCredentials !== "function") return;
+  try {
+    const revoked = await authority.revokeRunCredentials(runId, reason);
+    if (revoked > 0) logger.info({ runId, reason, revoked }, "revoked runner PRP credentials");
+  } catch (error) {
+    logger.warn(
+      { runId, reason, errorName: error instanceof Error ? error.name : typeof error,
+        errorMessage: error instanceof Error ? error.message : undefined },
+      "failed to revoke runner PRP credentials; the credential stays valid until it expires",
+    );
+  }
+}
+
 export async function registerRunnerPrpAuthority(input: {
   readonly companyId: string;
   readonly issueId?: string;
   readonly agentId?: string;
   readonly runId: string;
   readonly authority: DurablePrpControlPlane;
-}): Promise<{ readonly connectUrl: string; release(): Promise<void> }> {
+}): Promise<{ readonly connectUrl: string; release(reason?: RunnerPrpRouteReleaseReason): Promise<void> }> {
   const apiUrl = new URL(resolveLocalRuntimeApiUrl());
   apiUrl.protocol = "ws:";
   const loopbackOrigin = apiUrl.origin;
@@ -140,6 +179,18 @@ export async function registerRunnerPrpAuthority(input: {
       })
     : null;
   if (currentKey !== null) {
+    // Supersession: a successor run for the same company/issue/agent takes the
+    // live slot from a different authority. The predecessor's credentials stop
+    // authorizing once its received frames commit; the successor never waits.
+    const previous = currentLiveAuthorities.get(currentKey);
+    const previousRegistration = previous ? registrations.get(previous.runId) : undefined;
+    if (
+      previous && previous.runId !== input.runId &&
+      previousRegistration?.generation === previous.generation &&
+      previousRegistration.authority !== input.authority
+    ) {
+      void revokeRunnerPrpRunCredentials(previousRegistration.authority, previous.runId, "run_superseded");
+    }
     currentLiveAuthorities.set(currentKey, {
       runId: input.runId,
       generation,
@@ -147,8 +198,9 @@ export async function registerRunnerPrpAuthority(input: {
   }
   return {
     connectUrl: `${loopbackOrigin}${CONNECT_PATH_PREFIX}${input.runId}`,
-    release: async () => {
-      if (registrations.get(input.runId)?.generation === generation) {
+    release: async (reason?: RunnerPrpRouteReleaseReason) => {
+      const finalized = registrations.get(input.runId)?.generation === generation;
+      if (finalized) {
         registrations.delete(input.runId);
       }
       if (currentKey !== null) {
@@ -159,6 +211,11 @@ export async function registerRunnerPrpAuthority(input: {
         ) {
           currentLiveAuthorities.delete(currentKey);
         }
+      }
+      // Finalization: the run's session released its route for good. Only
+      // the current generation's first release revokes (idempotent).
+      if (finalized && reason === "finalize") {
+        await revokeRunnerPrpRunCredentials(input.authority, input.runId, "run_finalized");
       }
     },
   };
