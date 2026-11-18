@@ -746,14 +746,25 @@ function redactStandaloneBearerCredentials(input: string): string {
     // Only plain prose may bypass the base credential mask. Inspect the whole
     // whitespace-delimited word, not just the credential parser's structural
     // prefix (so `word;123` cannot pass as `word`). Quotes are never stripped,
-    // including an opening quote immediately before Bearer itself.
+    // including quotes separated from the phrase by same-line whitespace.
     let proseEnd = credentialStart;
     while (proseEnd < input.length && !/\s/.test(input[proseEnd])) proseEnd += 1;
     const proseWord = input
       .slice(credentialStart, proseEnd)
       .replace(/[.,;:!?)\]]+$/, "");
+    let beforeBearer = match.index - 1;
+    while (
+      beforeBearer >= 0 &&
+      /[^\S\r\n]/.test(input[beforeBearer])
+    ) beforeBearer -= 1;
+    let afterWord = proseEnd;
+    while (
+      afterWord < input.length &&
+      /[^\S\r\n]|[.,;:!?)\]]/.test(input[afterWord])
+    ) afterWord += 1;
     if (
-      !/["'`]/.test(input[match.index - 1] ?? "") &&
+      !/["'`]/.test(input[beforeBearer] ?? "") &&
+      !/["'`]/.test(input[afterWord] ?? "") &&
       proseWord.length < 20 &&
       /^[A-Za-z][a-z]*(?:-[a-z]+)?$/.test(proseWord)
     ) continue;
