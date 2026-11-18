@@ -170,6 +170,18 @@ describePostgres("heartbeat provider usage limit wait", () => {
     await heartbeat.sweepStaleIssueLocks();
     await heartbeat.reconcileStrandedAssignedIssues();
     await heartbeat.drainActiveRunExecutions();
+    // baefa0b994e: cancellation alone no longer proves execution Stop. A
+    // crash before settlement must retain the claim and start no successor.
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, f.agentId))).toEqual([{ id: lost.id }]);
+    const [held] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(held.executionRunId).toBe(lost.id);
+    // Model the executor's durable, process-free settlement (heartbeat.ts
+    // finally), then let the same recovery path recover the missing retry.
+    await db.update(heartbeatRuns).set({ executionStage: "settled" }).where(eq(heartbeatRuns.id, lost.id));
+    await heartbeat.sweepStaleIssueLocks();
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.drainActiveRunExecutions();
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
     // Existing stranded-work recovery gives the wake a bounded successor; the gate re-checks the limit when it runs.
     expect(runs.find(run => run.id !== lost.id)).toMatchObject({ status: "scheduled_retry", retryOfRunId: lost.id });
