@@ -116,6 +116,7 @@ import {
 } from "drizzle-orm";
 import { personStopExportPendingHoldsAdmission } from "./person-stop-release-export.js";
 import type { Db } from "@paperclipai/db";
+import { personStopHoldsSavedWake } from "../person-stop-held-input.js";
 import {
   agents,
   caseHandoffs,
@@ -5234,8 +5235,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   )
                   .orderBy(asc(agentWakeupRequests.requestedAt))
               : [];
+          // adopt-stopu-f3split: a person's messages saved before that person's
+          // Stop wait for Send; a later message's run never adopts them.
+          const stopHeldWakeIds = new Set<string>();
+          for (const wake of pendingComments) {
+            if (wake.id === executionWaitRequestId || wake.id === opts.queuedCommentInterruptId ||
+                wake.id === opts.queuedCommentRequestId || wake.requestedByActorType !== "user") continue;
+            if (await personStopHoldsSavedWake(tx as unknown as Db, wake, issue.id)) stopHeldWakeIds.add(wake.id);
+          }
           const adoptedComments = pendingComments.filter((wake) => {
             if (wake.id === executionWaitRequestId) return true;
+            if (stopHeldWakeIds.has(wake.id)) return false;
             if (wake.id === opts.queuedCommentInterruptId || wake.id === opts.queuedCommentRequestId) return true;
             const deferredPayload = parseObject(wake.payload);
             const deferredContext = parseObject(

@@ -1153,7 +1153,13 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
       { companyId, agentId, issueId, chatConversationId, durableActor },
     ) {
       const tx = requireAdmissionTx(scope, companyId);
-      const row = await tx
+      // adopt-stopu-f3split: a wake held by the person's Stop (saved before that
+      // Stop, no Send) never absorbs a later message: the post-Stop message gets
+      // its own wake, which is not held and runs; the held one waits for Send.
+      const heldByStop: string[] = [];
+      let row: typeof agentWakeupRequests.$inferSelect | null = null;
+      while (true) {
+      row = await tx
         .select()
         .from(agentWakeupRequests)
         .where(
@@ -1161,6 +1167,7 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+            heldByStop.length ? notInArray(agentWakeupRequests.id, heldByStop) : undefined,
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
             // A saved card response (interaction receipt) never absorbs user
             // input. Skip it so a later message joins the existing message
@@ -1197,6 +1204,12 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
         .limit(1)
         .then((rows) => rows[0] ?? null);
       if (!row) return null;
+      if (row.requestedByActorType === "user" && await personStopHoldsSavedWake(tx as unknown as Db, row, issueId)) {
+        heldByStop.push(row.id);
+        continue;
+      }
+      break;
+      }
       const payload = parseObject(row.payload);
       return {
         id: row.id,
