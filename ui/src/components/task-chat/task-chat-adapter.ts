@@ -74,7 +74,7 @@ export function commentsToTaskChatItems(
   for (const comment of comments) {
     if (comment.deletedAt) continue;
     if (hiddenIds.has(comment.id)) continue;
-    if (comment.conversationSessionGeneration != null) {
+    if (comment.conversationSessionGeneration != null && comment.origin !== "fast_response") {
       items.push({ id: comment.id, kind: "marker", variant: "session_start", label: "New session",
         detail: "Earlier messages and files are still available.", createdAtIso: new Date(comment.createdAt).toISOString() });
       continue;
