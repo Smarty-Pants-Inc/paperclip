@@ -5,6 +5,22 @@ Run-log events write to the `heartbeat_run_events` table
 Paperclip Telemetry events, and they are not OpenTelemetry exports. A run-log
 event needs no operator endpoint.
 
+## Native terminal plugin reservation
+
+`plugin.terminal.claimed` is a core-authored, system-stream debug receipt. Its
+`source_event_id` is `plugin-terminal:<runId>` and its payload holds only the
+plugin envelope `eventId`. The existing unique source-event index permits one
+receipt per run. The status transaction uses the ordinary append helper and
+registers best-effort post-commit publication only for a newly inserted row.
+Rollback discards both the receipt and the publication. Recovery preserves the
+receipt, even when it reopens the run and replaces result/context JSON.
+
+This is bookkeeping, not task progress, a native provider event, or an outbox.
+It has no `prpEvent` envelope, so the native transcript projection ignores it;
+the raw event log may show the debug receipt. Run-liveness action counts exclude
+it. It does not advance a native source cursor or wake recovery/progress readers.
+No first-party Telemetry or OpenTelemetry export is added.
+
 ## Assigned MCP delivery
 
 `tool_gateway.runtime_mcp_delivery` is a system-stream warning when an installed,

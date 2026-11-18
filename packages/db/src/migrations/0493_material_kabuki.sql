@@ -1,1 +1,0 @@
-ALTER TABLE "heartbeat_runs" ADD COLUMN IF NOT EXISTS "terminal_plugin_event_id" uuid;

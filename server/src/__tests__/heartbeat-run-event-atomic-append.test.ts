@@ -1,5 +1,5 @@
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
@@ -86,6 +86,32 @@ describeEmbeddedPostgres("atomic ordinary run events", () => {
     expect(receipt.row.createdAt).toBeInstanceOf(Date);
     expect(await readEvents(runId)).toEqual([receipt.row]);
     expect(statements).toHaveLength(1);
+  });
+
+  // KEEP: #20991 exactly-once receipt must survive races, rollback and JSON rewrites.
+  it("claims one durable core receipt across connections without joining a native cursor", async () => {
+    const runId = await makeRun();
+    const input = { companyId, agentId, runId, eventType: "plugin.terminal.claimed",
+      sourceEventId: `plugin-terminal:${runId}`, payload: { eventId: "first-envelope" } };
+    await expect(db.transaction(async tx => {
+      expect((await appendHeartbeatRunEvent(tx as unknown as typeof db, input)).disposition).toBe("committed");
+      throw new Error("rollback receipt");
+    })).rejects.toThrow("rollback receipt");
+    expect(await readEvents(runId)).toEqual([]);
+    expect((await readRun(runId)).nextEventSeq).toBe(1);
+    const receipts = await Promise.all([db, otherDb].map(connection => appendHeartbeatRunEvent(connection, input)));
+    expect(receipts.map(receipt => receipt.disposition).sort()).toEqual(["committed", "duplicate"]);
+    expect(receipts[0].row).toEqual(receipts[1].row);
+    expect(receipts[0].row).toMatchObject({ seq: 1, sourceEventId: input.sourceEventId,
+      sourceInstanceId: null, sourceSeq: null, sourcePayloadSha256: null, protocolSchemaVersion: null });
+    await otherDb.update(heartbeatRuns).set({ contextSnapshot: {}, resultJson: {} }).where(eq(heartbeatRuns.id, runId));
+    const replay = await appendHeartbeatRunEvent(otherDb, { ...input, payload: { eventId: "not-the-winner" } });
+    expect(replay).toEqual({ row: receipts[0].row, disposition: "duplicate", highestContiguousSourceSeq: 0 });
+    expect((await readRun(runId)).nextEventSeq).toBe(2);
+    expect((await appendHeartbeatRunEvent(otherDb, nativeEvent(runId, 1))).highestContiguousSourceSeq).toBe(1);
+    expect((await readEvents(runId)).map(row => [row.seq, row.sourceSeq])).toEqual([[1, null], [2, 1]]);
+    await expect(appendHeartbeatRunEvent(db, { ...input, companyId: randomUUID() }))
+      .rejects.toThrow("heartbeat_run_event_binding_mismatch");
   });
 
   it("shares the run lock and sequence with native writers on separate connections", async () => {

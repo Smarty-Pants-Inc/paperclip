@@ -1,6 +1,6 @@
 {
-  "id": "bb0df738-2162-410b-bf1a-ed8d642d86bf",
-  "prevId": "a0757941-5d7d-4617-9bf7-15172ff0c122",
+  "id": "349cdd89-db04-4340-a5d3-3b877bf7227d",
+  "prevId": "d5d69127-12de-4281-9816-c20e013bfeb7",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -2381,12 +2381,6 @@
           "primaryKey": false,
           "notNull": true,
           "default": "now()"
-        },
-        "revoked_at": {
-          "name": "revoked_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
         }
       },
       "indexes": {},
@@ -35113,12 +35107,6 @@
           "primaryKey": false,
           "notNull": false
         },
-        "terminal_plugin_event_id": {
-          "name": "terminal_plugin_event_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
         "error": {
           "name": "error",
           "type": "text",
@@ -64134,13 +64122,6 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
-        },
-        "agent_reasoning_display": {
-          "name": "agent_reasoning_display",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'{}'::jsonb"
         },
         "created_at": {
           "name": "created_at",

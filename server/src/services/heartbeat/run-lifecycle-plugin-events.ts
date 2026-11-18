@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, isNull } from "drizzle-orm";
 import { afterDatabaseCommit, heartbeatRuns, type Db } from "@paperclipai/db";
 import { parseObject } from "../../adapters/utils.js";
 import { publishPluginDomainEvent } from "../activity-log.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 
 /**
  * Called inside the status owner's transaction with its locked pre-write row.
@@ -19,12 +19,19 @@ export async function publishTerminalRunLifecyclePluginEventAfterCommit(
   if (after.runtimeMode !== "native" || !["queued", "scheduled_retry", "running"].includes(before.status)
     || !["succeeded", "failed", "timed_out", "cancelled", "interrupted"].includes(after.status)) return;
   const eventId = randomUUID();
-  const [claimed] = await tx.update(heartbeatRuns)
-    .set({ terminalPluginEventId: eventId })
-    .where(and(eq(heartbeatRuns.id, after.id), eq(heartbeatRuns.companyId, after.companyId),
-      isNull(heartbeatRuns.terminalPluginEventId)))
-    .returning({ id: heartbeatRuns.id });
-  if (claimed) afterDatabaseCommit(tx, () => publishRunLifecyclePluginEvent(after, eventId));
+  const claim = await appendHeartbeatRunEvent(tx as Db, {
+    companyId: after.companyId,
+    runId: after.id,
+    agentId: after.agentId,
+    sourceEventId: `plugin-terminal:${after.id}`,
+    eventType: "plugin.terminal.claimed",
+    stream: "system",
+    level: "debug",
+    payload: { eventId },
+  });
+  if (claim.disposition === "committed") {
+    afterDatabaseCommit(tx, () => publishRunLifecyclePluginEvent(after, eventId));
+  }
 }
 
 /** Publish after the owning status transaction commits, only for its winning transition. */

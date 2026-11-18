@@ -1370,20 +1370,25 @@ boundary; existing database work hints retain their own settlement semantics.
 
 ## Native terminal plugin-event identity
 
-`heartbeat_runs.terminal_plugin_event_id` reserves the first native terminal
-plugin event in the same transaction as the terminal status write. The event
-uses that UUID and is dispatched only after the outermost confirmed commit.
-All terminal status owners await the shared reservation; a rollback releases
-it. Workspace recovery, retry, restart and resumption must not clear it when
-reopening the same run. Later terminal writes may repair status and diagnostics,
-but cannot publish another lifecycle end for that run.
+An append-only `heartbeat_run_events` receipt with source identity
+`plugin-terminal:<runId>` reserves the first native terminal plugin event in the
+same transaction as the terminal status write. The existing unique
+`(run_id, source_event_id)` index arbitrates the claim with `ON CONFLICT DO
+NOTHING ... RETURNING`. Only a newly inserted receipt registers publication.
+The ordinary append helper allocates its run sequence; the receipt's payload
+stores the plugin envelope UUID, without joining any native source cursor.
 
-Migration `0493` adds one nullable UUID to the existing run row, with no table,
-index or backfill. A dedicated column survives full result/context JSON rewrites
-and can be claimed atomically. Historical nulls do not assert that an older
-release published an event; no historical publication is replayed by migration.
-Delivery remains best-effort: this reservation is not an outbox and does not
-retry a failed publication or an unconfirmed commit response.
+All terminal status owners await the shared reservation; a rollback releases
+it. Workspace recovery, retry, restart and resumption preserve run events when
+reopening the same run, including across full result/context JSON rewrites.
+Later terminal writes may repair status and diagnostics, but cannot publish
+another lifecycle end for that run. The receipt is retained until the owning
+agent or company is deleted along with its runs.
+
+No schema change, migration or backfill is required. An absent receipt cannot
+establish whether an older release already published an event. Delivery remains
+best-effort: this reservation is not an outbox and does not retry a failed
+publication or an unconfirmed commit response.
 
 ## Schema change workflow
 

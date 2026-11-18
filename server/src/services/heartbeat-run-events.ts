@@ -30,6 +30,8 @@ export interface AppendHeartbeatRunEventInput {
     scheduledRetryAttempt: number;
     maxAttempts: number;
   };
+  /** Core-authored idempotent receipt, independent of the native source cursor. */
+  sourceEventId?: string;
   nativeSource?: {
     sourceInstanceId: string;
     sourceEventId: string;
@@ -125,10 +127,11 @@ async function appendHeartbeatRunEventOnce(
   const projectsProgress = isSafeNativeChatProgressEventType(input.eventType);
   const projectsResponse = isNativeResponseEvidence(input.eventType, input.payload?.prpEvent);
   // Deduplicated receipts return without allocating, so they cannot carry run changes.
-  if (input.runUpdate && (input.nativeSource || input.retryExhaustion)) throw new Error("heartbeat_run_event_run_update_unsupported");
+  if (input.sourceEventId && input.nativeSource) throw new Error("heartbeat_run_event_source_identity_unsupported");
+  if (input.runUpdate && (input.nativeSource || input.retryExhaustion || input.sourceEventId)) throw new Error("heartbeat_run_event_run_update_unsupported");
   const wakes = { recovery: projectsRecovery, reassessment: projectsReassessment, progress: projectsProgress,
     response: projectsResponse, retention: projectsRetention };
-  if (!input.runUpdate && !input.nativeSource && !input.retryExhaustion && !input.assertWritable && !Object.values(wakes).some(Boolean)) {
+  if (!input.runUpdate && !input.nativeSource && !input.sourceEventId && !input.retryExhaustion && !input.assertWritable && !Object.values(wakes).some(Boolean)) {
     const [appended] = await db.execute<Record<string, unknown>>(sql`
       with allocated_run_event as (
         update heartbeat_runs
@@ -298,6 +301,15 @@ async function appendLockedEvent(
     throw new Error("heartbeat_run_event_binding_mismatch");
   }
 
+  // A core receipt uses the existing unique (run_id, source_event_id) index,
+  // without inventing a native source instance/sequence or advancing its cursor.
+  const readSourceReceipt = async () => input.sourceEventId ? (await tx.select().from(heartbeatRunEvents)
+    .where(and(eq(heartbeatRunEvents.runId, input.runId), eq(heartbeatRunEvents.companyId, input.companyId),
+      eq(heartbeatRunEvents.agentId, input.agentId), eq(heartbeatRunEvents.sourceEventId, input.sourceEventId)))
+    .limit(1))[0] : undefined;
+  const existingSourceReceipt = await readSourceReceipt();
+  if (existingSourceReceipt) return { row: existingSourceReceipt, disposition: "duplicate", highestContiguousSourceSeq: 0 };
+
   if (wakes.recovery) await notifyLiveRunRecovery(tx, input);
 
   if (input.retryExhaustion) {
@@ -337,7 +349,7 @@ async function appendLockedEvent(
   }
   if (wakes.retention) await notifyAttentionRetentionWork(tx, { companyId: input.companyId, sourceKind: "failed_run" });
   const seq = await allocateHeartbeatRunEventSeq(tx, input.runId, input.runUpdate);
-  const [row] = await tx.insert(heartbeatRunEvents).values({
+  const insert = tx.insert(heartbeatRunEvents).values({
     companyId: input.companyId,
     runId: input.runId,
     agentId: input.agentId,
@@ -348,8 +360,17 @@ async function appendLockedEvent(
     color: input.color ?? null,
     message: input.message ?? null,
     payload: input.payload ?? null,
-  }).returning();
-  if (!row) throw new Error("heartbeat_run_event_not_persisted");
+    sourceEventId: input.sourceEventId ?? null,
+  });
+  const [row] = input.sourceEventId
+    ? await insert.onConflictDoNothing({ target: [heartbeatRunEvents.runId, heartbeatRunEvents.sourceEventId],
+      where: sql`${heartbeatRunEvents.sourceEventId} is not null` }).returning()
+    : await insert.returning();
+  if (!row) {
+    const existing = await readSourceReceipt();
+    if (existing) return { row: existing, disposition: "duplicate", highestContiguousSourceSeq: 0 };
+    throw new Error("heartbeat_run_event_not_persisted");
+  }
   return { row, disposition: "committed" as const, highestContiguousSourceSeq: 0 };
 }
 

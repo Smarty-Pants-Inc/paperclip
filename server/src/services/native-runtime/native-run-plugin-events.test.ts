@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
-import { agents, companies, completionContracts, createDb, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
+import { agents, companies, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { CONTROL_PLANE_CONFORMANCE_RESULT, CONTROL_PLANE_CONFORMANCE_TERMINAL } from "../../vendor/paperclip-runner/testing.js";
 import { setPluginEventBus } from "../activity-log.js";
@@ -154,6 +154,16 @@ describe.skipIf(!support.supported)("native terminal plugin events", () => {
         payload: { runId: f.runId, agentId: f.agentId, issueId: f.issueId, status: "succeeded",
           startedAt: run.startedAt!.toISOString(), finishedAt: run.finishedAt!.toISOString() } });
       expect(f.committedStatuses).toEqual(["succeeded"]);
+      const reader = createDb(temporary.connectionString);
+      try {
+        const claims = await reader.select().from(heartbeatRunEvents).where(and(
+          eq(heartbeatRunEvents.runId, f.runId), eq(heartbeatRunEvents.companyId, f.companyId),
+          eq(heartbeatRunEvents.sourceEventId, `plugin-terminal:${f.runId}`),
+        ));
+        expect(claims).toHaveLength(1);
+        expect(claims[0]).toMatchObject({ eventType: "plugin.terminal.claimed", sourceInstanceId: null,
+          sourceSeq: null, payload: { eventId: f.events[0].eventId } });
+      } finally { await reader.$client.end(); }
     },
   );
 });

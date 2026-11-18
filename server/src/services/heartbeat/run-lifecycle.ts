@@ -263,6 +263,7 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
 ];
 
 const LIVENESS_BOOKKEEPING_EVENT_TYPES = [
+  "plugin.terminal.claimed",
   "lifecycle",
   "adapter.invoke",
   "error",
