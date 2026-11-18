@@ -47,6 +47,8 @@ export type StrandedRetryAdmission =
   | { admits: false; refusal: "agent_paused"; agentName?: string | null }
   | { admits: false; refusal: "workspace_repair_required" }
   | { admits: false; refusal: "previous_execution_unverified" }
+  | { admits: false; refusal: "budget_blocked" }
+  | { admits: false; refusal: "daily_limit"; agentName?: string | null }
   | { admits: false; refusal: "none" };
 
 const MENTIONS_RETRY = /\bretry\b/i;
@@ -70,6 +72,18 @@ export function strandedRetryRefusalCopy(retry: Exclude<StrandedRetryAdmission, 
         body: "This attempt could not be finished automatically. Paperclip can't confirm that the previous attempt stopped, so Retry can't continue from it. Your message is saved.",
         nextAction: "Press Confirm it stopped once the previous attempt has stopped.",
       };
+    case "budget_blocked":
+      return {
+        body: "This attempt could not be finished automatically, and the budget does not allow new work, so Retry can't start it. Your message is saved.",
+        nextAction: "Raise the budget in Costs.",
+      };
+    case "daily_limit": {
+      const name = retry.agentName?.trim() || "This agent";
+      return {
+        body: `This attempt could not be finished automatically, and ${name} reached its daily limit, so Retry can't start it now. Your message is saved.`,
+        nextAction: `Raise ${name}'s daily limit in its settings. The limit resets at 00:00 UTC.`,
+      };
+    }
     default:
       return {
         body: "This attempt could not be finished automatically. Your message is saved.",
