@@ -137,6 +137,50 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, at, nativeSuccessor };
   }
 
+  // ANSWERED (completedPersonMessageAnswerSql), read directly. Loaded dynamically so this file also runs (RED) on a
+  // base whose person-message-answer.ts has only answeredPersonMessageSql (DELIVERED).
+  const isAnswered = async (f: { companyId: string; issueId: string }, messageId: string) => {
+    const module = await import("../person-message-answer.js") as Record<string, unknown>;
+    const answered = (module.completedPersonMessageAnswerSql ?? module.answeredPersonMessageSql) as
+      (m: { id: unknown; companyId: unknown; issueId: unknown; createdAt: unknown }) => ReturnType<typeof sql>;
+    return (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.id, messageId),
+      answered({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })))).length > 0;
+  };
+  // What the continuation carry writes (continuation-comment-input.ts): the message in the successor's OWN context.
+  const carryOwnInput = async (runId: string, messageId: string) => {
+    const [row] = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...(row!.context as Record<string, unknown> ?? {}),
+      wakeCommentIds: [messageId], wakeCommentId: messageId } }).where(eq(heartbeatRuns.id, runId));
+  };
+
+  // RFL F1 (21:28Z), ANSWERED: a cut run's progress reply is DELIVERED only. The sweep owes ONE true notice
+  // and the carry still carries the message. RED at base 44d8ec736 (silence: the progress reply "answered").
+  it.each([true, false])("RFL F1: a message whose run posts a progress comment then FAILS, with no successor -> ONE true notice; the carry carries it (chat=%s)", async chat => {
+    const f = await fixture({ chat, status: "in_progress" });
+    const messageId = await f.message("Summarise the report.");
+    const failed = await f.run({ commentId: messageId, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    await f.reply(failed);
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed" });
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
+    expect(await readContinuationCommentInput(db, { ...f, runId: failed })).toMatchObject({ wakeCommentIds: [messageId] });
+    expect(await isAnswered(f, messageId)).toBe(false);
+  });
+
+  it.each([true, false])("RFL F1 control: a completed run's final answer -> ANSWERED, no notice, nothing carried (chat=%s)", async chat => {
+    const f = await fixture({ chat, status: "in_progress" });
+    const messageId = await f.message("Summarise the report.");
+    const done = await f.run({ commentId: messageId, status: "succeeded" });
+    await f.reply(done);
+    expect(await isAnswered(f, messageId)).toBe(true);
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    expect(await f.visible()).toHaveLength(0);
+    expect(await readContinuationCommentInput(db, { ...f, runId: done })).toEqual({});
+  });
+
   const codeOf = (comment: { metadata: unknown }) => {
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
     return sections.flatMap(section => section.rows).find(row => row.label === "Failure code")?.value;
@@ -592,7 +636,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
-  it.each(["retry", "native-status"])("supersedes(D10 row 12): ordered chain rule: PV2b chain: a comment-less %s continuation supersedes its ancestor's notice", async kind => {
+  it.each(["retry", "native-status"])("supersedes(ANSWERED blob, RFL 21:28Z/22:41Z): supersedes(D10 row 12): ordered chain rule: PV2b chain: a comment-less %s continuation supersedes its ancestor's notice", async kind => {
+    // Reason: ANSWERED attributes a reply only through the replying run's OWN pending input (RFL F2 22:41Z), never
+    // continuation ancestry. A comment-less continuation's reply does not answer; once it carries the message as its
+    // own input (as the carry writes it), its completed final answer does and supersedes the notice.
     const f = await fixture();
     const commentId = await f.message("What about my follow-up?");
     const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_workspace_required" });
@@ -603,6 +650,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const continuation = kind === "native-status" ? await f.nativeSuccessor(failed)
       : await f.run({ commentId: null, status: "succeeded", retryOfRunId: failed, wakeReason: "issue_continuation_needed" });
     await f.reply(continuation);
+    expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId })).toEqual({ kind: "noticed_before" });
+    expect(await f.visible()).toHaveLength(1);
+    await carryOwnInput(continuation, commentId);
     const outcome = await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
     expect(outcome).toEqual({ kind: "answered" });
     expect(await f.visible()).toHaveLength(0);
@@ -1352,7 +1402,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   it.each([
     ["carrying", "context"], ["continuation", "context"], ["carrying", "delivery"], ["continuation", "delivery"],
   ] as const)(
-    "PV2b chain: message -> %s card -> answer-resume (%s) fails -> successor final never gets a resend notice", async (cardSource, answerLink) => {
+    "supersedes(ANSWERED blob, RFL 21:28Z/22:41Z): PV2b chain: message -> %s card -> answer-resume (%s) fails -> successor final never gets a resend notice", async (cardSource, answerLink) => {
+      // Reason: a card answers only its source run's OWN pending input (RFL F2 22:41Z). A continuation's card answers
+      // the message only when that continuation carries it as its own input (as the carry writes it).
       const f = await fixture({ status: "in_review" });
       const messageId = await f.message("Build Sol; ask me for the name first.");
       const carryingRunId = await f.run({ commentId: messageId, status: "succeeded" });
@@ -1363,6 +1415,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         addresseeUserId: f.userId, continuationPolicy: "wake_assignee", createdAt: f.at(),
         payload: { version: 1, questions: [{ id: "name", prompt: "What is the product called?", required: true,
           selectionMode: "single", options: [{ id: "sol", label: "Sol" }] }] } }).returning();
+      if (cardSource === "continuation") {
+        expect(await isAnswered(f, messageId)).toBe(false);
+        await carryOwnInput(sourceRunId, messageId);
+      }
       const noticesEver = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
         sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
@@ -1395,7 +1451,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect((await db.select().from(issueComments).where(eq(issueComments.id, stale!.id)))[0]!.deletedAt).not.toBeNull();
     });
 
-  it("PV2b chain: a final after multiple failed ancestors answers without copied input ids or a card", async () => {
+  it("supersedes(ANSWERED blob, RFL 21:28Z/22:41Z): PV2b chain: a final after multiple failed ancestors answers only with the message as its own input", async () => {
+    // Reason: ANSWERED never attributes through continuation ancestry (RFL F2 22:41Z). Ancestry alone: not answered,
+    // still carried. The final that holds the message as its own input (as the carry writes it) answers it.
     const f = await fixture();
     const messageId = await f.message();
     const root = await f.run({ commentId: messageId, status: "failed", errorCode: "native_run_failed" });
@@ -1404,6 +1462,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, previousRunId: resume,
       wakeReason: "native_status_decision" } }).where(eq(heartbeatRuns.id, final));
     await f.reply(final);
+    expect(await isAnswered(f, messageId)).toBe(false);
+    expect(await readContinuationCommentInput(db, { ...f, runId: root })).toMatchObject({ wakeCommentIds: [messageId] });
+    await carryOwnInput(final, messageId);
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
@@ -1451,9 +1512,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
     });
 
-  it("PV2b chain: a pending output-cap continuation never asks for a resend; its final answers the chain", async () => {
+  it("supersedes(ANSWERED blob, RFL 21:28Z/22:41Z): PV2b chain: a pending output-cap continuation never asks for a resend; its final answers the chain", async () => {
+    // Reason: the final answers only once the continuation holds the message as its OWN input (RFL F2 22:41Z);
+    // ancestry alone is not attribution. The waiting rules above are unchanged.
     const f = await fixture();
-    const root = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_run_failed" });
+    const messageId = await f.message();
+    const root = await f.run({ commentId: messageId, status: "failed", errorCode: "native_run_failed" });
     // The sweep observes the durable continuation, not a provider-specific
     // output-cap string. No input ids need to be copied into its context.
     const successor = await f.nativeSuccessor(root, "queued");
@@ -1473,6 +1537,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect((await f.visible()).every(note => !note.body.includes("Sending it again"))).toBe(true);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, successor));
     await f.reply(successor);
+    expect(await isAnswered(f, messageId)).toBe(false);
+    await carryOwnInput(successor, messageId);
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     expect(await f.visible()).toHaveLength(0);
   });

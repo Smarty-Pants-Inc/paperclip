@@ -1,7 +1,7 @@
 import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issueComments, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
-import { answeredPersonMessageSql } from "./person-message-answer.js";
+import { completedPersonMessageAnswerSql } from "./person-message-answer.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -32,9 +32,10 @@ async function pendingPersonCommentInput(db: Pick<Db, "select">, input: {
   const rows = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     inArray(issueComments.id, candidates), isNull(issueComments.deletedAt),
-    // Only still-pending input: a comment with a PUBLISHED agent answer attributed to it (or to a later person
-    // input) is never re-presented, or every continuation re-answers it (the re-wake loop, org 19:48Z).
-    sql`not ${answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+    // Only still-pending input: carry unless ANSWERED. A message a completed run's final answer answered (attributed
+    // through that run's own pending input) is never re-presented, or every continuation re-answers it (org 19:48Z).
+    // A failed run's progress reply is DELIVERED only: the message is still carried (RFL F1, 21:28Z).
+    sql`not ${completedPersonMessageAnswerSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`,
   )).orderBy(asc(issueComments.createdAt), asc(issueComments.id));
   const commentIds = rows.map(row => row.id);
