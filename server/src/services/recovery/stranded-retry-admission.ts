@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { agents, issues, type Db } from "@paperclipai/db";
 import { taskInterruptionPresentation } from "../task-interruption-presentation.js";
-import type { StrandedRetryAdmission } from "./stranded-notice.js";
+import { strandedRetryRefusalCopy, type StrandedRetryAdmission } from "./stranded-notice.js";
 
 /**
  * Whether the stranded notice may say "Press Retry". It does not decide this
@@ -38,6 +38,27 @@ export async function decideStrandedRetryAdmission(db: Db, input: {
 }
 
 type Presentation = Awaited<ReturnType<typeof taskInterruptionPresentation>>;
+
+/**
+ * r2e: the task's execution blocker (GET /issues/:id `executionBlocker`, read by
+ * agents and the board) says "Retry" only where the screen's one Retry decision
+ * (`taskInterruptionPresentation.canRetry`) offers it. Where the projection
+ * withholds Retry, the blocker's Retry sentences are dropped and the
+ * projection's own next action (the same refusal copy as the stranded notice)
+ * is said instead. No predicate is repeated: `presentation.canRetry` decides.
+ */
+export async function executionBlockerFollowingPresentation<B extends { nextAction: string; canRetry?: boolean }>(
+  db: Db, issue: { companyId: string; assigneeAgentId: string | null }, blocker: B | null, presentation: Presentation,
+): Promise<B | null> {
+  if (!blocker?.canRetry || !presentation || presentation.canRetry) return blocker;
+  const agentName = issue.assigneeAgentId ? (await db.select({ name: agents.name }).from(agents).where(and(
+    eq(agents.companyId, issue.companyId), eq(agents.id, issue.assigneeAgentId))).limit(1))[0]?.name ?? null : null;
+  const admission = strandedRetryAdmissionFromPresentation(presentation, agentName);
+  if (admission.admits) return blocker;
+  const kept = (blocker.nextAction.match(/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g) ?? [])
+    .map(sentence => sentence.trim()).filter(sentence => sentence && !/\bretry\b/i.test(sentence));
+  return { ...blocker, canRetry: false, nextAction: [...kept, strandedRetryRefusalCopy(admission).nextAction].join(" ") };
+}
 
 /** Maps the screen's decision to notice copy. `canRetry` is the decision. */
 export function strandedRetryAdmissionFromPresentation(presentation: Presentation, agentName: string | null): StrandedRetryAdmission {

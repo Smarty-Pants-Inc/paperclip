@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq, ne } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents, authUsers, agentWakeupRequests, budgetPolicies, closeRegisteredClients, companies, companyMemberships, costEvents, createDb,
@@ -321,6 +321,11 @@ describe("Task Retry recovery-card refresh", () => {
       fingerprint: randomUUID(), status: "resolved", outcome: "blocked", nextAction: "Press Retry to continue.",
       evidence: { runId: f.run.id, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true });
+    // r2e: the blocker the task API returns follows the screen (no Retry sentence).
+    const shownU = (await request(appForBoard()).get(`/api/issues/${f.issueId}`).expect(200)).body;
+    console.info("JUDGE_BLOCKER_SHOWN (u)", JSON.stringify(shownU.executionBlocker));
+    expect(shownU.executionBlocker).toMatchObject({ canRetry: false });
+    expect(shownU.executionBlocker.nextAction).not.toMatch(/\bRetry\b/);
     const row = await judge(f);
     expect(row).toMatchObject({ status: 202, runStarted: false, savedWait: "previous_execution_unverified" });
     expect(row).toMatchObject({ admits: false, refusal: "previous_execution_unverified", pressRetry: false, screenCanRetry: false });
@@ -340,10 +345,19 @@ describe("Task Retry recovery-card refresh", () => {
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
     console.info("JUDGE_BLOCKER canRetry-true", JSON.stringify(blocker));
     expect(blocker).toMatchObject({ canRetry: true });
+    // r2e: the blocker the task API returns (GET /issues/:id executionBlocker)
+    // says Retry only where the screen's projection offers it.
+    const shown = (await request(appForBoard()).get(`/api/issues/${f.issueId}`).expect(200)).body;
+    console.info("JUDGE_BLOCKER_SHOWN", JSON.stringify({ executionBlocker: shown.executionBlocker, interruption: shown.interruption }));
+    expect(shown.interruption).toMatchObject({ canRetry: false });
+    expect(shown.executionBlocker.nextAction).not.toMatch(/\bRetry\b/);
+    expect(shown.executionBlocker).toMatchObject({ canRetry: false,
+      nextAction: "It continues once a board user records that the previous attempt stopped; there is no button for this on the task yet." });
     const row = await judge(f);
     expect(row.status).toBe(202);
     expect(row.pressRetry).toBe(row.runStarted);
     expect(row.screenCanRetry).toBe(row.runStarted);
+    expect(/\bRetry\b/.test(shown.executionBlocker.nextAction)).toBe(row.runStarted);
   }, 60_000);
 
   // r2d ST5: the agent is busy (its one concurrency slot is occupied by a
@@ -362,6 +376,58 @@ describe("Task Retry recovery-card refresh", () => {
     expect(row).toMatchObject({ status: 202, runStarted: false });
     // A successor may be queued for the slot; it has not started (startedAt null, no marker).
     expect(row.successorStartedAt.every(at => at === null)).toBe(true);
+    // r2e (RFL 11:11Z): after the press the screen must SAY it waits. The
+    // chat's run line (TaskChatLiveRunPill -> AgentQueueWait) reads the queued
+    // run's execution projection; agent_at_capacity is keyed on the same
+    // concurrency reader dispatch uses (parseHeartbeatPolicy maxConcurrentRuns
+    // vs running runs, queued-run-line.ts agentQueueLinesForRuns).
+    const { executionProjectionForRun } = await import("../services/execution-projection.js");
+    const queued = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId, f.issueId),
+      ne(heartbeatRuns.id, f.run.id))));
+    expect(queued).toHaveLength(1);
+    const successorId = queued[0]!.id;
+    const waitingLine = await executionProjectionForRun(db, f.companyId, successorId);
+    console.info("JUDGE_BUSY_WAITING", JSON.stringify({ waitingLine }));
+    expect(waitingLine).toMatchObject({ cause: "agent_at_capacity",
+      agentQueue: { agentName: "Judge agent", maxConcurrentRuns: 1, runningCount: 1, position: 1, queuedCount: 1 } });
+    expect(waitingLine!.nextAction).toBe("Judge agent is running 1 of 1 tasks at once. This task is 1 of 1 in line and starts automatically when a slot frees.");
+    // The other task's run finishes; the slot frees and dispatch starts the line.
+    resetProcessRunAdmissionForTests();
+    let after: { id: string; status: string; startedAt: Date | null; wakeReason?: string | null }[] = [];
+    try {
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busy!.id));
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, otherIssueId));
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+      // The slot frees outside a finalizer here, so the production queued-run sweep starts the line.
+      await heartbeatService(db).resumeQueuedRuns();
+      for (let i = 0; i < 60; i++) {
+        after = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
+          .from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId, f.issueId), ne(heartbeatRuns.id, f.run.id)));
+        if (after.some(run => run.id === successorId && !!run.startedAt && !["queued", "running"].includes(run.status))) break;
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      // Give any second run the same window to appear before counting.
+      await new Promise(resolve => setTimeout(resolve, 2_000));
+      after = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt,
+        wakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot}->>'wakeReason'` })
+        .from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId, f.issueId), ne(heartbeatRuns.id, f.run.id)));
+    } finally {
+      await heartbeatService(db).drainActiveRunExecutions();
+      closeProcessRunAdmission();
+    }
+    const executed = after.filter(run => run.startedAt && existsSync(path.join(markerDir, run.id))
+      && readFileSync(path.join(markerDir, run.id), "utf8") === run.id);
+    const freed = { successorId, after: after.map(run => ({ ...run, startedAt: run.startedAt?.toISOString() ?? null })),
+      executorMarker: executed.map(run => run.id) };
+    console.info("JUDGE_BUSY_FREED", JSON.stringify(freed));
+    if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: `${expect.getState().currentTestName} (after the slot frees)`,
+      waitingCause: waitingLine!.cause, waitingLine: waitingLine!.nextAction, ...freed })}\n`);
+    // Started = startedAt AND the executor's own marker: the Retry's queued run
+    // starts once the slot frees. Any later run is recorded with its wake
+    // reason (the stub never answers, so the task stays todo; CONTROL shows the
+    // same continuation, r2d finding 5); "no second run" is NOT claimed here.
+    expect([...executed].sort((a, b) => a.startedAt!.getTime() - b.startedAt!.getTime())[0]?.id).toBe(successorId);
+    expect(after.find(run => run.id === successorId)).toMatchObject({ status: "succeeded" });
   }, 60_000);
 
   // (b) the agent's budget hard stop is reached; the queued budget evaluation

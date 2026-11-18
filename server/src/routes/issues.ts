@@ -14,6 +14,7 @@ import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { INBOX_MINE_ISSUE_STATUS_FILTER, latestFailedRunsByAgent } from "@paperclipai/shared";
 import { getHeartbeatRunReadDecisions, redactHeartbeatRunListRow } from "../services/heartbeat-run-privacy.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
+import { executionBlockerFollowingPresentation } from "../services/recovery/stranded-retry-admission.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
 import { ISSUE_SUMMARIES_MAX_IDS, issueChatBootstrapQuerySchema, issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
@@ -10287,7 +10288,10 @@ export function issueRoutes(
     ]);
     const visibleMentionedProjects = mentionedProjects.filter((_, index) => mentionedProjectVisibility[index]);
     // Recovery revalidation may change the blocker; read it afterwards.
-    const executionBlocker = await timing.time("execution_blocker", () => getExecutionBlocker(db, issue.companyId, issue.id));
+    const interruption = await taskInterruptionPresentation(db, issue);
+    // r2e: the blocker's own text follows the screen's one Retry decision.
+    const executionBlocker = await executionBlockerFollowingPresentation(db, issue,
+      await timing.time("execution_blocker", () => getExecutionBlocker(db, issue.companyId, issue.id)), interruption);
     await recordAgentChildTaskRead(db, req, issue);
     res.setHeader("Server-Timing", timing.header());
     res.json({
@@ -10299,7 +10303,7 @@ export function issueRoutes(
       ...(reviewAttention ? { reviewAttention } : {}),
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
       executionBlocker,
-      interruption: await taskInterruptionPresentation(db, issue),
+      interruption,
       scheduledRetry,
       activeRecoveryAction: revalidatedActiveRecoveryAction,
       // Always present, so a cleared stall replaces the cached list.
