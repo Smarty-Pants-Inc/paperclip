@@ -46,6 +46,8 @@ import { hasConfirmedSandboxStopAndRetain } from "../services/sandbox-stop-and-r
 import { executionProjectionsForRuns } from "../services/execution-projection.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { acknowledgedNativeStopExecutionHasStopped } from "../services/acknowledged-native-stop.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 async function waitFor(check: () => Promise<boolean>, ms = 10_000) {
@@ -66,7 +68,9 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     const writable = async (dir: string): Promise<void> => { const st = await fs.lstat(dir).catch(() => null); if (!st?.isDirectory() || st.isSymbolicLink()) return; await fs.chmod(dir, 0o700); for (const entry of await fs.readdir(dir, { withFileTypes: true })) if (entry.isDirectory()) await writable(path.join(dir, entry.name)); };
     if (home) { await writable(home); await fs.rm(home, { recursive: true, force: true }); }
   });
-  async function exercise(mode: "waiting" | "mid_turn", label: string) {
+  // a8 (D2): opts.chat makes the task a chat and sends the message through the real chat
+  // route POST /api/issues/:id/comments (routes/issues.ts:20130-20162).
+  async function exercise(mode: "waiting" | "mid_turn", label: string, opts: { chat?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID(), wakeId = randomUUID();
     const providerLeaseId = `sandbox://fake/${runId}/${randomUUID()}`;
     const remoteCwd = path.join(home, runId); await fs.mkdir(remoteCwd); await fs.writeFile(path.join(remoteCwd, "notes.md"), "stopped edit\n");
@@ -94,8 +98,15 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "observed" });
       await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: -1, eventType: "tool.execution.started", stream: "system" });
     } });
-    const commentId = randomUUID();
+    let commentId = randomUUID();
     const message = async () => {
+      if (opts.chat) {
+        await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+        await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: "rf4-person", conversationState: "active" }).where(eq(issues.id, issueId));
+        const sent = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Please answer next.", clientRequestId: randomUUID() });
+        expect(sent.status, JSON.stringify(sent.body)).toBe(201); commentId = sent.body.id;
+        return db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      }
       await db.insert(issueComments).values({ id: commentId, companyId, issueId, authorType: "user", authorUserId: "rf4-person", body: "Please answer next." });
       return heartbeat.wakeup(agentId, { source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "rf4-person",
         payload: { issueId, commentId }, contextSnapshot: { issueId, commentId, wakeReason: "issue_commented" } });
@@ -117,13 +128,14 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       const admittedAt = Date.now();
       do { await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions(); if (fixture.calls.length > 1) break; await new Promise(r => setTimeout(r, 100)); } while (Date.now() - admittedAt < 10_000);
       const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+      const allLeases = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
       const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
-      const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.contextSnapshot}->>'commentId' = ${commentId}`));
+      const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), sql`(${heartbeatRuns.contextSnapshot}->>'commentId' = ${commentId} or ${heartbeatRuns.contextSnapshot}->'wakeCommentIds' ? ${commentId})`));
       const blocker = await getExecutionBlocker(db, companyId, issueId);
       const projection = (await executionProjectionsForRuns(db, companyId, [runId])).get(runId);
       const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
       const interruption = await taskInterruptionPresentation(db, task);
-      const evidence = { mode, runId, companyId, agentId, issueId, commentId, lease, holds, runs, calls: [...fixture.calls], blocker, projection, interruption,
+      const evidence = { mode, opts, runId, companyId, agentId, issueId, commentId, lease, allLeases, holds, runs, calls: [...fixture.calls], blocker, projection, interruption,
         stopMs, stopResponse, waitingWakes, stopCalls: stop.mock.calls, observedMs: Date.now() - admittedAt, confirmed: hasConfirmedSandboxStopAndRetain(lease) };
       await fs.writeFile(path.join(process.env.TASK_OUT!, `own-${label}.json`), JSON.stringify(evidence, null, 2));
       return { ...evidence, app, heartbeat };
@@ -226,5 +238,43 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       expect(r.blocker?.runId, "the blocker names the failed successor, not the stopped run").toBe(r.runs[0]?.id);
       expect(stopNotes, "the Stop note is still there once").toHaveLength(1);
     } finally { fixture.successorThrows = false; }
+  }, 60_000);
+  // a8 D2 (Fable, FABLE-RESULT.md): acknowledged-native-stop.ts demanded a sandbox
+  // stop receipt from EVERY lease, the twin of the rule e39891d3 removed at
+  // explicit-native-continuation.ts:573. Shape: a released LOCAL lease beside the
+  // stopped sandbox lease (the real flow writes it); messages go in through the
+  // real CHAT route.
+  it("Q1 chat: the held list says the true Stop line, never a recovery or auto-start wait", async () => {
+    const r = await exercise("waiting", "q1-line", { chat: true });
+    await db.update(issues).set({ conversationAgentId: r.agentId, conversationUserId: "rf4-person", conversationState: "active" }).where(eq(issues.id, r.issueId));
+    const queue = (await request(r.app).get(`/api/issues/${r.issueId}/queued-comments`)).body;
+    const [wake] = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, r.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q1-line.json"), JSON.stringify({ queue, wake, leases: r.allLeases }, null, 2));
+    expect(r.allLeases.some(l => l.provider === "local" && !!l.releasedAt) && r.allLeases.some(l => l.provider === "fake"), "the real flow leaves a released local lease beside the sandbox lease").toBe(true);
+    expect(queue.entries.map((e: any) => e.comment.id)).toEqual([r.commentId]); expect((wake.payload as any).executionWait ?? null, "no saved wait on a held message").toBeNull();
+    expect(queue.executionWait).toEqual({ reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." }); }, 60_000);
+  it("Q1 chat (a): a message typed while the box is still stopping runs once after the receipt", async () => {
+    const r = await exercise("mid_turn", "q1-stopping", { chat: true });
+    const later = await sweepRuns(r, 10_000);
+    const successors = later.runs.filter(run => run.id !== r.runId);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, r.agentId));
+    await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q1-stopping.json"), JSON.stringify({ calls: fixture.calls, wakes, leases: r.allLeases,
+      runs: later.runs.map(run => ({ id: run.id, status: run.status, commentId: run.ctx?.commentId, wakeCommentIds: run.ctx?.wakeCommentIds })) }, null, 2));
+    expect(r.allLeases.some(l => l.provider === "local" && !!l.releasedAt) && r.allLeases.some(l => l.provider === "fake")).toBe(true);
+    expect.soft(r.confirmed, "released stop_and_retain receipt").toBe(true);
+    expect(successors, "exactly one run after the receipt").toHaveLength(1);
+    expect(carries(successors[0]!, r.commentId), "it carries the message typed while stopping").toBe(true);
+    expect(fixture.calls).toEqual([r.runId, successors[0]!.id]);
+  }, 60_000);
+  it("Q1 control: a REMOTE (sandbox) lease without its stop receipt still holds, local lease or not", async () => {
+    const r = await exercise("waiting", "q1-remote-control", { chat: true });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.runId));
+    const withReceipt = await acknowledgedNativeStopExecutionHasStopped(db, run);
+    await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} - 'remoteExecutionTermination' - 'workspaceRecoveryCleanup'` })
+      .where(and(eq(environmentLeases.heartbeatRunId, r.runId), sql`${environmentLeases.provider} <> 'local'`));
+    const withoutReceipt = await acknowledgedNativeStopExecutionHasStopped(db, run);
+    await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q1-remote-control.json"), JSON.stringify({ withReceipt, withoutReceipt, leases: r.allLeases }, null, 2));
+    expect(withReceipt, "local released + sandbox receipt: the Stop is proven").toBe(true);
+    expect(withoutReceipt, "sandbox lease with no stop receipt: the Stop is NOT proven").toBe(false);
   }, 60_000);
 });
