@@ -69,9 +69,8 @@ export async function decidePersonStopExportAtBound(input: {
       if (!await recordStoppedTurnCloseProof(db, run, proof)) return null;
       reason = "box_reachable_tools_stopped";
     } else if (proof.outcome === "unanswered") reason = proof.reason;
-    // The box answered but the turn's processes are not proven gone: the
+    // else: the box answered but the turn's processes are not proven gone; the
     // existing bounded hold applies (tools_not_proven_stopped at the bound).
-    else return null;
   }
   if (reason === null) {
     const boundAt = personStopExportBoundAt(lease.metadata);
