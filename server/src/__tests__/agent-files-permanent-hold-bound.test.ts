@@ -20,6 +20,8 @@ import { agentFileSaveHeld } from "../services/agent-directory-working-copies.js
 import { agentFileCopiesToCollectOnLease, agentFileSaveHeldOnLease } from "../services/agent-file-save-hold.js";
 import * as fileStoreModule from "../services/agent-file-store.js";
 import * as holdModule from "../services/agent-file-save-hold.js";
+import * as activityModule from "../services/activity-log.js";
+import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -53,6 +55,12 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
   // B0: "Paused" changes files but its source read is refused with the Boat
   // plugin's LEASE-GONE message until its box is resumed; "Idle" changes nothing.
   const leaseGoneAgentId = randomUUID(), unchangedAgentId = randomUUID();
+  // bd2 rows (rf-3 round 2): "Empty" deletes its SOLE configured entry (a real
+  // 422, an EMPTY hold); "Muted" is a real 422 whose FIRST notice transaction
+  // fails (B3 outbox); "Resumed" is a real LEASE-GONE hold resumed through the
+  // runtime's lifecycle resumeRunLease (B0b).
+  const emptyAgentId = randomUUID(), mutedAgentId = randomUUID(), resumedAgentId = randomUUID();
+  let resumedGone = false, failMutedNotice = true;
   const LEASE_GONE = "Boat sandbox lease is no longer active.";
   // Set by Paused's run after it wrote its files: its stopped source read is refused.
   let leaseGone = false;
@@ -88,9 +96,10 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
     const inspect = fileStoreModule.inspectAgentDirectory;
     realInspect = inspect;
     vi.spyOn(fileStoreModule, "inspectAgentDirectory").mockImplementation(async (root, ...rest) => {
-      for (const agentId of [leaseGoneAgentId, unchangedAgentId]) if (String(root).includes(agentId)) {
+      for (const agentId of [leaseGoneAgentId, unchangedAgentId, resumedAgentId]) if (String(root).includes(agentId)) {
         sourceReads.set(agentId, (sourceReads.get(agentId) ?? 0) + 1);
         if (agentId === leaseGoneAgentId && leaseGone) throw new Error(LEASE_GONE);
+        if (agentId === resumedAgentId && resumedGone) throw new Error(LEASE_GONE);
         if (refusedAgents.has(agentId)) throw new Error(LEASE_GONE);
       }
       return inspect(root, ...rest);
@@ -114,13 +123,31 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
       };
       return store;
     });
+    // B3 outbox row: the FIRST notice transaction for Muted's real hold fails.
+    const persist = activityModule.persistActivity;
+    vi.spyOn(activityModule, "persistActivity").mockImplementation(async (...args) => {
+      if (args[1].action === "agent_files.save_held_permanent" && args[1].agentId === mutedAgentId && failMutedNotice) {
+        failMutedNotice = false;
+        throw new Error("injected: the first notice transaction fails after the hold committed");
+      }
+      return persist(...args);
+    });
     heartbeat = heartbeatService(db);
     copies = agentInstructionWorkingCopyService(db);
     registerServerAdapter({
       type: adapterType, supportsLocalAgentJwt: false, supportsInstructionsBundle: true,
       execute: async input => {
         const entry = String(input.config.instructionsFilePath);
-        if (input.agent.id === permanentAgentId) {
+        if (input.agent.id === emptyAgentId) {
+          // Real 422 with NOTHING left to keep: the run deletes its sole file.
+          await fs.unlink(entry);
+        } else if (input.agent.id === mutedAgentId) {
+          await fs.unlink(entry);
+          await fs.writeFile(path.join(path.dirname(entry), "muted-note.txt"), "Muted held bytes\n");
+        } else if (input.agent.id === resumedAgentId) {
+          await fs.writeFile(path.join(path.dirname(entry), "resumed-note.txt"), "Saved after the lifecycle resume\n");
+          resumedGone = true;
+        } else if (input.agent.id === permanentAgentId) {
           // Genuine permanent 422: canonical AGENTS.md exists, this run deletes it.
           await fs.unlink(entry);
           await fs.writeFile(path.join(path.dirname(entry), "unsaved-note.txt"), "Keep these exact held bytes\n");
@@ -144,9 +171,10 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
     await db.insert(companies).values({ id: companyId, name: "Held save bound", issuePrefix: `B${companyId.slice(0, 6)}`, defaultResponsibleUserId: userId });
     await db.insert(authUsers).values({ id: userId, name: "Owner", email: `${userId}@example.test`, createdAt: now, updatedAt: now });
     await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: userId,
-      permissionKey: "agents:configure", scope: { agentIds: [permanentAgentId, transientAgentId, leaseGoneAgentId, unchangedAgentId] } });
+      permissionKey: "agents:configure", scope: { agentIds: [permanentAgentId, transientAgentId, leaseGoneAgentId, unchangedAgentId, emptyAgentId, mutedAgentId, resumedAgentId] } });
     let issueNumber = 0;
-    for (const [agentId, name] of [[permanentAgentId, "Editor"], [transientAgentId, "Flaky"], [leaseGoneAgentId, "Paused"], [unchangedAgentId, "Idle"]] as const) {
+    for (const [agentId, name] of [[permanentAgentId, "Editor"], [transientAgentId, "Flaky"], [leaseGoneAgentId, "Paused"], [unchangedAgentId, "Idle"],
+      [emptyAgentId, "Empty"], [mutedAgentId, "Muted"], [resumedAgentId, "Resumed"]] as const) {
       await db.insert(companyMemberships).values([
         ...(agentId === permanentAgentId ? [{ companyId, principalType: "user", principalId: userId, membershipRole: "operator" }] : []),
         { companyId, principalType: "agent", principalId: agentId, membershipRole: "member" },
@@ -169,7 +197,7 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
       if (agentId === permanentAgentId) permanentRunId = run!.id;
       else if (agentId === transientAgentId) transientRunId = run!.id;
       else if (agentId === leaseGoneAgentId) leaseGoneRunId = run!.id;
-      else unchangedRunId = run!.id;
+      else if (agentId === unchangedAgentId) unchangedRunId = run!.id;
     }
     expect(applyFailures).toContainEqual({ agentId: permanentAgentId, status: 422, message: "The configured instruction entry cannot be deleted" });
   }, 120_000);
@@ -220,6 +248,30 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
         savePending: { since: input.stoppedAt.toISOString(), code: "AGENT_FILES_SAVE_FAILED", reason: LEASE_GONE, failures: 3 } } })
       .where(and(eq(agentInstructionWorkingCopies.companyId, companyId), eq(agentInstructionWorkingCopies.runId, unchangedRunId)));
     expect(agentFileSaveHeld(await copies.get(companyId, unchangedRunId))).toBe(true);
+  };
+  // PLANTED beside a real hold: bind it to a sandbox lease (the local adapter has
+  // none) so the destroy gate can be observed. Idempotent, so every row that
+  // needs the binding makes it itself (rf-3 item 6: no row depends on another).
+  const bindHoldToLease = async (runId: string) => {
+    let held = (await copies.get(companyId, runId))!;
+    const existing = (held.receipt?.cleanup as { leaseId?: string } | undefined)?.leaseId;
+    if (existing) {
+      const [bound] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, existing));
+      return { held, lease: bound!, leaseRef: { id: bound!.id, companyId, providerLeaseId: bound!.providerLeaseId, heartbeatRunId: runId } };
+    }
+    const [environment] = await db.insert(environments).values({ name: `Planted sandbox ${runId.slice(0, 8)}`, driver: "sandbox" }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, environmentId: environment!.id,
+      heartbeatRunId: runId, status: "active", leasePolicy: "ephemeral", provider: "daytona",
+      providerLeaseId: randomUUID(), metadata: { driver: "sandbox" } }).returning();
+    await db.update(agentInstructionWorkingCopies).set({ receipt: { ...held.receipt, cleanup: { leaseId: lease!.id, remoteCwd: "/planted" } } })
+      .where(and(eq(agentInstructionWorkingCopies.companyId, companyId), eq(agentInstructionWorkingCopies.runId, runId)));
+    held = (await copies.get(companyId, runId))!;
+    return { held, lease: lease!, leaseRef: { id: lease!.id, companyId, providerLeaseId: lease!.providerLeaseId, heartbeatRunId: runId } };
+  };
+  const gateAt25h = async (leaseRef: { id: string; companyId: string; providerLeaseId: string | null; heartbeatRunId: string }) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try { vi.setSystemTime(Date.now() + 25 * HOUR); return await agentFileSaveHeldOnLease(db, leaseRef); }
+    finally { vi.useRealTimers(); }
   };
   const sweep = async (hours: number[]) => {
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -491,18 +543,9 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
   }, 60_000);
 
   it("R3: after the bound the box is no longer blocked from destroy and the held bytes stay readable through the hold", async () => {
-    let held = (await copies.get(companyId, permanentRunId))!;
+    // PLANTED beside the real hold: bind the real 422 hold to a sandbox lease.
+    const { held, lease, leaseRef } = await bindHoldToLease(permanentRunId);
     heldRoot = held.localRoot;
-    // PLANTED beside the real hold: bind the real 422 hold to a sandbox lease
-    // (the local adapter has none) so the destroy gate can be observed.
-    const [environment] = await db.insert(environments).values({ name: "Planted sandbox", driver: "sandbox" }).returning();
-    const [lease] = await db.insert(environmentLeases).values({ companyId, environmentId: environment!.id,
-      heartbeatRunId: permanentRunId, status: "active", leasePolicy: "ephemeral", provider: "daytona",
-      providerLeaseId: randomUUID(), metadata: { driver: "sandbox" } }).returning();
-    await db.update(agentInstructionWorkingCopies).set({ receipt: { ...held.receipt, cleanup: { leaseId: lease!.id, remoteCwd: "/planted" } } })
-      .where(and(eq(agentInstructionWorkingCopies.companyId, companyId), eq(agentInstructionWorkingCopies.runId, permanentRunId)));
-    held = (await copies.get(companyId, permanentRunId))!;
-    const leaseRef = { id: lease!.id, companyId, providerLeaseId: lease!.providerLeaseId, heartbeatRunId: permanentRunId };
     const blockedNow = await agentFileSaveHeldOnLease(db, leaseRef);
     vi.useFakeTimers({ toFake: ["Date"] });
     let blockedAfter: boolean, toCollectAfter: string[];
@@ -525,10 +568,8 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
   }, 60_000);
 
   it("R6: every held file is byte-equal in the durable mirror (path + sha256) before destroy; a missing or changed file keeps destroy blocked and the hold says so", async () => {
-    const held = (await copies.get(companyId, permanentRunId))!;
-    const leaseId = (held.receipt?.cleanup as { leaseId: string }).leaseId;
-    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
-    const leaseRef = { id: lease!.id, companyId, providerLeaseId: lease!.providerLeaseId, heartbeatRunId: permanentRunId };
+    // Self-contained (rf-3 item 6): R6 binds the real hold itself (no R3 needed).
+    const { held, leaseRef } = await bindHoldToLease(permanentRunId);
     const manifest = (held.receipt?.savePending as { heldFiles?: Array<{ path: string; sha256: string }> }).heldFiles ?? [];
     // Every held candidate file vs its stored (mirror) copy, path + sha256.
     const rows = await Promise.all([...candidate].map(async ([file, hash]) => ({ path: file, candidate: hash,
@@ -540,11 +581,7 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
     // The server manifest names exactly the files the mirror holds (deleted entry absent).
     expect(manifest.map(item => item.path).sort()).toEqual((await listFiles(held.localRoot)).filter(file => !file.startsWith(".paperclip-runtime/")).sort());
     expect(manifest.map(item => item.path)).not.toContain("AGENTS.md");
-    const gate = async () => {
-      vi.useFakeTimers({ toFake: ["Date"] });
-      try { vi.setSystemTime(Date.now() + 25 * HOUR); return await agentFileSaveHeldOnLease(db, leaseRef); }
-      finally { vi.useRealTimers(); }
-    };
+    const gate = () => gateAt25h(leaseRef);
     const durableCheck = async () => ((await copies.get(companyId, permanentRunId))!.receipt?.savePending as { durableCheck?: Record<string, unknown> }).durableCheck;
     const notePath = path.join(held.localRoot, "unsaved-note.txt");
     const original = await fs.readFile(notePath);
@@ -571,6 +608,96 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
     expect(allowed).toBe(true);
     expect(checkOk).toMatchObject({ durable: true, changed: [], missing: [] });
     expect(agentFileSaveHeld(await copies.get(companyId, permanentRunId))).toBe(true);
+  }, 60_000);
+
+  it("B2-EMPTY (rf-3 item 2): a real 422 that deleted the SOLE configured entry leaves an EMPTY hold (nothing to keep): at +25 h it no longer blocks destroy", async () => {
+    const real = (await copies.get(companyId, runIdOf.get(emptyAgentId)!))!;
+    expect(applyFailures).toContainEqual({ agentId: emptyAgentId, status: 422, message: "The configured instruction entry cannot be deleted" });
+    const { held, leaseRef } = await bindHoldToLease(real.runId);
+    const pending = held.receipt?.savePending as { permanent?: unknown; heldFiles?: unknown[]; mirrorHash?: unknown };
+    const blockedNow = await agentFileSaveHeldOnLease(db, leaseRef);
+    const blockedAfter = await gateAt25h(leaseRef);
+    const check = ((await copies.get(companyId, real.runId))!.receipt?.savePending as { durableCheck?: Record<string, unknown> }).durableCheck;
+    console.log("B2_EMPTY", JSON.stringify({ runId: real.runId, permanent: pending.permanent, heldFiles: pending.heldFiles, mirrorHash: pending.mirrorHash, blockedNow, blockedAfter, check }));
+    expect(pending).toMatchObject({ permanent: true, permanentStatus: 422 });
+    expect(pending.heldFiles).toEqual([]);
+    expect(blockedNow).toBe(true);
+    expect(blockedAfter).toBe(false);
+    expect(check).toMatchObject({ durable: true, files: 0, empty: true });
+    expect(agentFileSaveHeld(await copies.get(companyId, real.runId))).toBe(true);
+  }, 60_000);
+
+  it("B2-DURABLE (rf-3 item 3): the gate checks the DURABLE mirror by its pinned mirrorHash, not just the listed files: an extra file in the mirror keeps destroy blocked", async () => {
+    const { held, leaseRef } = await bindHoldToLease(permanentRunId);
+    const mirrorHash = (held.receipt?.savePending as { mirrorHash?: string }).mirrorHash;
+    expect(typeof mirrorHash).toBe("string");
+    // PLANTED beside the real hold: the mirror tree drifts from its pinned hash
+    // while every LISTED held file is still byte-equal.
+    const extra = path.join(held.localRoot, "drift.txt");
+    await fs.writeFile(extra, "not part of the held candidate\n");
+    const blockedDrift = await gateAt25h(leaseRef);
+    const checkDrift = ((await copies.get(companyId, permanentRunId))!.receipt?.savePending as { durableCheck?: Record<string, unknown> }).durableCheck;
+    await fs.rm(extra);
+    const allowed = !await gateAt25h(leaseRef);
+    const checkOk = ((await copies.get(companyId, permanentRunId))!.receipt?.savePending as { durableCheck?: Record<string, unknown> }).durableCheck;
+    console.log("B2_DURABLE", JSON.stringify({ mirrorHash, blockedDrift, checkDrift, allowed, checkOk }));
+    expect(blockedDrift).toBe(true);
+    expect(checkDrift).toMatchObject({ durable: false, changed: [], missing: [], mirrorHash });
+    expect(checkDrift?.observedHash).not.toBe(mirrorHash);
+    expect(allowed).toBe(true);
+    expect(checkOk).toMatchObject({ durable: true, mirrorHash, observedHash: mirrorHash });
+  }, 60_000);
+
+  it("B0b-LIFECYCLE (rf-3 item 4): runtime.resumeRunLease (the exact lifecycle resume) re-arms a parked LEASE-GONE hold, and it is saved", async () => {
+    const runId = runIdOf.get(resumedAgentId)!;
+    const parked = (await copies.get(companyId, runId))!;
+    expect(parked.receipt?.savePending).toMatchObject({ reason: LEASE_GONE, retryOn: "lease_active" });
+    expect(parked.nextAttemptAt).toBeNull();
+    // PLANTED: the retained box's lease row and a deterministic provider driver
+    // (the local adapter has no sandbox); the resume goes through the REAL runtime.
+    const [environment] = await db.insert(environments).values({ name: "Planted lifecycle-resume sandbox", driver: "sandbox" }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, environmentId: environment!.id,
+      heartbeatRunId: runId, status: "active", leasePolicy: "reuse_by_environment", provider: "daytona",
+      providerLeaseId: randomUUID(), metadata: { driver: "sandbox" } }).returning();
+    const runtime = environmentRuntimeService(db, { drivers: [{ driver: "sandbox",
+      resumeRunLease: async (input: { lease: typeof lease }) => ({ ...input.lease }) } as never] });
+    resumedGone = false;
+    const resumed = await runtime.resumeRunLease({ environment: environment as never, lease: lease as never });
+    const rearmed = (await copies.get(companyId, runId))!;
+    await copies.recoverStopped();
+    const after = (await copies.get(companyId, runId))!;
+    const root = resolveManagedInstructionsRoot({ companyId, id: resumedAgentId, name: "Resumed", adapterConfig: {} });
+    const saved = await fs.readFile(path.join(root, "resumed-note.txt"), "utf8").catch(() => null);
+    console.log("B0B_LIFECYCLE", JSON.stringify({ resumed: Boolean(resumed), rearmedNextAttemptAt: rearmed.nextAttemptAt, rearmedPending: rearmed.receipt?.savePending ?? null,
+      state: after.state, held: agentFileSaveHeld(after), saved }));
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() }).where(eq(environmentLeases.id, lease!.id));
+    expect(resumed).toBeTruthy();
+    expect((rearmed.receipt?.savePending as { retryOn?: unknown } | undefined)?.retryOn).toBeUndefined();
+    expect(rearmed.nextAttemptAt).toBeInstanceOf(Date);
+    expect(after.state).toBe("saved");
+    expect(saved).toBe("Saved after the lifecycle resume\n");
+  }, 60_000);
+
+  it("B3-OUTBOX (rf-3 item 5): the FIRST notice transaction fails after the permanent hold committed; the intent is kept and the recovery worker delivers exactly one notice", async () => {
+    const runId = runIdOf.get(mutedAgentId)!;
+    const mutedNotices = async () => db.select().from(activityLog)
+      .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "agent_files.save_held_permanent")));
+    const held = (await copies.get(companyId, runId))!;
+    const before = await mutedNotices();
+    console.log("B3_OUTBOX_HELD", JSON.stringify({ runId, failMutedNotice, savePending: held.receipt?.savePending, notices: before.length }));
+    expect(failMutedNotice).toBe(false);
+    expect(held.receipt?.savePending).toMatchObject({ permanent: true, permanentStatus: 422 });
+    expect(before).toHaveLength(0);
+    await copies.recoverStopped();
+    await copies.recoverStopped();
+    await copies.collectStopped({ companyId, runId });
+    const after = await mutedNotices();
+    const row = (await copies.get(companyId, runId))!;
+    console.log("B3_OUTBOX_DELIVERED", JSON.stringify({ notices: after.map(n => ({ id: n.id, message: (n.details as { message?: string }).message })), savePending: row.receipt?.savePending }));
+    expect(after).toHaveLength(1);
+    expect(after[0]!.id).toBe((row.receipt?.savePending as { noticeActivityId?: string }).noticeActivityId);
+    expect((after[0]!.details as { message?: string }).message).toContain(`POST /api/companies/${companyId}/agent-file-holds/${runId}/discard`);
+    expect(agentFileSaveHeld(row)).toBe(true);
   }, 60_000);
 
   it("R5: the operator discard still works after the bound", async () => {

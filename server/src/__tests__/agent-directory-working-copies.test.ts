@@ -2704,10 +2704,14 @@ describe("persistent agent directories", () => {
     // the old assertion (errorMessage === AGENT_FILES_SAVE_PENDING_INSTRUCTION, a timer-retried
     // hold) is replaced: the over-limit entry is a permanent 422 refusal of these pinned bytes,
     // so the hold is permanent, never timer-retried, and names the discard route.
-    expect(result?.errorMessage).toContain(`/api/companies/${companyId}/agent-file-holds/${copy.runId}/discard`);
+    // bd2 (rf-3 item 7): EXACT again: the 422 status, permanent: true, the exact
+    // reason prefix, and the exact operator text (no substring matching).
+    const reason = (result?.receipt?.savePending as { reason?: string }).reason!;
+    expect(result?.receipt?.savePending).toMatchObject({ code: "AGENT_FILES_SAVE_FAILED", permanent: true, permanentStatus: 422 });
+    expect(reason.startsWith("Instructions must be a regular UTF-8 file of at most 1 MiB")).toBe(true);
+    expect(result?.errorMessage).toBe(`Agent-file changes cannot be saved: ${reason}. They are kept on the server and will not be retried. `
+      + `An instance operator can discard them: POST /api/companies/${companyId}/agent-file-holds/${copy.runId}/discard.`);
     expect(result?.nextAttemptAt).toBeNull();
-    expect(result?.receipt?.savePending).toMatchObject({ permanent: true, permanentStatus: 422 });
-    expect((result?.receipt?.savePending as { reason?: string }).reason).toContain("at most 1 MiB");
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
   });
 
