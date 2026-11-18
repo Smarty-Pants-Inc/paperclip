@@ -1,5 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { runningProcesses } from "../adapters/index.js";
+import { registerServerAdapter, runningProcesses, unregisterServerAdapter } from "../adapters/index.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
@@ -9,6 +12,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agentRuntimeState,
   agentWakeupRequests,
+  authUsers,
   agents,
   activityLog,
   companies,
@@ -2773,5 +2777,78 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       expect(await issueRuns(f)).toEqual([]);
       expect((await wakeRows(f.companyId)).filter(row => row.status === "deferred_issue_execution")).toEqual([]);
     }, 60_000);
+
+    // rf-5's S004 row, run-to-answer: the failed wake's message is delivered by
+    // ONE queued run that really executes (wake -> claim -> executor) and posts
+    // exactly ONE run-linked agent answer.
+    it("run-to-answer: a wake that throws after the 201 gets one run that executes and answers once", async () => {
+      const adapterType = "s004_run_to_answer";
+      const executed: string[] = [];
+      const oldHome = process.env.PAPERCLIP_HOME;
+      const home = await mkdtemp(path.join(tmpdir(), "s004-run-to-answer-"));
+      process.env.PAPERCLIP_HOME = home;
+      registerServerAdapter({
+        type: adapterType, supportsLocalAgentJwt: false,
+        execute: async (input: { runId: string; agent: { id: string }; context: unknown }) => {
+          executed.push(input.runId);
+          const issueId = String((input.context as Record<string, unknown>).issueId);
+          const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+          await db.insert(issueComments).values({ companyId: issue.companyId, issueId, authorAgentId: input.agent.id,
+            createdByRunId: input.runId, body: "S004 answer from the run" });
+          await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+          return { exitCode: 0, signal: null, timedOut: false, resultJson: {} };
+        },
+        testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
+      } as any);
+      const heartbeat = heartbeatService(db);
+      try {
+        const companyId = randomUUID(); const agentId = randomUUID(); const issueId = randomUUID();
+        await db.insert(companies).values({ id: companyId, name: "S004 RTA", issuePrefix: "SRA", requireBoardApprovalForNewAgents: false });
+        await db.insert(agents).values({ id: agentId, companyId, name: "S004 Answerer", role: "engineer", status: "idle",
+          adapterType, adapterConfig: {}, runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } }, permissions: {} });
+        const userId = `s004-rta-${companyId}`;
+        await db.insert(authUsers).values({ id: userId, name: "S004 person", email: `${userId}@example.test`,
+          createdAt: new Date(), updatedAt: new Date() });
+        await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId,
+          status: "active", membershipRole: "operator" });
+        await db.insert(issues).values({ id: issueId, companyId, identifier: "SRA-1", title: "Run to answer",
+          status: "todo", priority: "medium", assigneeAgentId: agentId });
+        const f = { companyId, issueId };
+        let calls = 0;
+        wakeupOverride.current = async () => { calls += 1; throw new Error("injected wake failure after commit"); };
+        const posted = await request(app(companyId, userId)).post(`/api/issues/${issueId}/comments`).send({ body: "Please answer me" });
+        expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+        await vi.waitFor(() => expect(calls).toBe(1), { timeout: 5_000, interval: 25 });
+        wakeupOverride.current = null;
+        // Exactly ONE queued run carries the message (no other path woke it).
+        for (let i = 0; i < 3 && (await issueRuns(f)).length === 0; i += 1) await drain(f);
+        await vi.waitFor(async () => expect(await issueRuns(f)).toHaveLength(1), { timeout: 10_000, interval: 100 });
+        const [run] = await issueRuns(f);
+        expect(JSON.stringify(run.contextSnapshot)).toContain(posted.body.id);
+        // That run EXECUTES through the real claim and executor.
+        await heartbeat.resumeQueuedRuns();
+        await vi.waitFor(async () => {
+          const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+          expect(current.status, JSON.stringify({ error: current.error, errorCode: current.errorCode, executed })).toBe("succeeded");
+        }, { timeout: 20_000, interval: 100 });
+        await drain(f);
+        await heartbeat.resumeQueuedRuns();
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+        expect(executed).toEqual([run.id]);
+        expect((await issueRuns(f)).map(r => r.id)).toEqual([run.id]);
+        // Exactly ONE run-linked agent answer comment.
+        const answers = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+          .filter(c => c.authorAgentId === agentId);
+        expect(answers.map(c => ({ run: c.createdByRunId, body: c.body })))
+          .toEqual([{ run: run.id, body: "S004 answer from the run" }]);
+        expect((await wakeRows(companyId)).filter(row => row.status === "comment_wake_pending")).toEqual([]);
+      } finally {
+        wakeupOverride.current = null;
+        await heartbeat.drainActiveRunExecutions?.();
+        unregisterServerAdapter(adapterType);
+        if (oldHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = oldHome;
+        await rm(home, { recursive: true, force: true });
+      }
+    }, 90_000);
   });
 });
