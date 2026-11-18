@@ -80,7 +80,21 @@ export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
 /** Setup completes by itself; a stalled setup gets one factual waiting note. */
 export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
 export const SETUP_WAIT_BOUND_MS = 10 * 60_000;
-const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE]);
+/** A run whose OWN input carries the message is RUNNING: the agent is working
+ * on it (the note a Resume's stale paused note becomes). Waiting-kind, so the
+ * answer supersedes it; never left standing over a run that has ended. */
+export const UNANSWERED_MESSAGE_WORKING_CODE = "working_on_message";
+/** The working note's wording, in ONE place (RFL's wording record changes it here). */
+export const UNANSWERED_MESSAGE_WORKING_TEXT = (name: string) => `${name} is working on your message.`;
+export const UNANSWERED_MESSAGE_WORKING_TITLE = (name: string) => `${name} is working on it`;
+/** RFL record SUPERSEDE-BPRIME3-NOTICE-WORDING-1118: after a run STARTED, 'safe' is unproven. */
+export const UNANSWERED_MESSAGE_STARTED_FAILED_TEXT = "Your message wasn't answered. "
+  + "Check the task's recent history before trying again; the run may have taken actions.";
+export const UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT = "This run finished without a reply to your message. "
+  + "Check the task's recent history before trying again; the run may have taken actions.";
+const UNANSWERED_MESSAGE_STARTED_NEXT_ACTION = "Check the task's recent history before trying again.";
+const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE,
+  UNANSWERED_MESSAGE_WORKING_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
@@ -568,8 +582,44 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // The standing paused note stops being true the moment the agent is not
   // paused: whatever this sweep would only wait for, the SAME note becomes
   // the one waiting note now (upgrade in place; its answer supersedes it).
-  if (!agentPaused && upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
+  // Working ONLY while a run whose OWN input carries the message is RUNNING
+  // (not queued, claimed or scheduled_retry, nor another message's or
+  // another task's run): then the agent is answering it, not waiting.
+  const working = liveRuns.some(candidate => candidate.status === "running"
+    && runCarriesMessage(candidate.contextSnapshot, message.id));
+  // A standing working note stops being true the moment that run is no longer
+  // running: whatever this sweep would only wait for, the SAME note becomes
+  // the waiting note (a further attempt carries it) or, once its run ended
+  // and settled, RFL's started-run text. Never left over an ended run.
+  const standingWorking = !agentPaused && !working && upgrading && standingWaitingCode === UNANSWERED_MESSAGE_WORKING_CODE;
+  if (standingWorking || (!agentPaused && upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE)) {
     standing.replacePaused = pending => {
+      const ended = run && TERMINAL.includes(run.status) ? run : null;
+      if (standingWorking && ended && !liveRuns.some(candidate => runCarriesMessage(candidate.contextSnapshot, message.id))) {
+        const due = (ended.finishedAt ?? ended.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
+        if (due > now.getTime()) return { kind: "pending", recheckAt: Math.min(pending.recheckAt, due) };
+        const code = ended.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(ended);
+        const notice = buildStrandedRecoveryEscalationNotice({
+          seed: { title: "Your message wasn't answered", tone: "warning", nextAction: UNANSWERED_MESSAGE_STARTED_NEXT_ACTION,
+            body: ended.status === "succeeded" ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_STARTED_FAILED_TEXT },
+          recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",
+          sourceRun: { id: ended.id, agentId: ended.agentId, status: ended.status, errorCode: code }, failureCode: undefined,
+        });
+        return { kind: "notice", reason, code, notice, upgradeCommentId: upgrading };
+      }
+      if (working) {
+        const name = agentRow?.name?.trim() || "This agent";
+        const notice = buildStrandedRecoveryEscalationNotice({
+          seed: { title: UNANSWERED_MESSAGE_WORKING_TITLE(name), body: UNANSWERED_MESSAGE_WORKING_TEXT(name), tone: "info" },
+          recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user", sourceRun: null, failureCode: undefined,
+        });
+        // No next action: nothing for the person to do while it works.
+        notice.metadata.sections = notice.metadata.sections
+          .map(section => ({ ...section, rows: section.rows.filter(row => row.label !== "Next action") }))
+          .filter(section => section.rows.length > 0);
+        notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, UNANSWERED_MESSAGE_WORKING_CODE)] });
+        return { kind: "notice", reason, code: UNANSWERED_MESSAGE_WORKING_CODE, notice, upgradeCommentId: upgrading };
+      }
       const notice = buildStrandedRecoveryEscalationNotice({
         seed: { title: "Your message is waiting to start", body: UNANSWERED_MESSAGE_WAITING_TEXT, tone: "info",
           nextAction: "No action is needed; it will start by itself." },
@@ -806,6 +856,10 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
+  // A standing working note whose run ended without answering: the run
+  // STARTED, so the SAME note gets RFL's started-run text (never 'safe').
+  const workingEnded = Boolean(standingWaitingCode === UNANSWERED_MESSAGE_WORKING_CODE && !waiting
+    && run && TERMINAL.includes(run.status));
   // The ONE bound: the message's automatic lineage used its K=2 fresh
   // continuations and the last one failed. Nothing further starts by itself.
   const boundReached = Boolean(!paused && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
@@ -817,9 +871,9 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
-    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
+    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
-      : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
+      : held ? HELD_PREDECESSOR_NOTICE : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
@@ -830,7 +884,8 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
-        : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
+        : held || boundReached ? "Send a new message to try again."
+        : workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
