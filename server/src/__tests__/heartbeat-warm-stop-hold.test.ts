@@ -257,14 +257,14 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
   }
 
   it.each(["immediate", "after_sweep"] as const)(
-    "a warm keep_running Stop writes no file-preservation hold; the message (%s) runs once on the same box",
+    "supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) a warm keep_running Stop writes no file-preservation hold; the message (%s) runs once on the same box",
     async messageDelay => {
       const r = await stopThenMessage({ warm: true, messageDelay });
       // No native-workspace:<run> recovery hold for the stopped warm turn.
       expect.soft(r.hold).toEqual([]);
-      // The warm box is not stopped: the lease is never released stop_and_retain.
-      expect.soft(r.release).not.toHaveBeenCalledWith(expect.objectContaining({ providerResourceDisposition: "stop_and_retain" }));
-      expect.soft(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "keep_running" }));
+      // Upstream rule (C3): a person's Stop stops and retains the box (disk kept); it is not kept warm.
+      expect.soft(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "stop_and_retain" }));
+      expect.soft(r.release).not.toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "keep_running" }));
       expect.soft(r.lease).not.toMatchObject({ leasePolicy: "retain_on_failure" });
       // Exactly one run for the message, and it reached the executor (one provider turn).
       expect.soft(r.messageRuns).toHaveLength(1);
@@ -276,9 +276,10 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
     120_000,
   );
 
-  it("a non-warm Stop (the box really stops) still preserves the prepared files", async () => {
+  it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) a non-warm Stop (the box really stops) still preserves the prepared files", async () => {
     const r = await stopThenMessage({ warm: false, messageDelay: "immediate" });
-    expect(r.hold).toEqual([expect.objectContaining({ cause: "native_continuation_requires_reconciliation" })]);
+    // C3: a person's Stop owes no restore and writes no repair hold; the disk is kept by stop_and_retain.
+    expect(r.hold).toEqual([]);
     expect(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "stop_and_retain" }));
     expect(createHash("sha256").update(await fs.readFile(r.unsynced)).digest("hex")).toBe(r.unsyncedSha);
   }, 120_000);
@@ -288,13 +289,14 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
   // still active (before the heartbeat release), and must classify an ordinary
   // warm Stop as a handoff exactly as the heartbeat handler does.
   it.each(["worker", "sweep"] as const)(
-    "the %s, racing the lease release, writes no hold for a warm keep_running Stop; the next message is admitted",
+    "supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) the %s, racing the lease release, writes no hold for a warm keep_running Stop; the next message is admitted",
     async producer => {
       const r = await stopThenMessage({ warm: true, messageDelay: "immediate", producer });
       expect(r.windowLease).toMatchObject({ status: "active", leasePolicy: "reuse_by_environment" });
       expect.soft(r.windowHold).toEqual([]);
       expect.soft(r.hold).toEqual([]);
-      expect.soft(r.release).not.toHaveBeenCalledWith(expect.objectContaining({ providerResourceDisposition: "stop_and_retain" }));
+      // C3: the person's Stop releases the box stop_and_retain (disk kept), not warm.
+      expect.soft(r.release).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: r.f.runId, providerResourceDisposition: "stop_and_retain" }));
       expect.soft(r.lease).not.toMatchObject({ leasePolicy: "retain_on_failure" });
       expect.soft(r.messageRuns).toHaveLength(1);
       expect.soft(r.messageRuns[0]?.errorCode).not.toBe("execution_reconciliation_required");
@@ -305,12 +307,13 @@ describe.skipIf(!support.supported)("Stop on a warm native turn, then the next m
   );
 
   it.each(["worker", "sweep"] as const)(
-    "the %s still writes the hold for a non-warm Stop in the same window",
+    "supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) the %s still writes the hold for a non-warm Stop in the same window",
     async producer => {
       const r = await stopThenMessage({ warm: false, messageDelay: "immediate", producer });
       expect(r.windowLease).toMatchObject({ status: "active" });
-      expect(r.windowHold).toEqual([expect.objectContaining({ cause: "native_continuation_requires_reconciliation" })]);
-      expect(r.hold).toEqual([expect.objectContaining({ cause: "native_continuation_requires_reconciliation" })]);
+      // C3: neither producer writes a repair hold for a person's Stop.
+      expect(r.windowHold).toEqual([]);
+      expect(r.hold).toEqual([]);
     },
     120_000,
   );
