@@ -14,6 +14,8 @@ export { PERSON_STOP_EXPORT_BOUND_MS, PERSON_STOP_WITHOUT_FILES_LINE, personStop
   readPersonStopBoundDecision } from "./person-stop-export-bound.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { proveStoppedTurnGoneOnBox, recordStoppedTurnCloseProof, stoppedTurnCloseOwedAfterCrash } from "./stopped-turn-box-proof.js";
+import { isolateSuccessorGeneration, personStopIsolationGate } from "./person-stop-isolate.js";
+import { logger } from "../../middleware/logger.js";
 
 async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T | "timed_out"> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -106,9 +108,14 @@ export async function decidePersonStopExportAtBound(input: {
   // export reads this decision under the same lock and, for without_files,
   // saves the old files aside instead of over the successor's host workspace
   // (native-workspace-sync.ts resumeNativeWorkspaceSync).
+  // adopt-stopu-isolate (org 03:29Z): DRAIN-COMPLETE or ISOLATE. Without a
+  // drain-complete record the successor gets its own generation FIRST; once
+  // that is committed no gate waits on the old (aside) writer (F9): the
+  // decision is recorded without its finalization lock or owner join.
+  const isolated = await personStopIsolateAtDecision(db, run, finalReason);
   const recorded = await db.transaction(async tx => {
-    if (!await tryLockNativeWorkspaceFinalization(tx as unknown as Db, { companyId: run.companyId, runId: run.id })) return null;
-    if (await personStopCopybackOwnerUnjoined(tx as unknown as Db, run)) return null;
+    if (!isolated && !await tryLockNativeWorkspaceFinalization(tx as unknown as Db, { companyId: run.companyId, runId: run.id })) return null;
+    if (!isolated && await personStopCopybackOwnerUnjoined(tx as unknown as Db, run)) return null;
     return tx.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
       || ${JSON.stringify({ [PERSON_STOP_BOUND_KEY]: decision })}::jsonb` })
       .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "active"),
@@ -119,7 +126,7 @@ export async function decidePersonStopExportAtBound(input: {
     const [again] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(eq(environmentLeases.id, lease.id));
     return readPersonStopBoundDecision(again?.metadata);
   }
-  if (decision.decision === "without_files") {
+  if (decision.decision === "without_files" && !isolated) {
     // ONE true line in the chat (rf-4 22:30Z + RFL 22:31Z): no 'restored'
     // claim, the box/lease unchanged (kept, not destroyed).
     const line = PERSON_STOP_WITHOUT_FILES_LINE;
@@ -134,6 +141,13 @@ export async function decidePersonStopExportAtBound(input: {
           summary: line, message: line } } } }).catch(() => undefined);
   }
   return { ...decision, decidedNow: true };
+}
+
+/** adopt-stopu-isolate: the decision site's call of THE generation step. */
+async function personStopIsolateAtDecision(db: Db, run: typeof heartbeatRuns.$inferSelect, reason: string): Promise<boolean> {
+  const result = await isolateSuccessorGeneration({ db, companyId: run.companyId, runId: run.id, reason })
+    .catch(error => { logger.warn({ err: error, runId: run.id }, "person-stop successor generation not built"); return null; });
+  return result?.kind === "isolated";
 }
 
 /**
@@ -223,6 +237,12 @@ export async function personStopExportPendingHoldsAdmission(db: Db,
       eq(heartbeatRuns.nativeIssueId, input.issueId))).limit(5);
   for (const { run, lease } of rows) {
     if (!lease.provider || lease.provider === "local" || !hasAcknowledgedNativeRunStopRequest(run)) continue;
+    // adopt-stopu-isolate (F9): once the successor's generation is committed
+    // no admission gate waits on the old (aside) writer; the named fallback
+    // (held) holds until the drain-complete record exists (the Retry re-check).
+    const isolationGate = personStopIsolationGate(run.runnerProfileJson as Record<string, unknown> | null);
+    if (isolationGate === "released") continue;
+    if (isolationGate === "held") return run.id;
     // adopt-stopu-compose4: at the bound the hold ends (rf-4 22:53Z); the
     // decision is durable on the lease.
     if (readPersonStopBoundDecision(lease.metadata)) {

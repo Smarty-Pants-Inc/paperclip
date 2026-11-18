@@ -1401,6 +1401,10 @@ export function personStopAsideDirectory(runId: string): string {
 }
 
 async function personStopWithoutFilesAsideDir(db: Db, runId: string, leaseId: string): Promise<string | null> {
+  // adopt-stopu-isolate: once the successor owns its own generation, this
+  // run's pinned localCwd (descriptor.binding.localCwd, written at dispatch)
+  // IS the stopped run's aside: the export lands there and nowhere else.
+  if (await personStopIsolationCommitted(db, runId)) return null;
   const [lease] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
     .where(eq(environmentLeases.id, leaseId)).limit(1);
   const decision = readPersonStopBoundDecision(lease?.metadata);
@@ -1425,6 +1429,44 @@ async function personStopSameBoxSuccessorAdmitted(db: Db, runId: string, decided
         and coalesce(s.started_at, s.updated_at) >= ${decidedAt}::timestamptz)` })
     .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1);
   return row?.admitted === true;
+}
+
+/** adopt-stopu-isolate: the durable successor-generation record on the stopped run. */
+export const PERSON_STOP_ISOLATION_KEY = "personStopIsolation";
+
+async function personStopIsolationCommitted(db: Db, runId: string): Promise<boolean> {
+  const [row] = await db.select({ record: sql<unknown>`${heartbeatRuns.runnerProfileJson}->${PERSON_STOP_ISOLATION_KEY}` })
+    .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1);
+  return row?.record !== null && row?.record !== undefined;
+}
+
+/**
+ * adopt-stopu-isolate: what a successor generation is built from. The seed is
+ * the stopped run's verified `workspace-seed.tar` (+ `git-seed.tar`), written
+ * once at prepare from the host state of that time; NEVER a live copy of the
+ * old folder. Null when the descriptor is not `prepared` (no seed kept).
+ */
+export async function readPersonStopIsolationSource(input: { runId: string; reference: NativeWorkspaceSyncReference }): Promise<{
+  localCwd: string; workspaceId: string; git: boolean;
+  workspaceArchivePath: string; workspaceArchiveSha256: string;
+  gitArchivePath: string | null; gitArchiveSha256: string | null;
+} | null> {
+  if (input.reference.state !== "prepared") return null;
+  const existing = await readDescriptor(input);
+  try {
+    const { descriptor } = existing;
+    if (descriptor.state !== "prepared" || !descriptor.seed) return null;
+    const seed = await verifiedDurableSeed({ runId: input.runId, seed: descriptor.seed,
+      gitSnapshot: descriptor.gitSnapshot, repositories: descriptor.repositories });
+    return { localCwd: descriptor.binding.localCwd, workspaceId: descriptor.binding.workspaceId,
+      git: Boolean(descriptor.gitSnapshot || descriptor.repositories?.length),
+      workspaceArchivePath: seed.workspaceArchivePath, workspaceArchiveSha256: seed.workspaceArchiveSha256,
+      gitArchivePath: seed.gitArchivePath ?? null, gitArchiveSha256: seed.gitArchiveSha256 ?? null };
+  } finally {
+    await disposeDirectorySnapshot(existing.baseline);
+    await disposeGitWorkspaceSnapshot(existing.descriptor.gitSnapshot);
+    for (const repository of existing.descriptor.repositories ?? []) await disposeGitWorkspaceSnapshot(repository.snapshot);
+  }
 }
 
 export async function cleanupNativeWorkspaceSync(runId: string): Promise<void> {

@@ -32,6 +32,8 @@ import {
 } from "@paperclipai/adapter-utils/host-mutation-drain";
 
 const OWNER_KEY = "nativeWorkspaceFinalizationOwner";
+/** adopt-stopu-isolate: the owner's own drain joined (see the release below). */
+export const DRAIN_COMPLETE_KEY = "nativeWorkspaceDrainComplete";
 
 export function nativeWorkspaceFinalizationLockKey(companyId: string, runId: string): string {
   return `native-workspace-finalization:${companyId}:${runId}`;
@@ -109,6 +111,14 @@ async function drainHostMutationsBeforeRelease(drain: HostMutationDrain, input: 
   logger.warn({ runId: input.runId, inFlight: result.inFlight, capMs: input.capMs },
     "workspace finalization ownership held past the drain cap: a host write is still running");
   if (input.agentId) {
+    // adopt-stopu-isolate (RFL 03:34Z): an operator-findable run event when the
+    // drain cap expires with a host call still outstanding (a hung disk).
+    await appendHeartbeatRunEvent(input.db, {
+      companyId: input.companyId, agentId: input.agentId, runId: input.runId,
+      eventType: "workspace_host_call_outstanding_at_drain_cap", stream: "system", level: "error",
+      message: "A host file call of this run's workspace export was still outstanding at the drain cap.",
+      payload: { inFlight: result.inFlight, capMs: input.capMs },
+    }).catch(error => logger.warn({ err: error, runId: input.runId }, "drain-cap run event could not be recorded"));
     try {
       await appendHeartbeatRunEvent(input.db, {
         companyId: input.companyId, agentId: input.agentId, runId: input.runId,
@@ -441,7 +451,12 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
           await notifyDeferredExecutionWork(tx, { companyId: input.companyId });
           await notifyDeferredWakesForRun(tx, { companyId: input.companyId, runId: input.runId });
           await tx.update(heartbeatRuns).set({
-            runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) - ${OWNER_KEY}`,
+            // adopt-stopu-isolate: the DRAIN-COMPLETE record. Written ONLY here,
+            // by the owner's own join after its action and host-mutation drain
+            // finished (actionPromise joined above); a takeover that clears a
+            // dead owner never writes it (person-stop-isolate.ts).
+            runnerProfileJson: sql`(coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) - ${OWNER_KEY})
+              || ${JSON.stringify({ [DRAIN_COMPLETE_KEY]: { token: owner.token, at: new Date().toISOString() } })}::jsonb`,
           }).where(owned);
         });
         joinedOwnerTokens.delete(owner.token);
