@@ -18,7 +18,7 @@ import type {
 } from "@paperclipai/shared";
 
 import { isNativeWorkspaceFinalizationOperationActive } from "./workspace-operations.js";
-import { exhaustedSystemRecoveryAction, readSystemRecovery } from "./system-recovery-state.js";
+import { exhaustedSystemRecoveryAction, personStopNote, readSystemRecovery } from "./system-recovery-state.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
@@ -156,6 +156,25 @@ function isUniqueRecoveryActionConflict(error: unknown) {
   return false;
 }
 
+/** The same one note as the execution blocker for a run a person stopped. Every
+ * read of a recovery action shown on the chat screen goes through this. */
+export async function projectPersonStopNotes(dbOrTx: DbOrTransaction, companyId: string, actions: IssueRecoveryAction[]) {
+  const runIdOf = (action: IssueRecoveryAction) => {
+    const runId = action.evidence?.runId ?? action.evidence?.sourceRunId;
+    return typeof runId === "string" && isUuidLike(runId) ? runId : null;
+  };
+  const runIds = [...new Set(actions.flatMap((action) => runIdOf(action) ?? []))];
+  if (runIds.length === 0) return actions;
+  const runs = await dbOrTx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds)));
+  const byId = new Map(runs.map((run) => [run.id, run]));
+  for (const action of actions) {
+    const note = personStopNote(byId.get(runIdOf(action) ?? ""), action.evidence);
+    if (note) action.nextAction = note;
+  }
+  return actions;
+}
+
 export function issueRecoveryActionService(db: DbOrTransaction) {
   const upsertQueues = new Map<string, Promise<void>>();
 
@@ -266,6 +285,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     if (!row) return null;
     const action = toReadModel(row);
     await projectNativeRunActivity(companyId, [action], dbOrTx);
+    await projectPersonStopNotes(dbOrTx, companyId, [action]);
     return action;
   }
 
@@ -287,6 +307,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       if (!result.has(row.sourceIssueId)) result.set(row.sourceIssueId, toReadModel(row));
     }
     await projectNativeRunActivity(companyId, [...result.values()], db);
+    await projectPersonStopNotes(db, companyId, [...result.values()]);
     return result;
   }
 
