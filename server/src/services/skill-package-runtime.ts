@@ -7,7 +7,8 @@ import { skillPackageStore, type StoredSkillVersion } from "./skill-package-stor
 import { assertSkillPackageFileSize, packageSha256, verifySkillPackageDirectory, relocateSkillPackageVerification, type SkillPackageFile, type SkillPackageManifest } from "./skill-package-files.js";
 import { REPOSITORY_CONTENT_DIR, repositorySkillProjection } from "./skill-repository-package.js";
 import { assertSkillSnapshotPath, skillFileBytes } from "./skill-snapshot.js";
-import { ensureSkillCacheDirectory } from "./skill-version-cache.js";
+import { ensureSkillCacheDirectory, skillCacheStep } from "./skill-version-cache.js";
+import { hostCleanup } from "@paperclipai/adapter-utils/host-mutation-drain";
 
 type ProjectedFile = SkillPackageFile & { sourcePath?: string; generated?: Buffer };
 // Only the wrapper/policy bytes and file metadata are retained, never a decoded repository.
@@ -97,21 +98,23 @@ export function skillPackageRuntime(db: Db) {
     await ensureSkillCacheDirectory(parent, true);
     if (await measureRunPhase("skills.version.verify", () => verifySkillPackageDirectory(directory, files), { fileCount: files.length })) return directory;
     return store.withPackage(version.companyId, (version.repositorySnapshotId ?? version.packageSnapshotId)!, async root => {
-      const staging = await fs.mkdtemp(path.join(parent, `.${version.id}-`));
+      // pl/keepalive7: every file write and the publication are separate checked, gated steps (see skillCacheStep).
+      const step = <T>(fn: () => Promise<T>) => skillCacheStep(version.companyId, fn);
+      const staging = await step(() => fs.mkdtemp(path.join(parent, `.${version.id}-`)));
       try {
         for (const file of files) {
           const target = path.join(staging, file.path);
-          await fs.mkdir(path.dirname(target), { recursive: true });
-          if (file.generated) await fs.writeFile(target, file.generated);
-          else await fs.copyFile(path.join(root, file.sourcePath!), target);
-          await fs.chmod(target, file.executable ? 0o555 : 0o444);
+          await step(() => fs.mkdir(path.dirname(target), { recursive: true }));
+          if (file.generated) await step(() => fs.writeFile(target, file.generated!));
+          else await step(() => fs.copyFile(path.join(root, file.sourcePath!), target));
+          await step(() => fs.chmod(target, file.executable ? 0o555 : 0o444));
         }
         if (!await verifySkillPackageDirectory(staging, files)) throw new Error("Prepared skill version failed integrity verification");
-        await fs.rm(directory, { recursive: true, force: true });
-        await fs.rename(staging, directory);
+        await step(() => fs.rm(directory, { recursive: true, force: true }));
+        await step(() => fs.rename(staging, directory));
         relocateSkillPackageVerification(staging, directory, files);
         return directory;
-      } finally { await fs.rm(staging, { recursive: true, force: true }); }
+      } finally { await hostCleanup(() => fs.rm(staging, { recursive: true, force: true })); }
     });
   }
   async function readFile(version: StoredSkillVersion, relative: string, maxBytes?: number) {

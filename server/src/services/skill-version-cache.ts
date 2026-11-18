@@ -30,6 +30,18 @@ export class SkillVersionCacheLockLostError extends Error {
 export function skillVersionCacheLockSignal(companyId: string): AbortSignal | undefined {
   return locks.getStore()?.find(lock => lock.companyId === companyId)?.lost;
 }
+/**
+ * pl/keepalive7: ONE host step of a multi-step cache writer (a version materialisation's each file write, its
+ * publication rename). Before the step, the held company cache lock's combined signal (its own loss or an
+ * enclosing lock's) and the held gate's are checked, so a lost lock stops the writer with its typed lost error
+ * before the NEXT step; the step goes through the held gate (refused after a loss, counted by the drain).
+ * Outside a held lock it is fn().
+ */
+export async function skillCacheStep<T>(companyId: string, fn: () => Promise<T>): Promise<T> {
+  skillVersionCacheLockSignal(companyId)?.throwIfAborted();
+  currentHostMutationDrain()?.signal.throwIfAborted();
+  return hostMutation(fn);
+}
 /** Hold through publication AND durable run pinning, not just file creation. */
 export async function withSkillVersionCacheLock<T>(db: Db, companyId: string, action: (signal?: AbortSignal) => Promise<T>, tryOnly = false): Promise<T> {
   const held = locks.getStore() ?? [];

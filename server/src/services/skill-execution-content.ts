@@ -8,7 +8,8 @@ import { skillPackageStore } from "./skill-package-store.js";
 import { skillPackageRuntime } from "./skill-package-runtime.js";
 import { skillPackageManifest, verifySkillPackageDirectory } from "./skill-package-files.js";
 import { skillFileBytes } from "./skill-snapshot.js";
-import { ensureSkillCacheDirectory, skillVersionCachePaths, touchSkillVersionCache, withSkillVersionCacheLock } from "./skill-version-cache.js";
+import { ensureSkillCacheDirectory, skillCacheStep, skillVersionCachePaths, touchSkillVersionCache, withSkillVersionCacheLock } from "./skill-version-cache.js";
+import { hostCleanup } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { runVersionSnapshotFlight } from "./skill-version-retention.js";
 
 export type SkillContentReference = { companyId: string; skillId: string; versionId: string };
@@ -34,18 +35,20 @@ export function skillExecutionContent(db: Db, options: { actor?: AuthorizationAc
         const parent = path.dirname(directory);
         await ensureSkillCacheDirectory(parent, true);
         if (await verifySkillPackageDirectory(directory, manifest.files)) return directory;
-        const staging = await fs.mkdtemp(path.join(parent, `.${versionId}-`));
+        // pl/keepalive7: every file write and the publication are separate checked, gated steps: after the cache
+        // lock (or an enclosing lock) is lost, no further file is written and the version is not published.
+        const staging = await skillCacheStep(companyId, () => fs.mkdtemp(path.join(parent, `.${versionId}-`)));
         try {
           for (const file of files) {
             const target = path.join(staging, file.path);
-            await fs.mkdir(path.dirname(target), { recursive: true });
-            await fs.writeFile(target, skillFileBytes(file), { mode: file.executable ? 0o555 : 0o444 });
+            await skillCacheStep(companyId, () => fs.mkdir(path.dirname(target), { recursive: true }));
+            await skillCacheStep(companyId, () => fs.writeFile(target, skillFileBytes(file), { mode: file.executable ? 0o555 : 0o444 }));
           }
           if (!await verifySkillPackageDirectory(staging, manifest.files)) throw new Error("Skill delivery verification failed");
-          await fs.rm(directory, { recursive: true, force: true });
-          await fs.rename(staging, directory);
+          await skillCacheStep(companyId, () => fs.rm(directory, { recursive: true, force: true }));
+          await skillCacheStep(companyId, () => fs.rename(staging, directory));
           return directory;
-        } finally { await fs.rm(staging, { recursive: true, force: true }); }
+        } finally { await hostCleanup(() => fs.rm(staging, { recursive: true, force: true })); }
       });
       await touchSkillVersionCache(companyId, skillId, versionId);
       return consume(directory);
