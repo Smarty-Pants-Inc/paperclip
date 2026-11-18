@@ -31,12 +31,17 @@ type Presentation = Awaited<ReturnType<typeof taskInterruptionPresentation>>;
 export function strandedRetryAdmissionFromPresentation(presentation: Presentation, agentName: string | null): StrandedRetryAdmission {
   if (presentation?.canRetry) return { admits: true };
   if (presentation?.userAction === "resume") return { admits: false, refusal: "agent_paused", agentName };
-  if (presentation?.userAction === "confirm_run_stopped" || presentation?.retryWait?.reason === "previous_execution_unverified")
-    return { admits: false, refusal: "previous_execution_unverified" };
+  // Confirm it stopped is named only under the screen's own condition for its button
+  // (ExecutionBlockerNotice.tsx: userAction === "confirm_run_stopped").
+  if (presentation?.userAction === "confirm_run_stopped") return { admits: false, refusal: "confirm_run_stopped" };
+  if (presentation?.retryWait?.reason === "previous_execution_unverified") return { admits: false, refusal: "previous_execution_unverified" };
   if (presentation?.retryWait?.reason === "workspace_repair_required") return { admits: false, refusal: "workspace_repair_required" };
   if (presentation?.userAction === "budget" || presentation?.retryWait?.reason === "budget.blocked")
     return { admits: false, refusal: "budget_blocked" };
   if (presentation?.retryWait?.reason === "heartbeat.daily_run_limit" || presentation?.retryWait?.reason === "heartbeat.daily_cost_limit")
     return { admits: false, refusal: "daily_limit", agentName };
+  // Any other wait Paperclip owns: say what the screen says, with no button.
+  if (presentation?.responsibility === "system" && !presentation.userAction && presentation.retryWait?.message)
+    return { admits: false, refusal: "system_waiting", waitMessage: presentation.retryWait.message };
   return { admits: false, refusal: "none" };
 }

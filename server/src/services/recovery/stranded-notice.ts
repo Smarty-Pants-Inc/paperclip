@@ -46,12 +46,31 @@ export type StrandedRetryAdmission =
   | { admits: true }
   | { admits: false; refusal: "agent_paused"; agentName?: string | null }
   | { admits: false; refusal: "workspace_repair_required" }
+  | { admits: false; refusal: "confirm_run_stopped" }
   | { admits: false; refusal: "previous_execution_unverified" }
+  | { admits: false; refusal: "system_waiting"; waitMessage: string }
   | { admits: false; refusal: "budget_blocked" }
   | { admits: false; refusal: "daily_limit"; agentName?: string | null }
   | { admits: false; refusal: "none" };
 
 const MENTIONS_RETRY = /\bretry\b/i;
+const ATTEMPT_NOT_FINISHED = "This attempt could not be finished automatically.";
+
+/**
+ * A cause-specific seed keeps what it says about the cause; only its sentences
+ * that offer Retry are replaced by the refusal's words. The generic default body
+ * has no cause of its own, so it is replaced whole.
+ */
+function withoutRetrySentences(seedBody: string | null, refusalBody: string, causeOnly: boolean): string {
+  const kept = (seedBody?.match(/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g) ?? [])
+    .map(sentence => sentence.trim()).filter(sentence => sentence && !MENTIONS_RETRY.test(sentence));
+  if (!kept.length) return refusalBody;
+  // No refusal reason of its own (refusal "none"): the seed's cause is the whole body.
+  if (causeOnly) return kept.join(" ");
+  const rest = refusalBody.startsWith(ATTEMPT_NOT_FINISHED) ? refusalBody.slice(ATTEMPT_NOT_FINISHED.length).trim()
+    : refusalBody.replace(/^This attempt could not be finished automatically, and /, "");
+  return [...kept, rest ? rest.charAt(0).toUpperCase() + rest.slice(1) : ""].filter(Boolean).join(" ");
+}
 
 export function strandedRetryRefusalCopy(retry: Exclude<StrandedRetryAdmission, { admits: true }>): { body: string; nextAction: string } {
   switch (retry.refusal) {
@@ -67,10 +86,27 @@ export function strandedRetryRefusalCopy(retry: Exclude<StrandedRetryAdmission, 
         body: "This attempt could not be finished automatically, and its saved files must be recovered first, so Retry can't start it. Your message is saved.",
         nextAction: "Press Recover saved files to recover the workspace.",
       };
-    case "previous_execution_unverified":
+    // The screen shows its Confirm it stopped button only for this userAction
+    // (ExecutionBlockerNotice.tsx: userAction === "confirm_run_stopped").
+    case "confirm_run_stopped":
       return {
         body: "This attempt could not be finished automatically. Paperclip can't confirm that the previous attempt stopped, so Retry can't continue from it. Your message is saved.",
         nextAction: "Press Confirm it stopped once the previous attempt has stopped.",
+      };
+    // A retryWait with no userAction: the screen has no button for it, and the
+    // confirm route refuses it (409 run_not_finished). Dispatch lifts it only
+    // when the previous attempt is reconciled, its workspace repair is verified,
+    // or a fresh workspace is chosen (explicit-native-continuation.ts legacy gate).
+    case "previous_execution_unverified":
+      return {
+        body: "This attempt could not be finished automatically. Paperclip can't confirm that the previous attempt stopped, so Retry can't continue from it. Your message is saved.",
+        nextAction: "It continues once a board user records that the previous attempt stopped; there is no button for this on the task yet.",
+      };
+    // A system-owned wait the screen names itself (retryWait.message, no button).
+    case "system_waiting":
+      return {
+        body: `This attempt could not be finished automatically. ${retry.waitMessage}`,
+        nextAction: "Paperclip is handling this step first; Retry is not available until it finishes.",
       };
     case "budget_blocked":
       return {
@@ -359,7 +395,8 @@ export function buildStrandedRecoveryEscalationNotice(input: {
   const fallbackBody = input.fallbackBody?.trim();
   const refusal = input.retry.admits ? null : strandedRetryRefusalCopy(input.retry);
   const offeredBody = seed?.body ?? (fallbackBody || DEFAULT_STRANDED_RECOVERY_NOTICE_BODY);
-  const body = refusal && MENTIONS_RETRY.test(offeredBody) ? refusal.body : offeredBody;
+  const body = refusal && MENTIONS_RETRY.test(offeredBody)
+    ? withoutRetrySentences(seed?.body ? offeredBody : null, refusal.body, !input.retry.admits && input.retry.refusal === "none") : offeredBody;
   const title =
     STRANDED_RECOVERY_NOTICE_TITLES_BY_RUN_ERROR_CODE[input.sourceRun?.errorCode?.trim() ?? ""] ??
     seed?.title ??

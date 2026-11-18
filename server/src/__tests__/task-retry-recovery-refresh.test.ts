@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { and, eq, ne } from "drizzle-orm";
@@ -209,20 +211,26 @@ describe("Task Retry recovery-card refresh", () => {
       JSON.stringify(await getExecutionBlocker(db, f.companyId, f.issueId)));
     // The screen withholds Retry while the saved files are already being
     // recovered (no person action exists yet), so the notice names none.
-    expect(row).toMatchObject({ admits: false, refusal: "none", pressRetry: false, status: 202, runStarted: false });
+    // r2d ST3: no row here proves the recovery then answers the message by
+    // itself, so the notice no longer says "Nothing restarts it by itself"; it
+    // says what the screen says (retryWait.message) and names no button.
+    expect(row).toMatchObject({ admits: false, refusal: "system_waiting", pressRetry: false, status: 202, runStarted: false });
     expect(notice.body).toContain("Your message is saved.");
+    expect(JSON.stringify(notice)).not.toContain("Nothing restarts it by itself");
   });
 
   // Judge rows (rf-5 bar): the stranded notice says "Press Retry" IFF the
   // screen's one Retry decision (taskInterruptionPresentation.canRetry) admits,
   // compared with what the REAL POST /issues/:id/retry + dispatch then do.
+  const markerDir = mkdtempSync(path.join(tmpdir(), "judge-executor-"));
   async function judgeFixture(opts: { paused?: boolean; blocker?: boolean; adapterType?: "process" | "paperclip_runner";
-    heartbeat?: Record<string, unknown> } = {}) {
+    heartbeat?: Record<string, unknown>; legacy?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Stranded judge", issuePrefix: `SJ${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
     const adapterType = opts.adapterType ?? "process";
     await db.insert(agents).values({ id: agentId, companyId, name: "Judge agent", role: "engineer", status: opts.paused ? "paused" : "idle",
-      adapterType, adapterConfig: adapterType === "process" ? { command: "true" } : {},
+      adapterType, adapterConfig: adapterType === "process" ? { command: "/bin/sh",
+        args: ["-c", 'printf %s "$PAPERCLIP_RUN_ID" > "$JUDGE_MARKER_DIR/$PAPERCLIP_RUN_ID"'], env: { JUDGE_MARKER_DIR: markerDir } } : {},
       runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, ...opts.heartbeat } } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Stranded task", status: "todo", assigneeAgentId: agentId, priority: "medium" });
     if (opts.blocker) {
@@ -232,7 +240,7 @@ describe("Task Retry recovery-card refresh", () => {
     }
     const at = new Date(Date.now() - 60_000);
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, status: "failed", errorCode: "adapter_failed",
-      ...(adapterType === "paperclip_runner" ? { runtimeMode: "legacy" } : {}),
+      ...(adapterType === "paperclip_runner" || opts.legacy ? { runtimeMode: "legacy" } : {}),
       error: "Injected failure", invocationSource: "on_demand", contextSnapshot: { issueId }, createdAt: at, startedAt: at, finishedAt: at }).returning();
     return { companyId, agentId, issueId, run: run! };
   }
@@ -242,18 +250,39 @@ describe("Task Retry recovery-card refresh", () => {
     const notice = buildStrandedRecoveryEscalationNotice({ retry, recoveryCause: "stranded_assigned_issue",
       recoveryActionId: null, recoveryOwner: null, sourceRun: { id: f.run.id, agentId: f.agentId, status: f.run.status, errorCode: f.run.errorCode } } as never);
     const screen = await taskInterruptionPresentation(db, await issueRow(f.issueId));
-    const res = await request(appForBoard()).post(`/api/issues/${f.issueId}/retry`).send({ idempotencyKey: randomUUID(), observedRunId: f.run.id });
+    // r2d ST5: process admission is open only for this press, so a successor can
+    // really execute. "Run started" = a successor with startedAt AND the
+    // executor's own marker file naming that run, never a row's existence.
+    resetProcessRunAdmissionForTests();
+    let res: Awaited<ReturnType<ReturnType<typeof request>["post"]>>;
     let dispatchError: string | null = null;
-    // The route nudges dispatch with `void resumeTaskRetry(...)`; await the same call to read its outcome.
-    if (res.body.requestId) await heartbeatService(db).resumeTaskRetry(f.companyId, res.body.requestId)
-      .catch((error: Error) => { dispatchError = error.message; });
-    const started = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.issueId, f.issueId), ne(heartbeatRuns.id, f.run.id)));
+    let started: { id: string; status: string; startedAt: Date | null }[] = [];
+    try {
+      res = await request(appForBoard()).post(`/api/issues/${f.issueId}/retry`).send({ idempotencyKey: randomUUID(), observedRunId: f.run.id });
+      // The route nudges dispatch with `void resumeTaskRetry(...)`; await the same call to read its outcome.
+      if (res.body.requestId) await heartbeatService(db).resumeTaskRetry(f.companyId, res.body.requestId)
+        .catch((error: Error) => { dispatchError = error.message; });
+      const successors = () => db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
+        .from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId, f.issueId), ne(heartbeatRuns.id, f.run.id)));
+      for (let i = 0; i < 40; i++) {
+        started = await successors();
+        if (!started.some(run => ["queued", "running"].includes(run.status) && run.startedAt)) break;
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      started = await successors();
+    } finally {
+      await heartbeatService(db).drainActiveRunExecutions();
+      closeProcessRunAdmission();
+    }
+    const executed = started.filter(run => run.startedAt && existsSync(path.join(markerDir, run.id))
+      && readFileSync(path.join(markerDir, run.id), "utf8") === run.id);
     const [saved] = res.body.requestId ? await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, res.body.requestId)) : [];
     const text = JSON.stringify(notice);
     const row = { admits: retry.admits, refusal: retry.admits ? null : retry.refusal, pressRetry: /Press Retry/.test(text),
       screenCanRetry: screen?.canRetry ?? null, screenUserAction: screen?.userAction ?? null, screenWait: screen?.retryWait?.reason ?? null,
-      status: res.status, routeCanRetry: res.body.presentation?.canRetry ?? null, runStarted: started.length > 0, dispatchError,
+      status: res.status, routeCanRetry: res.body.presentation?.canRetry ?? null, runStarted: executed.length > 0, dispatchError,
+      successorRows: started.length, successorStartedAt: started.map(run => run.startedAt?.toISOString() ?? null),
+      successorStatus: started.map(run => run.status), executorMarker: executed.map(run => run.id),
       savedWait: (saved?.payload as Record<string, any> | undefined)?.executionWait?.reason ?? saved?.status ?? null,
       body: notice.body, nextAction: JSON.stringify(notice.metadata.sections[0]!.rows.find(r => "label" in r && r.label === "Next action") ?? null) };
     console.info("JUDGE_ROW", JSON.stringify(row));
@@ -288,6 +317,43 @@ describe("Task Retry recovery-card refresh", () => {
     const row = await judge(f);
     expect(row).toMatchObject({ status: 202, runStarted: false, savedWait: "previous_execution_unverified" });
     expect(row).toMatchObject({ admits: false, refusal: "previous_execution_unverified", pressRetry: false, screenCanRetry: false });
+    // r2d ST2: the screen has no Confirm button here (screenUserAction null), so the notice names none.
+    expect(row).toMatchObject({ screenUserAction: null });
+    expect(JSON.stringify(row)).not.toContain("Confirm it stopped");
+  }, 60_000);
+
+  // r2d ST5: an execution blocker that says canRetry=true on an idle process
+  // agent. The notice may say Press Retry only if a run really executes.
+  it("JUDGE execution blocker canRetry=true, idle process agent: Press Retry iff the executor runs", async () => {
+    const f = await judgeFixture({ legacy: true });
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", ownerType: "board",
+      fingerprint: randomUUID(), status: "resolved", outcome: "blocked", nextAction: "Press Retry to continue.",
+      evidence: { runId: f.run.id, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    console.info("JUDGE_BLOCKER canRetry-true", JSON.stringify(blocker));
+    expect(blocker).toMatchObject({ canRetry: true });
+    const row = await judge(f);
+    expect(row.status).toBe(202);
+    expect(row.pressRetry).toBe(row.runStarted);
+  }, 60_000);
+
+  // r2d ST5: the agent is busy (its one concurrency slot is occupied by a
+  // running run on another task). Record what Retry does at press time.
+  it("JUDGE occupied slot (agent busy): Press Retry vs the executor at press time", async () => {
+    const f = await judgeFixture({ heartbeat: { maxConcurrentRuns: 1 } });
+    const otherIssueId = randomUUID();
+    await db.insert(issues).values({ id: otherIssueId, companyId: f.companyId, title: "Busy task", status: "in_progress",
+      assigneeAgentId: f.agentId, priority: "medium" });
+    const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: otherIssueId,
+      status: "running", invocationSource: "on_demand", contextSnapshot: { issueId: otherIssueId },
+      startedAt: new Date(), processPid: process.pid, processStartedAt: new Date() } as never).returning();
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, f.agentId));
+    const row = await judge(f);
+    console.info("JUDGE_BUSY", JSON.stringify({ busyRunId: busy!.id }));
+    expect(row).toMatchObject({ status: 202, runStarted: false });
+    // A successor may be queued for the slot; it has not started (startedAt null, no marker).
+    expect(row.successorStartedAt.every(at => at === null)).toBe(true);
   }, 60_000);
 
   // (b) the agent's budget hard stop is reached; the queued budget evaluation
