@@ -1,5 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
-import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY, agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, holdUncollectedAgentFileCopy, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
+import { AGENT_FILE_COLLECTION_PINS_KEY, AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY, agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, holdUncollectedAgentFileCopy, nativeHarnessBackupMissingOnAllocation, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -2031,11 +2031,11 @@ function createSandboxEnvironmentDriver(
       // J3-26: verified chain custody destroys a closed ACTIVE tip only if it still proves closed.
       const destroyable = closedActiveTipIds.has(lease.id) ? await closedActiveTipStill(lease.id) : lease;
       if (!destroyable) continue;
-      await destroyReusableSandboxLease({
+      if (!await destroyReusableSandboxLease({
         environment: input.environment,
         lease: destroyable as EnvironmentLease,
         failureReason: "lease_fingerprint_mismatch",
-      });
+      })) await stopAndKeepRefusedDestroy(destroyable as EnvironmentLease, "lease_fingerprint_mismatch");
     }
   }
 
@@ -2443,11 +2443,11 @@ function createSandboxEnvironmentDriver(
             // The verified, lease-bound backup authorizes destructive
             // replacement. Keep the existing sandbox intact when validation
             // fails so the only recoverable provider state is not lost.
-            await destroyReusableSandboxLease({
+            if (!await destroyReusableSandboxLease({
               environment: input.environment,
               lease: reusableLease,
               failureReason: replacementReason ?? "resume_failed",
-            });
+            })) await stopAndKeepRefusedDestroy(reusableLease, replacementReason ?? "resume_failed");
           }
         }
         const acquiredLease = providerLease ?? await createOwnedSandbox(db, {
@@ -2766,11 +2766,11 @@ function createSandboxEnvironmentDriver(
         throw error;
       }
       if (reusableLease && providerLease.providerLeaseId !== reusableLease.providerLeaseId) {
-        await destroyReusableSandboxLease({
+        if (!await destroyReusableSandboxLease({
           environment: input.environment,
           lease: reusableLease,
           failureReason: "resume_failed",
-        });
+        })) await stopAndKeepRefusedDestroy(reusableLease, "resume_failed");
       }
 
       // Same ephemeral-policy-for-tests guard as the plugin-backed path:
@@ -3769,6 +3769,32 @@ function createSandboxEnvironmentDriver(
         logger.warn({ leaseId: input.lease.id }, "agent-file destroy claim release failed");
       });
     }
+  }
+
+  /** custody-stop. An obsolete/replaced retained lease whose final destroy
+   * claim the allocation-wide nativeHarnessBackupMissing veto refused would
+   * otherwise keep a paid box running with no owner: warm expiry and the
+   * orphan settle exclude superseded rows, and the sweep takes only
+   * pending_cleanup. Persist the existing stop-only intent on the exact row
+   * (the sweep stops the box and keeps its disk; custody metadata stays).
+   * Never for a vanished row, a row no longer exactly retained (a reacquire:
+   * prepareSupersededWarmSandboxStop's status guard and compare-and-swap),
+   * an allocation another lease holds (SANDBOX_ALLOCATION_HOLDER_STATUSES,
+   * as retryPendingSandboxTeardown's otherOwner), or a pinned/held box. */
+  async function stopAndKeepRefusedDestroy(lease: EnvironmentLease, reason: string) {
+    const [current] = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.id, lease.id)));
+    if (current?.status !== "retained" || !current.provider || !current.providerLeaseId) return null;
+    if (!await nativeHarnessBackupMissingOnAllocation(db, current)) return null;
+    if (isRecord(current.metadata?.[AGENT_FILE_COLLECTION_PINS_KEY])
+      && Object.keys(current.metadata[AGENT_FILE_COLLECTION_PINS_KEY] as object).length > 0) return null;
+    if (await agentFileSaveHeldOnLease(db, current)) return null;
+    const [otherOwner] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      ne(environmentLeases.id, current.id), eq(environmentLeases.provider, current.provider),
+      eq(environmentLeases.providerLeaseId, current.providerLeaseId), inArray(environmentLeases.status, [...SANDBOX_ALLOCATION_HOLDER_STATUSES]),
+    )).limit(1);
+    if (otherOwner) return null;
+    return await prepareSupersededWarmSandboxStop(db, current, { reason, destroyRefused: "native_harness_backup_missing" });
   }
 
   async function destroyReusableSandboxLeaseClaimed(input: {
