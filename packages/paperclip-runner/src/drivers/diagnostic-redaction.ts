@@ -1,8 +1,29 @@
+import { redactCommandText } from "@paperclipai/adapter-utils/command-redaction";
+
+/** Answer-only prose exception; credential-shaped rules still run first. */
+export function redactProviderAnswer(message: string): string {
+  return redactProviderDiagnostic(redactCommandText(message, "[REDACTED]"), true);
+}
+
 /** Redact diagnostic text without importing the provider process or its credentials. */
-export function redactProviderDiagnostic(message: string): string {
+export function redactProviderDiagnostic(message: string, allowBearerProse = false): string {
   const sanitized = message
     .replaceAll(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, (match, offset: number, input: string) => {
+      if (!allowBearerProse) return "Bearer [REDACTED]";
+      // Keep in sync with server redactStandaloneBearerCredentials: inspect the
+      // whole whitespace-delimited word and same-line quotes, not a token prefix.
+      const start = offset + /^Bearer\s+/i.exec(match)![0].length;
+      const word = /^\S+/.exec(input.slice(start))![0];
+      const prose = word.replace(/[.,;:!?)\]]+$/, "");
+      let before = offset - 1;
+      while (before >= 0 && /[^\S\r\n]/.test(input[before]!)) before--;
+      let after = start + word.length;
+      while (after < input.length && /[^\S\r\n]|[.,;:!?)\]]/.test(input[after]!)) after++;
+      return !/["'`]/.test(input[before] ?? "") && !/["'`]/.test(input[after] ?? "")
+        && prose.length < 20 && /^[A-Za-z][a-z]*(?:-[a-z]+)?$/.test(prose)
+        ? match : "Bearer [REDACTED]";
+    })
     .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (match, encoded: string) => {
       try {
         // Only redact an actual RFC 7617 credential. Ordinary prose such as
