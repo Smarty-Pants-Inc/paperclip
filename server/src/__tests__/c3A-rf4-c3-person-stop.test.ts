@@ -107,7 +107,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       const result = await request(app).post(`/api/heartbeat-runs/${runId}/cancel`).send({});
       stopMs = Date.now() - start; stopResponse = { status: result.status, body: result.body };
       expect(result.status).toBe(200); expect(result.body.status).toBe("cancelled");
-      await waitFor(async () => (await heartbeat.getRun(runId))?.resultJson?.nativeCancellation?.dispatchState === "acknowledged");
+      await waitFor(async () => ((await heartbeat.getRun(runId))?.resultJson?.nativeCancellation as { dispatchState?: string } | undefined)?.dispatchState === "acknowledged");
       await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "native_retry_cancelled", leaseOwner: null, leaseExpiresAt: null }).where(eq(nativeRunFinalizations.runId, runId));
       if (mode === "mid_turn") waitingWakes = await message();
     };
