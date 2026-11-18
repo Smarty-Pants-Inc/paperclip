@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
-import { redactProviderDiagnostic } from "../diagnostic-redaction.js";
+import { redactProviderAnswer, redactProviderDiagnostic } from "../diagnostic-redaction.js";
 import { piPerformanceEntrySpans } from "./pi-performance-diagnostics.js";
 import { PROVIDER_PERFORMANCE_DIAGNOSTIC } from "../../contracts/provider-performance.js";
 
@@ -462,7 +462,10 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         if (type.endsWith("_delta")) {
           // Every streamed delta reaches the person whole; one too large for a
           // record is paged across consecutive deltas, never cut.
-          for (const page of pages(text(update.delta))) if (page) output.push(emit("item.delta", block.id, { ...payload, text: page }));
+          // displayValue is diagnostic-strict; answer deltas use the native text
+          // with the prose-aware rule, just like the authoritative final answer.
+          const delta = thinking ? text(update.delta) : redactProviderAnswer(text(record(source.assistantMessageEvent).delta));
+          for (const page of pages(delta)) if (page) output.push(emit("item.delta", block.id, { ...payload, text: page }));
         } else if (type.endsWith("_end")) {
           // The block-end snapshot is not a delta. message_end publishes its
           // authoritative final content/status without duplicating streamed text.
@@ -510,7 +513,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
             // and shown as a plain line plus a labelled excerpt (fullText names it for the agent).
             // Read the native text: displayValue already replaced an oversized string with a spill reference.
             const answer = kind === "reasoning" ? undefined
-              : finalAnswerText(redactProviderDiagnostic(text(record(nativeContent[index]).text)), MAX_ANSWER_BYTES, spillDirectory);
+              : finalAnswerText(redactProviderAnswer(text(record(nativeContent[index]).text)), MAX_ANSWER_BYTES, spillDirectory);
             if (answer?.fullText) displayTruncated = true;
             block.text = answer ? answer.text : projectText(text(part.thinking), MAX_ANSWER_BYTES, "text"); block.terminal = true;
             output.push(emit(failed ? "item.failed" : "item.completed", block.id, { kind, channel: kind === "reasoning" ? "detail" : message.stopReason === "toolUse" ? "progress" : "final", text: block.text,

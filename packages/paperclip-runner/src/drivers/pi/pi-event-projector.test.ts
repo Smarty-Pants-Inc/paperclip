@@ -35,6 +35,25 @@ const envelope = (event: PiProjectedEvent, index: number): PrpEvent => ({
   emittedAt: "2026-11-12T05:24:25.000Z", ...event,
 });
 
+// Never-OK guard: answer prose survives without exposing credential-shaped text.
+describe("Pi answer bearer prose and credentials", () => {
+  const prose = "the Bearer of bad news arrived";
+  const credentials = ['"Bearer SYNTHabcdefghij"', `Authorization: Bearer ${"a".repeat(40)}`, `sk-proj-${"a".repeat(40)}`,
+    `ghp_${"a".repeat(40)}`, "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature12345678"];
+  it.each([prose, ...credentials])("projects final answer safely: %s", input => {
+    const events = createPiEventProjector({ runId: "r", turnId: "t" }).project(final({ content: [{ type: "text", text: input }] }));
+    const answer = events.find(event => event.eventType === "item.completed" && event.payload.kind === "agentMessage")?.payload.text;
+    if (input === prose) expect(answer).toBe(prose);
+    else { expect(answer).toContain("REDACTED"); expect(answer).not.toContain(input); }
+  });
+  it.each([prose, ...credentials])("projects answer delta safely: %s", input => {
+    const events = createPiEventProjector({ runId: "r", turnId: "t" }).project(update("text_delta", { delta: input }));
+    const answer = events.find(event => event.eventType === "item.delta")?.payload.text;
+    if (input === prose) expect(answer).toBe(prose);
+    else { expect(answer).toContain("REDACTED"); expect(answer).not.toContain(input); }
+  });
+});
+
 describe("real Pi 1.5.2 RPC -> canonical events -> existing reducer/transcript", () => {
   it("matches the recorded wire golden and every closed PRP schema", () => {
     const actual = realProjection();

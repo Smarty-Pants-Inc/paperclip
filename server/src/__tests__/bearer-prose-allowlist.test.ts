@@ -1,6 +1,7 @@
 // Task-authorized never-OK guard: a prose exception must not expose credentials.
 import { describe, expect, it } from "vitest";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { redactProviderAnswer } from "../../../packages/paperclip-runner/src/drivers/diagnostic-redaction.js";
 
 const prose = [
   "pass the bearer token along",
@@ -66,10 +67,16 @@ describe("standalone bearer prose allowlist", () => {
   it.each(prose)("preserves prose: %s", input => {
     expect(redactSensitiveText(input)).toBe(input);
     expect(redactEventPayload({ text: input })).toEqual({ text: input });
+    expect(redactProviderAnswer(input)).toBe(input);
   });
   it.each(credentials)("keeps the credential masked: %s", input => {
     expect(redactSensitiveText(input)).toContain("REDACTED");
     expect(redactEventPayload({ text: input })?.text).toContain("REDACTED");
+    // Keep the runner's equivalent prose decision synced with this whole table.
+    // Quoted values outside its token grammar still get the server's scanner.
+    const answer = redactProviderAnswer(input);
+    if (/\bBearer\s+[A-Za-z0-9._~+\/-]+/i.test(input)) expect(answer).toContain("REDACTED");
+    expect(redactSensitiveText(answer)).toContain("REDACTED");
   });
   it.each([...prose, ...credentials])("is idempotent: %s", input => {
     const once = redactSensitiveText(input);
