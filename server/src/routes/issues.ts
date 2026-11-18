@@ -8130,6 +8130,15 @@ export function issueRoutes(
     return { activeRun, wake, queueRun, state, queue, queueState };
   }
 
+  // S8 order (rf-4): after a queued message is discarded or deleted (committed),
+  // a message held behind the person's Interrupt is promoted if that press is
+  // no longer live. Best-effort: the receipt sweep retries it.
+  async function releaseWakesBehindDeadPress(issue: { companyId: string; id: string }) {
+    await heartbeat.releaseWakesBehindDeadPress({ companyId: issue.companyId, issueId: issue.id }).catch((err: unknown) => {
+      logger.warn({ err, issueId: issue.id }, "a message held behind a dead Interrupt could not be promoted yet");
+    });
+  }
+
   function operatorInterruptCancelOptions(input: { issueId: string; actor: ReturnType<typeof getActorInfo> }) {
     return {
       errorCode: "operator_interrupted",
@@ -18585,6 +18594,7 @@ export function issueRoutes(
       if (result.cancelledRun) {
         void emitAgentTaskRunById(db, { runId: result.cancelledRun.id, companyId: issue.companyId });
       }
+      await releaseWakesBehindDeadPress(issue);
       res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, result.queue));
     },
   );
@@ -19885,6 +19895,7 @@ export function issueRoutes(
             activeRun?.id ?? queueWakeForCancellation?.runId ?? null,
         },
       });
+      await releaseWakesBehindDeadPress(issue);
 
       res.json(removed);
       return;
@@ -19983,6 +19994,7 @@ export function issueRoutes(
         resolvedAnnotationThreadIds: annotationCleanup.resolvedThreadIds,
       },
     });
+    await releaseWakesBehindDeadPress(issue);
 
     res.json(deleted);
   });
