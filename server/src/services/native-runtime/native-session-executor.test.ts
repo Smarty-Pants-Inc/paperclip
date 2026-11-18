@@ -12157,7 +12157,9 @@ describe("bounded stopped instruction collection", () => {
 });
 
 describe("native warm session supervision", () => {
-  it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-remove-entry-held-person", "claim-canonical", "claim-config", "claim-uncertain"])("composes remote warm ownership with real DB successor leases and current-run collection: %s", async ending => {
+  it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-remove-entry-held-person", "claim-canonical", "claim-config", "claim-uncertain"].map(ending => ({
+    ending, rowTitle: ending === "claim-remove-entry-held-person" ? `${ending} (planted admission/Send records; rf-3, 2026-11-18)` : ending,
+  })))("composes remote warm ownership with real DB successor leases and current-run collection: $rowTitle", async ({ ending }) => {
     const tables = await import("@paperclipai/db");
     const { eq, sql } = await import("drizzle-orm");
     const { randomUUID } = await import("node:crypto");
@@ -12212,15 +12214,18 @@ describe("native warm session supervision", () => {
     });
     // rf-3 (smarty-dev#20787 C1, required 1 and 3): the person's next actions
     // while a permanent 422 save stays held, on this native path, continuing
-    // after the hold instead of discarding first. The provider turn is the
+    // after the hold instead of discarding first. PLANTED admission/Send records:
+    // next-run and chat admission, user message and lease rows are inserted here,
+    // not produced by the real Send route (rf-3 fixture ruling, 2026-11-18,
+    // smarty-dev#20787#issuecomment-6993289033). The provider turn is the
     // suite's controlled boundary; copies, preparation, executor, events,
     // finalization and the answer's comment row are the production owners.
     const personNextActionsWhileHeld = async (h: { heldRunId: string; current: NativeExecutionInputV3; target: Record<string, unknown> }) => {
       const { agentFileSaveHeld } = await import("../agent-directory-working-copies.js");
       const canonicalEntry = "Retain this exact directory.\n";
       const stillHeld = async () => agentFileSaveHeld(await copies.get(companyId, h.heldRunId));
-      // (a) The agent's next run: a new run, a new lease on the same environment,
-      // real preparation and the native executor while the old save is held.
+      // (a) PLANTED admission: a new run and lease on the same environment;
+      // real preparation and native execution follow while the old save is held.
       const nextRunId = randomUUID(), nextLease = randomUUID();
       const [issueRow] = await db.select().from(tables.issues).where(eq(tables.issues.id, issueId));
       const [nextRun] = await db.insert(tables.heartbeatRuns).values({ id: nextRunId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId,
@@ -12249,8 +12254,9 @@ describe("native warm session supervision", () => {
       expect.soft(nextTurn?.input.runtimeContext?.instructions.workingCopy?.rootPath).toBe(nextCopy!.executionRoot);
       expect.soft(nextEntry, "(a) the next run reads canonical AGENTS.md").toBe(canonicalEntry);
       expect.soft(await stillHeld(), "(a) the hold stays").toBe(true);
-      // (b) A person's new chat message is answered while the save is held, and
-      // the answer is PERSISTED: the agent's comment row, created by its run.
+      // (b) PLANTED Send/admission: seed the user's message, chat run and lease.
+      // The answer is genuinely PERSISTED by production native finalization:
+      // the agent's comment row, attributed to its run. This is not Send-route proof.
       const chatId = randomUUID(), chatRunId = randomUUID(), chatSession = randomUUID(), chatRunner = randomUUID();
       const message = "Can you answer a new message while the previous file save is held?";
       const answer = "Yes: answered while the earlier agent-file save is held.";

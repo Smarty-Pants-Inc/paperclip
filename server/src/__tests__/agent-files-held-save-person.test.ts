@@ -13,6 +13,7 @@ import {
 import { characterStateForAgent } from "@paperclipai/shared";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { errorHandler } from "../middleware/index.js";
+import { agentRoutes } from "../routes/agents.js";
 import { environmentRoutes } from "../routes/environments.js";
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
 import { agentFileSaveHeld } from "../services/agent-directory-working-copies.js";
@@ -24,9 +25,12 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 
 // Keep reason: explicit BRIEF-crp2 / RFL SUPERSEDE-CLAIM-REMOVE-ENTRY-HELD-1118
 // person-side integration row: (c) no phantom 'working' (normal finalize and
-// after a crash) and (d) the named HTTP discard. The filesystem, store, DB,
-// dispatcher and HTTP routers are real; only the model adapter is a
+// planted stale-running state) and (d) the named HTTP discard. The filesystem,
+// store, DB, dispatcher and HTTP routers are real; only the model adapter is a
 // deterministic process boundary. (a)/(b) live in the native harness.
+// Fixture ruling: rf-3, 2026-11-18, smarty-dev#20787#issuecomment-6993289033.
+// Missing companion: a real interrupted/crashed producer followed by the stale
+// reconciler; the agents-table write below does NOT prove crash recovery.
 describe("permanent-4xx held agent-file save: the person's next actions", () => {
   const adapterType = "held_save_person_test";
   const originalHome = process.env.PAPERCLIP_HOME;
@@ -99,7 +103,7 @@ describe("permanent-4xx held agent-file save: the person's next actions", () => 
     }
   });
 
-  it("shows no phantom work and offers named operator discard while a real 422 save is held", async () => {
+  it("shows no phantom work (normal finalize + planted after-crash state) and offers named operator discard while a real 422 save is held", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), userId = randomUUID(), issueId = randomUUID();
     const now = new Date();
     await db.insert(companies).values({ id: companyId, name: "Held save person", issuePrefix: `P${companyId.slice(0, 6)}`, defaultResponsibleUserId: userId });
@@ -136,38 +140,53 @@ describe("permanent-4xx held agent-file save: the person's next actions", () => 
     expect(await fs.readFile(path.join(held.localRoot, "unsaved-note.txt"), "utf8")).toBe("Keep these exact held bytes\n");
     expect(await fs.readFile(path.join(root, "AGENTS.md"), "utf8")).toBe(initial);
 
-    // (c) The same run query and avatar presentation helper AgentDetail uses.
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId, companyIds: [companyId], isInstanceAdmin: true }; next(); });
+    app.use("/api", agentRoutes(db));
+    app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+
+    // (c) Real GETs, not a DB read: AgentDetail's agentsApi.get uses /agents/:id
+    // (ui/src/api/agents.ts); its avatar maps that response through this helper.
+    const agentPath = `/api/agents/${agentId}`;
+    const runPath = `/api/heartbeat-runs/${first!.id}`;
     const assertQuiet = async (phase: string) => {
-      const run = await heartbeat.getRun(first!.id);
-      const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
-      const pose = characterStateForAgent(agent!.status);
-      console.log("PERSON_C", JSON.stringify({ phase, runId: first!.id, runStatus: run?.status, agentStatus: agent!.status, pose }));
-      expect.soft(run?.status, `${phase}: held run terminal`).toBe("succeeded");
-      expect.soft(run?.finishedAt, `${phase}: held run finished`).not.toBeNull();
-      expect.soft(agent!.status, `${phase}: agent idle`).toBe("idle");
+      const agentResponse = await request(app).get(agentPath);
+      const runResponse = await request(app).get(runPath);
+      expect(agentResponse.status, JSON.stringify(agentResponse.body)).toBe(200);
+      expect(runResponse.status, JSON.stringify(runResponse.body)).toBe(200);
+      const agent = agentResponse.body, run = runResponse.body;
+      const pose = characterStateForAgent(agent.status);
+      console.log("PERSON_C", JSON.stringify({ phase, runId: first!.id, agentRoute: `GET ${agentPath}`, agentHttpStatus: agentResponse.status,
+        runRoute: `GET ${runPath}`, runHttpStatus: runResponse.status, runStatus: run.status, agentStatus: agent.status, pose }));
+      expect.soft(run.status, `${phase}: held run terminal`).toBe("succeeded");
+      expect.soft(run.finishedAt, `${phase}: held run finished`).not.toBeNull();
+      expect.soft(agent.status, `${phase}: agent idle`).toBe("idle");
       expect.soft(pose, `${phase}: UI does not say working`).not.toBe("working");
     };
     await assertQuiet("held, normally finalized");
-    // (c) after a crash: the agent is left flagged running with no live run and
-    // only this real held save outstanding. Stranded-status recovery settles it;
-    // the hold stays exactly as it was (rf-3, smarty-dev#20787 C1 required 2).
+    // (c) PLANTED after-crash state, not a real crash: explicitly seed an old
+    // running agents row with no live run and only this real held save. The real
+    // stranded-status reconciler settles it; the hold stays exactly as it was.
+    // rf-3 fixture ruling, 2026-11-18 (smarty-dev#20787 C1 required 2).
     await heartbeat.drainActiveRunExecutions();
     await db.update(agents).set({ status: "running", updatedAt: new Date(Date.now() - 60 * 60_000) }).where(eq(agents.id, agentId));
+    const planted = await request(app).get(agentPath);
+    expect(planted.status, JSON.stringify(planted.body)).toBe(200);
+    expect(planted.body.status).toBe("running");
+    expect(characterStateForAgent(planted.body.status)).toBe("working");
     const reconciled = await createHeartbeatAgentStatus(db).reconcileStrandedAgentStatuses(() => new Set(), { companyId, agentId });
     const heldAfterCrash = await copies.get(companyId, first!.id);
-    console.log("PERSON_C_CRASH", JSON.stringify({ reconciled, held: agentFileSaveHeld(heldAfterCrash), state: heldAfterCrash?.state }));
+    console.log("PERSON_C_PLANTED_CRASH", JSON.stringify({ fixture: "planted agents-table stale-running write", ruling: "rf-3, 2026-11-18",
+      beforeGetStatus: planted.body.status, reconciled, held: agentFileSaveHeld(heldAfterCrash), state: heldAfterCrash?.state }));
     expect.soft(reconciled, "a held save alone never keeps the agent running").toEqual([agentId]);
     expect.soft(agentFileSaveHeld(heldAfterCrash), "the hold stays visible as a hold").toBe(true);
     expect.soft(heldAfterCrash?.nextAttemptAt).toEqual(held.nextAttemptAt);
-    await assertQuiet("held, after a crash left the agent running");
+    await assertQuiet("held, after planted stale-running state was reconciled");
 
     // (a) next run and (b) chat answer moved to the native harness, where Paul's
     // agents run: native-session-executor.test.ts "claim-remove-entry-held-person"
     // (rf-3, smarty-dev#20787 C1 required 3). (c) and (d) stay here: the
-    // avatar helper and the documented HTTP discard route with its authority.
-    const app = express(); app.use(express.json());
-    app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId, companyIds: [companyId], isInstanceAdmin: true }; next(); });
-    app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+    // real agent/avatar GET and the documented HTTP discard with its authority.
 
     // (d) Documented named route, real authorization and discard implementation.
     const discardPath = `/api/companies/${companyId}/agent-file-holds/${first!.id}/discard`;
