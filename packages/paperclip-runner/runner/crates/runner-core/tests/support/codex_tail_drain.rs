@@ -255,3 +255,142 @@ done
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
+
+// Keep: P1c5g. A suspended box that resumes (slow thaw) delivers the settled
+// turn's tail as a paced burst longer than the warm-attach drain's 100 ms
+// clock. That must not mark the settled session reconciliation_required, which
+// forces a replacement provider thread (a fork) on the next run.
+fn settled_burst_executor(
+    label: &str,
+    unsafe_at: Option<usize>,
+) -> (PathBuf, PathBuf, CodexCommandExecutor) {
+    let directory = temporary_directory(label);
+    let gate = directory.join("release-settled-tail-burst");
+    let mut switches = vec![
+        "--durable-turn-ids".to_owned(),
+        "--settled-tail-burst-gate".to_owned(),
+        gate.to_str().unwrap().to_owned(),
+        "--settled-tail-burst-frames".to_owned(),
+        "120".to_owned(),
+        "--settled-tail-burst-interval-ms".to_owned(),
+        "2".to_owned(),
+    ];
+    if let Some(index) = unsafe_at {
+        switches.push("--settled-tail-burst-turn-started-at".to_owned());
+        switches.push(index.to_string());
+    }
+    let switches = switches.iter().map(String::as_str).collect::<Vec<_>>();
+    let config = provider_config(&directory, &switches);
+    // A warm (kept) provider: no completion contract, so the settled process
+    // stays live for the next run's in-place attachment.
+    let runner_config = durable_config(&directory);
+    let mut executor = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config, "authorizedTools": task_context_tool_set()}),
+        ))
+        .unwrap();
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .unwrap();
+    executor
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Settle, then the box is suspended."}),
+        ))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first turn must settle"
+        );
+        let events = poll_and_ack(&mut executor).unwrap();
+        if events
+            .iter()
+            .any(|event| event.event_type == "turn.completed")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let settled = saved_tail_state(&directory);
+    assert_eq!(settled["activeProviderTurnId"], Value::Null);
+    assert_ne!(settled["lifecycle"], "reconciliation_required");
+    // Resume: the box thaws and the settled tail starts arriving.
+    fs::write(&gate, b"release").unwrap();
+    let started = gate.with_extension("started");
+    while !started.exists() {
+        assert!(std::time::Instant::now() < deadline, "burst did not start");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    (directory, gate, executor)
+}
+
+fn attach_during_burst(
+    executor: &mut CodexCommandExecutor,
+) -> Result<paperclip_runner_core::durable::CommandExecution, DurableRunnerError> {
+    executor.execute(&command(
+        "attach",
+        5,
+        "run.attach",
+        json!({"authorizedTools": task_context_tool_set()}),
+    ))
+}
+
+#[test]
+fn warm_attach_survives_a_settled_tail_burst_longer_than_the_drain_clock() {
+    let (directory, gate, mut executor) = settled_burst_executor("settled-tail-burst-attach", None);
+    let before = saved_tail_state(&directory);
+    let started = std::time::Instant::now();
+    let attached = attach_during_burst(&mut executor);
+    let elapsed = started.elapsed();
+    let saved = saved_tail_state(&directory);
+    eprintln!(
+        "settled burst attach: elapsed={elapsed:?} ok={} lifecycle={}",
+        attached.is_ok(),
+        saved["lifecycle"]
+    );
+    let attached = attached.expect("a settled-turn tail burst is history, not new work");
+    assert!(
+        elapsed > std::time::Duration::from_millis(100),
+        "the burst must outlast the 100 ms drain clock to prove anything ({elapsed:?})"
+    );
+    assert!(attached
+        .events
+        .iter()
+        .any(|(event_type, _, _)| event_type == "run.attached"));
+    assert_ne!(saved["lifecycle"], "reconciliation_required");
+    assert_eq!(saved["threadId"], before["threadId"], "no fork");
+    assert!(
+        gate.with_extension("emitted").exists(),
+        "attach waited out the burst"
+    );
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn warm_attach_still_fails_closed_on_turn_started_inside_a_settled_tail_burst() {
+    let (directory, _gate, mut executor) =
+        settled_burst_executor("settled-tail-burst-unsafe", Some(60));
+    let error =
+        attach_during_burst(&mut executor).expect_err("a new turn inside the burst is live work");
+    assert!(
+        error
+            .to_string()
+            .contains("unsafe post-terminal provider method turn/started"),
+        "unexpected attachment error: {error}"
+    );
+    assert_eq!(
+        saved_tail_state(&directory)["lifecycle"],
+        "reconciliation_required"
+    );
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
