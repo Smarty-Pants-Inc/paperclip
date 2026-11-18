@@ -103,8 +103,10 @@ export function agentPausedText(name: string) {
     + `A board user or ${name}'s manager can resume ${name}.`;
 }
 
+// An unanswered run is not proof of side-effect-free execution. Do not infer safe replay from a failure
+// code, a missing final reply, or an empty tool log (RFL record SUPERSEDE-BPRIME3-NOTICE-WORDING-1118).
 export const UNANSWERED_MESSAGE_TEXT =
-  "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
+  "Your message wasn't answered. Check the task's recent history before trying again; the run may have taken actions.";
 export const UNANSWERED_CARD_ANSWER_TEXT =
   "Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
@@ -676,18 +678,41 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode ?? UNANSWERED_MESSAGE_WAITING_CODE : null;
 
   // The run this message started (the latest run that carries it), if any.
-  const runs = await q.select({
+  const runColumns = {
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
     errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
-    updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus,
-  }).from(heartbeatRuns).where(and(
+    updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, startedAt: heartbeatRuns.startedAt,
+    issueCommentStatus: heartbeatRuns.issueCommentStatus,
+  };
+  const runs = await q.select(runColumns).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     gt(heartbeatRuns.createdAt, new Date(message.createdAt.getTime() - 60 * 60_000))))
     .orderBy(desc(heartbeatRuns.createdAt)).limit(20);
   // Only a run that carries THIS message is evidence about it. An unrelated
   // run (a timer, or the continuation that replaced a cancelled deferred wake
   // with no comment ids) is not: the message's own wake path decides.
-  const messageRun = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
+  // The run's OWN pending input, exactly carriesCommentSql's R-ONCE ids plus
+  // attribution, never ancestry. Do not let the latest-20 run window hide an
+  // earlier start, or a newer unstarted carrier erase its terminal evidence.
+  const context = heartbeatRuns.contextSnapshot;
+  const ownInput = sql`(${context}->>'wakeCommentId' = ${message.id} or ${context}->>'commentId' = ${message.id}
+    or ${context}->>'conversationReplyBoundaryCommentId' = ${message.id}
+    or coalesce(${context}->'attributionCommentIds', '[]'::jsonb) ? ${message.id}
+    or ${context}->>'interactionId' = ${message.id}
+    or coalesce(${context}->'interactionIds', '[]'::jsonb) ? ${message.id}
+    or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${message.id}
+    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${message.id}
+    or (jsonb_typeof(${heartbeatRuns.resultJson}->'queuedSteeringAcknowledgements') = 'object'
+      and ${heartbeatRuns.resultJson}->'queuedSteeringAcknowledgements' ? ${message.id})
+    or exists (select 1 from ${heartbeatRunEvents} steer where steer.company_id = ${heartbeatRuns.companyId}
+      and steer.run_id = ${heartbeatRuns.id} and steer.source_event_id is not null and steer.event_type = 'item.completed'
+      and steer.payload->'prpEvent'->'payload'->>'kind' = 'steering_acknowledgement'
+      and steer.payload->'prpEvent'->>'itemId' like '%:steer:' || ${message.id}))`;
+  const carriers = await q.select(runColumns).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun, ownInput))
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
+  const startedMessageRun = carriers.find(candidate => candidate.startedAt !== null || candidate.status === "running") ?? null;
+  const messageRun = startedMessageRun ?? carriers[0] ?? null;
   // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
   // native-governance.ts conversationTurnAnswered): only a pending question or
   // confirmation card that the message's OWN run created stands in for its
@@ -809,7 +834,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     inArray(heartbeatRuns.status, LIVE))).limit(1);
   const liveRuns = otherLive ? [...live, otherLive] : live;
-  if (liveRuns.some(candidate => candidate.status === "running")) {
+  // Once this input started, a further carrying attempt is not NO_RUN or a
+  // resend remedy, however long it queues. Its terminal state reopens the
+  // existing once-only notice decision; silence cannot settle the obligation.
+  if ((startedMessageRun && carriers.some(candidate => LIVE.includes(candidate.status)))
+    || liveRuns.some(candidate => candidate.status === "running")) {
     return { kind: "pending", recheckAt: now.getTime() + 30_000 };
   }
   // The agent is paused (Paperclip's lifecycle: status paused, lifecycle state
@@ -894,7 +923,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // attempt wins over an older pause cancellation.
   const ownWakes = terminalWakes.filter(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
   const latestWake = ownWakes[0];
-  if (!boardHold && !agentPaused && !settingUp) {
+  if (!agentPaused && !settingUp) {
     const savedWakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status,
       runId: agentWakeupRequests.runId, createdAt: agentWakeupRequests.createdAt })
       .from(agentWakeupRequests).where(and(
@@ -911,13 +940,20 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, wakeRunIds),
       notInArray(heartbeatRuns.status, LIVE)))).map(row => row.id) : []);
     const wakes = savedWakes.filter(wake => !(wake.status === "queued" && wake.runId && endedWakeRuns.has(wake.runId)));
+    // A native-status wake can carry only attribution ids. Even behind a
+    // recovery hold it is a saved attempt, not proof that resend is safe.
+    if (startedMessageRun && wakes.some(wake => wakeCarriesIssue(wake.payload, issue.id)
+      && (wakeCarriesMessage(wake.payload, message.id)
+        || runCarriesMessage((wake.payload as Record<string, unknown> | null)?._paperclipWakeContext, message.id)))) {
+      return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+    }
     // Admission has saved a real further attempt for THIS message, not a
     // failed start. Coalesced receipts alone are not live; missing/malformed
     // waits retain the ordinary no-run/failure decision.
     const pendingExecutionWait = wakes.some(wake => ["deferred", "deferred_issue_execution"].includes(wake.status)
       && isWellFormedExecutionWait(wake.payload?.executionWait)
       && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
-    if (pendingExecutionWait || wakes.some(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id))) {
+    if (!boardHold && (pendingExecutionWait || wakes.some(wake => wake.status !== "deferred" && wakeCarriesIssue(wake.payload, issue.id)))) {
       // The run-END cap belongs to the HELD class only (RFL 00:10Z (b)):
       // bounded() applies heldRecoveryDeadline itself. A non-held restored
       // wake keeps the base first-sweep T0 wait.
@@ -952,7 +988,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       }
       code = UNANSWERED_MESSAGE_WAITING_CODE;
     } else {
-      code = UNANSWERED_MESSAGE_NO_RUN_CODE;
+      code = startedMessageRun ? runCode! : UNANSWERED_MESSAGE_NO_RUN_CODE;
     }
   } else if (!run) {
     // Paperclip records a deferred or coalesced wake that could not start as
@@ -998,6 +1034,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       failureCode: nativeRunFinalizations.failureCode, failureDetail: nativeRunFinalizations.failureDetail })
       .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id)));
     if (coordinator && !boardHold) {
+      if (startedMessageRun && coordinator.phase === "retryable_failure" && coordinator.nextAttemptAt
+        && coordinator.nextAttemptAt.getTime() + OVERDUE_NATIVE_RETRY_MS > now.getTime()) {
+        return { kind: "pending", recheckAt: Math.max(now.getTime() + 30_000, coordinator.nextAttemptAt?.getTime() ?? 0) };
+      }
       if (NATIVE_PENDING_PHASES.includes(coordinator.phase)) {
         const wait = await bounded(now.getTime() + 30_000);
         if (wait) return wait;

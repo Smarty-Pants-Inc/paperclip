@@ -29,7 +29,8 @@ import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition 
 // managed instructions. "Visible" is the v2 chat filter (TaskChatThread.tsx:930):
 // a system comment is hidden only when recoveryResponsibility is "system".
 const HELD = "Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.";
-const NOT_ANSWERED = "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
+// supersedes(RFL record SUPERSEDE-BPRIME3-NOTICE-WORDING-1118): the not-answered sentence no longer promises a safe resend.
+const NOT_ANSWERED = "Your message wasn't answered. Check the task's recent history before trying again; the run may have taken actions.";
 const NO_RUN = "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
 const NO_REPLY = "This run finished without a reply to your message. Sending it again is safe.";
 

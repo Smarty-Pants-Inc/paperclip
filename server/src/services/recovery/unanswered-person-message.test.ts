@@ -213,6 +213,58 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   // RFL F1 (21:28Z), ANSWERED: a cut run's progress reply is DELIVERED only. The sweep owes ONE true notice
   // and the carry still carries the message. RED at base 44d8ec736 (silence: the progress reply "answered").
+  // KEEP (norun-sweep on stack tA, 5e): review-fleet-2 caught NO_RUN describing an earlier started attempt as never started.
+  it("NORUN (1): an earlier own carrier started and failed; the newest queued carrier never started", async () => {
+    const f = await fixture();
+    const m = await f.message();
+    const failed = await f.run({ commentId: m, status: "failed", errorCode: "adapter_failed" });
+    await db.update(heartbeatRuns).set({ startedAt: f.at(0) }).where(eq(heartbeatRuns.id, failed));
+    await f.run({ commentId: m, status: "queued" });
+    const start = new Date();
+    await settleUnansweredPersonMessage(db, { ...f, now: start });
+    await settleUnansweredPersonMessage(db, { ...f, now: new Date(start.getTime() + 60_000) });
+    await settleUnansweredPersonMessage(db, { ...f, now: new Date(start.getTime() + 3_600_000) });
+    const notes = await f.visible();
+    console.log("NORUN_1", JSON.stringify(notes.map(n => ({ id: n.id, body: n.body }))));
+    expect(notes.map(n => n.body).join("\n")).not.toContain("no run started");
+    expect(notes, "a live carrying attempt is not a failure or a resend remedy").toHaveLength(0);
+  });
+
+  it("NORUN (2) CONTROL: no own carrier ever started still gets the NO_RUN line", async () => {
+    const f = await fixture();
+    const m = await f.message();
+    // An ancestry-only started run is NOT evidence that this message started.
+    const ancestor = await f.run({ status: "failed", errorCode: "adapter_failed" });
+    await db.update(heartbeatRuns).set({ startedAt: f.at(0) }).where(eq(heartbeatRuns.id, ancestor));
+    await f.run({ commentId: m, status: "queued", retryOfRunId: ancestor });
+    const start = new Date();
+    await settleUnansweredPersonMessage(db, { ...f, now: start });
+    await settleUnansweredPersonMessage(db, { ...f, now: new Date(start.getTime() + 3_600_000) });
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.body).toBe(NO_RUN);
+  });
+
+  it("NORUN (3): started then failed, nothing queued or due: one true note at +1h and no more at +2h", async () => {
+    const f = await fixture();
+    const m = await f.message();
+    const failed = await f.run({ commentId: m, status: "failed", errorCode: "adapter_failed" });
+    await db.update(heartbeatRuns).set({ startedAt: f.at(0) }).where(eq(heartbeatRuns.id, failed));
+    // A tool effect is deliberately present: absence of a final answer does not prove safe replay.
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: failed, agentId: f.agentId,
+      seq: 1, eventType: "item.completed", stream: "system", level: "info", message: "Tool completed a write." });
+    const start = new Date();
+    await settleUnansweredPersonMessage(db, { ...f, now: new Date(start.getTime() + 3_600_000) });
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    // RFL record SUPERSEDE-BPRIME3-NOTICE-WORDING-1118.
+    expect(notes[0]!.body).toBe("Your message wasn't answered. Check the task's recent history before trying again; the run may have taken actions.");
+    expect(notes[0]!.body).not.toMatch(/no run started|safe/i);
+    await settleUnansweredPersonMessage(db, { ...f, now: new Date(start.getTime() + 7_200_000) });
+    expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual(notes.map(n => ({ id: n.id, body: n.body })));
+    console.log("NORUN_3", JSON.stringify(notes.map(n => ({ id: n.id, body: n.body }))));
+  });
+
   it.each([true, false])("RFL F1: a message whose run posts a progress comment then FAILS, with no successor -> ONE true notice; the carry carries it (chat=%s)", async chat => {
     const f = await fixture({ chat, status: "in_progress" });
     const messageId = await f.message("Summarise the report.");
@@ -2980,7 +3032,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await f.visible()).toHaveLength(0);
     });
 
-    it("RED scope: a message the stopped run carried but had NOT read (acked, unread steer), neither carried on nor held -> its notice stays", async () => {
+    it("supersedes(norun-sweep: no 'no run started' after an own start): RED scope: a message the stopped run carried but had NOT read (acked, unread steer), neither carried on nor held -> its notice stays", async () => {
       const f = await stopCase(f => stopFields(f.userId));
       const steer = await f.message("Also add a test.");
       const t = new Date(f.t.getTime() + 20_000);
@@ -2991,7 +3043,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const notes = await f.visible();
       expect(notes).toHaveLength(1);
       expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${steer}`);
-      expect(notes[0]!.body).toBe(NO_RUN);
+      // supersedes(norun-sweep, stack tA 5e): the acknowledged steer is the run's OWN pending input (R-ONCE), even
+      // unread, and that run started: never "no run started". The one true note is the not-answered line.
+      expect(notes[0]!.body).toBe(NOT_ANSWERED);
     });
 
     it("RED scope: the run's own message that the model had NOT read yet (no userMessage item) -> its notice stays", async () => {
