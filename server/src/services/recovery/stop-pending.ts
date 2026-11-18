@@ -278,6 +278,42 @@ export async function recheckPersonStopCleanupPending(db: Db, run: StoppedRun & 
   });
   for (const publication of publications) publishActivity(publication);
 }
+/** adopt-stopu-twoclock: the person-Stop export bound DECIDED for this run and
+ * kept the box (no stop request, so no stop receipt will ever close a card).
+ * Its one true line supersedes this run's Stop-pending card: a standalone card
+ * is cancelled (never 'Stop proved'), an annotation on a stronger obligation is
+ * removed (the obligation and its budget stay). Under the task and run locks. */
+export async function supersedePersonStopCardByBoundDecision(db: Db, run: StoppedRun & { contextSnapshot?: Record<string, unknown> | null }) {
+  const issueId = runIssueId(run);
+  if (!issueId || !isPersonStop(run)) return;
+  const publications: ActivityPublication[] = [];
+  await db.transaction(async tx => {
+    await tx.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.companyId, run.companyId), eq(issues.id, issueId))).for("update");
+    await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).for("update");
+    const existing = await activeAction(tx as unknown as Db, { companyId: run.companyId, issueId, runIds: [run.id] });
+    const pending = existing && stopPending(existing);
+    if (!existing || !pending || JSON.stringify(pending.runIds) !== JSON.stringify([run.id])) return;
+    await notify(tx as unknown as Db, { companyId: run.companyId, issueId, runIds: [run.id] });
+    const now = new Date();
+    if (pending.standalone && existing.cause === STOP_PENDING_CODE) {
+      await tx.update(issueRecoveryActions).set({ status: "cancelled", outcome: "cancelled", resolvedAt: now, updatedAt: now,
+        resolutionNote: "The Stop's bounded export decision kept the box and runs the next message without the stopped turn's files; that decision's line replaces this card. The Stop is not proved.",
+      }).where(eq(issueRecoveryActions.id, existing.id));
+    } else {
+      const { stopPending: _pending, ...evidence } = existing.evidence;
+      await tx.update(issueRecoveryActions).set({ evidence, updatedAt: now,
+        nextAction: existing.nextAction.endsWith(stopPendingCopy(pending))
+          ? pending.previousNextAction ?? "" : existing.nextAction.replace(stopPendingCopy(pending), "").trim(),
+      }).where(eq(issueRecoveryActions.id, existing.id));
+    }
+    await logActivity(tx as unknown as Db, { companyId: run.companyId, actorType: "system", actorId: "recovery",
+      action: "issue.execution_stop_pending_superseded", entityType: "issue", entityId: issueId,
+      details: { runIds: [run.id], recoveryActionId: existing.id, reason: "person_stop_export_bound_decided" } }, publications);
+  });
+  for (const publication of publications) publishActivity(publication);
+}
 /** The person's line while this run's Stop-pending card is open, else null. */
 export async function personStopPendingLine(db: Db, input: { companyId: string; issueId: string; runId: string }) {
   const actions = await db.select().from(issueRecoveryActions).where(and(

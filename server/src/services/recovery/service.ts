@@ -124,6 +124,7 @@ import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
 import { isCancelledNativeStartup } from "../cancelled-native-startup.js";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
 import { clearTaskStopPending, hasRecordedStopRequest, hasTaskStopPending, isPersonStop, personStopCardBoundAt, recheckTaskStopPending, recordTaskStopPending } from "./stop-pending.js";
+import { personStopExportBoundAt, readPersonStopBoundDecision } from "../heartbeat/person-stop-export-bound.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
@@ -4321,6 +4322,15 @@ export function recoveryService(
           deadline = typeof claim === "number" && Number.isFinite(claim) ? Math.min(bound, claim) : NaN;
       } else if (lease.status !== "active" || lease.releasedAt) {
         return null;
+      } else if (readPersonStopBoundDecision(lease.metadata)?.decision === "without_files") {
+        // adopt-stopu-twoclock: the bound decided and kept the box (no stop
+        // request, so no stop receipt will come); its one true line owns the
+        // person's chat, not a card no receipt can close. Keep re-checking.
+        return now + 30_000;
+      } else {
+        // adopt-stopu-twoclock: ONE clock. While the export hold is on (its own
+        // bound, from the later failingSince), the hold owns the person's line.
+        deadline = Math.max(deadline, personStopExportBoundAt(lease.metadata) ?? deadline);
       }
       // adopt-stopu-card2, live gate 4 (card 56bcdc6a, 3.7 s after the Stop): before the
       // stop_and_retain release the person's Stop is still in flight on an unreleased

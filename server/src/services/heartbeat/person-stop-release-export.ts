@@ -13,6 +13,7 @@ import { PERSON_STOP_BOUND_KEY, PERSON_STOP_PROBE_TIMEOUT_MS, PERSON_STOP_WITHOU
 export { PERSON_STOP_EXPORT_BOUND_MS, PERSON_STOP_WITHOUT_FILES_LINE, personStopExportBoundAt, personStopKeptBoxForSuccessor,
   readPersonStopBoundDecision } from "./person-stop-export-bound.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { supersedePersonStopCardByBoundDecision } from "../recovery/stop-pending.js";
 import { proveStoppedTurnGoneOnBox, recordStoppedTurnCloseProof, stoppedTurnCloseOwedAfterCrash } from "./stopped-turn-box-proof.js";
 
 async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T | "timed_out"> {
@@ -119,6 +120,9 @@ export async function decidePersonStopExportAtBound(input: {
     return readPersonStopBoundDecision(again?.metadata);
   }
   if (decision.decision === "without_files") {
+    // adopt-stopu-twoclock: the decision owns the person's line from now on; a
+    // Stop-pending card no receipt can close (the box is kept) is superseded.
+    await supersedePersonStopCardByBoundDecision(db, run).catch(() => undefined);
     // ONE true line in the chat (rf-4 22:30Z + RFL 22:31Z): no 'restored'
     // claim, the box/lease unchanged (kept, not destroyed).
     const line = PERSON_STOP_WITHOUT_FILES_LINE;
