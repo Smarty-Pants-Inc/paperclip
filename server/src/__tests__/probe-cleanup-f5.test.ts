@@ -215,7 +215,7 @@ const support = await getEmbeddedPostgresTestSupport();
   async function expectNoReceipt(f: Fixture, probeLease: { id: string; providerLeaseId: string | null }, boundary: ReturnType<typeof probeBoundary>) {
     const [now] = await leases(f.environment.id);
     expect(now!.id).toBe(probeLease.id);
-    expect(now!.metadata?.remoteExecutionTermination?.state === "stopped" && now!.metadata?.remoteExecutionTermination?.confirmedBy === "inspect", "no inspect receipt").toBe(false);
+    expect(now!.metadata?.remoteExecutionTermination, "no receipt from the typed read").toBeUndefined();
     expect(boundary.cleanup).not.toHaveBeenCalled();
     expect(boundary.probes()).toBe(1);
     expect(f.boat.calls.filter(c => c.providerLeaseId === probeLease.providerLeaseId && NEVER.includes(c.method))).toEqual([]);
