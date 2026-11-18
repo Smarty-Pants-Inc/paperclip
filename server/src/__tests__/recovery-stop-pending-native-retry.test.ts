@@ -37,7 +37,7 @@ describe("native retry phase alone does not own a retained task Stop", () => {
   }
   async function task(issueId: string) { return (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!; }
 
-  it.each(["cancelled", "succeeded", "timed_out", "interrupted"])("supersedes(C1 no-Stop card): escalates a failed Stop inspection for a non-resumable %s run, once", async status => {
+  it.each(["cancelled", "succeeded", "timed_out", "interrupted"])("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): escalates a failed Stop inspection for a non-resumable %s run, once", async status => {
     const f = await fixture(status, status === "cancelled" ? null : process.pid, PERSON_STOP);
     const before = await task(f.issueId);
     const coordinator = (await db.select().from(nativeRunFinalizations))[0];
@@ -66,7 +66,7 @@ describe("native retry phase alone does not own a retained task Stop", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("supersedes(C1 no-Stop card): resolves the diagnostic only after positive Stop proof, retaining the native coordinator as history", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): resolves the diagnostic only after positive Stop proof, retaining the native coordinator as history", async () => {
     const f = await fixture("cancelled", null, PERSON_STOP);
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
     expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
