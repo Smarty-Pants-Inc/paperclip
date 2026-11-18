@@ -1422,7 +1422,7 @@ suite("fresh-continuation fallback", () => {
   // (cleanup_status already 'success', so 0496 never fires) and the clear goes ONLY through that field.
   it.each(["sandbox_cleanup", "agent_setup", "ordinary_pause", "budget_pause",
     "lease_released_at", "lease_status", "lease_pending_cleanup_in_flight", "lease_leaves_run",
-    "run_finalization_owner", "native_finalization_row"] as const)("FIX15 %s clears: no failed flash inside the bound, one run, failed + Retry at stamp + 10 min", async hold => {
+    "run_finalization_owner", "native_finalization_row", "manual_admission_release", "recovered_stopped_receipt"] as const)("FIX15 %s clears: no failed flash inside the bound, one run, failed + Retry at stamp + 10 min", async hold => {
     const f = await judgeQueued(), heartbeat = heartbeatService(db);
     const { createLifecycleStore } = await import("../modules/agent-lifecycle/adapters/postgres.js");
     const { createAgentLifecycleEffects } = await import("./agent-lifecycle.js");
@@ -1445,6 +1445,20 @@ suite("fresh-continuation fallback", () => {
         await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.source.id));
         await db.insert(nativeRunFinalizations).values({ runId: f.source.id, companyId, issueId: f.issueId, phase: "committed", leaseOwner: "native-finalizer:fix16" });
       },
+      // FIX18 (1): execution-blocker.ts:81, the manual admission hold that waits for a person.
+      manual_admission_release: async () => {
+        const { createSystemRecovery } = await import("./system-recovery-state.js");
+        await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+        await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.source.id));
+        await db.insert(nativeRunFinalizations).values({ runId: f.source.id, companyId, issueId: f.issueId, phase: "terminal_failure",
+          failureCode: "native_restart_recovery_blocked", failureDetail: { systemRecovery: { ...createSystemRecovery(f.source.id), state: "exhausted" } } });
+        const { hasPendingRunCleanup } = await import("./execution-blocker.js");
+        expect(await hasPendingRunCleanup(db, companyId, f.source.id), "the manual admission hold alone holds the run").toBe(true);
+      },
+      // FIX18 (2): execution-blocker.ts:84-87, the recovered-stopped exclusion. The lease holds ONLY by
+      // pendingCleanupInFlight; the receipt write (shape of workspace-recovery.ts:598) leaves it
+      // pending_cleanup (still holding by 0497's clause) but excluded by its stop receipt.
+      recovered_stopped_receipt: () => db.update(environmentLeases).set({ cleanupStatus: "success", metadata: { pendingCleanupInFlight: true } }).where(eq(environmentLeases.id, f.lease.id)),
     };
     const fieldClears: Record<string, () => Promise<unknown>> = {
       lease_released_at: () => db.update(environmentLeases).set({ releasedAt: new Date() }).where(eq(environmentLeases.id, f.lease.id)),
@@ -1453,6 +1467,21 @@ suite("fresh-continuation fallback", () => {
       lease_leaves_run: () => db.update(environmentLeases).set({ heartbeatRunId: null }).where(eq(environmentLeases.id, f.lease.id)),
       run_finalization_owner: () => db.update(heartbeatRuns).set({ runnerProfileJson: {} }).where(eq(heartbeatRuns.id, f.source.id)),
       native_finalization_row: () => db.update(nativeRunFinalizations).set({ leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.source.id)),
+      // The person releases the hold: the exhausted system-recovery policy is cleared from the owner.
+      manual_admission_release: async () => {
+        await db.update(nativeRunFinalizations).set({ failureDetail: {} }).where(eq(nativeRunFinalizations.runId, f.source.id));
+        const { hasPendingRunCleanup } = await import("./execution-blocker.js");
+        expect(await hasPendingRunCleanup(db, companyId, f.source.id), "released: nothing holds the run").toBe(false);
+      },
+      recovered_stopped_receipt: async () => {
+        const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+        const stopReceipt = { schema: "paperclip.remote-termination.v1", companyId, runId: f.source.id, leaseId: lease!.id,
+          provider: lease!.provider, providerLeaseId: lease!.providerLeaseId, state: "stopped", confirmedAt: new Date().toISOString() };
+        await db.update(environmentLeases).set({ status: "pending_cleanup", cleanupStatus: "failed", leasePolicy: "ephemeral",
+          metadata: { workspaceRecoveryCleanup: { runId: f.source.id, stopReceipt }, pendingCleanupInFlight: false } }).where(eq(environmentLeases.id, f.lease.id));
+        const { hasPendingRunCleanup } = await import("./execution-blocker.js");
+        expect(await hasPendingRunCleanup(db, companyId, f.source.id), "the receipt excludes the lease: nothing holds the run").toBe(false);
+      },
     };
     if (hold === "sandbox_cleanup") await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
     else if (fieldHolds[hold]) {

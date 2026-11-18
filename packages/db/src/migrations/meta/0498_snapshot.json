@@ -1,6 +1,6 @@
 {
-  "id": "91d73020-79cf-49d5-9496-d3db317e7f6f",
-  "prevId": "eeb1ca7c-ed76-490b-a76e-444e67b18447",
+  "id": "2432b818-c0d7-4358-aa57-c1d9a4add658",
+  "prevId": "ddeebccd-b6d1-480b-a238-3cafa59783b4",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -35212,6 +35212,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "startable_since": {
+          "name": "startable_since",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "execution_control_deadline_at": {
           "name": "execution_control_deadline_at",
           "type": "timestamp with time zone",
@@ -64983,6 +64989,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "agent_reasoning_display": {
+          "name": "agent_reasoning_display",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
         },
         "created_at": {
           "name": "created_at",
