@@ -4,6 +4,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { expectPersonSeesInsteadOfCard } from "./helpers/c1-no-card-surface.js";
 
 // Keep reason: #20807 / #20389 F1 data safety. A pause request is not proof that
 // its task's provider stopped; releasing the claim can admit a second executor.
@@ -40,6 +41,8 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
     const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     if (!card) {
       expect(actions).toEqual([]);
+      // C1 record condition (2): what the person sees instead of the card.
+      await expectPersonSeesInsteadOfCard(db, f.issueId);
       expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toEqual([]);
       return;
     }
@@ -49,7 +52,7 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toEqual([]);
   }
 
-  it.each(["both", "checkout", "execution"] as const)("supersedes(C1 no-Stop card): preserves a running provider's %s task lock despite a non-invokable assignee", async binding => {
+  it.each(["both", "checkout", "execution"] as const)("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): preserves a running provider's %s task lock despite a non-invokable assignee", async binding => {
     const f = await fixture();
     if (binding !== "both") await db.update(issues).set(binding === "checkout" ? { executionRunId: null } : { checkoutRunId: null }).where(eq(issues.id, f.issueId));
     const before = await task(f.issueId);
@@ -59,7 +62,7 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]!.status).toBe("running");
   });
 
-  it("supersedes(C1 no-Stop card): does not treat terminal cancellation as Stop proof, then releases after durable acknowledgement", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not treat terminal cancellation as Stop proof, then releases after durable acknowledgement", async () => {
     const f = await fixture("cancelled");
     const before = await task(f.issueId);
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
@@ -74,16 +77,18 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
     expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(0);
   });
 
-  it("retains a cancelled acknowledged run while its controller still owns execution", async () => {
+  // C1 round 3 F1: an acknowledged cancellation with no person actor is not a person's Stop.
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): retains a cancelled acknowledged run while its controller still owns execution", async () => {
     const f = await fixture("cancelled");
     await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() + 600_000),
       resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, f.runId));
     const before = await task(f.issueId);
     expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileStrandedAssignedIssues()).escalated).toBe(0);
-    await untouched(f, before);
+    await untouched(f, before, false);
   });
 
-  it("rechecks the owning run in the escalation transaction after the candidate was read", async () => {
+  // C1 round 3 F1: an acknowledged cancellation with no person actor is not a person's Stop.
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): rechecks the owning run in the escalation transaction after the candidate was read", async () => {
     const f = await fixture("cancelled");
     await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, f.runId));
     const before = await task(f.issueId);
@@ -91,10 +96,11 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
       if (issueId === f.issueId) await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
     } });
     expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(0);
-    await untouched(f, before);
+    await untouched(f, before, false);
   });
 
-  it("checks both bound owners, not only the latest context-scoped run", async () => {
+  // C1 round 3 F1: an acknowledged cancellation with no person actor is not a person's Stop.
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): checks both bound owners, not only the latest context-scoped run", async () => {
     const f = await fixture("cancelled"), liveId = randomUUID();
     await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, f.runId));
     await db.insert(heartbeatRuns).values({ id: liveId, companyId: f.companyId, agentId: f.agentId,
@@ -102,19 +108,20 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
     await db.update(issues).set({ executionRunId: liveId }).where(eq(issues.id, f.issueId));
     const before = await task(f.issueId);
     expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileStrandedAssignedIssues()).escalated).toBe(0);
-    await untouched(f, before);
+    await untouched(f, before, false);
   });
 
-  it("retains a terminal acknowledged run whose recorded local process is still alive", async () => {
+  // C1 round 3 F1: an acknowledged cancellation with no person actor is not a person's Stop.
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): retains a terminal acknowledged run whose recorded local process is still alive", async () => {
     const f = await fixture("cancelled");
     await db.update(heartbeatRuns).set({ processPid: process.pid,
       resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, f.runId));
     const before = await task(f.issueId);
     expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileStrandedAssignedIssues()).escalated).toBe(0);
-    await untouched(f, before);
+    await untouched(f, before, false);
   });
 
-  it("supersedes(C1 no-Stop card): does not accept another company's run as Stop evidence for a bound owner", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not accept another company's run as Stop evidence for a bound owner", async () => {
     const f = await fixture("cancelled"), other = await fixture("cancelled");
     await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, other.runId));
     await db.update(issues).set({ checkoutRunId: other.runId, executionRunId: other.runId }).where(eq(issues.id, f.issueId));
@@ -130,5 +137,25 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
       invocationSource: "on_demand", status: "running", startedAt: new Date(), contextSnapshot: { issueId: randomUUID() } });
     expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileStrandedAssignedIssues()).escalated).toBe(1);
     expect(await task(f.issueId)).toMatchObject({ status: "blocked", checkoutRunId: null, executionRunId: null });
+  });
+  // C1 round 3 F2 (RFL 14:00Z): on the real stranded path, an UNFINISHED person
+  // Stop's 60 s clock runs from the Stop request's own recorded time.
+  it.each([0, 30, 59])("C1 F2: stranded recovery opens no card for an unfinished person Stop requested %s s ago", async seconds => {
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-user",
+      executionCancellation: { state: "requested", requestedAt: new Date(Date.now() - seconds * 1000).toISOString() } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const before = await task(f.issueId);
+    expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileStrandedAssignedIssues()).escalated).toBe(0);
+    await untouched(f, before, false);
+  });
+  it("C1 F2 KEEP: stranded recovery cards an unfinished person Stop still unconfirmed 61 s after the request", async () => {
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-user",
+      executionCancellation: { state: "requested", requestedAt: new Date(Date.now() - 61_000).toISOString() } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const before = await task(f.issueId);
+    expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileStrandedAssignedIssues()).escalated).toBe(0);
+    await untouched(f, before);
   });
 });

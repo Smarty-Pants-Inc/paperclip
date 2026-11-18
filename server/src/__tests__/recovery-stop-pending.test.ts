@@ -8,6 +8,8 @@ import { seedCompanyWithBoardAccess, routeApp } from "./helpers/route-test-harne
 import { issueRoutes } from "../routes/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { recordTaskStopPending } from "../services/recovery/stop-pending.js";
+import { expectPersonSeesInsteadOfCard } from "./helpers/c1-no-card-surface.js";
 
 // Keep reason: #20807 RFL F2's real PostgreSQL reproduction found a stable,
 // silent Stop hold on a 30-day unassigned task. Data safety requires retaining
@@ -46,7 +48,7 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
       .where(eq(heartbeatRuns.id, runId));
   }
 
-  it("supersedes(C1 no-Stop card): gives the judge's 30-day unassigned hold a durable API-visible code, recovery owner and bounded board escalation", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): gives the judge's 30-day unassigned hold a durable API-visible code, recovery owner and bounded board escalation", async () => {
     const f = await fixture(PERSON_STOP);
     const before = await task(f.issueId);
     const runBefore = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0];
@@ -80,7 +82,7 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
       .toMatchObject({ status: "resolved", outcome: "restored" });
   });
 
-  it("supersedes(C1 no-Stop card): keeps a stronger existing recovery action and its owner, while exposing Stop escalation; proof removes only this annotation", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): keeps a stronger existing recovery action and its owner, while exposing Stop escalation; proof removes only this annotation", async () => {
     const f = await fixture(PERSON_STOP);
     const [prior] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
       kind: "active_run_watchdog", cause: "uncertain_provider_action", fingerprint: "existing-action",
@@ -101,7 +103,7 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
       attemptCount: 3, maxAttempts: 3, nextAction: prior.nextAction, evidence: prior.evidence });
   });
 
-  it("supersedes(C1 no-Stop card): does not let terminal task projection or generic recovery resolution hide an unproven Stop", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not let terminal task projection or generic recovery resolution hide an unproven Stop", async () => {
     const f = await fixture(PERSON_STOP);
     await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, f.issueId));
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
@@ -136,7 +138,7 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
     return db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
   }
 
-  it("C1 RED: a failed run with a pending lease release and no person Stop never gets a card (+30 s, +2 min, +1 h)", async () => {
+  it("C1 RED: a failed run with a pending lease release and no person Stop never gets a 'Stop pending' card (+30 s, +2 min, +14 min; +1 h only the true late card)", async () => {
     const f = await fixture();
     await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", runtimeMode: "native",
       issueId: f.issueId, nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.runId));
@@ -144,11 +146,17 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
       status: "active", leasePolicy: "reuse_by_environment", provider: "plugin:boat:computer", providerLeaseId: `boat-${f.runId}`,
       expiresAt: new Date(Date.now() + 300_000), metadata: { releaseDeferral: { reason: "workspace_retention_busy", attempts: 1,
         retryAt: new Date().toISOString() } } });
-    for (const ms of [30_000, 2 * 60_000, 60 * 60_000]) {
+    for (const ms of [30_000, 2 * 60_000, 14 * 60_000]) {
       await finishedAgo(f.runId, ms);
       expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks()).cleared).toBe(0);
       expect(await stopCards(f.issueId), `+${ms} ms`).toEqual([]);
     }
+    await expectPersonSeesInsteadOfCard(db, f.issueId);
+    // C1 (b): an hour on, still unreleased: the true late card, never 'Stop pending'.
+    await finishedAgo(f.runId, 60 * 60_000);
+    expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks()).cleared).toBe(0);
+    expect(await stopCards(f.issueId)).toMatchObject([{ cause: "execution_environment_unreleased", status: "escalated" }]);
+    expect((await stopCards(f.issueId))[0]!.nextAction).not.toMatch(/stop pending/i);
     expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_stop_pending"))).toEqual([]);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
   });
@@ -181,5 +189,153 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
     await finishedAgo(f.runId, 61_000);
     expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(1);
     expect(await stopCards(f.issueId)).toEqual([]);
+  });
+  // ---- C1 round 3 (rf-5 13:55Z FAIL + RFL 14:00Z ruling) ----
+  const LATE_TEXT = "The previous run's environment hasn't been released, so this task can't start yet.";
+  async function sweep() { return (await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks()).cleared; }
+  async function stopPendingLogs() { return db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_stop_pending")); }
+  async function writer(f: Awaited<ReturnType<typeof fixture>>) {
+    await db.transaction(async tx => recordTaskStopPending(tx as unknown as Db, { companyId: f.companyId, issueId: f.issueId,
+      runIds: [f.runId], source: "recovery.sweep_stale_issue_locks" }, []));
+  }
+  /** What a non-person cancel records (heartbeat/run-control.ts runCancellationFenceSql): no user actor. */
+  function systemCancel(errorCode: string, extra: Record<string, unknown>, at = new Date().toISOString()) {
+    return { errorCode, resultJson: { cancellation: { requestedAt: at, reason: errorCode },
+      startupCancellation: { requestedAt: at, errorCode, beforeNativeSelection: false },
+      executionCancellation: { state: "requested", requestedAt: at }, ...extra } };
+  }
+  const SYSTEM_CAUSES = [
+    ["a system cancel", "cancelled", {}],
+    ["controller_lease_lost", "controller_lease_lost", {}],
+    ["server_shutdown_interrupted", "server_shutdown_interrupted", {}],
+    ["duplex_channel_lost", "duplex_channel_lost", {}],
+    ["a system reassignment", "issue_reassigned", { reassignmentStopRequested: true }],
+    // routes/issues.ts board Done: issue_terminalized with the board user's attribution.
+    ["board Done", "issue_terminalized", { terminalizationStopConfirmed: true, cancelledByActorType: "user", cancelledByUserId: "board-user" }],
+    // routes/agents.ts POST /heartbeat-runs/:runId/cancel by a managing agent.
+    ["a managing agent's cancel", "operator_interrupted", { cancelledByActorType: "agent", cancelledByAgentId: "manager-agent" }],
+  ] as const;
+
+  it.each(SYSTEM_CAUSES)("C1 F1: %s is not a person's Stop: no 'Stop pending' card at +61 s; at +16 min only the true late card", async (_label, errorCode, extra) => {
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ ...systemCancel(errorCode, extra), issueId: f.issueId,
+      contextSnapshot: { issueId: f.issueId } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ assigneeAgentId: f.agentId }).where(eq(issues.id, f.issueId));
+    const before = await task(f.issueId);
+    await finishedAgo(f.runId, 61_000);
+    expect(await sweep()).toBe(0);
+    expect(await stopCards(f.issueId)).toEqual([]);
+    expect(await stopPendingLogs()).toEqual([]);
+    expect(await task(f.issueId)).toEqual(before);
+    await expectPersonSeesInsteadOfCard(db, f.issueId);
+    await finishedAgo(f.runId, 16 * 60_000);
+    expect(await sweep()).toBe(0);
+    const cards = await stopCards(f.issueId);
+    expect(cards).toMatchObject([{ cause: "execution_environment_unreleased", status: "escalated", ownerType: "board" }]);
+    expect(cards[0]!.nextAction.startsWith(LATE_TEXT)).toBe(true);
+    expect(cards[0]!.nextAction).not.toMatch(/stop pending|execution_stop_pending/i);
+    expect(await stopPendingLogs()).toEqual([]);
+    expect(await task(f.issueId)).toEqual(before);
+  });
+
+  it("C1 F1 KEEP: a person's Interrupt (the Interrupt route's user actor) still raises 'Stop pending' after 60 s", async () => {
+    const f = await fixture({ operatorInterrupted: true, interruptionSource: "issue_comment_interrupt", interruptedByActorType: "user",
+      interruptedByActorId: "board-user", cancelledByActorType: "user", cancelledByUserId: "board-user" });
+    await db.update(heartbeatRuns).set({ errorCode: "operator_interrupted" }).where(eq(heartbeatRuns.id, f.runId));
+    await finishedAgo(f.runId, 61_000);
+    expect(await sweep()).toBe(0);
+    expect(await stopCards(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+  });
+
+  it.each([0, 30, 59])("C1 F2: an unfinished person Stop requested %s s ago gets no card from the writer", async seconds => {
+    const at = new Date(Date.now() - seconds * 1000).toISOString();
+    const f = await fixture({ ...PERSON_STOP, executionCancellation: { state: "requested", requestedAt: at } });
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
+    const before = await task(f.issueId);
+    await writer(f);
+    expect(await stopCards(f.issueId)).toEqual([]);
+    expect(await task(f.issueId)).toEqual(before);
+  });
+
+  it("C1 F2 KEEP: an unfinished person Stop requested 61 s ago and still unconfirmed raises 'Stop pending'", async () => {
+    const at = new Date(Date.now() - 61_000).toISOString();
+    const f = await fixture({ ...PERSON_STOP, executionCancellation: { state: "requested", requestedAt: at } });
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
+    await writer(f);
+    expect(await stopCards(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated",
+      evidence: { stopPending: { code: "execution_stop_pending", runIds: [f.runId] } } }]);
+  });
+
+  it("C1 guard 2 (live shape): a person Stop answered by a successor 41.7 s later gets no card after the answer", async () => {
+    const f = await fixture(PERSON_STOP);
+    await finishedAgo(f.runId, 61_000);
+    await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      invocationSource: "on_demand", issueId: f.issueId, contextSnapshot: { issueId: f.issueId },
+      createdAt: new Date(Date.now() + 1_000), startedAt: new Date(Date.now() - 19_300), finishedAt: new Date(Date.now() - 5_000) });
+    const before = await task(f.issueId);
+    for (let tick = 0; tick < 2; tick++) expect(await sweep()).toBe(0);
+    expect(await stopCards(f.issueId)).toEqual([]);
+    expect(await stopPendingLogs()).toEqual([]);
+    expect(await task(f.issueId)).toEqual(before);
+  });
+
+  it("C1 guard 2: a person Stop whose stop receipt lands 41.7 s after the request never cards, at +61 s or later", async () => {
+    const f = await fixture(PERSON_STOP);
+    await finishedAgo(f.runId, 41_700);
+    expect(await sweep()).toBe(0);
+    await db.update(heartbeatRuns).set({ resultJson: { ...PERSON_STOP, executionCancellation: { state: "acknowledged" } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await finishedAgo(f.runId, 61_000);
+    expect(await sweep()).toBe(1);
+    expect(await stopCards(f.issueId)).toEqual([]);
+    expect(await stopPendingLogs()).toEqual([]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
+  });
+
+  async function unreleasedFailedRun() {
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", runtimeMode: "native",
+      issueId: f.issueId, nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.runId));
+    const [lease] = await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId, heartbeatRunId: f.runId,
+      status: "active", leasePolicy: "reuse_by_environment", provider: "plugin:boat:computer", providerLeaseId: `boat-${f.runId}`,
+      expiresAt: new Date(Date.now() + 300_000), metadata: { releaseDeferral: { reason: "workspace_retention_busy", attempts: 1,
+        retryAt: new Date().toISOString() } } }).returning();
+    return { ...f, lease: lease! };
+  }
+
+  it("C1 (b): a run nobody stopped, finished 15+ min ago and still unreleased, surfaces ONE true card whose next step (Force release) works", async () => {
+    const f = await unreleasedFailedRun();
+    const before = await task(f.issueId);
+    await finishedAgo(f.runId, 16 * 60_000);
+    for (let tick = 0; tick < 2; tick++) expect(await sweep()).toBe(0);
+    const cards = await stopCards(f.issueId);
+    expect(cards).toMatchObject([{ cause: "execution_environment_unreleased", status: "escalated", ownerType: "board",
+      evidence: { stopPending: { code: "execution_environment_unreleased", runIds: [f.runId] } } }]);
+    expect(cards[0]!.nextAction).toBe(`${LATE_TEXT} A board member can release the task with Force release (paperclipai issue force-release <task>), then start it again.`);
+    expect(cards[0]!.nextAction).not.toMatch(/stop pending|execution_stop_pending/i);
+    expect(await stopPendingLogs()).toEqual([]);
+    expect(await task(f.issueId)).toEqual(before);
+    const app = routeApp(db, f.actor, issueRoutes);
+    const shown = (await request(app).get(`/api/issues/${f.issueId}`).expect(200)).body.activeRecoveryAction;
+    expect(shown).toMatchObject({ id: cards[0]!.id, cause: "execution_environment_unreleased" });
+    expect(shown.nextAction.startsWith(LATE_TEXT)).toBe(true);
+    // The offered next step: the board's Force release (routes/issues.ts POST /issues/:id/admin/force-release).
+    await request(app).post(`/api/issues/${f.issueId}/admin/force-release`).send({}).expect(200);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null, executionLockedAt: null });
+  });
+
+  it("C1 (b) transient: a run released within 15 min never cards", async () => {
+    const f = await unreleasedFailedRun();
+    for (const ms of [61_000, 5 * 60_000, 14 * 60_000]) {
+      await finishedAgo(f.runId, ms);
+      expect(await sweep()).toBe(0);
+      expect(await stopCards(f.issueId), `+${ms} ms`).toEqual([]);
+    }
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success", metadata: {} })
+      .where(eq(environmentLeases.id, f.lease.id));
+    await finishedAgo(f.runId, 16 * 60_000);
+    await sweep();
+    expect(await stopCards(f.issueId)).toEqual([]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_environment_unreleased"))).toEqual([]);
   });
 });

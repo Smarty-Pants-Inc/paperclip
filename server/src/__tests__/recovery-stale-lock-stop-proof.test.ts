@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { activityLog, agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
+import { expectPersonSeesInsteadOfCard } from "./helpers/c1-no-card-surface.js";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentExecutionStopBlocker, runExecutionsHaveStopped } from "../services/agent-execution-stop.js";
@@ -71,6 +72,11 @@ describe("stale-lock sweep requires execution Stop proof", () => {
   async function stopActions(issueId: string) {
     return db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
   }
+  /** C1 record condition (2): no Stop card, and the person sees the failure line + Retry or the one note instead. */
+  async function noCard(f: { issueId: string }) {
+    expect(await stopActions(f.issueId)).toEqual([]);
+    await expectPersonSeesInsteadOfCard(db, f.issueId);
+  }
   async function inspect(f: Awaited<ReturnType<typeof warmFixture>>, path: "sweep" | "stranded") {
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
     if (path === "sweep") expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
@@ -99,7 +105,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
 
   // C1: a failed owner nobody stopped gets no card; the claims are still kept.
   it.each([false])("checks a distinct terminal owner for independent Stop blockers (controller=%s)", async controller => distinctTerminalOwner(controller));
-  it.each([true])("supersedes(C1 no-Stop card): checks a distinct terminal owner for independent Stop blockers (controller=%s)", async controller => distinctTerminalOwner(controller));
+  it.each([true])("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): checks a distinct terminal owner for independent Stop blockers (controller=%s)", async controller => distinctTerminalOwner(controller));
   async function distinctTerminalOwner(controller: boolean) {
     const f = await warmFixture(), checkoutRunId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: checkoutRunId, companyId: f.companyId, agentId: f.agentId,
@@ -109,26 +115,26 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, f.issueId));
     await inspect(f, "sweep");
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId, executionRunId: f.runId });
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
   }
 
-  it("supersedes(C1 no-Stop card): does not defer a second lease whose fallback lifetime is unknown", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not defer a second lease whose fallback lifetime is unknown", async () => {
     const f = await warmFixture();
     await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.runId,
       status: "active", leasePolicy: "ephemeral", provider: "plugin:boat:computer", providerLeaseId: "another-computer" });
     await inspect(f, "sweep");
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
   });
 
-  it("supersedes(C1 no-Stop card): rechecks task cancellation under the task lock rather than the sweep's earlier read", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): rechecks task cancellation under the task lock rather than the sweep's earlier read", async () => {
     const f = await warmFixture();
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(), beforeStaleLockClear: async () => {
       await db.update(issues).set({ status: "cancelled", cancelledAt: new Date(), conversationAgentId: null,
         conversationUserId: null, conversationState: null }).where(eq(issues.id, f.issueId));
     } });
     expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
   });
 
@@ -160,19 +166,23 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       ownerType: "board", evidence: { stopPending: { owner: path === "sweep" ? "recovery.sweep_stale_issue_locks" : "recovery.stranded_assigned_issue" } } }]);
   });
 
-  it.each(["sweep", "stranded"] as const)("%s still escalates a cancelled warm owner", async path => {
+  // C1 round 3: sweep re-seeded with the person Stop route's attribution (run-control.ts cancelRun writes it
+  // beside executionCancellation). Stranded keeps the actor-less (system) cancel: the claims stay, with no Stop card.
+  it.each(["sweep", "stranded"] as const)("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): %s still escalates a cancelled warm owner", async path => {
     const f = await warmFixture(path === "stranded");
-    await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: { executionCancellation: { state: "requested" } } })
+    await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: { ...(path === "sweep"
+      ? { cancelledByActorType: "user", cancelledByUserId: "board-user" } : {}), executionCancellation: { state: "requested" } } })
       .where(eq(heartbeatRuns.id, f.runId));
     const before = await task(f.issueId);
     await inspect(f, path);
     expect(await task(f.issueId)).toEqual(before);
-    expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated", ownerType: "board" }]);
+    if (path === "stranded") await noCard(f);
+    else expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated", ownerType: "board" }]);
   });
 
   // RF3 case (h): the shared guard reports lease cleanup first, so recovery
   // must independently preserve the missing remote termination proof.
-  it.each(["sweep", "stranded"] as const)("supersedes(C1 no-Stop card): %s remote_stop_unconfirmed is an independent blocker, not just unreleased lease", async path => {
+  it.each(["sweep", "stranded"] as const)("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): %s remote_stop_unconfirmed is an independent blocker, not just unreleased lease", async path => {
     const f = await warmFixture(path === "stranded");
     await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
@@ -182,7 +192,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       .where(eq(environmentLeases.id, f.lease.id));
     const before = await task(f.issueId);
     await inspect(f, path);
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     expect(await task(f.issueId)).toEqual(before);
   });
 
@@ -210,18 +220,18 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0]).toEqual(f.lease);
   });
 
-  it("supersedes(C1 no-Stop card): does not hide task cancellation behind a succeeded warm run", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not hide task cancellation behind a succeeded warm run", async () => {
     const f = await warmFixture();
     // A conversation is open-only; task cancellation retires its identity too.
     await db.update(issues).set({ status: "cancelled", cancelledAt: new Date(), conversationAgentId: null,
       conversationUserId: null, conversationState: null }).where(eq(issues.id, f.issueId));
     await inspect(f, "sweep");
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
   });
 
   it.each(["sweep"] as const)("%s preserves the existing non-terminal-owner behavior", async path => nonTerminalOwner(path));
-  it.each(["stranded"] as const)("supersedes(C1 no-Stop card): %s preserves the existing non-terminal-owner behavior", async path => nonTerminalOwner(path));
+  it.each(["stranded"] as const)("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): %s preserves the existing non-terminal-owner behavior", async path => nonTerminalOwner(path));
   async function nonTerminalOwner(path: "sweep" | "stranded") {
     const f = await warmFixture(path === "stranded");
     await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
@@ -230,12 +240,13 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     expect(await task(f.issueId)).toEqual(before);
     // The sweep skips live candidates. Neither may clear a live owner's claims;
     // C1: with no recorded Stop, stranded recovery opens no Stop card either.
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
   }
 
-  it.each(["interrupt", "pending_cancel"] as const)("does not silently skip a warm-looking lease with another blocker: %s", async blocker => anotherBlocker(blocker));
+  // C1 round 3: re-seeded with the person Interrupt / Stop route's user actor.
+  it.each(["interrupt", "pending_cancel"] as const)("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not silently skip a warm-looking lease with another blocker: %s", async blocker => anotherBlocker(blocker));
   // C1: these blockers carry no recorded Stop: the claims stay, with no Stop card.
-  it.each(["controller", "coordinator", "local_process", "local_cancelled_unproven"] as const)("supersedes(C1 no-Stop card): does not silently skip a warm-looking lease with another blocker: %s", async blocker => anotherBlocker(blocker));
+  it.each(["controller", "coordinator", "local_process", "local_cancelled_unproven"] as const)("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not silently skip a warm-looking lease with another blocker: %s", async blocker => anotherBlocker(blocker));
   async function anotherBlocker(blocker: "controller" | "coordinator" | "local_process" | "local_cancelled_unproven" | "interrupt" | "pending_cancel") {
     const f = await warmFixture();
     if (blocker === "controller") await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, f.runId));
@@ -247,14 +258,16 @@ describe("stale-lock sweep requires execution Stop proof", () => {
         processPid: blocker === "local_process" ? process.pid : null, resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
     }
     if (blocker === "interrupt") await db.update(heartbeatRuns).set({ resultJson: { operatorInterrupted: true,
-      interruptionSource: "issue_comment_interrupt", queuedCommentInterruptQueueId: randomUUID() } }).where(eq(heartbeatRuns.id, f.runId));
+      interruptionSource: "issue_comment_interrupt", queuedCommentInterruptQueueId: randomUUID(),
+      interruptedByActorType: "user", interruptedByActorId: "board-user", cancelledByActorType: "user", cancelledByUserId: "board-user" } }).where(eq(heartbeatRuns.id, f.runId));
     if (blocker === "pending_cancel") await db.update(heartbeatRuns).set({ resultJson: {
+      cancelledByActorType: "user", cancelledByUserId: "board-user",
       executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, f.runId));
     const before = await task(f.issueId);
     await inspect(f, "sweep");
     if (blocker === "interrupt" || blocker === "pending_cancel")
       expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
-    else expect(await stopActions(f.issueId)).toEqual([]);
+    else await noCard(f);
     expect(await task(f.issueId)).toEqual(before);
   }
 
@@ -288,7 +301,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
   ] as const).filter(([, allowed]) => allowed === allowedRows).map(([reason, allowed]) => [path, reason, allowed] as const));
   it.each(deferralRows(true))("%s release deferral %s allowed=%s", async (path, reason, allowed) => releaseDeferral(path, reason, allowed));
   // C1: an unallowed deferral on a run nobody stopped keeps the claims, with no Stop card.
-  it.each(deferralRows(false))("supersedes(C1 no-Stop card): %s release deferral %s allowed=%s", async (path, reason, allowed) => releaseDeferral(path, reason, allowed));
+  it.each(deferralRows(false))("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): %s release deferral %s allowed=%s", async (path, reason, allowed) => releaseDeferral(path, reason, allowed));
   async function releaseDeferral(path: "sweep" | "stranded", reason: string, allowed: boolean) {
       const f = await warmFixture(path === "stranded");
       await db.update(environmentLeases).set({ metadata: { releaseDeferral: { reason, attempts: 1,
@@ -296,68 +309,71 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       const before = await task(f.issueId);
       await inspect(f, path);
       expect(await task(f.issueId)).toEqual(before);
-      expect(await stopActions(f.issueId), `allowed=${allowed}`).toEqual([]);
+      if (allowed) expect(await stopActions(f.issueId)).toEqual([]); else await noCard(f);
   }
 
-  it.each(["release_skipped", "release_failed"] as const)("supersedes(C1 no-Stop card): bounds allow-listed %s by expiry plus five minutes", async reason => {
+  it.each(["release_skipped", "release_failed"] as const)("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): bounds allow-listed %s by expiry plus five minutes", async reason => {
     const f = await warmFixture();
     await db.update(environmentLeases).set({ expiresAt: new Date(Date.now() - 240_000),
       metadata: { releaseDeferral: { reason, attempts: 1, retryAt: new Date().toISOString() } } })
       .where(eq(environmentLeases.id, f.lease.id));
     const before = await task(f.issueId);
     await inspect(f, "sweep");
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     await db.update(environmentLeases).set({ expiresAt: new Date(Date.now() - 301_000) })
       .where(eq(environmentLeases.id, f.lease.id));
     await inspect(f, "sweep");
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     expect(await task(f.issueId)).toEqual(before);
   });
 
-  it("supersedes(C1 no-Stop card): does not allow release_skipped on a lease that is no longer active", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not allow release_skipped on a lease that is no longer active", async () => {
     const f = await warmFixture();
     await db.update(environmentLeases).set({ status: "pending_cleanup",
       metadata: { releaseDeferral: { reason: "release_skipped", attempts: 1, retryAt: new Date().toISOString() } } })
       .where(eq(environmentLeases.id, f.lease.id));
     await inspect(f, "sweep");
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
   });
 
-  it("retains a recorded pause request even on a succeeded run", async () => {
+  // C1 round 3 F1: a pause request is not a person's Stop; the claims stay, with no Stop card.
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): retains a recorded pause request even on a succeeded run", async () => {
     const f = await warmFixture();
     await db.update(heartbeatRuns).set({ resultJson: { pauseRequested: { requestedAt: new Date().toISOString() } } })
       .where(eq(heartbeatRuns.id, f.runId));
+    const before = await task(f.issueId);
     await inspect(f, "sweep");
-    expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+    await noCard(f);
+    expect(await task(f.issueId)).toEqual(before);
   });
 
-  it.each(["sweep", "stranded"] as const)("supersedes(C1 no-Stop card): %s bounds deferral by each lease's own expiry plus five minutes", async path => {
+  it.each(["sweep", "stranded"] as const)("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): %s bounds deferral by each lease's own expiry plus five minutes", async path => {
     const f = await warmFixture(path === "stranded");
     await db.update(heartbeatRuns).set({ status: "failed", errorCode: "setup_failed", resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
     await db.update(environmentLeases).set({ expiresAt: new Date(Date.now() - 240_000), status: "pending_cleanup" })
       .where(eq(environmentLeases.id, f.lease.id));
     await inspect(f, path);
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     // A second, older unreleased lease cannot borrow the first one's deadline.
     await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.runId,
       status: "pending_cleanup", expiresAt: new Date(Date.now() - 301_000) });
     await inspect(f, path);
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
   });
 
-  it("supersedes(C1 no-Stop card): uses acquisition plus the environment TTL, never last use or run finish, when expiry is absent", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): uses acquisition plus the environment TTL, never last use or run finish, when expiry is absent", async () => {
     const f = await warmFixture();
     const [environment] = await db.insert(environments).values({ name: randomUUID(), driver: "plugin:boat:computer",
       config: { ttlMinutes: 30 } }).returning();
     await db.update(environmentLeases).set({ environmentId: environment!.id, expiresAt: null,
       acquiredAt: new Date(Date.now() - 34 * 60_000), lastUsedAt: new Date() }).where(eq(environmentLeases.id, f.lease.id));
     await inspect(f, "sweep");
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     await db.update(environmentLeases).set({ acquiredAt: new Date(Date.now() - 36 * 60_000) }).where(eq(environmentLeases.id, f.lease.id));
     await inspect(f, "sweep");
-    expect(await stopActions(f.issueId)).toEqual([]);
+    await noCard(f);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
   });
 
@@ -381,7 +397,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       createdAt: new Date(Date.now() + 1_000) });
     return id;
   }
-  it.each([false, true])("supersedes(C1 no-Stop card): resolves an existing card after a later same-task answer, even when old locks are gone=%s", async noLocks => {
+  it.each([false, true])("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): resolves an existing card after a later same-task answer, even when old locks are gone=%s", async noLocks => {
     const f = await warmFixture();
     await existingCard(f);
     await laterAnswer(f);
@@ -395,7 +411,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
     expect(await stopActions(f.issueId)).toHaveLength(1);
   });
-  it("supersedes(C1 no-Stop card): the normal recovery worker discovers a card even without stale lock columns", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): the normal recovery worker discovers a card even without stale lock columns", async () => {
     const f = await warmFixture();
     await existingCard(f);
     await laterAnswer(f);
@@ -415,7 +431,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     } finally { await worker.stop(); await coordinator.stop(); }
   });
 
-  it("supersedes(C1 no-Stop card): does not mistake an earlier answer or another task's answer for recovery", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not mistake an earlier answer or another task's answer for recovery", async () => {
     const f = await warmFixture(), other = await warmFixture();
     await existingCard(f);
     await laterAnswer(other);
@@ -431,7 +447,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     await inspect(f, "sweep");
     expect(await stopActions(f.issueId)).toMatchObject([{ status: "escalated" }]);
   });
-  it("supersedes(C1 no-Stop card): removes only a stale Stop annotation, preserves independent recovery and records answer resolution once", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): removes only a stale Stop annotation, preserves independent recovery and records answer resolution once", async () => {
     const f = await warmFixture();
     await existingCard(f);
     const [action] = await stopActions(f.issueId);
@@ -473,7 +489,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     expect(await stopActions(f.issueId)).toMatchObject([{ id: before[0]!.id, status: "resolved", outcome: "restored",
       resolutionNote: "Stop proved under the task and bound-run locks." }]);
   });
-  it("supersedes(C1 no-Stop card): resolves an existing no-Stop card once the named lease is released after its binding changes", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): resolves an existing no-Stop card once the named lease is released after its binding changes", async () => {
     const f = await warmFixture();
     await existingCard(f);
     await db.update(issues).set({ checkoutRunId: null, executionRunId: null }).where(eq(issues.id, f.issueId));

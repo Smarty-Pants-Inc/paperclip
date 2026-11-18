@@ -916,7 +916,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   ];
   it.each(heldCases.filter(c => c.label !== "an unacknowledged Stop"))("nativeUserStopRecoveryHeld on a Stop-pending card with $label: held=$held", stopRecoveryHeld, 60_000);
   // C1: a card needs a recorded Stop; this fixture now records the person's Stop.
-  it.each(heldCases.filter(c => c.label === "an unacknowledged Stop"))("supersedes(C1 no-Stop card): nativeUserStopRecoveryHeld on a Stop-pending card with $label: held=$held", stopRecoveryHeld, 60_000);
+  it.each(heldCases.filter(c => c.label === "an unacknowledged Stop"))("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): nativeUserStopRecoveryHeld on a Stop-pending card with $label: held=$held", stopRecoveryHeld, 60_000);
   async function stopRecoveryHeld({ held, journal, stop, otherRun, stronger }: (typeof heldCases)[number]) {
     const prior = await seedRecoveredPriorRun();
     await stopSettledOwner(prior, stop ?? {});

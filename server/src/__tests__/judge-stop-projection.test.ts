@@ -31,7 +31,7 @@ describe("judge: Stop-pending remains a person's visible durable obligation", ()
   await db.insert(issues).values({id:issueId,companyId,title:"Locked until previous execution stops",status:"in_progress",checkoutRunId:runId,executionRunId:runId,executionLockedAt:old});
   return {companyId,actor,agentId,issueId,runId};
  }
- it("supersedes(C1 no-Stop card): keeps the Stop instruction visible when an exhausted workspace recovery owns the existing card", async () => {
+ it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): keeps the Stop instruction visible when an exhausted workspace recovery owns the existing card", async () => {
   const f=await fixture();
   const state={...createSystemRecovery(f.runId),state:"exhausted",attempts:6,retriesUsed:5,failure:{code:"provider_unavailable",retryClass:"retry_transient",evidenceFingerprint:"prior-failure"}};
   await db.insert(issueRecoveryActions).values({companyId:f.companyId,sourceIssueId:f.issueId,kind:"active_run_watchdog",cause:"workspace_restore_unavailable",fingerprint:"saved-work",ownerType:"system",status:"escalated",nextAction:"Saved work recovery is exhausted.",evidence:{runId:f.runId,systemRecovery:state,workspaceRecovery:{sourceRunId:f.runId}},attemptCount:6,maxAttempts:6});
@@ -41,7 +41,7 @@ describe("judge: Stop-pending remains a person's visible durable obligation", ()
   expect(response.body.activeRecoveryAction.evidence.stopPending.code).toBe("execution_stop_pending");
   expect(response.body.activeRecoveryAction.nextAction).toContain("execution_stop_pending");
  });
- it("supersedes(C1 no-Stop card): does not let an ordinary source-scoped recovery upsert erase an unproved Stop obligation", async () => {
+ it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not let an ordinary source-scoped recovery upsert erase an unproved Stop obligation", async () => {
   const f=await fixture(); const recovery=recoveryService(db,{enqueueWakeup:vi.fn()});
   expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
   // The same source-scoped writer is used by native run/finalization recovery.
@@ -52,7 +52,7 @@ describe("judge: Stop-pending remains a person's visible durable obligation", ()
   expect(response.body.activeRecoveryAction.evidence.stopPending).toMatchObject({code:"execution_stop_pending",runIds:[f.runId]});
   expect(response.body.activeRecoveryAction.nextAction).toContain("execution_stop_pending");
  });
- it("supersedes(C1 no-Stop card): exposes a thirty-day cancelled native lock whose empty retry coordinator has no future attempt or owner", async () => {
+ it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): exposes a thirty-day cancelled native lock whose empty retry coordinator has no future attempt or owner", async () => {
   const f=await fixture();
   await db.update(agents).set({adapterType:"paperclip_runner"}).where(eq(agents.id,f.agentId));
   await db.update(heartbeatRuns).set({runtimeMode:"native",nativeIssueId:f.issueId}).where(eq(heartbeatRuns.id,f.runId));
