@@ -23,6 +23,7 @@ import { AGENT_HANDOVER_PENDING_CODE, pendingAgentHandover } from "./agent-hando
 import { budgetServiceInTransaction, policyBlocks, type BudgetServiceHooks } from "./budgets.js";
 import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
+import { notifyPausedNoteResume } from "./recovery/unanswered-person-message.js";
 import { deleteAgentDependencies } from "./agent-deletion.js";
 import { lockAgentConfigurationInteractions, prepareAgentConfiguration, completeAgentConfiguration } from "./agent-configuration.js";
 import { prepareAgentHire, initializeAgentHire, prepareAgentHireApproval, completeAgentHireApproval, isHireGrantStepContention } from "./agent-hiring.js";
@@ -165,7 +166,15 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
         scopeType: "agent", scopeId: agentId, amount, isActive, windowKind: "calendar_month_utc",
       }, userId),
     recordCreation: (db, companyId, agentId) => recordResourceCreationEvent(db, companyId, "agent", agentId),
-    recordStatus: recordAgentStatusEvent,
+    // The resume transition (paused -> resuming, modules/agent-lifecycle/adapters/
+    // postgres.ts recordStatus 'paused' -> 'idle'; the compatibility status stays
+    // 'paused' until 'ready', so beforeStatusChange's eligibility notification
+    // comes later): a standing '<agent> is paused' note is no longer true. Hand
+    // its tasks to the stranded sweep's per-issue entry at commit (event-driven).
+    async recordStatus(db, companyId, agentId, before, after) {
+      await recordAgentStatusEvent(db, companyId, agentId, before, after);
+      if (before === "paused" && after === "idle") await notifyPausedNoteResume(db, { companyId, agentId });
+    },
     clearPrimary: (db, companyId, agentId, publications) => clearPrimaryAgent(db, companyId, agentId, undefined, publications),
     lockConfigurationInteractions: lockAgentConfigurationInteractions,
     prepareConfiguration: prepareAgentConfiguration,
