@@ -114,13 +114,15 @@ export async function noStoppedTurnProcessRemains(box: StoppedTurnBox | null | u
     /** The stopped run: processes carrying its PAPERCLIP_RUN_ID are the turn's. */
     runId?: string;
     bypassSession?: boolean;
+    /** Test seam: treat the box as a separate kernel (whole-box mode) even when it shares the controller's. */
+    wholeBox?: boolean;
   }): Promise<StoppedTurnProcessProof> {
   if (!box?.runner || !box.remoteCwd) return { proven: false, detail: "no_box_command_path" };
   const startedMs = turnStartedAt ? new Date(turnStartedAt).getTime() : NaN;
   if (!Number.isFinite(startedMs)) return { proven: false, detail: "turn_start_unknown" };
   const since = Math.floor((startedMs - NO_STOPPED_TURN_PROCESS_CLOCK_SLACK_MS) / 1000);
   const result = await box.runner.execute({ command: "sh", args: ["-c", SCRIPT, "sh", String(since), box.remoteCwd,
-    readControllerBootId(), String(NO_STOPPED_TURN_PROCESS_KILL_ROUNDS),
+    options?.wholeBox ? "" : readControllerBootId(), String(NO_STOPPED_TURN_PROCESS_KILL_ROUNDS),
     options?.retainedSession ? "retained" : "closed", options?.runId ?? ""], cwd: box.remoteCwd,
     timeoutMs: options?.timeoutMs ?? NO_STOPPED_TURN_PROCESS_TIMEOUT_MS,
     ...(options?.bypassSession ? { bypassSession: true } : {}) } as Parameters<StoppedTurnBox["runner"]["execute"]>[0]).catch((error: unknown) => ({
