@@ -190,7 +190,7 @@ import {
   isStrandedIssueRecoveryOriginKind,
 } from "./origins.js";
 import { withRecoveryContext } from "./status-only-context.js";
-import { getExecutionBlocker } from "../execution-blocker.js";
+import { getExecutionBlocker, withoutUnavailableRetry } from "../execution-blocker.js";
 import { currentRunFailureText } from "../native-runtime/native-exact-resume-failure.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { rehomeStrandedLegacyWorkspaceTasks } from "./legacy-workspace-rehome.js";
@@ -4521,9 +4521,12 @@ export function recoveryService(
           input.successfulRunHandoffEvidence.missingDisposition,
       });
     }
+    // The notice shares the Retry decision already read for the recovery action.
     const escalationNotice = buildStrandedRecoveryEscalationNotice({
       seed: input.notice,
       fallbackBody: input.comment,
+      retryDecision: executionBlocker ? { offered: executionBlocker.canRetry === true, nextAction: executionBlocker.nextAction,
+        withoutRetry: text => withoutUnavailableRetry(text, executionBlocker.canRetry === true) } : null,
       recoveryCause,
       recoveryActionId: recoveryAction.id,
       retryOffered,
