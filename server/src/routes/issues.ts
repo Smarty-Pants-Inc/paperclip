@@ -434,6 +434,7 @@ import {
   queuedCommentQueueRevision,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
+import { consumedQueuedPersonMessageSql } from "../services/heartbeat/queue.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -8137,6 +8138,15 @@ export function issueRoutes(
           : "unsupported",
     });
     return { activeRun, wake, queueRun, state, queue, queueState };
+  }
+
+  // S8 order (rf-4): after a queued message is discarded or deleted (committed),
+  // a message held behind the person's Interrupt is promoted if that press is
+  // no longer live. Best-effort: the receipt sweep retries it.
+  async function releaseWakesBehindDeadPress(issue: { companyId: string; id: string }) {
+    await heartbeat.releaseWakesBehindDeadPress({ companyId: issue.companyId, issueId: issue.id }).catch((err: unknown) => {
+      logger.warn({ err, issueId: issue.id }, "a message held behind a dead Interrupt could not be promoted yet");
+    });
   }
 
   function operatorInterruptCancelOptions(input: { issueId: string; actor: ReturnType<typeof getActorInfo> }) {
@@ -18147,9 +18157,58 @@ export function issueRoutes(
         }
         // The click is durable fresh user intent, including when the message
         // predates a failed run's stop. Keep its content and original attribution.
+        // S8 order (Paul note 6): in a chat the press sends everything waiting,
+        // in the order written. The person's plain messages from the oldest on
+        // join this wake, as after a person's Stop (gatherPersonStoppedChatMessages).
+        // S8 phase 2 (RFL F1 blocker): the batch never re-presents consumed input.
+        // A message that is ANSWERED, carriedInLiveRun or personStopped
+        // (consumedQueuedPersonMessageSql: the shared person-message-answer.ts
+        // functions only) is left out of the press's ids; a waiting wake whose
+        // messages are all consumed is passed over, neither joined nor ending the queue.
+        let pressedPayload = readObject(locked.wake.payload);
+        if (issue.conversationAgentId) {
+          const waiting = await tx.select().from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, locked.wake.agentId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.requestedByActorType, "user"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+            sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
+          )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).for("update");
+          const ids = waiting.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload));
+          const byId = new Map((ids.length ? await tx.select().from(issueComments).where(and(eq(issueComments.companyId,
+            issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids))) : []).map((c) => [c.id, c]));
+          const consumed = new Set((ids.length ? await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+            eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids),
+            consumedQueuedPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+              issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}`,
+              agentId: sql`${locked.wake.agentId}::uuid` }))) : []).map((c) => c.id));
+          const joined: typeof waiting = [];
+          for (const wake of waiting) {
+            const payload = readObject(wake.payload), wakeIds = queuedCommentIdsFromWakePayload(wake.payload);
+            if (wake.id !== locked.wake.id && wakeIds.length && wakeIds.every((id) => consumed.has(id))) continue;
+            if (wake.id !== locked.wake.id && (payload.queuedCommentInterrupt || queuedInteractionId(wake.payload) ||
+                readObject(payload._paperclipWakeContext).forceFreshSession === true || !wakeIds.length ||
+                !wakeIds.every((id) => { const c = byId.get(id);
+                  return c && !c.deletedAt && c.authorUserId && !c.authorAgentId && !isConversationReset(c.body); }))) break;
+            joined.push(wake);
+          }
+          const kept = [...new Set(joined.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))]
+            .filter((id) => !consumed.has(id));
+          const ownIds = queuedCommentIdsFromWakePayload(locked.wake.payload);
+          if (kept.length && joined.some((wake) => wake.id === locked.wake.id) &&
+              (joined.length > 1 || ownIds.some((id) => consumed.has(id)))) {
+            const rest = joined.filter((wake) => wake.id !== locked.wake.id);
+            pressedPayload = withQueuedCommentIdsInWakePayload(pressedPayload, kept);
+            await tx.update(agentWakeupRequests).set({ coalescedCount: (locked.wake.coalescedCount ?? 0) + rest.length })
+              .where(eq(agentWakeupRequests.id, locked.wake.id));
+            await tx.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: new Date(), updatedAt: new Date(),
+              error: "Sent with the chat's other queued messages by an Interrupt" }).where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId), inArray(agentWakeupRequests.id, rest.map((wake) => wake.id)),
+              eq(agentWakeupRequests.status, "deferred_issue_execution")));
+          }
+        }
         await notifyDeferredExecutionWork(tx, { companyId: issue.companyId, requestId: locked.wake.id });
         await tx.update(agentWakeupRequests).set({
-          payload: { ...readObject(locked.wake.payload), queuedCommentInterrupt: {
+          payload: { ...pressedPayload, queuedCommentInterrupt: {
             actorId: actor.actorId, requestedAt: new Date().toISOString(),
             ...(locked.queue.protocol === "paperclip_runner_v1" && locked.activeRun?.status === "running"
               ? { targetRunId: locked.activeRun.id } : {}),
@@ -18559,6 +18618,7 @@ export function issueRoutes(
       if (result.cancelledRun) {
         void emitAgentTaskRunById(db, { runId: result.cancelledRun.id, companyId: issue.companyId });
       }
+      await releaseWakesBehindDeadPress(issue);
       res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, result.queue));
     },
   );
@@ -19859,6 +19919,7 @@ export function issueRoutes(
             activeRun?.id ?? queueWakeForCancellation?.runId ?? null,
         },
       });
+      await releaseWakesBehindDeadPress(issue);
 
       res.json(removed);
       return;
@@ -19957,6 +20018,7 @@ export function issueRoutes(
         resolvedAnnotationThreadIds: annotationCleanup.resolvedThreadIds,
       },
     });
+    await releaseWakesBehindDeadPress(issue);
 
     res.json(deleted);
   });

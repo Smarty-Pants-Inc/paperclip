@@ -113,8 +113,10 @@ import {
   notInArray,
   or,
   sql,
+  type SQL,
 } from "drizzle-orm";
 import { personStopExportPendingHoldsAdmission } from "./person-stop-release-export.js";
+import { answeredPersonMessageSql, carriedInLiveRunSql, completedPersonMessageAnswerSql } from "../person-message-answer.js";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -282,6 +284,71 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
 
 
 export const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+
+/** S8 order: the queued-comment Interrupt wake a person's later message waits behind (fix A). */
+export const DEFERRED_BEHIND_INTERRUPT_KEY = "deferredBehindInterruptId";
+
+/**
+ * S8 order (Paul note 6): the ONE live-press predicate, over the outer
+ * agent_wakeup_requests row. A queued-comment Interrupt is live while its wake
+ * waits; the issue's latest run is the run this press stopped (recorded with
+ * this queue id, stopped by the press's own actor no earlier than the press,
+ * and its named target when it named one), the same proof as
+ * deferred-receipt-work's interruptedNativeReleased without its teardown
+ * clause; and its queue still holds a person's undeleted plain message that
+ * is not consumed (consumedQueuedPersonMessageSql).
+ */
+export function liveQueuedCommentInterruptSql(companyId: string, issueId: string) {
+  return sql`(agent_wakeup_requests.status = 'deferred_issue_execution'
+    and agent_wakeup_requests.payload -> 'queuedCommentInterrupt' is not null
+    and agent_wakeup_requests.payload ->> 'issueId' = ${issueId}
+    and exists (select 1 from (select r.id, r.status, r.result_json, r.finished_at from heartbeat_runs r
+      where r.company_id = ${companyId} and r.context_snapshot ->> 'issueId' = ${issueId}
+      order by r.created_at desc, r.id desc limit 1) latest
+      where latest.status = 'cancelled'
+        and latest.result_json ->> 'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text
+        and coalesce(agent_wakeup_requests.payload -> 'queuedCommentInterrupt' ->> 'targetRunId', latest.id::text) = latest.id::text
+        and latest.result_json ->> 'interruptedByActorId' = agent_wakeup_requests.payload -> 'queuedCommentInterrupt' ->> 'actorId'
+        and latest.finished_at is not null
+        and to_char(latest.finished_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+          >= agent_wakeup_requests.payload -> 'queuedCommentInterrupt' ->> 'requestedAt')
+    and exists (select 1 from issue_comments press_comment
+      where press_comment.company_id = ${companyId} and press_comment.issue_id::text = ${issueId}
+        and press_comment.deleted_at is null and press_comment.author_user_id is not null and press_comment.author_agent_id is null
+        and not ${consumedQueuedPersonMessageSql({ id: sql`press_comment.id`, companyId: sql`press_comment.company_id`, issueId: sql`press_comment.issue_id`,
+          createdAt: sql`press_comment.created_at`, agentId: sql`agent_wakeup_requests.agent_id` })}
+        and press_comment.id::text in (select jsonb_array_elements_text(case
+          when jsonb_typeof(agent_wakeup_requests.payload #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'
+          then agent_wakeup_requests.payload #> '{_paperclipWakeContext,wakeCommentIds}' else '[]'::jsonb end))))`;
+}
+
+/**
+ * S8 order phase 2 (RFL F1 blocker): a queued person message that is already
+ * CONSUMED, so an Interrupt's batch (fix B) never re-presents it and it never
+ * keeps a press live (fix A). Composed ONLY of the shared person-message-answer.ts
+ * functions, no rule of its own about answers or carries:
+ * - ANSWERED: completedPersonMessageAnswerSql (a completed run's final answer);
+ * - carriedInLiveRun: carriedInLiveRunSql (a live run already owns it);
+ * - personStopped: a run its sender stopped (a person's Stop, the run
+ *   `cancelled` with cancelledByActorType 'user', as gatherPersonStoppedChatMessages
+ *   reads it), started after the message was written, and the message was
+ *   answered (answeredPersonMessageSql, DELIVERED, attributed through the
+ *   replying run's own pending input) after that run started. Stop means stop:
+ *   the stopped turn's answer is not repeated.
+ */
+export function consumedQueuedPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL; agentId: SQL }): SQL {
+  return sql`(${completedPersonMessageAnswerSql(m)}
+    or ${carriedInLiveRunSql(m)}
+    or exists (select 1 from ${heartbeatRuns} person_stopped
+      where person_stopped.company_id = ${m.companyId} and person_stopped.agent_id = ${m.agentId}
+        and (person_stopped.issue_id = ${m.issueId} or person_stopped.native_issue_id = ${m.issueId}
+          or person_stopped.context_snapshot->>'issueId' = ${m.issueId}::text)
+        and person_stopped.status = 'cancelled'
+        and person_stopped.result_json->>'cancelledByActorType' = 'user'
+        and person_stopped.started_at > ${m.createdAt}
+        and ${answeredPersonMessageSql({ id: m.id, companyId: m.companyId, issueId: m.issueId,
+          createdAt: sql`person_stopped.started_at` })}))`;
+}
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -2073,9 +2140,59 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return cancelled;
   }
 
+  // S8 order (rf-4): a message fix A held behind a person's Interrupt is never
+  // left behind a dead press. Once no press on its issue is live (its queue
+  // emptied, discarded or deleted, its wake left the deferred status, or its
+  // target is no longer the issue's latest cancelled run) each held message is
+  // promoted, oldest first, through the same saved-receipt admission as
+  // resumeExecutionWaitComments: exactly what admission would have done had
+  // the press not held it (a stopped run's release never promotes by itself).
+  // A live run on the issue promotes it at its own release instead.
+  // Callers run this after their commit; each admission is its own transaction.
+  async function releaseWakesBehindDeadPress(scope: { companyId?: string; issueId?: string } = {}) {
+    const held = await db.select().from(agentWakeupRequests).where(and(
+      scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
+      scope.issueId ? sql`${agentWakeupRequests.payload} ->> 'issueId' = ${scope.issueId}` : undefined,
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      sql`${agentWakeupRequests.payload} ->> ${DEFERRED_BEHIND_INTERRUPT_KEY} is not null`,
+      sql`${agentWakeupRequests.payload} ->> 'issueId' is not null`,
+    )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(50);
+    const pressDead = new Map<string, Promise<boolean>>();
+    for (const wake of held) {
+      const issueId = String(wake.payload?.issueId);
+      const key = `${wake.companyId}:${wake.agentId}:${issueId}`;
+      if (!pressDead.has(key)) pressDead.set(key, (async () => {
+        const [live] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
+          liveQueuedCommentInterruptSql(wake.companyId, issueId))).limit(1);
+        if (live) return false;
+        const [latest] = await db.select({ status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt })
+          .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, wake.companyId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`))
+          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+        return !latest || (latest.finishedAt !== null && isHeartbeatRunTerminalStatus(latest.status));
+      })());
+      if (!(await pressDead.get(key))) continue;
+      const context = parseObject(parseObject(wake.payload)[DEFERRED_WAKE_CONTEXT_KEY]);
+      const { [DEFERRED_BEHIND_INTERRUPT_KEY]: _press, [DEFERRED_WAKE_CONTEXT_KEY]: _context, ...payload } = parseObject(wake.payload);
+      await enqueueWakeup(wake.agentId, {
+        source: wake.source as WakeupOptions["source"], triggerDetail: wake.triggerDetail as WakeupOptions["triggerDetail"],
+        reason: wake.reason ?? undefined, payload, contextSnapshot: context,
+        requestedByActorType: wake.requestedByActorType as WakeupOptions["requestedByActorType"],
+        requestedByActorId: wake.requestedByActorId ?? undefined,
+      }, wake.id, wake.payload?.interactionOrigin).catch((err) => {
+        if (err instanceof PersistedExecutionWaitRefusal) return;
+        logger.warn({ err, requestId: wake.id }, "a message held behind a dead Interrupt could not be promoted");
+      });
+    }
+  }
+
   async function resumeDeferredExecutionReceipts(scope: DeferredReceiptRecoveryOptions = {}) {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments(scope);
+    // The press's wake can leave the deferred status on any path (sent,
+    // discarded, refused, restart); this durable pass releases what it held.
+    await releaseWakesBehindDeadPress({ companyId: scope.companyId });
     const cutoff = await getWorktreeExecutionCutoff();
     // S8q: the age gate waits out a run that may still write. An exact hint for
     // an Interrupt whose stopped run has finished teardown needs no wait; every
@@ -4829,6 +4946,29 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
+          // S8 order (Paul note 6): a person's new message never runs before the
+          // messages their own live Interrupt is sending. The press is live while
+          // its wake waits, the issue's latest run is the one it stopped and its
+          // queue still holds a message (liveQueuedCommentInterruptSql). Once it
+          // is not, releaseWakesBehindDeadPress promotes the held message.
+          if (!activeExecutionRun && opts.requestedByActorType === "user" && wakeCommentId && !opts.queuedCommentInterruptId &&
+              !executionWaitRequestId && !durableRequest?.failedRunRetry && !caseRequest && !reconciledSourceRunId) {
+            const [livePress] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+              liveQueuedCommentInterruptSql(issue.companyId, issue.id),
+            )).limit(1);
+            if (livePress) {
+              await tx.insert(agentWakeupRequests).values({ ...durableReceiptFields,
+                companyId: agent.companyId, agentId, source, triggerDetail, reason,
+                payload: withQueuedCommentIdsInWakePayload({ ...payload, issueId: issue.id,
+                  [DEFERRED_BEHIND_INTERRUPT_KEY]: livePress.id,
+                  [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot }, [wakeCommentId]),
+                status: "deferred_issue_execution", requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null, idempotencyKey: opts.idempotencyKey ?? null });
+              return { kind: "deferred" as const, admitted: true };
+            }
+          }
+
           if (activeExecutionRun) {
             // The case ledger owns retry. Do not place its exact receipt in a
             // generic deferred queue that cannot retain handoff authority.
@@ -6008,6 +6148,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     trackWakeup,
     resumeQueuedRuns,
     resumeDeferredExecutionReceipts,
+    releaseWakesBehindDeadPress,
     resumeQueuedRunsAfterDrain,
     resumeFreshQueuedRunsAtStartup,
     parseHeartbeatPolicy,
