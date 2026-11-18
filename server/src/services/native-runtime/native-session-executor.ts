@@ -993,7 +993,8 @@ function successorOnOwnerSandbox(entry: WarmNativeSession, successor: WarmPredec
 async function warmOwnerStopReceiptWithinBound(entry: WarmNativeSession, successor: WarmPredecessorSuccessor): Promise<boolean> {
   const db = entry.sandboxLeaseDb;
   if (!db || !entry.providerLeaseId || !entry.environmentId) return false;
-  const scope = { successorOnOwnerSandbox: successorOnOwnerSandbox(entry, successor) };
+  // Retirement: a receipt (stopped OR destroyed) counts only on the owner's own lease.
+  const scope = { successorOnOwnerSandbox: successorOnOwnerSandbox(entry, successor), ownLeaseOnly: true };
   const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
   for (;;) {
     try {
@@ -1330,9 +1331,12 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
 
 /** Boat's typed teardown receipt on the owner's lease: "destroyed" proves the
  * owner gone anywhere; "stopped" by the owner's own run proves it only when the
- * successor is not on that same sandbox. */
+ * successor is not on that same sandbox. With ownLeaseOnly (the retirement
+ * path), "destroyed" too counts only on the owner's own run's lease: a destroy
+ * receipt on another run's lease of the same box (an earlier lifecycle of a
+ * box since resumed) never proves the current owner gone. */
 async function warmSandboxTerminated(db: Db, entry: WarmNativeSession,
-  scope: { successorOnOwnerSandbox?: boolean } = {}): Promise<boolean> {
+  scope: { successorOnOwnerSandbox?: boolean; ownLeaseOnly?: boolean } = {}): Promise<boolean> {
   if (!entry.providerLeaseId || !entry.environmentId) return false;
   const leases = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.companyId, entry.companyId),
@@ -1343,8 +1347,9 @@ async function warmSandboxTerminated(db: Db, entry: WarmNativeSession,
   return resolved.some(lease => {
     if (!hasRemoteTerminationReceipt(lease)) return false;
     const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
-    return state === "destroyed"
-      || (state === "stopped" && lease.heartbeatRunId === entry.runId && scope.successorOnOwnerSandbox !== true);
+    const ownLease = lease.heartbeatRunId === entry.runId;
+    return (state === "destroyed" && (ownLease || scope.ownLeaseOnly !== true))
+      || (state === "stopped" && ownLease && scope.successorOnOwnerSandbox !== true);
   });
 }
 
