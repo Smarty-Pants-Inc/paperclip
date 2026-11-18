@@ -2,7 +2,7 @@ import { resolveExternalTestDatabaseUrl } from "../../../__tests__/helpers/exter
 import { DELIVERY_QUEUES } from "../../../services/delivery-work-notifications.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { randomBytes, randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { createSystemRecovery } from "../../../services/system-recovery-state.js";
@@ -17,6 +17,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueTreeHolds,
   issues,
   nativeRunFinalizations,
   subscribeDatabaseWork,
@@ -33,7 +34,7 @@ import {
 import type { WakeQueuePostgresAdapterDeps } from "./postgres.js";
 import { createReleaseIssueExecution } from "../application/use-cases.js";
 import type { TransactionScope } from "../application/ports.js";
-import { withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../../../services/issue-queued-comment-queue.js";
+import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../../../services/issue-queued-comment-queue.js";
 
 // Proves the atomicity and company-scope properties the security review
 // requires: every mutation names `companyId` in its own SQL `WHERE` clause,
@@ -824,6 +825,86 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
       eq(heartbeatRuns.agentId, agentId)))).toHaveLength(1);
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+  });
+
+  // Stop row, S10 Option B (org 11-17 08:11Z, "Stop means stop", Gate 5
+  // native): a person queued A, B, C behind a chat turn (one wake each, as a
+  // chat saves them) and pressed the square Stop. Nothing is promoted and no
+  // run starts; the chat's messages wait as ONE queue, in order, for the
+  // owner's Send. A held chat (leaf_pause) is the same. A task keeps its rule.
+  it.each(["chat", "held-chat", "new-boundary", "task"] as const)("a person's Stop on a native chat turn sends nothing and gathers its waiting messages in order (%s)", async (variant) => {
+    const chat = variant !== "task";
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId, status: "in_progress" });
+    if (chat) await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: "board-user",
+      conversationState: "active" }).where(eq(issues.id, issueId));
+    if (variant === "held-chat") await db.insert(issueTreeHolds).values({ companyId, rootIssueId: issueId, mode: "pause",
+      status: "active", createdByActorType: "user", createdByUserId: "board-user",
+      releasePolicy: { strategy: "manual", note: "leaf_pause" } });
+    const runId = await seedRun({ companyId, agentId, status: "cancelled", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId, errorCode: "cancelled",
+      finishedAt: new Date(), resultJson: {
+        cancelledByActorType: "user", cancelledByUserId: "board-user",
+        cancellation: { source: "operator", expected: true, initiator: { type: "user", id: "board-user" },
+          reason: "Cancelled by a board operator", recordedAt: new Date().toISOString() },
+        nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId, companyId, issueId,
+          scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+          intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID() },
+      } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+    const queuedIds: string[] = [];
+    const wakeIds: string[] = [];
+    // new-boundary: A, B, /new, C. Only A and B gather; /new keeps its turn
+    // boundary and C stays behind it.
+    const bodies = variant === "new-boundary" ? ["A", "B", "/new", "C"] : ["A", "B", "C"];
+    for (const [index, body] of bodies.entries()) {
+      const at = new Date(Date.now() - 60_000 + index * 21_000);
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "board-user", body,
+        createdAt: at }).returning();
+      queuedIds.push(comment.id);
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand",
+        triggerDetail: "manual", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+        requestedByActorType: "user", requestedByActorId: "board-user", requestedAt: at,
+        idempotencyKey: `conversation-comment:${comment.id}`,
+        payload: withQueuedCommentIdsInWakePayload({ issueId,
+          _paperclipWakeContext: { issueId, taskKey: issueId, wakeReason: "issue_commented", source: "issue.comment" } }, [comment.id]),
+      }).returning();
+      wakeIds.push(wake.id);
+    }
+    const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: { escalateStrandedAssignedIssue: async () => { throw new Error("must not escalate a stopped run"); },
+        escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("must not escalate a stopped run"); } },
+    });
+
+    // A repeated release (finalizer and Stop both release) changes nothing more.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = await release({ companyId, runId, now: new Date() });
+      expect(result.outcome.kind).toBe("released");
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ id: runId, status: "cancelled" });
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+      const wakes = await db.select().from(agentWakeupRequests).where(inArray(agentWakeupRequests.id, wakeIds));
+      const byId = new Map(wakes.map((wake) => [wake.id, wake]));
+      if (!chat) {
+        // Guard: a task's Stop holds each queued comment where it was.
+        for (const [index, id] of wakeIds.entries()) {
+          expect(byId.get(id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+          expect(queuedCommentIdsFromWakePayload(byId.get(id)!.payload)).toEqual([queuedIds[index]]);
+        }
+        continue;
+      }
+      const gathered = variant === "new-boundary" ? 2 : 3;
+      expect(byId.get(wakeIds[0]!)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(queuedCommentIdsFromWakePayload(byId.get(wakeIds[0]!)!.payload)).toEqual(queuedIds.slice(0, gathered));
+      for (const id of wakeIds.slice(1, gathered)) expect(byId.get(id)).toMatchObject({ status: "coalesced", runId: null });
+      for (const [index, id] of wakeIds.entries()) if (index >= gathered) {
+        expect(byId.get(id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+        expect(queuedCommentIdsFromWakePayload(byId.get(id)!.payload)).toEqual([queuedIds[index]]);
+      }
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ executionRunId: null });
+    }
   });
 
   it("releases an acknowledged interrupt Stop without blocking or retiring the settling executor", async () => {

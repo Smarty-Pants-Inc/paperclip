@@ -46,6 +46,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 
 type QueueAction = "steer" | "interrupt" | "discard" | null;
+export const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
+export const CHAT_STOPPED_BY_PERSON_LINE = "Stopped. These messages are waiting: Send them, or delete any first.";
 
 export function reorderQueuedMessageEntries(
   entries: IssueQueuedCommentEntry[],
@@ -70,6 +72,13 @@ export function queuedMessageLabel(entry: IssueQueuedCommentEntry): string {
   if (entry.source?.kind !== "interaction") return entry.comment.body;
   const summary = entry.source.summary?.trim();
   return summary || entry.comment.body.split("\n")[0] || "Saved response";
+}
+
+/** The server's own words for a refusal the person can act on (a paused chat). */
+function queueActionErrorText(error: unknown): string | null {
+  const body = typeof error === "object" && error !== null ? (error as { body?: unknown }).body : null;
+  const text = typeof body === "object" && body !== null ? (body as { error?: unknown }).error : null;
+  return typeof text === "string" && text.trim() ? text : null;
 }
 
 function queueActionErrorCode(error: unknown): string | null {
@@ -109,6 +118,7 @@ function SortableQueuedMessage({
   onInterrupt,
   onDiscard,
   onCancelAutoSteer,
+  sendOnLine = false,
 }: {
   entry: IssueQueuedCommentEntry;
   queue: IssueQueuedCommentQueue;
@@ -122,6 +132,8 @@ function SortableQueuedMessage({
   onInterrupt?: () => void;
   onDiscard: () => void;
   onCancelAutoSteer: () => void;
+  /** The queue's one Send is on its status line (after a person's Stop). */
+  sendOnLine?: boolean;
 }) {
   const immutableResponse = entry.source?.kind === "interaction";
   const body = queuedMessageLabel(entry);
@@ -187,7 +199,7 @@ function SortableQueuedMessage({
         </div> : null}
       </div>
 
-      {autoSteerSecondsLeft !== null ? (
+      {sendOnLine ? null : autoSteerSecondsLeft !== null ? (
         <span className="flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
           <span className="px-1 text-xs text-muted-foreground tabular-nums">
             Sending in {autoSteerSecondsLeft}s
@@ -514,7 +526,8 @@ export function TaskChatQueuedMessages({
           : action === "steer"
             ? "Couldn’t steer. Message is still queued."
             : action === "interrupt"
-              ? queue.targetRunId ? "Couldn’t interrupt. Message is still queued." : "Couldn’t send. Message is still queued."
+              ? code === "queued_comment_chat_paused" ? queueActionErrorText(error) ?? "Couldn’t send. Message is still queued."
+              : queue.targetRunId ? "Couldn’t interrupt. Message is still queued." : "Couldn’t send. Message is still queued."
               : code === "queued_comment_revision_conflict"
                 ? "The queue changed in another session. Review it and try again."
                 : "Couldn’t discard. Message is still queued.",
@@ -530,6 +543,11 @@ export function TaskChatQueuedMessages({
   const statusMessage = deferredStatus?.message
     ?? (queue.state === "deferred" && !queue.queueId && !queue.targetRunId && entries.length > 0
       ? queue.executionWait?.message ?? null : null);
+
+  // Stop means stop (org 11-17): after a person's Stop the chat's waiting
+  // messages are not sent until the person sends them (or deletes some first).
+  const stoppedByPerson = queue.executionWait?.reason === CHAT_STOPPED_BY_PERSON_REASON &&
+    Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0 && Boolean(onInterrupt);
 
   if (entries.length === 0 && !visibleError && !statusMessage) return null;
 
@@ -577,6 +595,7 @@ export function TaskChatQueuedMessages({
                     : undefined
                 }
                 onDiscard={() => void runRowAction(entry.comment.id, "discard")}
+                sendOnLine={stoppedByPerson}
               />
             );
           })}
@@ -584,6 +603,25 @@ export function TaskChatQueuedMessages({
         </SortableContext>
       </DndContext>
       {statusMessage ? <p role="status" className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground">{statusMessage}</p> : null}
+      {stoppedByPerson ? (
+        <div
+          className="flex flex-wrap items-center gap-2 border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
+          data-testid="task-chat-queued-stopped"
+        >
+          <p role="status" className="min-w-0 flex-1">{CHAT_STOPPED_BY_PERSON_LINE}</p>
+          <button
+            type="button"
+            className="flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-border px-2.5 text-xs font-medium text-foreground transition-colors hover:bg-accent disabled:opacity-40"
+            disabled={Boolean(pending || reordering)}
+            onClick={() => void runRowAction(entries[0]!.comment.id, "interrupt")}
+            aria-label="Send the waiting messages"
+            data-testid="task-chat-queued-stopped-send"
+          >
+            {pending?.action === "interrupt" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
+            Send
+          </button>
+        </div>
+      ) : null}
       {visibleError ? (
         <div
           role="status"
