@@ -1,3 +1,4 @@
+import { AGENT_FILE_DESTROY_CLAIM_KEY } from "./agent-file-save-hold.js";
 import { notifyEnvironmentConfigChange, withEnvironmentConfigChange } from "./environment-config-revision.js";
 import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
 import { inheritWarmRetentionMetadata } from "./environment-warm-retention.js";
@@ -1758,8 +1759,12 @@ export function environmentService(db: Db) {
       },
     ) => {
       const now = new Date();
+      // Confirmed destruction ends every agent-file destroy claim on this lease:
+      // its bytes are gone, so no hold or collection pin can need the claim.
       const releaseMetadata = options?.remoteExecutionTermination
-        ? sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
+        ? options.remoteExecutionTermination.state === "destroyed"
+          ? sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - ${AGENT_FILE_DESTROY_CLAIM_KEY}::text) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
+          : sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
         : sql`${environmentLeases.metadata} - 'remoteExecutionTermination'`;
       const cleanupSettled = options?.expectedPendingCleanupAttemptId && options.cleanupStatus === "success"
         && status !== "pending_cleanup";

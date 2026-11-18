@@ -6,7 +6,7 @@ import { Readable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { beforeAll, beforeEach, afterEach, afterAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, agentConfigRevisions, agentFileRoots, agentInstructionWorkingCopies, authUsers, companies, companyMemberships, principalPermissionGrants, heartbeatRuns, createDb, closeFileStorageDb } from "@paperclipai/db";
+import { activityLog, agents, agentConfigRevisions, agentFileRoots, agentInstructionWorkingCopies, authUsers, companies, companyMemberships, principalPermissionGrants, heartbeatRuns, createDb, closeFileStorageDb } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentFileStore, adoptAgentFiles, fileHash } from "../services/agent-file-store.js";
 import { invalidateAgentFileProjection, persistDurableAgentFiles } from "../services/agent-file-durability.js";
@@ -14,6 +14,8 @@ import { materializeInstructionBytes } from "../services/agent-instruction-files
 import { agentInstructionsService, resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { AGENT_FILE_OBJECT_GRACE_MS, collectAgentFileObjects, migrateAgentFiles } from "../services/agent-file-maintenance.js";
 import { getStorageService } from "../storage/index.js";
+import { captureAgentFiles } from "../services/scripts/agent-file-checkpoint.mjs";
+import { checkpointSnapshot } from "../services/agent-file-checkpoints.js";
 
 const objects = vi.hoisted(() => ({ bytes: new Map<string, Buffer>(), rejectWrites: false, corruptReads: false, readDelayMs: 0, activeReads: 0, peakReads: 0 }));
 vi.mock("../storage/index.js", () => ({ getStorageService: () => ({
@@ -312,6 +314,65 @@ describe("durable agent file authority", () => {
     await db.delete(agents).where(eq(agents.id, agentId));
     expect(await collect()).toMatchObject({ retained: 0, deleted: 1 });
     expect(objects.bytes.size).toBe(0);
+  });
+
+  // A parked chat's retirement checkpoint applies its edit made over base C
+  // after a sibling saved B to the same file. B must stay the indexed head.
+  async function checkpointOver(sibling: string | null, edit: string) {
+    await store().write({ companyId, agentId, path: "AGENTS.md", bytes: Buffer.from("Root"), baseHash: null }, actor());
+    await store().write({ companyId, agentId, path: "memory/x.md", bytes: Buffer.from("C"), baseHash: null }, actor());
+    const live = path.join(home, "parked-chat");
+    await fs.cp(root, live, { recursive: true });
+    const base = await captureAgentFiles(live);
+    if (sibling !== null) await store().write({ companyId, agentId, path: "memory/x.md", bytes: Buffer.from(sibling), baseHash: fileHash(Buffer.from("C")) }, actor());
+    const [before] = await db.select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId));
+    await fs.writeFile(path.join(live, "memory", "x.md"), edit);
+    const delta = path.join(home, "parked-delta");
+    const captured = await captureAgentFiles(live, base.manifest, delta);
+    const result = await store().apply({ companyId, agentId, sourceDir: path.join(delta, "files"),
+      baseline: checkpointSnapshot(base.manifest), checkpoint: captured.manifest }, actor());
+    const [after] = await db.select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId));
+    return { result, before: before!, after: after! };
+  }
+
+  it("keeps a sibling's saved note as the durable head and indexes the parked chat's edit as a named conflict copy", async () => {
+    const { result, before, after } = await checkpointOver("B", "A");
+    const hash = (text: string) => fileHash(Buffer.from(text));
+    expect(await store().read(companyId, agentId, "memory/x.md", actor())).toEqual(Buffer.from("B"));
+    const conflict = (result as { conflicts?: Array<Record<string, unknown>> }).conflicts?.[0];
+    expect(conflict).toMatchObject({ path: "memory/x.md", baseHash: hash("C"), currentHash: hash("B"), incomingHash: hash("A"),
+      conflictCopy: expect.stringMatching(/^memory\/x\.conflict-[0-9a-z]{8}-\d+\.md$/) });
+    const copy = conflict!.conflictCopy as string;
+    // B keeps its exact object; A is uploaded and indexed under the copy path.
+    const head = new Map(after.entries.map(entry => [entry.path, entry]));
+    const priorB = before.entries.find(entry => entry.path === "memory/x.md");
+    expect(head.get("memory/x.md")).toEqual(priorB);
+    expect(head.get(copy)).toMatchObject({ kind: "file", sha256: hash("A"), size: 1 });
+    const copyEntry = head.get(copy) as { objectKey: string };
+    expect(objects.bytes.get(copyEntry.objectKey)).toEqual(Buffer.from("A"));
+    expect(objects.bytes.get((priorB as { objectKey: string }).objectKey)).toEqual(Buffer.from("B"));
+    // The overwrite is recorded in the same transaction as the head.
+    const audits = await db.select().from(activityLog).where(eq(activityLog.entityId, agentId));
+    expect(audits.map(row => row.details)).toContainEqual(expect.objectContaining({ conflicts: [conflict] }));
+    // Both survive a replaced filesystem from Postgres and object storage alone.
+    await replaceFilesystem();
+    expect(await store().read(companyId, agentId, "memory/x.md", actor())).toEqual(Buffer.from("B"));
+    expect(await store().read(companyId, agentId, copy, actor())).toEqual(Buffer.from("A"));
+  });
+
+  it("applies a parked chat's edit normally when nothing changed the file since its base", async () => {
+    const { result, after } = await checkpointOver(null, "A");
+    expect((result as { conflicts?: unknown[] }).conflicts ?? []).toEqual([]);
+    expect(after.entries.map(entry => entry.path)).toEqual(["AGENTS.md", "memory", "memory/x.md"]);
+    expect(after.entries.find(entry => entry.path === "memory/x.md")).toMatchObject({ sha256: fileHash(Buffer.from("A")) });
+    expect(await store().read(companyId, agentId, "memory/x.md", actor())).toEqual(Buffer.from("A"));
+  });
+
+  it("treats a parked chat's edit that equals the sibling's saved note as a no-op", async () => {
+    const { result, before, after } = await checkpointOver("B", "B");
+    expect((result as { conflicts?: unknown[] }).conflicts ?? []).toEqual([]);
+    expect(after.entries).toEqual(before.entries);
+    expect(await store().read(companyId, agentId, "memory/x.md", actor())).toEqual(Buffer.from("B"));
   });
 
   it("refuses to treat a missing legacy filesystem as an empty durable folder", async () => {

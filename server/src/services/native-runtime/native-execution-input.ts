@@ -59,6 +59,8 @@ export interface BuildNativeExecutionInput {
   };
   taskPrompt: string;
   initialCommunicationGuidance?: string | null;
+  /** One-time receipt notice sealed by instruction-working-copy preparation. */
+  agentFileConflictNotice?: string | null;
   /** Bounded, redacted background restored only after a fresh provider bootstrap. */
   freshSessionHandoff?: string | null;
   /**
@@ -235,6 +237,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     ? `Configured GitHub instruction skills:\n${configuredGitHubSkills.map((skill) => `/${skill.runtimeName}`).join("\n")}`
     : null;
   const taskPrompt = caseProjectionBootstrapPrefix(input.caseContext) + [
+    input.agentFileConflictNotice ?? "",
     wakePrompt,
     // Durable task questions must survive the current provider turn.
     // Keep routing visible before deferred tool discovery; usage belongs in the tool schema.
@@ -268,7 +271,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       initialCommunicationGuidance: [input.initialCommunicationGuidance, input.freshSessionHandoff].filter(Boolean).join("\n\n"),
     } : {}),
     ...(input.resumedSession && input.previousTurn && !input.conversationMode ? {
-      continuationPrompt: buildNativeContinuationPrompt({
+      continuationPrompt: [input.agentFileConflictNotice, buildNativeContinuationPrompt({
         wakePayload: input.wakePayload,
         previousRunId: input.previousTurn.runId,
         previousIssue: input.previousTurn.task,
@@ -279,7 +282,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
         // received it. Old/unknown projections take the full bootstrap path.
         caseContext: input.caseContext,
         workflowCase,
-      }),
+      })].filter(Boolean).join("\n\n") || null,
     } : {}),
     executionMode,
     planningContext: input.planningContext ?? null,

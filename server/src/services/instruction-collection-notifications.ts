@@ -15,9 +15,12 @@ const waitingCopyState = sql`(
   (not (coalesce(receipt, '{}'::jsonb) ? 'retainedByRunId') and (
     (attempts < 3 and state in ('prepared', 'pending_collection', 'unchanged_turn', 'warm_saved'))
     or (state = 'unavailable' and process_stopped_at is null and location like 'remote:%'
+      and receipt->>'schema' = 'paperclip.agent-files.v1')
+    or (receipt ? 'savePending' and state not in ('saved', 'unchanged', 'resolved') and process_stopped_at is not null
       and receipt->>'schema' = 'paperclip.agent-files.v1')))
   or (state in ('saved', 'unchanged', 'resolved', 'unavailable') and process_stopped_at is not null
     and receipt->>'schema' = 'paperclip.agent-files.v1' and coalesce(receipt->>'retainedByRunId', '') = ''
+    and not (state = 'unavailable' and receipt ? 'savePending')
     and (receipt->>'cleanupPending' = 'true' or (receipt->>'cleanupPending' is distinct from 'false' and receipt ? 'baseline'))))`;
 
 const waitingCopy = (scope: { companyId: string; runId: string }) =>

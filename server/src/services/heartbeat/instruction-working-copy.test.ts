@@ -27,6 +27,7 @@ function fixture(executionTarget: Input["workspace"]["executionTarget"] = null, 
     checkpointWarm: vi.fn<Input["instructionCopies"]["checkpointWarm"]>().mockResolvedValue({ ...copy, state: "warm_saved", receipt: { ...copy.receipt, checkpointState: "unchanged" } }),
     hasChanges: vi.fn().mockResolvedValue(false), canReuseWarm: vi.fn().mockResolvedValue(true),
     reportRetirementUnconfirmed: vi.fn().mockResolvedValue(null),
+    claimConflictNotice: vi.fn<Input["instructionCopies"]["claimConflictNotice"]>().mockResolvedValue(null),
   };
   const appendRunEvent = vi.fn().mockResolvedValue(undefined);
   const context = { paperclipWorkspace: { agentHome: "/canonical" } } as Record<string, unknown>;
