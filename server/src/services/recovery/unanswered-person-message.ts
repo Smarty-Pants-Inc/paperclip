@@ -19,7 +19,6 @@ import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
-import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
 import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
@@ -188,7 +187,8 @@ const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorization
 /**
  * SQL: message m is ANSWERED, by the one shared rule (person-message-answer.ts):
  * a reply after m from a run that SUCCEEDED and whose OWN input names m, via
- * any carrying key; or m is imported history. A reply from a failed, cancelled,
+ * any carrying key; or an ANSWERABLE card that run posted for m (RFL rulings 2, 3);
+ * or m is imported history. A reply from a failed, cancelled,
  * timed-out or interrupted run, a reply to a LATER message, a progress comment
  * and an agent comment with no run never answer m.
  */
@@ -563,15 +563,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
   const upgrading = noticed?.waiting ? noticed.id : null;
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode : null;
-  // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
-  // native-governance.ts conversationTurnAnswered): only a pending question or
-  // confirmation card that the message's OWN run created stands in for its
-  // reply. A card from an earlier turn or one the board addressed to someone
-  // else, and any approval, can hold the task but do not answer the message.
-  if (messageRun && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: messageRun.id }))) {
-    return { kind: "answered" };
-  }
-
   // A failed fresh continuation that descends from the message's run is the
   // run the person's message ended on: the automatic lineage, typed or not,
   // ends there (fork-lead a6342a4d4, fresh-continuation-chain.ts).
