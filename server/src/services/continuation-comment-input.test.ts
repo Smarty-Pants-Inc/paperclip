@@ -1,13 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "./continuation-comment-input.js";
 import { claimFirstTurnQueuedInput } from "./native-runtime/first-turn-queued-input.js";
 import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 import { requestTaskRetry } from "./task-retry.js";
 import { heartbeatService } from "./heartbeat.js";
+import { completedPersonMessageAnswerSql } from "./person-message-answer.js";
+import { settleUnansweredPersonMessage } from "./recovery/unanswered-person-message.js";
 
 // DREA-31 / data safety: exercise persisted input and answer attribution, not SQL text.
 const support = await getEmbeddedPostgresTestSupport();
@@ -85,6 +87,88 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     expect(await claimFirstTurnQueuedInput(db, { ...f, runId: f.run.id })).toBeNull();
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id));
     expect(run.contextSnapshot?.firstTurnQueuedInput).toMatchObject({ commentIds: [] });
+  });
+
+  // KEEP: rf5 A3, Stop means stop; an unrelated later input must still survive the same carry.
+  it.each([true, false])("A3: sender-stopped input is excluded only after answering started (%s)", async (started) => {
+    const f = await fixture();
+    const [next] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "board", body: "Unrelated next message" }).returning();
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", resultJson: {
+      cancelledByActorType: "user", cancelledByUserId: "board", stopReason: "cancelled",
+      executionCancellation: { state: "requested", requestedAt: new Date().toISOString() },
+      cancellation: { source: "operator", expected: true, initiator: { id: "board", type: "user" },
+        recordedAt: new Date().toISOString() },
+    } }).where(eq(heartbeatRuns.id, f.run.id));
+    if (started) await db.insert(heartbeatRunEvents).values(["userMessage", "agentMessage"].map((kind, index) => ({
+      companyId: f.companyId, agentId: f.agentId, runId: f.run.id, seq: index + 1,
+      eventType: "item.started", sourceEventId: randomUUID(), payload: { prpEvent: {
+        eventType: "item.started", turnId: `turn-${f.run.id}`, itemId: `item-${index}`,
+        payload: { kind, item: { type: kind } },
+      } },
+    })));
+    const input = await pendingContinuationCommentInput(db, { ...f,
+      contextSnapshot: { wakeCommentIds: [f.message.id, next.id] },
+      liveOwner: { agentId: f.agentId, runId: f.run.id } });
+    expect(input.wakeCommentIds).toEqual(started ? [next.id] : [f.message.id, next.id]);
+    console.log("A3_EVIDENCE", JSON.stringify({ started, sourceRunId: f.run.id, stoppedMessageId: f.message.id,
+      unrelatedMessageId: next.id, input }));
+  });
+
+  // KEEP: rf5 A2 caught lost card input and false safe-to-retry advice on a failed resume.
+  it.each(["interactionId", "interactionIds", "respondWake", "respondWakeContext"])("A2: failed card resume carries %s into its successor's OWN input and suppresses a false notice", async (field) => {
+    const f = await fixture();
+    const t0 = f.message.createdAt.getTime();
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, sourceRunId: f.run.id,
+      resolvedByUserId: "board", resolvedAt: new Date(t0 + 1_000), idempotencyKey: randomUUID(),
+      payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", selectionMode: "single", options: [{ id: "yes", label: "YES" }] }] },
+      result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }] } } as never).returning();
+    const [resume] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "failed", finishedAt: new Date(t0 + 2_000),
+      contextSnapshot: { issueId: f.issueId, interactionId: card.id } }).returning();
+    // An array-only source is supported too, while the original respond run remains durable.
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "failed", retryOfRunId: resume.id,
+      contextSnapshot: { issueId: f.issueId,
+        ...(!field.startsWith("respondWake") ? { [field]: field === "interactionIds" ? [card.id] : card.id } : {}) } }).returning();
+    if (field.startsWith("respondWake")) {
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "on_demand", reason: "issue_interaction_responded", status: "completed", runId: source.id,
+        payload: { issueId: f.issueId, ...(field === "respondWake" ? { interactionId: card.id }
+          : { _paperclipWakeContext: { interactionId: card.id } }) } }).returning();
+      await db.update(heartbeatRuns).set({ wakeupRequestId: wake.id }).where(eq(heartbeatRuns.id, source.id));
+    }
+    // An existing live owner blocks promotion under either card-input spelling; its failure releases the input.
+    for (const status of ["queued", "running", "scheduled_retry"]) {
+      const [live] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        nativeIssueId: f.issueId, status, contextSnapshot: { interactionIds: [card.id] } }).returning();
+      expect(await readContinuationCommentInput(db, { ...f, runId: source.id }), `live ${status} card owner`).toEqual({});
+      await db.update(heartbeatRuns).set({ contextSnapshot: { interactionId: card.id } }).where(eq(heartbeatRuns.id, live.id));
+      expect(await readContinuationCommentInput(db, { ...f, runId: source.id }), `live ${status} singular card owner`).toEqual({});
+      await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, live.id));
+    }
+    const input = await readContinuationCommentInput(db, { ...f, runId: source.id });
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "succeeded", retryOfRunId: source.id,
+      contextSnapshot: { issueId: f.issueId, ...input } }).returning();
+    const [reply] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "agent", authorAgentId: f.agentId, createdByRunId: successor.id,
+      body: "Acted on YES.", createdAt: new Date(t0 + 3_000) }).returning();
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "create", commentId: reply.id } } })
+      .where(eq(heartbeatRuns.id, successor.id));
+    const [state] = await db.select({ answered: completedPersonMessageAnswerSql({ id: sql`${card.id}::uuid`,
+      companyId: sql`${f.companyId}::uuid`, issueId: sql`${f.issueId}::uuid`,
+      createdAt: sql`${card.resolvedAt!.toISOString()}::timestamptz` }) }).from(issues).where(eq(issues.id, f.issueId));
+    const sweep = await settleUnansweredPersonMessage(db, { ...f, now: new Date(t0 + 20 * 60_000) });
+    const notices = await db.select({ id: issueComments.id, body: issueComments.body }).from(issueComments)
+      .where(sql`${issueComments.issueId} = ${f.issueId} and ${issueComments.body} like '%wasn''t acted on%'`);
+    console.log("A2_EVIDENCE", JSON.stringify({ field, cardId: card.id, sourceRunId: source.id,
+      successorRunId: successor.id, input, state, sweep, notices }));
+    expect.soft(input.interactionIds).toEqual([card.id]);
+    expect.soft(state.answered).toBe(true);
+    expect(notices).toHaveLength(0);
+    expect(await readContinuationCommentInput(db, { ...f, runId: source.id }), "ANSWERED is never re-carried").toEqual({});
   });
 
   it("does not manufacture comment intent for ordinary work", async () => {
