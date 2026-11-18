@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { agents, companies, createDb, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "./continuation-comment-input.js";
 import { claimFirstTurnQueuedInput } from "./native-runtime/first-turn-queued-input.js";
+import { answeredPersonMessageSql } from "./person-message-answer.js";
+import { settleUnansweredPersonMessage } from "./recovery/unanswered-person-message.js";
 
 // DREA-31 / data safety: exercise persisted input and answer attribution, not SQL text.
 const support = await getEmbeddedPostgresTestSupport();
@@ -47,10 +49,40 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
       createdByRunId: earlierRun.id, body: "Answer to the earlier one" });
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
+  });
+
+  // RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118, row 1, ruling row (a). The record names this row 'a FAILED parent's own reply
+  // answered the comment': it was the LAST assertion of the row above at 422b8c26 (that row's other assertions stay live).
+  // OLD: with the FAILED parent's own reply published, the carry is {} (M answered).
+  // NEW: M is OWED (still carried, the one function says not answered) AND M's notice stays.
+  // Control: the same reply once that parent SUCCEEDED answers M (carry {}), and M's notice is retired.
+  it("supersedes(carries the parent's comment ids as-is; a later reply does not erase them; RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118)", async () => {
+    const f = await fixture();
+    const answered = async () => (await db.select({ answered: answeredPersonMessageSql({ id: sql`${issueComments.id}`,
+      companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) })
+      .from(issueComments).where(eq(issueComments.id, f.message.id)))[0]!.answered;
+    const notices = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"),
+      sql`${issueComments.metadata}->>'authorizationReason' = ${`unanswered_message:${f.message.id}`}`));
+    const later = (minutes: number) => new Date(Date.now() + minutes * 60_000);
+    await db.update(heartbeatRuns).set({ finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.run.id));
+    expect(await settleUnansweredPersonMessage(db, { ...f, now: later(5) })).toMatchObject({ kind: "noticed" });
+    expect(await notices(), "M has its ONE notice before the failed parent replies").toHaveLength(1);
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
-      createdByRunId: f.run.id, body: "COBALT" });
-    // RFL ruling (1), 20:06Z: the parent's OWN published reply answers the comment (carrying it would answer it twice).
+      createdByRunId: f.run.id, body: "COBALT", createdAt: later(1) });
+    // The fixture's parent FAILED: its reply is not an answer. M is owed: answered 0 times, still carried.
+    expect(await answered()).toBe(false);
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
+    // ... AND its notice stays: the sweep neither retires it nor adds a second one.
+    expect(await settleUnansweredPersonMessage(db, { ...f, now: later(6) })).toEqual({ kind: "noticed_before" });
+    expect((await notices()).map(n => n.deletedAt), "M's ONE notice stays live").toEqual([null]);
+    // Control (still ANSWERED): RFL ruling (1), 20:06Z, on a parent that SUCCEEDED: its OWN published reply answers the
+    // comment (carrying it would answer it twice), and the answer retires M's notice.
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
+    expect(await answered()).toBe(true);
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
+    expect(await settleUnansweredPersonMessage(db, { ...f, now: later(7) })).toEqual({ kind: "answered" });
+    expect((await notices()).filter(n => n.deletedAt === null), "the answer retires M's notice").toHaveLength(0);
+    expect(await notices(), "and there was only ever one").toHaveLength(1);
   });
 
   it("keeps all live comment authors within the source company and task", async () => {
