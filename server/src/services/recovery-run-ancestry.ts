@@ -1,13 +1,18 @@
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
+import { preDispatchHeldSourceRunId } from "./pre-dispatch-execution-wait.js";
 import { agentWakeupRequests, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 
 export async function taskRetryRunAncestry(input: {
   db: Db; companyId: string; issueId: string; agentId: string; sourceRunId: string;
 }): Promise<string[] | null> {
+  // A run the stale-run gate cancelled before it started has no retry edge; its
+  // predecessor is the held source its executionWait receipt named (#21914).
+  const predecessorOf = (run: SQL) => sql`coalesce(${run}.retry_of_run_id, ${preDispatchHeldSourceRunId({
+    runId: sql`${run}.id`, companyId: input.companyId, issueId: input.issueId, agentId: input.agentId })})`;
   const rows = await input.db.execute<{ id: string | null; status: string | null; valid: boolean; cycle: boolean; depth: number }>(sql`
     with recursive ancestry as (
-      select r.id, r.status, r.retry_of_run_id, r.created_at, array[r.id] as path, false as cycle, 1 as depth,
+      select r.id, r.status, ${predecessorOf(sql`r`)} as retry_of_run_id, r.created_at, array[r.id] as path, false as cycle, 1 as depth,
         (r.agent_id = ${input.agentId}::uuid and r.finished_at is not null
           and r.status in ('failed', 'interrupted', 'timed_out', 'cancelled', 'succeeded')
           and (r.native_issue_id is null or r.native_issue_id::text = ${input.issueId})
@@ -16,7 +21,7 @@ export async function taskRetryRunAncestry(input: {
       from ${heartbeatRuns} r
       where r.company_id = ${input.companyId} and r.id = ${input.sourceRunId}::uuid
       union all
-      select predecessor.id, predecessor.status, predecessor.retry_of_run_id, predecessor.created_at,
+      select predecessor.id, predecessor.status, ${predecessorOf(sql`predecessor`)}, predecessor.created_at,
         current.path || predecessor.id, coalesce(predecessor.id = any(current.path), false), current.depth + 1,
         (predecessor.id is not null and predecessor.agent_id = ${input.agentId}::uuid
           and predecessor.finished_at is not null
