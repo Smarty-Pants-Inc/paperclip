@@ -149,8 +149,10 @@ describe("judge runtime grant: same native session new run credential",()=>{
   const first=await coldLaunch(f,"same-session",f.runtimeDirectory,undefined,firstGrant);
   const second=await coldLaunch(f,"same-session",f.runtimeDirectory,first.checkpoint,secondGrant);
   expect(second.nativeId).toBe(first.nativeId); expect(second.boundary).toBe(first.boundary);
-  await writeFile(`${process.env.TASK_OUT}/mcp-prefix-first.json`,first.prefix);
-  await writeFile(`${process.env.TASK_OUT}/mcp-prefix-second.json`,second.prefix);
+  if (process.env.TASK_OUT) {
+    await writeFile(`${process.env.TASK_OUT}/mcp-prefix-first.json`,first.prefix);
+    await writeFile(`${process.env.TASK_OUT}/mcp-prefix-second.json`,second.prefix);
+  }
   expect(second.prefix).toBe(first.prefix);
  });
 });
