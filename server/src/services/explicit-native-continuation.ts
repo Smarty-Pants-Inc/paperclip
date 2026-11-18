@@ -40,6 +40,7 @@ import { canResumePreservedResultFinalization } from "./preserved-result-finaliz
 import { isServerReplacementInterruption } from "./server-replacement-interruption.js";
 import { normalizeAgentNameKey } from "./agent-name-key.js";
 import { liftInterruptionBlock } from "./interruption-block-release.js";
+import { isAcknowledgedNativeStop } from "./acknowledged-native-stop.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "agentId" | "status" | "startedAt" | "finishedAt" | "createdAt" |
@@ -315,7 +316,8 @@ export async function admitExplicitNativeContinuation(input: {
   const sourceChecks: Array<{ id?: string; cause: string; evidence: Record<string, unknown> }> =
     actions.map(action => ({ id: action.id, cause: action.cause, evidence: action.evidence }));
   if (nativeQueuedSend) {
-    const [latest] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode })
+    const [latest] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode,
+      companyId: heartbeatRuns.companyId, nativeIssueId: heartbeatRuns.nativeIssueId, resultJson: heartbeatRuns.resultJson, finishedAt: heartbeatRuns.finishedAt })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
         eq(heartbeatRuns.runtimeMode, "native"),
         or(eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.issueId, issueId),
@@ -343,7 +345,13 @@ export async function admitExplicitNativeContinuation(input: {
       if (!result || await hasPendingRunCleanup(db, companyId, latest.id))
         return blocked("cleanup_pending", "Waiting for the previous run to finish cleanup. Your message is saved.");
     }
-    if (latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) &&
+    // Option S: the chat owner's Send after an acknowledged person Stop takes the
+    // same ordinary admission as a typed message; no synthetic stopped-run source.
+    const ownerSendAfterPersonStop = !blocker && !sourceChecks.length && task.conversationAgentId === agentId
+      && interruptIntent?.actorId === task.conversationUserId && !!latest && isAcknowledgedNativeStop(latest)
+      && latest.resultJson?.operatorInterrupted !== true && !latest.resultJson?.queuedCommentInterruptQueueId
+      && !!latest.finishedAt && latest.finishedAt <= interruptRequestedAt!;
+    if (latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) && !ownerSendAfterPersonStop &&
         !sourceChecks.some(source => (source.evidence.runId ?? source.evidence.sourceRunId) === latest.id)) {
       sourceChecks.push({ cause: "native_continuation_requires_reconciliation", evidence: { runId: latest.id } });
     }
