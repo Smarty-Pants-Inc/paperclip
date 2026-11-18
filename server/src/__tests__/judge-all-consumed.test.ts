@@ -237,7 +237,7 @@ describeEmbeddedPostgres("queued-comment Interrupt keeps the person's order", ()
     const evidence={oldRunId,excluded:f.commentIds[1],runs:runs.map(r=>({id:r.id,status:r.status,context:r.contextSnapshot})),actual:latest?.contextSnapshot?.wakeCommentIds};
     writeFileSync(process.env.TASK_OUT+'/stop-exclusion-'+(process.env.JUDGE_LABEL??'head')+'.json',JSON.stringify(evidence,null,2));
     console.log("JUDGE_STOP_EXCLUSION",JSON.stringify(evidence));
-    expect(runs.filter(r => r.id !== oldRunId).flatMap(r => (r.contextSnapshot?.wakeCommentIds as string[] ?? [])).filter(id => f.commentIds.includes(id))).toEqual([]);
+    expect(runs.filter(r => r.id !== oldRunId).flatMap(r => (r.contextSnapshot?.wakeCommentIds as string[] ?? [])).filter(id => (f.commentIds as string[]).includes(id))).toEqual([]);
   });
 
   it("JUDGE failure-shaped first successor retains all pending input in its next retry", async () => {
