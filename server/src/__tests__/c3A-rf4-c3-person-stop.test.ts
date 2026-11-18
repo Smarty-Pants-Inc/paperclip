@@ -85,7 +85,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
   // P9-60: opts.messages sends that many messages through the real comment route
   // (POST /api/issues/:id/comments), on the chat and on a plain task alike;
   // mode "fails" sends them, then the first turn's provider fails (no Stop).
-  async function exercise(mode: "waiting" | "mid_turn" | "fails", label: string, opts: { chat?: boolean; messages?: number } = {}) {
+  async function exercise(mode: "waiting" | "mid_turn" | "fails", label: string, opts: { chat?: boolean; messages?: number; noMessages?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID(), wakeId = randomUUID();
     const providerLeaseId = `sandbox://fake/${runId}/${randomUUID()}`;
     const remoteCwd = path.join(home, runId); await fs.mkdir(remoteCwd); await fs.writeFile(path.join(remoteCwd, "notes.md"), "stopped edit\n");
@@ -146,7 +146,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     };
     fixture.firstRun = runId; fixture.calls = [];
     fixture.onFirst = async () => {
-      if (mode === "fails") { waitingWakes = await message(); return; }
+      if (mode === "fails") { if (!opts.noMessages) waitingWakes = await message(); return; }
       if (mode === "waiting") waitingWakes = await message();
       const start = Date.now();
       const result = await request(app).post(`/api/heartbeat-runs/${runId}/cancel`).send({});
@@ -339,6 +339,14 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     const evidence: Record<string, unknown> = { holdsAfterStop: r.holds };
     // The real Stop leaves NO board-owned recovery action (the measured board hold was the harness's).
     expect(r.holds.filter(h => ["active", "escalated"].includes(h.status)), "the real Stop leaves no board hold").toEqual([]);
+    // LIVE shape (stack-lead 22:12Z, live c1 captures): the card has no "Recovery action" row and
+    // issue.activeRecoveryAction is null. Ordering: the person's Stop is acknowledged while the
+    // executor still runs the turn (cancelNativeSession dispatch, then the executor ends the turn
+    // with NativeCancellationPendingRecoveryError), so the release sees the acknowledged Stop
+    // (wake-queue/adapters/postgres.ts isAcknowledgedNativeStop) and writes no hold.
+    const issueRead = (await request(r.app).get(`/api/issues/${r.issueId}`).expect(200)).body;
+    evidence.activeRecoveryAction = issueRead.activeRecoveryAction ?? null;
+    expect(issueRead.activeRecoveryAction ?? null, "issue.activeRecoveryAction is null, like live").toBeNull();
     const messages = (await db.select().from(issueComments).where(and(eq(issueComments.issueId, r.issueId), eq(issueComments.authorType, "user"))))
       .sort((a, b) => +a.createdAt - +b.createdAt);
     expect(messages.map(m => m.body)).toEqual(["Held message 1", "Held message 2", "Held message 3"]);
@@ -351,9 +359,13 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     for (const minutes of [1, 3, 5]) {
       const outcome = await settleUnansweredPersonMessage(db, { companyId: r.companyId, issueId: r.issueId, now: new Date(latest + minutes * 60_000) });
       const shown = (await request(r.app).get(`/api/issues/${r.issueId}/comments`).expect(200)).body as any[];
-      sweeps.push({ minutes, outcome, notes: unansweredNotes(shown).map(n => ({ reason: n.metadata.authorizationReason, body: n.body })) });
+      sweeps.push({ minutes, outcome, notes: unansweredNotes(shown).map(n => ({ reason: n.metadata.authorizationReason, body: n.body, title: n.presentation?.title })) });
+      await fs.writeFile(path.join(process.env.TASK_OUT!, `own-p960-${surface}-sweeps.json`), JSON.stringify({ ...evidence, sweeps }, null, 2));
       if (minutes === 1) continue;
       const notes = unansweredNotes(shown);
+      const all = JSON.stringify(shown);
+      expect(all, "no no_run card").not.toContain(UNANSWERED_MESSAGE_NO_RUN_TEXT);
+      expect(all, "never 'assign this agent a new task'").not.toContain("assign this agent a new task");
       expect(notes.length, `+${minutes} min: one note for the held set`).toBe(1);
       for (const note of notes) {
         expect(note.body, "R3 exactly").toBe(PERSON_STOP_HELD_MESSAGE_TEXT);
@@ -361,9 +373,6 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
         expect(JSON.stringify(note)).toContain(PERSON_STOP_HELD_MESSAGE_NEXT_ACTION);
         expect(messages.map(m => `unanswered_message:${m.id}`)).toContain(note.metadata.authorizationReason);
       }
-      const all = JSON.stringify(shown);
-      expect(all, "no no_run card").not.toContain(UNANSWERED_MESSAGE_NO_RUN_TEXT);
-      expect(all, "never 'assign this agent a new task'").not.toContain("assign this agent a new task");
     }
     evidence.sweeps = sweeps;
     // The person's Send; the successor answers with one reply.
@@ -436,4 +445,145 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     expect(notes[0].body).not.toBe(PERSON_STOP_HELD_MESSAGE_TEXT);
     expect(JSON.stringify(notes[0]), "the card names the board hold").toContain(hold!.id);
   }, 180_000);
+  // A planted RUNNING native turn that no executor runs (as w1/stopnote/H2), then the REAL person
+  // Stop route on it, then the runner's acknowledgement + terminal finalization (w1-measure's DB
+  // write). The release ran BEFORE the acknowledgement, so the wake queue's release wrote the Stop's
+  // OWN hold (recordNativeTerminalRecoveryIfNeeded: active_run_watchdog /
+  // native_continuation_requires_reconciliation, evidence.runId = the stopped run). A person meets it
+  // whenever the acknowledgement lands late.
+  async function plantedTurnStop(r: { app: express.Express; companyId: string; agentId: string; issueId: string }) {
+    const turnId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: turnId, companyId: r.companyId, agentId: r.agentId, issueId: r.issueId, scopeKind: "issue", status: "running",
+      invocationSource: "assignment", runtimeMode: "native", nativeIssueId: r.issueId, startedAt: new Date(), contextSnapshot: { issueId: r.issueId, taskId: r.issueId } });
+    await db.update(issues).set({ executionRunId: turnId, checkoutRunId: turnId }).where(eq(issues.id, r.issueId));
+    await db.insert(nativeRunFinalizations).values({ runId: turnId, companyId: r.companyId, issueId: r.issueId, phase: "observed" });
+    const send = async (n: number) => {
+      const ids: string[] = [];
+      for (let i = 1; i <= n; i += 1) {
+        const sent = await request(r.app).post(`/api/issues/${r.issueId}/comments`).send({ body: `Held message ${i}`, clientRequestId: randomUUID() });
+        expect(sent.status, JSON.stringify(sent.body)).toBe(201); ids.push(sent.body.id);
+        await new Promise(res => setTimeout(res, 20));
+      }
+      return ids;
+    };
+    const stop = async () => {
+      const res = await request(r.app).post(`/api/heartbeat-runs/${turnId}/cancel`).send({ cancellationRequestId: randomUUID() });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const [src] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, turnId));
+      await db.update(heartbeatRuns).set({ resultJson: { ...(src.resultJson ?? {}), nativeCancellation: { schema: "paperclip.native-cancellation.v1",
+        runId: turnId, companyId: r.companyId, issueId: r.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
+        dispatched: true, intentAuditId: "stop-intent", acknowledgementAuditId: "stop-ack" } } }).where(eq(heartbeatRuns.id, turnId));
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: null }).where(eq(nativeRunFinalizations.runId, turnId));
+      return res;
+    };
+    return { turnId, send, stop };
+  }
+  async function seedPlain(surface: "chat" | "task") {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Late ack", issuePrefix: `K${companyId.slice(0, 6)}`, defaultResponsibleUserId: "rf4-person", requireBoardApprovalForNewAgents: false });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "rf4-person", membershipRole: "owner", status: "active" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer", status: "idle", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "codex", model: "gpt-5.6-luna" }, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Late ack", status: "in_progress", priority: "medium", assigneeAgentId: agentId,
+      responsibleUserId: "rf4-person", issueNumber: 1, identifier: `K${companyId.slice(0, 6)}-1`,
+      ...(surface === "chat" ? { conversationAgentId: agentId, conversationUserId: "rf4-person", conversationState: "active" as const } : {}) });
+    if (surface === "chat") await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId: "rf4-person", companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: false }; next(); });
+    app.use("/api", agentRoutes(db, {})); app.use("/api", issueRoutes(db, {} as any, {})); app.use(errorHandler);
+    return { app, companyId, agentId, issueId };
+  }
+  const STOPPED_BAR = { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." };
+  // R2 (SECONDARY, the board-hold shape, H2-RESULT row (i) ordering): the acknowledgement lands AFTER
+  // the release, so the Stop's OWN native_continuation_requires_reconciliation hold is active. The
+  // person-Stop held state wins over it through the ONE reader (readPersonStopHold): R3, never no_run.
+  for (const surface of ["chat", "task"] as const) it(`P9-60 late ack ${surface}: the Stop's OWN board hold does not turn R3 into no_run`, async () => {
+    const r = await seedPlain(surface);
+    const turn = await plantedTurnStop(r);
+    const ids = await turn.send(3);
+    await turn.stop();
+    const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, r.issueId));
+    const own = holds.find(h => ["active", "escalated"].includes(h.status));
+    const header = (await request(r.app).get(`/api/issues/${r.issueId}/queued-comments`)).body;
+    const messages = (await db.select().from(issueComments).where(eq(issueComments.issueId, r.issueId))).filter(c => ids.includes(c.id));
+    const latest = Math.max(...messages.map(m => m.createdAt.getTime()));
+    const sweeps: unknown[] = [];
+    let shown: any[] = [];
+    for (const minutes of [1, 3, 5]) {
+      const outcome = await settleUnansweredPersonMessage(db, { companyId: r.companyId, issueId: r.issueId, now: new Date(latest + minutes * 60_000) });
+      shown = (await request(r.app).get(`/api/issues/${r.issueId}/comments`).expect(200)).body as any[];
+      sweeps.push({ minutes, outcome, notes: unansweredNotes(shown).map(n => ({ body: n.body, title: n.presentation?.title })) });
+    }
+    await fs.writeFile(path.join(process.env.TASK_OUT!, `own-p960-lateack-${surface}.json`), JSON.stringify({ holds, header: { state: header.state, executionWait: header.executionWait,
+      entries: (header.entries ?? []).map((e: any) => e.comment.id) }, ids, sweeps }, null, 2));
+    expect(own?.ownerType, "the Stop's OWN board hold is active").toBe("board");
+    expect(own?.cause).toBe("native_continuation_requires_reconciliation");
+    expect((own?.evidence as any)?.runId, "the hold names the person-stopped run").toBe(turn.turnId);
+    expect(header.executionWait, "header: the stopped shape").toEqual(STOPPED_BAR);
+    const notes = unansweredNotes(shown);
+    const all = JSON.stringify(shown);
+    expect(all, "no no_run card").not.toContain(UNANSWERED_MESSAGE_NO_RUN_TEXT);
+    expect(all, "never 'assign this agent a new task'").not.toContain("assign this agent a new task");
+    expect(notes.length, "one note for the held set").toBe(1);
+    expect(notes[0].body, "R3 exactly").toBe(PERSON_STOP_HELD_MESSAGE_TEXT);
+    expect(notes[0].presentation?.title).toBe(PERSON_STOP_HELD_MESSAGE_TITLE);
+  }, 120_000);
+  // H2 (header): an EARLIER turn failed through the executor path with a NAMED injected adapter fault
+  // (the mocked executePaperclipNativeSession throws "p960_first_provider_turn_failed"; the real
+  // release then writes the PRODUCT hold active_run_watchdog / native_continuation_requires_reconciliation
+  // for that run). Then a turn runs (planted running row), the person sends 3 messages through the real
+  // comment POST (admission saves an execution_active wait on them: queue.ts deferBlockedExecution),
+  // then the REAL Stop of that turn. The header shows the stopped shape (Z's text) at +0. The note keeps
+  // the earlier failure's own card: that hold is NOT the Stop's (RFL control, isPersonStopOwnHold).
+  // TASK is PLANTED: on a plain task the person's first comment reopens the blocked task to todo
+  // (routes/issues.ts:20416-20425) and cancels the earlier hold as stale (:4509-4510, "manually moved
+  // from blocked to todo"), so admission finds no blocker and saves NO wait. The task row plants the
+  // wait H2 measured on c2b (execution_active, "Waiting for the current run. Your message is saved.")
+  // on the held wake; everything else is the real path.
+  for (const surface of ["chat", "task"] as const) it(`H2 ${surface}${surface === "task" ? " (planted saved wait)" : ""}: a saved wait from an earlier turn's hold never hides the person's Stop in the header`, async () => {
+    fixture.firstFails = true;
+    let r: Awaited<ReturnType<typeof exercise>>;
+    try { r = await exercise("fails", `h2-${surface}`, { noMessages: true }); } finally { fixture.firstFails = false; }
+    if (surface === "chat") {
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+      await db.update(issues).set({ conversationAgentId: r.agentId, conversationUserId: "rf4-person", conversationState: "active" }).where(eq(issues.id, r.issueId));
+    }
+    const earlier = r.holds.find(h => ["active", "escalated"].includes(h.status));
+    const turn = await plantedTurnStop(r);
+    const ids = await turn.send(3);
+    if (surface === "task") await db.update(agentWakeupRequests).set({ payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{executionWait}',
+      ${JSON.stringify({ reason: "execution_active", message: "Waiting for the current run. Your message is saved." })}::jsonb)` })
+      .where(and(eq(agentWakeupRequests.agentId, r.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    const wakesBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, r.agentId));
+    await turn.stop();
+    const header = (await request(r.app).get(`/api/issues/${r.issueId}/queued-comments`)).body;
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, r.agentId));
+    const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, r.issueId));
+    const latest = Math.max(...(await db.select().from(issueComments).where(eq(issueComments.issueId, r.issueId))).filter(c => ids.includes(c.id)).map(m => m.createdAt.getTime()));
+    const outcome = await settleUnansweredPersonMessage(db, { companyId: r.companyId, issueId: r.issueId, now: new Date(latest + 5 * 60_000) });
+    const notes = unansweredNotes((await request(r.app).get(`/api/issues/${r.issueId}/comments`).expect(200)).body as any[]);
+    const savedWaits = wakes.filter(w => ["deferred", "deferred_issue_execution"].includes(w.status) && ids.some(id => JSON.stringify(w.payload).includes(id))).map(w => ({ id: w.id, status: w.status, executionWait: (w.payload as any)?.executionWait ?? null }));
+    await fs.writeFile(path.join(process.env.TASK_OUT!, `own-h2-${surface}.json`), JSON.stringify({ earlier, holds, firstRun: r.runId, stoppedTurn: turn.turnId,
+      savedWaitsBeforeStop: wakesBefore.map(w => ({ id: w.id, status: w.status, executionWait: (w.payload as any)?.executionWait ?? null })), savedWaits,
+      header: { state: header.state, executionWait: header.executionWait, entries: (header.entries ?? []).map((e: any) => e.comment.id) }, ids, outcome,
+      notes }, null, 2));
+    expect(earlier?.ownerType, "the earlier turn's PRODUCT hold").toBe("board");
+    expect(earlier?.cause).toBe("native_continuation_requires_reconciliation");
+    expect((earlier?.evidence as any)?.runId, "the hold is the failed earlier turn's").toBe(r.runId);
+    const earlierNow = holds.find(h => h.id === earlier!.id);
+    expect(earlierNow?.status, surface === "chat" ? "the earlier hold is still open when the messages are sent" : "task: the person's comment cancelled it as stale")
+      .toBe(surface === "chat" ? "active" : "cancelled");
+    // The saved wait is whatever admission wrote behind the earlier hold (measured: local_cleanup, the
+    // earlier turn's environment cleanup); before the reader, ANY saved wait hid the Stop (!queue.executionWait).
+    expect(savedWaits.length > 0 && savedWaits.every(w => typeof w.executionWait?.reason === "string" && typeof w.executionWait?.message === "string"),
+      "every held message carries a saved wait").toBe(true);
+    expect(header.executionWait, "header at +0: the stopped shape (Z's text)").toEqual(STOPPED_BAR);
+    expect((header.entries ?? []).map((e: any) => e.comment.id).some((id: string) => ids.includes(id)), "the held messages are listed").toBe(true);
+    // RFL control: a person Stop whose run is NOT the hold's run keeps the hold's card.
+    if (surface === "chat") {
+      expect(JSON.stringify(notes), "the earlier hold keeps its own card").toContain(earlier!.id);
+      expect(notes.map(n => n.body)).not.toContain(PERSON_STOP_HELD_MESSAGE_TEXT);
+    }
+  }, 120_000);
 });

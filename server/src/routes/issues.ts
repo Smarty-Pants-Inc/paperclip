@@ -90,6 +90,7 @@ import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
   activityLog,
@@ -7905,18 +7906,16 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
-    if (wake && queueState?.state === "deferred" && !input.activeRun && !queue.executionWait && comments.length > 0 &&
+    if (wake && queueState?.state === "deferred" && !input.activeRun && !interruptHandoff && comments.length > 0 &&
         input.issue.assigneeAgentId && !queuedInteractionId(wake.payload)) {
       // Stop means stop (org 11-17): after a person's Stop the waiting messages
       // of every task (Agent Chat or not) are not sent. The person sends them,
-      // or deletes some first.
-      const [lastTurn] = await input.executor.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
-        .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.issue.companyId),
-          eq(heartbeatRuns.agentId, input.issue.assigneeAgentId),
-          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issue.id}`))
-        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-      const stop = readObject(lastTurn?.resultJson);
-      if (lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId) {
+      // or deletes some first. H2: the ONE person-Stop reader (the note reads it
+      // too) decides, with or without a saved wait on the held wake; the
+      // person's Stop overrides a stale saved wait (execution_active,
+      // execution_recovery, stopped_execution) that nothing clears after it.
+      if (await readPersonStopHold(input.executor as Db, { companyId: input.issue.companyId, issueId: input.issue.id,
+        agentId: input.issue.assigneeAgentId, wakeId: wake.id })) {
         queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
       }
     }

@@ -1,5 +1,5 @@
-import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { agentWakeupRequests, environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
@@ -8,6 +8,8 @@ import { validatePrpEvent } from "../vendor/paperclip-runner/index.js";
 import { nativeSha256 } from "./native-runtime/canonical.js";
 import { isConfirmedCursorCloudTerminalObservation } from "./native-runtime/cursor-cloud-runtime.js";
 import { isAgentLifecycleStopRecord } from "./governance-pause-stop.js";
+import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "./deferred-execution-wait.js";
 
 export function hasAcknowledgedNativeRunStopRequest(run: {
   id: string; companyId: string; status: string; nativeIssueId: string | null;
@@ -134,4 +136,69 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pic
     catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
   };
   return (!run.processPid || absent(run.processPid)) && (!run.processGroupId || absent(-run.processGroupId));
+}
+
+/** The cause and fingerprint run of the hold the wake queue's release writes for
+ * a native run that ended before its Stop was acknowledged
+ * (modules/wake-queue/adapters/postgres.ts recordNativeTerminalRecoveryIfNeeded:
+ * cause native_continuation_requires_reconciliation, evidence.runId = the run). */
+export const PERSON_STOP_OWN_HOLD_CAUSE = "native_continuation_requires_reconciliation";
+
+export type PersonStopHold = { stoppedRunId: string; wakeIds: string[] };
+
+function personStopWakeCarries(payload: unknown, issueId: string, messageId?: string): boolean {
+  const value = parseObject(payload);
+  const nested = parseObject(value._paperclipWakeContext);
+  if (value.issueId !== issueId && nested.issueId !== issueId && value.taskId !== issueId) return false;
+  const ids = [...queuedCommentIdsFromWakePayload(value), value.commentId, nested.wakeCommentId,
+    ...(Array.isArray(nested.wakeCommentIds) ? nested.wakeCommentIds : [])]
+    .filter((id): id is string => typeof id === "string" && id.length > 0);
+  return messageId ? ids.includes(messageId) : ids.length > 0;
+}
+
+/**
+ * Stop means stop: the ONE reader of "these messages are held by a person's
+ * Stop" (H2 section 3). Both the queued-comments header (routes/issues.ts) and
+ * the per-message note (recovery/unanswered-person-message.ts) read it, so they
+ * cannot disagree. Held when ALL of these are true:
+ * - no run is running on the issue;
+ * - the latest run of the assignee on the issue (nativeIssueId OR
+ *   contextSnapshot.issueId) is cancelled by a user (cancelledByActorType
+ *   "user") and is not a queued-comment interrupt (queuedCommentInterruptQueueId);
+ * - a deferred_issue_execution wake, or a deferred wake with a well-formed
+ *   saved wait, carries the issue's messages (the given message, or wake, when
+ *   named), WITH OR WITHOUT a saved wait, and has no queuedCommentInterrupt
+ *   (a person's Send is delivering it).
+ * A saved wait (execution_active, execution_recovery, stopped_execution) does
+ * not undo the Stop: nothing clears it after the Stop, so it is stale.
+ */
+export async function readPersonStopHold(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; messageId?: string; wakeId?: string;
+}): Promise<PersonStopHold | null> {
+  const onIssue = or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
+  const [running] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), or(onIssue, eq(heartbeatRuns.issueId, input.issueId)),
+    eq(heartbeatRuns.status, "running"))).limit(1);
+  if (running) return null;
+  const [lastTurn] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), onIssue))
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  const stop = parseObject(lastTurn?.resultJson);
+  if (!lastTurn || lastTurn.status !== "cancelled" || stop.cancelledByActorType !== "user" || stop.queuedCommentInterruptQueueId) return null;
+  const wakes = await db.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
+    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, input.agentId),
+      or(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        and(eq(agentWakeupRequests.status, "deferred"), wellFormedExecutionWaitSql(agentWakeupRequests.payload)))));
+  const held = wakes.filter(wake => (!input.wakeId || wake.id === input.wakeId)
+    && (wake.status === "deferred_issue_execution" || isWellFormedExecutionWait(parseObject(wake.payload).executionWait))
+    && parseObject(wake.payload).queuedCommentInterrupt == null
+    && personStopWakeCarries(wake.payload, input.issueId, input.messageId));
+  return held.length ? { stoppedRunId: lastTurn.id, wakeIds: held.map(wake => wake.id) } : null;
+}
+
+/** The Stop's OWN board hold: the release wrote it for the very run the person
+ * stopped (the acknowledgement landed after the release). Any other hold (a
+ * real failure, or a person Stop of a different run) is not this. */
+export function isPersonStopOwnHold(hold: { cause: string | null; evidence: unknown } | null | undefined, stop: PersonStopHold | null): boolean {
+  return Boolean(hold && stop && hold.cause === PERSON_STOP_OWN_HOLD_CAUSE && parseObject(hold.evidence).runId === stop.stoppedRunId);
 }
