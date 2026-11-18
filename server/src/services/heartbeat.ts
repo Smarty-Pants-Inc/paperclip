@@ -83,6 +83,8 @@ import {
 } from "./heartbeat/scheduling.js";
 import { canApplyTaskWorkspaceSelectionAtAdmission, taskWorkspaceRuntimeSelectionEnabled } from "./execution-workspace-policy.js";
 import { agentExecutionStopBlocker } from "./agent-execution-stop.js";
+import { cleanupNotParkedSql } from "./environment-cleanup-state.js";
+import { confirmRemoteLeaseStop, hasBoundRemoteStopReceipt } from "./remote-execution-termination.js";
 import {
   cancelHeartbeatNativeRun,
   terminateHeartbeatRunProcess,
@@ -4482,7 +4484,8 @@ export function heartbeatService(
           and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed"))),
         sql`not (coalesce((${environmentLeases.metadata}->'releaseDeferral'->>'retryAt')::timestamptz > now(), false)
           and (${options.trigger ?? null}::text is null
-            or coalesce(${environmentLeases.metadata}->'releaseDeferral'->'triggers', '[]'::jsonb) ? ${options.trigger ?? ""}::text))`));
+            or coalesce(${environmentLeases.metadata}->'releaseDeferral'->'triggers', '[]'::jsonb) ? ${options.trigger ?? ""}::text))`,
+        cleanupNotParkedSql()));
     const needsRelease = new Set(leasesToRelease.map(lease => lease.runId));
     let blocker: string | null = null;
     for (const run of runs) {
@@ -4500,7 +4503,23 @@ export function heartbeatService(
           ...(options.trigger ? { trigger: options.trigger } : {}) });
       }
     }
-    return blocker ?? agentExecutionStopBlocker(db, agentIds);
+    if (blocker) return blocker;
+    // #20766: recheck each ended remote lease of a cancelled run that has no
+    // bound receipt with its recorded provider (C4: proved/unproved/unsupported).
+    const ended = await db.select({ lease: environmentLeases }).from(environmentLeases)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
+      .where(and(inArray(heartbeatRuns.agentId, agentIds), eq(heartbeatRuns.status, "cancelled"),
+        inArray(environmentLeases.status, ["released", "expired", "failed"]), eq(environmentLeases.cleanupStatus, "success"),
+        sql`coalesce(${environmentLeases.provider}, 'local') <> 'local'`));
+    const inspect = environmentRuntime.inspectLeaseResource
+      && ((leaseId: string) => environmentRuntime.inspectLeaseResource(leaseId, { freshThreadStop: true }));
+    let unsupported = false;
+    for (const { lease } of ended) {
+      if (!hasBoundRemoteStopReceipt(lease)) unsupported = await confirmRemoteLeaseStop(db, lease, inspect) === "unsupported" || unsupported;
+    }
+    const stopBlocker = await agentExecutionStopBlocker(db, agentIds);
+    // The provider cannot answer: an operator must reconcile the named computer.
+    return stopBlocker === "remote_stop_unconfirmed" && unsupported ? "remote_stop_unsupported" : stopBlocker;
   }
 
   async function stopInvocationsForAgents(agentIds: string[], reason: string, options: StopInvocationOptions = {}) {

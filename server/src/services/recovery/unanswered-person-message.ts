@@ -85,7 +85,8 @@ const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWER
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
  * assertAgentLifecycleAuthority / assertCanManageSubordinateAgent). */
-export function agentPausedText(name: string) {
+export function agentPausedText(name: string, stopUnconfirmed = false) {
+  if (stopUnconfirmed) return `${name} is paused for new work. We could not confirm that its previous run stopped. Your message is saved.`;
   return `${name} is paused. Your message is saved, and it will run when ${name} is resumed. `
     + `A board user or ${name}'s manager can resume ${name}.`;
 }
@@ -766,7 +767,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
-    : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : paused ? agentPausedText(pausedName, agentRow?.lifecycleState === "pausing") : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT

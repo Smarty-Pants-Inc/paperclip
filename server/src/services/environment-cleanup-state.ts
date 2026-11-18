@@ -73,6 +73,12 @@ export function recoveredOrphanFirstAttemptSql() {
     and coalesce(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') <> 'true'`;
 }
 
+/** C2: automatic cleanup of a proved-stopped computer the provider retains is
+ * parked. Shared by the sweep's claim, its deadline and lifecycle release. */
+export function cleanupNotParkedSql() {
+  return sql`coalesce(${environmentLeases.metadata}#>>'{cleanupDisposition,state}', '') <> 'parked'`;
+}
+
 export function pendingCleanupDeadlineSql(now = Date.now()) {
   const deadline = sql`case
     when ${environmentLeases.metadata}->>'pendingCleanupInFlight' = 'true'
@@ -89,7 +95,8 @@ export async function nextEnvironmentCleanupAt(db: Db, backoffMs = ENVIRONMENT_C
   const [row] = await db.select({ next: sql<string | null>`min(case when ${recoveredOrphanFirstAttemptSql()}
     then ${pendingCleanupDeadlineSql()} else greatest(
     extract(epoch from ${environmentLeases.updatedAt}) * 1000 + ${backoffMs},
-    ${pendingCleanupDeadlineSql()}) end)` }).from(environmentLeases).where(eq(environmentLeases.status, "pending_cleanup"));
+    ${pendingCleanupDeadlineSql()}) end)` }).from(environmentLeases)
+    .where(and(eq(environmentLeases.status, "pending_cleanup"), cleanupNotParkedSql()));
   const [creation] = await db.select({ next: sql<string | null>`min(extract(epoch from ${sandboxCreationOperations.nextAttemptAt}) * 1000)` })
     .from(sandboxCreationOperations).where(recoverableSandboxCreationCondition());
   const expiry = await nextAbandonedWorkspaceFileHoldExpiryAt(db);

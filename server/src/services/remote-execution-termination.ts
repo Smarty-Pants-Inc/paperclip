@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, type Db } from "@paperclipai/db";
 import { retiredReusableLeasePredecessors } from "./environment-lease-handoff.js";
 import { OWN_PROCESS_START_EVENT_TYPES } from "./native-process-start-events.js";
@@ -76,7 +76,7 @@ export type RemoteLeaseOwner = {
  * since resumed) never proves the current owner gone. "Own" is the owner run's
  * lease, or the probe's exact lease id. No error code or text is ever proof. */
 export async function ownLeaseTerminated(db: Db, owner: RemoteLeaseOwner,
-  scope: { successorOnOwnerSandbox?: boolean; ownLeaseOnly?: boolean } = {}): Promise<boolean> {
+  scope: { successorOnOwnerSandbox?: boolean; ownLeaseOnly?: boolean; carriedCleanupStop?: boolean } = {}): Promise<boolean> {
   if (!owner.providerLeaseId || !owner.environmentId) return false;
   const leases = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.companyId, owner.companyId),
@@ -85,10 +85,14 @@ export async function ownLeaseTerminated(db: Db, owner: RemoteLeaseOwner,
   ));
   const resolved = await Promise.all(leases.map(lease => resolveRemoteTerminationLease(db, lease)));
   return resolved.some(lease => {
-    if (!terminationReceipt(lease, owner.leaseId)) return false;
-    const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
     const ownLease = (owner.runId !== null && lease.heartbeatRunId === owner.runId)
       || (owner.leaseId !== undefined && lease.id === owner.leaseId);
+    // Execution-only readers (pause, task settlement): the own lease's Stop
+    // receipt carried into pending destroy proves execution, not destruction.
+    if (scope.carriedCleanupStop && ownLease && scope.successorOnOwnerSandbox !== true
+      && hasRecoveredCleanupStopReceipt(lease)) return true;
+    if (!terminationReceipt(lease, owner.leaseId)) return false;
+    const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
     return (state === "destroyed" && (ownLease || scope.ownLeaseOnly !== true))
       || (state === "stopped" && ownLease && scope.successorOnOwnerSandbox !== true);
   });
@@ -123,6 +127,27 @@ export function hasRecoveredCleanupStopReceipt(lease: LeaseIdentity & {
       !["pending_cleanup", "released", "expired", "failed"].includes(lease.status)) return false;
   return hasRemoteTerminationReceipt({ ...lease, status: "released", cleanupStatus: "success",
     metadata: { remoteExecutionTermination: cleanup.stopReceipt } });
+}
+
+/** Upstream #20766's confirmer for one ended remote lease of a cancelled run:
+ * the recorded provider's exact-resource answer, persisted only as a bound
+ * receipt. "unsupported" (no answer possible) is never retried as "unproved". */
+export type RemoteStopConfirmation = "proved" | "unproved" | "unsupported";
+export async function confirmRemoteLeaseStop(db: Db, lease: Lease,
+  inspect: ((leaseId: string) => Promise<unknown>) | undefined): Promise<RemoteStopConfirmation> {
+  if (hasBoundRemoteStopReceipt(lease)) return "proved";
+  if (!inspect) return "unsupported";
+  const observation = await inspect(lease.id).catch(() => null);
+  if (observation === undefined) return "unsupported";
+  const termination = remoteTerminationReceipt(lease, observation);
+  if (!termination) return "unproved";
+  const saved = await db.update(environmentLeases).set({ updatedAt: new Date(),
+    metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: termination })}::jsonb`,
+  }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, lease.status),
+    eq(environmentLeases.providerLeaseId, termination.providerLeaseId),
+    sql`${environmentLeases.metadata} is not distinct from ${JSON.stringify(lease.metadata)}::jsonb`))
+    .returning({ id: environmentLeases.id });
+  return saved.length ? "proved" : "unproved";
 }
 
 export function remoteLeaseCleanupScope(lease: Pick<LeaseIdentity, "provider" | "providerLeaseId">) {
