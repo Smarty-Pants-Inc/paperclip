@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
-import { decideRetryAuthority } from "../task-retry-eligibility.js";
+import { decideRetryAuthority, readRetryAuthorityFacts } from "../task-retry-eligibility.js";
 import { completedPersonMessageAnswerSql, PENDING_WAIT_START_BOUND_MS, unansweredCardAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
@@ -1107,6 +1107,12 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
+  // rf-5 R2-1: the plain not-answered line names Retry only when the one Retry
+  // authority admits it for this task with no source check of the card's own
+  // (personMessageOwed: the same decision the card and admission read).
+  const plainLine = !(policyRefused || settingUp || paused || pauseStopped || waiting || supervisionUnconfirmed
+    || heldAtEndBound || cardAnswer || boundReached || held);
+  const owedRetry = plainLine ? decideRetryAuthority(await readRetryAuthorityFacts(q, { companyId: issue.companyId, issueId: issue.id })) : null;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused`
@@ -1127,6 +1133,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         // rf-3 STOP 2: a HELD body names Retry (a held notice never withholds it); its Next action is that same one instruction.
         : boundReached ? "Send a new message to try again."
         : held ? decideRetryAuthority({ heldConversation: true, retrySource: true }).nextAction!
+        : owedRetry?.canRetry && owedRetry.nextAction ? owedRetry.nextAction
         : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,

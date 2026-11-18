@@ -1,7 +1,7 @@
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
 import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON } from "./execution-recovery-attempt.js";
 import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-setup-command-failure.js";
-import { and, desc, eq, inArray, isNull, not, notInArray, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import { unidentifiedLocalLaunchRefusals } from "./native-local-process-stop.js";
 import { nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
 import { agents, agentWakeupRequests, approvals, chatActions, companies, environmentLeases, heartbeatRuns, issueApprovals, issueRecoveryActions,
@@ -942,8 +942,21 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   // and takes canRetry, the resume action and its words from that decision.
   // The card's own checks are the authority's retrySource fact; a card whose
   // run is live (state 'working', not an automatic recovery) speaks for itself.
+  // rf-5 R2-1: a card whose latest run COMPLETED has no source check of its own,
+  // but the authority's personMessageOwed fact (an earlier failed run's own
+  // message is not ANSWERED) is a Retry admission accepts. That card asks the
+  // same authority and shows its Retry and words. Only an open, assigned task
+  // with a failed run can hold the fact (one batched read; the rest are skipped).
+  const completed = [...result].flatMap(([issueId, presentation]) => presentation?.state === "resolved" ? [issueId] : [])
+    .filter(issueId => selected.some(issue => issue.id === issueId && issue.assigneeAgentId
+      && issue.assigneeAgentId === runMap.get(issueId)?.agentId && !["done", "cancelled"].includes(issue.status)));
+  const owedRunIssueId = sql<string | null>`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId')`;
+  const mayOweMessage = new Set(completed.length ? (await db.selectDistinct({ issueId: owedRunIssueId }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["failed", "timed_out"]),
+    or(inArray(heartbeatRuns.issueId, completed), inArray(heartbeatRuns.nativeIssueId, completed),
+      inArray(sql`${heartbeatRuns.contextSnapshot}->>'issueId'`, completed))))).map(row => row.issueId) : []);
   for (const [issueId, presentation] of result) {
-    if (!presentation || presentation.state === "resolved") continue;
+    if (!presentation || (presentation.state === "resolved" && !mayOweMessage.has(issueId))) continue;
     const automaticRecovery = presentation.state === "working" && !presentation.canRetry
       && continuingIssues.has(issueId) && !presentation.notice && !presentation.retryWait;
     if (presentation.state === "working" && !presentation.canRetry && !automaticRecovery) continue;
@@ -958,6 +971,11 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       automaticRecovery, restoreHold, retrySource: presentation.canRetry });
     // fam-retry2: an accept-held Retry is not a second Retry button; the card
     // keeps upstream's withheld Retry and says the hold's words.
+    if (presentation.state === "resolved") {
+      if (authority.canRetry && authority.admission !== "held" && facts.personMessageOwed) Object.assign(presentation,
+        { state: "failed", canRetry: true, notice: { code: "person_message_owed", text: authority.cardText! } });
+      continue;
+    }
     if (authority.canRetry && authority.admission !== "held") continue;
     // fam-retry4: the card, the chat and the API render the authority's one
     // accept-held state (no Retry button; the hold's words), before and after

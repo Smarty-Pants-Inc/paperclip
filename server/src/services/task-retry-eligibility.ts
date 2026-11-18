@@ -66,6 +66,14 @@ export type RetryAuthorityFacts = {
    * pending input; a failed run's progress comment is DELIVERED only and keeps
    * the Retry): a Retry would only answer it again. */
   personMessageAnswered?: boolean;
+  /** rf-5 R2-1 (one Retry decision): the task's latest run COMPLETED, and an
+   * earlier FAILED run's own person message is still not ANSWERED (M1's run
+   * failed while M2 was held; a later run answered only M2). Read with
+   * personMessageAnswered, from the same rows (readPersonMessageAnswered). The
+   * Retry that answers that message is this fact's: the card (which has no
+   * source check of its own on a completed run), the unanswered notice's next
+   * action and admission all read it here. */
+  personMessageOwed?: boolean;
   /** The assignee (or its project / company) is paused: only Resume continues. */
   agentPaused?: boolean;
   /** Paperclip is continuing this conversation by itself (a recovery successor is pending). */
@@ -185,11 +193,12 @@ export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority
   if (facts.heldRefusal && !held && !heldRetryOffersRetry(facts.heldRefusal))
     return decision(["cancelled_by_operator", "retry_source_changed"].includes(facts.heldRefusal) ? "message" : "new_task",
       facts.heldRefusal, null, null);
-  if (facts.retrySource) {
+  if (facts.retrySource || facts.personMessageOwed) {
     if (facts.stoppedBeforeWork) return decision("retry", "retry", NO_SAVED_WORK_RETRY_MESSAGE, NO_SAVED_WORK_RETRY_ACTION);
     if (facts.stopKind) return decision("retry", "retry", STOPPED_TASK_RETRY_MESSAGE, STOPPED_TASK_RETRY_ACTION);
     if (held) return decision("retry", "retry", recovered ? HELD_RECOVERED_WORK_MESSAGE : HELD_PREDECESSOR_NOTICE, HELD_RETRY_ACTION);
     if (recovered) return decision("retry", "retry", RECOVERED_WORK_RETRY_MESSAGE, RECOVERED_WORK_RETRY_ACTION);
+    if (facts.personMessageOwed) return decision("retry", "retry", PERSON_MESSAGE_OWED_MESSAGE, PERSON_MESSAGE_OWED_RETRY_ACTION);
     return decision("retry", "retry", null, null);
   }
   // Retry refused for its own reason on a run that is not Retry's source (a
@@ -211,7 +220,7 @@ export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority
  * Paperclip Cut B R4): the executor's durable HELD notice is. */
 export async function readRetryAuthorityFacts(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
   const { readUnsupersededHeldConversationNotice } = await import("./native-runtime/pi-session-recovery-notice.js");
-  const [[assignee], notice, refusals, restoreStopWait, personMessageAnswered] = await Promise.all([
+  const [[assignee], notice, refusals, restoreStopWait, personMessage] = await Promise.all([
     db.select({ status: agents.status }).from(issues).innerJoin(agents, and(eq(agents.companyId, issues.companyId),
       eq(agents.id, issues.assigneeAgentId))).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).limit(1),
     readUnsupersededHeldConversationNotice(db, { companyId: input.companyId, issueId: input.issueId }),
@@ -220,11 +229,15 @@ export async function readRetryAuthorityFacts(db: Db, input: { companyId: string
     readPersonMessageAnswered(db, input),
   ]);
   return { agentPaused: assignee?.status === "paused", heldConversation: Boolean(notice),
-    heldRefusal: refusals.get(input.issueId) ?? null, restoreStopWait, personMessageAnswered } satisfies RetryAuthorityFacts;
+    heldRefusal: refusals.get(input.issueId) ?? null, restoreStopWait, personMessageAnswered: personMessage.answered,
+    personMessageOwed: personMessage.owed } satisfies RetryAuthorityFacts;
 }
 
 export const PERSON_MESSAGE_ANSWERED_REASON = "person_message_already_answered";
 export const PERSON_MESSAGE_ANSWERED_MESSAGE = "Already answered above.";
+/** The personMessageOwed Retry's one instruction, and the card's text around it. */
+export const PERSON_MESSAGE_OWED_RETRY_ACTION = "Press Retry to answer it.";
+export const PERSON_MESSAGE_OWED_MESSAGE = `An earlier message wasn't answered. ${PERSON_MESSAGE_OWED_RETRY_ACTION}`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** fam-retry3: the personMessageAnswered fact. Retry's source run (the given
  * run, else the task's latest run, as readRestoreStopWait reads it) carried
@@ -238,11 +251,13 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * (M1's run failed while M2 was held; a later run answered only M2) is the
  * task's latest run, and its answered M2 says nothing about M1: while any
  * failed run's own carried person message is not ANSWERED, the Retry is not
- * "Already answered above." */
+ * "Already answered above."
+ * rf-5 R2-1: the same rows give personMessageOwed: the source run COMPLETED and
+ * another failed run's own carried person message is not ANSWERED. */
 async function readPersonMessageAnswered(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
   const onTask = or(eq(heartbeatRuns.issueId, input.issueId), eq(heartbeatRuns.nativeIssueId, input.issueId),
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
-  const [source] = await db.select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+  const [source] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), input.sourceRunId ? eq(heartbeatRuns.id, input.sourceRunId) : onTask))
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
   // A run's own input: what it carried as input, and what it carried for ANSWERED
@@ -255,16 +270,18 @@ async function readPersonMessageAnswered(db: Db, input: { companyId: string; iss
       .filter((id): id is string => typeof id === "string" && UUID.test(id));
   };
   const carried = carriedBy(source?.contextSnapshot);
-  if (!carried.length) return false;
+  if (!carried.length && source?.status !== "succeeded") return { answered: false, owed: false };
   const failedRuns = await db.select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, input.companyId), onTask, inArray(heartbeatRuns.status, ["failed", "timed_out"])))
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(FAILED_RUN_OWN_INPUT_WINDOW);
   const failedRunsOwn = failedRuns.filter(run => run.id !== source?.id).flatMap(run => carriedBy(run.contextSnapshot));
+  if (!carried.length && !failedRunsOwn.length) return { answered: false, owed: false };
   const rows = await db.select({ id: issueComments.id, answered: sql<boolean>`${completedPersonMessageAnswerSql({ id: sql`${issueComments.id}`,
     companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}` })
     .from(issueComments).where(and(eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
       inArray(issueComments.id, [...new Set([...carried, ...failedRunsOwn])]), eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)));
-  return rows.some(row => carried.includes(row.id)) && rows.every(row => row.answered === true);
+  return { answered: rows.some(row => carried.includes(row.id)) && rows.every(row => row.answered === true),
+    owed: source?.status === "succeeded" && rows.some(row => failedRunsOwn.includes(row.id) && row.answered !== true) };
 }
 /** How many of the task's most recent failed runs the answered-already fact reads. */
 const FAILED_RUN_OWN_INPUT_WINDOW = 50;
