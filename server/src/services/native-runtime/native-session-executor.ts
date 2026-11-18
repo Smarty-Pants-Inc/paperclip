@@ -1406,7 +1406,12 @@ async function warmCloseFailureProvesOwnerGone(entry: WarmNativeSession, error: 
       providerLeaseId: entry.providerLeaseId ?? null, ...warmCloseFailureEvidence(entry, error, inspection) },
     "warm native session close failed; sandbox Runner evidence");
   }
-  if (runnerIdMissing && suspendedRunnerHasExited(entry, inspection)) return "close_failed";
+  // B1 fence (b): runnerd's exit alone is not the Runner's exit; every process group it recorded (its
+  // providers run in their own groups) must be empty too, else the owner is kept (fail closed).
+  if (runnerIdMissing && suspendedRunnerHasExited(entry, inspection) && entry.sandboxRunner
+    && await sandboxSessionRunnerExited({ runner: entry.sandboxRunner.runner,
+      runtimeRoot: posix.join(entry.sandboxRunner.remoteCwd, ".paperclip-runtime", "paperclip-runner"),
+      sessionDirectory: createHash("sha256").update(entry.normalizedSessionId).digest("hex") })) return "close_failed";
   try {
     if (db && (await warmSandboxTerminated(db, entry) || await warmRunnerPortTakenBySuccessor(db, entry))) return "close_failed";
   } catch (proofError) {
