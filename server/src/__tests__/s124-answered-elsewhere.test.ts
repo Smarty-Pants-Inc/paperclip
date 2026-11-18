@@ -55,7 +55,7 @@ function waitForReal(assertion: () => unknown | Promise<unknown>, { timeout = 5_
   });
 }
 
-describe("S124 fix: a parked Send answered elsewhere gets no false note", () => {
+describe("S124 fix: a parked Send whose held messages were carried by a run that replied gets no false note", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;
   let db: ReturnType<typeof createDb>;
   let coordinator: ReturnType<typeof createDeliveryWorkCoordinator>;
@@ -168,7 +168,7 @@ describe("S124 fix: a parked Send answered elsewhere gets no false note", () => 
     expect(await notes(f.issue.id)).toHaveLength(0);
   }
 
-  it('row 1 B-shape: Stop, Send (parks), typed M2; M2 run answers M1+M2 -> no note, wake retired, held list empty', async()=>{
+  it('row 1 carried-and-replied: Stop, Send (parks M1), typed M2; a run CARRYING M1+M2 publishes a reply -> no note, wake retired, held list empty', async()=>{
     const f=await fixture(),at=Date.now();
     const deps=createHeartbeatQueueTestDependencies(db),queue=createHeartbeatQueue(db,deps);
     const wake=await stopAndSend(f,at,[f.message.id]);
@@ -178,7 +178,7 @@ describe("S124 fix: a parked Send answered elsewhere gets no false note", () => 
     await register(queue); await pastDeadline(queue,at);
     await expectRetired(f,wake.id,deps,queue,at);
   });
-  it('row 2: Send + typed within ~1 s (the wake holds M1+M2), both answered -> retired, no note', async()=>{
+  it('row 1b carried-and-replied: Send + typed within ~1 s (the wake holds M1+M2), a run CARRYING both replies -> retired, no note', async()=>{
     const f=await fixture(),at=Date.now();
     const m2=await typed(f,'typed right after Send');
     const deps=createHeartbeatQueueTestDependencies(db),queue=createHeartbeatQueue(db,deps);
@@ -187,7 +187,7 @@ describe("S124 fix: a parked Send answered elsewhere gets no false note", () => 
     await register(queue); await pastDeadline(queue,at);
     await expectRetired(f,wake.id,deps,queue,at);
   });
-  it('row 3 TRUE: nothing answered -> exactly one note; Retry (real Send route) sends it', async()=>{
+  it('row TRUE: nothing answered -> exactly one note; Retry (real Send route) sends it', async()=>{
     const f=await fixture(),at=Date.now();
     const deps=createHeartbeatQueueTestDependencies(db),queue=createHeartbeatQueue(db,deps);
     const wake=await stopAndSend(f,at,[f.message.id]);
@@ -201,7 +201,7 @@ describe("S124 fix: a parked Send answered elsewhere gets no false note", () => 
     expect(retry.status,JSON.stringify(retry.body)).toBe(200);
     expect(queuedCommentIdsFromWakePayload((await readWake(wake.id)).payload)).toEqual([f.message.id]);
   });
-  it('row 3 PARTIAL: 2 held, 1 answered elsewhere -> one note about the unanswered one; held list and Retry carry only it', async()=>{
+  it('row PARTIAL: 2 held, M1 carried by a run that replied -> one note about the unanswered one; held list and Retry carry only it', async()=>{
     const f=await fixture(),at=Date.now();
     const m2=await typed(f,'second held');
     const deps=createHeartbeatQueueTestDependencies(db),queue=createHeartbeatQueue(db,deps);
@@ -218,7 +218,7 @@ describe("S124 fix: a parked Send answered elsewhere gets no false note", () => 
     expect(retry.status,JSON.stringify(retry.body)).toBe(200);
     expect(queuedCommentIdsFromWakePayload((await readWake(wake.id)).payload)).toEqual([m2.id]);
   });
-  it('row 4 control: a run CARRIED M1 then FAILED (no completed answer) -> not retired, note fires', async()=>{
+  it('row 3 carried-then-FAILED: a run CARRIED M1 then failed with no reply -> not retired, note stays', async()=>{
     const f=await fixture(),at=Date.now();
     const deps=createHeartbeatQueueTestDependencies(db),queue=createHeartbeatQueue(db,deps);
     const wake=await stopAndSend(f,at,[f.message.id]);
@@ -226,5 +226,50 @@ describe("S124 fix: a parked Send answered elsewhere gets no false note", () => 
     await register(queue); await pastDeadline(queue,at);
     const v=await view(f,wake.id);
     expect(v.notes).toHaveLength(1); expect(v.wake.status).toBe('deferred_issue_execution'); expect(heldIds(v.queue)).toEqual([f.message.id]);
+  });
+  it('row 2 NEVER carried (R1-306): Stop, Send parks M1, typed M2 carried by its own run which replies -> M1 keeps its note; ONE Retry, its run carries M1 -> each answered once, list empty', async()=>{
+    const f=await fixture(),at=Date.now();
+    const deps=createHeartbeatQueueTestDependencies(db),queue=createHeartbeatQueue(db,deps);
+    const wake=await stopAndSend(f,at,[f.message.id]);
+    await tick(queue,at+10_000);
+    const m2=await typed(f,'typed after Send');
+    await answer(f,[m2.id]);
+    await register(queue); await pastDeadline(queue,at);
+    const v=await view(f,wake.id);
+    expect(v.notes).toHaveLength(1); expect(v.notes[0]!.body).toMatch(/did not start/);
+    expect((v.notes[0]!.metadata as any)?.authorizationReason).toBe(`unanswered_message:${f.message.id}`);
+    expect(v.wake.status).toBe('deferred_issue_execution'); expect(heldIds(v.queue)).toEqual([f.message.id]);
+    expect(v.queue.executionWait?.reason).toBe('parked_not_started');
+    const sends=deps.resumeQueuedCommentInterrupt.mock.calls.length;
+    const retry=await request(app(f)).post(`/api/issues/${f.issue.id}/queued-comments/interrupt`).send({queueId:wake.id,targetRunId:null,revision:v.queue.revision});
+    expect(retry.status,JSON.stringify(retry.body)).toBe(200);
+    expect(queuedCommentIdsFromWakePayload((await readWake(wake.id)).payload)).toEqual([f.message.id]);
+    // The Retry press's run: it takes the wake (promotion) and carries M1, then completes with a reply.
+    const run=await answer(f,[f.message.id]);
+    await db.update(heartbeatRuns).set({wakeupRequestId:wake.id}).where(eq(heartbeatRuns.id,run.id));
+    await db.update(agentWakeupRequests).set({status:'completed',runId:run.id,finishedAt:new Date()}).where(eq(agentWakeupRequests.id,wake.id));
+    const from=Date.now();
+    for(let i=1;i<=6;i++) await tick(queue,from+i*RETRY_MS);
+    const after=await view(f,wake.id);
+    expect(heldIds(after.queue)).toEqual([]);
+    expect(after.queue.executionWait?.reason).not.toBe('parked_not_started');
+    expect(deps.resumeQueuedCommentInterrupt).toHaveBeenCalledTimes(sends);
+    expect(after.notes.length).toBeLessThanOrEqual(1);
+    expect(after.notes.filter(n=>(n.metadata as any)?.authorizationReason===`unanswered_message:${f.message.id}`).length).toBeLessThanOrEqual(1);
+    const carrying=(id:string)=>db.select({id:heartbeatRuns.id}).from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId,f.issue.id),sql`${heartbeatRuns.contextSnapshot}->'wakeCommentIds' ? ${id}`));
+    expect(await carrying(f.message.id)).toHaveLength(1); expect(await carrying(m2.id)).toHaveLength(1);
+    const replies=await db.select().from(issueComments).where(and(eq(issueComments.issueId,f.issue.id),eq(issueComments.authorType,'agent')));
+    expect(replies).toHaveLength(2);
+    const wakes=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,f.companyId),eq(agentWakeupRequests.status,'deferred_issue_execution')));
+    expect(wakes).toHaveLength(0);
+  });
+  it('row 4 carried-FAILED then carried-and-REPLIED: M1 carried by a failed run, then by a run that replies -> retired, no note', async()=>{
+    const f=await fixture(),at=Date.now();
+    const deps=createHeartbeatQueueTestDependencies(db),queue=createHeartbeatQueue(db,deps);
+    const wake=await stopAndSend(f,at,[f.message.id]);
+    await answer(f,[f.message.id],'failed');
+    await answer(f,[f.message.id]);
+    await register(queue); await pastDeadline(queue,at);
+    await expectRetired(f,wake.id,deps,queue,at);
   });
 });

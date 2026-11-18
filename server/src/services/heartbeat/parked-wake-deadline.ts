@@ -1,10 +1,10 @@
 import { and, eq, inArray, isNull, sql, type SQLWrapper } from "drizzle-orm";
 import { anchorParkedWakePayloadSql, parkedWakeAnchor, parkedWakeNeedsAnchorSql, parkedWakeSql, personSendSql,
   type Payload } from "./parked-wake-anchor.js";
-import { agentWakeupRequests, issueComments, issues, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { issueService } from "../issues.js";
 import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
-import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { chainCarriesCommentSql } from "../person-message-answer.js";
 import { buildStrandedRecoveryEscalationNotice } from "../recovery/stranded-notice.js";
 import { PENDING_WAIT_BOUND_MS, UNANSWERED_MESSAGE_NO_RUN_CODE, UNANSWERED_MESSAGE_REASON_PREFIX,
   UNANSWERED_WAITING_ROW_JSON } from "../recovery/unanswered-person-message.js";
@@ -93,14 +93,21 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
         eq(agentWakeupRequests.status, "deferred_issue_execution"))).for("update");
     const anchor = parkedWakeAnchor(current?.payload);
     if (!current || anchor === null || anchor + parkedWakeDeadlineMs() > now.getTime() || parkedWakeNoticed(current.payload)) return false;
-    // A held message another run already ANSWERED (B's completed-answer rule,
-    // not carried/delivered) did not "not start": it leaves this wake. All
-    // answered: the wake is settled (cancelled, kept) and gets no note.
+    // A held message X leaves this wake only when a run that CARRIED X itself
+    // published a reply after X (rf-4 ruling 09:32Z). A reply to a later
+    // message whose run never carried X does not count: X never started, so it
+    // keeps its note. All held carried-and-replied: the wake is settled
+    // (cancelled, kept) and gets no note.
     const held = queuedCommentIdsFromWakePayload(current.payload);
+    const message = { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` };
     const answered = new Set(held.length === 0 ? [] : (await tx.select({ id: issueComments.id }).from(issueComments)
       .where(and(eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, held),
-        answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-          issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })))).map(row => row.id));
+        sql`exists (select 1 from ${issueComments} a
+          join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
+          where a.company_id = ${message.companyId} and a.issue_id = ${message.issueId} and a.author_type = 'agent'
+            and a.deleted_at is null and a.created_at > ${message.createdAt}
+            and ${chainCarriesCommentSql("r", message.id, message)})`))).map(row => row.id));
     const open = held.filter(id => !answered.has(id));
     if (held.length > 0 && open.length === 0) {
       await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now,
