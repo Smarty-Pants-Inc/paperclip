@@ -1179,6 +1179,17 @@ export const issueCommentMetadataSchema = z
     }).strict().optional(),
     recoveryResponsibility: z.enum(["system", "user"]).optional(),
     attachmentPreparation: z.object({ attachmentId: z.uuid() }).strict().optional(),
+    // H5: one part of ONE logical answer posted in ordered parts. `label` and the
+    // synthetic fence wrappers (`prefix`/`suffix`) are recorded verbatim, so
+    // stripping them from every part and joining by `index` is source-equal.
+    answerPart: z.object({
+      answerId: z.uuid(),
+      index: z.number().int().positive(),
+      count: z.number().int().min(2),
+      label: z.string().min(1).max(80),
+      prefix: z.string().max(4096),
+      suffix: z.string().max(4096),
+    }).strict().optional(),
     // A notice's wording is immutable. Later state appends a new notice and
     // points the previous one at it instead of rewriting conversation history.
     supersededByCommentId: z.uuid().optional(),

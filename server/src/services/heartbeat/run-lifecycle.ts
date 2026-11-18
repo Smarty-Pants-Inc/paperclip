@@ -1,6 +1,9 @@
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { writeRuntimeRunPointer } from "./runtime-run-pointer.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { readRunAnswerEvents, readThinkingCapStop, thinkingCapStopCandidate } from "../thinking-cap-stop.js";
+import { readExhaustedNativeMidStreamCutCandidate, readNativeProviderAccountFailureCandidate } from "../native-runtime/native-mid-stream-cut.js";
+import { readExhaustedNativeFailedTurnCandidate } from "../native-runtime/native-failed-turn-continuation.js";
 import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
 import { isContextCompactionRun } from "../context-compaction.js";
@@ -130,9 +133,11 @@ import {
   hasAcceptedSemanticResult,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
+  readFailedTurnStreamedAnswer,
   readTruncatedCompletedAgentMessageItemId,
   readTruncatedCompletedAssistantMessageCandidate,
   selectHeartbeatRunFinalAgentMessage,
+  type CompletedFinalAgentMessageCandidate,
   type RunPresentationDecision,
 } from "../heartbeat-run-summary.js";
 import {
@@ -2428,6 +2433,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         id: issueComments.id,
         body: issueComments.body,
         presentation: issueComments.presentation,
+        // H5 round 2: part metadata, so a multipart answer is read back whole.
+        metadata: issueComments.metadata,
       })
       .from(issueComments)
       .where(
@@ -2435,6 +2442,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
           eq(issueComments.companyId, companyId),
           eq(issueComments.issueId, issueId),
           eq(issueComments.createdByRunId, runId),
+          isNull(issueComments.deletedAt),
         ),
       )
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id));
@@ -2444,7 +2452,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
   async function findLatestCompletedFinalAgentMessage(
     runId: string,
     companyId: string,
-  ) {
+  ): Promise<(CompletedFinalAgentMessageCandidate & { reasonCode?: string }) | null> {
     const rows = await db
       .select({
         seq: heartbeatRunEvents.seq,
@@ -2531,10 +2539,48 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
               "semantic_result_missing",
           )?.seq ?? null,
       );
-    return selectHeartbeatRunFinalAgentMessage({
+    const selected = selectHeartbeatRunFinalAgentMessage({
       candidates,
       semanticResultRecoveryAfterSeq: recoveryBoundary,
     });
+    // dl-n5-cont (Paul NOTE 5): a turn that streamed its answer and then
+    // failed (pi_output_truncated at the output cap, a provider EOF) has no
+    // completed answer. Its streamed prefix, rebuilt from the stored deltas,
+    // is posted first, with one true note; the continuation picks up at its end.
+    // dl-n5-cont4 (rf-2 D-completed-first): the failed turn is checked BEFORE
+    // a completed candidate wins. When the selected completed item is one of
+    // that failed turn's own items (or there is none), the reply is ALL the
+    // turn's answer items in order, completed and streamed, posted whole once;
+    // the completed item is inside it, never posted on its own as well. A
+    // completed answer of an EARLIER turn keeps its selection unchanged.
+    const streamedRows = await readRunAnswerEvents(db, companyId, runId);
+    // The last cut of the ONE automatic successor ends the lane, whatever
+    // kind its parent was. Publish its note even with no answer text; with
+    // text, keep it whole but never promise another automatic continuation.
+    const exhaustedCut = await readExhaustedNativeMidStreamCutCandidate(db, { companyId, runId }, streamedRows);
+    if (exhaustedCut) return exhaustedCut;
+    // The generic failed-turn lane spends the same one-retry budget, but has
+    // no cut candidate (for example a runner exit with no provider text).
+    const exhaustedFailedTurn = await readExhaustedNativeFailedTurnCandidate(db, { companyId, runId }, streamedRows);
+    if (exhaustedFailedTurn) return exhaustedFailedTurn;
+    const cut = readFailedTurnStreamedAnswer(streamedRows);
+    // Account rejections never enter the cut lane. Keep the provider's own
+    // failure text on the normal attributed reply, rather than leaving its
+    // message unanswered or promising to continue a rejected request.
+    const accountFailure = readNativeProviderAccountFailureCandidate(streamedRows);
+    // compose: every other candidate here carries a reasonCode; this one has
+    // none (unchanged at runtime). Say so in the type, so the function's
+    // inferred result keeps `reasonCode` as a known property for its callers.
+    if (accountFailure && (!selected || (cut && selected.seq >= cut.startSeq))) {
+      return accountFailure as typeof accountFailure & { reasonCode?: string };
+    }
+    if (cut && (!selected || selected.seq >= cut.startSeq)) return cut.candidate;
+    if (selected) return selected;
+    // dl-n5-cont2 item 3: the turn stopped at the output cap having streamed
+    // no answer text. The person gets ONE true note (with Retry when the one
+    // automatic continuation stopped the same way), never a resend notice.
+    const capStop = await readThinkingCapStop(db, { companyId, runId });
+    return capStop ? thinkingCapStopCandidate(capStop) : null;
   }
 
   async function refreshContinuationSummaryForRun(

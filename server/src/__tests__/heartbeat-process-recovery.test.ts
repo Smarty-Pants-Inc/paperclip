@@ -15817,7 +15817,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await commitNativeStatusDecision({ db, companyId: fixture.companyId, issueId: fixture.issueId, runId: fixture.runId,
       assessmentId: coordinator!.assessmentId!, priorStatus: issue!.status, priorStatusVersion: issue!.statusVersion,
       priorDecisionId: issue!.lastStatusDecisionId,
-      decision: { policyVersion: "phase6-v14", statusAction: "in_progress", toStatus: "in_progress",
+      decision: { policyVersion: "phase6-v15", statusAction: "in_progress", toStatus: "in_progress",
         reasonCode: "board_response_waiting", unblockDescriptor: null, effects: [] },
       requireBoardResponseWaitSource: source!.source, requireBoardResponseWaitOrigin: origin!,
     });
@@ -16441,7 +16441,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         priorStatusVersion: issue!.statusVersion,
         priorDecisionId: issue!.lastStatusDecisionId,
         decision: {
-          policyVersion: "phase6-v14",
+          policyVersion: "phase6-v15",
           statusAction: reasonCode === "prior_status_preserved_no_live_path" ? "preserve" : "in_progress",
           toStatus: "in_progress",
           reasonCode,
@@ -17684,7 +17684,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.update(issueQuestionResponseDeliveries).set({ payloadSha256: "changed" }).where(eq(issueQuestionResponseDeliveries.id, f.deliveryId));
     await expect(commitNativeStatusDecision({ db, companyId: f.companyId, issueId: f.issueId, runId: f.runId, assessmentId: coordinator!.assessmentId!,
       priorStatus: issue!.status, priorStatusVersion: issue!.statusVersion, priorDecisionId: issue!.lastStatusDecisionId,
-      decision: { policyVersion: "phase6-v14", statusAction: "in_progress", toStatus: "in_progress", reasonCode: "native_plan_accepted_waiting_for_continuation", unblockDescriptor: null, effects: [] },
+      decision: { policyVersion: "phase6-v15", statusAction: "in_progress", toStatus: "in_progress", reasonCode: "native_plan_accepted_waiting_for_continuation", unblockDescriptor: null, effects: [] },
       requirePlanWaitSource: f.proof.source })).rejects.toBeInstanceOf(NativeStatusRaceError);
     expect(await db.select().from(statusDecisions).where(eq(statusDecisions.runId, f.runId))).toHaveLength(0);
     expect(await db.select().from(issueComments).where(eq(issueComments.createdByRunId, f.runId))).toHaveLength(0);

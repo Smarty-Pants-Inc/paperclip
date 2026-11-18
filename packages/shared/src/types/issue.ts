@@ -1269,6 +1269,8 @@ export interface IssueCommentMetadata {
   recoveryResponsibility?: "system" | "user";
   /** Generated file-preparation receipt; presentation only, never authorization. */
   attachmentPreparation?: { attachmentId: string };
+  /** H5: one part of ONE logical answer posted in ordered parts (see the validator). */
+  answerPart?: { answerId: string; index: number; count: number; label: string; prefix: string; suffix: string };
   /** Later state appends a notice; the original body remains conversation history. */
   supersededByCommentId?: string;
   /** Inbound channel attribution; never an authorization input. */

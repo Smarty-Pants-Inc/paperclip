@@ -635,7 +635,7 @@ describe("native status authority", () => {
       expect.objectContaining({
         statusAction: "blocked",
         toStatus: "blocked",
-        policyVersion: "phase6-v14",
+        policyVersion: "phase6-v15",
         reasonCode: "current_track_blocker_waiting",
         unblockDescriptor: {
           owner: "board",

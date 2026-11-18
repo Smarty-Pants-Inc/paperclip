@@ -3,14 +3,20 @@ import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
 import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE, PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "./native-provider-failure.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_ACTION, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE,
   NATIVE_ENVIRONMENT_BLOCKER_MAX_RETRIES } from "./native-environment-blocker.js";
+import { NATIVE_MID_STREAM_CUT_CODE, type NativeMidStreamCut } from "./native-mid-stream-cut-cause.js";
 
-export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v14";
+export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v15";
 
 /** The automatic continuation after a failed turn is used once per chain. */
 export const NATIVE_RUN_FAILED_RETRY_CAUSE = "native_run_failed";
 export const NATIVE_RESPONSE_WAKE_WAITING_REASON = "response_wake_waiting_for_input";
 export const NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION =
   "The agent's turn failed again after Paperclip continued it automatically. The saved work is kept. Check the failed run, then Retry the task.";
+
+/** An account rejection (billing, quota hard limit, credentials, permission): a person's action, never an automatic successor. */
+export const NATIVE_PROVIDER_ACCOUNT_FAILURE_CODE = "native_provider_account_failure";
+export const NATIVE_PROVIDER_ACCOUNT_FAILURE_ACTION =
+  "The model provider rejected this request for an account reason (billing, quota or credentials). Paperclip did not retry it. Fix the provider account, then Retry the task.";
 
 export type NativeAuthoritativeIssueStatus =
   | "backlog"
@@ -269,6 +275,19 @@ export function arbitrateNativeStatus(input: {
    * Another failure needs a person's Retry, never another automatic wake.
    */
   failedTurnContinuationUsed?: boolean;
+  /**
+   * How the provider cut this failed turn mid-stream (an output-cap stop, an
+   * EOF or other provider error, a refusal), re-derived from the run's own
+   * persisted turn events. Null for every other failure.
+   */
+  midStreamCut?: NativeMidStreamCut | null;
+  /**
+   * The failed turn ended with the provider rejecting the ACCOUNT (billing,
+   * quota hard limit, credentials, permission), re-derived from the run's own
+   * persisted turn events. The same request is rejected again until a person
+   * acts on the account, so it never gets an automatic successor.
+   */
+  providerAccountFailure?: boolean;
   agentId: string;
   priorIssueStatus: NativeAuthoritativeIssueStatus;
 }): NativeStatusDecision {
@@ -337,7 +356,8 @@ export function arbitrateNativeStatus(input: {
   }
   // A refused request must never enter either generic continuation or capacity
   // retry. Keep review authority intact; otherwise bind the existing board hold.
-  if (input.providerPolicyRefused && input.terminalState === "failed") {
+  // A cut the cut lane reads as a refusal is this same decision: one code, one note.
+  if ((input.providerPolicyRefused || input.midStreamCut === "provider_refusal") && input.terminalState === "failed") {
     if (input.nativeReviewOutcome) return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
       statusAction: "preserve", toStatus: input.priorIssueStatus,
@@ -349,6 +369,24 @@ export function arbitrateNativeStatus(input: {
       statusAction: "blocked", toStatus: "blocked", reasonCode: PROVIDER_POLICY_REFUSAL_CODE,
       unblockDescriptor: { owner: "board", action: PROVIDER_POLICY_REFUSAL_MESSAGE },
       effects: [{ kind: "bind_blocker", owner: "board", action: PROVIDER_POLICY_REFUSAL_MESSAGE }],
+    };
+  }
+  // An account rejection has NO automatic successor of any kind: no generic
+  // retry, no cut-lane recovery, no capacity retry, no continuation. The
+  // person gets the provider's own text once (the failed run's attributed
+  // reply) and the next attempt is theirs, after the account is fixed.
+  if (input.providerAccountFailure && input.terminalState === "failed") {
+    if (input.nativeReviewOutcome) return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: NATIVE_PROVIDER_ACCOUNT_FAILURE_CODE, unblockDescriptor: null,
+      effects: [{ kind: "release_checkout" }],
+    };
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "blocked", toStatus: "blocked", reasonCode: NATIVE_PROVIDER_ACCOUNT_FAILURE_CODE,
+      unblockDescriptor: { owner: "board", action: NATIVE_PROVIDER_ACCOUNT_FAILURE_ACTION },
+      effects: [{ kind: "bind_blocker", owner: "board", action: NATIVE_PROVIDER_ACCOUNT_FAILURE_ACTION }],
     };
   }
   if (input.providerModelRejected && input.terminalState === "failed" &&
@@ -442,6 +480,26 @@ export function arbitrateNativeStatus(input: {
         reasonCode: "native_run_failed_continuation_exhausted",
         unblockDescriptor: { owner: "board", action: NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION },
         effects: [{ kind: "bind_blocker", owner: "board", action: NATIVE_RUN_FAILED_CONTINUATION_EXHAUSTED_ACTION }],
+      };
+    }
+    if (input.midStreamCut) {
+      // A mid-stream cut has ONE automatic successor, and it is the recovery
+      // run (at 'high' after a cap stop with no text: a new process on the
+      // SAME conversation; the cut turn is not sent), never the generic wake below.
+      return {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "preserve",
+        toStatus: input.priorIssueStatus,
+        reasonCode: "run_failed_partial_evidence_preserved",
+        unblockDescriptor: null,
+        effects: [{
+          kind: "schedule_retry",
+          cause: NATIVE_MID_STREAM_CUT_CODE,
+          summary: input.midStreamCut === "output_cap_no_text"
+            ? "Recover the output-cap stop once: a new process on the SAME conversation; the cut turn is not sent."
+            : "Recover the cut turn once.",
+          agentId: input.agentId,
+        }],
       };
     }
     return {

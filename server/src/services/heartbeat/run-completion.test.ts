@@ -19,7 +19,7 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { createNativeRunLogCoverageVerifier, formatNativeRunLogEvent } from "../native-runtime/native-run-log-export.js";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, authUsers, agentWakeupRequests, approvals, issueApprovals, budgetReservations, caseHandoffs, cases, companies, completionContracts, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, heartbeatRunEvents, issueComments, issueQuestionResponseDeliveries, issueRecoveryActions, issues, issueThreadInteractions, nativeRunFinalizations } from "@paperclipai/db";
-import { and, eq, sql } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import * as usageReceipts from "../usage-receipts.js";
@@ -62,6 +62,7 @@ import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-mes
 import { NativeRunCoordinatorStore } from "../native-runtime/native-run-coordinator-store.js";
 import { finalizeNativeRun, NativeFinalizationDeferredError, recoverCommittedNativeChatResponse } from "../native-runtime/native-run-finalizer.js";
 import { nativeResponsePresentationWork } from "../native-runtime/native-response-presentation-work.js";
+import { issueService } from "../issues.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -653,6 +654,597 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     // The posted answer (or the run's own card) is the turn's response: the
     // conversation waits for the person.
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].conversationState).toBe("waiting");
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  // dl-n5-cont (Paul NOTE 5; gate 1 run 00e31d20): a chat turn that streamed
+  // items 0001-0262 and then FAILED at the output cap posted nothing. A failed
+  // run's streamed prefix is its reply: posted once, before any continuation.
+  it.each([true, false])("dl-n5-cont posts a failed chat turn's streamed prefix once (streamed answer: %s)", async (streamed) => {
+    const f = await fixture({ runtimeMode: "native" }, `CUT${randomUUID().slice(0, 5)}`);
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Chat with CEO",
+      status: "in_progress", assigneeAgentId: f.agent.id, responsibleUserId: "local-board",
+      conversationAgentId: f.agent.id, conversationUserId: "local-board", conversationState: "active" }).returning();
+    await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, responsibleUserId: "local-board",
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.run.id));
+    f.input.issueId = issue.id;
+    f.input.issueRef = issue;
+    f.input.issueContext = await createHeartbeatRunPreparation(db).getIssueExecutionContext(f.run.companyId, issue.id);
+    f.input.adapterResult = { ...f.input.adapterResult, exitCode: 1, errorCode: "pi_output_truncated",
+      errorMessage: "Pi's final assistant response reached its output limit.", resultJson: {} };
+    const item = (n: number) => `Item ${String(n).padStart(4, "0")}: ${"body text of this numbered item; ".repeat(7)}\n`;
+    const prefix = Array.from({ length: 262 }, (_, i) => item(i + 1)).join("");
+    const turnId = "turn-1", itemId = "turn-1:pi-message:2:block:0";
+    const rows = [
+      ...(streamed ? [{ seq: 1, payload: { prpEvent: { eventType: "item.delta", itemId, turnId, payload: { kind: "agentMessage", text: prefix } } } }] : []),
+      { seq: 2, payload: { prpEvent: { eventType: "turn.failed", turnId, payload: { error: { code: "pi_output_truncated" } } } } },
+    ];
+    const { readFailedTurnStreamedAnswer } = await import("../heartbeat-run-summary.js");
+    f.deps.findLatestCompletedFinalAgentMessage.mockResolvedValue(readFailedTurnStreamedAnswer(rows)?.candidate ?? null);
+    f.deps.issuesSvc.addComment.mockImplementation(async (issueId, body) => {
+      const [comment] = await db.insert(issueComments).values({ companyId: f.run.companyId, issueId,
+        authorAgentId: f.agent.id, authorType: "agent", createdByRunId: f.run.id, body }).returning();
+      return { ...comment, authorType: "agent" as const };
+    });
+
+    await f.completion.completeRun(f.input);
+
+    const posted = (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id)))
+      .filter(comment => comment.createdByRunId === f.run.id);
+    expect((await read(f.run.id)).status).toBe("failed");
+    if (!streamed) {
+      // Nothing streamed: no reply here; the unanswered-message notice stays the true note.
+      expect(posted).toHaveLength(0);
+      return;
+    }
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body.startsWith(prefix)).toBe(true);
+    expect(posted[0]!.body.slice(prefix.length)).toMatch(/output limit/u);
+    expect(posted[0]!.body).not.toMatch(/wasn't answered|Sending it again is safe/u);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  // H5: exercise stored pi_rpc events -> real candidate selection -> successful
+  // completion -> real comment service -> PostgreSQL read-back (not mock bodies).
+  const h5Answer = "0123456789abcdef\n".repeat(Math.ceil(300 * 1024 / 17)).slice(0, 300 * 1024);
+  it.each([
+    { storage: "intact", name: "300 KiB intact", answer: h5Answer },
+    { storage: "rebuilt", name: "300 KiB rebuilt", answer: h5Answer },
+    { storage: "projected", name: "300 KiB projector preview", answer: h5Answer },
+    { storage: "intact", name: "under limit unchanged", answer: "  A complete short answer.\n\n" },
+    { storage: "intact", name: "exactly at limit", answer: "x".repeat(250 * 1024) },
+    { storage: "intact", name: "multi-byte boundary", answer: "😀漢é".repeat(40_000) },
+    { storage: "rebuilt", name: "code fence spanning boundary", answer: `\`\`\`ts\n${h5Answer}\n\`\`\`\n`, fence: "```", opening: "```ts" },
+    { storage: "intact", name: "tilde fence spanning boundary", answer: `~~~~js\n${h5Answer}\n~~~~\n`, fence: "~~~~", opening: "~~~~js" },
+  ])("H5 completed final $name posts whole in ordered parts", async ({ storage, answer, name, fence, opening }) => {
+    const f = await fixture({ runtimeMode: "native" }, `H5${randomUUID().slice(0, 5)}`, true);
+    await db.insert(authUsers).values({ id: "local-board", name: "Board", email: "h5-board@example.test",
+      createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Chat with CEO",
+      status: "in_progress", assigneeAgentId: f.agent.id, responsibleUserId: "local-board",
+      conversationAgentId: f.agent.id, conversationUserId: "local-board", conversationState: "active" }).returning();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, f.agent.id));
+    await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, responsibleUserId: "local-board",
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.run.id));
+    f.input.issueId = issue.id;
+    f.input.issueRef = issue;
+    f.input.issueContext = await createHeartbeatRunPreparation(db).getIssueExecutionContext(f.run.companyId, issue.id);
+    f.input.adapterResult.resultJson = { nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Short summary must not replace the answer." } };
+    f.deps.issuesSvc.addComment.mockImplementation(issueService(db).addComment);
+    const turnId = `runner:${f.run.id}:turn-1`, itemId = `${turnId}:pi-message:2:block:0`;
+    const base = { companyId: f.run.companyId, runId: f.run.id, agentId: f.agent.id, stream: "system", level: "info", message: "e" };
+    const events: (typeof heartbeatRunEvents.$inferInsert)[] = [];
+    let seq = 1;
+    for (let offset = 0; offset < answer.length;) {
+      let end = Math.min(answer.length, offset + 4_001);
+      if (end < answer.length && /[\uD800-\uDBFF]/u.test(answer[end - 1]!)) end--;
+      events.push({ ...base, seq: seq++, eventType: "item.delta",
+        payload: { prpEvent: { eventType: "item.delta", itemId, turnId, payload: { kind: "agentMessage", channel: "progress", text: answer.slice(offset, end) } } } });
+      offset = end;
+    }
+    events.push({ ...base, seq: seq++, eventType: "item.completed", payload: { prpEvent: { eventType: "item.completed", itemId, turnId,
+      payload: storage === "intact" ? { kind: "agentMessage", channel: "final", text: answer }
+        : storage === "projected" ? { kind: "agentMessage", channel: "final", text: `This answer is longer than one message (308 KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n${answer.slice(0, 16 * 1024)}`,
+          fullText: { path: "/runner-private/spill.txt", sha256: createHash("sha256").update(answer).digest("hex"), bytes: Buffer.byteLength(answer) } }
+        : { truncated: true, byteSize: Buffer.byteLength(answer) } } } });
+    events.push({ ...base, seq: seq++, eventType: "turn.completed", payload: { prpEvent: { eventType: "turn.completed", turnId, payload: {} } } });
+    await db.insert(heartbeatRunEvents).values(events);
+    await db.update(heartbeatRuns).set({ nextEventSeq: seq }).where(eq(heartbeatRuns.id, f.run.id));
+    await f.completion.completeRun(f.input);
+    const posted = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id), eq(issueComments.createdByRunId, f.run.id)))
+      .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+    if (process.env.H5_EVIDENCE_DIR) {
+      const evidenceDir = join(process.env.H5_EVIDENCE_DIR, name.replaceAll(" ", "-"));
+      await fs.mkdir(evidenceDir, { recursive: true });
+      for (const [i, comment] of posted.entries()) await fs.writeFile(join(evidenceDir, `part-${i + 1}.txt`), comment.body);
+    }
+    expect((await read(f.run.id)).status).toBe("succeeded");
+    expect(f.input.onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining("Failed to resolve run presentation"));
+    const multiple = Buffer.byteLength(answer) > 250 * 1024;
+    if (multiple) expect(posted.length).toBeGreaterThan(1);
+    else expect(posted).toHaveLength(1);
+    const payloads = posted.map((comment, i) => {
+      expect(comment.body.startsWith(`part ${i + 1} of ${posted.length}\n`)).toBe(multiple);
+      expect(Buffer.byteLength(comment.body)).toBeLessThanOrEqual(250 * 1024);
+      expect(comment.body).not.toContain("The full text is kept");
+      expect(Buffer.from(comment.body).toString("utf8")).toBe(comment.body);
+      let payload = comment.body.replace(/^part \d+ of \d+\n/u, "");
+      if (fence) {
+        // Each code part renders independently. Discard only the known
+        // synthetic fence wrappers to recover the byte-identical source.
+        expect(payload.startsWith(`${opening}\n`)).toBe(true);
+        expect(payload.trimEnd().endsWith(fence)).toBe(true);
+        if (i > 0) payload = payload.slice(opening!.length + 1);
+        if (i < posted.length - 1) payload = payload.slice(0, -(fence.length + 1));
+      }
+      return payload;
+    });
+    if (process.env.H5_EVIDENCE_DIR) {
+      const evidenceDir = join(process.env.H5_EVIDENCE_DIR, name.replaceAll(" ", "-"));
+      await fs.mkdir(evidenceDir, { recursive: true });
+      await fs.writeFile(join(evidenceDir, "stored-answer.txt"), answer);
+      await fs.writeFile(join(evidenceDir, "receipt.json"), JSON.stringify({ storage, name, status: (await read(f.run.id)).status,
+        answerBytes: Buffer.byteLength(answer), answerSha256: createHash("sha256").update(answer).digest("hex"),
+        comments: posted.map(comment => ({ id: comment.id, bytes: Buffer.byteLength(comment.body), createdAt: comment.createdAt,
+          sha256: createHash("sha256").update(comment.body).digest("hex") })),
+        reconstructedSha256: createHash("sha256").update(payloads.join("")).digest("hex") }, null, 2));
+    }
+    const storedDeltas = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.run.id), eq(heartbeatRunEvents.eventType, "item.delta"))).orderBy(asc(heartbeatRunEvents.seq));
+    const storedAnswer = storedDeltas.map(row => (row.payload as { prpEvent: { payload: { text: string } } }).prpEvent.payload.text).join("");
+    expect(Buffer.from(payloads.join("")).equals(Buffer.from(storedAnswer))).toBe(true);
+    // A replay of the same final must reuse the durable receipt, not any part.
+    await issueService(db).addComment(issue.id, storedAnswer, { agentId: f.agent.id, runId: f.run.id }, { completionReply: true });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))).toHaveLength(posted.length);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  // dl-n5-cont3 F1 + F4 (judge rf-2): at 300 KiB the person saw a 16 KB
+  // excerpt while the continuation quoted the end of the FULL prefix. The
+  // "whole once" check now reads the POSTED comments back from the DB: the
+  // first reply holds the whole prefix, the quoted ending is that reply's
+  // ending, and the replies together hold every item exactly once, in order.
+  it("dl-n5-cont3 F1/F4 RED: a 300 KiB cut answer is posted whole; the posted comments hold the answer once, in order", async () => {
+    const f = await fixture({ runtimeMode: "native" }, `CUT${randomUUID().slice(0, 5)}`);
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Chat with CEO",
+      status: "in_progress", assigneeAgentId: f.agent.id, responsibleUserId: "local-board",
+      conversationAgentId: f.agent.id, conversationUserId: "local-board", conversationState: "active" }).returning();
+    await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, responsibleUserId: "local-board",
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.run.id));
+    f.input.issueId = issue.id;
+    f.input.issueRef = issue;
+    f.input.issueContext = await createHeartbeatRunPreparation(db).getIssueExecutionContext(f.run.companyId, issue.id);
+    f.input.adapterResult = { ...f.input.adapterResult, exitCode: 1, errorCode: "pi_output_truncated",
+      errorMessage: "Pi's final assistant response reached its output limit.", resultJson: {} };
+    const item = (n: number) => `Item ${String(n).padStart(4, "0")}: ${"body text of this numbered item; ".repeat(7)}\n`;
+    const whole = Array.from({ length: 1_500 }, (_, i) => item(i + 1)).join("");
+    const streamed = 1_300;
+    const prefix = Array.from({ length: streamed }, (_, i) => item(i + 1)).join("");
+    expect(Buffer.byteLength(prefix)).toBeGreaterThan(300 * 1024);
+    const turnId = "turn-1", itemId = "turn-1:pi-message:2:block:0";
+    const rows: { seq: number; payload: unknown }[] = [];
+    let seq = 1;
+    for (let offset = 0; offset < prefix.length; offset += 4_001) rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta",
+      itemId, turnId, payload: { kind: "agentMessage", channel: "progress", text: prefix.slice(offset, offset + 4_001) } } } });
+    rows.push({ seq: seq++, payload: { prpEvent: { eventType: "turn.failed", turnId, payload: { error: { code: "pi_output_truncated" } } } } });
+    const { readFailedTurnStreamedAnswer, cutAnswerContinuationInstruction } = await import("../heartbeat-run-summary.js");
+    const cut = readFailedTurnStreamedAnswer(rows)!;
+    f.deps.findLatestCompletedFinalAgentMessage.mockResolvedValue(cut.candidate);
+    f.deps.issuesSvc.addComment.mockImplementation(async (issueId, body) => {
+      const [comment] = await db.insert(issueComments).values({ companyId: f.run.companyId, issueId,
+        authorAgentId: f.agent.id, authorType: "agent", createdByRunId: f.run.id, body }).returning();
+      return { ...comment, authorType: "agent" as const };
+    });
+
+    await f.completion.completeRun(f.input);
+
+    const postedByRun = (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id)))
+      .filter(comment => comment.createdByRunId === f.run.id);
+    expect(postedByRun).toHaveLength(1);
+    const NOTE = /\n+— The answer stopped here because it hit the model's output limit\. Paperclip is continuing it from exactly this point in the next reply\.$/u;
+    expect(postedByRun[0]!.body).toMatch(NOTE);
+    const shown = postedByRun[0]!.body.replace(NOTE, "\n");
+    expect(shown).toBe(prefix);
+    // The continuation is told an ending the person really saw.
+    const instruction = cutAnswerContinuationInstruction({ text: cut.text, cause: cut.cause, posted: true });
+    const quoted = /<<<END OF POSTED TEXT\n([\s\S]*)\nEND OF POSTED TEXT>>>/u.exec(instruction)![1]!;
+    expect(shown.endsWith(quoted)).toBe(true);
+    // A continuation that follows it posts the rest from the next words after that ending.
+    await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: issue.id, authorAgentId: f.agent.id,
+      authorType: "agent", body: whole.slice(whole.indexOf(quoted) + quoted.length), createdAt: new Date(Date.now() + 60_000) });
+    const replies = (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))
+      .orderBy(asc(issueComments.createdAt), asc(issueComments.id))).filter(comment => comment.authorAgentId === f.agent.id);
+    const answer = replies.map(comment => comment.body.replace(NOTE, "\n")).join("");
+    expect(answer).toBe(whole);
+    for (const n of [1, 700, streamed, streamed + 1, 1_500]) expect(answer.split(item(n)).length - 1).toBe(1);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  // dl-n5-cont4 (judge rf-2 'JUDGE real DB completion D-completed-first', 3x5):
+  // a failed turn whose FIRST answer item completed and whose SECOND item only
+  // streamed. The real lifecycle selection (no mock) returned the completed item
+  // first, so item B was lost, and the recovery opening then said none of the
+  // answer was shown. The run's events are real DB rows; the posted comments
+  // are read back from the DB.
+  // dl-n5-cont5: `message`/`block` place the item at '<turn>:pi-message:N:block:M'
+  // (default: message index+1, block 0); `kind` is its agent-message spelling.
+  type AnswerItem = { text: string; completed: boolean; message?: number; block?: number; kind?: "agentMessage" | "assistant_message" };
+  async function failedTurnRealCompletion(items: AnswerItem[], terminal: "turn.failed" | "turn.completed" = "turn.failed", realAddComment = false) {
+    const f = await fixture({ runtimeMode: "native" }, `CF${randomUUID().slice(0, 5)}`, true);
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Chat with CEO",
+      status: "in_progress", assigneeAgentId: f.agent.id, responsibleUserId: "local-board",
+      conversationAgentId: f.agent.id, conversationUserId: "local-board", conversationState: "active" }).returning();
+    await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, responsibleUserId: "local-board",
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.run.id));
+    f.input.issueId = issue.id;
+    f.input.issueRef = issue;
+    f.input.issueContext = await createHeartbeatRunPreparation(db).getIssueExecutionContext(f.run.companyId, issue.id);
+    f.input.adapterResult = terminal === "turn.failed"
+      ? { ...f.input.adapterResult, exitCode: 1, errorCode: "pi_output_truncated",
+        errorMessage: "Pi's final assistant response reached its output limit.", resultJson: {} }
+      : { ...f.input.adapterResult, resultJson: {} };
+    const turnId = `runner-1:${f.run.id}:turn-1`;
+    const base = { companyId: f.run.companyId, runId: f.run.id, agentId: f.agent.id, stream: "system", level: "info", message: "e" };
+    const events: (typeof heartbeatRunEvents.$inferInsert)[] = [];
+    let seq = 1 + Number((await db.select({ max: sql<number>`coalesce(max(${heartbeatRunEvents.seq}), 0)` }).from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, f.run.id)))[0]!.max);
+    items.forEach((item, index) => {
+      const itemId = `${turnId}:pi-message:${item.message ?? index + 1}:block:${item.block ?? 0}`;
+      const kind = item.kind ?? "agentMessage";
+      for (let offset = 0; offset < item.text.length; offset += 1_009) events.push({ ...base, seq: seq++, eventType: "item.delta",
+        payload: { prpEvent: { eventType: "item.delta", itemId, turnId,
+          payload: { kind, channel: "final", text: item.text.slice(offset, offset + 1_009) } } } });
+      if (item.completed) events.push({ ...base, seq: seq++, eventType: "item.completed",
+        payload: { prpEvent: { eventType: "item.completed", itemId, turnId,
+          payload: { kind, channel: "final", text: item.text } } } });
+    });
+    events.push({ ...base, seq: seq++, eventType: terminal, payload: { prpEvent: { eventType: terminal, turnId,
+      payload: terminal === "turn.failed" ? { error: { code: "pi_output_truncated" } } : {} } } });
+    await db.insert(heartbeatRunEvents).values(events);
+    await db.update(heartbeatRuns).set({ nextEventSeq: seq }).where(eq(heartbeatRuns.id, f.run.id));
+    f.deps.issuesSvc.addComment.mockImplementation(async (issueId, body) => {
+      const [comment] = await db.insert(issueComments).values({ companyId: f.run.companyId, issueId,
+        authorAgentId: f.agent.id, authorType: "agent", createdByRunId: f.run.id, body }).returning();
+      return { ...comment, authorType: "agent" as const };
+    });
+    // H5 round 2: through the REAL addComment (its multipart path), not a direct insert.
+    if (realAddComment) f.deps.issuesSvc.addComment.mockImplementation(issueService(db).addComment);
+    await f.completion.completeRun(f.input);
+    const posted = (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))
+      .orderBy(asc(issueComments.createdAt), asc(issueComments.id))).filter(comment => comment.createdByRunId === f.run.id);
+    return { f, issue, posted };
+  }
+  const CUT_NOTE = /\n+— The answer stopped here because it hit the model's output limit\. Paperclip is continuing it from exactly this point in the next reply\.$/u;
+  const answerItem = (label: string, bytes: number) => {
+    const line = (n: number) => `${label} line ${String(n).padStart(4, "0")}: ${"text of this answer item; ".repeat(3)}\n`;
+    let text = "";
+    for (let n = 1; Buffer.byteLength(text) < bytes; n++) text += line(n);
+    return text;
+  };
+  const occurrences = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+  async function recoveryOpening(runId: string, companyId: string) {
+    const { readSourceRunCutAnswer } = await import("../fresh-continuation-fallback.js");
+    const { cutAnswerContinuationInstruction } = await import("../heartbeat-run-summary.js");
+    const cut = await readSourceRunCutAnswer(db, { id: runId, companyId });
+    if (!cut || "thinkingOnlyCapStop" in cut) throw new Error("expected a cut answer");
+    return { cut, opening: cutAnswerContinuationInstruction(cut) };
+  }
+
+  // H5 round 2 (review-fleet-2 F1/F2/F3): a multipart answer is ONE logical
+  // response. Everything below posts through the REAL addComment into real
+  // Postgres and reads back through the real lifecycle findRunIssueComment and
+  // the real resolver; no comment row is inserted directly.
+  async function chatRunForReply() {
+    const f = await fixture({ runtimeMode: "native" }, `WP${randomUUID().slice(0, 5)}`, true);
+    await db.insert(authUsers).values({ id: "local-board", name: "Board", email: "wp-board@example.test",
+      createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Chat with CEO",
+      status: "in_progress", assigneeAgentId: f.agent.id, responsibleUserId: "local-board",
+      conversationAgentId: f.agent.id, conversationUserId: "local-board", conversationState: "active" }).returning();
+    await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, responsibleUserId: "local-board",
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.run.id));
+    const post = (body: string, completionReply = true) =>
+      issueService(db).addComment(issue.id, body, { agentId: f.agent.id, runId: f.run.id }, { completionReply });
+    // The task-run REPLY: findRunIssueComment (descending) -> the resolver.
+    const reply = async () => {
+      const comment = await f.deps.findRunIssueComment(f.run.id, f.run.companyId, issue.id, {});
+      const { resolveHeartbeatRunResponse } = await import("../heartbeat-run-summary.js");
+      return { comment, resolved: resolveHeartbeatRunResponse({ resultJson: {}, existingComment: comment }) };
+    };
+    const rows = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id),
+      eq(issueComments.createdByRunId, f.run.id))).orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+    return { f, issue, post, reply, rows };
+  }
+  const probeAnswer = (bytes: number) => {
+    let text = "";
+    for (let n = 1; Buffer.byteLength(text) < bytes; n++) text += `Line ${String(n).padStart(6, "0")} of the long answer — détails ✓\n`;
+    return text;
+  };
+  const sameBytes = (a: string | null | undefined, b: string) => Buffer.from(a ?? "").equals(Buffer.from(b));
+
+  it.each([
+    { name: "300 KiB", answer: probeAnswer(300 * 1024) },
+    { name: "1 MiB", answer: probeAnswer(1024 * 1024) },
+    { name: "code fence spanning a part boundary", answer: `Intro\n\n\`\`\`ts\n${probeAnswer(300 * 1024)}\`\`\`\n\nAfter the fence.\n` },
+  ])("PROBE task-run reply must be whole: $name via the real addComment", async ({ answer }) => {
+    const { post, reply, rows } = await chatRunForReply();
+    const receipt = await post(answer);
+    const posted = await rows();
+    expect(posted.length).toBeGreaterThan(1);
+    // F1 first: the task-run reply is the WHOLE answer, not its last part.
+    const { comment, resolved } = await reply();
+    expect(Buffer.byteLength(resolved.text ?? "")).toBe(Buffer.byteLength(answer));
+    expect(sameBytes(resolved.text, answer)).toBe(true);
+    // addComment: first part keeps the single-comment shape; ordered receipt of ALL parts.
+    expect(receipt.id).toBe(posted[0]!.id);
+    expect(receipt.answerPartCommentIds).toEqual(posted.map(row => row.id));
+    for (const [i, row] of posted.entries()) {
+      expect(row.body.startsWith(`part ${i + 1} of ${posted.length}\n`)).toBe(true);
+      expect(row.metadata?.answerPart).toMatchObject({ index: i + 1, count: posted.length, answerId: posted[0]!.metadata!.answerPart!.answerId });
+    }
+    expect(comment!.id).toBe(posted[0]!.id);
+    expect(comment!.answerPartCommentIds).toEqual(posted.map(row => row.id));
+    expect(sameBytes(comment!.body, answer)).toBe(true);
+    expect(resolved.decision.commentAction).toBe("reuse");
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it.each(["case", "numbers", "unknown label", "wrapper"])(
+    "rf-2 (c): a damaged %s never makes the last physical part the reply", async (damage) => {
+      const answer = `\`\`\`ts\n${probeAnswer(300 * 1024)}\`\`\`\ntail\n`;
+      const { post, reply, rows } = await chatRunForReply();
+      await post(answer);
+      const posted = await rows();
+      const first = posted[0]!;
+      const part = first.metadata!.answerPart!;
+      const body = damage === "case" ? first.body.replace(/^part /u, "pArt ")
+        : damage === "numbers" ? first.body.replace(/^part \d+ of \d+/u, "part 999 of 1000")
+        : damage === "unknown label" ? `edited label\n${first.body.slice(part.label.length)}`
+        : `${first.body.slice(0, -part.suffix.length)}damaged closing wrapper`;
+      await db.update(issueComments).set({ body }).where(eq(issueComments.id, first.id));
+      const { comment, resolved } = await reply();
+      const expected = damage === "case" || damage === "numbers" ? answer
+        : (await rows()).map(row => row.body).join("");
+      expect(sameBytes(resolved.text, expected)).toBe(true);
+      expect(comment!.id).toBe(first.id);
+      expect(comment!.answerPartCommentIds).toEqual(posted.map(row => row.id));
+      expect(resolved.text).not.toBe(posted.at(-1)!.body);
+    }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it.each(["missing", "duplicate", "soft-deleted", "invalid index"])(
+    "rf-2: a %s answer part resolves to C1, never one physical part", async (damage) => {
+      const { post, reply, rows } = await chatRunForReply();
+      await post(probeAnswer(300 * 1024));
+      const posted = await rows();
+      expect(posted).toHaveLength(2);
+      const first = posted[0]!;
+      if (damage === "missing") {
+        await db.delete(issueComments).where(eq(issueComments.id, first.id));
+      } else if (damage === "soft-deleted") {
+        await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, first.id));
+      } else {
+        const metadata = first.metadata!;
+        await db.update(issueComments).set({ metadata: { ...metadata,
+          answerPart: { ...metadata.answerPart!, index: damage === "duplicate" ? 2 : 0 },
+        } }).where(eq(issueComments.id, first.id));
+      }
+      const { comment, resolved } = await reply();
+      const { TRUNCATED_FINAL_UNDELIVERABLE_TEXT } = await import("../heartbeat-run-summary.js");
+      expect(comment!.body).toBe(TRUNCATED_FINAL_UNDELIVERABLE_TEXT);
+      expect(resolved.text).toBe(TRUNCATED_FINAL_UNDELIVERABLE_TEXT);
+      expect(comment).not.toHaveProperty("answerPartCommentIds");
+      expect(resolved.text).not.toBe(posted[1]!.body);
+    }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
+  it("F3: with the recorded wrappers, a fence spanning a boundary strips back to the source, byte-equal", async () => {
+    const answer = `\`\`\`ts\n${probeAnswer(300 * 1024)}\`\`\`\ntail\n`;
+    const { post, rows } = await chatRunForReply();
+    await post(answer);
+    const posted = await rows();
+    expect(posted.length).toBeGreaterThan(1);
+    // Each part renders on its own: a closing fence is added to part 1 and a reopening to part 2.
+    expect(posted[0]!.metadata!.answerPart!.suffix).toBe("\n```");
+    expect(posted[1]!.metadata!.answerPart!.prefix).toBe("```ts\n");
+    const stripped = posted.map(row => {
+      const part = row.metadata!.answerPart!;
+      expect(row.body.startsWith(`${part.label}${part.prefix}`) && row.body.endsWith(part.suffix)).toBe(true);
+      return row.body.slice(part.label.length + part.prefix.length, row.body.length - part.suffix.length);
+    }).join("");
+    expect(sameBytes(stripped, answer)).toBe(true);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("control: a single comment under the limit is unchanged everywhere", async () => {
+    const { post, reply, rows } = await chatRunForReply();
+    const answer = "  A complete short answer.\n\n";
+    const receipt = await post(answer);
+    const posted = await rows();
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toBe(answer);
+    expect(posted[0]!.metadata?.answerPart).toBeUndefined();
+    expect(receipt.answerPartCommentIds).toBeUndefined();
+    const { comment, resolved } = await reply();
+    expect({ id: comment!.id, body: comment!.body }).toEqual({ id: posted[0]!.id, body: answer });
+    expect(comment).not.toHaveProperty("answerPartCommentIds");
+    expect(resolved.text).toBe(answer);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("control: a run with no answer is unchanged", async () => {
+    const { reply } = await chatRunForReply();
+    const { comment, resolved } = await reply();
+    expect(comment).toBeNull();
+    expect(resolved.text).toBeNull();
+    expect(resolved.decision.reasonCodes).toContain("no_user_facing_response");
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("control: an older single-comment answer then a newer multipart one: the reply is the newer one, whole", async () => {
+    const { post, reply, rows } = await chatRunForReply();
+    await post("An older, short reply.\n", false);
+    const answer = probeAnswer(300 * 1024);
+    await post(answer);
+    const posted = await rows();
+    expect(posted[0]!.body).toBe("An older, short reply.\n");
+    const { comment, resolved } = await reply();
+    expect(sameBytes(resolved.text, answer)).toBe(true);
+    expect(comment!.id).toBe(posted[1]!.id);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("F2 RED: a failed 300 KiB prefix posted in parts is recognised as posted; the opening quotes its really posted ending", async () => {
+    const A = answerItem("A", 300 * 1024);
+    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: false }], "turn.failed", true);
+    expect(posted.length).toBeGreaterThan(1);
+    expect(posted[0]!.body.startsWith(`part 1 of ${posted.length}\n`)).toBe(true);
+    // F2 first: the continuation must know the prefix WAS posted.
+    const { cut, opening } = await recoveryOpening(f.run.id, f.run.companyId);
+    expect(cut.posted).toBe(true);
+    const shownWhole = posted.map(row => {
+      const part = row.metadata!.answerPart!;
+      return row.body.slice(part.label.length + part.prefix.length, row.body.length - part.suffix.length);
+    }).join("");
+    expect(shownWhole).toMatch(CUT_NOTE);
+    expect(sameBytes(shownWhole.replace(CUT_NOTE, "\n"), A)).toBe(true);
+    expect(cut).not.toHaveProperty("partial");
+    expect(opening).not.toMatch(/none of it was shown|starting the answer again/u);
+    expect(opening).toContain("was posted to the person");
+    const quoted = /<<<END OF POSTED TEXT\n([\s\S]*)\nEND OF POSTED TEXT>>>/u.exec(opening)![1]!;
+    expect(quoted.length).toBeGreaterThan(100);
+    // The quoted ending is really posted: it is the end of the LAST part's content.
+    expect(A.endsWith(quoted)).toBe(true);
+    expect(posted[posted.length - 1]!.body).toContain(quoted);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("dl-n5-cont4 RED (JUDGE real DB completion D-completed-first): A completed + B streamed, the turn failed: A then B posted whole, each once; the opening quotes the real posted ending", async () => {
+    const A = answerItem("A", 2 * 1024), B = answerItem("B", 20 * 1024);
+    // dl-n5-cont5 (RFL ruling 17:47Z): A and B are text blocks of the LAST message.
+    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true, message: 2, block: 0 },
+      { text: B, completed: false, message: 2, block: 1 }]);
+    expect((await read(f.run.id)).status).toBe("failed");
+    const bodies = posted.map(comment => comment.body);
+    const all = bodies.join("");
+    expect(occurrences(all, A)).toBe(1);
+    expect(occurrences(all, B)).toBe(1);
+    expect(all.indexOf(A)).toBeLessThan(all.indexOf(B));
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]!).toMatch(CUT_NOTE);
+    const shown = bodies[0]!.replace(CUT_NOTE, "\n");
+    expect(shown).toBe(`${A}\n${B}`);
+    const { cut, opening } = await recoveryOpening(f.run.id, f.run.companyId);
+    expect(cut.posted).toBe(true);
+    expect(opening).not.toMatch(/none of it was shown|starting the answer again/u);
+    expect(opening).toContain("was posted to the person");
+    const quoted = /<<<END OF POSTED TEXT\n([\s\S]*)\nEND OF POSTED TEXT>>>/u.exec(opening)![1]!;
+    expect(quoted.length).toBeGreaterThan(100);
+    expect(shown.endsWith(quoted)).toBe(true);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("dl-n5-cont4 (2): when only item A was really posted, the opening says A was shown, quotes A's posted ending, never 'none of it was shown'", async () => {
+    const A = answerItem("A", 2 * 1024), B = answerItem("B", 20 * 1024);
+    const { f, issue, posted } = await failedTurnRealCompletion([{ text: A, completed: true, message: 2, block: 0 },
+      { text: B, completed: false, message: 2, block: 1 }]);
+    // What an older server (073f4a4f) really posted for this turn: item A alone.
+    await db.delete(issueComments).where(eq(issueComments.issueId, issue.id));
+    await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: issue.id, authorAgentId: f.agent.id,
+      authorType: "agent", createdByRunId: f.run.id, body: A });
+    expect(posted.length).toBeGreaterThan(0);
+    const { cut, opening } = await recoveryOpening(f.run.id, f.run.companyId);
+    expect(cut.posted).toBe(true);
+    expect(cut.text).toBe(A);
+    expect(opening).toContain("Only the first part of what you had written was posted to the person");
+    expect(opening).not.toMatch(/none of it was shown|starting the answer again/u);
+    const quoted = /<<<END OF POSTED TEXT\n([\s\S]*)\nEND OF POSTED TEXT>>>/u.exec(opening)![1]!;
+    expect(A.endsWith(quoted)).toBe(true);
+    expect(B).not.toContain(quoted);
+    // Nothing of this run posted: the opening truthfully says none was shown.
+    await db.delete(issueComments).where(eq(issueComments.issueId, issue.id));
+    const none = await recoveryOpening(f.run.id, f.run.companyId);
+    expect(none.cut.posted).toBe(false);
+    expect(none.opening).toMatch(/none of it was shown/u);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("dl-n5-cont4 control: a successful turn with completed items posts the latest completed item, unchanged", async () => {
+    const A = answerItem("A", 2 * 1024), B = answerItem("B", 3 * 1024);
+    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true }, { text: B, completed: true }], "turn.completed");
+    expect((await read(f.run.id)).status).toBe("succeeded");
+    expect(posted.map(comment => comment.body)).toEqual([B]);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("dl-n5-cont4 control: a streamed-only failed turn is cont3's F1 path, unchanged", async () => {
+    const B = answerItem("B", 20 * 1024);
+    const { posted } = await failedTurnRealCompletion([{ text: B, completed: false }]);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toMatch(CUT_NOTE);
+    expect(posted[0]!.body.replace(CUT_NOTE, "\n")).toBe(B);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("dl-n5-cont4 control: two completed items plus a third streamed: all three posted, in order, each once", async () => {
+    const A = answerItem("A", 2 * 1024), A2 = answerItem("A2", 4 * 1024), C = answerItem("C", 12 * 1024);
+    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true, message: 2, block: 0 },
+      { text: A2, completed: true, message: 2, block: 1 }, { text: C, completed: false, message: 2, block: 2 }]);
+    expect(posted).toHaveLength(1);
+    const shown = posted[0]!.body.replace(CUT_NOTE, "\n");
+    expect(shown).toBe(`${A}\n${A2}\n${C}`);
+    for (const piece of [A, A2, C]) expect(occurrences(shown, piece)).toBe(1);
+    const { cut, opening } = await recoveryOpening(f.run.id, f.run.companyId);
+    expect(cut.posted).toBe(true);
+    const quoted = /<<<END OF POSTED TEXT\n([\s\S]*)\nEND OF POSTED TEXT>>>/u.exec(opening)![1]!;
+    expect(shown.endsWith(quoted)).toBe(true);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  // dl-n5-cont5 (rf-2 cont4 verdict; RFL ruling 17:47Z): THE ANSWER is every
+  // text block of the LAST assistant message, in block order, completed or
+  // streamed, posted whole once, on the completed AND the failed path.
+  const lastBlock = "Short closing block of the same final message, 53 B.\n";
+  it("dl-n5-cont5 (i) RED: last message with 2 completed text blocks, turn COMPLETED: both blocks posted, in order", async () => {
+    const A = answerItem("A", 2_072);
+    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true, message: 2, block: 0 },
+      { text: lastBlock, completed: true, message: 2, block: 1 }], "turn.completed");
+    expect((await read(f.run.id)).status).toBe("succeeded");
+    expect(posted.map(comment => comment.body)).toEqual([`${A}\n${lastBlock}`]);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it.each([false, true])("dl-n5-cont5 (ii) RED: the same, turn FAILED: both blocks posted, the cut tail (streamed tail: %s), ONE true note", async (tail) => {
+    const A = answerItem("A", 2_072), C = answerItem("C", 6 * 1024);
+    const { f, posted } = await failedTurnRealCompletion([{ text: A, completed: true, message: 2, block: 0 },
+      { text: lastBlock, completed: true, message: 2, block: 1 }, ...(tail ? [{ text: C, completed: false, message: 2, block: 2 }] : [])]);
+    expect((await read(f.run.id)).status).toBe("failed");
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toMatch(CUT_NOTE);
+    expect(occurrences(posted[0]!.body, "— The answer stopped here")).toBe(1);
+    expect(posted[0]!.body.replace(CUT_NOTE, "\n")).toBe(tail ? `${A}\n${lastBlock}\n${C}` : `${A}\n${lastBlock}`);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it.each([true, false])("dl-n5-cont5 (iii) RED: 2 items in DIFFERENT messages (last completed: %s), turn failed: only the last message is posted, with ONE note; the earlier one stays in the transcript", async (lastCompleted) => {
+    const commentary = answerItem("Commentary", 2_072), B = answerItem("B", 3 * 1024);
+    const { f, posted } = await failedTurnRealCompletion([{ text: commentary, completed: true, message: 1, block: 0 },
+      { text: B, completed: lastCompleted, message: 3, block: 0 }]);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toMatch(CUT_NOTE);
+    expect(posted[0]!.body.replace(CUT_NOTE, "\n")).toBe(B);
+    expect(occurrences(posted[0]!.body, commentary)).toBe(0);
+    const transcript = (await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.run.id),
+      eq(heartbeatRunEvents.eventType, "item.completed")))).map(row => (row.payload as { prpEvent: { payload: { text: string } } }).prpEvent.payload.text);
+    expect(transcript).toContain(commentary);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("dl-n5-cont5 (iv) RED: a streamed 'assistant_message' item is rebuilt and posted", async () => {
+    const B = answerItem("B", 8 * 1024);
+    const { posted } = await failedTurnRealCompletion([{ text: B, completed: false, kind: "assistant_message" }]);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toMatch(CUT_NOTE);
+    expect(posted[0]!.body.replace(CUT_NOTE, "\n")).toBe(B);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it.each(["one block", "two blocks"] as const)("dl-n5-cont5 (v) RED: a posted ending that differs only by a trailing newline is recognised as shown (%s)", async (shape) => {
+    const A = answerItem("A", 2 * 1024), B = answerItem("B", 6 * 1024);
+    const items = shape === "one block" ? [{ text: B, completed: false }]
+      : [{ text: A, completed: true, message: 2, block: 0 }, { text: B, completed: false, message: 2, block: 1 }];
+    const { f, issue } = await failedTurnRealCompletion(items);
+    const answer = shape === "one block" ? B : `${A}\n${B}`;
+    // What was really posted: the answer whose trailing newline was dropped.
+    await db.delete(issueComments).where(eq(issueComments.issueId, issue.id));
+    await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: issue.id, authorAgentId: f.agent.id,
+      authorType: "agent", createdByRunId: f.run.id, body: answer.trimEnd() });
+    const { cut, opening } = await recoveryOpening(f.run.id, f.run.companyId);
+    expect(cut.posted).toBe(true);
+    expect(cut.partial).toBeUndefined();
+    expect(cut.text).toBe(answer);
+    expect(opening).not.toMatch(/none of it was shown|starting the answer again|Only the first part/u);
+    expect(opening).toContain("was posted to the person as your reply, exactly as written");
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   // Gate 3, run f5c33c68 (stack-lane/): the native result was accepted at

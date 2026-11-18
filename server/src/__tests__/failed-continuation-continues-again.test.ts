@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 import { recoveryService } from "../services/recovery/service.js";
 import { ASSIGNED_WORK_CONTINUED_ACTION, assignedWorkSweep } from "../services/recovery/assigned-work-sweep.js";
 import { FRESH_CONTINUATION_SCHEMA, continueHeldExecutions, ensureFreshContinuation, resetBacklogContinuationPacingForTests } from "../services/fresh-continuation-fallback.js";
@@ -117,6 +117,40 @@ describePostgres("a continuation that fails before doing any work is continued a
     inArray(issueRecoveryActions.status, ["active", "escalated"])));
   const continuationsOf = async (runId: string) => db.select().from(issueRecoveryActions)
     .where(sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}' = ${runId}`);
+
+  // dl-n5-cont3 (5): recovery/assigned-work-sweep.ts could start a THIRD run
+  // with an issue_continuation_needed wake after the thinking-only cap-stop
+  // cost guard refused ('output_budget_exhausted_again'). The guard holds here too.
+  it("dl-n5-cont3 (5) RED: after an output_budget_exhausted_again refusal the sweep starts no run", async () => {
+    const f = await seed();
+    const task = await f.task();
+    const failed = await f.continued(task.id, { errorCode: "native_session_interrupted", error: "native_session_interrupted" });
+    const capStop = (runId: string) => {
+      const turnId = `runner-1:${runId}:turn-1`;
+      const base = { companyId: f.companyId, runId, agentId: f.agentId, stream: "system", level: "info", message: "e" };
+      return [
+        { ...base, seq: 1, eventType: "item.delta", payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`,
+          turnId, payload: { kind: "reasoning", text: "thinking only ".repeat(200) } } } },
+        { ...base, seq: 2, eventType: "turn.failed", payload: { prpEvent: { eventType: "turn.failed", turnId,
+          payload: { status: "failed", error: { code: "pi_output_truncated", recoverable: false } } } } },
+      ];
+    };
+    await db.insert(heartbeatRunEvents).values([...capStop(failed.retryOfRunId!), ...capStop(failed.id)]);
+    expect(await ensureFreshContinuation(db, { companyId: f.companyId, runId: failed.id, trigger: "assigned_work" }))
+      .toEqual({ kind: "person_owned", reason: "output_budget_exhausted_again" });
+    const queue = wakeQueue();
+    const recovery = recoveryService(db, { enqueueWakeup: queue.enqueueWakeup, scheduleRecoveryRetry: async () => null });
+    const runsBefore = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+
+    const check = await recovery.assignedWork.checkIssue({ companyId: f.companyId, issueId: task.id });
+
+    expect(check?.outcome).not.toBe("repaired");
+    expect(queue.calls).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .toHaveLength(runsBefore.length);
+    expect(await continuationsOf(failed.id)).toHaveLength(0);
+  }, 60_000);
 
   it("a recorded continuation whose run failed in setup is not escalated to the board, and the sweep continues it again from saved work", async () => {
     const f = await seed();

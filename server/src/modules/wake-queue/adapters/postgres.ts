@@ -1,4 +1,5 @@
 import { lockAgentForRunAdmission } from "../../../services/heartbeat-run-admission-lock.js";
+import { nativeStatusSuccessorState } from "../../../services/native-runtime/native-status-successor.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
@@ -617,6 +618,27 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async claimDeferredWakeForPromotion({ companyId, wakeId, now }) {
+      // Promotion bypasses heartbeat enqueue/admission. Re-read the durable
+      // failure/answer edges at this execution boundary, under the release
+      // issue lock and before claiming/reopening or inserting a queued run.
+      const [wake] = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, wakeId),
+        eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+      )).limit(1);
+      if (!wake) return false;
+      const candidate = toDeferredWakeCandidate(wake);
+      const issueId = readNonEmptyString(candidate.payload.issueId);
+      const successor = issueId ? await nativeStatusSuccessorState(tx as unknown as Db, {
+        companyId, issueId, reason: candidate.wakeReason ?? candidate.reason ?? "", payload: candidate.payload,
+      }) : null;
+      if (successor?.skipReason) {
+        await tx.update(agentWakeupRequests).set({ status: "skipped", error: successor.skipReason,
+          finishedAt: now, updatedAt: now }).where(and(
+            eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, wakeId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS), isNull(agentWakeupRequests.runId),
+          ));
+        return false;
+      }
       const claimed = await tx
         .update(agentWakeupRequests)
         .set({

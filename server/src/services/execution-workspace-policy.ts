@@ -399,7 +399,7 @@ export function resolveExecutionWorkspaceMode(input: {
   return "shared_workspace";
 }
 
-interface ParsedIssueAssigneeAdapterOverrides {
+export interface ParsedIssueAssigneeAdapterOverrides {
   adapterConfig: Record<string, unknown> | null;
   useProjectWorkspace: boolean | null;
 }

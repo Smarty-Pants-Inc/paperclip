@@ -3265,6 +3265,16 @@ its process-wide execution and wakeup promise sets. Forwarding callbacks preserv
 construction order for retry and recovery services. Keep queue policy changes
 separate from this extraction and from adapter execution changes.
 
+Generic native-status retries are fallback work, not another recovery owner.
+`native-runtime/native-status-successor.ts` uses the shared person-message answer
+predicate and durable retry/restore links before enqueue and dispatch. An answered
+input or any existing successor suppresses the generic retry. Dispatch records a
+terminal `skipped` wake with `person_message_already_answered` or
+`failed_run_has_successor`; decision-time suppression records a skipped effect
+without inserting a wake. Admission repeats the DB-only check under the issue
+lock, including promotion of a saved dispatch receipt. The heartbeat dependency
+scheduling integration suite covers the failed-person-Retry/recovery-answer race.
+
 Run lifecycle handling is in `server/src/services/heartbeat/run-lifecycle.ts`.
 It owns status transitions, run events and progress, liveness classification,
 completion handoffs, issue-comment finalization, and runtime/cost settlement.

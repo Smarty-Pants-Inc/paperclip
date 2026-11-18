@@ -31,7 +31,9 @@ import { hasPendingNativeChildCompletion } from "./native-child-completion-deliv
 import { settleExternalConversation } from "../slack-conversation-lifecycle.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { isFailedTurnContinuationRun } from "./native-failed-turn-continuation.js";
+import { isNativeMidStreamCutRecoveryRun, readNativeMidStreamCut, readNativeProviderAccountFailure } from "./native-mid-stream-cut.js";
 import { readPersistedNativeFailureEvidence } from "./native-provider-failure-evidence.js";
+import { PROVIDER_POLICY_REFUSAL_FAILURE } from "./native-provider-failure.js";
 // Fork: upstream reads nativeRunHasStopRequest from native-tool-receipt-limit.ts (#21913, not carried).
 import { nativeRunHasStopRequest } from "./native-run-stop-request.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE, isNativeEnvironmentBlocker } from "./native-environment-blocker.js";
@@ -67,6 +69,7 @@ import { classifyNativeEvidence } from "./evidence-classifier.js";
 import type { PrpIgnoredAttentionRequest, PrpTerminalState } from "@paperclipai/paperclip-runner";
 import {
   arbitrateNativeStatus,
+  NATIVE_PROVIDER_ACCOUNT_FAILURE_CODE,
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   supersedeHandedOffDecision,
   supersedeStaleOwnerCompletion,
@@ -109,6 +112,7 @@ import {
   readAcceptedTaskContinuationSummary,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
+  readCompletedOrTruncatedFinalCandidate,
   readTruncatedCompletedAgentMessageItemId,
   readTruncatedCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
@@ -1021,6 +1025,17 @@ export async function recoverCommittedNativeChatResponse(
   return withRunResponsePresentationTiming(input.runId, () => recoverCommittedNativeChatResponseInScope(db, input));
 }
 
+/** The stored live deltas of one agent message item of a run, in order (dl-n5-66k / dl-n5-cont2 C2). */
+function loadAgentMessageDeltaRows(tx: Pick<Db, "select">, companyId: string, runId: string, itemId: string) {
+  return tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, companyId),
+      eq(heartbeatRunEvents.runId, runId),
+      eq(heartbeatRunEvents.eventType, "item.delta"),
+      sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' = ${itemId}`,
+    )).orderBy(heartbeatRunEvents.seq);
+}
+
 async function recoverCommittedNativeChatResponseInScope(
   db: Db,
   input: { companyId: string; issueId: string; runId: string; onlyWhenDue?: boolean },
@@ -1276,20 +1291,15 @@ async function recoverCommittedNativeChatResponseInScope(
             eq(heartbeatRunEvents.runId, run.id),
             eq(heartbeatRunEvents.eventType, "item.completed"),
             sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${accepted.turnId}`,
-            sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,truncated}' = 'true'`,
+            sql`(${heartbeatRunEvents.payload} #>> '{prpEvent,payload,truncated}' = 'true'
+              or jsonb_typeof(${heartbeatRunEvents.payload} #> '{prpEvent,payload,fullText}') = 'object')`,
           )).orderBy(desc(heartbeatRunEvents.seq)).limit(20);
         const rebuiltCandidates = [];
         for (const row of truncatedRows) {
           const prpEvent = record(row.payload).prpEvent;
           const itemId = readTruncatedCompletedAgentMessageItemId(prpEvent);
           if (!itemId) continue;
-          const deltaRows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
-            .from(heartbeatRunEvents).where(and(
-              eq(heartbeatRunEvents.companyId, input.companyId),
-              eq(heartbeatRunEvents.runId, run.id),
-              eq(heartbeatRunEvents.eventType, "item.delta"),
-              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' = ${itemId}`,
-            )).orderBy(heartbeatRunEvents.seq);
+          const deltaRows = await loadAgentMessageDeltaRows(tx, input.companyId, run.id, itemId);
           const rebuilt = readTruncatedCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent, deltaRows });
           if (rebuilt) rebuiltCandidates.push(rebuilt);
         }
@@ -1300,7 +1310,8 @@ async function recoverCommittedNativeChatResponseInScope(
           }), ...rebuiltCandidates],
         });
         if (!finalAgentMessage && !blockedTaskReply) return false;
-        const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation })
+        const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation,
+          metadata: issueComments.metadata })
           .from(issueComments).where(and(
             eq(issueComments.companyId, input.companyId),
             eq(issueComments.issueId, input.issueId),
@@ -1381,21 +1392,27 @@ async function recoverCommittedNativeChatResponseInScope(
       const replyEventId = (Array.isArray(result.evidence) ? result.evidence : [])
         .map((entry) => record(entry).ref).find((ref): ref is string => typeof ref === "string" && ref.startsWith("run-event:"))
         ?.slice("run-event:".length);
-      const [replyRow] = replyEventId ? await tx.select({ payload: heartbeatRunEvents.payload })
+      const [replyRow] = replyEventId ? await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
         .from(heartbeatRunEvents).where(and(
           eq(heartbeatRunEvents.companyId, input.companyId),
           eq(heartbeatRunEvents.runId, run.id),
           eq(heartbeatRunEvents.sourceEventId, replyEventId),
         )).limit(1) : [];
-      const replyPayload = record(record(record(replyRow?.payload).prpEvent).payload);
+      // dl-n5-cont2 C2: a reply whose completed event was stored truncated is
+      // rebuilt from its deltas (the same helper as the internal branch), or
+      // gets the plain undeliverable line; the summary never stands in for it.
+      const replyCandidate = replyEventId && replyRow ? await readCompletedOrTruncatedFinalCandidate({
+        seq: replyRow.seq, prpEvent: record(replyRow.payload).prpEvent,
+        loadDeltaRows: (itemId) => loadAgentMessageDeltaRows(tx, input.companyId, run.id, itemId),
+      }) : null;
       const resolved = resolveHeartbeatRunResponse({
         resultJson: {
           nativeResult: result,
           finalizationPhase: "committed",
           finalizationReasonCode: decision.reasonCode,
         },
-        finalAgentMessage: replyEventId && replyPayload.kind === "agentMessage" && replyPayload.channel === "final"
-          && typeof replyPayload.text === "string" ? { text: replyPayload.text, sourceEventId: replyEventId, channel: "final" } : null,
+        finalAgentMessage: replyEventId && replyCandidate?.channel === "final"
+          ? { ...replyCandidate, sourceEventId: replyEventId, channel: "final" } : null,
         preferFinalResponseOverExistingComment: true,
         externalChatResponseWakeSummaryAuthorized: true,
         externalChatCommittedResponseWakeSummaryAuthorized: true,
@@ -1822,9 +1839,22 @@ async function finalizeNativeRunAndProject(input: {
         (!planWait || nativeSha256(planWait.result) !== nativeSha256(result))) {
       throw new Error("native_plan_wait_authority_lost");
     }
-    const { providerFailure, turnFailure, providerExplanation } = await readPersistedNativeFailureEvidence(
+    const persistedFailure = await readPersistedNativeFailureEvidence(
       input.db, run, resultRow.turnId, envelope.terminal as PrpTerminalState,
     );
+    const { providerExplanation } = persistedFailure;
+    const midStreamCut = terminalState === "failed"
+      ? await readNativeMidStreamCut(input.db, { companyId: run.companyId, runId: run.id }) : null;
+    // An account rejection (billing, quota hard limit, credentials) is rejected
+    // again until a person acts: it gets no automatic successor of any kind.
+    const providerAccountFailure = terminalState === "failed"
+      && await readNativeProviderAccountFailure(input.db, { companyId: run.companyId, runId: run.id });
+    // A cut the cut lane reads as a provider refusal defers to the refusal
+    // path: its code, its terminal decision and its one neutral note. The cut
+    // lane has no refusal code or note of its own.
+    const cutDefersToRefusal = !persistedFailure.providerFailure && midStreamCut === "provider_refusal";
+    const providerFailure = cutDefersToRefusal ? { ...PROVIDER_POLICY_REFUSAL_FAILURE } : persistedFailure.providerFailure;
+    const turnFailure = cutDefersToRefusal ? null : persistedFailure.turnFailure;
     const ownsProviderFailureDecision =
       (!authoritativeIssue.executionRunId || authoritativeIssue.executionRunId === run.id) &&
       (reviewContext ? nativeReview?.interaction.status === "pending"
@@ -1874,8 +1904,11 @@ async function finalizeNativeRunAndProject(input: {
       failureRetryCount: executionFailureRetryCount(run),
       // Only the task's current owner may turn its own failed continuation
       // into a blocker; the committer rechecks that under the issue lock.
+      // The recovery successor of a mid-stream cut is that one continuation too.
       failedTurnContinuationUsed: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext
-        && await isFailedTurnContinuationRun(input.db, run, authoritativeIssue.id),
+        && (isNativeMidStreamCutRecoveryRun(run) || await isFailedTurnContinuationRun(input.db, run, authoritativeIssue.id)),
+      midStreamCut: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext ? midStreamCut : null,
+      providerAccountFailure: providerAccountFailure && ownsProviderFailureDecision,
       ...(addressedOutcome ? { nativeAddressedInteractionOutcome: addressedOutcome } : {}),
       ...(reviewContext ? { nativeReviewOutcome: nativeReview
         ? nativeReview.interaction.status === "pending" ? "pending" as const : "resolved" as const
@@ -2032,6 +2065,7 @@ async function finalizeNativeRunAndProject(input: {
         requireProviderFailureOwner: decision.reasonCode?.startsWith("native_provider_overloaded")
           || decision.reasonCode === "provider_policy_refusal"
           || decision.reasonCode === "native_run_failed_continuation_exhausted"
+          || decision.reasonCode === NATIVE_PROVIDER_ACCOUNT_FAILURE_CODE
           || decision.reasonCode === NATIVE_ENVIRONMENT_BLOCKER_CODE
           || decision.reasonCode === NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE
           ? { agentId: run.agentId, reviewContext } : undefined,
