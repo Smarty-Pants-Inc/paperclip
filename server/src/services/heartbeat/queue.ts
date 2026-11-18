@@ -69,7 +69,8 @@ import {
   undeliveredLegacyUserCommentIds,
 } from "../explicit-native-continuation.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
-import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.js";
+import { getExecutionBlocker } from "../execution-blocker.js";
+import { queuedRunOwnsIssue, queuedRunPredecessorHold } from "./queued-run-predecessor.js";
 import { nativeManualAdmissionHoldsExecution } from "../native-runtime/native-runner-ownership.js";
 import { taskChatRetrySourceCleanupPending } from "../chat-channels/task-retry-authority.js";
 import { validateNativeWorkspaceReconstruction } from "../native-runtime/native-workspace-reconstruction.js";
@@ -1385,8 +1386,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }).from(issues).where(and(
         eq(issues.id, issueId), eq(issues.companyId, run.companyId),
       )).for("update") : [];
-      const ownsIssue = owner?.assigneeAgentId === run.agentId &&
-        context.wakeReason !== "source_scoped_recovery_action";
+      const ownsIssue = queuedRunOwnsIssue(owner?.assigneeAgentId, run.agentId, context.wakeReason);
       const [handoff] = issueId ? await tx.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, run.companyId), eq(caseHandoffs.issueId, issueId),
         inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]))).limit(1) : [];
       const declined = (reason: string, predecessorRunId?: string) => {
@@ -1419,34 +1419,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (ownsIssue && issueId && await taskChatRetrySourceCleanupPending(tx, run, issueId)) {
         return declined("task_chat_retry_source_cleanup_pending");
       }
-      const executionOwnerId = run.scheduledRetryReason === "native_provider_overloaded"
-        ? run.retryOfRunId : ownsIssue ? owner?.executionRunId : null;
-      for (const previousRunId of new Set([executionOwnerId, ownsIssue ? run.retryOfRunId : null])) {
-        if (!previousRunId || previousRunId === run.id) continue;
-        const [previous] = await tx.select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId,
-          issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
-          supersededByFreshContinuation: sql<boolean>`${heartbeatRuns.resultJson} ? 'freshContinuationSupersededAt'`,
-          contextIssueId: sql<unknown>`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId')`,
-        })
-          .from(heartbeatRuns).where(and(
-            eq(heartbeatRuns.id, previousRunId),
-            eq(heartbeatRuns.companyId, run.companyId),
-          ));
-        if (previousRunId !== executionOwnerId && (previous?.agentId !== run.agentId ||
-            (previous.nativeIssueId ?? previous.issueId ?? previous.contextIssueId) !== issueId)) continue;
-        // A terminal result can precede workspace/lease cleanup on this or
-        // another controller. Local absence alone is not a release receipt.
-        if (!isHeartbeatRunTerminalStatus(previous?.status) ||
-            liveRunExecutions.has(previousRunId)) {
-          return declined("predecessor_still_executing", previousRunId);
-        }
-        // A fresh continuation replaced the predecessor: its writes are revoked
-        // and it shares no workspace with this run (a fenced remote epoch or a
-        // new isolated workspace), so its cleanup continues without holding it.
-        if (!previous?.supersededByFreshContinuation && await hasPendingRunCleanup(tx, run.companyId, previousRunId)) {
-          return declined("predecessor_cleanup_pending", previousRunId);
-        }
-      }
+      const predecessorHold = await queuedRunPredecessorHold(tx, { run, issueId, ownsIssue,
+        executionRunId: owner?.executionRunId, isTerminal: isHeartbeatRunTerminalStatus, isLive: id => liveRunExecutions.has(id) });
+      if (predecessorHold) return declined(predecessorHold.reason, predecessorHold.predecessorRunId);
       return { ownsIssue, blocked: false };
     }
     async function bindClaimedIssueExecution(tx: Db, ownsIssue: boolean, claimedRun: typeof heartbeatRuns.$inferSelect | null | undefined) {

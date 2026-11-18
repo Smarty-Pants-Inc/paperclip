@@ -441,28 +441,32 @@ async function quarantineCleanupSettling(db: Db, companyId: string,
 }
 
 /** Never-started queued runs past the queued-input bound that the issue claim
- * refuses for a predecessor's unsettled cleanup. The predecessors are the ones
- * the claim checks (heartbeat/queue.ts): the task's execution owner and the
- * run this one retries, with the claim's own predicate (hasPendingRunCleanup).
+ * refuses for a predecessor's unsettled cleanup: the claim's own predecessor
+ * decision (heartbeat/queued-run-predecessor.ts, called by heartbeat/queue.ts),
+ * with its eligibility, provenance and supersession guards.
  * A predecessor sandbox lease the provider has not released names the provider. */
 async function queuedRunStartHolds(db: Db, companyId: string,
-  entries: Array<[string, { id: string; status: string; startedAt: Date | null; createdAt: Date; retryOfRunId: string | null }]>) {
+  entries: Array<[string, { id: string; status: string; startedAt: Date | null; createdAt: Date; retryOfRunId: string | null;
+    agentId: string; scheduledRetryReason: string | null; claimIssueId: string | null; claimWakeReason: string | null }]>) {
   const holds = new Map<string, QueuedStartHold>();
   const late = entries.filter(([, run]) => run.status === "queued" && !run.startedAt
     && run.createdAt.getTime() <= Date.now() - QUEUED_INPUT_DISPATCH_GRACE_MS);
   if (!late.length) return holds;
-  const owners = new Map((await db.select({ id: issues.id, executionRunId: issues.executionRunId }).from(issues)
-    .where(and(eq(issues.companyId, companyId), inArray(issues.id, late.map(([issueId]) => issueId)))))
-    .map(row => [row.id, row.executionRunId]));
-  const { hasPendingRunCleanup } = await import("./execution-blocker.js");
+  const claimIssueIds = [...new Set(late.flatMap(([, run]) => run.claimIssueId ? [run.claimIssueId] : []))];
+  const owners = new Map(claimIssueIds.length ? (await db.select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId,
+    executionRunId: issues.executionRunId }).from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(sql<string>`${issues.id}::text`, claimIssueIds))))
+    .map(row => [row.id, row] as const) : []);
+  const { queuedRunOwnsIssue, queuedRunPredecessorHold } = await import("./heartbeat/queued-run-predecessor.js");
   for (const [issueId, run] of late) {
-    const predecessors = [...new Set([owners.get(issueId), run.retryOfRunId])]
-      .filter((id): id is string => !!id && id !== run.id);
-    const pending: string[] = [];
-    for (const id of predecessors) if (await hasPendingRunCleanup(db, companyId, id)) pending.push(id);
-    if (!pending.length) continue;
+    const owner = run.claimIssueId ? owners.get(run.claimIssueId) : undefined;
+    const ownsIssue = queuedRunOwnsIssue(owner?.assigneeAgentId, run.agentId, run.claimWakeReason);
+    const hold = await queuedRunPredecessorHold(db, { run: { ...run, companyId }, issueId: run.claimIssueId, ownsIssue,
+      executionRunId: owner?.executionRunId });
+    // A predecessor still executing is ordinary work in progress: stays working.
+    if (hold?.reason !== "predecessor_cleanup_pending") continue;
     const [sandbox] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
-      eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, pending),
+      eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, hold.predecessorRunId),
       sql`${environmentLeases.provider} is distinct from 'local'`,
       or(isNull(environmentLeases.releasedAt), inArray(environmentLeases.status, ["active", "pending_cleanup"]),
         eq(environmentLeases.cleanupStatus, "failed")))).limit(1);
@@ -507,6 +511,10 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       createdAt: heartbeatRuns.createdAt, finishedAt: heartbeatRuns.finishedAt, agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId,
       nativeIssueId: heartbeatRuns.nativeIssueId, runtimeMode: heartbeatRuns.runtimeMode, startedAt: heartbeatRuns.startedAt,
       retryOfRunId: heartbeatRuns.retryOfRunId,
+      // The issue claim reads these from the run's context (heartbeat/queue.ts).
+      claimIssueId: sql<string | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}->'issueId') = 'string'
+        and ${heartbeatRuns.contextSnapshot}->>'issueId' ~ '\\S' then ${heartbeatRuns.contextSnapshot}->>'issueId' end`,
+      claimWakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot}->>'wakeReason'`,
       processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
       agentAdapter: agents.adapterType,
       error: sql<string | null>`case when ${heartbeatRuns.errorCode} = 'setup_failed'
