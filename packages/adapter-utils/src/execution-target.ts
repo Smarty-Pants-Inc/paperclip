@@ -1459,6 +1459,36 @@ export function adapterExecutionTargetSessionIdentity(
   };
 }
 
+// Ported from upstream paperclipai/paperclip 12aa08721 (#21248),
+// packages/adapter-utils/src/execution-target.ts normalizeAdapterExecutionTargetSessionIdentity
+// (upstream master :1396-1411), plus the fork's d0dba44c providerLeaseId retention.
+// A saved session identity is rebuilt from allowlisted guard fields only, so a
+// privateKey, a local tailscaleSocket or any other extra field never persists.
+export function normalizeAdapterExecutionTargetSessionIdentity(value: unknown): Record<string, unknown> | null {
+  const saved = parseObject(value);
+  if (saved.transport === "ssh") {
+    if (!readStringMeta(saved, "host") || !readStringMeta(saved, "username") || !readStringMeta(saved, "remoteCwd")
+      || typeof saved.port !== "number" || !Number.isInteger(saved.port) || saved.port < 1 || saved.port > 65535
+      || (saved.useHostAuth !== undefined && typeof saved.useHostAuth !== "boolean")) return null;
+    const fields = Object.fromEntries(Object.entries(saved).filter(([key, entry]) => typeof entry === "string"
+      || (key === "port" && typeof entry === "number") || (key === "useHostAuth" && typeof entry === "boolean")));
+    return buildRemoteExecutionSessionIdentity(fields as unknown as SshRemoteExecutionSpec);
+  }
+  if (saved.transport === "sandbox" && readStringMeta(saved, "remoteCwd")) {
+    const normalized = adapterExecutionTargetSessionIdentity({ kind: "remote", transport: "sandbox", remoteCwd: readStringMeta(saved, "remoteCwd")!,
+      providerKey: readStringMeta(saved, "providerKey"), environmentId: readStringMeta(saved, "environmentId"), leaseId: readStringMeta(saved, "leaseId") });
+    // Reusable sandboxes retain session files across Paperclip lease rows.
+    // Normalizing a saved physical identity must not turn it into leaseId:null.
+    const providerLeaseId = readStringMeta(saved, "providerLeaseId");
+    if (normalized && providerLeaseId) {
+      delete normalized.leaseId;
+      return { ...normalized, providerLeaseId };
+    }
+    return normalized;
+  }
+  return null;
+}
+
 export function adapterExecutionTargetSessionMatches(
   saved: unknown,
   target: AdapterExecutionTarget | null | undefined,
