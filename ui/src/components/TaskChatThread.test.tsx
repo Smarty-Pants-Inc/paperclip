@@ -2926,21 +2926,28 @@ describe("TaskChatThread runtime transcript selection", () => {
     ).toBeNull();
   });
 
-  // SCREEN row 5: a run a PERSON stopped says what happens to its partial
-  // reply; any other cancel keeps the neutral detail (control).
+  // SCREEN row 5 / S5: a run a PERSON stopped says what happens to its partial
+  // reply; any other cancel keeps the neutral detail (control). `resultJson` is
+  // exactly what the chat bootstrap serves (activity.ts summarizedResultJson,
+  // proved by issue-chat-bootstrap-routes "SCREEN S5"): the actor type and no
+  // user id. The chat (conversationMode) and an ordinary task read the same run.
   it.each([
-    ["user", "Stopped. The unfinished reply isn't sent to the agent with your next message."],
-    ["system", "The run was cancelled."],
-  ] as const)("SCREEN row 5: the cancelled marker detail for a run cancelled by %s", (actor, expectedDetail) => {
-    nativeTranscriptState.transcriptByRun.set(`native-stop-${actor}`, [
+    ["user", true, { cancelledByActorType: "user" }, "Stopped. The unfinished reply isn't sent to the agent with your next message."],
+    ["user", false, { cancelledByActorType: "user" }, "Stopped. The unfinished reply isn't sent to the agent with your next message."],
+    ["system", true, { cancelledByActorType: "system", stopReason: "cancelled" }, "The run was cancelled."],
+    ["system", false, { cancelledByActorType: "system", stopReason: "cancelled" }, "The run was cancelled."],
+    ["unrecorded", false, null, "The run was cancelled."],
+  ] as const)("SCREEN row 5: the cancelled marker detail for a run cancelled by %s (conversationMode=%s)", (actor, conversationMode, resultJson, expectedDetail) => {
+    nativeTranscriptState.transcriptByRun.set(`native-stop-${actor}-${conversationMode}`, [
       assistantEntry("2026-08-25T18:00:01.000Z", "Half a reply", "progress"),
     ]);
     renderThread({
       comments: [],
       onAdd: async () => {},
+      conversationMode,
       linkedRuns: [
         {
-          runId: `native-stop-${actor}`,
+          runId: `native-stop-${actor}-${conversationMode}`,
           runtimeMode: "native",
           status: "cancelled",
           agentId: "agent-1",
@@ -2949,7 +2956,7 @@ describe("TaskChatThread runtime transcript selection", () => {
           createdAt: "2026-08-25T18:00:00.000Z",
           startedAt: "2026-08-25T18:00:00.000Z",
           finishedAt: "2026-08-25T18:00:02.000Z",
-          resultJson: actor === "user" ? { cancelledByActorType: "user", cancelledByUserId: "user-1" } : null,
+          resultJson: resultJson ? { ...resultJson } : null,
         },
       ],
     });

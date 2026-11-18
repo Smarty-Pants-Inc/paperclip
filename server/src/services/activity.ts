@@ -124,11 +124,16 @@ export function activityService(db: Db) {
   // A denied user needs the selected connection's name to repair their task.
   // Other readers need the connection's existing human sharing permission.
   // A malformed present Stop receipt must stay unconfirmed, not disappear.
+  // `cancelledByActorType` says who stopped the run, so the chat's cancelled
+  // marker tells a person's Stop apart from any other cancel. It is a bounded
+  // actor type and never an id.
   const summarizedResultJson = (viewerUserId: string | null) => sql<Record<string, unknown> | null>`
     case
       when ${heartbeatRuns.resultJson} is null then null
       else jsonb_strip_nulls(jsonb_build_object(
         'conversationReset', ${heartbeatRuns.resultJson} -> 'conversationReset',
+        'cancelledByActorType', case when ${heartbeatRuns.resultJson} ->> 'cancelledByActorType'
+          in ('user', 'agent', 'board', 'system') then ${heartbeatRuns.resultJson} -> 'cancelledByActorType' end,
         'executionCancellation', case when ${heartbeatRuns.resultJson} ? 'executionCancellation'
           then jsonb_build_object('state', case
             when jsonb_typeof(${heartbeatRuns.resultJson} -> 'executionCancellation') = 'object'
