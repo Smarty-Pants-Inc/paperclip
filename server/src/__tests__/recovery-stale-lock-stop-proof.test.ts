@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { agents, companies, createDb, environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { runExecutionsHaveStopped } from "../services/agent-execution-stop.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { claimCancellationRequest } from "../services/native-runtime/native-cancellation-request.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { registerIssueRecoveryWork } from "../services/recovery/work.js";
 
 // Keep reason: #20807 RFL F1's independent PostgreSQL reproduction caught a
 // data-safety failure: the ordinary sweep released a still-executing owner's
@@ -106,7 +108,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     else expect(await stopActions(f.issueId)).toEqual([]);
   });
 
-  it("does not hide a second non-reusable lease behind the warm keep", async () => {
+  it("does not defer a second lease whose fallback lifetime is unknown", async () => {
     const f = await warmFixture();
     await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.runId,
       status: "active", leasePolicy: "ephemeral", provider: "plugin:boat:computer", providerLeaseId: "another-computer" });
@@ -183,22 +185,189 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     else expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
   });
 
-  it.each(["cleanup", "ephemeral", "deferred", "controller", "coordinator", "interrupt", "pending_cancel", "stop_reason"] as const)("does not silently skip a warm-looking lease with another blocker: %s", async blocker => {
+  it.each(["controller", "coordinator", "local_process", "local_cancelled_unproven", "interrupt", "pending_cancel"] as const)("does not silently skip a warm-looking lease with another blocker: %s", async blocker => {
     const f = await warmFixture();
-    if (blocker === "cleanup") await db.update(environmentLeases).set({ cleanupStatus: "failed" }).where(eq(environmentLeases.id, f.lease.id));
-    if (blocker === "ephemeral") await db.update(environmentLeases).set({ leasePolicy: "ephemeral" }).where(eq(environmentLeases.id, f.lease.id));
-    if (blocker === "deferred") await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata,
-      releaseDeferral: { reason: "save_failed", attempts: 1, retryAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
     if (blocker === "controller") await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, f.runId));
     if (blocker === "coordinator") await db.insert(nativeRunFinalizations).values({ runId: f.runId, companyId: f.companyId,
       issueId: f.issueId, phase: "observed", leaseOwner: "native-finalizer:still-owned", leaseExpiresAt: new Date(Date.now() + 60_000) });
+    if (blocker === "local_process" || blocker === "local_cancelled_unproven") {
+      await db.update(environmentLeases).set({ provider: "local" }).where(eq(environmentLeases.id, f.lease.id));
+      await db.update(heartbeatRuns).set({ status: blocker === "local_process" ? "failed" : "cancelled",
+        processPid: blocker === "local_process" ? process.pid : null, resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
+    }
     if (blocker === "interrupt") await db.update(heartbeatRuns).set({ resultJson: { operatorInterrupted: true,
       interruptionSource: "issue_comment_interrupt", queuedCommentInterruptQueueId: randomUUID() } }).where(eq(heartbeatRuns.id, f.runId));
     if (blocker === "pending_cancel") await db.update(heartbeatRuns).set({ resultJson: {
       executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, f.runId));
-    if (blocker === "stop_reason") await db.update(heartbeatRuns).set({ resultJson: { stopReason: "cancelled" } }).where(eq(heartbeatRuns.id, f.runId));
     await inspect(f, "sweep");
     expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+  });
+
+  // Rule of record: terminal failures and release-pending leases are not Stop requests.
+  it.each(["sweep", "stranded"] as const)("%s defers failed owners with pending cleanup, without changing claims", async path => {
+    for (const errorCode of ["native_provider_terminal_failed", "setup_failed"]) {
+      const f = await warmFixture(path === "stranded");
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode, resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(environmentLeases).set({ status: "pending_cleanup", cleanupStatus: "failed", leasePolicy: "ephemeral" })
+        .where(eq(environmentLeases.id, f.lease.id));
+      const before = await task(f.issueId);
+      await inspect(f, path);
+      expect(await stopActions(f.issueId)).toEqual([]);
+      expect(await task(f.issueId)).toEqual(before);
+    }
+  });
+
+  it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted"] as const)("does not infer a Stop request from terminal status %s", async status => {
+    const f = await warmFixture();
+    await db.update(heartbeatRuns).set({ status, resultJson: { stopReason: "cancelled" } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(environmentLeases).set({ metadata: { releaseDeferral: { reason: "save_failed", attempts: 1,
+      retryAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
+    await inspect(f, "sweep");
+    expect(await stopActions(f.issueId)).toEqual([]);
+  });
+
+  it("retains a recorded pause request even on a succeeded run", async () => {
+    const f = await warmFixture();
+    await db.update(heartbeatRuns).set({ resultJson: { pauseRequested: { requestedAt: new Date().toISOString() } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await inspect(f, "sweep");
+    expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+  });
+
+  it.each(["sweep", "stranded"] as const)("%s bounds deferral by each lease's own expiry plus five minutes", async path => {
+    const f = await warmFixture(path === "stranded");
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "setup_failed", resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(environmentLeases).set({ expiresAt: new Date(Date.now() - 240_000), status: "pending_cleanup" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    await inspect(f, path);
+    expect(await stopActions(f.issueId)).toEqual([]);
+    // A second, older unreleased lease cannot borrow the first one's deadline.
+    await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.runId,
+      status: "pending_cleanup", expiresAt: new Date(Date.now() - 301_000) });
+    await inspect(f, path);
+    expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
+  });
+
+  it("uses acquisition plus the environment TTL, never last use or run finish, when expiry is absent", async () => {
+    const f = await warmFixture();
+    const [environment] = await db.insert(environments).values({ name: randomUUID(), driver: "plugin:boat:computer",
+      config: { ttlMinutes: 30 } }).returning();
+    await db.update(environmentLeases).set({ environmentId: environment!.id, expiresAt: null,
+      acquiredAt: new Date(Date.now() - 34 * 60_000), lastUsedAt: new Date() }).where(eq(environmentLeases.id, f.lease.id));
+    await inspect(f, "sweep");
+    expect(await stopActions(f.issueId)).toEqual([]);
+    await db.update(environmentLeases).set({ acquiredAt: new Date(Date.now() - 36 * 60_000) }).where(eq(environmentLeases.id, f.lease.id));
+    await inspect(f, "sweep");
+    expect(await stopActions(f.issueId)).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+  });
+
+  async function existingCard(f: Awaited<ReturnType<typeof warmFixture>>, realStop = false) {
+    if (realStop) {
+      await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
+      await claimCancellationRequest(db, f.runId, f.companyId, randomUUID(), "board-user");
+    }
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(environmentLeases).set({ expiresAt: new Date(Date.now() - 301_000) }).where(eq(environmentLeases.id, f.lease.id));
+    await inspect(f, "sweep");
+    expect(await stopActions(f.issueId)).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+  }
+  async function laterAnswer(f: Awaited<ReturnType<typeof warmFixture>>, companyId = f.companyId, issueId = f.issueId) {
+    const id = randomUUID();
+    await db.insert(heartbeatRuns).values({ id, companyId, agentId: f.agentId, invocationSource: "on_demand", status: "succeeded",
+      issueId, nativeIssueId: issueId, contextSnapshot: { issueId }, startedAt: new Date(), finishedAt: new Date(),
+      createdAt: new Date(Date.now() + 1_000) });
+    return id;
+  }
+  it.each([false, true])("resolves an existing card after a later same-task answer, even when old locks are gone=%s", async noLocks => {
+    const f = await warmFixture();
+    await existingCard(f);
+    await laterAnswer(f);
+    if (noLocks) await db.update(issues).set({ checkoutRunId: null, executionRunId: null }).where(eq(issues.id, f.issueId));
+    await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
+    expect(await stopActions(f.issueId)).toMatchObject([{ status: "resolved", outcome: "restored",
+      resolutionNote: expect.stringContaining("succeeded") }]);
+    // Resolving stale copy is NOT Stop proof and must not release the old executor.
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    if (!noLocks) expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
+    await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
+    expect(await stopActions(f.issueId)).toHaveLength(1);
+  });
+  it("the normal recovery worker discovers a card even without stale lock columns", async () => {
+    const f = await warmFixture();
+    await existingCard(f);
+    await laterAnswer(f);
+    await db.update(issues).set({ checkoutRunId: null, executionRunId: null }).where(eq(issues.id, f.issueId));
+    const errors: unknown[] = [];
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, canReconcile: () => true,
+      onError: error => errors.push(error) });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+    const worker = registerIssueRecoveryWork(db, coordinator, { stranded: async () => {}, orphanBlockers: async () => {},
+      recoveryActions: async () => {}, dependencies: async () => ({ enqueueFailed: 0 }),
+      locks: scope => recovery.sweepStaleIssueLocks(scope), watchdogs: async () => ({ incomplete: 0 }),
+      schedulingSuppressed: async () => false }, () => true);
+    try {
+      await worker.ready;
+      await vi.waitFor(async () => expect(await stopActions(f.issueId)).toMatchObject([{ status: "resolved" }]), { timeout: 5_000 });
+      expect(errors).toEqual([]);
+    } finally { await worker.stop(); await coordinator.stop(); }
+  });
+
+  it("does not mistake an earlier answer or another task's answer for recovery", async () => {
+    const f = await warmFixture(), other = await warmFixture();
+    await existingCard(f);
+    await laterAnswer(other);
+    const otherIssueId = randomUUID();
+    await db.insert(issues).values({ id: otherIssueId, companyId: f.companyId, title: "Another task", status: "in_review" });
+    await laterAnswer(f, f.companyId, otherIssueId);
+    // Authoritative task binding wins over an old context snapshot.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+      status: "succeeded", issueId: otherIssueId, nativeIssueId: otherIssueId, contextSnapshot: { issueId: f.issueId },
+      createdAt: new Date(Date.now() + 1_000) });
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+      status: "succeeded", issueId: f.issueId, createdAt: new Date(0) });
+    await inspect(f, "sweep");
+    expect(await stopActions(f.issueId)).toMatchObject([{ status: "escalated" }]);
+  });
+  it("removes only a stale Stop annotation, preserves independent recovery and records answer resolution once", async () => {
+    const f = await warmFixture();
+    await existingCard(f);
+    const [action] = await stopActions(f.issueId);
+    await db.update(issueRecoveryActions).set({ cause: "independent_recovery", evidence: { ...action!.evidence,
+      independentProof: "preserve", stopPending: { ...(action!.evidence.stopPending as Record<string, unknown>),
+        standalone: false, previousNextAction: "Old independent instruction" } },
+      nextAction: `${action!.nextAction}\n\nKeep current independent instruction` }).where(eq(issueRecoveryActions.id, action!.id));
+    await laterAnswer(f);
+    await inspect(f, "sweep");
+    await inspect(f, "sweep");
+    const [after] = await stopActions(f.issueId);
+    expect(after).toMatchObject({ status: "escalated", cause: "independent_recovery",
+      nextAction: "Keep current independent instruction", evidence: { independentProof: "preserve" } });
+    expect(after!.evidence).not.toHaveProperty("stopPending");
+    const logs = await db.select().from(activityLog).where(eq(activityLog.entityId, f.issueId));
+    expect(logs.filter(log => log.action === "issue.execution_stop_pending_resolved")).toHaveLength(1);
+    expect(logs.filter(log => log.action === "issue.execution_stop_confirmed")).toHaveLength(0);
+  });
+
+  it("never resolves a real unproven Stop just because a later chat answered", async () => {
+    const f = await warmFixture();
+    await existingCard(f, true);
+    await laterAnswer(f);
+    await inspect(f, "sweep");
+    expect(await stopActions(f.issueId)).toMatchObject([{ status: "escalated" }]);
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
+    expect(await stopActions(f.issueId)).toMatchObject([{ status: "resolved", outcome: "restored" }]);
+  });
+  it("resolves an existing no-Stop card once the named lease is released after its binding changes", async () => {
+    const f = await warmFixture();
+    await existingCard(f);
+    await db.update(issues).set({ checkoutRunId: null, executionRunId: null }).where(eq(issues.id, f.issueId));
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
+    expect(await stopActions(f.issueId)).toMatchObject([{ status: "resolved", outcome: "restored" }]);
   });
 
   it("retains both claims after guarded recovery when cancellation has no Stop proof and the PID is live", async () => {

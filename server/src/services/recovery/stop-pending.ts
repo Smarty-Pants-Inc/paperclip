@@ -1,5 +1,6 @@
-import { and, eq, inArray } from "drizzle-orm";
-import { issueRecoveryActions, type Db } from "@paperclipai/db";
+import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
+import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { logActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
@@ -25,6 +26,36 @@ type StopPending = {
   standalone: boolean;
   previousNextAction: string | null;
 };
+/** Recorded requests, not a terminal status or a paused assignee, establish intent. */
+export function hasRecordedStopRequest(run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">): boolean {
+  const result = run.resultJson ?? {};
+  return run.errorCode === "operator_interrupted" ||
+    ["executionCancellation", "startupCancellation", "nativeCancellation", "cancellation",
+      "operatorInterrupted", "cancelledByActorType", "cancelledByUserId", "interruptedByActorType",
+      "queuedCommentInterruptQueueId", "pauseRequested", "stopRequested", "interruptRequested"]
+      .some(key => result[key] != null && result[key] !== false);
+}
+
+/** An answer can retire a no-request diagnostic, never prove execution Stop. */
+async function laterSuccessfulTaskRun(tx: Db, input: TaskBinding) {
+  if (!input.runIds.length) return null;
+  const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  if (!issue || issue.status === "cancelled" || issue.cancelledAt) return null;
+  const runs = await tx.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, input.runIds)));
+  if (runs.length !== input.runIds.length || runs.some(hasRecordedStopRequest)) return null;
+  // Compare in PostgreSQL: JS Date truncates microseconds and could otherwise
+  // misclassify the named succeeded run itself as a later answer.
+  const sourceTime = tx.select({ at: sql<Date>`max(${heartbeatRuns.createdAt})` }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, input.runIds)));
+  return (await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.status, "succeeded"),
+    notInArray(heartbeatRuns.id, input.runIds), sql`${heartbeatRuns.createdAt} > (${sourceTime})`,
+    sql`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.nativeIssueId}::text,
+      ${heartbeatRuns.contextSnapshot}->>'issueId') = ${input.issueId}`,
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1))[0] ?? null;
+}
+
 /** Ordinary task progress is not evidence that this retained executor stopped. */
 export function hasTaskStopPending(action: { evidence: Record<string, unknown> }): boolean {
   const value = action.evidence.stopPending;
@@ -48,6 +79,28 @@ async function activeAction(tx: Db, input: TaskBinding): Promise<typeof issueRec
     inArray(issueRecoveryActions.status, ["active", "escalated"]),
   )).for("update"))[0];
 }
+/** Re-check the diagnostic's named owners, not just the task's current binding.
+ * Caller holds the task lock. Take run locks before recovery-action locks. */
+export async function recheckTaskStopPending(tx: Db, input: { companyId: string; issueId: string }, publications: ActivityPublication[]) {
+  const actions = await tx.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId),
+    inArray(issueRecoveryActions.status, ["active", "escalated"]),
+  ));
+  const pending = actions.map(stopPending).find(value => value !== null);
+  if (!pending?.runIds.length) return;
+  const runIds = [...new Set(pending.runIds)].sort();
+  await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, runIds),
+  )).orderBy(asc(heartbeatRuns.id)).for("update");
+  const binding = { ...input, runIds };
+  if (await runExecutionsHaveStopped(tx, input.companyId, runIds)) {
+    await clearTaskStopPending(tx, binding, publications);
+    return;
+  }
+  const answer = await laterSuccessfulTaskRun(tx, binding);
+  if (answer) await clearTaskStopPending(tx, { ...binding, answeredByRunId: answer.id }, publications);
+}
+
 async function notify(tx: Db, input: TaskBinding) {
   await notifyIssueRecovery(tx, { companyId: input.companyId });
   await notifyNativeRecoveryNotices(tx, { companyId: input.companyId, issueId: input.issueId });
@@ -59,6 +112,9 @@ async function notify(tx: Db, input: TaskBinding) {
  * task or a historical run without issue context. No task workflow state changes. */
 export async function recordTaskStopPending(tx: Db, input: TaskBinding & { source: string }, publications: ActivityPublication[]) {
   const runIds = [...new Set(input.runIds)].sort();
+  // Do not recreate a retired no-Stop card on every tick while the old lease
+  // remains held. A later answer does not release either execution claim.
+  if (await laterSuccessfulTaskRun(tx, { ...input, runIds })) return;
   let existing = await activeAction(tx, input);
   const prior = existing && stopPending(existing);
   if (prior && JSON.stringify(prior.runIds) === JSON.stringify(runIds) && existing!.nextAction.includes(STOP_PENDING_CODE)) return;
@@ -101,9 +157,9 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   }, publications);
 }
 
-/** Only the successful guarded release removes this diagnostic. Independent
- * recovery evidence, work, runs, sessions and traces remain untouched. */
-export async function clearTaskStopPending(tx: Db, input: TaskBinding, publications: ActivityPublication[]) {
+/** Caller supplies guarded Stop proof, or a checked later answer without any
+ * recorded Stop request. Neither resolution mutates execution claims. */
+export async function clearTaskStopPending(tx: Db, input: TaskBinding & { answeredByRunId?: string }, publications: ActivityPublication[]) {
   const existing = await activeAction(tx, input);
   const pending = existing && stopPending(existing);
   if (!existing || !pending) return;
@@ -113,18 +169,22 @@ export async function clearTaskStopPending(tx: Db, input: TaskBinding, publicati
     const sameBinding = JSON.stringify(pending.runIds) === JSON.stringify([...new Set(input.runIds)].sort());
     await tx.update(issueRecoveryActions).set({ status: sameBinding ? "resolved" : "cancelled",
       outcome: sameBinding ? "restored" : "cancelled", resolvedAt: now, updatedAt: now,
-      resolutionNote: sameBinding ? "Stop proved under the task and bound-run locks."
+      resolutionNote: sameBinding ? input.answeredByRunId
+        ? `Later run ${input.answeredByRunId} of this task succeeded; no Stop was requested. Execution claims are unchanged.`
+        : "Stop proved under the task and bound-run locks."
         : "Task execution ownership changed; the old Stop inspection is historical.",
     }).where(eq(issueRecoveryActions.id, existing.id));
   } else {
     const { stopPending: _pending, ...evidence } = existing.evidence;
     await tx.update(issueRecoveryActions).set({ evidence, updatedAt: now,
       nextAction: existing.nextAction.endsWith(STOP_PENDING_ACTION)
-        ? pending.previousNextAction ?? "" : existing.nextAction,
+        ? pending.previousNextAction ?? "" : existing.nextAction.replace(STOP_PENDING_ACTION, "").trim(),
     }).where(eq(issueRecoveryActions.id, existing.id));
   }
   await logActivity(tx, { companyId: input.companyId, actorType: "system", actorId: "recovery",
-    action: "issue.execution_stop_confirmed", entityType: "issue", entityId: input.issueId,
-    details: { runIds: input.runIds, recoveryActionId: existing.id },
+    action: input.answeredByRunId ? "issue.execution_stop_pending_resolved" : "issue.execution_stop_confirmed",
+    entityType: "issue", entityId: input.issueId,
+    details: { runIds: input.runIds, recoveryActionId: existing.id,
+      ...(input.answeredByRunId ? { reason: "later_run_succeeded", answeredByRunId: input.answeredByRunId } : {}) },
   }, publications);
 }
