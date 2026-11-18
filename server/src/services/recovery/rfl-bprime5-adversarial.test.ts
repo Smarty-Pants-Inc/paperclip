@@ -75,9 +75,13 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
   function carry(key: typeof keys[number], id: string) {
     return key === "wakeCommentIds" ? { [key]: [id] } : key === "firstTurnQueuedInput" ? { [key]: { commentIds: [id] } } : { [key]: id };
   }
-  for (const key of keys) it(`attribution by ${key} answers the carried later message, not semantic analysis of prose`, async () => {
+  // RFL binding scope 2026-11-18 14:23Z, row (b): a reply counts for message M only if its run's OWN input names M;
+  // a reply to a LATER message never answers M. The old row read the earlier message as answered by the later
+  // message's reply (discovered: false). The earlier message is now still owed; the control proves the difference
+  // is the run's own input, nothing else.
+  for (const key of keys) it(`supersedes(attribution by ${key} answers the carried later message, not semantic analysis of prose; RFL binding scope 2026-11-18 14:23Z row (b), RECORD PENDING): attribution by ${key} answers the carried message, not semantic analysis of prose; the earlier message it does not name stays owed`, async () => {
     const f = await fixture();
-    await f.message("Production version?", f.base);
+    const first = await f.message("Production version?", f.base);
     const second = await f.message("Staging version?", f.base + 10_000);
     const run = await f.run(second, f.base + 11_000, carry(key, second));
     // Deliberately answers only the first question. Native finalization judges
@@ -86,12 +90,22 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     await settleConversationTurnForRun(db, f.companyId, run);
     const [native] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     expect(native).toMatchObject({ status: "in_review", conversationState: "waiting" });
-    expect(await f.flags()).toEqual({ discovered: false, batched: false });
+    // The carried (latest) message is answered; the earlier one, which the run's own input does not name, is owed.
+    expect(await f.flags()).toEqual({ discovered: true, batched: true });
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     await f.sweep(); expect(await f.notices()).toHaveLength(0);
+    // Control: the same run and reply, with the earlier message in the run's own input too, answers both.
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented",
+      conversationSessionGeneration: 0, ...carry(key, second), ...(key === "wakeCommentIds" ? { wakeCommentIds: [first, second] }
+        : { wakeCommentIds: [first] }) } }).where(eq(heartbeatRuns.id, run));
+    expect(await f.flags()).toEqual({ discovered: false, batched: false });
   });
 
-  it("supersession across a soft-deleted later carrying boundary uses the same predicate everywhere", async () => {
+  // RFL binding scope 2026-11-18 14:23Z, row (b): the old row retired the FIRST message's notice on a reply whose run
+  // named only the later (then soft-deleted) message. That reply never answers the first message: its notice stands.
+  // The retirement the old row proved (discovery, the worker flag and the settle read one predicate) is kept on a
+  // reply whose run's own input names the first message.
+  it("supersedes(supersession across a soft-deleted later carrying boundary uses the same predicate everywhere; RFL binding scope 2026-11-18 14:23Z row (b), RECORD PENDING): a reply to a soft-deleted LATER message does not retire the earlier message's notice; an own-input reply does, by the same predicate everywhere", async () => {
     const f = await fixture();
     const first = await f.message("Production version?", f.base);
     await f.sweep(); const [notice] = await f.notices(); expect(notice?.metadata?.authorizationReason).toBe(`unanswered_message:${first}`);
@@ -99,6 +113,12 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     const run = await f.run(second, f.base + 11_000, { conversationReplyBoundaryCommentId: second });
     await f.reply(run, f.base + 40_000);
     await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, second));
+    expect(await f.flags()).toEqual({ discovered: false, batched: false }); // the first message is still owed and has its notice
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
+    expect((await f.notices()).map(n => n.metadata?.authorizationReason)).toEqual([`unanswered_message:${first}`]);
+    // A reply from a succeeded run whose own input names the first message retires it.
+    const own = await f.run(first, f.base + 50_000);
+    await f.reply(own, f.base + 80_000);
     expect(await f.flags()).toEqual({ discovered: true, batched: true }); // notice needs retiring
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     expect(await f.notices()).toHaveLength(0);

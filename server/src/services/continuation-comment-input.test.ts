@@ -47,9 +47,16 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
       createdByRunId: earlierRun.id, body: "Answer to the earlier one" });
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
+  });
+
+  it("supersedes(RFL ruling (1) 20:06Z 'the parent's OWN published reply answers the comment', asserted on a FAILED parent; RFL binding scope 2026-11-18 14:23Z row (a), basis RFL record SUPERSEDE-PAUSESTOP-ANSWERED-1118 'ANSWERED = completed final answer'; own record PENDING): a FAILED parent's own reply does not answer; the same reply answers once that parent SUCCEEDED", async () => {
+    const f = await fixture();
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
       createdByRunId: f.run.id, body: "COBALT" });
-    // RFL ruling (1), 20:06Z: the parent's OWN published reply answers the comment (carrying it would answer it twice).
+    // The fixture's parent FAILED: its reply is not an answer, so the comment is still carried (owed).
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
+    // RFL ruling (1), 20:06Z, on a parent that SUCCEEDED: its OWN published reply answers the comment (carrying it would answer it twice).
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
   });
 
