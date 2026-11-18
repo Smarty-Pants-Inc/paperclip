@@ -44,13 +44,14 @@ import { redactSensitiveText } from "../redaction.js";
  *   included) and ArrayBuffer.
  * - A credential split across two fields, or across two log lines, is in no
  *   single string either layer scans.
- * - The walker also masks by key name: a value of any type under a key in
+ * - Both layers also mask by key name: a value of any type under a key in
  *   SENSITIVE_LOG_KEY_NAMES (http-log-redaction.ts; whole key, any case, "-"
- *   and "_" alike) becomes "[masked: sensitive key]", at any depth of err,
- *   stderr, stdout, msg and errorContext. Elsewhere a plain value under such a
- *   key ({"x-api-key": "abc"} in a field no serializer visits) is masked only
- *   where a redact path or redactSensitive covers it: the backstop masks by
- *   credential shape, not by key name.
+ *   and "_" alike) becomes "[masked: sensitive key]". The walker does it at
+ *   any depth of err, stderr, stdout, msg and errorContext; the backstop does
+ *   it in every field of the line, so it also covers fields no serializer
+ *   visits ({"ctx":{"x-api-key":"abc"}}), child bindings, and pino-http's req
+ *   and res. A value a redact path already wrote as "[Redacted]" is left as
+ *   it is.
  */
 const MAX_LOG_REDACTION_DEPTH = 8;
 const TRUNCATED_LOG_VALUE = `[masked: nested deeper than ${MAX_LOG_REDACTION_DEPTH}]`;
@@ -158,8 +159,11 @@ function redactLogObject(value: object, depth: number, ancestors: Set<object>): 
 // A line with nothing to mask is returned as the same string, byte for byte;
 // on a masked line only the masked tokens change, so Pino's key order and
 // duplicate keys are kept (a whole-line JSON.parse/stringify would reorder
-// integer-like keys and collapse duplicates). The scan is a loop, not a
-// recursion: there is no depth limit to fall past.
+// integer-like keys and collapse duplicates). A key token whose decoded name
+// is in SENSITIVE_LOG_KEY_NAMES has its whole value (a string, number or
+// literal, or a balanced object or array) replaced with
+// "[masked: sensitive key]", whatever field it is in. The scan is a loop, not
+// a recursion: there is no depth limit to fall past.
 export function maskSerializedLogLine(line: string): string {
   return maskSerializedLogStrings(maskSerializedLogBytes(line));
 }
@@ -224,19 +228,66 @@ function maskSerializedLogBytes(line: string): string {
     });
 }
 
+const SENSITIVE_KEY_LOG_JSON = JSON.stringify(SENSITIVE_KEY_LOG_VALUE);
+// Values already masked by name: ours, and Pino's redact-path censor.
+const MASKED_KEY_LOG_JSON: ReadonlySet<string> = new Set([SENSITIVE_KEY_LOG_JSON, JSON.stringify("[Redacted]")]);
+
+// The index of the closing quote of the JSON string opening at `start`, or -1.
+function jsonStringEnd(line: string, start: number): number {
+  let end = start + 1;
+  while (end < line.length) {
+    const code = line.charCodeAt(end);
+    if (code === 0x5c) end += 2;
+    else if (code === 0x22) return end;
+    else end += 1;
+  }
+  return -1;
+}
+
+function jsonSpaceEnd(line: string, start: number): number {
+  let index = start;
+  while (index < line.length && " \t\r\n".includes(line[index])) index += 1;
+  return index;
+}
+
+// One past the end of the JSON value starting at `start`, or -1: a string, a
+// balanced object or array (brackets inside strings skipped), or a number or
+// literal. A loop, not a recursion.
+function jsonValueEnd(line: string, start: number): number {
+  const first = line.charCodeAt(start);
+  if (first === 0x22) {
+    const end = jsonStringEnd(line, start);
+    return end === -1 ? -1 : end + 1;
+  }
+  if (first === 0x7b || first === 0x5b) {
+    let depth = 0;
+    let index = start;
+    while (index < line.length) {
+      const code = line.charCodeAt(index);
+      if (code === 0x22) {
+        const end = jsonStringEnd(line, index);
+        if (end === -1) return -1;
+        index = end + 1;
+        continue;
+      }
+      if (code === 0x7b || code === 0x5b) depth += 1;
+      else if ((code === 0x7d || code === 0x5d) && --depth === 0) return index + 1;
+      index += 1;
+    }
+    return -1;
+  }
+  let index = start;
+  while (index < line.length && !",}] \t\r\n".includes(line[index])) index += 1;
+  return index === start ? -1 : index;
+}
+
 function maskSerializedLogStrings(line: string): string {
   let parts: string[] | null = null;
   let copied = 0;
   let index = line.indexOf('"');
   while (index !== -1) {
-    let end = index + 1;
-    while (end < line.length) {
-      const code = line.charCodeAt(end);
-      if (code === 0x5c) end += 2;
-      else if (code === 0x22) break;
-      else end += 1;
-    }
-    if (end >= line.length) return unparsableLogLine(line);
+    const end = jsonStringEnd(line, index);
+    if (end === -1) return unparsableLogLine(line);
     let decoded: unknown;
     try {
       decoded = JSON.parse(line.slice(index, end + 1));
@@ -245,6 +296,21 @@ function maskSerializedLogStrings(line: string): string {
     }
     const text = decoded as string;
     const masked = redactSensitiveText(text);
+    // A string followed by ":" is a key (JSON has no other place for one).
+    const colon = jsonSpaceEnd(line, end + 1);
+    if (line.charCodeAt(colon) === 0x3a && sensitiveLogKey(text)) {
+      // A key with a sensitive name: its whole value becomes the marker.
+      const valueStart = jsonSpaceEnd(line, colon + 1);
+      const valueEnd = jsonValueEnd(line, valueStart);
+      if (valueEnd === -1) return unparsableLogLine(line);
+      if (!MASKED_KEY_LOG_JSON.has(line.slice(valueStart, valueEnd))) {
+        parts ??= [];
+        parts.push(line.slice(copied, valueStart), SENSITIVE_KEY_LOG_JSON);
+        copied = valueEnd;
+      }
+      index = line.indexOf('"', valueEnd);
+      continue;
+    }
     if (masked !== text) {
       parts ??= [];
       parts.push(line.slice(copied, index), JSON.stringify(masked));

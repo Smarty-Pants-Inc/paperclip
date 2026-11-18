@@ -1,7 +1,8 @@
 // Key names whose value is a credential whatever its shape. ONE list for both
-// layers: the logger's walker masks the value under any of these names, at any
-// depth and of any type (logger.ts, sensitiveLogKey), and the request-header
-// redact paths below are built from it. Matched case-insensitively against the
+// layers: the logger masks the value under any of these names, at any depth
+// and of any type, in the serializer walker and, in every field of the line,
+// in the streamWrite backstop (logger.ts, sensitiveLogKey), and the
+// request-header redact paths below are built from it. Matched case-insensitively against the
 // WHOLE key, with "-" and "_" treated alike: "X_API_KEY" and "Client-Secret"
 // match; "token_count", "secretary", "passwordPolicy" and "authorizationUrl" do
 // not. The same idea as Pino's own redact paths, applied by name.

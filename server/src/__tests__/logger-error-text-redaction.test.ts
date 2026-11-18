@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { baseLoggerOptions, createHttpLogger, maskSerializedLogLine } from "../middleware/logger.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { redactSensitiveText } from "../redaction.js";
+import { createDb } from "@paperclipai/db";
 
 const JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk0";
 const SECRETS = {
@@ -841,5 +842,158 @@ describe("every ArrayBuffer view is decoded and masked", () => {
     expect(JSON.parse(maskSerializedLogLine(`${u16}\n`)).ctx.trimEnd()).toBe(MASKED_LINE);
     const clean = '{"msg":"x","ctx":{"0":26984,"1":8224},"n":{"0":-1.5,"1":1e300}}\n';
     expect(maskSerializedLogLine(clean)).toBe(clean);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sensitive key names in EVERY field of the line. The walker only visits err,
+// stderr, stdout, msg and errorContext; the streamWrite backstop sees every
+// field of every line (top-level fields, child bindings, pino-http's req and
+// res), so it masks the whole value under a sensitive key name there.
+// ---------------------------------------------------------------------------
+
+const NEAR_MISS_KEYS = {
+  token_count: 5,
+  secretary: "Ms Smith",
+  passwordPolicy: "min 12 chars",
+  keyId: "k-1",
+  cookieConsent: true,
+  authorizationUrl: "https://auth.example.test/authorize",
+};
+
+describe.each<Layer>(["production", "backstop"])("sensitive key names are masked in every field of the line (%s)", (layer) => {
+  it("masks { ctx: { headers: { 'x-api-key' } } } in a top-level field logged with log.info", () => {
+    const { log, output } = captureLayer(layer);
+    log.info({ ctx: { headers: { Accept: "application/json", "x-api-key": SHAPELESS_KEY } } }, "calling upstream");
+    const text = output();
+    expect(text).not.toContain(SHAPELESS_KEY);
+    expectCleanLines(text);
+    const [record] = records(text);
+    expect(record.ctx).toEqual({ headers: { Accept: "application/json", "x-api-key": SENSITIVE_KEY_MARKER } });
+    expect(record.msg).toBe("calling upstream");
+  });
+
+  it("masks a sensitive key in a child logger's bindings, and in a grandchild's", () => {
+    const { log, output } = captureLayer(layer);
+    const child = log.child({ upstream: { headers: { "X-Api-Key": SHAPELESS_KEY } }, service: "billing" });
+    child.info("from child");
+    child.child({ db: { password: "plain-words-no-shape" } }).warn({ ctx: { Authorization: SHAPELESS_KEY } }, "from grandchild");
+    const text = output();
+    expect(text).not.toContain(SHAPELESS_KEY);
+    expect(text).not.toContain("plain-words-no-shape");
+    expectCleanLines(text);
+    const [first, second] = records(text);
+    expect(first.upstream).toEqual({ headers: { "X-Api-Key": SENSITIVE_KEY_MARKER } });
+    expect(first.service).toBe("billing");
+    expect(second.upstream).toEqual({ headers: { "X-Api-Key": SENSITIVE_KEY_MARKER } });
+    expect(second.db).toEqual({ password: SENSITIVE_KEY_MARKER });
+    expect(second.ctx).toEqual({ Authorization: SENSITIVE_KEY_MARKER });
+  });
+
+  it("masks it through pino-http's req.log and in pino-http's res headers", async () => {
+    const { log, output } = captureLayer(layer);
+    const app = express();
+    app.use(createHttpLogger(log));
+    app.get("/api/talk", (req, res) => {
+      req.log.info({ ctx: { headers: { "x-api-key": SHAPELESS_KEY } } }, "talking");
+      res.setHeader("x-auth-token", SHAPELESS_KEY);
+      res.status(200).json({ ok: true });
+    });
+    await request(app).get("/api/talk");
+    const text = output();
+    expect(text).not.toContain(SHAPELESS_KEY);
+    expectCleanLines(text);
+    const [talk, done] = records(text);
+    expect(talk.ctx.headers["x-api-key"]).toBe(SENSITIVE_KEY_MARKER);
+    expect(talk.req.method).toBe("GET");
+    expect(done.res.headers["x-auth-token"]).toBe(SENSITIVE_KEY_MARKER);
+    expect(done.res.statusCode).toBe(200);
+  });
+
+  it("masks an object or array under `password` whole, and values of any type", () => {
+    const { log, output } = captureLayer(layer);
+    log.info({
+      ctx: {
+        password: { primary: "plain-words-no-shape", list: ["p1-shapeless", { deep: "p2-shapeless" }] },
+        login: { user: "app", Password: ["p3-shapeless", "p4-shapeless"] },
+        SECRET: 1234567890,
+        client_secret: true,
+        private_key: null,
+      },
+      after: "kept",
+    }, "values");
+    const text = output();
+    for (const raw of ["plain-words-no-shape", "p1-shapeless", "p2-shapeless", "p3-shapeless", "p4-shapeless", "1234567890"]) {
+      expect(text).not.toContain(raw);
+    }
+    expectCleanLines(text);
+    const [record] = records(text);
+    expect(record.ctx).toEqual({
+      password: SENSITIVE_KEY_MARKER,
+      login: { user: "app", Password: SENSITIVE_KEY_MARKER },
+      SECRET: SENSITIVE_KEY_MARKER,
+      client_secret: SENSITIVE_KEY_MARKER,
+      private_key: SENSITIVE_KEY_MARKER,
+    });
+    expect(record.after).toBe("kept");
+  });
+
+  it("keeps near-miss key names as written: token_count, secretary, passwordPolicy, keyId, cookieConsent, authorizationUrl", () => {
+    const { log, output } = captureLayer(layer);
+    log.info({ ctx: NEAR_MISS_KEYS }, "kept");
+    log.child({ bound: NEAR_MISS_KEYS }).info("kept");
+    const [first, second] = records(output());
+    expect(first.ctx).toEqual(NEAR_MISS_KEYS);
+    expect(second.bound).toEqual(NEAR_MISS_KEYS);
+  });
+});
+
+describe("the backstop's key-name masking, given the line directly", () => {
+  it("masks the whole value after a sensitive key token, even with an escaped key or braces inside strings", () => {
+    const line = '{"level":30,"ctx":{"x\\u002dapi-key":"abc","password":{"a":"}{]\\"[","b":[1,{"c":2}]},"n":1},"msg":"x"}\n';
+    expect(maskSerializedLogLine(line)).toBe(
+      '{"level":30,"ctx":{"x\\u002dapi-key":"[masked: sensitive key]","password":"[masked: sensitive key]","n":1},"msg":"x"}\n',
+    );
+  });
+
+  it("leaves a sensitive name used as a VALUE, an already-masked value and a clean line byte for byte", () => {
+    for (const line of [
+      '{"level":30,"field":"password","list":["secret","cookie"],"msg":"password"}\n',
+      '{"level":30,"req":{"headers":{"authorization":"[Redacted]"}},"ctx":{"secret":"[masked: sensitive key]"}}\n',
+      `{"level":30,"ctx":${JSON.stringify(NEAR_MISS_KEYS)}}\n`,
+    ]) {
+      expect(maskSerializedLogLine(line)).toBe(line);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RFL errser F3: createDb's ERR_INVALID_URL carries the FULL connection URL,
+// password included, in err.input. The real error from the real createDb,
+// logged through the real (production) Pino logger: no password anywhere.
+// ---------------------------------------------------------------------------
+
+describe("createDb's ERR_INVALID_URL is logged without the password (RFL errser F3)", () => {
+  it("masks the password in err.input and err.message", () => {
+    const password = "judge-userinfo-password";
+    let caught: unknown;
+    try {
+      createDb(`postgres://u:${password}@h:BAD/db`);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as { code?: unknown }).code).toBe("ERR_INVALID_URL");
+    expect((caught as { input?: unknown }).input).toBe(`postgres://u:${password}@h:BAD/db`);
+    const { log, output } = capture();
+    log.error({ err: caught }, "database startup failed");
+    log.error({ err: new Error(`connection failed postgres://u:${password}@h/db`) }, "URL in message");
+    const text = output();
+    expect(text).not.toContain(password);
+    const [startup, inMessage] = records(text);
+    expect(startup.err.code).toBe("ERR_INVALID_URL");
+    expect(startup.err.input).toBe("postgres://u:***REDACTED***@h:BAD/db");
+    expect(startup.err.message).not.toContain(password);
+    expect(inMessage.err.message).toBe("connection failed postgres://u:***REDACTED***@h/db");
   });
 });
