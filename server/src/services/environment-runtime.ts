@@ -1429,7 +1429,15 @@ function adaptDuplexChannelHostSession(
 /** A setup test's own lease (no run, no issue, never reusable: :2511-2516)
  * once it is closed. Nothing may start its box again: a stopped one-off test
  * box keeps the test's files, and only this fence is durable across a
- * provider worker restart (Boat's own admission fences are in memory). */
+ * provider worker restart (Boat's own admission fences are in memory).
+ * The single choke point for plugin starts is the dispatch fence in
+ * environmentRuntimeService (environmentAcquireLease/ResumeLease/
+ * RunnerIngressEndpoint/RealizeWorkspace/Execute/SyncIn/SyncOut and starting
+ * environmentTask kinds) plus openDuplexChannel; callers reuse this predicate
+ * and never copy it.
+ * Residual (RFL §G4): with the fence, the probe's credential home is never
+ * removed from a closed box; the token stays on the archived disk, readable
+ * only by a holder of our Boat key, until a real delete exists. */
 export function closedSetupTestLease(lease: { status: string; heartbeatRunId: string | null; issueId: string | null; leasePolicy: string | null }): boolean {
   return lease.heartbeatRunId === null && lease.issueId === null && lease.leasePolicy !== "reuse_by_environment"
     && ["released", "failed", "expired"].includes(lease.status);
