@@ -3116,3 +3116,5 @@ export * from "./mcp-apps.js";
 export * from "./tool-call-progress.js";
 export * from "./mcp-skills.js";
 export type { TailscaleConnection, TailscaleDeviceLogin } from "./types/tailscale.js";
+export { REPLY_FILE_LINE_STATES, FILE_LINE_LOST, FILE_LINE_KEPT, FILE_LINE_KEPT_NO_BUTTON, FILE_LINE_SAVING, FILE_LINE_NOT_SAVED_YET,
+  readReplyFileLine, replyFileLineSavingExpired, replyFileLineText, type ReplyFileLine, type ReplyFileLineState } from "./reply-file-line.js";

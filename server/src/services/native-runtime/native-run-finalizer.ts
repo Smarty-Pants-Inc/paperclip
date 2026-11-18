@@ -1,3 +1,4 @@
+import { NATIVE_WITHHELD_REPLY_SCHEMA, pendingNativeWithheldReply } from "./native-withheld-reply-trigger.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { REMOTE_WORKSPACE_SANDBOX_DISK_FULL_CODE } from "../remote-workspace-transport.js";
@@ -991,18 +992,14 @@ export async function acceptedResponseDigestMatches(
   );
 }
 
-export const NATIVE_WITHHELD_REPLY_SCHEMA = "paperclip.native_withheld_reply.v1";
+export { NATIVE_WITHHELD_REPLY_SCHEMA, pendingNativeWithheldReply };
 /** Copy-back failures that end an accepted run without ever committing it. */
 export const NATIVE_WITHHELD_REPLY_FAILURE_CODES = [
   "native_workspace_sync_out_retry_exhausted", "native_workspace_sync_out_unrecoverable",
 ] as const;
-/** The durable trigger of publishWithheldAcceptedReply (native-withheld-reply.ts).
- * It is written by the SAME statement that ends the accepted run without a
- * committed reply, so a crash cannot separate the two; the reply-presentation
- * worker discovers the pending marker and publishes the saved answer once. */
-export function pendingNativeWithheldReply(resultId: string, failureCode: string | null) {
-  return { nativeWithheldReply: { schema: NATIVE_WITHHELD_REPLY_SCHEMA, state: "pending", resultId, failureCode } };
-}
+
+/** The settled file line of a reply whose copy-back succeeded: no line. */
+export const REPLY_FILE_LINE_SAVED = { state: "saved", deadlineAt: null } as const;
 
 /** An existing selected answer, including a subsequently deleted one, must
  * never be replaced or resurrected. The ONE never-twice guard shared by the
@@ -2172,13 +2169,24 @@ async function finalizeNativeRunAndProject(input: {
       // is published once by the withheld-reply path, without a file line.
       const cancelledWithheldReply = finalizationPhase === "committed" && terminalState === "succeeded" && coordinator.resultId
         ? sql`case when ${heartbeatRuns.status} = 'cancelled'
-            and ${heartbeatRuns.resultJson} #> '{nativeWithheldReply}' is null
+            and (${heartbeatRuns.resultJson} #> '{nativeWithheldReply}' is null
+              or (${heartbeatRuns.resultJson} #>> '{nativeWithheldReply,trigger}' = 'acceptance'
+                and ${heartbeatRuns.resultJson} #>> '{nativeWithheldReply,state}' = 'skipped'))
             and jsonb_typeof(${heartbeatRuns.resultJson} #> '{presentationDecision,commentId}') is distinct from 'string'
           then ${JSON.stringify(pendingNativeWithheldReply(coordinator.resultId, null))}::jsonb else '{}'::jsonb end`
+        : sql`'{}'::jsonb`;
+      // The file line of an already published reply is a bounded state
+      // (reply-file-line.ts). A commit is the copy-back succeeding: whatever the
+      // line said (saving, kept, lost), the files are saved now and it clears.
+      const savedReplyFileLine = finalizationPhase === "committed"
+        ? sql`case when jsonb_typeof(${heartbeatRuns.resultJson} #> '{presentationDecision,fileLine}') = 'object'
+          then jsonb_build_object('presentationDecision', (${heartbeatRuns.resultJson} -> 'presentationDecision')
+            || ${JSON.stringify({ fileLine: REPLY_FILE_LINE_SAVED })}::jsonb) else '{}'::jsonb end`
         : sql`'{}'::jsonb`;
       const projectedResult = sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
         || ${JSON.stringify(finalizationMetadata)}::jsonb
         || ${cancelledWithheldReply}
+        || ${savedReplyFileLine}
         || ${clearExecutionFailure ? sql`case when ${heartbeatRuns.status} = 'cancelled' then '{}'::jsonb
           else ${recoveredExecutionFailureMetadata()} end` : sql`'{}'::jsonb`}`;
       const nextError = providerFailure ? sql`coalesce(${heartbeatRuns.error}, ${providerFailure.errorMessage})`

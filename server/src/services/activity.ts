@@ -156,6 +156,7 @@ export function activityService(db: Db) {
   // A denied user needs the selected connection's name to repair their task.
   // Other readers need the connection's existing human sharing permission.
   // A malformed present Stop receipt must stay unconfirmed, not disappear.
+  // replyFileLine: the bounded file-line state of this run's presented reply (reply-file-line.ts).
   const summarizedResultJson = (viewerUserId: string | null) => sql<Record<string, unknown> | null>`
     case
       when ${heartbeatRuns.resultJson} is null then null
@@ -193,6 +194,12 @@ export function activityService(db: Db) {
           then ${heartbeatRuns.resultJson} -> 'workspaceRestoreFailure' end,
         'workspaceRestorePath', case when length(${heartbeatRuns.resultJson} ->> 'workspaceRestorePath') <= 180
           then ${heartbeatRuns.resultJson} -> 'workspaceRestorePath' end,
+        'replyFileLine', case when jsonb_typeof(${heartbeatRuns.resultJson} #> '{presentationDecision,fileLine}') = 'object'
+            and jsonb_typeof(${heartbeatRuns.resultJson} #> '{presentationDecision,commentId}') = 'string'
+          then jsonb_build_object(
+            'commentId', ${heartbeatRuns.resultJson} #> '{presentationDecision,commentId}',
+            'state', ${heartbeatRuns.resultJson} #> '{presentationDecision,fileLine,state}',
+            'deadlineAt', ${heartbeatRuns.resultJson} #> '{presentationDecision,fileLine,deadlineAt}') end,
         'finalResponseRecorded', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'finalResponseRecorded') = 'boolean'
           then ${heartbeatRuns.resultJson} -> 'finalResponseRecorded' end,
         'billingType', coalesce(${heartbeatRuns.resultJson} -> 'billingType', ${heartbeatRuns.resultJson} -> 'billing_type'),
