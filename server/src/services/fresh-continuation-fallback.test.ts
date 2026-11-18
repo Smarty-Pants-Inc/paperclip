@@ -1263,11 +1263,14 @@ suite("fresh-continuation fallback", () => {
       expect(kept, `${label}: the old run is unchanged`).toMatchObject({ status: "queued", startedAt: null, errorCode: g.queued.errorCode });
       expect.soft(await taskWakes(), `${label}: no wake queued, cancelled or changed`).toEqual(wakesBefore);
       if (label === "backlog") {
-        // Remove only the fixture's independent predecessor cleanup hold; the person changes status through the real route.
-        await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, g.lease.id));
+        // Change only status through the real route: no lease or queued run is repaired by the test.
         const move = await request(app).patch(`/api/issues/${g.issueId}`).send({ status: "todo" });
         expect(move.status, JSON.stringify(move.body)).toBe(200);
-        await heartbeat.drainActiveRunExecutions();
+        await vi.waitFor(async () => {
+          await heartbeat.drainActiveRunExecutions();
+          const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, g.issueId));
+          expect(runs.filter(r => r.id !== g.source.id && r.startedAt)).toHaveLength(1);
+        }, { timeout: 5_000, interval: 50 });
         for (let pass = 0; pass < 2; pass++) {
           await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
         }
@@ -1276,6 +1279,10 @@ suite("fresh-continuation fallback", () => {
         console.info(JSON.stringify({ fix14MoveToTodo: { issueId: g.issueId, route: move.status,
           started: movedRuns.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
         expect(movedRuns, "Moving to To do starts exactly ONE run, including later queue passes").toHaveLength(1);
+        expect(movedRuns[0]!.id, "the held old run is not re-poked").not.toBe(g.queued.id);
+        expect(movedRuns[0]!.retryOfRunId, "the assignment has no old retry ancestry").toBeNull();
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, g.queued.id)))[0])
+          .toMatchObject({ status: "cancelled", startedAt: null });
       }
     }
   }, 120_000);
