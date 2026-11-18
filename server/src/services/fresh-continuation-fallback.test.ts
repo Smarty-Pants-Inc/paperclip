@@ -1390,16 +1390,17 @@ suite("fresh-continuation fallback", () => {
       vi.setSystemTime(stamp + 1_000);
       const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId,
         observedRunId: f.queued.id, idempotencyKey: randomUUID() });
-      if (receipt.startQueuedRunId) await startPersonQueuedRunFresh(db, heartbeat as never,
-        { companyId, issueId: f.issueId, runId: receipt.startQueuedRunId, actorId: userId });
+      const startQueuedRunId = "startQueuedRunId" in receipt ? receipt.startQueuedRunId : undefined;
+      if (startQueuedRunId) await startPersonQueuedRunFresh(db, heartbeat as never,
+        { companyId, issueId: f.issueId, runId: startQueuedRunId, actorId: userId });
       vi.setSystemTime(stamp + 600_000);
       const lapsed = await card();
-      console.info(JSON.stringify({ fix15: { hold, enqueued, stamp: stamped!.startableSince, seen, retry: receipt.startQueuedRunId ?? null,
+      console.info(JSON.stringify({ fix15: { hold, enqueued, stamp: stamped!.startableSince, seen, retry: startQueuedRunId ?? null,
         lapsed: lapsed && { state: lapsed.state, canRetry: lapsed.canRetry } } }));
       expect(stamped!.startableSince, "the clear wrote the startable-since stamp").not.toBeNull();
       expect(seen.map(s => s.state), "working at clear + 1 ms and throughout the bound").toEqual(["working", "working", "working"]);
       expect(seen.map(s => s.canRetry ?? false), "no Retry inside the bound").toEqual([false, false, false]);
-      expect(receipt.startQueuedRunId, "the Retry press starts no fresh run").toBeUndefined();
+      expect(startQueuedRunId, "the Retry press starts no fresh run").toBeUndefined();
       expect(lapsed, "never taken: failed + Retry at stamp + 10 min").toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
       vi.useRealTimers();
       await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
