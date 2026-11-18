@@ -2797,6 +2797,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const answered = await readContinuationCommentInput(db, { companyId: receipt.companyId, issueId: issueId!,
         runId: retry.sourceRunId });
       if (answered.interactionIds) Object.assign(enrichedContextSnapshot, answered);
+      // Orphan: the retried run's own still-pending TYPED message. The Retry run reads its
+      // text from the fresh history (previousRunId), so it is not sent again as input: the
+      // ids ride for ANSWERED attribution only (person-message-answer.ts carriesCommentSql),
+      // so the Retry's final answer answers that message and its one notice retires.
+      else if (Array.isArray(answered.wakeCommentIds) && answered.wakeCommentIds.length)
+        enrichedContextSnapshot.attributionCommentIds = answered.wakeCommentIds;
       if (retry.boardMessageOrigin) enrichedContextSnapshot.boardMessageRetry = true;
     }
 
