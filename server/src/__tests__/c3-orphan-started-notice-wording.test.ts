@@ -130,7 +130,7 @@ describe("RFL started-run notice wording: real typed-chat orphan", () => {
       unanswered: true, skipExternalConversationSettlement: true, skipRelatedRecovery: true });
   }
 
-  it("supersedes(M1 STARTED and FAILED, later run answers only M2: ONE true started-run notice within 60s, no Retry, no double; RFL R2-1 rulings 11-18 12:06Z: the card and notice read decideRetryAuthority)", async () => {
+  it("supersedes(M1 STARTED and FAILED, later run answers only M2: ONE true started-run notice within 60s, no Retry, no double; RFL record SUPERSEDE-TAMIN4-M2HELD-RETRY-1118)", async () => {
     const c = await chat();
     fixture.calls = []; fixture.failNext = 1;
     let m2 = "";
