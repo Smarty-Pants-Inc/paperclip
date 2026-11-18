@@ -13,6 +13,12 @@ import { AsyncLocalStorage } from "node:async_hooks";
  *   synchronously and counted in flight until its promise settles.
  * - `cleanup(fn)` (via `hostCleanup`): always runs (releasing this work's own
  *   lock / removing its uniquely named temp), and is counted in flight too.
+ * - `work(fn)` (via `hostWork`): always runs, and the WHOLE of fn (including
+ *   its finally-block cleanup of private snapshots, temp files and the merge
+ *   owner sidecar) is counted in flight until it settles. adopt-drain3: work
+ *   that may still clean up after the owner's action returned (e.g. a restore
+ *   the action raced against its deadline) joins the drain this way, so the
+ *   drain is complete only when that cleanup has also finished.
  * - `close()`: no new `run` starts. Idempotent.
  * - `closeAndDrain(capMs)`: close, then wait until nothing is in flight or
  *   `capMs` passes. Returns `{ drained: true }` or `{ drained: false, inFlight }`.
@@ -39,6 +45,7 @@ export type HostMutationDrain = {
   readonly inFlight: number;
   run<T>(fn: () => Promise<T>): Promise<T>;
   cleanup<T>(fn: () => Promise<T>): Promise<T>;
+  work<T>(fn: () => Promise<T>): Promise<T>;
   close(reason?: unknown): void;
   closeAndDrain(capMs: number, reason?: unknown): Promise<{ drained: true } | { drained: false; inFlight: number }>;
   drained(): Promise<void>;
@@ -73,6 +80,7 @@ export function createHostMutationDrain(): HostMutationDrain {
       return track(fn);
     },
     cleanup: track,
+    work: track,
     close(reason) { if (!closed) { closed = true; closeReason = reason; } },
     async closeAndDrain(capMs, reason) {
       this.close(reason);
@@ -116,4 +124,17 @@ export function hostMutation<T>(fn: () => Promise<T>): Promise<T> {
 export function hostCleanup<T>(fn: () => Promise<T>): Promise<T> {
   const drain = store.getStore();
   return drain ? drain.cleanup(fn) : fn();
+}
+
+/** adopt-drain3: a unit of host work that owns private cleanup (its finally
+ * blocks remove its own snapshots/temp files and its merge owner sidecar).
+ * Under an owner's drain the whole unit is tracked, so `closeAndDrain()` /
+ * `drained()` (and therefore the owner's release) wait until its cleanup has
+ * finished, even when the owner's action stopped awaiting it (deadline race).
+ * It is never refused: its host mutations inside still go through
+ * `hostMutation` (refused once closed) and `hostCleanup` (always). Outside a
+ * drain it is just `fn()`. */
+export function hostWork<T>(fn: () => Promise<T>): Promise<T> {
+  const drain = store.getStore();
+  return drain ? drain.work(fn) : fn();
 }
