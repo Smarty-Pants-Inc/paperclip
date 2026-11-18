@@ -182,7 +182,6 @@ describe("heartbeat warm sandbox failure settlement", () => {
 
   it.each([
     { status: "failed", errorCode: "native_session_interrupted" },
-    { status: "cancelled", errorCode: "cancelled" },
     { status: "interrupted", errorCode: null },
   ] as const)("also counts ordinary $status/$errorCode as the second non-successful turn", async ({ status, errorCode }) => {
     const f = await seed();
@@ -195,6 +194,42 @@ describe("heartbeat warm sandbox failure settlement", () => {
     expect(f.state()).toEqual({ running: false, starts: 1 });
     expect(await environmentService(db).getLeaseById(next.leaseId)).toMatchObject({ status: "released",
       metadata: { warmFailureStreak: 2, warmRetentionReasonCode: "warm_retention_failure_limit" } });
+  });
+
+  // Reason: c3 restores upstream's rule: a cancelled run stops and retains its box (stop_and_retain) with its
+  // receipt, whoever cancelled it. A cancel is not a warm failure, so it neither counts toward nor hits the
+  // warm retention failure limit. Replaces the old cancelled/cancelled row of "also counts ordinary
+  // $status/$errorCode as the second non-successful turn" (RFL 06:52Z).
+  it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118): a NON-person cancel after a failure is stop_and_retain with its receipt, the box kept, no warm-retention failure counted; CONTROL: a genuine warm failure still hits the limit", async () => {
+    const f = await seed();
+    await finish(f, f.runId, "failed");
+    const next = await nextTurn(f);
+    // No person: no cancelledByActorType / cancelledByUserId on the run.
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, next.runId));
+    await f.heartbeat.releaseEnvironmentLeasesForRun({ runId: next.runId, companyId: f.companyId,
+      agentId: f.agentId, status: "cancelled", providerResourceDisposition: "keep_running" });
+    const stopped = await environmentService(db).getLeaseById(next.leaseId);
+    expect(stopped).toMatchObject({ status: "released", cleanupStatus: "success",
+      metadata: { sandboxStopAndRetainReceipt: expect.any(Object), warmFailureStreak: 1 } });
+    expect(hasConfirmedSandboxStopAndRetain(stopped!), "stop_and_retain receipt").toBe(true);
+    expect(stopped!.metadata, "no warm-retention failure counted").not.toHaveProperty("warmRetentionReasonCode");
+    expect(f.state()).toEqual({ running: false, starts: 1 });
+    expect(f.call.mock.calls.map(call => call[1]), "stopped and retained, never destroyed")
+      .toEqual(["environmentAcquireLease", "environmentResumeLease", "environmentStopLease"]);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.runId)))[0]?.resultJson ?? {})
+      .not.toHaveProperty("warmRetentionReasonCode");
+
+    // CONTROL: the same shape with a genuine warm failure as the second turn still counts and hits the limit.
+    const g = await seed();
+    await finish(g, g.runId, "failed");
+    const failedAgain = await nextTurn(g);
+    await finish(g, failedAgain.runId, "failed");
+    expect(g.state()).toEqual({ running: false, starts: 1 });
+    expect(await environmentService(db).getLeaseById(failedAgain.leaseId)).toMatchObject({ status: "released",
+      metadata: { warmFailureStreak: 2, warmRetentionReasonCode: "warm_retention_failure_limit" } });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failedAgain.runId)))[0]?.resultJson)
+      .toMatchObject({ warmRetentionReasonCode: "warm_retention_failure_limit" });
   });
 
   it("clears a capped streak after a stopped allocation resumes and succeeds", async () => {
