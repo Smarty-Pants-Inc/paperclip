@@ -2034,6 +2034,81 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect((await db.select().from(issueComments).where(eq(issueComments.id, stale!.id)))[0]!.deletedAt).not.toBeNull();
     });
 
+  // SUPERSEDE-F2-PENDING-ONLY-1117: pair each of the four superseded PV2b
+  // positives above for BOTH inputs: the card's source must own the typed
+  // message, and the final-answer successor must own the pending card answer.
+  it.each([
+    ["carrying", "context"], ["continuation", "context"], ["carrying", "delivery"], ["continuation", "delivery"],
+  ] as const)("PV2b paired no-own-input control: %s card / %s resume: successor final does not answer inherited input", async (cardSource, answerLink) => {
+    const f = await fixture({ status: "in_progress" });
+    const messageId = await f.message("Build Sol; ask me for the name first.");
+    const carryingRunId = await f.run({ commentId: messageId, status: "succeeded" });
+    const sourceRunId = cardSource === "carrying" ? carryingRunId
+      : await f.run({ commentId: messageId, status: "succeeded", retryOfRunId: carryingRunId });
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId,
+      addresseeUserId: f.userId, continuationPolicy: "none", createdAt: f.at(),
+      payload: { version: 1, questions: [{ id: "name", prompt: "What is the product called?", required: true,
+        selectionMode: "single", options: [{ id: "sol", label: "Sol" }] }] } }).returning();
+    // The superseded fixture added M to the card-producing run's own input.
+    // Remove ONLY that field: neither a card's timing nor continuation ancestry
+    // may answer M. Restore it to exercise the paired positive unchanged.
+    const messageAnswerState = () => db.select({ answered: completedPersonMessageAnswerSql({
+      id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) })
+      .from(issueComments).where(eq(issueComments.id, messageId));
+    await carryInto(sourceRunId, { wakeCommentId: null });
+    expect(await messageAnswerState()).toMatchObject([{ answered: false }]);
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed" });
+    const messageNotes = await f.visible();
+    expect(messageNotes).toHaveLength(1);
+    expect(messageNotes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
+    await carryInto(sourceRunId, { wakeCommentId: messageId });
+    expect(await messageAnswerState()).toMatchObject([{ answered: true }]);
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    expect(await f.visible()).toHaveLength(0);
+    await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId }, card!.id,
+      { answers: [{ questionId: "name", optionIds: ["sol"] }] }, { userId: f.userId });
+    // Keep the resolved input and its delivery on the fixture clock: a pending
+    // delivery's grace must not mask the owed answer in either paired variant.
+    await db.update(issueThreadInteractions).set({ resolvedAt: f.at() }).where(eq(issueThreadInteractions.id, card!.id));
+    const resume = await f.run({ status: "failed", errorCode: "adapter_failed" });
+    await carryInto(resume, { interactionId: card!.id, interactionStatus: "answered", source: "issue.interaction.respond" });
+    await db.update(issueQuestionResponseDeliveries).set({ targetRunId: resume,
+      status: answerLink === "context" ? "delivered" : "fallback_queued",
+      deliveryMode: answerLink === "context" ? "steered" : "wake_fallback" })
+      .where(eq(issueQuestionResponseDeliveries.interactionId, card!.id));
+    const successor = await f.nativeSuccessor(resume);
+    await f.reply(successor);
+    const cardAnswerState = () => db.select({ answered: completedPersonMessageAnswerSql({
+      id: sql`${issueThreadInteractions.id}`, companyId: sql`${issueThreadInteractions.companyId}`,
+      issueId: sql`${issueThreadInteractions.issueId}`, createdAt: sql`${issueThreadInteractions.resolvedAt}` }),
+      owed: unansweredCardAnswerSql("issue_thread_interactions") }).from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, card!.id));
+    const noOwnState = await cardAnswerState();
+    expect(noOwnState, "ancestry-only final leaves the card answer owed").toMatchObject([{ answered: false, owed: true }]);
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed" });
+    await f.sweep(); await f.sweep();
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card!.id}`);
+    expect(notes[0]!.body).toBe(sweepModule.UNANSWERED_CARD_ANSWER_TEXT);
+    // Paired positive: change ONLY the successor's own pending input. The
+    // same final now answers it and supersedes the one standing notice.
+    await carryInto(successor, { interactionIds: [card!.id] });
+    const ownState = await cardAnswerState();
+    expect(ownState).toMatchObject([{ answered: true, owed: false }]);
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    expect((await db.select().from(issueComments).where(eq(issueComments.id, notes[0]!.id)))[0]!.deletedAt).not.toBeNull();
+    if (process.env.A4A6_EVIDENCE_FILE) appendFileSync(process.env.A4A6_EVIDENCE_FILE,
+      JSON.stringify({ row: "A6", cardSource, answerLink, messageId, sourceRunId,
+        noOwnMessageAnswered: false, ownMessageAnswered: true, messageNoticeId: messageNotes[0]!.id,
+        cardId: card!.id, resume, successor, noOwnState, ownState,
+        noticeId: notes[0]!.id, noticeBody: notes[0]!.body, visibleAfterOwnInput: 0 }) + "\n");
+  });
+
   it("supersedes(RFL F2 pending-only attribution, 22:41Z): PV2b chain: a final after multiple failed ancestors answers only with the input in its own pending input", async () => {
     // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
     // Was: the final answered with no copied input ids, through previousRunId/retryOfRunId ancestry.
@@ -2260,7 +2335,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await noticesEver()).toHaveLength(0);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, first!.targetRunId!));
     await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, wakes[0]!.id));
-    await f.reply(first!.targetRunId!);
+    // The real answer service resolved at wall time. Its final reply must
+    // follow that resolution, not the fixture clock 15 minutes in the past.
+    // The removed status-only rule used to mask this misordered fixture.
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      body: "Here is my answer.", authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: first!.targetRunId!, createdAt: new Date() });
     await f.sweep();
     expect(await noticesEver()).toHaveLength(0);
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent"))))
@@ -2538,6 +2618,37 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notices).toHaveLength(1);
       expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
       expect(notices[0]!.body).toBe("Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.");
+    });
+
+    it("RED A4: a succeeded answer-resume without its final reply owes ONE true card-answer notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "succeeded");
+      const state = await db.select({ answered: completedPersonMessageAnswerSql({
+        id: sql`${issueThreadInteractions.id}`, companyId: sql`${issueThreadInteractions.companyId}`,
+        issueId: sql`${issueThreadInteractions.issueId}`, createdAt: sql`${issueThreadInteractions.resolvedAt}` }),
+        owed: unansweredCardAnswerSql("issue_thread_interactions") }).from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, card.id));
+      expect(state).toMatchObject([{ answered: false, owed: true }]);
+      const decision = await settleUnansweredPersonMessage(db, f);
+      expect(decision, "a succeeded status alone must never silence an owed answer").toMatchObject({ kind: "noticed" });
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      if (process.env.A4A6_EVIDENCE_FILE) appendFileSync(process.env.A4A6_EVIDENCE_FILE,
+        JSON.stringify({ row: "A4", root, card: card.id, resume: first, state, decision,
+          notices: notices.map(n => ({ id: n.id, body: n.body, reason: n.metadata?.authorizationReason })) }) + "\n");
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
+      expect(notices[0]!.body).toBe(sweepModule.UNANSWERED_CARD_ANSWER_TEXT);
+      expect(await f.visible()).toHaveLength(1);
+      // The same succeeded run's final answer is the shared policy's positive
+      // control: it supersedes the notice and never creates a second one.
+      await f.reply(first);
+      await f.sweep(); await f.sweep();
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+      expect(await f.visible()).toHaveLength(0);
+      expect(await cardNotices(f)).toHaveLength(1);
     });
 
     it("guard: answer, answer-resume answers: no notice", async () => {

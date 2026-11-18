@@ -632,9 +632,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     && ["failed", "timed_out", "interrupted", "cancelled"].includes(latest.status)
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
       runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
-  // A card answer's duty is its answer-resume chain ending with every run
-  // failed. A chain that ended otherwise is outside this rule.
-  if (cardAnswer && run && run.status === "succeeded") return { kind: "answered" };
+  // Card-answer selection above already reads the ONE ANSWERED predicate.
+  // A succeeded resume without its final answer still owes the card notice;
+  // run status alone must never override that shared decision.
 
   // Classify the refusal from its run, before a waiting/no-run state can replace its code.
   // Fresh-thread refusals belong to their own continuation fallback, not the held class.
