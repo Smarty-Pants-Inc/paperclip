@@ -557,7 +557,16 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     }
     settingUp = true;
   }
-  const agentPaused = Boolean(!settingUp && agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)
+  // A pause a person can act on is a lifecycle HOLD (the pause route adds its
+  // reason, modules/agent-lifecycle/adapters/postgres.ts:197; resume removes
+  // it, :198; pauseReason mirrors holds[0], :239) or an explicit pauseReason
+  // or lifecycle error. 'pausing'/'resuming' with none of those is a
+  // transition that ends by itself (an environment handoff,
+  // adapters/configuration.ts:48; with no hold, 'complete' goes on to
+  // 'resuming', postgres.ts:206, then ready): its saved message waits.
+  const lifecycleTransit = Boolean(!settingUp && agentRow && ["pausing", "resuming"].includes(agentRow.lifecycleState)
+    && (agentRow.lifecycleHolds ?? []).length === 0 && agentRow.pauseReason == null && !agentRow.lifecycleError);
+  const agentPaused = Boolean(!settingUp && !lifecycleTransit && agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)
     || (agentRow.lifecycleHolds ?? []).length > 0));
   // Import intentionally parks automations until activation. It lost neither
   // the message nor an attempt: do not annotate every carried-over open task.
@@ -589,6 +598,12 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       if (runCarriesMessage(candidate.contextSnapshot, message.id) || descendant) waitingToStart = true;
       if (descendant) { continuationWaiting = true; break; }
     }
+  }
+
+  if (lifecycleTransit && !waitingToStart) {
+    const wait = await bounded(now.getTime() + 30_000);
+    if (wait) return wait;
+    waitingToStart = true;
   }
 
   // A board-owned hold means nothing moves by itself: queued wakes behind it
