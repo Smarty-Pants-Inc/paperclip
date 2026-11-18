@@ -10509,9 +10509,13 @@ export function issueRoutes(
     // cannot change. The receipt is already committed. Admission that waits
     // (for example on the agent's start lock) keeps running after the answer,
     // which then stays "accepted"; maintenance redelivers it after a crash.
+    // A Retry the authority accepted HELD behind a restore hold is not admitted
+    // now: upstream's restore-held admission (deferred-execution promotion)
+    // admits it once, when the files are back (RetryAuthority.admission).
+    const heldForRestore = "held" in receipt && receipt.held?.reason === "workspace_repair_required";
     let refused: { reason: string; message: string } | null = null;
     let admissionSettled: string | null = null;
-    if (receipt.accepted && receipt.requestId && !finalizeRunId && !chatActionId) {
+    if (receipt.accepted && receipt.requestId && !finalizeRunId && !chatActionId && !heldForRestore) {
       const requestId = receipt.requestId;
       const admitted = heartbeat.resumeTaskRetry(issue.companyId, requestId).then(() => true, err => {
         logger.warn({ err, issueId: issue.id }, "Task Retry remains queued");
