@@ -196,6 +196,14 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
   // disagree on a message (RFL 20:22Z: run-less agent comments never answer; org 20:29Z: imported history).
   return answeredPersonMessageSql(m);
 }
+/** The key of a notice's still-owed member list: one notice covers one owed GROUP (the person messages one failed
+ * or reply-less run carried in its own input, or one no-run batch settled in the same pass). Its authorizationReason
+ * names the latest still-owed member; a group of one has no list. */
+export const UNANSWERED_MESSAGE_GROUP_KEY = "unansweredMessageIds";
+/** SQL: notice row n (alias) covers message id: its key names it, or its still-owed member list does. */
+const noticeCoversSql = (n: string, id: SQL) => sql`(substr(${sql.raw(n)}.metadata->>'authorizationReason',
+    strpos(${sql.raw(n)}.metadata->>'authorizationReason', ':') + 1) = ${id}::text
+  or coalesce(${sql.raw(n)}.metadata->${sql.raw(`'${UNANSWERED_MESSAGE_GROUP_KEY}'`)}, '[]'::jsonb) ? ${id}::text)`;
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 
@@ -232,11 +240,10 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
         and m.deleted_at is null and ${inScopeSql(rawMessage("m"), since)}
         and not ${answeredSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
-          and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
+          and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}) and ${noticeCoversSql("n", sql.raw("m.id"))}
           and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or exists (select 1 from ${issueComments} n
-      join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
-        and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
+      join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id and ${noticeCoversSql("n", sql.raw("m.id"))}
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
@@ -258,13 +265,13 @@ export function unansweredPersonMessageCommentCondition(): SQL {
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
-        and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
+        and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}) and ${noticeCoversSql("n", sql`${issueComments.id}`)}
         and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
       and exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
-          and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
+          and ${noticeCoversSql(`"issue_comments"`, sql.raw("m.id"))}
           and ${answeredSql(rawMessage("m"))})))`;
 }
 
@@ -320,7 +327,7 @@ export async function settleUnansweredPersonMessage(
 
 /** The task's owed set, one entry per message (the joint rule): every earlier person message discovery flags
  * (unansweredPersonMessageCommentCondition: in scope, unanswered by the one function, no notice yet), oldest
- * first, then the latest message LAST. Each gets its own decision and its own ONE notice. */
+ * first, then the latest message LAST. Each gets its own decision; each owed GROUP gets ONE notice. */
 async function settleOwedPersonMessages(
   db: Db,
   input: { companyId: string; issueId: string; now?: Date; issueCreatedAtGte?: Date | null;
@@ -351,8 +358,19 @@ async function settleOwedPersonMessages(
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
       and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
-        and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
-        and ${answeredSql(rawMessage("m"))})`);
+        and ${noticeCoversSql("n", sql.raw("m.id"))} and ${answeredSql(rawMessage("m"))})
+      and not exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
+        and ${noticeCoversSql("n", sql.raw("m.id"))} and not ${answeredSql(rawMessage("m"))})`);
+    // A group notice with an answered member and a still-owed one STAYS and stays true: it names only the still-owed.
+    await tx.execute(sql`update ${issueComments} n set updated_at = ${now.toISOString()}::timestamptz,
+      metadata = n.metadata || (select jsonb_build_object(${UNANSWERED_MESSAGE_GROUP_KEY}::text, jsonb_agg(m.id::text order by m.created_at, m.id),
+          'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}::text || (array_agg(m.id::text order by m.created_at desc, m.id desc))[1])
+        from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
+          and ${noticeCoversSql("n", sql.raw("m.id"))} and not ${answeredSql(rawMessage("m"))})
+    where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
+      and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX}) and n.metadata ? ${UNANSWERED_MESSAGE_GROUP_KEY}::text
+      and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
+        and ${noticeCoversSql("n", sql.raw("m.id"))} and ${answeredSql(rawMessage("m"))})`);
   });
 
   const earlierOwed = await db.select({ id: issueComments.id }).from(issueComments).where(and(
@@ -361,17 +379,28 @@ async function settleOwedPersonMessages(
     sql`${issueComments.id} <> (select l.id from ${issueComments} l where l.company_id = ${issue.companyId} and l.issue_id = ${issue.id}
       and l.author_type = 'user' and l.deleted_at is null order by l.created_at desc, l.id desc limit 1)`))
     .orderBy(issueComments.createdAt, issueComments.id).limit(EARLIER_OWED_PER_PASS);
+  // Decide every owed message, then ONE notice per owed GROUP: the members share the run that carried them (or
+  // have no run, this pass), the code and the standing note to replace. Never two notices for one message.
   const outcomes: UnansweredMessageOutcome[] = [];
+  const groups = new Map<string, Array<{ index: number; messageId: string | undefined; decision: NoticeDecision }>>();
   for (const messageId of [...earlierOwed.map(row => row.id), undefined]) {
-    outcomes.push(await settleOnePersonMessage(db, issue, now, input.nativeBlockedRepairApplies, messageId));
+    const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies, messageId);
+    if (decision.kind === "notice") {
+      groups.set(groupKey(decision), [...(groups.get(groupKey(decision)) ?? []), { index: outcomes.length, messageId, decision }]);
+      outcomes.push({ kind: "noticed_before" });
+    } else outcomes.push(await recordPendingDecision(db, issue, decision));
+  }
+  for (const members of [...groups.values()].reverse()) { // the latest message's group first
+    const outcome = await writeGroupNotice(db, issue, now, input.nativeBlockedRepairApplies, members);
+    for (const member of members) outcomes[member.index] = outcome;
   }
   return outcomes;
 }
 
-/** One message of the task (the latest when messageId is not given): decide, then write its notice under the fence. */
-async function settleOnePersonMessage(db: Db, issue: DecisionIssue, now: Date,
-  nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined, messageId: string | undefined): Promise<UnansweredMessageOutcome> {
-  const decision = await decideUnansweredMessage(db, issue, now, nativeBlockedRepairApplies, messageId);
+const groupKey = (decision: NoticeDecision) => `${decision.group}|${decision.code}|${decision.upgradeCommentId ?? ""}`;
+
+/** A decision that writes no notice: record a first deferral (T0) when it asks for it. */
+async function recordPendingDecision(db: Db, issue: DecisionIssue, decision: Exclude<Decision, NoticeDecision>): Promise<UnansweredMessageOutcome> {
   if (decision.kind === "pending") {
     if (decision.recordDeferral) {
       await appendHeartbeatRunEvent(db, { companyId: issue.companyId, runId: decision.recordDeferral.runId,
@@ -386,7 +415,12 @@ async function settleOnePersonMessage(db: Db, issue: DecisionIssue, now: Date,
     }
     return { kind: "pending", recheckAt: decision.recheckAt };
   }
-  if (decision.kind !== "notice") return decision;
+  return decision;
+}
+
+/** One owed group: write its ONE notice under the fence, keyed to its latest member that is still to be noticed. */
+async function writeGroupNotice(db: Db, issue: DecisionIssue, now: Date, nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined,
+  members: Array<{ messageId: string | undefined; decision: NoticeDecision }>): Promise<UnansweredMessageOutcome> {
   const commentId = await db.transaction(async tx => {
     // The issue fence that comment writers, the executor's held-notice writer
     // and execution admission take. The SAME predicate is evaluated again
@@ -395,9 +429,16 @@ async function settleOnePersonMessage(db: Db, issue: DecisionIssue, now: Date,
     // means no notice.
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies, messageId);
-    if (fenced.kind !== "notice" || fenced.reason !== decision.reason
-      || fenced.upgradeCommentId !== decision.upgradeCommentId) return null;
+    const kept: NoticeDecision[] = [];
+    for (const { messageId, decision } of members) {
+      const again = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies, messageId);
+      if (again.kind === "notice" && again.reason === decision.reason && groupKey(again) === groupKey(decision)) kept.push(again);
+    }
+    // Members are oldest first, the task's latest message last: the notice is keyed to the latest one kept.
+    const fenced = kept[kept.length - 1];
+    if (!fenced) return null;
+    if (kept.length > 1) Object.assign(fenced.notice.metadata, {
+      [UNANSWERED_MESSAGE_GROUP_KEY]: kept.map(member => member.reason.slice(UNANSWERED_MESSAGE_REASON_PREFIX.length)) });
     if (fenced.upgradeCommentId) {
       // The SAME note (same key) becomes the failure text: still one note.
       const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
@@ -413,7 +454,7 @@ async function settleOnePersonMessage(db: Db, issue: DecisionIssue, now: Date,
     }, tx);
     return comment?.id ?? null;
   });
-  return commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" };
+  return commentId ? { kind: "noticed", code: members[0].decision.code, commentId } : { kind: "noticed_before" };
 }
 
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
@@ -421,9 +462,12 @@ type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: 
 type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: { messageId: string; runId: string | null } }
-  | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
-      /** Set when this replaces the message's standing waiting note. */
-      upgradeCommentId?: string };
+  | NoticeDecision;
+type NoticeDecision = { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
+  /** The owed group: the run that carried the message in its own input, or "no_run". */
+  group: string;
+  /** Set when this replaces the message's standing waiting note. */
+  upgradeCommentId?: string };
 
 /** The run event that records, once and durably, when this step first deferred
  * a person message's notice to the native blocked-request repair (T0). */
@@ -464,7 +508,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       jsonb_array_elements(coalesce(sec->'rows', '[]'::jsonb)) r where r->>'label' = ${WAITING_ROW_LABEL} limit 1)` })
     .from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-    sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
+    sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
+    noticeCoversSql(`"issue_comments"`, sql`${message.id}`))).limit(1);
   // A standing WAITING note is still an open obligation: it must stay true.
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
   const upgrading = noticed?.waiting ? noticed.id : null;
@@ -729,7 +774,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     failureCode: waiting ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
-  return { kind: "notice", reason, code, notice, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
+  return { kind: "notice", reason, code, notice, group: messageRun?.id ?? UNANSWERED_MESSAGE_NO_RUN_CODE, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
 
 
@@ -741,8 +786,9 @@ export async function settleUnansweredPersonMessagesForTask(
     nativeBlockedRepairApplies?: NativeBlockedRepairApplies },
 ): Promise<{ noticed: number; pending: number }> {
   const result = { noticed: 0, pending: 0 };
+  const notices = new Set<string>(); // one notice covers a whole owed group: count it once
   for (const outcome of await settleOwedPersonMessages(db, input)) {
-    if (outcome.kind === "noticed") result.noticed += 1;
+    if (outcome.kind === "noticed" && !notices.has(outcome.commentId)) { notices.add(outcome.commentId); result.noticed += 1; }
     if (outcome.kind === "pending") {
       result.pending += 1;
       input.onDeferredDeadline?.(outcome.recheckAt);
@@ -765,10 +811,11 @@ export async function settleUnansweredPersonMessages(
     unansweredPersonMessageCondition(issues.id, issues.companyId),
   )).limit(200);
   const result = { noticed: 0, pending: 0 };
+  const notices = new Set<string>(); // one notice covers a whole owed group: count it once
   for (const candidate of candidates) {
     for (const outcome of await settleOwedPersonMessages(db, { companyId: candidate.companyId, issueId: candidate.id, now: input.now,
       nativeBlockedRepairApplies: input.nativeBlockedRepairApplies })) {
-      if (outcome.kind === "noticed") result.noticed += 1;
+      if (outcome.kind === "noticed" && !notices.has(outcome.commentId)) { notices.add(outcome.commentId); result.noticed += 1; }
       if (outcome.kind === "pending") {
         result.pending += 1;
         input.onDeferredDeadline?.(outcome.recheckAt);
