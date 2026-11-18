@@ -518,6 +518,36 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(JSON.stringify(notices[0])).not.toContain("receipt missing");
   });
 
+  // RFL F6 on this line (al/answered-unit): the crash between a run's 'running' commit and its wake's 'claimed'
+  // update (heartbeat/queue.ts claim) leaves the wake 'queued' while the run runs. The existing liveness rule
+  // (process recovery) then settles the run durably 'failed'. That queued wake is not a further attempt.
+  it.each([false, true])("RFL F6 crash state: a run that ran and failed while its wake stayed 'queued' is not a further attempt: exactly ONE notice (crashState=%s)", async crashState => {
+    const f = await fixture();
+    const messageId = await f.message("Write the report.");
+    const runId = await f.run({ commentId: messageId, status: "failed", error: "adapter process exited", finishedAgoMs: 60_000 });
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+      reason: "issue_commented", status: crashState ? "queued" : "claimed", runId, claimedAt: crashState ? null : f.at(),
+      payload: { issueId: f.issueId, commentId: messageId, _paperclipWakeContext: { issueId: f.issueId, wakeCommentId: messageId } } });
+    expect((await settleUnansweredPersonMessage(db, f)).kind, "the failed run is the attempt: noticed now").toBe("noticed");
+    await f.sweep(); await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
+  });
+
+  // F6 CONTROL: a queued wake whose run is itself still queued (live) remains a further attempt (pending).
+  it("RFL F6 control: a queued wake whose run is still queued keeps the message pending", async () => {
+    const f = await fixture();
+    const messageId = await f.message("Write the report.");
+    const failed = await f.run({ commentId: messageId, status: "failed", error: "adapter process exited", finishedAgoMs: 60_000 });
+    const next = await f.run({ commentId: messageId, status: "queued", retryOfRunId: failed });
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+      reason: "issue_commented", status: "queued", runId: next,
+      payload: { issueId: f.issueId, commentId: messageId, _paperclipWakeContext: { issueId: f.issueId, wakeCommentId: messageId } } });
+    expect((await settleUnansweredPersonMessage(db, f)).kind).toBe("pending");
+    expect(await f.visible()).toHaveLength(0);
+  });
+
   it("REG-21: after a gateway key rotation the person's wake FAILED 'provider or completion contract changed', no run, blocked -> exactly one notice", async () => {
     const f = await fixture({ status: "blocked" });
     const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: "Are you there?",

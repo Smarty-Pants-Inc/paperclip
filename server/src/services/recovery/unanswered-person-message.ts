@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import { completedPersonMessageAnswerSql } from "../person-message-answer.js";
 import {
   activityLog,
@@ -607,11 +607,22 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
   if (!boardHold && !agentPaused && !settingUp) {
-    const wakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status })
+    const savedWakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status,
+      runId: agentWakeupRequests.runId })
       .from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
         or(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
           and(eq(agentWakeupRequests.status, "deferred"), wellFormedExecutionWaitSql(agentWakeupRequests.payload)))));
+    // RFL F6: a crash between a run's 'running' commit and its wake's claim
+    // (heartbeat/queue.ts) leaves the wake 'queued' after its run ran. A queued
+    // wake is a further attempt only when its run is missing or still LIVE
+    // (queued/running/scheduled_retry); a run the existing liveness rule
+    // settled terminal is the attempt that already ended, never a pending one.
+    const wakeRunIds = [...new Set(savedWakes.flatMap(wake => wake.status === "queued" && wake.runId ? [wake.runId] : []))];
+    const endedWakeRuns = new Set(wakeRunIds.length ? (await q.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, wakeRunIds),
+      notInArray(heartbeatRuns.status, LIVE)))).map(row => row.id) : []);
+    const wakes = savedWakes.filter(wake => !(wake.status === "queued" && wake.runId && endedWakeRuns.has(wake.runId)));
     // Admission has saved a real further attempt for THIS message, not a
     // failed start. Coalesced receipts alone are not live; missing/malformed
     // waits retain the ordinary no-run/failure decision.
