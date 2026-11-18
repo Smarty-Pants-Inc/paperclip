@@ -7,7 +7,7 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, environments,
-  heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+  heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 
@@ -285,7 +285,12 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await s.copyBack();
     expect(await s.coordinator()).toMatchObject({ phase: "terminal_failure", failureCode: "native_workspace_sync_out_unrecoverable",
       failureDetail: { workspaceFinalizeAttempt: 1 } });
+    // Which check ended it: the lease-state check of the copy-back itself
+    // (native-workspace-finalizer.ts, `lease.status === "expired"`), before any export was tried.
     expect(box.resume).not.toHaveBeenCalled();
+    expect((await db.select().from(workspaceOperations).where(and(eq(workspaceOperations.heartbeatRunId, s.runId),
+      eq(workspaceOperations.phase, "workspace_finalize")))).map(operation => [operation.status, operation.stderrExcerpt]))
+      .toEqual([["failed", "workspace_sync_out_unrecoverable\n"]]);
     // Until the worker publishes, the one answered rule says M is unanswered.
     expect(await s.answered()).toEqual([false]);
     await s.presentationWorker();
@@ -311,7 +316,8 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await db.update(environmentLeases).set({ status: "expired", releasedAt: new Date() }).where(eq(environmentLeases.id, s.leaseId));
     await s.copyBack();
     expect(await s.coordinator()).toMatchObject({ phase: "terminal_failure", failureCode: "native_workspace_sync_out_unrecoverable" });
-    await s.presentationWorker();
+    // Four workers discover the same pending reply at once: the row lock lets one publish.
+    await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
     const replies = await s.replies();
     expect(replies).toHaveLength(1);
     expect(replies[0].body).toBe(`${ANSWER}\n\n${FILE_LINE_LOST}`);
