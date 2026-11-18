@@ -829,15 +829,16 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
   }
   type Capture = Awaited<ReturnType<typeof captureAgentFileCheckpoint>>;
-  type Precapture = { row: Copy; target: AdapterExecutionTarget; captured: Capture };
+  type Precapture = { row: Copy; target: AdapterExecutionTarget; captured: Capture; startedAt: Date };
   async function precapture(row: Copy, target?: AdapterExecutionTarget | null): Promise<Precapture | undefined> {
     if (!disposableRemoteCopy(row) || row.receipt?.warm !== true || !await owns(row) || row.state === "superseded") return undefined;
     const resolved = target ?? transports.get(key(row))?.target;
     if (resolved?.kind !== "remote" || row.localRoot !== projectionRoot(row)) return undefined;
     try {
       const previous = row.receipt?.checkpointManifest as AgentFileManifest | undefined ?? checkpointBaseline(baseline(row));
+      const startedAt = new Date();
       const captured = await captureAgentFileCheckpoint({ runId: row.runId, localRoot: row.localRoot, executionRoot: row.executionRoot, previous, target: resolved });
-      return { row, target: resolved, captured };
+      return { row, target: resolved, captured, startedAt };
     } catch (error) {
       logger.warn({ err: error, runId: row.runId }, "Agent file checkpoint capture before the directory lock failed; capturing under the lock");
       return undefined;
@@ -904,6 +905,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // A failed surfacing fails CLOSED: no cleanup, and no stopped release.
     let unsurfaced = aside ? await notesAsideRetried(row, aside, "surface") === null : false;
     let failure: unknown;
+    let captureStartedAt = new Date();
     for (let attempt = 0; attempt < 3; attempt++) {
       let captured: Capture | undefined;
       try {
@@ -911,7 +913,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         const previous = row.receipt?.checkpointManifest as AgentFileManifest | undefined ?? checkpointBaseline(baseline(row));
         // Upstream's pre-lock capture is reused only when no aside surfacing ran
         // first: a surfaced note copy must be in the capture that saves it.
-        captured = attempt === 0 && reusable && !aside ? reusable
+        const reused = attempt === 0 && reusable && !aside;
+        captureStartedAt = reused ? early!.startedAt : new Date();
+        captured = reused ? reusable
           : await captureAgentFileCheckpoint({ runId: row.runId, localRoot: row.localRoot, executionRoot: row.executionRoot, previous, target, signal });
         live();
         const snapshot = checkpointSnapshot(captured.manifest);
@@ -926,13 +930,18 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null, conflicts: [],
           }));
         live();
+        // B0a checkpoint time: a warm capture is timed at its START (an edit made
+        // while it ran may be missing from it). A stopped capture runs after the
+        // provider stopped, so its time is the stop time this write records.
+        const stopAt = new Date();
+        const checkpointAt = (stopped ? stopAt : captureStartedAt).toISOString();
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
-          ...(stopped ? { processStoppedAt: new Date() } : {}),
+          ...(stopped ? { processStoppedAt: stopAt } : {}),
           // A verified save ends any earlier failed save's hold. This warm
           // path and collectStopped's cold path both strip it.
           receipt: { ...withoutSaveHold(row.receipt), baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
-            checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning, conflicts,
+            checkpointState: changed ? "saved" : "unchanged", checkpointAt, checkpointStats: captured.stats, storageWarning, conflicts,
             pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
         if (aside && !unsurfaced) {
           live();
@@ -992,7 +1001,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const reason = failure instanceof HttpError || failure instanceof AgentFileLimitError || failure instanceof Error ? failure.message : String(failure);
     // B0a: a refused save of a copy with nothing to save is never held. An
     // authorization refusal (403) never records unchanged (b13 guards).
-    if (errorCode !== AGENT_FILES_ASIDE_UNSURFACED && !(failure instanceof HttpError && failure.status === 403) && nothingToSave(row))
+    if (errorCode !== AGENT_FILES_ASIDE_UNSURFACED && !(failure instanceof HttpError && failure.status === 403) && await nothingToSave(row))
       return settleNothingToSave(row, reason);
     const stoppedAt = row.processStoppedAt ?? new Date();
     const previous = row.receipt?.savePending as { since?: string; failures?: number; permanentAt?: string; heldFiles?: AgentFileHeldFile[]; noticeActivityId?: string } | undefined;
@@ -1016,16 +1025,37 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       agentFileHoldWriteCondition);
     return noticePermanentHold(held);
   }
-  /** B0a: the copy's last verified checkpoint recorded no change (candidate ==
-   * base, checkpointState unchanged, no copied files, no conflicts). */
-  function nothingToSave(row: Copy) {
+  /** B0a (rf-3 caveat 1): there is nothing to save ONLY IF the last verified
+   * checkpoint recorded no change (candidate == base, checkpointState unchanged,
+   * no copied files, no conflicts) AND either that checkpoint is at or after the
+   * run's process stop (no edit could follow it) or the box is proven gone (no
+   * byte is left to save). A checkpoint taken before the stop, or one with no
+   * recorded time (rows written before checkpointAt existed), proves nothing
+   * about edits made after it: the copy stays held (B0b, retried on resume). */
+  async function nothingToSave(row: Copy) {
     const stats = row.receipt?.checkpointStats as { copiedFiles?: unknown } | undefined;
-    return row.receipt?.checkpointState === "unchanged" && row.candidateHash === row.baseHash
+    const unchanged = row.receipt?.checkpointState === "unchanged" && row.candidateHash === row.baseHash
       && (stats?.copiedFiles === undefined || stats.copiedFiles === 0)
       && !(Array.isArray(row.receipt?.conflicts) && row.receipt.conflicts.length) && pendingConflicts(row).length === 0;
+    if (!unchanged) return false;
+    return checkpointAtOrAfterStop(row) || await boxProvenGone(row);
+  }
+  /** The last verified checkpoint's time (receipt.checkpointAt) is at or after
+   * the recorded process stop (processStoppedAt). Either missing proves nothing. */
+  function checkpointAtOrAfterStop(row: Copy) {
+    const at = typeof row.receipt?.checkpointAt === "string" ? Date.parse(row.receipt.checkpointAt) : NaN;
+    return Number.isFinite(at) && row.processStoppedAt !== null && at >= row.processStoppedAt.getTime();
+  }
+  /** The exact remote box is destroyed: its bound lease carries a destroyed
+   * termination receipt (the same proof recoverStoppedRemote settles on). */
+  async function boxProvenGone(row: Copy) {
+    if (row.location === "local") return false;
+    const lease = await ownedRemoteLease(row);
+    return Boolean(lease && hasRemoteTerminationReceipt(lease)
+      && (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed");
   }
   async function settleNothingToSave(row: Copy, reason: string) {
-    logger.warn({ runId: row.runId, reason }, "Agent-file save refused on an unchanged copy; nothing to save, no hold");
+    logger.warn({ runId: row.runId, reason, checkpointAt: row.receipt?.checkpointAt, processStoppedAt: row.processStoppedAt }, "Agent-file save refused on an unchanged copy; nothing to save, no hold");
     return patch(row, { state: "unchanged", processStoppedAt: row.processStoppedAt ?? new Date(), errorCode: null,
       errorMessage: `Nothing to save: the last verified checkpoint was unchanged. The refusal (${reason.slice(0, 200)}) needs no retry.`,
       nextAttemptAt: null, receipt: { ...withoutSaveHold(row.receipt), nothingToSave: { reason: reason.slice(0, 500), at: new Date().toISOString() } } });
@@ -1066,7 +1096,19 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // never an authorization refusal) on a copy with nothing to save settles; no retry.
     const heldReason = String((row.receipt?.savePending as { reason?: unknown } | undefined)?.reason ?? "");
     if (held && (row.receipt?.savePending as { code?: unknown } | undefined)?.code !== AGENT_FILES_ASIDE_UNSURFACED
-      && agentFileSourceLeaseGone(new Error(heldReason)) && nothingToSave(row)) return settleNothingToSave(row, heldReason);
+      && agentFileSourceLeaseGone(new Error(heldReason)) && await nothingToSave(row)) return settleNothingToSave(row, heldReason);
+    // B0b for an EXISTING LEASE-GONE hold the predicate above does not settle (e.g.
+    // a hold written before checkpointAt existed): park it for the lease-active
+    // re-arm instead of the timer, while its bound lease is not active.
+    if (held && !agentFileHoldParked(row.receipt?.savePending) && agentFileSourceLeaseGone(new Error(heldReason))
+      && (row.receipt?.savePending as { code?: unknown } | undefined)?.code === "AGENT_FILES_SAVE_FAILED" && row.location !== "local") {
+      const lease = await ownedRemoteLease(row);
+      if (!lease || lease.releasedAt || lease.status !== "active") {
+        const savePending = { ...(row.receipt?.savePending as Record<string, unknown>), retryOn: AGENT_FILE_HOLD_RETRY_ON_LEASE_ACTIVE };
+        return patch(row, { nextAttemptAt: null, errorMessage: agentFileHoldInstruction({ ...row, receipt: { ...row.receipt, savePending } }),
+          receipt: { ...row.receipt, savePending } }, agentFileHoldWriteCondition);
+      }
+    }
     // B1/B0b: a parked hold is never retried here (only its notice is ensured);
     // a LEASE-GONE hold is re-armed by rearmAgentFileHoldsOnLeaseActive.
     if (held && agentFileHoldParked(row.receipt?.savePending)) return noticePermanentHold(row);
