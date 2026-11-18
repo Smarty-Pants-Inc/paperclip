@@ -21,6 +21,7 @@ import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-loc
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { EXECUTION_FINALIZATION_DEADLINE_EXCEEDED, EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 import { NATIVE_HUMAN_SELF_HANDOFF_KEY } from "./native-runtime/native-human-self-handoff.js";
+import { hasTaskStopPending } from "./recovery/stop-pending.js";
 
 const blockerContextKeys = ["issueId", "taskId", "source", "connectionIntentResolution",
   "interactionKind", "interactionStatus", "mutation", "interactionId"] as const;
@@ -506,9 +507,11 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     // A stopped reviewer can differ from the task owner who receives the work back.
     agentId: run?.agentId ?? null,
     cause: action.cause,
+    // A Stop-pending card clears by itself (recovery/stop-pending.ts): never
+    // rewrite it into "Create a new task to continue the work."
     nextAction: withoutUnavailableRetry(workspaceRecovery?.message
       ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
-      retryOffered),
+      retryOffered || hasTaskStopPending(action)),
 
     ...(workspaceRecovery ? { workspaceRecovery } : {}),
     runStatus: run?.status ?? null,
