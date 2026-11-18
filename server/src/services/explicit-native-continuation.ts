@@ -566,8 +566,12 @@ export async function admitExplicitNativeContinuation(input: {
     const remote = leases.some(lease => lease.provider !== "local");
     if (remote) {
       // Never interpret remote PIDs using the control-plane host's process table.
-      if (!leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
-      if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
+      // Each lease proves its own stop: a sandbox lease by its stop receipt, a
+      // released local lease (the run's host-side environment) by its release.
+      if (!leases.every(lease => lease.provider === "local"
+        ? !!lease.releasedAt && lease.cleanupStatus !== "failed"
+        : hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => lease.provider === "local" || completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
       }))) return refused("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
     } else {
