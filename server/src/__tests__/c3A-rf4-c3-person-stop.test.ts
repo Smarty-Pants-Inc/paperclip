@@ -13,7 +13,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // Independent reviewer regression: real person HTTP Stop, real DB cancellation,
 // real release/orchestrator/provider receipts and admission. No release or hold
 // producer is mocked. Only native provider execution/cancel delivery is scripted.
-const fixture = vi.hoisted(() => ({ calls: [] as string[], firstRun: "", onFirst: undefined as undefined | (() => Promise<void>) }));
+const fixture = vi.hoisted(() => ({ calls: [] as string[], firstRun: "", onFirst: undefined as undefined | (() => Promise<void>), successorThrows: false }));
 vi.mock("../services/heartbeat/runtime-selection.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/heartbeat/runtime-selection.js")>();
   return { ...actual, prepareAndSelectHeartbeatRuntime: (async (db, input, deps) => actual.prepareAndSelectHeartbeatRuntime(db,
@@ -32,7 +32,8 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
     executePaperclipNativeSession: (async input => {
       const runId = input.execution.binding.runId; fixture.calls.push(runId);
       if (runId === fixture.firstRun && fixture.onFirst) { await fixture.onFirst(); throw new actual.NativeCancellationPendingRecoveryError(); }
-      throw new Error("rf4_successor_provider_turn_reached");
+      if (fixture.successorThrows) throw new Error("rf4_successor_provider_turn_reached");
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "rf4 successor answered" };
     }) as typeof actual.executePaperclipNativeSession };
 });
 import { heartbeatService } from "../services/heartbeat.js";
@@ -211,5 +212,19 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     const notes = r.holds.filter(h => /stopp|recover|sandbox|saved/i.test(h.nextAction));
     expect.soft(notes, "one truthful note, not a fabricated active recovery promise").toHaveLength(1);
     expect.soft(visible).not.toMatch(/refused to recover|Create a new task|Recovering your saved work/);
+  }, 60_000);
+  it("Q5 control (RFL): a THROWING successor provider still gets its own true failure note, separate from the Stop note", async () => {
+    fixture.successorThrows = true;
+    try {
+      const r = await exercise("mid_turn", "q5-control");
+      const failure = r.holds.filter(h => h.evidence?.runId !== r.runId && ["active", "escalated"].includes(h.status));
+      const stopNotes = r.holds.filter(h => h.evidence?.runId === r.runId && /unsaved changes stay on the previous sandbox/.test(h.nextAction ?? ""));
+      await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q5-control-holds.json"), JSON.stringify({ holds: r.holds, blocker: r.blocker }, null, 2));
+      expect(r.calls.length, "the provider was reached").toBe(2);
+      expect(failure, "the successor's real failure has its own note").toHaveLength(1);
+      expect(failure[0]!.nextAction).not.toMatch(/unsaved changes stay on the previous sandbox/);
+      expect(r.blocker?.runId, "the blocker names the failed successor, not the stopped run").toBe(r.runs[0]?.id);
+      expect(stopNotes, "the Stop note is still there once").toHaveLength(1);
+    } finally { fixture.successorThrows = false; }
   }, 60_000);
 });
