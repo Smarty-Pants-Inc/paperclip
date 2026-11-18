@@ -1357,7 +1357,7 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
 }
 
 /** The owner's own-lease receipt (ownLeaseTerminated in remote-execution-termination.ts). */
-async function warmSandboxTerminated(db: Db, entry: WarmNativeSession,
+async function warmSandboxTerminated(db: Db, entry: Pick<WarmNativeSession, "companyId" | "environmentId" | "providerLeaseId" | "runId">,
   scope: { successorOnOwnerSandbox?: boolean; ownLeaseOnly?: boolean } = {}): Promise<boolean> {
   return ownLeaseTerminated(db, { companyId: entry.companyId, environmentId: entry.environmentId,
     providerLeaseId: entry.providerLeaseId, runId: entry.runId }, scope);
@@ -7037,6 +7037,10 @@ function acknowledgedUserStopRequestedAt(run: typeof heartbeatRuns.$inferSelect)
 }
 
 const STOP_ISSUED_TURN_COMMANDS: ReadonlySet<string> = new Set(["turn.interrupt", "turn.stop"]);
+/** S095 receipt: a stopped run without an acknowledged person's Stop whose own
+ * lease carries Boat's stop/destroy receipt. A cancelled run stays with the
+ * person's-Stop rule above (its agent, foreign and pre-Stop rows keep today's refusal). */
+const RECEIPT_EXEMPT_TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(["failed", "timed_out"]);
 
 /** S095 (RFL 23:46Z + rf-3 23:48Z). The person's acknowledged Stop of the
  * finished owner issued turn.interrupt / turn.stop that its Runner never
@@ -7053,9 +7057,15 @@ const STOP_ISSUED_TURN_COMMANDS: ReadonlySet<string> = new Set(["turn.interrupt"
  * run's lease (remoteExecutionTermination, which sandboxStopAndRetainReceipt
  * also requires) on a box this run does not hold, or a TERM/KILL-confirmed
  * retirement of that run's exact Runner instance. Returns the journal
- * projected without those commands, or null when (a), (b) or (d) fails. */
+ * projected without those commands, or null when (a), (b) or (d) fails.
+ * S095 receipt: without (b), the run's own pending turn.interrupt / turn.stop
+ * (whoever issued them: a timeout, an Interrupt) do not count for (d)'s direct
+ * successor when the run is terminal (RECEIPT_EXEMPT_TERMINAL_RUN_STATUSES)
+ * and its OWN lease carries the typed receipt as warmSandboxTerminated reads it
+ * (ownLeaseOnly; "stopped" only when the successor is not on that box). Without
+ * that receipt: null, today's refusal. */
 async function stopIssuedTurnCommandsOfDirectSuccessor(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0])
-  : Promise<{ projected: string; generationGone: boolean } | null> {
+  : Promise<{ projected: string; generationGone: boolean; ownLeaseReceipt?: true } | null> {
   const { companyId, runId: successorRunId } = input.execution.binding;
   const stoppedRunId = input.identity.runId, sessionId = input.identity.normalizedSessionId;
   const runnerInstanceId = input.identity.runnerInstanceId;
@@ -7065,7 +7075,7 @@ async function stopIssuedTurnCommandsOfDirectSuccessor(input: Parameters<typeof 
     const [stopped] = await input.db.select().from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, stoppedRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
     const stopAt = stopped ? acknowledgedUserStopRequestedAt(stopped) : null;
-    if (!stopped || stopAt === null) return null;
+    if (!stopped || (stopAt === null && !RECEIPT_EXEMPT_TERMINAL_RUN_STATUSES.has(stopped.status))) return null;
     const intent = record(record(stopped.resultJson).nativeCancellation);
     const stopAuditIds = new Set([intent.intentAuditId, intent.acknowledgementAuditId].filter(id => typeof id === "string"));
     // (a)
@@ -7076,13 +7086,17 @@ async function stopIssuedTurnCommandsOfDirectSuccessor(input: Parameters<typeof 
     const unsettled = new Set(unsettledControllerCommands(commands));
     const issuedByStop = (command: Record<string, unknown>) => {
       if (command.status !== "pending" || !STOP_ISSUED_TURN_COMMANDS.has(String(command.type))) return false;
+      if (stopAt === null) return true;
       const payload = record(command.payload);
       const auditIds = [payload.intentAuditId, payload.acknowledgementAuditId, payload.stopAuditId].filter(id => id !== undefined);
       if (auditIds.length > 0) return auditIds.every(id => typeof id === "string" && stopAuditIds.has(id));
       const issuedAt = typeof command.issuedAt === "string" ? Date.parse(command.issuedAt) : Number.NaN;
       return issuedAt >= stopAt;
     };
-    if (unsettled.size === 0 || ![...unsettled].every(issuedByStop)) return null;
+    // S095 receipt: Runner lifecycle commands stay in the projection for today's retirement to decide.
+    const exempt = new Set(stopAt === null ? [...unsettled].filter(command => !LOCAL_RUNNER_LIFECYCLE_COMMANDS.has(String(command.type)))
+      : unsettled);
+    if (exempt.size === 0 || ![...exempt].every(issuedByStop)) return null;
     // (d)
     const [successor] = await input.db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, successorRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
@@ -7099,6 +7113,20 @@ async function stopIssuedTurnCommandsOfDirectSuccessor(input: Parameters<typeof 
       ? { leaseId: target.leaseId, providerLeaseId: target.sandboxLeaseAcquisition?.providerLeaseId } : null;
     const leases = await input.db.select().from(environmentLeases)
       .where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, stoppedRunId)));
+    if (stopAt === null) {
+      // (ii) the typed receipt on the run's own lease, read by A-REPAIR's warmSandboxTerminated.
+      for (const lease of leases) {
+        if (!lease.providerLeaseId) continue;
+        const onOwnBox = successorBox !== null
+          && (lease.id === successorBox.leaseId || lease.providerLeaseId === successorBox.providerLeaseId);
+        if (await warmSandboxTerminated(input.db, { companyId, environmentId: lease.environmentId,
+          providerLeaseId: lease.providerLeaseId, runId: stoppedRunId }, { successorOnOwnerSandbox: onOwnBox, ownLeaseOnly: true })) {
+          return { projected: JSON.stringify({ ...control, commands: commands.filter(command => !exempt.has(command)) }),
+            generationGone: true, ownLeaseReceipt: true };
+        }
+      }
+      return null;
+    }
     let generationGone = successorBox !== null && leases.some(lease => hasBoundRemoteStopReceipt(lease)
       && lease.id !== successorBox.leaseId && lease.providerLeaseId !== successorBox.providerLeaseId);
     if (!generationGone) {
@@ -7137,7 +7165,8 @@ async function retireAfterStopIssuedTurnCommands(input: Parameters<typeof inspec
       { message: await stoppedRunWaitMessage(input, input.identity.runId) });
   }
   await input.onLog?.("stderr", `[paperclip-runner] run ${String(input.identity.runId)}'s Runner is gone; `
-    + "its unanswered turn commands issued after the person's acknowledged Stop no longer hold this conversation\n");
+    + (exempt.ownLeaseReceipt ? "its own lease carries Boat's stop receipt, so its unanswered turn.interrupt / turn.stop no longer hold this conversation\n"
+      : "its unanswered turn commands issued after the person's acknowledged Stop no longer hold this conversation\n"));
   return retireFinishedPerTurnRunnerdOwner({ ...input, projectedControlBytes: exempt.projected });
 }
 
