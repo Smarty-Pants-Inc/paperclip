@@ -18,7 +18,7 @@ import { registerIssueRecoveryWork } from "./recovery/work.js";
 import { settleUnansweredPersonMessages, settleUnansweredPersonMessagesForTask } from "./recovery/unanswered-person-message.js";
 import { registerRunDispatchWork } from "./heartbeat/dispatch-work.js";
 import { listUndispatchedQueuedRuns } from "./queued-run-dispatch-liveness.js";
-import { NATIVE_RETAINED_OWNER_WAIT } from "./native-runtime/native-controller-recovery.js";
+import { NATIVE_RETAINED_OWNER_WAIT, NativeControllerRecoveryWaitingError } from "./native-runtime/native-controller-recovery.js";
 import { describeFailedAttachment } from "./native-runtime/remote-warm-session-recovery.js";
 import { createProviderLimitWait } from "./heartbeat/provider-limit-wait.js";
 import { externalConversationSettlementWork } from "./external-conversation-settlement-work.js";
@@ -3931,7 +3931,9 @@ export function heartbeatService(
             stream: "system",
             level: "warn",
             message:
-              waitingForRetainedOwner ? "native continuation waiting for the retained controller lease"
+              // S095: the wait's own per-state words when it carries them.
+              waitingForRetainedOwner ? (err.original instanceof NativeControllerRecoveryWaitingError
+                ? err.original.detail?.message : undefined) ?? "native continuation waiting for the retained controller lease"
                 : retryReasonCode === "semantic_result_missing"
                 ? "provider turn completed without a semantic result; same-run disposition recovery persisted"
                 : "native session transport interrupted; same-run resume persisted",
