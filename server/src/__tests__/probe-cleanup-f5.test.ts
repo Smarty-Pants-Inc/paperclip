@@ -207,7 +207,8 @@ const support = await getEmbeddedPostgresTestSupport();
     await life.work.process(f.agent.id);
     expect(boundary.probes()).toBe(1);
     expect(await row(f.agent.id)).toMatchObject({ lifecycleState: "verifying", lifecycleError: FIRST_LINE });
-    const [probeLease] = await leases(f.environment.id);
+    // The fresh probe may follow an earlier sibling fixture lease.
+    const probeLease = (await leases(f.environment.id)).at(-1);
     return { ...life, boundary, probeLease: probeLease! };
   }
 
@@ -235,7 +236,7 @@ const support = await getEmbeddedPostgresTestSupport();
   }
 
   async function expectNoReceipt(f: Fixture, probeLease: { id: string; providerLeaseId: string | null }, boundary: ReturnType<typeof probeBoundary>) {
-    const [now] = await leases(f.environment.id);
+    const [now] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, probeLease.id));
     expect(now!.id).toBe(probeLease.id);
     expect(now!.metadata?.remoteExecutionTermination, "no receipt from the typed read").toBeUndefined();
     expect(boundary.cleanup).not.toHaveBeenCalled();
@@ -355,14 +356,15 @@ const support = await getEmbeddedPostgresTestSupport();
 
   it("RED never for ANOTHER lease: the entry's proof reads only its own lease, never a sibling box's typed state", async () => {
     const f = await fixture({ release: "void", inspect: "active" });
-    const { work, boundary, probeLease } = await firstPass(f);
-    // A sibling closed setup-test lease on another box that Boat reads stopped.
-    // One ms later, so leases()' createdAt order never ties under the frozen Date.
-    vi.setSystemTime(new Date(Date.now() + 1));
+    // RFL VERDICT-SPM1-HIRE C1: insert the wrong sibling FIRST, so deleting
+    // confirmProbeLeaseTermination's exact-id predicate reads the wrong box.
     const runtime = environmentRuntimeService(db, { pluginWorkerManager: f.boat.worker });
     const sibling = await runtime.acquireRunLease({ companyId: f.companyId, agentId: f.agent.id, adapterType: "paperclip_runner",
       environment: f.environment as never, configuredEnvironment: f.environment as never, issueId: null, heartbeatRunId: null, persistedExecutionWorkspace: null } as never);
     await runtime.getDriver("sandbox")!.releaseRunLease({ environment: f.environment as never, lease: sibling.lease, status: "failed" });
+    // One ms later, so leases()' createdAt order never ties under the frozen Date.
+    vi.setSystemTime(new Date(Date.now() + 1));
+    const { work, boundary, probeLease } = await firstPass(f);
     // Boat reads the SIBLING's box stopped; the probe's own box is still active.
     f.mode.inspectBy = { [sibling.lease.providerLeaseId!]: "stopped" };
     const inspectSpy = f.boat.worker.call as ReturnType<typeof vi.fn>;
