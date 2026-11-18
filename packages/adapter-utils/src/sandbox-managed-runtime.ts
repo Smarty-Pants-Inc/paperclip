@@ -56,7 +56,7 @@ import {
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
-import { hostCleanup, hostMutation, hostWork } from "./host-mutation-drain.js";
+import { hostCleanup, hostDeferredCleanup, hostMutation, type HostCleanupHandle } from "./host-mutation-drain.js";
 import {
   scheduleSyncOperations,
   SYNC_OPERATION_CONCURRENCY_LIMIT,
@@ -868,11 +868,19 @@ export function sandboxExecutionSessionMatches(saved: unknown, current: SandboxR
 }
 
 async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
-  const dir = await hostMutation(() => fs.mkdtemp(path.join(os.tmpdir(), prefix)));
+  // adopt-drain4: the removal is registered with the current owner's drain
+  // inside the tracked mkdtemp (before that call settles), so a closing drain
+  // removes the directory itself and the late finally below is a no-op.
+  let removeDir: HostCleanupHandle | undefined;
+  const dir = await hostMutation(async () => {
+    const created = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+    removeDir = hostDeferredCleanup(() => hostCleanup(() => fs.rm(created, { recursive: true, force: true }).catch(() => undefined)));
+    return created;
+  });
   try {
     return await fn(dir);
   } finally {
-    await hostCleanup(() => fs.rm(dir, { recursive: true, force: true }).catch(() => undefined));
+    await removeDir!();
   }
 }
 
@@ -1460,14 +1468,17 @@ export async function prepareSandboxManagedRuntime(input: {
   let filesystemDeleted: Awaited<ReturnType<typeof createWorkspaceManifest>> | null = null;
   managedIgnored?.close();
   let baselineSnapshot: DirectorySnapshot | null = null;
-  const cleanupWorkspaceSnapshot = async () => {
+  // adopt-drain4: run once (the restore registers it with the owner's drain,
+  // which may run it before the restore's own finally does).
+  let workspaceSnapshotCleanup: Promise<void> | undefined;
+  const cleanupWorkspaceSnapshot = () => workspaceSnapshotCleanup ??= (async () => {
     await disposeDirectorySnapshot(baselineSnapshot);
     if (input.workspaceBaseline && input.workspaceBaseline !== baselineSnapshot) await disposeDirectorySnapshot(input.workspaceBaseline);
     await disposeGitWorkspaceSnapshot(gitSnapshot);
     if (!gitSnapshot) for (const repo of repositories) await disposeGitWorkspaceSnapshot(repo.snapshot);
     if (managedIgnored) { const dir = path.dirname(managedIgnored.filePath); await hostCleanup(() => fs.rm(dir, { recursive: true, force: true })); }
     if (filesystemDeleted) { const dir = path.dirname(filesystemDeleted.filePath); await hostCleanup(() => fs.rm(dir, { recursive: true, force: true })); }
-  };
+  })();
   try {
   // A selected subfolder has no cloneable Git snapshot, but its parent
   // repository's ignore rules still govern which files may leave the host.
@@ -2048,9 +2059,12 @@ export async function prepareSandboxManagedRuntime(input: {
         ? { baseline: baselineSnapshot, gitSnapshot, ...(!gitSnapshot && repositories.length ? { repositories } : {}) }
         : null,
     cleanupWorkspaceSnapshot,
-    // adopt-drain3: the whole restore (including the finally below that
-    // removes this run's private snapshots) joins the current owner's drain.
-    restoreWorkspace: (onProgress?: RuntimeProgressSink, restoreOptions?: WorkspaceRestoreOptions) => hostWork(async () => {
+    restoreWorkspace: async (onProgress?: RuntimeProgressSink, restoreOptions?: WorkspaceRestoreOptions) => {
+      // adopt-drain4: this run's private snapshot cleanup is registered with
+      // the current owner's drain: if the owner closes first (deadline, lock
+      // loss), the drain runs it after the in-flight host calls and before the
+      // release; the finally below is then a no-op.
+      const releaseWorkspaceSnapshot = hostDeferredCleanup(cleanupWorkspaceSnapshot);
       try {
       const restoreSink = onProgress ?? input.onProgress;
       const restoreSignal = restoreOptions?.signal;
@@ -2473,8 +2487,8 @@ export async function prepareSandboxManagedRuntime(input: {
           throw result.reason;
         }
       }
-      } finally { await cleanupWorkspaceSnapshot(); }
-    }),
+      } finally { await releaseWorkspaceSnapshot(); }
+    },
   };
   } catch (error) { await cleanupWorkspaceSnapshot(); throw error; }
 }
