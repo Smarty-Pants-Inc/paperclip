@@ -10,6 +10,7 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import { canonicalNativeRuntimeContextDigest, parseNativeExecutionInput, type NativeRuntimeContextSnapshot } from "../../vendor/paperclip-runner/index.js";
 import { canBypassFailedNativePredecessor, refusedAtPriorOwnerFenceBeforeLaunch, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
+import { NATIVE_EXECUTION_START_EVENT_TYPES } from "../native-process-start-events.js";
 
 export type NativeToolExecutionTargetKind = "local" | "remote";
 
@@ -319,7 +320,7 @@ async function isUnstartedInheritedFollowUp(
         and prior.process_started_at is not distinct from ${heartbeatRuns.processStartedAt})`,
     processStart: sql<boolean>`exists (select 1 from ${heartbeatRunEvents} event
       where event.company_id = ${heartbeatRuns.companyId} and event.run_id = ${heartbeatRuns.id}
-        and event.event_type in ('native.process_identity_recorded', 'native.process_started'))`,
+        and event.event_type in (${sql.join(NATIVE_EXECUTION_START_EVENT_TYPES.map(type => sql`${type}`), sql`, `)}))`,
     controllerCheckpoint: sql<boolean>`exists (select 1 from ${nativeRunnerCheckpoints}
       where ${nativeRunnerCheckpoints.companyId} = ${heartbeatRuns.companyId} and ${nativeRunnerCheckpoints.runId} = ${heartbeatRuns.id})`,
     result: sql<boolean>`exists (select 1 from ${nativeRunResults}
