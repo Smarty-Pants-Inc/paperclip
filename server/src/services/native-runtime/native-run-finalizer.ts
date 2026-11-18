@@ -631,6 +631,10 @@ async function recordRetryableFailure(input: {
             ? "native_workspace_sync_out_retry_exhausted"
             : "native_finalization_retry_exhausted"
           : input.failureCode;
+    // notifyNativeFinalizationWork also wakes the reply-presentation worker,
+    // which publishes a withheld accepted reply from the marker written below.
+    const withheldReplyResultId = phase === "terminal_failure" && !supersededByNewerRun && input.failureScope === "workspace"
+      && (NATIVE_WITHHELD_REPLY_FAILURE_CODES as readonly string[]).includes(failureCode) ? input.coordinator.resultId : null;
     await notifyNativeFinalizationWork(tx, { companyId: input.run.companyId, runId: input.run.id });
     if (phase === "terminal_failure") await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, input.run.companyId);
     if (phase === "terminal_failure" && failureCode === "native_workspace_sync_out_unsafe_archive") {
@@ -703,6 +707,8 @@ async function recordRetryableFailure(input: {
           failureCause,
           ...(finalizationFailureCount === null ? {} : { finalizationFailureCount }),
           nextAttemptAt: supersededByNewerRun || exhausted ? null : nextAttemptAt.toISOString(),
+          // The accepted answer will never reach the committed reply path now.
+          ...(withheldReplyResultId ? pendingNativeWithheldReply(withheldReplyResultId, failureCode) : {}),
         })}::jsonb`,
         updatedAt: now,
       })
@@ -926,7 +932,7 @@ async function materializeCommittedReviewResponse(db: Db, runId: string) {
   }
 }
 
-async function acceptedResponseDigestMatches(
+export async function acceptedResponseDigestMatches(
   db: Db,
   run: Pick<typeof heartbeatRuns.$inferSelect,
     "id" | "companyId" | "agentId" | "nativeIssueId" | "nativeSessionId" |
@@ -983,6 +989,93 @@ async function acceptedResponseDigestMatches(
         ...canonical,
       }) === accepted.canonicalSha256,
   );
+}
+
+export const NATIVE_WITHHELD_REPLY_SCHEMA = "paperclip.native_withheld_reply.v1";
+/** Copy-back failures that end an accepted run without ever committing it. */
+export const NATIVE_WITHHELD_REPLY_FAILURE_CODES = [
+  "native_workspace_sync_out_retry_exhausted", "native_workspace_sync_out_unrecoverable",
+] as const;
+/** The durable trigger of publishWithheldAcceptedReply (native-withheld-reply.ts).
+ * It is written by the SAME statement that ends the accepted run without a
+ * committed reply, so a crash cannot separate the two; the reply-presentation
+ * worker discovers the pending marker and publishes the saved answer once. */
+export function pendingNativeWithheldReply(resultId: string, failureCode: string | null) {
+  return { nativeWithheldReply: { schema: NATIVE_WITHHELD_REPLY_SCHEMA, state: "pending", resultId, failureCode } };
+}
+
+/** An existing selected answer, including a subsequently deleted one, must
+ * never be replaced or resurrected. The ONE never-twice guard shared by the
+ * committed reply path and the withheld-reply path (native-withheld-reply.ts). */
+export function acceptedReplyAlreadyPresented(run: { resultJson: unknown; contextSnapshot: unknown }): boolean {
+  const recordedPresentation = record(record(run.resultJson).presentationDecision);
+  return typeof recordedPresentation.commentId === "string" ||
+    (recordedPresentation.commentAction !== undefined && recordedPresentation.commentAction !== "create" &&
+      // A provisional live none recorded before this commit is still pending.
+      !isPendingCommitPresentation(recordedPresentation)) ||
+    record(run.contextSnapshot).skipIssueComment === true;
+}
+
+/** The accepted turn's final agent message: the latest completed final-channel
+ * agentMessage of that turn, with a truncated completed item rebuilt from its
+ * stored deltas. The ONE selection shared by the committed reply path and the
+ * withheld-reply path, so both present the text the person saw streamed. */
+export async function selectAcceptedFinalAgentMessage(tx: Db, input: {
+  companyId: string; runId: string; agentId: string; nativeSessionId: string | null; turnId: string | null;
+  conversation: boolean; currentConversation: boolean;
+}) {
+  const rows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, input.companyId),
+      eq(heartbeatRunEvents.runId, input.runId),
+      eq(heartbeatRunEvents.eventType, "item.completed"),
+      input.conversation ? and(eq(heartbeatRunEvents.agentId, input.agentId),
+        sql`${heartbeatRunEvents.payload}->'prpEvent'->>'runId' = ${input.runId}`,
+        sql`${heartbeatRunEvents.payload}->'prpEvent'->>'normalizedSessionId' = ${input.nativeSessionId}`) : undefined,
+      sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${input.turnId}`,
+      sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`,
+      input.currentConversation
+        ? inArray(sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}'`, ["final", "unknown"])
+        : sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}' = 'final'`,
+    )).orderBy(desc(heartbeatRunEvents.seq)).limit(200);
+  const proposedItemIds = completedPlanProposalIds(await tx.select({ payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, input.companyId),
+      eq(heartbeatRunEvents.runId, input.runId),
+      eq(heartbeatRunEvents.eventType, "plan.proposed"),
+    )).limit(200));
+  // dl-n5-66k: a completed answer stored as {truncated, byteSize} (no
+  // kind, channel or text) is rebuilt from its stored deltas, so the
+  // semantic summary never replaces it.
+  const truncatedRows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, input.companyId),
+      eq(heartbeatRunEvents.runId, input.runId),
+      eq(heartbeatRunEvents.eventType, "item.completed"),
+      sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${input.turnId}`,
+      sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,truncated}' = 'true'`,
+    )).orderBy(desc(heartbeatRunEvents.seq)).limit(20);
+  const rebuiltCandidates = [];
+  for (const row of truncatedRows) {
+    const prpEvent = record(row.payload).prpEvent;
+    const itemId = readTruncatedCompletedAgentMessageItemId(prpEvent);
+    if (!itemId) continue;
+    const deltaRows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, input.companyId),
+        eq(heartbeatRunEvents.runId, input.runId),
+        eq(heartbeatRunEvents.eventType, "item.delta"),
+        sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' = ${itemId}`,
+      )).orderBy(heartbeatRunEvents.seq);
+    const rebuilt = readTruncatedCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent, deltaRows });
+    if (rebuilt) rebuiltCandidates.push(rebuilt);
+  }
+  return selectHeartbeatRunFinalAgentMessage({
+    candidates: [...rows.flatMap((row) => {
+      const candidate = readCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent: record(row.payload).prpEvent, proposedItemIds });
+      return candidate ? [candidate] : [];
+    }), ...rebuiltCandidates],
+  });
 }
 
 async function hasLaterAppliedStatusDecision(db: Db, input: {
@@ -1114,15 +1207,9 @@ async function recoverCommittedNativeChatResponseInScope(
         return false;
       // An existing selected answer, including a subsequently deleted one, must
       // never be replaced or resurrected by a background presentation repair.
-      const recordedPresentation = record(record(run.resultJson).presentationDecision);
-      if (
-        typeof recordedPresentation.commentId === "string" ||
-        (recordedPresentation.commentAction !== undefined && recordedPresentation.commentAction !== "create" &&
-          // A provisional live none recorded before this commit is still pending.
-          !isPendingCommitPresentation(recordedPresentation)) ||
-        record(run.contextSnapshot).skipIssueComment === true
-      )
-        return false;
+      // The withheld-reply path records its comment the same way, so a later
+      // commit (a board Retry after a terminal copy-back failure) posts nothing.
+      if (acceptedReplyAlreadyPresented(run)) return false;
       if (input.onlyWhenDue) {
         if (coordinator.nextAttemptAt && coordinator.nextAttemptAt.getTime() > Date.now()) return false;
         const [pendingEffect] = await tx.select({ id: statusDecisionEffects.id }).from(statusDecisionEffects).where(and(
@@ -1247,57 +1334,9 @@ async function recoverCommittedNativeChatResponseInScope(
       const externalChatReply = blockedTaskReply &&
         isExternalChatPresentationContext(run.contextSnapshot, replyAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON);
       if (taskReplyEligible && replyAuthorization && (blockedTaskReply || replyAuthorization === "internal_agent_write")) {
-        const rows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
-          .from(heartbeatRunEvents).where(and(
-            eq(heartbeatRunEvents.companyId, input.companyId),
-            eq(heartbeatRunEvents.runId, run.id),
-            eq(heartbeatRunEvents.eventType, "item.completed"),
-            conversation ? and(eq(heartbeatRunEvents.agentId, run.agentId),
-              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'runId' = ${run.id}`,
-              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'normalizedSessionId' = ${run.nativeSessionId}`) : undefined,
-            sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${accepted.turnId}`,
-            sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`,
-            currentConversation
-              ? inArray(sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}'`, ["final", "unknown"])
-              : sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}' = 'final'`,
-          )).orderBy(desc(heartbeatRunEvents.seq)).limit(200);
-        const proposedItemIds = completedPlanProposalIds(await tx.select({ payload: heartbeatRunEvents.payload })
-          .from(heartbeatRunEvents).where(and(
-            eq(heartbeatRunEvents.companyId, input.companyId),
-            eq(heartbeatRunEvents.runId, run.id),
-            eq(heartbeatRunEvents.eventType, "plan.proposed"),
-          )).limit(200));
-        // dl-n5-66k: a completed answer stored as {truncated, byteSize} (no
-        // kind, channel or text) is rebuilt from its stored deltas, so the
-        // semantic summary never replaces it.
-        const truncatedRows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
-          .from(heartbeatRunEvents).where(and(
-            eq(heartbeatRunEvents.companyId, input.companyId),
-            eq(heartbeatRunEvents.runId, run.id),
-            eq(heartbeatRunEvents.eventType, "item.completed"),
-            sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${accepted.turnId}`,
-            sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,truncated}' = 'true'`,
-          )).orderBy(desc(heartbeatRunEvents.seq)).limit(20);
-        const rebuiltCandidates = [];
-        for (const row of truncatedRows) {
-          const prpEvent = record(row.payload).prpEvent;
-          const itemId = readTruncatedCompletedAgentMessageItemId(prpEvent);
-          if (!itemId) continue;
-          const deltaRows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
-            .from(heartbeatRunEvents).where(and(
-              eq(heartbeatRunEvents.companyId, input.companyId),
-              eq(heartbeatRunEvents.runId, run.id),
-              eq(heartbeatRunEvents.eventType, "item.delta"),
-              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' = ${itemId}`,
-            )).orderBy(heartbeatRunEvents.seq);
-          const rebuilt = readTruncatedCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent, deltaRows });
-          if (rebuilt) rebuiltCandidates.push(rebuilt);
-        }
-        const finalAgentMessage = selectHeartbeatRunFinalAgentMessage({
-          candidates: [...rows.flatMap((row) => {
-            const candidate = readCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent: record(row.payload).prpEvent, proposedItemIds });
-            return candidate ? [candidate] : [];
-          }), ...rebuiltCandidates],
+        const finalAgentMessage = await selectAcceptedFinalAgentMessage(tx, {
+          companyId: input.companyId, runId: run.id, agentId: run.agentId, nativeSessionId: run.nativeSessionId,
+          turnId: accepted.turnId, conversation, currentConversation,
         });
         if (!finalAgentMessage && !blockedTaskReply) return false;
         const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation })
@@ -2122,8 +2161,18 @@ async function finalizeNativeRunAndProject(input: {
       // including a cancellation that won after this finalizer read the run.
       const projectedRunStatus = sql`case when ${heartbeatRuns.status} = 'cancelled'
         then ${heartbeatRuns.status} else ${projectedStatus} end`;
+      // Decision (i): a run cancelled after its result was accepted keeps
+      // `cancelled`, which the committed reply path refuses. Its saved answer
+      // is published once by the withheld-reply path, without a file line.
+      const cancelledWithheldReply = finalizationPhase === "committed" && terminalState === "succeeded" && coordinator.resultId
+        ? sql`case when ${heartbeatRuns.status} = 'cancelled'
+            and ${heartbeatRuns.resultJson} #> '{nativeWithheldReply}' is null
+            and jsonb_typeof(${heartbeatRuns.resultJson} #> '{presentationDecision,commentId}') is distinct from 'string'
+          then ${JSON.stringify(pendingNativeWithheldReply(coordinator.resultId, null))}::jsonb else '{}'::jsonb end`
+        : sql`'{}'::jsonb`;
       const projectedResult = sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
         || ${JSON.stringify(finalizationMetadata)}::jsonb
+        || ${cancelledWithheldReply}
         || ${clearExecutionFailure ? sql`case when ${heartbeatRuns.status} = 'cancelled' then '{}'::jsonb
           else ${recoveredExecutionFailureMetadata()} end` : sql`'{}'::jsonb`}`;
       const nextError = providerFailure ? sql`coalesce(${heartbeatRuns.error}, ${providerFailure.errorMessage})`
