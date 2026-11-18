@@ -85,11 +85,13 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     expect(await notices(), "and there was only ever one").toHaveLength(1);
   });
 
-  // rf-5's A3 row (judge file rf5-answered-focus.test.ts, "A3 sender Stop covers typed AND card own input after
-  // read=<started>"), same seed. TYPED half, live for read=false: the typed message the
-  // stopped run never read is carried ([M]), rf-5's exact expectation. For read=true rf-5 expects [] (the sender Stop
-  // covers it); this base has no sender Stop (READ at 422b8c26) and carries [M], so that half is a todo below, not a pin.
-  for (const started of [false]) it(`A3 typed half: a person-stopped run's own typed input after read=${started} is carried`, async () => {
+  // supersedes(A3 it.todo -> live: card carry ported; RFL rulings 2, 3, 8). rf-5's A3 row (judge file
+  // rf5-answered-focus.test.ts, "A3 sender Stop covers typed AND card own input after read=<started>"), same seed,
+  // rf-5's exact expectations for BOTH halves and both reads. OLD (a3888089, this base had no sender Stop and no
+  // card-answer carry): typed half live for read=false only, with `"interactionIds" in carried` false; the
+  // read=true typed half and the card half were it.todo. NEW: read=false carries the typed message AND the card
+  // answer ([M], [card]); read=true (the run had started answering when its sender stopped it) carries neither.
+  for (const started of [false, true]) it(`A3 sender Stop covers typed AND card own input after read=${started}`, async () => {
     const f = await fixture();
     const [asker] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
       runtimeMode: "native", status: "succeeded", contextSnapshot: { issueId: f.issueId } }).returning();
@@ -106,13 +108,30 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
       companyId: f.companyId, agentId: f.agentId, runId: f.run.id, seq: index + 1, eventType: "item.started", sourceEventId: randomUUID(),
       payload: { prpEvent: { eventType: "item.started", turnId: `turn-${f.run.id}`, itemId: `item-${index}`, payload: { kind, item: { type: kind } } } } })));
     const carried = await readContinuationCommentInput(db, { ...f, runId: f.run.id });
-    expect(carried.wakeCommentIds ?? []).toEqual(started ? [] : [f.message.id]);
-    expect("interactionIds" in carried, "no card-answer carry on this base").toBe(false);
+    expect(carried.wakeCommentIds ?? [], "typed half").toEqual(started ? [] : [f.message.id]);
+    expect(carried.interactionIds ?? [], "card half: Stop must also exclude the card answer this run started acting on")
+      .toEqual(started ? [] : [card.id]);
   });
-  // CARD half: absent on this base by READ at 422b8c26 (no card-answer carry: readContinuationCommentInput never returns
-  // interactionIds; no sender Stop). A gate when the B-line unit ports.
-  it.todo("A3 typed half after read=true: the sender Stop covers the typed input the run already read (carried.wakeCommentIds toEqual []); B-line unit 'tA-min card carry (bb/tamin6 5cddd3d1)'");
-  it.todo("A3 card half: Stop must also exclude the card answer this run started acting on (carried.interactionIds toEqual started ? [] : [card.id]); B-line unit 'tA-min card carry (bb/tamin6 5cddd3d1)'");
+  // The same Stop by someone who is NOT the input's sender ends nothing: both inputs are still carried.
+  it("A3 control: another user's Stop after read=true still carries the typed message and the card answer", async () => {
+    const f = await fixture();
+    const [asker] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "native", status: "succeeded", contextSnapshot: { issueId: f.issueId } }).returning();
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, sourceRunId: asker.id,
+      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, addresseeUserId: "board",
+      resolvedAt: new Date(), resolvedByUserId: "board", payload: { version: 1, questions: [] } as never }).returning();
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled",
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: f.message.id, interactionIds: [card.id] },
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "someone-else", stopReason: "cancelled",
+        executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } },
+    }).where(eq(heartbeatRuns.id, f.run.id));
+    await db.insert(heartbeatRunEvents).values(["userMessage", "agentMessage"].map((kind, index) => ({
+      companyId: f.companyId, agentId: f.agentId, runId: f.run.id, seq: index + 1, eventType: "item.started", sourceEventId: randomUUID(),
+      payload: { prpEvent: { eventType: "item.started", turnId: `turn-${f.run.id}`, itemId: `item-${index}`, payload: { kind, item: { type: kind } } } } })));
+    const carried = await readContinuationCommentInput(db, { ...f, runId: f.run.id });
+    expect(carried.wakeCommentIds ?? []).toEqual([f.message.id]);
+    expect(carried.interactionIds ?? []).toEqual([card.id]);
+  });
 
   it("keeps all live comment authors within the source company and task", async () => {
     const f = await fixture(), foreign = await fixture();
