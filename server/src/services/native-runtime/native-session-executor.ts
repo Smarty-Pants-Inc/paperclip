@@ -118,7 +118,7 @@ import { nativeRetryCancellationEligible, rethrowNativeCancellationLockConflict,
 import { readNativePlanWait } from "./native-plan-wait.js";
 import { nativeProviderLifecycle } from "./provider-lifecycle.js";
 import { NativePermissionDeclinedError, readCompletedNativePermissionDecline } from "./native-permission-decline.js";
-import { activeIssueInteractionCondition } from "../issue-question-context.js";
+import { activeIssueInteractionCondition, personCommentAfterInteractionCondition } from "../issue-question-context.js";
 import { resolveAcpxQualification, resolveAntigravityCandidateAdmission, resolveKimiCandidateAdmission } from "./acpx-qualification.js";
 import { readLocalAiCredentialFile } from "../local-ai-credential-file.js";
 import { prepareGrokRunnerCredentials } from "./grok-runner-credentials.js";
@@ -2340,6 +2340,8 @@ export function pendingGovernedWaitCondition(execution: NativeExecutionInput) {
       and(
         eq(issueThreadInteractions.kind, "connection_intent"),
         eq(issueThreadInteractions.createdByAgentId, execution.binding.agentId),
+        // A person's newer message in this wake releases an earlier run's card, as it does a question.
+        sql`not ${personCommentAfterInteractionCondition(sql`(select jsonb_array_elements_text(${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds') from ${heartbeatRuns} where ${heartbeatRuns.id} = ${execution.binding.runId})`)}`,
       ),
       ...(continuingInteractionIds.length > 0
         ? [inArray(issueThreadInteractions.id, continuingInteractionIds)]

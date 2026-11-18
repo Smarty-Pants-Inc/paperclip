@@ -29,7 +29,12 @@ export function deferredInteractionCondition() {
 
 /** Historical questions remain answerable, including after task completion. */
 export function historicalQuestionCondition() {
-  return sql`(${ordinaryQuestionCondition()} and (${deferredInteractionCondition()} or exists (
+  return sql`(${ordinaryQuestionCondition()} and (${deferredInteractionCondition()} or ${personCommentAfterInteractionCondition()}))`;
+}
+
+/** A person wrote on the issue after the interaction (optionally one of `commentIds`). */
+export function personCommentAfterInteractionCondition(commentIds?: SQL) {
+  return sql<boolean>`exists (
     select 1 from ${issueComments}
     where ${issueComments.companyId} = ${issueThreadInteractions.companyId}
       and ${issueComments.issueId} = ${issueThreadInteractions.issueId}
@@ -44,7 +49,8 @@ export function historicalQuestionCondition() {
       and ${issueComments.sourceTrust} is null
       and coalesce(${issueComments.presentation} ->> 'kind', '') <> 'system_notice'
       and (${issueComments.authorType} = 'user' or ${issueComments.authorType} is null)
-  )))`;
+      ${commentIds ? sql`and ${issueComments.id}::text in ${commentIds}` : sql``}
+  )`;
 }
 
 /** One predicate for completion feedback, waiting, and status arbitration. */
