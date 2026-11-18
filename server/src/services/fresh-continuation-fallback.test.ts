@@ -1300,6 +1300,46 @@ suite("fresh-continuation fallback", () => {
     }
   }, 120_000);
 
+  // fix17 (rf-3 smarty-dev#20787 c6966691438 (1)): Backlog commits while the Retry waits on the issue
+  // lock. Admission refuses; the ANSWER must be projected from the task as admission saw it, not the
+  // pre-admission row (routes/issues.ts POST /issues/:id/retry), or the card shows failed + Retry.
+  it("fix17 race: Backlog committed during the Retry's lock wait answers the refusal, never failed + Retry", async () => {
+    await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null })
+      .where(and(eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId)));
+    const f = await judgeQueued(false), heartbeat = heartbeatService(db);
+    expect(await taskInterruptionPresentation(db, await issue(f.issueId))).toMatchObject({ state: "failed", canRetry: true });
+    const message = "This task is in Backlog. Move it to To do to run it.";
+    let press: request.Response | undefined;
+    await db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("update");
+      const [{ holder }] = Array.from(await tx.execute(sql`select pg_backend_pid() as holder`) as unknown as { holder: number }[]);
+      const pending = request(retryRouteApp()).post(`/api/issues/${f.issueId}/retry`)
+        .send({ observedRunId: f.queued.id, idempotencyKey: randomUUID() }).then(res => { press = res; });
+      // The Retry has read the task and now waits on the issue lock this transaction holds.
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select pid from pg_stat_activity where ${holder}::int = any(pg_blocking_pids(pid))`);
+        expect(Array.from(waiting as unknown as unknown[]), "the Retry waits on the issue lock").toHaveLength(1);
+      }, { timeout: 10_000, interval: 25 });
+      expect(press, "no answer before the lock is released").toBeUndefined();
+      await tx.update(issues).set({ status: "backlog", conversationAgentId: null, conversationUserId: null, conversationState: null })
+        .where(eq(issues.id, f.issueId));
+      void pending;
+    });
+    await vi.waitFor(() => expect(press).toBeDefined(), { timeout: 10_000, interval: 25 });
+    await heartbeat.drainActiveRunExecutions();
+    const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId));
+    console.info(JSON.stringify({ fix17Race: { issueId: f.issueId, route: press!.status, body: press!.body,
+      runs: rows.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+    expect.soft(press!.status, "a true refusal, never 202").toBe(200);
+    expect.soft(press!.body, "the named refusal").toMatchObject({ accepted: false, requestId: null,
+      refused: { reason: "task_backlog", message } });
+    expect.soft(press!.body.presentation, "the answer's card: the refusal, no Retry")
+      .toMatchObject({ canRetry: false, notice: { code: "task_backlog", text: message } });
+    expect.soft(press!.body.presentation?.state, "the answer's card is never failed").not.toBe("failed");
+    expect(rows.filter(r => r.id !== f.source.id && r.id !== f.queued.id), "no run is created").toEqual([]);
+    expect(rows.find(r => r.id === f.queued.id), "the old run is unchanged").toMatchObject({ status: "queued", startedAt: null });
+  }, 120_000);
+
   // fix12 item 2b (rf-3 22:23Z): the external-bot gate (heartbeat/queue.ts claimQueuedRun
   // canStartNewExternalBotWork) holds a person's run for an external agent with no ready binding.
   // The card names it: no failed, no Retry, at +10 min and later.
