@@ -12,6 +12,7 @@ import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-no
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
+import { personStopHoldsSavedWake } from "../../../services/person-stop-held-input.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition, isConversationReset } from "../../../services/agent-conversations.js";
@@ -286,6 +287,13 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           .limit(1)
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
+        // adopt-stopu-card6: a person's messages saved before that person's Stop
+        // wait for Send. A later run's release (the new message's successor),
+        // the stranded pass and the late stop receipt never promote them.
+        if (await personStopHoldsSavedWake(tx as unknown as Db, row, issueId)) {
+          locallyExcludedWakeIds.push(row.id);
+          continue;
+        }
         const candidate = toDeferredWakeCandidate(row);
         const payload = candidate.payload;
         const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
