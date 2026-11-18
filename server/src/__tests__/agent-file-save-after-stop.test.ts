@@ -145,24 +145,21 @@ describe("agent-file save after the box stopped", () => {
     expect(await claimLeaseForDestroyUnlessHeld(db, await fx.lease())).toEqual(expect.any(String));
   }, 60_000);
 
-  it("R2 existing stuck row (unavailable + savePending 'lease no longer active') no longer refuses the destroy claim", async () => {
+  it("R2 existing stuck row (unavailable + savePending 'lease no longer active') keeps its NEVER-OK hold on the stopped box (RFL 14:34Z ruling 1)", async () => {
     const fx = await warmRemoteCopy();
     await fx.stopBox();
     const since = new Date(Date.now() - 4 * 3600_000);
+    const savePending = { code: "AGENT_FILES_SAVE_FAILED", since: since.toISOString(), reason: BOX_GONE, failures: 15 };
     await db.update(agentInstructionWorkingCopies).set({ state: "unavailable", processStoppedAt: since, errorCode: "AGENT_FILES_SAVE_FAILED",
-      nextAttemptAt: new Date(Date.now() - 1000),
-      receipt: { ...fx.copy.receipt, savePending: { code: "AGENT_FILES_SAVE_FAILED", since: since.toISOString(), reason: BOX_GONE, failures: 15 } } })
+      nextAttemptAt: new Date(Date.now() - 1000), receipt: { ...fx.copy.receipt, savePending } })
       .where(eq(agentInstructionWorkingCopies.runId, fx.runId));
-    // The row as gate 4 found it, untouched: the claim is granted.
-    expect(await agentFileSaveHeldOnLease(db, await fx.lease())).toBe(false);
-    const claim = await claimLeaseForDestroyUnlessHeld(db, await fx.lease());
-    expect(claim).toEqual(expect.any(String));
-    await releaseLeaseDestroyClaim(db, fx.leaseId, claim!);
-    // The ordinary retry turns it into upstream's pending_collection without a pin.
+    // The hold still refuses the destroy claim; the park key (held_for_unsaved_files) settles the pause instead.
+    expect(await agentFileSaveHeldOnLease(db, await fx.lease())).toBe(true);
+    expect(await claimLeaseForDestroyUnlessHeld(db, await fx.lease())).toBeNull();
+    const before = fx.commands.length;
     const retried = (await fx.copies.collectStopped({ companyId, runId: fx.runId, target: fx.remote }))!;
-    expect(retried.state).toBe("pending_collection");
-    expect(retried.receipt?.savePending).toBeUndefined();
-    expect(retried.errorMessage).toBe(UPSTREAM_STOPPED_LINE);
+    expect(retried.receipt?.savePending).toEqual(savePending);
+    expect(fx.commands.length).toBe(before); // still no save against the stopped box
   }, 60_000);
 
   it("R3 negative: a save failing or in flight on an ACTIVE lease still holds the destroy", async () => {
