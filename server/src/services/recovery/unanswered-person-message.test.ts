@@ -1822,7 +1822,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(codeOf(notices[0]!)).toBe("provider_process_exited");
   });
 
-  it.each([false, true])("pause-stop guard: an answer %s after the resumed stop note supersedes it", async afterNotice => {
+  // RFL record SUPERSEDE-PAUSESTOP-ANSWERED-1118: ANSWERED = a COMPLETED run's final answer. The old rows
+  // counted the paused (cancelled) run's own late reply as the answer that clears the stop note.
+  const PAUSE_STOP_SUPERSEDES = "supersedes(pause-stop guard: an answer after the resumed stop note supersedes it; RFL record SUPERSEDE-PAUSESTOP-ANSWERED-1118, ANSWERED = completed final answer)";
+  const PAUSED_NOTE = "Managed Pi was paused before it answered your message. Send it again to continue.";
+  it.each([false, true])(`${PAUSE_STOP_SUPERSEDES}: pause-stop guard: an answer %s after the resumed stop note supersedes it`, async afterNotice => {
     const f = await fixture();
     const commentId = await f.message();
     const stopped = await f.run({ commentId, status: "cancelled", errorCode: "agent_paused" });
@@ -1831,11 +1835,57 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await resume(f);
     if (afterNotice) {
       await f.sweep();
-      expect((await f.visible())[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
+      expect((await f.visible())[0]!.body).toBe(PAUSED_NOTE);
     }
+    // The paused (cancelled) run's own late reply is delivered, not an answer: the stop note stays.
     await f.reply(stopped);
     await f.sweep();
+    expect((await f.visible()).map(n => n.body)).toEqual([PAUSED_NOTE]);
+    // A COMPLETED run carrying the message publishes its final answer: that supersedes the note.
+    await f.reply(await f.run({ commentId, status: "succeeded" }));
+    await f.sweep();
     expect(await f.visible()).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+  });
+
+  // Record row 1: with nothing else in between, a COMPLETED final answer alone clears the resumed stop note.
+  it(`${PAUSE_STOP_SUPERSEDES}: a COMPLETED final answer after the resumed stop note supersedes the note`, async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "cancelled", errorCode: "agent_paused" });
+    await pause(f);
+    await f.sweep();
+    await resume(f);
+    await f.sweep();
+    expect((await f.visible()).map(n => n.body)).toEqual([PAUSED_NOTE]);
+    await f.reply(await f.run({ commentId, status: "succeeded" }));
+    expect(await isAnswered(f, commentId)).toBe(true);
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+  });
+
+  // Record row 2 (the mutation row: count a cancelled reply as answered -> the cancelled case is red).
+  // cancelled: the paused run's own late reply. failed: a later attempt carrying the message replied, then failed.
+  it.each(["cancelled", "failed"] as const)(`${PAUSE_STOP_SUPERSEDES}: a %s reply after the resumed stop note does NOT supersede it: the note stays, and stays TRUE`, async status => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const stopped = await f.run({ commentId, status: "cancelled", errorCode: "agent_paused" });
+    await pause(f);
+    await f.sweep();
+    await resume(f);
+    await f.sweep();
+    const before = await f.visible();
+    expect(before.map(n => n.body)).toEqual([PAUSED_NOTE]);
+    await f.reply(status === "cancelled" ? stopped
+      : await f.run({ commentId, status: "failed", error: "provider_process_exited: exit 1", errorCode: "adapter_failed" }));
+    expect(await isAnswered(f, commentId)).toBe(false);
+    for (let pass = 0; pass < 2; pass += 1) {
+      await f.sweep();
+      // ONE note, the SAME row and text: never cleared, never doubled, never rewritten (a final notice is
+      // written once per message). It stays true: the message was paused before an answer and still has none.
+      expect((await f.visible()).map(n => [n.id, n.body])).toEqual([[before[0]!.id, PAUSED_NOTE]]);
+    }
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
   });
 
