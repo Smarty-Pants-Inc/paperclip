@@ -69,6 +69,31 @@ export function agentFileHoldInstruction(row: Pick<Copy, "receipt" | "executionR
  * dedicated connection closes and its advisory lock is released. The
  * abandoned work keeps no lock and re-checks `signal`.
  */
+/**
+ * review-fleet-3 (smarty-dev#20787): releases the session advisory lock on the
+ * SAME dedicated session that took it. The merged base's
+ * withDedicatedDbConnection caches a successful connection (upstream #21769),
+ * so the session's end can no longer be relied on to drop the lock. The unlock
+ * is bounded; when it fails, times out or reports the lock was not held by
+ * this session, the session is ended so it is never cached still holding it.
+ */
+async function releaseOperationLock(dedicated: Db, lockKey: string): Promise<void> {
+  let released = false;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const unlock = dedicated.execute(sql`select pg_advisory_unlock(hashtextextended(${lockKey}, 0)) as released`);
+    unlock.catch(() => undefined);
+    const [row] = await Promise.race([unlock, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("agent_directory_lock_release_timeout")), 2_000);
+    })]);
+    released = (row as { released?: unknown } | undefined)?.released === true;
+  } catch (error) {
+    logger.warn({ err: error }, "Agent directory operation lock release failed; ending its session");
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  if (!released) await dedicated.$client.end({ timeout: 0 }).catch(() => undefined);
+}
 export async function endLockSessionOnAbort<T>(db: Db, session: { pid: number; backendStart: string }, work: Promise<T>, signal: AbortSignal): Promise<T> {
   work.catch(() => undefined);
   let onAbort: (() => void) | undefined;
@@ -1274,20 +1299,28 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // AF-ABORT (RFL row-22): a SESSION advisory lock on a dedicated one-connection
     // client, so no DB transaction is open while the operation does provider
     // I/O (the session is idle, never idle in transaction). The lock ends with
-    // the session: withDedicatedDbConnection closes it when the operation
-    // settles, or at once when `signal` aborts. Same key space as before, so
-    // it conflicts with any transaction-level lock on the same key.
+    // the session. withDedicatedDbConnection may keep a successful connection
+    // for the next burst (upstream #21769), so the lock is released explicitly
+    // on the same session when the operation settles (success, failure or
+    // abort); a session that cannot prove the release is ended, never cached.
+    // Same key space as before, so it conflicts with any transaction-level
+    // lock on the same key.
+    const lockKey = `agent-directory:${row.companyId}:${row.agentId}`;
     return withDedicatedDbConnection(db, async dedicated => {
-      const [lock] = await dedicated.execute(sql`select pg_try_advisory_lock(hashtextextended(${`agent-directory:${row.companyId}:${row.agentId}`}, 0)) as acquired,
+      const [lock] = await dedicated.execute(sql`select pg_try_advisory_lock(hashtextextended(${lockKey}, 0)) as acquired,
         (select setting::bigint from pg_settings where name = 'idle_session_timeout') as idle_timeout_ms,
         pg_backend_pid() as pid, (select backend_start::text from pg_stat_activity where pid = pg_backend_pid()) as backend_start`);
       if (lock?.acquired !== true) throw new AgentDirectoryOperationBusyError();
-      const work = withWorkspaceLockKeepalive(dedicated, Number(lock.idle_timeout_ms ?? 0), run);
-      if (!signal) return work;
-      // pl/cancel-finalize2 pattern (5e0eac367): the lock session is released
-      // at the abort, not when a held provider call returns; the abandoned
-      // work re-checks the signal and writes nothing.
-      return endLockSessionOnAbort(db, { pid: Number(lock.pid), backendStart: String(lock.backend_start) }, work, signal);
+      try {
+        const work = withWorkspaceLockKeepalive(dedicated, Number(lock.idle_timeout_ms ?? 0), run);
+        if (!signal) return await work;
+        // pl/cancel-finalize2 pattern (5e0eac367): the lock session is released
+        // at the abort, not when a held provider call returns; the abandoned
+        // work re-checks the signal and writes nothing.
+        return await endLockSessionOnAbort(db, { pid: Number(lock.pid), backendStart: String(lock.backend_start) }, work, signal);
+      } finally {
+        await releaseOperationLock(dedicated, lockKey);
+      }
     });
   }
   async function claimConflictNotice(input: { companyId: string; agentId: string; runId: string; previousRunId?: string | null }): Promise<string | null> {
