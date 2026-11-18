@@ -144,7 +144,7 @@ describeEmbeddedPostgres("isolated repository source re-home", () => {
     const f=await fixture();await makeWork(f.cwd);const before=await currentRestorePointSnapshot(f.cwd);
     const agentId=randomUUID(),runId=randomUUID();
     await db.insert(agents).values({id:agentId,companyId:f.companyId,name:'RFL custody',role:'engineer',adapterType:'process'});
-    await db.insert(heartbeatRuns).values({id:runId,companyId:f.companyId,agentId,issueId:f.issueId,executionWorkspaceId:f.workspaceId,status:'succeeded',finishedAt:new Date()});
+    await db.insert(heartbeatRuns).values({id:runId,companyId:f.companyId,agentId,issueId:f.issueId,contextSnapshot:{executionWorkspaceId:f.workspaceId},status:'succeeded',finishedAt:new Date()});
     const {heartbeatRunEvents}=await import('@paperclipai/db');
     await db.insert(heartbeatRunEvents).values({companyId:f.companyId,runId,agentId,seq:1,eventType:'judge.custody',payload:{text:'retain this event across lock loss'}});
     const [databaseName]=await db.execute(sql`select current_database() as name`);
