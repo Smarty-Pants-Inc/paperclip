@@ -1,4 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { appendFileSync } from "node:fs";
+const judgeReceipt = (data: unknown) => {
+  if (process.env.TASK_OUT) appendFileSync(`${process.env.TASK_OUT}/judge-http.jsonl`, `${JSON.stringify(data)}\n`);
+};
 import { runningProcesses } from "../adapters/index.js";
 import { randomUUID } from "node:crypto";
 import express from "express";
@@ -1539,6 +1543,98 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         activity: await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)).orderBy(activityLog.id),
       };
     }
+    // catch: https://github.com/Smarty-Pants-Inc/paperclip/commit/326cbfe7866bed1a40266213066ca00dd8d2f651
+    // RFL rfl-qfix4c: each crossing wrote despite a still-held pre-Stop list.
+    it.each([
+      ["running", "M1 below M3"], ["running", "M3 above M1"],
+      ["succeeded", "M1 below M3"], ["succeeded", "M3 above M1"],
+    ] as const)("JUDGE newer typed run %s retains the old Stop line: %s", async (status, direction) => {
+      const f = await fixture(true), [a, b, c] = f.commentIds;
+      const [old] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const boundary = new Date(String((old.resultJson?.cancellation as any).recordedAt));
+      await db.update(issueComments).set({ createdAt: new Date(boundary.getTime() - 500) }).where(eq(issueComments.id, b));
+      const typedId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: typedId, companyId: f.companyId, agentId: f.agentId,
+        status, runtimeMode: 'native', nativeIssueId: f.issueId,
+        createdAt: new Date(Date.now() + 5000), startedAt: new Date(),
+        finishedAt: status === 'succeeded' ? new Date() : null,
+        contextSnapshot: { issueId: f.issueId, commentId: c }, resultJson: {} });
+      const chosen = direction === "M1 below M3" ? [b, c, a] : [c, a, b];
+      const before = (await request(f.client).get(f.path).expect(200)).body;
+      const stored = await saved(f.companyId);
+      const response = await request(f.client).put(`${f.path}/order`).send({ queueId: before.queueId,
+        revision: before.revision, orderedCommentIds: chosen });
+      const after = await saved(f.companyId);
+      const observed = (await request(f.client).get(f.path).expect(200)).body.entries.map((e: any) => e.comment.id);
+      judgeReceipt({ row: 2, kind, status, direction, expected: 409, actual: response.status, code: response.body.details?.code,
+        oldRunId: f.runId, typedId, boundary, before: stored, after, chosen, observed });
+      expect(response.status).toBe(409);
+      expect(response.body.details?.code).toBe("queued_comment_stop_line_crossing");
+      expect(after).toEqual(stored);
+      expect(observed).toEqual(f.commentIds);
+    });
+    it("allows any order once the held pre-Stop list emptied through removal", async () => {
+      const f = await fixture(true), [a, b, c] = f.commentIds;
+      const before = (await request(f.client).get(f.path).expect(200)).body;
+      await request(f.client).delete(`${f.path}/${a}`)
+        .send({ queueId: before.queueId, revision: before.revision }).expect(200);
+      const remaining = (await request(f.client).get(f.path).expect(200)).body;
+      expect(remaining.entries.map((e: any) => e.comment.id)).toEqual([b, c]);
+      for (const chosen of [[c, b], [b, c]]) {
+        const current = (await request(f.client).get(f.path).expect(200)).body;
+        const response = await request(f.client).put(`${f.path}/order`)
+          .send({ queueId: current.queueId, revision: current.revision, orderedCommentIds: chosen }).expect(200);
+        expect(response.body.entries.map((e: any) => e.comment.id)).toEqual(chosen);
+        expect((await request(f.client).get(f.path).expect(200)).body.entries.map((e: any) => e.comment.id)).toEqual(chosen);
+        judgeReceipt({ row: "held-list-emptied", kind, actual: response.status, chosen });
+      }
+    });
+    it.each(["cancelled", "failed"] as const)("uses the newest person-Stop boundary (%s), not an older Stop", async status => {
+      const f = await fixture(true), [a, b, c] = f.commentIds;
+      const [old] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const oldBoundary = new Date(String((old.resultJson?.cancellation as any).recordedAt));
+      const boundary = new Date(oldBoundary.getTime() + 150);
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status,
+        runtimeMode: "native", nativeIssueId: f.issueId, contextSnapshot: {},
+        createdAt: new Date(Date.now() + 5000), finishedAt: new Date(boundary.getTime() + 1),
+        resultJson: { cancellation: { source: "operator", expected: true, initiator: { type: "user", id: "queue-owner" },
+          reason: "Second Stop", recordedAt: boundary.toISOString() } } });
+      const before = (await request(f.client).get(f.path).expect(200)).body;
+      // A and B now precede the newest Stop, so their same-side swap is legal.
+      const allowed = await request(f.client).put(`${f.path}/order`)
+        .send({ queueId: before.queueId, revision: before.revision, orderedCommentIds: [b, a, c] }).expect(200);
+      expect(allowed.body.entries.map((e: any) => e.comment.id)).toEqual([b, a, c]);
+      const stored = await saved(f.companyId);
+      const refused = await request(f.client).put(`${f.path}/order`)
+        .send({ queueId: allowed.body.queueId, revision: allowed.body.revision, orderedCommentIds: [a, c, b] }).expect(409);
+      expect(refused.body.details?.code).toBe("queued_comment_stop_line_crossing");
+      expect(await saved(f.companyId)).toEqual(stored);
+    });
+    it("does not invent a person-Stop boundary from a provider cancellation", async () => {
+      const f = await fixture(false), [a, b, c] = f.commentIds;
+      const [first] = await db.select().from(issueComments).where(eq(issueComments.id, a));
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: first.createdAt,
+        resultJson: { cancellation: { source: "provider", expected: false, initiator: { type: "provider" },
+          reason: "Provider ended", recordedAt: first.createdAt.toISOString() } } }).where(eq(heartbeatRuns.id, f.runId));
+      const before = (await request(f.client).get(f.path).expect(200)).body;
+      const response = await request(f.client).put(`${f.path}/order`)
+        .send({ queueId: before.queueId, revision: before.revision, orderedCommentIds: [c, b, a] }).expect(200);
+      expect(response.body.entries.map((e: any) => e.comment.id)).toEqual([c, b, a]);
+    });
+    if (kind === 'task') it.each([false, true])('JUDGE real admission persists the expected authorizer sameSide=%s', async sameSide => {
+      const f = await fixture(true), [a,b,c] = f.commentIds;
+      const before = (await request(f.client).get(f.path).expect(200)).body;
+      const chosen = sameSide ? [a,c,b] : [b,c,a];
+      const response = await request(f.client).put(`${f.path}/order`).send({queueId: before.queueId, revision: before.revision, orderedCommentIds: chosen});
+      const service = heartbeatService(db);
+      await service.resumeRemoteStopComments((await service.getRun(f.runId))!);
+      const successors = await hold50Successors(f);
+      const expected = sameSide ? b : c;
+      judgeReceipt({row:4, sameSide, status: response.status, expected, successors});
+      expect(response.status).toBe(sameSide ? 200 : 409);
+      expect(successors).toHaveLength(1);
+      expect(successors[0].contextSnapshot).toMatchObject({commentId:expected, explicitUserContinuation:{commentId:expected}});
+    });
     it.each(["B above A", "A below C"])("refuses %s with a distinct 409 and no writes", async direction => {
       const f = await fixture(true), [a, b, c] = f.commentIds;
       const before = (await request(f.client).get(f.path).expect(200)).body;
