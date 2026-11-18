@@ -2,6 +2,10 @@ import { persistHeartbeatRunProcessMetadata } from "../services/heartbeat/run-li
 import { BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS } from "../services/heartbeat/retries.js";
 import { SERVER_RESTART_RETRY_MAX_ATTEMPTS, SERVER_RESTART_RETRY_WINDOW_MS } from "../services/execution-recovery-attempt.js";
 import { enableRunFailureReporting } from "./helpers/run-failure-reporting.js";
+import {
+  acquireHeartbeatRecoveryHostLock,
+  HEARTBEAT_RECOVERY_HOST_LOCK_WAIT_MS,
+} from "./helpers/heartbeat-recovery-host-lock.js";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { createSystemRecovery } from "../services/system-recovery-state.js";
 import * as conversationContinuation from "../services/conversation-continuation.js";
@@ -297,6 +301,16 @@ import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
 } from "@paperclipai/adapter-utils/server-utils";
+// File-owned hooks cover direct Vitest invocations as well as package/CI runners.
+// The outer teardown runs after the suite's database and process cleanup.
+let releaseHostLock: (() => Promise<void>) | undefined;
+beforeAll(async () => {
+  releaseHostLock = await acquireHeartbeatRecoveryHostLock();
+}, HEARTBEAT_RECOVERY_HOST_LOCK_WAIT_MS + 5_000);
+afterAll(async () => {
+  await releaseHostLock?.();
+});
+
 const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL?.trim();
 const embeddedPostgresSupport = externalTestDatabaseUrl
   ? { supported: true }

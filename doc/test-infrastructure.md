@@ -20,6 +20,18 @@ family, including the separate deadline and settlement regressions, with:
 pnpm --filter @paperclipai/paperclip-runner exec vitest run runnerd-codex-transport
 ```
 
+## Heartbeat recovery host lock
+
+`server/src/__tests__/heartbeat-process-recovery.test.ts` acquires an exclusive
+util-linux `flock` on `/tmp/paperclip-heartbeat-recovery.lock` before its suite
+setup and releases it after suite cleanup. File-owned hooks apply to direct
+`vitest run <file>` invocations and package/CI runners alike; no flag is needed.
+The wait prints `waiting for host lock` once and fails clearly after 30 minutes.
+The holder reads a pipe from the worker, so worker exit also releases the lock.
+Do not remove the lock file: contenders must use the same inode. This serializes
+recovery suites only on the same host, not across hosts, and does not exclude
+other test files or unrelated host load.
+
 ## Embedded Postgres template cache
 
 To run the suite with one owned PostgreSQL server and a separate disposable
