@@ -435,16 +435,24 @@ describe("stranded notice offers Retry only where Retry admits", () => {
     buildStrandedRecoveryEscalationNotice({ retry, recoveryActionId: "action-1", recoveryOwner: null,
       sourceRun: { id: "run-1", status: "failed" } });
   it.each([
-    [{ admits: false, refusal: "agent_paused", agentName: "Ada" } as const, "Ask a board user or Ada's manager to resume Ada.", "Ada is paused"],
-    [{ admits: false, refusal: "confirm_run_stopped" } as const, "Press Confirm it stopped once the previous attempt has stopped.", "can't confirm that the previous attempt stopped"],
-    [{ admits: false, refusal: "previous_execution_unverified" } as const, "a board user records that the previous attempt stopped", "can't confirm that the previous attempt stopped"],
-    [{ admits: false, refusal: "workspace_repair_required" } as const, "Press Recover saved files to recover the workspace.", "saved files must be recovered first"],
-  ])("RED %o: no Retry instruction; the true action instead", (retry, action, cause) => {
+    [{ admits: false, refusal: "agent_paused", agentName: "Ada" } as const, "If Ada is still paused, ask a board user or Ada's manager to resume Ada, then press Retry.", "Ada was paused"],
+    [{ admits: false, refusal: "confirm_run_stopped" } as const, "Press Confirm it stopped once the previous attempt has stopped.", "could not confirm that the previous attempt stopped"],
+    [{ admits: false, refusal: "previous_execution_unverified" } as const, "a board user records that the previous attempt stopped", "could not confirm that the previous attempt stopped"],
+    [{ admits: false, refusal: "workspace_repair_required" } as const, "If the task still offers Recover saved files, press it; once the files are recovered, press Retry.", "saved files had to be recovered"],
+    [{ admits: false, refusal: "saved_work_recovering" } as const, "Nothing is needed from you while Paperclip recovers the saved work", "Paperclip started recovering the saved work"],
+    [{ admits: false, refusal: "budget_blocked" } as const, "Raise the budget in Costs, then press Retry.", "the budget did not allow new work"],
+    [{ admits: false, refusal: "daily_limit", agentName: "Ada", kind: "runs", limit: 3 } as const, "press Retry after 00:00 UTC", "Ada had reached its daily run limit"],
+    [{ admits: false, refusal: "daily_limit", agentName: "Ada", kind: "runs", limit: 0 } as const, "is set to 0, so it never resets", "Ada had reached its daily run limit"],
+  ])("RED %o: no bare Retry instruction; the true action instead", (retry, action, cause) => {
     const notice = build(retry);
     expect(notice.body).not.toMatch(/press retry/i);
     expect(notice.body).toContain(cause);
     expect(notice.body).toContain("Your message is saved.");
-    expect(JSON.stringify(nextActionOf(notice))).not.toMatch(/press retry/i);
+    // r2f SD1: a posted notice is never refreshed; nothing in it may say Retry
+    // "can't" start, which turns false once the gate clears. Retry is named only
+    // after the step that lets it start ("..., then press Retry").
+    expect(JSON.stringify(notice)).not.toMatch(/can't start|can't continue|does not allow|is paused|must be recovered/);
+    expect(JSON.stringify(nextActionOf(notice))).not.toMatch(/Press Retry/);
     expect(JSON.stringify(nextActionOf(notice))).toContain(action);
     expect(notice.presentation.title).toBe("Automatic recovery blocked");
   });
