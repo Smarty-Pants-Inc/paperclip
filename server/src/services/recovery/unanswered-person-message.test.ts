@@ -56,6 +56,9 @@ import * as sweepModule from "./unanswered-person-message.js";
 import * as pendingModule from "./automatic-recovery-pending.js";
 import * as providerFailureModule from "../native-runtime/native-provider-failure.js";
 import { enqueueNativeContinuationWake } from "../native-runtime/status-decision-committer.js";
+import { NativeRunCoordinatorStore } from "../native-runtime/native-run-coordinator-store.js";
+import { finalizeNativeRun } from "../native-runtime/native-run-finalizer.js";
+import { instanceSettingsService } from "../instance-settings.js";
 import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
 import { claimFirstTurnQueuedInput } from "../native-runtime/first-turn-queued-input.js";
 import { completedPersonMessageAnswerSql, unansweredCardAnswerSql } from "../person-message-answer.js";
@@ -2306,6 +2309,78 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect((await f.visible())[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
     });
+
+  // rf-5 B: use the real accepted-terminal -> finalizer -> schedule_retry outbox ->
+  // wake dispatcher -> admitted run path, not fixture.nativeSuccessor's reconstructed context.
+  it("rf-5 B real output-cap continuation: its final answers the origin message beyond the sweep bound", async () => {
+    const f = await fixture({ chat: false, status: "in_progress" });
+    const messageId = await f.message("Write the complete report, even if it spans the output cap.");
+    const root = await f.run({ commentId: messageId, status: "running" });
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: f.userId,
+      status: "active", membershipRole: "member" });
+    await db.update(issues).set({ executionRunId: root, responsibleUserId: f.userId }).where(eq(issues.id, f.issueId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, f.agentId));
+    const [contract] = await db.insert(completionContracts).values({ companyId: f.companyId, issueId: f.issueId,
+      revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard",
+      completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { revision: "test", objective: "Write the report", criteria: [] }, canonicalSha256: "output-cap-contract",
+      createdByActorType: "system", createdByActorId: "test" }).returning();
+    const sessionId = randomUUID(), runnerId = randomUUID();
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId, runnerInstanceId: runnerId,
+      completionContractId: contract!.id, completionContractSha256: contract!.canonicalSha256,
+      responsibleUserId: f.userId }).where(eq(heartbeatRuns.id, root));
+    const store = new NativeRunCoordinatorStore(db, { companyId: f.companyId, issueId: f.issueId, runId: root,
+      agentId: f.agentId, normalizedSessionId: sessionId, runnerSourceInstanceId: runnerId,
+      completionContractId: contract!.id, completionContractSha256: contract!.canonicalSha256,
+      completionContractRevision: "test", completionContractCriterionIds: [] });
+    // pi-rpc-driver.ts agent_end: final stopReason=length -> turn.failed/pi_output_truncated,
+    // even when partial text exists. This is the real driver's durable terminal shape.
+    await store.appendEvent({ schema: "paperclip.prp.event.v1", runId: root, normalizedSessionId: sessionId,
+      turnId: "capped-turn", sourceInstanceId: runnerId, sourceEventId: "output-cap-terminal", sourceSeq: 1,
+      sourceKind: "runner", eventType: "turn.failed", schemaVersion: 1, priority: 0, emittedAt: f.at().toISOString(),
+      payload: { status: "failed", piAgentSettled: true,
+        error: { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false } } });
+    await store.completeRun({ result: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "needs_review",
+      summary: "Report part one; the provider reached its output limit.",
+      completionClaim: { contractRevision: "test", objectiveSatisfied: false, criteria: [],
+        remainingWork: [{ description: "Finish the report", blocksCompletion: true }] },
+      evidence: [], verification: [], attentionRequests: [], artifacts: [] },
+      terminal: { schema: "paperclip.prp.terminal.v1", turnTerminalState: "failed", runTerminalState: "failed",
+        reportedWorkDisposition: "needs_review" }, turnId: "capped-turn" });
+    await finalizeNativeRun({ db, runId: root, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, root));
+    expect(stopped!.status).toBe("failed");
+    const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, root));
+    expect(decision!.reasonCode).toBe("run_failed_partial_evidence_preserved");
+    const deps = createHeartbeatQueueTestDependencies(db);
+    deps.getAgent.mockImplementation(async id => (await db.select().from(agents).where(eq(agents.id, id)))[0] ?? null);
+    deps.instanceSettings.getExperimental.mockImplementation(() => instanceSettingsService(db).getExperimental());
+    // Keep the admitted run queued: this row exercises persistence/attribution, not an external model launch.
+    deps.getSchedulingSuppression.mockResolvedValue({ suppressed: true, reason: "task_drain" });
+    const queue = createHeartbeatQueue(db, deps);
+    expect(await queue.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).toMatchObject({ dispatched: 1 });
+    await Promise.all([...deps.activeRunExecutionPromises, ...deps.activeWakeupPromises]);
+    const [intent] = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.requestedByActorId, "native-status-committer")));
+    expect(intent!.runId).toBeTruthy();
+    const successor = intent!.runId!;
+    const [continued] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, successor));
+    await f.reply(successor);
+    for (const laterMs of [PENDING_WAIT_BOUND_MS + 60_000, 3_600_000]) {
+      expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + laterMs) })).toEqual({ kind: "answered" });
+      await f.sweep();
+    }
+    const noticesEver = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      sql`${issueComments.metadata}->>'authorizationReason' = ${`unanswered_message:${messageId}`}`));
+    expect(noticesEver, "no false wasn't answered notice, including deleted notices").toHaveLength(0);
+    expect(await f.visible()).toHaveLength(0);
+    expect(await isAnswered(f, messageId)).toBe(true);
+    expect(continued!.contextSnapshot).toMatchObject({ nativeStatusWakeIntentId: intent!.id,
+      attributionCommentIds: [messageId], conversationReplyBoundaryCommentId: messageId });
+    for (const key of ["wakeCommentId", "wakeCommentIds", "commentId", "commentContinuation", "firstTurnQueuedInput", "interactionId", "interactionIds"])
+      expect(continued!.contextSnapshot, `attribution only: ${key}`).not.toHaveProperty(key);
+  }, 120_000);
 
   it.each([
     ["output cap, no text", "native_run_failed", "The provider stopped at the output cap before any text."],
