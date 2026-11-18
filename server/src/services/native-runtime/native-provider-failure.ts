@@ -35,8 +35,8 @@ function isPiPolicyRefusal(error: Record<string, unknown>): boolean {
   if (typeof error.message !== "string") return false;
   const message = error.message;
   return message.trim() === "The model refused to complete the request"
-    || /https:\/\/(?:platform\.claude\.com\/docs\/en\/build-with-claude\/refusals-and-fallback|www\.anthropic\.com\/legal\/commercial-terms)(?:[\s"'?#/.,]|$)/i.test(message)
-    || /\b(?:this|your|the) request triggered\b[^\n]*\brestrictions\b/i.test(message)
+    || /https:\/\/platform\.claude\.com\/docs\/en\/build-with-claude\/refusals-and-fallback(?:[\s"'?#/.,]|$)/i.test(message)
+    || /\b(?:this|your|the) request triggered\b[^\n]*\brestrictions\b[^\n]*\bblocked\b/i.test(message)
     || /\bblocked as it seems to violate\b[^\n]*\bterms of service restrictions on\b/i.test(message)
     || /\b(?:this|your|the) request (?:was |is |has been |would )?(?:blocked|flagged|refused|rejected|violate[sd]?)\b[^\n]*\b(?:(?:usage|acceptable[ -]use|safety|content)[ -]polic(?:y|ies)|terms[ -]of[ -]use|commercial[ -]terms)\b/i.test(message);
 }
