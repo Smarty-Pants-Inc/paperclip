@@ -1102,7 +1102,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : heldAtEndBound ? HELD_PREDECESSOR_NOTICE
-    : cardAnswer ? UNANSWERED_CARD_ANSWER_TEXT
+    : cardAnswer ? !run || code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
+      : ["failed", "timed_out", "interrupted"].includes(run.status) ? UNANSWERED_CARD_ANSWER_TEXT
+        : UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT

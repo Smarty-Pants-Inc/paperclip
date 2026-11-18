@@ -2830,6 +2830,51 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       return id;
     };
 
+    // catch: review-fleet-5 R3-W, RFL SUPERSEDE-BPRIME3-NOTICE-WORDING-1118.
+    it.each(["succeeded", "failed", "timed_out", "interrupted", "cancelled"] as const)(
+      "R3-W: answered card, %s answer-resume without a reply -> ONE notice stating its real outcome", async status => {
+        const f = await fixture({ status: "in_progress" });
+        const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+        const card = await answeredCard(f, root);
+        expect(card).toMatchObject({ status: "answered", resolvedByUserId: f.userId });
+        const runId = await resume(f, card.id, status);
+        await db.update(heartbeatRuns).set({ startedAt: sql`${heartbeatRuns.createdAt}` }).where(eq(heartbeatRuns.id, runId));
+        await f.sweep(); await f.sweep();
+        const notices = await cardNotices(f);
+        expect(notices).toHaveLength(1);
+        expect(await f.visible()).toHaveLength(1);
+        expect(notices[0]!.metadata).toMatchObject({ authorizationReason: `unanswered_message:${card.id}`, sourceRunId: runId });
+        expect(notices[0]!.body).toBe(["failed", "timed_out", "interrupted"].includes(status)
+          ? "Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task."
+          : "This run finished without a reply to your message. Check the task's recent history before trying again; the run may have taken actions.");
+      });
+
+    it("R3-W: answered card, no answer-resume run started -> ONE existing NO_RUN notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      await resume(f, card.id, "queued");
+      const now = Date.now();
+      expect((await settleUnansweredPersonMessage(db, { ...f, now: new Date(now) })).kind).toBe("pending");
+      await settleUnansweredPersonMessage(db, { ...f, now: new Date(now + PENDING_WAIT_START_BOUND_MS + 1_000) });
+      await settleUnansweredPersonMessage(db, { ...f, now: new Date(now + PENDING_WAIT_START_BOUND_MS + 2_000) });
+      const notices = await cardNotices(f);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
+      expect(notices[0]!.body).toBe(NO_RUN);
+    });
+
+    it("R3-W: answered card, answer-resume posts a reply after the answer -> no notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const runId = await resume(f, card.id, "succeeded");
+      await f.reply(runId); await f.sweep(); await f.sweep();
+      expect(await cardNotices(f)).toHaveLength(0);
+      expect(await f.visible()).toHaveLength(0);
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    });
+
     it("supersedes(RFL record SUPERSEDE-F2-PENDING-ONLY-1117): RED (rf5 RF5_ALL_FAILED_WITH_ANSWER): answer, failed answer-resume, failed successor: ONE true notice for the answer", async () => {
       // RFL F2: the successor carries the answer in its own pending input (resume helper); was ancestry-only.
       const f = await fixture({ status: "in_progress" });
