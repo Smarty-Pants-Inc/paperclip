@@ -221,22 +221,42 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * every one of them is ANSWERED by the ONE shared predicate
  * (completedPersonMessageAnswerSql, RFL F1/F2). A run that carried no person
  * message, or a message with no completed run's final answer (a cancelled run
- * posted nothing; a failed run posted only a progress comment), keeps its Retry. */
+ * posted nothing; a failed run posted only a progress comment), keeps its Retry.
+ * rf-5 tA-min finding 3: a FAILED run of the task is "already answered" only
+ * when its OWN carried input is ANSWERED. A later run that answered other input
+ * (M1's run failed while M2 was held; a later run answered only M2) is the
+ * task's latest run, and its answered M2 says nothing about M1: while any
+ * failed run's own carried person message is not ANSWERED, the Retry is not
+ * "Already answered above." */
 async function readPersonMessageAnswered(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
-  const [source] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, input.companyId), input.sourceRunId ? eq(heartbeatRuns.id, input.sourceRunId) : or(
-      eq(heartbeatRuns.issueId, input.issueId), eq(heartbeatRuns.nativeIssueId, input.issueId),
-      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`)))
+  const onTask = or(eq(heartbeatRuns.issueId, input.issueId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`);
+  const [source] = await db.select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), input.sourceRunId ? eq(heartbeatRuns.id, input.sourceRunId) : onTask))
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-  const carried = ((carryContinuationCommentInput(source?.contextSnapshot).wakeCommentIds as string[] | undefined) ?? [])
-    .filter(id => UUID.test(id));
+  // A run's own input: what it carried as input, and what it carried for ANSWERED
+  // attribution only (attributionCommentIds: a Retry or a native-status
+  // continuation answers its origin's message without being sent its text again).
+  const carriedBy = (contextSnapshot: unknown) => {
+    const context = contextSnapshot as Record<string, unknown> | null | undefined;
+    const attribution = Array.isArray(context?.attributionCommentIds) ? context.attributionCommentIds : [];
+    return [...new Set([...((carryContinuationCommentInput(context).wakeCommentIds as string[] | undefined) ?? []), ...attribution])]
+      .filter((id): id is string => typeof id === "string" && UUID.test(id));
+  };
+  const carried = carriedBy(source?.contextSnapshot);
   if (!carried.length) return false;
+  const failedRuns = await db.select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), onTask, inArray(heartbeatRuns.status, ["failed", "timed_out"])))
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(FAILED_RUN_OWN_INPUT_WINDOW);
+  const failedRunsOwn = failedRuns.filter(run => run.id !== source?.id).flatMap(run => carriedBy(run.contextSnapshot));
   const rows = await db.select({ id: issueComments.id, answered: sql<boolean>`${completedPersonMessageAnswerSql({ id: sql`${issueComments.id}`,
     companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}` })
     .from(issueComments).where(and(eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
-      inArray(issueComments.id, carried), eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)));
-  return rows.length > 0 && rows.every(row => row.answered === true);
+      inArray(issueComments.id, [...new Set([...carried, ...failedRunsOwn])]), eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)));
+  return rows.some(row => carried.includes(row.id)) && rows.every(row => row.answered === true);
 }
+/** How many of the task's most recent failed runs the answered-already fact reads. */
+const FAILED_RUN_OWN_INPUT_WINDOW = 50;
 
 /** fam-retry2: a restore hold behind which upstream accepts and holds a Retry
  * (task-retry.ts admission records it deferred and binds it to the hold's
