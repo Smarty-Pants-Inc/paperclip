@@ -1,3 +1,4 @@
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "./run-lifecycle-plugin-events.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
@@ -846,6 +847,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           )
           .returning();
         if (!terminal) return null;
+        publishTerminalRunLifecyclePluginEventAfterCommit(tx, current, terminal);
         if (current.wakeupRequestId)
           await tx
             .update(agentWakeupRequests)
@@ -897,7 +899,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             error: settled.error,
           },
         });
-        publishRunLifecyclePluginEvent(settled);
+        if (settled.runtimeMode !== "native") publishRunLifecyclePluginEvent(settled);
         if (stage === "dispatch")
           await finalizeAgentStatus(settled.agentId, "cancelled");
       }
@@ -1064,6 +1066,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const [row] = await tx.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(),
             errorCode: "case_handoff_superseded", error: "This case handoff was cancelled or superseded.", updatedAt: new Date() })
             .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.status, "queued"))).returning();
+          if (row) publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "queued" }, row);
           return row;
         });
         if (cancelled) await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: new Date(), error: cancelled.error });
@@ -1566,6 +1569,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     )
                     .returning();
                   if (!cancelled) return { kind: "stale" as const, run: null };
+                  publishTerminalRunLifecyclePluginEventAfterCommit(tx, lockedRun, cancelled);
                   await tx
                     .update(agentWakeupRequests)
                     .set({
@@ -1685,6 +1689,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     ),
                   )
                   .returning();
+                if (cancelled) publishTerminalRunLifecyclePluginEventAfterCommit(tx, lockedRun, cancelled);
                 await tx
                   .update(agentWakeupRequests)
                   .set({
@@ -1797,7 +1802,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             : null,
         },
       });
-      publishRunLifecyclePluginEvent(queuedCommentClaim.run);
+      if (queuedCommentClaim.run.runtimeMode !== "native") publishRunLifecyclePluginEvent(queuedCommentClaim.run);
       // Fire-and-forget: nothing else in this path depends on the emission,
       // so it must not delay the return.
       void emitAgentTaskRun(db, queuedCommentClaim.run);
@@ -4334,6 +4339,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               .then((rows) => rows[0] ?? null);
 
             if (!cancelled) return false;
+            publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "scheduled_retry" }, cancelled);
 
             if (scheduledRun.wakeupRequestId) {
               await tx
@@ -4476,6 +4482,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               )
               .returning();
             if (cancelled.length > 0) {
+              publishTerminalRunLifecyclePluginEventAfterCommit(tx, activeExecutionRun, cancelled[0]);
               cancelledRunsToEmit.push(cancelled[0]);
               if (activeExecutionRun.wakeupRequestId) {
                 await tx

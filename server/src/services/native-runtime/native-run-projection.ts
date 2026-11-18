@@ -17,6 +17,7 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notificati
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report.js";
 import { nativeRunnerOwnershipNotHeldCondition } from "./native-runner-ownership.js";
 import { explainFailedRun, explainNativeTurnFailure, NATIVE_RUN_FAILED_UNEXPLAINED } from "./native-run-failure-explanation.js";
@@ -207,6 +208,7 @@ export async function projectCommittedRun(input: {
       .where(needsRepair)
       .returning();
     if (after) {
+      publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, after);
       await settleNativeTerminalWake(tx, after);
       await promoteDeferredWorkIntents(tx, { companyId: input.run.companyId, trigger: "lock_released", issueId: input.coordinator.issueId });
     }

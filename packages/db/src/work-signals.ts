@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 type Listener = (event: "intent" | "settled", hints?: ReadonlySet<string>) => void;
 type Transaction = { topics: Set<string>; hints: Map<string, Set<string>>; xid?: Promise<string>; uncertain: boolean };
 type Scope = { key: object; listeners: Map<string, Set<Listener>>; transactions: Set<Transaction>; root: Connection; notificationOrigin: string; notify: boolean };
-type Context = { scope: Scope; transaction?: Transaction; pending?: Map<string, string>; ended?: boolean };
+type Context = { scope: Scope; transaction?: Transaction; pending?: Map<string, string>; postCommitEffects?: Array<() => void>; ended?: boolean };
 type Connection = { transaction: (...args: any[]) => Promise<any>; execute: (...args: any[]) => Promise<any> };
 const contexts = new WeakMap<object, Context>();
 
@@ -48,7 +48,19 @@ function install(connection: Connection, context: Context) {
       if (context.pending && level?.pending) {
         for (const [key, payload] of level.pending) if (!context.pending.has(key)) context.pending.set(key, payload);
       }
-      if (!context.transaction) context.scope.transactions.delete(state);
+      if (context.transaction) {
+        // Merge only a successfully released savepoint. A caught rollback must
+        // discard its own effects, without discarding the parent's effects.
+        if (level?.postCommitEffects?.length) (context.postCommitEffects ??= []).push(...level.postCommitEffects);
+      } else {
+        context.scope.transactions.delete(state);
+        // The driver's outer transaction promise resolves only after COMMIT.
+        // Never run these from the callback, on savepoint release, or in finally.
+        for (const effect of level?.postCommitEffects ?? []) {
+          try { effect(); }
+          catch (error) { process.emitWarning(`Database post-commit effect failed: ${String(error)}`); }
+        }
+      }
       return result;
     } catch (error) {
       if (!context.transaction) {
@@ -62,6 +74,19 @@ function install(connection: Connection, context: Context) {
       if (!context.transaction) for (const topic of state.topics) publish(context.scope, topic, "settled", state.hints.get(topic));
     }
   };
+}
+
+/**
+ * Register a synchronous, best-effort effect on a createDb transaction. Effects
+ * belong to their savepoint, propagate only on success, and run once after the
+ * outermost confirmed commit. Rollback and an unconfirmed/lost commit response
+ * never run them. This is not a durable outbox or a transaction retry mechanism.
+ */
+export function afterDatabaseCommit(connection: object, effect: () => void): void {
+  const context = contexts.get(connection);
+  if (!context?.transaction) throw new Error("Post-commit effects require a createDb transaction");
+  if (context.ended) throw new Error("Post-commit effect registered after its transaction or savepoint ended");
+  (context.postCommitEffects ??= []).push(effect);
 }
 
 /** Await BEFORE the queue write, on its transaction. Nested transactions work. */
