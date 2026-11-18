@@ -89,14 +89,16 @@ export function agentPausedText(name: string) {
     + `A board user or ${name}'s manager can resume ${name}.`;
 }
 
+// An unanswered run is not proof of side-effect-free execution. Do not infer
+// safe replay from a failure code, a missing final reply, or an empty tool log.
 export const UNANSWERED_MESSAGE_TEXT =
-  "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
+  "Your message wasn't answered. Check the task's recent history before trying again; the run may have taken actions.";
 export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
-  "This run finished without a reply to your message. Sending it again is safe.";
+  "This run finished without a reply to your message. Check the task's recent history before trying again; the run may have taken actions.";
 /** The ONE bound (follow-Paperclip B-2, RFL 05:51Z): the fork's K=2 fresh-continuation chain cap. */
 export const FRESH_CONTINUATION_BOUND = 2;
 export const UNANSWERED_MESSAGE_BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, "
