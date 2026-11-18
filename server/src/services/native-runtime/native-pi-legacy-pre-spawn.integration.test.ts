@@ -1,12 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentTaskSessions, authUsers, companies, completionContracts, createDb, environments, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
-import { canBypassFailedNativePredecessor, FAILED_PREDECESSOR_P1_ENABLED, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { agents, agentTaskSessions, authUsers, companies, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
+import { canBypassFailedNativePredecessor } from "./native-provider-work-proof.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
 import { selectPiConversation } from "./pi-conversation-record.js";
 import { findNativeSessionResumeRun } from "./native-session-resume.js";
-import { resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import fixture from "./native-pi-legacy-rows.test-fixture.json" with { type: "json" };
 
 // Keep reason: recorded daily-work incident, plus an ownership/data-safety
@@ -241,48 +240,4 @@ describe.skipIf(!recoveryPostgresSupport.supported)("legacy Pi setup failures th
       seq: 1000, stream: "system", eventType: "native.process_start_requested" });
     expect(await canBypassFailedNativePredecessor(db, { companyId: failed.companyId, runId: failed.id })).toBe(false);
   }, 60_000);
-
-  it.each(["unprobeable", "live", "lost", "rebooted", "foreign-marker"] as const)(
-    "P1 (when enabled) probes ONLY the predecessor's box and is fail-closed; disabled = HELD: %s", async control => {
-      const h = await seed("SMAA-143", "claimed"), failed = h.rows.at(-1)!;
-      await db.insert(heartbeatRunEvents).values({ companyId: failed.companyId, agentId: failed.agentId, runId: failed.id,
-        seq: 1000, eventType: "native.process_start_requested", stream: "system" });
-      const environmentId = randomUUID(), leaseId = randomUUID();
-      await db.insert(environments).values({ id: environmentId, name: `predecessor box ${environmentId}`, driver: "sandbox" });
-      await db.insert(environmentLeases).values({ id: leaseId, companyId: failed.companyId, environmentId,
-        issueId: failed.nativeIssueId, heartbeatRunId: failed.id, provider: "fixture", providerLeaseId: "predecessor-box",
-        status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/old-owner-workspace" } });
-      const execute: FailedNativePredecessorProbe["execute"] = vi.fn(async request => {
-        expect(request.lease.id).toBe(leaseId);
-        expect(request.lease.providerLeaseId).toBe("predecessor-box");
-        expect(request.lease.heartbeatRunId).toBe(failed.id);
-        expect(request.environment.id).toBe(environmentId);
-        expect(request.bypassSession).toBe(true);
-        expect(request.args?.join(" ")).toContain("/old-owner-workspace/");
-        if (control === "unprobeable") throw new Error("predecessor computer replaced and unreachable");
-        if (request.args?.includes("paperclip-runner-generation-marker")) return { exitCode: 0, signal: null, timedOut: false,
-          stdout: `nonce\n42424\n2026-11-13T10:00:00.000Z\n${control === "foreign-marker" ? randomUUID() : failed.runnerInstanceId}\nlinux:00000000-0000-4000-8000-000000000000:100\n`, stderr: "" };
-        expect(request.args).toContain("paperclip-runner-generation-check");
-        return { exitCode: control === "lost" ? 45 : control === "rebooted" ? 47 : 0, signal: null, timedOut: false, stdout: "", stderr: "" };
-      });
-      const predecessorEnvironmentRuntime = { execute };
-      const allowed = FAILED_PREDECESSOR_P1_ENABLED && (control === "lost" || control === "rebooted");
-      expect(await canBypassFailedNativePredecessor(db, { companyId: failed.companyId, runId: failed.id, predecessorEnvironmentRuntime })).toBe(allowed);
-      if (!FAILED_PREDECESSOR_P1_ENABLED) expect(execute).not.toHaveBeenCalled();
-      const selected = await findNativeSessionResumeRun(db, { ...h.input, normalizedSessionId: failed.nativeSessionId,
-        currentRunId: h.current.id, beforeCreatedAt: h.current.createdAt, predecessorEnvironmentRuntime });
-      expect(selected?.id ?? null).toBe(allowed ? null : failed.id);
-      // The executor re-selects during projection restore: preserve the SAME
-      // predecessor-box probe there, not just during initial admission.
-      await db.update(heartbeatRuns).set({ nativeSessionId: failed.nativeSessionId }).where(eq(heartbeatRuns.id, h.current.id));
-      const recovery = await resolveNativeControllerRecovery(db, { ...h.input,
-        normalizedSessionId: failed.nativeSessionId, currentRunId: h.current.id, predecessorEnvironmentRuntime });
-      expect(recovery.kind).toBe(allowed ? "no_prior_execution" : "missing_evidence");
-      if (allowed) {
-        const conversation = await selectPiConversation(db, { ...h.input, predecessorEnvironmentRuntime });
-        expect(await selectPiConversation(db, { ...h.input, predecessorEnvironmentRuntime })).toEqual(conversation);
-        expect(await h.notices()).toHaveLength(1);
-      } else await expect(selectPiConversation(db, { ...h.input, predecessorEnvironmentRuntime }))
-        .rejects.toThrow("pi_conversation_legacy_predecessor_unproven");
-    }, 60_000);
 });

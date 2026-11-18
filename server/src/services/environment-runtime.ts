@@ -4,7 +4,7 @@ import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
 import { RetainedSandboxAbsentError, SandboxLeaseStartDeniedError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
-import { ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
+import { ReusableSandboxBackupUnrestorableError, ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
 import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
 import { NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, readReplaceBeforeReuseMarker } from "./native-runtime/predecessor-retirement.js";
 import {
@@ -12,7 +12,10 @@ import {
   REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY,
   REUSABLE_SANDBOX_RESUME_BUDGET_MS,
   keepReplacedReusableSandboxLease,
+  nativeHarnessBackupCustody,
+  RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY,
   retireReplacedReusableSandboxLease,
+  typedNativeHarnessBackupFailure,
   reusableSandboxConfigurationChangeIsSafe,
   reusableSandboxKeptAfterReplacement,
   reusableSandboxLeaseIsIdle,
@@ -24,7 +27,11 @@ import {
   RESUME_RETRY_FIRST_DELAY_MS,
   resumeFailureTimedOut,
   transientSandboxResumeFailure,
+  providerReportsSandboxBusy,
+  sandboxResumeRefusedForGood,
 } from "./reusable-sandbox-resume-replacement.js";
+import { assertSandboxNotKeptAfterReplacement, fenceReusableSandboxAtRestoreCapture, KEPT_SANDBOX_CLEARED_BY_OPERATOR_KEY,
+  liftRestoreCaptureFence, type ReusableSandboxRestoreCapture } from "./reusable-sandbox-kept-marker.js";
 import { admittedSandboxLeaseConfig, sandboxLeaseIdentityConfig, sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import { HttpError } from "../errors.js";
@@ -41,7 +48,7 @@ import { historicalProviderCredentials } from "./historical-provider-credentials
 import { ownedWorkspaceRecoveryLease, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
 import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSandboxStop, preparePreviousBootClosedTipStop, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
-import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError, readEnvironmentResumeErrorDiagnostic } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
 import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
@@ -91,8 +98,6 @@ import { verifyRecoverableNativeHarnessBackup } from "./native-runtime/native-ha
 import { loadNativeHarnessBackupLeaseChain, loadNativeHarnessBackupLeaseRows, nativeHarnessBackupHasLaterProviderWork,
   nativeSessionOfLeaseRun, newestNativeHarnessBackupStampOnChain, sourceFilesHeld } from "./native-runtime/native-retired-backup-source.js";
 import { warmOwnerInThisProcessHoldsLease } from "./native-runtime/warm-owner-lease-holders.js";
-import type { PredecessorSandboxRecord } from "./native-runtime/native-session-executor.js";
-import { parseStrictIsoInstant } from "./native-runtime/strict-iso-instant.js";
 import {
   collectEnvironmentSecretRefs,
   parseEnvironmentDriverConfig,
@@ -822,6 +827,23 @@ const DEFAULT_DEFERRED_ORPHAN_CLEANUP_BUFFER_LIMIT = 256;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The provider reports the sandbox busy rather than gone: a resume conflict
+ * (Boat answers 409 only for a sandbox still stopping, starting or not ready),
+ * a temporary unavailability (503), or one of Boat's documented state codes.
+ * An idle sandbox in this state is retried, and waited for up to the idle
+ * resume budget, before the run gives up on it or rotates. A bare 409 on a
+ * sandbox another run still holds is a conflict, not readiness, and is not
+ * retried. A provider that already spent its own start deadline says so in
+ * text and keeps the initial budget.
+ */
+function sandboxResumeStillSettling(error: unknown): boolean {
+  if (sandboxResumeRefusedForGood(error)) return false;
+  if (providerReportsSandboxBusy(error)) return true;
+  const status = readEnvironmentResumeErrorDiagnostic(error)?.httpStatus;
+  return status === 409 || status === 503;
 }
 
 function getLeaseDriverKey(
@@ -2159,6 +2181,8 @@ function createSandboxEnvironmentDriver(
         let providerLease: PluginEnvironmentLease | null = null;
         let replacingUnretiredOwner = false;
         let replacementPlan: ReusableSandboxReplacementPlan | null = null;
+        let replacementCapture: ReusableSandboxRestoreCapture | undefined;
+        const onRetireCapture = (capture: ReusableSandboxRestoreCapture) => { replacementCapture = capture; };
         let replacementReason:
           | "not_found"
           | "expired"
@@ -2186,17 +2210,19 @@ function createSandboxEnvironmentDriver(
           }
           // A run that could not retire its predecessor's Runner on this
           // sandbox asked for a fresh one. Replace it under the same safety
-          // rule as a failed resume; otherwise resume it as before.
-          replacingUnretiredOwner = readReplaceBeforeReuseMarker(reusableLease.metadata) !== null
-            && await reusableSandboxReplacementPlan({
+          // rule as a failed resume (a projectless chat's box is kept, never
+          // retired); otherwise resume it as before.
+          const unretiredOwnerPlan = readReplaceBeforeReuseMarker(reusableLease.metadata) !== null
+            ? await reusableSandboxReplacementPlan({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
-              executionWorkspaceId: input.executionWorkspaceId, adapterType: input.adapterType,
-              cause: new Error(NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE),
-            }) === "retire";
+              executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, adapterType: input.adapterType,
+              cause: new Error(NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE), onRetireCapture,
+            }).catch(error => { throw typedNativeHarnessBackupFailure(error, reusableLease.providerLeaseId!); }) : null;
+          replacingUnretiredOwner = unretiredOwnerPlan !== null;
           let idleStartWaitSpent = false;
-          if (replacingUnretiredOwner) {
+          if (unretiredOwnerPlan) {
             replacementReason = "resume_failed";
-            replacementPlan = "retire";
+            replacementPlan = unretiredOwnerPlan;
           } else try {
             // One run spends a bounded budget resuming, retries included; the
             // provider's own start deadline (five minutes on Daytona) is not it.
@@ -2236,12 +2262,15 @@ function createSandboxEnvironmentDriver(
                 );
                 break;
               } catch (error) {
-                if (!transientSandboxResumeFailure(error)) throw error;
+                if (!transientSandboxResumeFailure(error) && !(sandboxResumeStillSettling(error)
+                  && await reusableSandboxLeaseIsIdle({
+                    db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
+                  }))) throw error;
                 if (!resumeFailureTimedOut(error)) everyResumeTimedOut = false;
                 const retryAt = Date.now() + retryDelayMs * 1.25;
                 if (retryAt >= resumeDeadline) {
                   const waitForIdleStart = resumeDeadline < idleResumeDeadline && retryAt < idleResumeDeadline
-                    && resumeFailureTimedOut(error)
+                    && (resumeFailureTimedOut(error) || sandboxResumeStillSettling(error))
                     && await reusableSandboxLeaseIsIdle({
                       db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
                     });
@@ -2275,10 +2304,17 @@ function createSandboxEnvironmentDriver(
             // nothing lives solely on it; otherwise preserve it for the retry.
             replacementPlan = await reusableSandboxReplacementPlan({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
-              executionWorkspaceId: input.executionWorkspaceId, adapterType: input.adapterType, cause: error,
-              providerCannotStart: idleStartWaitSpent,
-            });
+              executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, adapterType: input.adapterType, cause: error,
+              providerCannotStart: idleStartWaitSpent, onRetireCapture,
+            }).catch(planError => { throw typedNativeHarnessBackupFailure(planError, reusableLease.providerLeaseId!); });
             if (!replacementPlan) {
+              // A broken saved backup is the true reason, not the provider's
+              // refusal: say so with one instruction. Nothing was destroyed.
+              const custody = input.adapterType === "paperclip_runner"
+                ? await nativeHarnessBackupCustody({ db, lease: reusableLease }) : "absent";
+              if (custody !== "absent" && custody !== "verified") {
+                throw new ReusableSandboxBackupUnrestorableError({ providerLeaseId: reusableLease.providerLeaseId, reason: custody, cause: error });
+              }
               throw new ReusableSandboxResumeError({
                 provider: parsed.config.provider,
                 providerLeaseId: reusableLease.providerLeaseId,
@@ -2288,25 +2324,54 @@ function createSandboxEnvironmentDriver(
             replacementReason = "resume_failed";
           }
           if (!providerLease && replacementReason !== "resume_failed") {
-            if (
-              input.adapterType === "paperclip_runner" &&
-              !await verifyRecoverableNativeHarnessBackup({ db, companyId: reusableLease.companyId,
-                stamp: reusableLease.metadata?.nativeHarnessBackup, providerLeaseId: reusableLease.providerLeaseId })
-            ) {
+            const custody = input.adapterType === "paperclip_runner"
+              ? await nativeHarnessBackupCustody({ db, lease: reusableLease }) : "verified";
+            if (custody === "absent") {
               throw new RunnerHarnessBackupUnavailableError(
                 reusableLease.providerLeaseId,
               );
             }
-            // The verified, lease-bound backup authorizes destructive
-            // replacement. Keep the existing sandbox intact when validation
-            // fails so the only recoverable provider state is not lost.
-            await destroyReusableSandboxLease({
-              environment: input.environment,
-              lease: reusableLease,
-              failureReason: replacementReason ?? "resume_failed",
-            });
+            if (custody !== "verified") {
+              throw new ReusableSandboxBackupUnrestorableError({ providerLeaseId: reusableLease.providerLeaseId, reason: custody });
+            }
+            // Destroy only a box the provider says is already gone (expired or
+            // not found). An identity mismatch means a box still exists at
+            // that id: keep it, never destroy it, and fence it from selection
+            // once its replacement is recorded (below).
+            if (replacementReason !== "identity_mismatch") {
+              await destroyReusableSandboxLease({
+                environment: input.environment,
+                lease: reusableLease,
+                failureReason: replacementReason ?? "resume_failed",
+              });
+            }
           }
         }
+        // Retire case: the plan just captured the old box's state for the restore
+        // (committed snapshot + verified harness backup, carried by the
+        // replacement below). From here until the executor acknowledges the
+        // restore and retires it, the old box is fenced like a kept box
+        // (assertSandboxNotKeptAfterReplacement). Any failure before the
+        // replacement is recorded lifts the fence, so the old box stays usable.
+        let restoreCaptureFenced = false;
+        if (replacementReason === "resume_failed" && replacementPlan === "retire") {
+          restoreCaptureFenced = Boolean(reusableLease && input.heartbeatRunId && replacementCapture)
+            && await fenceReusableSandboxAtRestoreCapture(db, {
+              lease: reusableLease!, heartbeatRunId: input.heartbeatRunId!, capture: replacementCapture!,
+            });
+          if (!restoreCaptureFenced) {
+            throw new ReusableSandboxResumeError({ provider: parsed.config.provider,
+              providerLeaseId: reusableLease?.providerLeaseId ?? "unknown",
+              cause: new Error("Reusable sandbox replacement capture changed; re-plan required") });
+          }
+        }
+        const liftCaptureFenceAndRethrow = async (error: unknown): Promise<never> => {
+          if (restoreCaptureFenced && reusableLease && input.heartbeatRunId) {
+            await liftRestoreCaptureFence(db, { companyId: input.companyId, leaseId: reusableLease.id,
+              heartbeatRunId: input.heartbeatRunId }).catch(() => false);
+          }
+          throw error;
+        };
         const acquiredLease = providerLease ?? await createOwnedSandbox(db, {
           companyId: input.companyId, environmentId: input.environment.id,
           heartbeatRunId: input.heartbeatRunId, issueId: input.issueId, executionWorkspaceId: input.executionWorkspaceId,
@@ -2360,7 +2425,7 @@ function createSandboxEnvironmentDriver(
             }, diagnostic);
             throw error;
           }
-        });
+        }).catch(liftCaptureFenceAndRethrow);
 
         // Ad-hoc test leases are never publishable for reuse: storing them
         // as `reuse_by_environment` would let a concurrent heartbeat resume
@@ -2410,6 +2475,10 @@ function createSandboxEnvironmentDriver(
                   reason: replacementReason ?? "resume_failed",
                   ...((replacementReason ?? "resume_failed") === "resume_failed" ? { previousProviderLeaseId: reusableLease.providerLeaseId } : {}),
                   ...(replacingUnretiredOwner ? { cause: NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE } : {}),
+                  // A native run retires the preserved box only after its
+                  // executor acknowledges the restore on this one.
+                  ...(replacementReason === "resume_failed" && replacementPlan === "retire" && input.adapterType === "paperclip_runner"
+                    ? { [RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY]: reusableLease.id } : {}),
                 }
               : {
                   outcome: "created",
@@ -2451,24 +2520,35 @@ function createSandboxEnvironmentDriver(
             reusableLease?.heartbeatRunId !== input.heartbeatRunId
               ? reusableLease?.id
               : null,
-        });
+        }).catch(liftCaptureFenceAndRethrow);
         // Retire the unresumable sandbox only once its replacement, which
         // carries the harness backup, is recorded. A failed creation or a
         // restart before this point leaves it eligible for the next attempt.
         if (rolloverLease && input.heartbeatRunId) {
           await retireCompatibleConfigurationSource(rolloverLease, recordedLease, input.heartbeatRunId);
         }
+        // The kept box is blocked on its lease with the reason: out of selection,
+        // every sweep and every channel (assertSandboxNotKeptAfterReplacement)
+        // until a person's consented environment delete destroys it.
+        if (replacementReason === "identity_mismatch" && reusableLease && input.heartbeatRunId) {
+          await keepReplacedReusableSandboxLease({
+            db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
+            replacementLeaseId: recordedLease.id, reason: "identity_mismatch",
+          });
+        }
         if (replacementReason === "resume_failed" && reusableLease && input.heartbeatRunId) {
           if (replacementPlan === "keep") {
             await keepReplacedReusableSandboxLease({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
-              replacementLeaseId: recordedLease.id,
+              replacementLeaseId: recordedLease.id, reason: "resume_failed", predecessorRetirementUnproven: replacingUnretiredOwner,
             });
-          } else {
+          } else if (input.adapterType !== "paperclip_runner") {
             await retireReplacedReusableSandboxLease({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
             });
           }
+          // paperclip_runner: retired by retireReplacedReusableSandboxLeaseAfterRestore
+          // once the executor has restored and verified the session on the new box.
         }
         return recordedLease;
       }
@@ -4213,30 +4293,6 @@ function createPluginEnvironmentDriver(
   };
 }
 
-/**
- * Maps a provider's typed inspection of a predecessor's sandbox to the
- * predicate's record. destroyed -> gone; stopped -> present/stopped (the
- * long-stop branch needs its stoppedAt); active -> present/running (the marker
- * probe; lastRebootAt still counts). unknown, a missing answer or another
- * sandbox's answer throws: not proven. Absent optional fields prove nothing.
- */
-export function predecessorSandboxRecordFromObservation(
-  observation: PluginEnvironmentLeaseObservation | undefined,
-  providerLeaseId: string,
-): PredecessorSandboxRecord {
-  if (!observation || observation.providerLeaseId !== providerLeaseId) throw new Error("predecessor_sandbox_unobserved");
-  if (observation.state === "destroyed") return { kind: "gone" };
-  if (observation.state !== "stopped" && observation.state !== "active") throw new Error("predecessor_sandbox_state_unknown");
-  const instant = (value: unknown) => parseStrictIsoInstant(value) === null ? null : value as string;
-  return {
-    kind: "present",
-    state: observation.state === "stopped" ? "stopped" : "running",
-    stoppedAt: observation.state === "stopped" ? instant(observation.stoppedAt) : null,
-    lastRebootAt: instant(observation.lastRebootAt),
-    observedAt: instant(observation.observedAt),
-  };
-}
-
 export function environmentRuntimeService(
   db: Db,
   options: {
@@ -4350,6 +4406,8 @@ export function environmentRuntimeService(
     failureReason: string;
     anyLeasePolicy?: boolean;
     releasesKeptSandbox?: boolean;
+    /** A person cleared this ONE kept box: who and why, recorded in the claim write. */
+    clearedKeptSandbox?: { actorId: string; reason: string };
   }): Promise<EnvironmentLease | null> {
     if (await nativeWorkspaceExportPendingForLease(db, input.leaseRow)) return null;
     if (!(await allowLegacyShutdownWorkspaceCleanup(db, input.leaseRow))) return null;
@@ -4373,7 +4431,13 @@ export function environmentRuntimeService(
         then ${environmentLeases.metadata} else '{}'::jsonb end - 'remoteExecutionTermination'
         - ${input.releasesKeptSandbox ? REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY : ""}::text)
         || ${JSON.stringify({ pendingCleanupAttemptId: attemptId, pendingCleanupInFlight: true,
-          pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000, pendingCleanupController: controller })}::jsonb`,
+          pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000, pendingCleanupController: controller })}::jsonb
+        || ${input.clearedKeptSandbox
+          ? sql`jsonb_build_object(${KEPT_SANDBOX_CLEARED_BY_OPERATOR_KEY}::text, jsonb_build_object(
+            'actorId', ${input.clearedKeptSandbox.actorId}::text, 'reason', ${input.clearedKeptSandbox.reason}::text,
+            'at', ${now.toISOString()}::text,
+            'kept', ${environmentLeases.metadata}->${REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY}::text))`
+          : sql`'{}'::jsonb`}`,
     }).where(and(
       eq(environmentLeases.id, input.leaseRow.id),
       eq(environmentLeases.companyId, input.leaseRow.companyId),
@@ -4755,22 +4819,6 @@ export function environmentRuntimeService(
     // record, so a deleted or foreign-bound environment never strands it. The
     // caller owns the lease release; this dispatcher only runs the provider
     // teardown and throws when the driver teardown throws.
-    /**
-     * A FRESH provider read of a predecessor run's sandbox, for the shared
-     * prior-owner-proven-gone predicate (remoteRunnerGenerationLost). Unlike
-     * inspectLeaseResource (cleanup/stop verification only), this reads any
-     * lease of the company through its provider's read-only inspection, never
-     * a cached or label state. It throws when the provider cannot answer for
-     * that exact sandbox, which the predicate treats as not proven.
-     */
-    async readPredecessorSandboxRecord(input: { companyId: string; leaseId: string }): Promise<PredecessorSandboxRecord> {
-      const lease = await environmentsSvc.getLeaseById(input.leaseId);
-      if (!lease || lease.companyId !== input.companyId || !lease.providerLeaseId) throw new Error("predecessor_sandbox_lease_unavailable");
-      const environment = lease.environmentId ? await environmentsSvc.getById(lease.environmentId) : null;
-      const observation = await getDriver(getLeaseDriverKey(lease, environment))?.inspectLeaseResource?.({ environment, lease });
-      return predecessorSandboxRecordFromObservation(observation, lease.providerLeaseId);
-    },
-
     async inspectLeaseResource(leaseId: string, options?: { freshThreadStop?: true }): Promise<PluginEnvironmentLeaseObservation | undefined> {
       const lease = await environmentsSvc.getLeaseById(leaseId);
       if (!lease || !lease.providerLeaseId) return undefined;
@@ -5062,7 +5110,43 @@ export function environmentRuntimeService(
       return { destroyed, failed, skippedLiveRun };
     },
 
+    /**
+     * A person clears ONE kept box (`reusableSandboxKeptAfterReplacement`): its
+     * lease is claimed and the box destroyed, exactly like the consented
+     * environment delete does per lease, but no other lease of the environment
+     * is read or touched. The claim write removes the block and records who
+     * cleared it and why (`keptSandboxClearedByOperator`, with the old block).
+     * Refused for a lease without the block, and for one a live run still holds
+     * (`busy`: the claim's live-run guard); a failed provider destroy leaves the
+     * lease `pending_cleanup` for the sweep, never silently orphaned.
+     */
+    async destroyKeptReusableSandboxLease(input: {
+      leaseId: string;
+      actorId: string;
+      reason: string;
+    }): Promise<{ outcome: "destroyed" | "pending_cleanup" | "not_found" | "not_kept" | "busy"; lease: EnvironmentLease | null }> {
+      const [leaseRow] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, input.leaseId));
+      if (!leaseRow) return { outcome: "not_found", lease: null };
+      const snapshot = toEnvironmentLeaseSnapshot(leaseRow);
+      if (!reusableSandboxKeptAfterReplacement(snapshot)) return { outcome: "not_kept", lease: snapshot };
+      const environment = leaseRow.environmentId ? await environmentsSvc.getById(leaseRow.environmentId) : null;
+      if (!environment) return { outcome: "not_found", lease: null };
+      const key = REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY;
+      const lease = await destroyClaimedSandboxLease({ environment, leaseRow, anyLeasePolicy: true,
+        failureReason: "kept_sandbox_cleared_by_operator", releasesKeptSandbox: true,
+        clearedKeptSandbox: { actorId: input.actorId, reason: input.reason },
+        scopeCondition: and(
+          inArray(environmentLeases.status, ["active", "released", "retained", "failed"]),
+          sql`jsonb_typeof(${environmentLeases.metadata}->${key}::text) = 'object'`,
+        ) });
+      if (!lease) return { outcome: "busy", lease: snapshot };
+      return { outcome: lease.status === "pending_cleanup" ? "pending_cleanup" : "destroyed", lease };
+    },
+
     async resumeRunLease(input: EnvironmentDriverResumeInput): Promise<PluginEnvironmentLease | EnvironmentLease | null> {
+      // Write fence: a box kept after its chat moved to a new box is never woken,
+      // read or reached again (see assertSandboxNotKeptAfterReplacement).
+      await assertSandboxNotKeptAfterReplacement(db, { lease: input.lease, channel: "resume" });
       if (await legacyShutdownWorkspaceResourceProtected(db, input.lease)) return null;
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.resumeRunLease) {
@@ -5116,6 +5200,7 @@ export function environmentRuntimeService(
     },
 
     async execute(input: EnvironmentDriverExecuteInput): Promise<PluginEnvironmentExecuteResult> {
+      await assertSandboxNotKeptAfterReplacement(db, { lease: input.lease, channel: "execute" });
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.execute) {
         throw new Error(`Environment driver "${driver.driver}" does not support command execution.`);
@@ -5157,6 +5242,7 @@ export function environmentRuntimeService(
     },
 
     async syncOut(input: EnvironmentDriverSyncInput): Promise<PluginEnvironmentSyncResult> {
+      await assertSandboxNotKeptAfterReplacement(db, { lease: input.lease, channel: "sync_out" });
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.syncOut) {
         throw new Error(`Environment driver "${driver.driver}" does not support native file sync.`);
@@ -5167,6 +5253,7 @@ export function environmentRuntimeService(
     async openDuplexChannel(
       input: EnvironmentDriverOpenDuplexChannelInput,
     ): Promise<CommandManagedDuplexChannel> {
+      await assertSandboxNotKeptAfterReplacement(db, { lease: input.lease, channel: "duplex_channel" });
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.openDuplexChannel) {
         throw new Error(`Environment driver "${driver.driver}" does not support duplex channels.`);
@@ -5188,6 +5275,9 @@ export function environmentRuntimeService(
     async getRunnerIngressEndpoint(
       input: EnvironmentDriverRunnerIngressInput,
     ): Promise<RunnerIngressEndpoint> {
+      // Every PRP event, checkpoint, result and tool call from a box arrives on
+      // the ingress connection Paperclip opens here (and on each reconnect).
+      await assertSandboxNotKeptAfterReplacement(db, { lease: input.lease, channel: "runner_ingress" });
       const driver = requireDriverKey(
         getLeaseDriverKey(input.lease, input.environment),
       );

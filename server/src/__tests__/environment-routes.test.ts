@@ -31,6 +31,7 @@ const mockEnvironmentRuntimeService = vi.hoisted(() => ({
   getDriver: vi.fn(),
   destroyReusableSandboxLeasesForEnvironment: vi.fn(async () => ({ destroyed: 0, failed: 0, skippedLiveRun: 0 })),
   releaseRestoreSourcesForEnvironmentDelete: vi.fn(async () => 0),
+  destroyKeptReusableSandboxLease: vi.fn(),
 }));
 const mockCloseWarmNativeSessionsForEnvironment = vi.hoisted(() =>
   vi.fn(async (): Promise<{ closed: number; busy: number; failed: number; failures: Array<Record<string, unknown>> }> =>
@@ -358,6 +359,7 @@ describe("environment routes", () => {
     mockEnvironmentRuntimeService.destroyReusableSandboxLeasesForEnvironment.mockResolvedValue(
       { destroyed: 0, failed: 0, skippedLiveRun: 0 },
     );
+    mockEnvironmentRuntimeService.destroyKeptReusableSandboxLease.mockReset();
     mockCloseWarmNativeSessionsForEnvironment.mockReset();
     mockCloseWarmNativeSessionsForEnvironment.mockResolvedValue({
       closed: 0,
@@ -1835,6 +1837,69 @@ describe("environment routes", () => {
       "env-1",
     );
     expect(res.body.destroyedReusableSandboxLeaseCount).toBe(2);
+  });
+
+  describe("per-box operator clear of ONE kept sandbox", () => {
+    const keptLease = () => ({ id: "lease-kept", companyId: "company-1", environmentId: "env-1",
+      providerLeaseId: "bx_kept", status: "released", metadata: { reusableSandboxKeptAfterReplacement: {
+        runId: "run-1", replacementLeaseId: "lease-new", recordedAt: "2026-11-17T10:00:00.000Z", reason: "identity_mismatch" } } });
+
+    it("destroys only the named kept lease and records who did it and why", async () => {
+      mockEnvironmentService.getLeaseById.mockResolvedValue(keptLease());
+      mockEnvironmentService.getById.mockResolvedValue(createEnvironment());
+      mockEnvironmentRuntimeService.destroyKeptReusableSandboxLease.mockResolvedValue({ outcome: "destroyed",
+        lease: { ...keptLease(), status: "expired", metadata: { keptSandboxClearedByOperator: {
+          actorId: "admin-1", reason: "runner survived on the old box" } } } });
+      const app = createApp(localBoardActor("admin-1"));
+
+      const res = await request(app).post("/api/environment-leases/lease-kept/destroy-kept-sandbox")
+        .send({ reason: "runner survived on the old box" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.outcome).toBe("destroyed");
+      expect(mockEnvironmentRuntimeService.destroyKeptReusableSandboxLease).toHaveBeenCalledExactlyOnceWith({
+        leaseId: "lease-kept", actorId: "admin-1", reason: "runner survived on the old box" });
+      // The environment-wide teardown is never reached.
+      expect(mockEnvironmentRuntimeService.destroyReusableSandboxLeasesForEnvironment).not.toHaveBeenCalled();
+      expect(mockCloseWarmNativeSessionsForEnvironment).not.toHaveBeenCalled();
+      expect(mockEnvironmentService.removeIfDeletable).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+        companyId: "company-1", actorType: "user", actorId: "admin-1",
+        action: "environment_lease.kept_sandbox_destroyed", entityType: "environment_lease", entityId: "lease-kept",
+        details: { environmentId: "env-1", providerLeaseId: "bx_kept", reason: "runner survived on the old box", outcome: "destroyed" },
+      }));
+    });
+
+    it("refuses an unauthorized caller, and a call without a reason, before anything is destroyed", async () => {
+      mockEnvironmentService.getLeaseById.mockResolvedValue(keptLease());
+      mockEnvironmentService.getById.mockResolvedValue(createEnvironment());
+      const path = "/api/environment-leases/lease-kept/destroy-kept-sandbox";
+      const agent = await request(createApp({ type: "agent", agentId: "agent-1", companyId: "company-1",
+        source: "agent_key", runId: "run-1" })).post(path).send({ reason: "x" });
+      const member = await request(createApp({ type: "board", userId: "user-2", source: "session",
+        companyIds: ["company-1"], memberships: [{ companyId: "company-1", status: "active", membershipRole: "member" }],
+        isInstanceAdmin: false })).post(path).send({ reason: "x" });
+      const noReason = await request(createApp(localBoardActor("admin-1"))).post(path).send({});
+
+      expect(agent.status).toBe(403);
+      expect(member.status).toBe(403);
+      expect(noReason.status).toBe(422);
+      expect(mockEnvironmentRuntimeService.destroyKeptReusableSandboxLease).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("refuses a lease that carries no kept block", async () => {
+      mockEnvironmentService.getLeaseById.mockResolvedValue({ ...keptLease(), metadata: {} });
+      mockEnvironmentService.getById.mockResolvedValue(createEnvironment());
+      mockEnvironmentRuntimeService.destroyKeptReusableSandboxLease.mockResolvedValue({ outcome: "not_kept", lease: null });
+
+      const res = await request(createApp(localBoardActor("admin-1")))
+        .post("/api/environment-leases/lease-kept/destroy-kept-sandbox").send({ reason: "tidy up" });
+
+      expect(res.status).toBe(409);
+      expect(res.body.details).toEqual({ outcome: "not_kept" });
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
   });
 
   it("names the warm runner session that could not be stopped and why", async () => {

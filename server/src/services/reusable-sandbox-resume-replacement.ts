@@ -12,7 +12,10 @@ import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
 import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import { nativeHarnessBackupHasLaterProviderWork } from "./native-runtime/native-retired-backup-source.js";
 import { sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
-import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
+import { liftRestoreCaptureFence, REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY, type ReusableSandboxKeptMarker,
+  type ReusableSandboxKeptReason, type ReusableSandboxRestoreCapture } from "./reusable-sandbox-kept-marker.js";
+import { nativeHarnessBackupFailureReason, ReusableSandboxBackupUnrestorableError,
+  type ReusableSandboxBackupFailure } from "./reusable-sandbox-resume-error.js";
 
 export {
   REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY,
@@ -43,9 +46,32 @@ export type ReusableSandboxReplacementPlan = "retire" | "keep";
  * resolve it, so it is retried like a 5xx.
  */
 export function sandboxStateTransitionFailure(error: unknown): boolean {
+  if (sandboxResumeRefusedForGood(error)) return false;
   for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
     const message = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
     if (/state change in progress|\bis still [a-z_]+ at its start deadline\b|\bis still settling cancelled work\b/i.test(message)) return true;
+  }
+  return providerReportsSandboxBusy(error);
+}
+
+/** Boat's documented resume refusals for a sandbox that is still changing
+ * state (POST /sandboxes/{id}/resume: 409 sandbox_stopping, sandbox_starting,
+ * sandbox_not_ready, machine_not_running; 502 sandbox_restoring). */
+export function providerReportsSandboxBusy(error: unknown): boolean {
+  if (sandboxResumeRefusedForGood(error)) return false;
+  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
+    const message = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+    if (/\b(sandbox_stopping|sandbox_starting|sandbox_not_ready|sandbox_resuming|sandbox_restoring|machine_not_running)\b/.test(message)) return true;
+  }
+  return false;
+}
+
+/** Boat's documented resume refusals that waiting cannot fix: the saved
+ * sandbox state is gone or its resume already failed. Never retried in place. */
+export function sandboxResumeRefusedForGood(error: unknown): boolean {
+  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
+    const message = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+    if (/\b(snapshot_data_expired|resume_failed)\b/.test(message)) return true;
   }
   return false;
 }
@@ -75,6 +101,8 @@ export function isPluginRpcDeadline(error: unknown): boolean {
  * already reached the host.
  */
 export function transientSandboxResumeFailure(error: unknown, scope: EnvironmentRetryScope = "first_acquisition"): boolean {
+  // The provider says the saved state is gone: waiting cannot help.
+  if (sandboxResumeRefusedForGood(error)) return false;
   const candidate = error && typeof error === "object" ? error as Record<string, unknown> : {};
   if (isRetryableEnvironmentHttpStatus(candidate.status) || isRetryableEnvironmentHttpStatus(candidate.statusCode)) return true;
   const envelope = readEnvironmentResumeErrorDiagnostic(error);
@@ -148,6 +176,10 @@ export async function reusableSandboxLeaseIsIdle(input: {
  *   so a new sandbox restores exactly the same files;
  * - a native runner session has a verified, lease-bound harness backup, or the
  *   provider proved it cannot start the sandbox, which is then kept, not retired.
+ * A projectless chat (an issue-scoped lease with no execution workspace) has
+ * no workspace snapshot; its history is its verified harness backup. It is
+ * replaced only when that backup is current for the chat's session, and its
+ * sandbox is always kept, never retired: files outside the backup stay on it.
  * Anything else (unsaved work, a live owner, a legacy workspace with no saved
  * version, an access refusal) keeps the strict preserve-and-retry behavior.
  *
@@ -162,13 +194,15 @@ export async function reusableSandboxReplacementPlan(input: {
   companyId: string;
   heartbeatRunId: string | null;
   executionWorkspaceId: string | null;
+  issueId?: string | null;
   adapterType: string | null | undefined;
   cause: unknown;
   providerCannotStart?: boolean;
+  /** Pass the exact read to a caller that will CAS the retire capture. No DB write here. */
+  onRetireCapture?: (capture: ReusableSandboxRestoreCapture) => void;
 }): Promise<ReusableSandboxReplacementPlan | null> {
   const { db, lease } = input;
   if (!lease.providerLeaseId || !await reusableSandboxLeaseIsIdle(input)) return null;
-  if (!input.executionWorkspaceId || lease.executionWorkspaceId !== input.executionWorkspaceId) return null;
   // A replacement cannot succeed where the resume was refused for access, and
   // an unavailable worker cannot create one either.
   if (findPluginWorkerUnavailableError(input.cause)) return null;
@@ -176,6 +210,8 @@ export async function reusableSandboxReplacementPlan(input: {
   const status = failure.status ?? readEnvironmentResumeErrorDiagnostic(input.cause)?.httpStatus ?? null;
   if (failure.label === "provider_access_denied" || failure.label === "permission_denied"
     || status === 401 || status === 403) return null;
+  if (!input.executionWorkspaceId) return await projectlessChatCheckpointed(input) ? "keep" : null;
+  if (lease.executionWorkspaceId !== input.executionWorkspaceId) return null;
 
   const [workspace] = await db.select({ metadata: executionWorkspaces.metadata }).from(executionWorkspaces)
     .where(and(eq(executionWorkspaces.companyId, input.companyId), eq(executionWorkspaces.id, input.executionWorkspaceId)));
@@ -203,7 +239,37 @@ export async function reusableSandboxReplacementPlan(input: {
     return input.providerCannotStart === true ? "keep" : null;
   }
 
+  input.onRetireCapture?.({ workspaceMetadata: workspace!.metadata, snapshotId: snapshot.id });
   return "retire";
+}
+
+/** A projectless native chat's sandbox holds nothing its verified, current
+ * harness backup cannot restore: same issue scope, the backup is bound to this
+ * sandbox and to the owner's session, and no provider work followed it. */
+async function projectlessChatCheckpointed(input: {
+  db: Db;
+  lease: EnvironmentLease;
+  companyId: string;
+  heartbeatRunId: string | null;
+  issueId?: string | null;
+  adapterType: string | null | undefined;
+}): Promise<boolean> {
+  const { db, lease } = input;
+  if (!lease.providerLeaseId || lease.executionWorkspaceId !== null || !lease.issueId) return false;
+  if (input.issueId !== undefined && input.issueId !== lease.issueId) return false;
+  const scope = lease.metadata?.reusableSandboxLease as { adapterType?: unknown } | undefined;
+  if (input.adapterType !== "paperclip_runner" && scope?.adapterType !== "paperclip_runner") return false;
+  if (!await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
+    stamp: lease.metadata?.nativeHarnessBackup, providerLeaseId: lease.providerLeaseId })) return false;
+  const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId);
+  if (!stamp) return false;
+  if (lease.heartbeatRunId) {
+    const [owner] = await db.select({ nativeSessionId: heartbeatRuns.nativeSessionId }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId)));
+    if (owner?.nativeSessionId && owner.nativeSessionId !== stamp.normalizedSessionId) return false;
+  }
+  return !await nativeHarnessBackupHasLaterProviderWork(db, { companyId: input.companyId,
+    currentRunId: input.heartbeatRunId, normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt });
 }
 
 /** A compatible configuration change drains only after its owner is terminal
@@ -291,19 +357,29 @@ export async function retireReplacedReusableSandboxLease(input: {
   return Boolean(claimed);
 }
 
+/**
+ * Block the kept box on its lease, with the reason. The block keeps it out of
+ * selection, every sweep and every channel (`assertSandboxNotKeptAfterReplacement`)
+ * until a person's consented environment delete destroys it; see
+ * `ReusableSandboxKeptMarker`.
+ */
 export async function keepReplacedReusableSandboxLease(input: {
   db: Db;
   lease: EnvironmentLease;
   companyId: string;
   heartbeatRunId: string;
   replacementLeaseId: string;
+  reason: ReusableSandboxKeptReason;
+  predecessorRetirementUnproven?: boolean;
 }): Promise<boolean> {
   const { db, lease } = input;
   if (!lease.providerLeaseId) return false;
   const now = new Date();
-  const marker = { [REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY]: {
+  const block: ReusableSandboxKeptMarker = {
     runId: input.heartbeatRunId, replacementLeaseId: input.replacementLeaseId, recordedAt: now.toISOString(),
-  } };
+    reason: input.reason, ...(input.predecessorRetirementUnproven ? { predecessorRetirementUnproven: true as const } : {}),
+  };
+  const marker = { [REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY]: block };
   const [kept] = await db.update(environmentLeases).set({
     metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify(marker)}::jsonb`,
     updatedAt: now,
@@ -320,4 +396,83 @@ export async function keepReplacedReusableSandboxLease(input: {
     )`,
   )).returning({ id: environmentLeases.id });
   return Boolean(kept);
+}
+
+/**
+ * Custody of a lease's harness backup, read with the real verifier:
+ * `absent` when the lease carries no lease-bound stamp, `verified` when the
+ * durable copy verifies, else the closed reason it failed. Any other error
+ * (database, storage outage) propagates unchanged.
+ */
+export async function nativeHarnessBackupCustody(input: {
+  db: Db;
+  lease: EnvironmentLease;
+}): Promise<"absent" | "verified" | ReusableSandboxBackupFailure> {
+  const { lease } = input;
+  if (!lease.providerLeaseId || !readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId)) return "absent";
+  try {
+    return await verifyRecoverableNativeHarnessBackup({ db: input.db, companyId: lease.companyId,
+      stamp: lease.metadata?.nativeHarnessBackup, providerLeaseId: lease.providerLeaseId }) ? "verified" : "backup_missing";
+  } catch (error) {
+    const reason = nativeHarnessBackupFailureReason(error);
+    if (reason) return reason;
+    throw error;
+  }
+}
+
+/** Type a real verifier failure raised while planning a replacement. */
+export function typedNativeHarnessBackupFailure(error: unknown, providerLeaseId: string): unknown {
+  const reason = nativeHarnessBackupFailureReason(error);
+  return reason ? new ReusableSandboxBackupUnrestorableError({ providerLeaseId, reason, cause: error }) : error;
+}
+
+/** Acquisition-metadata key on a native replacement lease naming the preserved
+ * lease to retire once the executor has acknowledged the restore on the new box. */
+export const RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY = "retirePreviousLeaseAfterRestore";
+
+/**
+ * Retire the preserved lease that a native replacement named at acquisition,
+ * only after the executor restored and verified the chat's harness state on
+ * the new box. Before that acknowledgement the preserved lease stays released
+ * or retained, so a failed restore or a restart leaves it intact and eligible.
+ * Idempotent: the retire write is guarded by the preserved lease's status.
+ */
+export async function retireReplacedReusableSandboxLeaseAfterRestore(input: {
+  db: Db;
+  companyId: string;
+  replacementLeaseId: string;
+  heartbeatRunId: string;
+}): Promise<boolean> {
+  const { db } = input;
+  const [replacement] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
+    .where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.id, input.replacementLeaseId)));
+  const acquisition = replacement?.metadata?.sandboxLeaseAcquisition as Record<string, unknown> | undefined;
+  const previousLeaseId = acquisition?.outcome === "replacement" ? acquisition[RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY] : undefined;
+  if (typeof previousLeaseId !== "string" || previousLeaseId === input.replacementLeaseId) return false;
+  const [previous] = await db.select().from(environmentLeases)
+    .where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.id, previousLeaseId)));
+  if (!previous || previous.providerLeaseId !== acquisition?.previousProviderLeaseId) return false;
+  return retireReplacedReusableSandboxLease({ db, lease: previous as unknown as EnvironmentLease,
+    companyId: input.companyId, heartbeatRunId: input.heartbeatRunId });
+}
+
+/**
+ * The restore on the new box failed: lift the capture fence the acquisition
+ * put on the preserved box it names (`RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY`),
+ * so that box stays usable for the next attempt. Only this run's fence on a
+ * still released or retained lease is lifted.
+ */
+export async function liftRestoreCaptureFenceAfterFailedRestore(input: {
+  db: Db;
+  companyId: string;
+  replacementLeaseId: string;
+  heartbeatRunId: string;
+}): Promise<boolean> {
+  const { db } = input;
+  const [replacement] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
+    .where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.id, input.replacementLeaseId)));
+  const acquisition = replacement?.metadata?.sandboxLeaseAcquisition as Record<string, unknown> | undefined;
+  const previousLeaseId = acquisition?.outcome === "replacement" ? acquisition[RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY] : undefined;
+  if (typeof previousLeaseId !== "string" || previousLeaseId === input.replacementLeaseId) return false;
+  return liftRestoreCaptureFence(db, { companyId: input.companyId, leaseId: previousLeaseId, heartbeatRunId: input.heartbeatRunId });
 }

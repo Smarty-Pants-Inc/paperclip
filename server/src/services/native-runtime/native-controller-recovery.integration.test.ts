@@ -889,22 +889,23 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
   it.each(["clean", "missing Stop", "pending Stop", "foreign Stop", "real failure", "lease held", "recovery state",
     "missing idle receipt", "foreign idle receipt", "changed epoch", "pending request", "active turn", "missing JSONL", "invalid JSONL",
     "escalated abort", "pending tool", "uncertain side effect", "failed turn", "open recovery", "broken handoff", "changed source",
-    // RFL (REG-03 at 45 s): the Stop stopped the box before Core's idle close
+    // REG-03 at 45 s: the Stop stopped the box before Core's idle close
     // completed its drain/suspend, so the stopped journal keeps them pending.
-    "pending maintenance, owner proven dead", "pending maintenance, owner alive", "pending maintenance, no probe",
-    "pending turn.start, owner proven dead", "pending tool result, owner proven dead",
+    // No liveness probe excuses a pending command: the read binding refuses and
+    // Paperclip's own recovery path decides what runs next.
+    "pending maintenance", "pending turn.start", "pending tool result",
     // The same, on the REAL 45 s journal (fork-lead's REG-03 run): its pending
     // runner.drain/suspend as written, and with its one turn.start flipped to pending.
-    "real 45 s journal, owner proven dead", "real 45 s journal, turn.start flipped to pending"] as const)(
+    "real 45 s journal", "real 45 s journal, turn.start flipped to pending"] as const)(
     "REG-03 retained clean Stop read binding: %s", async scenario => {
     const real = JSON.parse(readFileSync(new URL("./__fixtures__/reg03-45s-stopped-journal-commands.json", import.meta.url), "utf8"))
       .commands as Array<Record<string, unknown>>;
-    const journal = scenario === "real 45 s journal, owner proven dead" ? { records: real }
+    const journal = scenario === "real 45 s journal" ? { records: real }
       : scenario === "real 45 s journal, turn.start flipped to pending" ? { records: real.map(command => command.type === "turn.start"
         ? { ...command, status: "pending", result: null } : command) }
-      : scenario.startsWith("pending maintenance") ? { completed: ["turn.start", "turn.interrupt"], pending: ["runner.drain", "runner.suspend"] }
-      : scenario === "pending turn.start, owner proven dead" ? { completed: ["turn.interrupt"], pending: ["turn.start", "runner.drain", "runner.suspend"] }
-      : scenario === "pending tool result, owner proven dead" ? { completed: ["turn.start", "turn.interrupt"], pending: ["semantic_tool.result", "runner.suspend"] }
+      : scenario === "pending maintenance" ? { completed: ["turn.start", "turn.interrupt"], pending: ["runner.drain", "runner.suspend"] }
+      : scenario === "pending turn.start" ? { completed: ["turn.interrupt"], pending: ["turn.start", "runner.drain", "runner.suspend"] }
+      : scenario === "pending tool result" ? { completed: ["turn.start", "turn.interrupt"], pending: ["semantic_tool.result", "runner.suspend"] }
       : {};
     const fixture = await seed(journal), successorRunId = randomUUID(), originalRunId = randomUUID(), environmentId = randomUUID();
     const providerLeaseId = randomUUID(), sourceLeaseId = randomUUID(), successorLeaseId = randomUUID();
@@ -983,22 +984,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     });
     const target = { kind: "remote", transport: "sandbox", environmentId, leaseId: successorLeaseId, providerKey: "boat",
       remoteCwd, sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId }, runner: { execute } } as const;
-    const sourceRunnerGenerationLost = vi.fn(async () => scenario !== "pending maintenance, owner alive");
-    const binding = assertNativeRetainedSandboxBinding(db, { ...fixture.scope, successorRunId, target: target as never,
-      ...(scenario === "pending maintenance, no probe" ? {} : { sourceRunnerGenerationLost }) });
-    if (scenario === "pending maintenance, owner proven dead" || scenario === "real 45 s journal, owner proven dead") {
-      // Only maintenance is pending and the Runner is proven dead on this box:
-      // the same conversation continues from the retained source.
-      await expect(binding).resolves.toEqual({ remoteCwd });
-      expect(sourceRunnerGenerationLost).toHaveBeenCalledTimes(1);
-      expect(sourceRunnerGenerationLost).toHaveBeenCalledWith({ remoteCwd,
-        identity: { runnerInstanceId: fixture.native.runnerInstanceId, normalizedSessionId: fixture.scope.normalizedSessionId } });
-      expect(JSON.stringify(execute.mock.calls)).toContain("verifyPiSessionFile");
-    } else if (scenario.startsWith("pending") || scenario === "real 45 s journal, turn.start flipped to pending") {
+    const binding = assertNativeRetainedSandboxBinding(db, { ...fixture.scope, successorRunId, target: target as never });
+    if (scenario.startsWith("pending") || scenario.startsWith("real 45 s journal")) {
       await expect(binding).rejects.toThrow("retained_sandbox_binding");
-      // Pending conversation state refuses before any probe: proof of death
-      // never excuses an unsettled turn or tool.
-      if (!scenario.startsWith("pending maintenance")) expect(sourceRunnerGenerationLost).not.toHaveBeenCalled();
     } else if (scenario === "clean") {
       await expect(binding).resolves.toEqual({ remoteCwd });
       expect(execute).toHaveBeenCalledTimes(1);

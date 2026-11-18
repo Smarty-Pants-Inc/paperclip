@@ -3,3 +3,6 @@
 // standalone tools that must not pull in the heartbeat service graph.
 export const NATIVE_RETAINED_OWNER_WAIT = "native_controller_recovery_waiting_for_owner";
 export const NATIVE_AGENT_DIRECTORY_BUSY_WAIT = "agent_directory_operation_busy";
+/** A run that met an unretirable predecessor on its resumed sandbox continues,
+ * as the same run, on a new sandbox restored from the saved history. */
+export const NATIVE_PREDECESSOR_ROTATION_WAIT = "native_predecessor_rotation";

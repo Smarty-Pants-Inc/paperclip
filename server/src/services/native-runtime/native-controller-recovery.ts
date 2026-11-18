@@ -15,14 +15,13 @@ import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { isQuiescentRetainedPiSource, readStoppedRemotePiSource } from "./native-retained-pi-source.js";
-import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { nativeUserStopRecoveryHeld, stopJournalLeftUndeliveredTool, userStopLeftUncertainty } from "./native-user-stop-settlement.js";
 import { probePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { nativeReconciliationError } from "./runner-reconciliation-refusal.js";
-import { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_RETAINED_OWNER_WAIT } from "./native-recovery-wait-codes.js";
+import { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_PREDECESSOR_ROTATION_WAIT, NATIVE_RETAINED_OWNER_WAIT } from "./native-recovery-wait-codes.js";
 
-export { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_RETAINED_OWNER_WAIT };
+export { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_PREDECESSOR_ROTATION_WAIT, NATIVE_RETAINED_OWNER_WAIT };
 
 export const NATIVE_CONTROLLER_RECOVERY_MAX_BYTES = 4 * 1024;
 
@@ -150,9 +149,15 @@ export async function deferNativeControllerRecovery(db: Db, input: {
 }
 
 
+/** A same-run wait before any provider work: the run keeps its id and the
+ * same-run resume dispatch starts it again at `retryAt`. `wait` names why
+ * (default: another run of this agent still uses its files). */
 export async function deferNativeRunForBusyAgentDirectory(db: Db, input: {
   companyId: string; runId: string; leaseOwner?: string; retryAt: Date; maxDeferrals: number;
+  wait?: { failureCode: string; message: string; counterKey: string };
 }): Promise<"deferred" | "pre_admission" | "refused"> {
+  const wait = input.wait ?? { failureCode: NATIVE_AGENT_DIRECTORY_BUSY_WAIT,
+    message: "Waiting for another run of this agent to finish with its files.", counterKey: "agentDirectoryBusyDeferrals" };
   return db.transaction(async tx => {
     const [current] = await tx.select({ issueId: heartbeatRuns.nativeIssueId }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
@@ -170,7 +175,7 @@ export async function deferNativeRunForBusyAgentDirectory(db: Db, input: {
     const cancellation = record(run?.resultJson?.nativeCancellation);
     const stop = readRunCancellation(run?.resultJson);
     const context = record(run?.contextSnapshot);
-    const deferrals = typeof context.agentDirectoryBusyDeferrals === "number" ? context.agentDirectoryBusyDeferrals : 0;
+    const deferrals = typeof context[wait.counterKey] === "number" ? context[wait.counterKey] as number : 0;
     const [clock] = await tx.execute<{ now: Date }>(sql`select clock_timestamp() as now`);
     if (!run || run.runtimeMode !== "native" || run.status !== "running" || task?.executionRunId !== input.runId
       || !owner || owner.resultId || owner.phase !== "observed"
@@ -180,18 +185,21 @@ export async function deferNativeRunForBusyAgentDirectory(db: Db, input: {
       || (["run", "issue"].includes(String(cancellation.scope)) && ["pending", "acknowledged"].includes(String(cancellation.dispatchState)))
       || deferrals >= input.maxDeferrals) return "refused";
     await notifyNativeFinalizationWork(tx, { companyId: input.companyId, issueId: current.issueId, runId: input.runId });
-    await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context, agentDirectoryBusyDeferrals: deferrals + 1 }, updatedAt: new Date() })
+    // A failed attempt armed the execution-control deadline; its same-run
+    // continuation has started no provider work, so nothing is due yet.
+    await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context, [wait.counterKey]: deferrals + 1 },
+      ...(input.wait ? { executionControlDeadlineAt: null } : {}), updatedAt: new Date() })
       .where(eq(heartbeatRuns.id, input.runId));
     const detail = record(owner.failureDetail);
     await tx.update(nativeRunFinalizations).set({
       phase: "retryable_failure", leaseOwner: null, leaseExpiresAt: null, controlDeadlineAt: null,
-      nextAttemptAt: input.retryAt, recoveryState: "resuming_session", failureCode: NATIVE_AGENT_DIRECTORY_BUSY_WAIT,
+      nextAttemptAt: input.retryAt, recoveryState: "resuming_session", failureCode: wait.failureCode,
       failureDetail: {
         recoveryMode: record(run.runnerProfileJson).sessionCheckpoint ? "same_session_resume" : "bootstrap_retry",
         providerSessionEstablished: false, providerEventsExist: false,
         ...detail,
-        originalFailureCode: detail.originalFailureCode ?? NATIVE_AGENT_DIRECTORY_BUSY_WAIT,
-        message: "Waiting for another run of this agent to finish with its files.",
+        originalFailureCode: detail.originalFailureCode ?? wait.failureCode,
+        message: wait.message,
       },
       updatedAt: new Date(),
     }).where(eq(nativeRunFinalizations.runId, input.runId));
@@ -225,20 +233,7 @@ type RetainedSandboxBindingInput = {
   companyId: string; issueId: string; runId: string;
   agentId?: string; successorRunId?: string; normalizedSessionId?: string;
   target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
-  /** The executor's marker probe of `target`'s box (remoteRunnerGenerationLost):
-   * true only when the named Runner's process is absent (45) or of another
-   * generation (47) on that box. */
-  sourceRunnerGenerationLost?: (probe: { remoteCwd: string; identity: Record<string, unknown> }) => Promise<boolean>;
 };
-
-/** Runner lifecycle maintenance that only the stopped source Runner itself
- * could complete: the same lifecycle set the finished-owner fence ignores for
- * a stopped Runner (native-session-executor.ts LOCAL_RUNNER_LIFECYCLE_COMMANDS).
- * A Stop that stopped the box leaves Core's idle drain/suspend pending. They
- * say nothing about the conversation, but only once that Runner's generation
- * is proven dead on this same box. Every other pending command (turn.*, tool
- * results, attachments, session reads) is conversation state and refuses. */
-const STOPPED_SOURCE_MAINTENANCE_COMMANDS: ReadonlySet<string> = new Set(["runner.drain", "runner.suspend", "runner.shutdown"]);
 
 /** A cancelled business run may still leave a good conversation checkpoint.
  * Compose existing lease termination/handoff and runnerd lineage evidence; do
@@ -290,17 +285,9 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
     || checkpoint.recoveryEvidence.normalizedSessionId !== normalizedSessionId) return false;
   const header = record(JSON.parse(checkpoint.records.get("header") ?? "null"));
   const identity = record(record(header.state).identity);
-  const pending = [...checkpoint.records].filter(([key]) => key.startsWith("command:"))
-    .map(([, bytes]) => record(JSON.parse(bytes))).filter(command => command.status !== "completed");
   if (identity.runId !== source.id
     || identity.runnerInstanceId !== source.runnerInstanceId || identity.normalizedSessionId !== normalizedSessionId
-    || pending.some(command => !STOPPED_SOURCE_MAINTENANCE_COMMANDS.has(String(command.type)))) return false;
-  // Pending maintenance only: ignored only for a user-Stopped source whose
-  // Runner generation the marker probe proves dead on this same box (the
-  // binding chain above fixed the box: the successor's providerLeaseId).
-  if (pending.length > 0 && (!retainedUserStop || !input.sourceRunnerGenerationLost
-    || !await input.sourceRunnerGenerationLost({ remoteCwd: sourceLease.metadata!.remoteCwd as string,
-      identity: { runnerInstanceId: source.runnerInstanceId, normalizedSessionId } }))) return false;
+    || [...checkpoint.records].some(([key, bytes]) => key.startsWith("command:") && record(JSON.parse(bytes)).status !== "completed")) return false;
   if (retainedUserStop) {
     // A warm Runner's physical lease can predate the stopped business turn.
     // Accept it only within the already verified same-sandbox handoff chain.
@@ -393,7 +380,6 @@ export async function assertNativeRetainedSandboxBinding(db: Db, input: Retained
  * reads evidence; it grants neither command nor acknowledgement authority. */
 export async function resolveNativeControllerRecovery(db: Db, input: {
   companyId: string; agentId: string; issueId: string; normalizedSessionId: string; currentRunId: string;
-  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
 }): Promise<NativeControllerRecoveryOutcome> {
   if (!isNativeSessionId(input.normalizedSessionId)) return { kind: "missing_evidence", reason: "session_binding" };
   const [current] = await db.select({ createdAt: heartbeatRuns.createdAt, processPid: heartbeatRuns.processPid,

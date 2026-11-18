@@ -5,7 +5,7 @@ import { CONTROLLER_LEASE_RENEW_MS } from "../controller-instance-lease.js";
 import { currentControllerProcessStamp, UNKNOWN_PROCESS_SPACE } from "../controller-process-identity.js";
 import { readNativeSessionResumptionAgent, restoreNativeSessionExecution } from "./native-session-resumption-admission.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
-import { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_RETAINED_OWNER_WAIT } from "./native-controller-recovery.js";
+import { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_PREDECESSOR_ROTATION_WAIT, NATIVE_RETAINED_OWNER_WAIT } from "./native-controller-recovery.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { remoteWorkspaceRunReferenceSchema } from "@paperclipai/shared";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
@@ -1768,7 +1768,8 @@ export async function claimNativeRestartRecoveries(input: {
         && remoteWorkspace?.state === "prepared" && !pluginTask && !durableAuthority && stagedAttachment === null
         && row.run.runnerProfileJson?.nativePreparationFencingVersion === NATIVE_PREPARATION_FENCING_VERSION
         && row.coordinator.phase === "retryable_failure" && row.run.status === "running" && !row.coordinator.leaseOwner
-        && row.coordinator.failureCode === NATIVE_AGENT_DIRECTORY_BUSY_WAIT
+        && (row.coordinator.failureCode === NATIVE_AGENT_DIRECTORY_BUSY_WAIT
+          || row.coordinator.failureCode === NATIVE_PREDECESSOR_ROTATION_WAIT)
         && settledFailure?.recoveryMode === "bootstrap_retry"
         && settledFailure?.providerSessionEstablished === false && settledFailure?.providerEventsExist === false
         && !settledFailure?.successorRunId

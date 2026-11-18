@@ -1,5 +1,7 @@
 import type { IssueCommentMetadata, IssueCommentPresentation } from "@paperclipai/shared";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "../environment-provider-unavailable-error.js";
+import { REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_CODE, REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION,
+  reusableSandboxBackupUnrestorableInstruction } from "../reusable-sandbox-resume-error.js";
 import {
   agentLinkRow,
   keyValueRow,
@@ -85,6 +87,13 @@ const WORKSPACE_SCAN_NOTICES: Record<string, { title: string; nextAction: string
 };
 
 const SETUP_FAILURE_NOTICES: Record<string, StrandedRecoveryNoticeSeed> = {
+  // One true instruction: the body and the next action say the same thing.
+  [REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_CODE]: {
+    title: "Saved chat could not be restored",
+    body: REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION,
+    nextAction: REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION,
+    tone: "danger",
+  },
   runner_revision_mismatch: {
     title: "Remote Runner is out of date",
     body: "The remote Runner does not match this Paperclip version, which is expected for a few minutes while a release updates the Runner. "
@@ -279,6 +288,8 @@ export function buildStrandedRecoveryEscalationNotice(input: {
   recoveryActionId: string | null;
   continuesAutomatically?: boolean;
   retryOffered?: boolean;
+  /** The step the person can take when Retry is not offered (the execution blocker's next action). */
+  nextStepWithoutRetry?: string | null;
   recoveryOwner: { id: string; name: string | null } | null | undefined;
   /** Overrides the cause-derived responsibility: "user" when the person must act. */
   recoveryResponsibility?: "system" | "user";
@@ -305,7 +316,12 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     tone: "danger" as const,
   } : SETUP_FAILURE_NOTICES[input.sourceRun?.errorCode ?? ""] ?? input.seed;
   const fallbackBody = input.fallbackBody?.trim();
-  const honest = (text: string) => input.retryOffered === false ? withoutRetryInstruction(text) : text;
+  // A chat whose saved box could not be restored holds nothing: when Retry is
+  // not offered, say the old box is kept and the step that is available.
+  const backupUnrestorable = input.sourceRun?.errorCode === REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_CODE;
+  const honest = (text: string) => input.retryOffered !== false ? text
+    : backupUnrestorable ? reusableSandboxBackupUnrestorableInstruction(false, input.nextStepWithoutRetry)
+    : withoutRetryInstruction(text);
   const body = honest(seed?.body ?? (fallbackBody || DEFAULT_STRANDED_RECOVERY_NOTICE_BODY));
   const title =
     STRANDED_RECOVERY_NOTICE_TITLES_BY_RUN_ERROR_CODE[input.sourceRun?.errorCode?.trim() ?? ""] ??

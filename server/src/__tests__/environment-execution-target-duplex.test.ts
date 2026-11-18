@@ -37,6 +37,10 @@ import type {
   PluginWorkerManager,
 } from "../services/plugin-worker-manager.js";
 
+// The kept-box write fence reads the lease row before any channel opens. These
+// service tests carry no database: no lease row names a kept box here.
+const NO_KEPT_BOX_DB = { update: () => ({ set: () => ({ where: () => ({ returning: async () => [] }) }) }) } as never;
+
 // A snapshot that grants the opt-in duplex capability, plus the rest true so the
 // gate reads only the duplex flag.
 const DUPLEX_GRANT: EffectiveExecutionCapabilities = {
@@ -126,7 +130,7 @@ beforeEach(() => {
 describe("sandbox driver duplex channel wiring", () => {
   it("reaches the worker manager route with the lease scope and delegates the channel members", async () => {
     const { manager, worker, hostSession, settleWait } = makeFakeWorkerManager();
-    const service = environmentRuntimeService({} as never, { pluginWorkerManager: manager });
+    const service = environmentRuntimeService(NO_KEPT_BOX_DB, { pluginWorkerManager: manager });
 
     const channel = await service.openDuplexChannel({
       environment: SANDBOX_ENVIRONMENT,
@@ -170,7 +174,7 @@ describe("sandbox driver duplex channel wiring", () => {
 
   it("refuses a lease that is not a plugin-backed sandbox lease before it reaches the worker", async () => {
     const { manager, worker } = makeFakeWorkerManager();
-    const service = environmentRuntimeService({} as never, { pluginWorkerManager: manager });
+    const service = environmentRuntimeService(NO_KEPT_BOX_DB, { pluginWorkerManager: manager });
     const nonPluginLease = {
       id: "lease-2",
       companyId: "company-1",
@@ -204,7 +208,7 @@ describe("EnvironmentRuntimeService.openDuplexChannel capability gate", () => {
     // capability. An opt-in capability needs an explicit declaration, so the
     // effective snapshot denies it.
     mockResolvePluginSandboxProviderDriverById.mockResolvedValue({ plugin: {}, driver: {} });
-    const service = environmentRuntimeService({} as never, { pluginWorkerManager: manager });
+    const service = environmentRuntimeService(NO_KEPT_BOX_DB, { pluginWorkerManager: manager });
 
     await expect(
       service.openDuplexChannel({
@@ -222,7 +226,7 @@ describe("EnvironmentRuntimeService.openDuplexChannel capability gate", () => {
     // the `duplexChannelOpen` verb, so the runtime never verified it. A
     // declaration never grants an unverified capability.
     worker.supportedMethods = [];
-    const service = environmentRuntimeService({} as never, { pluginWorkerManager: manager });
+    const service = environmentRuntimeService(NO_KEPT_BOX_DB, { pluginWorkerManager: manager });
 
     await expect(
       service.openDuplexChannel({
@@ -247,7 +251,7 @@ describe("EnvironmentRuntimeService.openDuplexChannel capability gate", () => {
       resolveCapabilities: vi.fn(async () => ({ ...DUPLEX_ABSENT })),
       openDuplexChannel,
     } as unknown as EnvironmentRuntimeDriver;
-    const service = environmentRuntimeService({} as never, { drivers: [narrowedDriver] });
+    const service = environmentRuntimeService(NO_KEPT_BOX_DB, { drivers: [narrowedDriver] });
 
     await expect(
       service.openDuplexChannel({
@@ -265,7 +269,7 @@ describe("EnvironmentRuntimeService.openDuplexChannel capability gate", () => {
     // the provider config cannot be resolved. An untrusted provider fails closed,
     // so the config-resolution failure narrows the duplex capability away.
     mockResolveEnvironmentDriverConfigForRuntime.mockRejectedValue(new Error("config unresolved"));
-    const service = environmentRuntimeService({} as never, { pluginWorkerManager: manager });
+    const service = environmentRuntimeService(NO_KEPT_BOX_DB, { pluginWorkerManager: manager });
 
     await expect(
       service.openDuplexChannel({
