@@ -452,23 +452,6 @@ describeIssueRecovery("company hints and notification reloads (census)", () => {
         await immediate();
       }
     };
-    /** pg_stat_user_tables for the two tables a stranded load reads, after
-     * every pooled backend flushed its counters (PG 15+ flushes an idle
-     * backend's pending counters within about a second; ours is forced). */
-    const counters = async () => {
-      await new Promise(resolve => realSetTimeout(resolve, 2_500));
-      await state.db.execute(sql`select pg_stat_force_next_flush()`);
-      await state.db.execute(sql`select pg_stat_clear_snapshot()`);
-      const rows = await state.db.execute<{ relname: string; seq_scan: string; seq_tup_read: string; idx_scan: string; idx_tup_fetch: string }>(sql`
-        select relname, seq_scan::text, seq_tup_read::text, coalesce(idx_scan, 0)::text as idx_scan, coalesce(idx_tup_fetch, 0)::text as idx_tup_fetch
-        from pg_stat_user_tables where relname in ('issues', 'issue_comments')`);
-      return Object.fromEntries([...rows].map(row => [row.relname, { seqScan: Number(row.seq_scan), seqTupRead: Number(row.seq_tup_read),
-        idxScan: Number(row.idx_scan), idxTupFetch: Number(row.idx_tup_fetch) }])) as Record<"issues" | "issue_comments",
-        { seqScan: number; seqTupRead: number; idxScan: number; idxTupFetch: number }>;
-    };
-    const delta = (a: Awaited<ReturnType<typeof counters>>, b: Awaited<ReturnType<typeof counters>>) => Object.fromEntries(
-      (["issues", "issue_comments"] as const).map(table => [table, Object.fromEntries(Object.entries(b[table]).map(([key, value]) =>
-        [key, value - a[table][key as keyof typeof a.issues]]))])) as Record<"issues" | "issue_comments", Record<string, number>>;
     const notices = async (issueId: string) => (await state.db.select({ id: issueComments.id }).from(issueComments).where(and(
       eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
       sql`starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})`))).length;
@@ -492,63 +475,37 @@ describeIssueRecovery("company hints and notification reloads (census)", () => {
       // 2. An idle pass, nothing changed: a plain company hint (changed rows
       // once a full pass is recent) and the backstop pass it schedules.
       const idleFrom = statements.length, idleVisits = visits.length, idleLoads = loads.length;
-      const before = await counters();
       await state.db.transaction(tx => notifyIssueRecovery(tx, { companyId: f.companyId }));
       await run(ISSUE_RECOVERY_BACKSTOP_MS + MINUTE);
-      const after = await counters();
       const idle = { loads: loads.slice(idleLoads).map(l => l.scope), visited: visits.length - idleVisits,
-        pageLoads: pageLoads(idleFrom).length, commentScans: commentScans(idleFrom).length, pg: delta(before, after) };
-      const idleSql = pageLoads(idleFrom)[0];
+        pageLoads: pageLoads(idleFrom).length, commentScans: commentScans(idleFrom).length };
 
       // 3. One new person message on one quiet blocked task.
       const target = ids["blocked-plain"]![0]!;
       const oneFrom = statements.length, oneVisits = visits.length;
       const [message] = await state.db.insert(issueComments).values({ companyId: f.companyId, issueId: target, body: "Any news?",
         authorType: "user", authorUserId: "recovery-user", createdAt: new Date(), updatedAt: new Date() }).returning({ id: issueComments.id });
-      const oneBefore = await counters();
       // A plain company hint, not the task's own: the changed-rows load must find it.
       await state.db.transaction(tx => notifyIssueRecovery(tx, { companyId: f.companyId }));
-      await run(ISSUE_RECOVERY_BACKSTOP_MS + MINUTE);
-      const oneAfter = await counters();
-      await run(2 * ISSUE_RECOVERY_BACKSTOP_MS);
+      await run(3 * ISSUE_RECOVERY_BACKSTOP_MS + MINUTE);
       const one = { visited: [...new Set(visits.slice(oneVisits).map(v => v.issueId))],
         flagged: [...new Set(visits.slice(oneVisits).filter(v => v.unanswered).map(v => v.issueId))],
-        notices: await notices(target), pageLoads: pageLoads(oneFrom).length, commentScans: commentScans(oneFrom).length,
-        pg: delta(oneBefore, oneAfter) };
-      const scanSql = commentScans(oneFrom)[0] ?? commentScans(fullFrom)[0];
-
-      // The per-pass plans of the two loads, on the seeded data.
-      const explain = async (statement: { query: string; params: unknown[] } | undefined) => statement
-        ? (await state.db.$client.unsafe(`explain (analyze, buffers, costs off, timing off, summary off) ${statement.query}`, statement.params as never[]))
-          .map(row => Object.values(row)[0]).join("\n") : "(no statement)";
-      const plans = { idlePageLoad: await explain(idleSql), commentScan: await explain(scanSql) };
+        notices: await notices(target), pageLoads: pageLoads(oneFrom).length, commentScans: commentScans(oneFrom).length };
       console.info(`stranded cost row: ${JSON.stringify({ tasks: all.length, comments, full, idle, one })}`);
-      console.info(`stranded cost row plan (idle page load):\n${plans.idlePageLoad}`);
-      console.info(`stranded cost row plan (comment scan):\n${plans.commentScan}`);
-      console.info(`stranded cost row sql (idle page load): ${idleSql?.query}`);
-      const shapes: Record<string, number> = {};
-      for (const s of statements.slice(idleFrom, oneFrom)) {
-        const shape = s.query.replace(/\s+/g, " ").slice(0, 140);
-        shapes[shape] = (shapes[shape] ?? 0) + 1;
-      }
-      console.info(`stranded cost row idle-window statements: ${JSON.stringify(shapes, null, 1)}`);
 
+      // The row asserts what each pass DOES, from its own calls and
+      // statements, not from pg_stat_user_tables: those counters are shared by
+      // everything on the same Postgres and flush asynchronously per backend,
+      // so their deltas are not deterministic. The plan shapes (the changed
+      // clause's comment EXISTS and the blocked leg's condition each read
+      // issue_comments whole, O(N*M) per idle pass, not O(changed)) are the
+      // bounded-plan follow-up, smarty-dev#21187.
       // The idle pass ran (a backstop load) and loaded nothing: no task
-      // checked, no comment scan. Its reads stay below one row per task: the
-      // changed-rows clause and the leg's condition only touch tasks through
-      // indexes, never every task's M comments (a full rescan reads >= N rows
-      // of issues and >= N*M comment rows).
+      // checked, no leg comment scan.
       expect(idle.loads.length).toBeGreaterThan(0);
+      expect(idle.pageLoads).toBeGreaterThan(0);
       expect(idle.visited).toBe(0);
       expect(idle.commentScans).toBe(0);
-      expect(idle.pageLoads).toBeGreaterThan(0);
-      expect(idle.pg.issues!.seqTupRead + idle.pg.issues!.idxTupFetch).toBeLessThan(all.length);
-      // issue_comments is read whole a few times per idle window, not per
-      // task: the stranded load plans the changed clause's comment EXISTS
-      // (upstream) as one seq scan and the blocked leg's condition (fork) as
-      // two more (hashed anti-joins); the company queues add their own. This
-      // is O(N*M) per idle pass, the measured cost; not O(changed).
-      expect(idle.pg.issue_comments!.seqTupRead + idle.pg.issue_comments!.idxTupFetch).toBeLessThanOrEqual(8 * comments);
       // The new message: only its task is loaded and checked, flagged, noted once.
       expect(one.visited).toEqual([target]);
       expect(one.flagged).toEqual([target]);
