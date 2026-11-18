@@ -1112,7 +1112,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       // it does not imply a failed workspace or a persisted run result.
       // pl/cancel-finalize: a settled Stop of a warm turn first finishes its
       // own prepared export (bounded), before the box's stop_and_retain release.
-      await finishCancelledWarmWorkspaceExport({ db, runId: run.id, companyId: run.companyId, nativeWorkspaceSync })
+      // adopt-stopu-proof: the box's command path, for the process-gone proof.
+      const box = executionTarget?.kind === "remote" && "runner" in executionTarget && executionTarget.runner
+        ? { runner: executionTarget.runner, remoteCwd: executionTarget.remoteCwd } : null;
+      await finishCancelledWarmWorkspaceExport({ db, runId: run.id, companyId: run.companyId, nativeWorkspaceSync, box })
         .catch((error) => logger.warn({ err: error, runId: run.id }, "cancelled warm workspace export failed"));
       throw adapterErr;
     }

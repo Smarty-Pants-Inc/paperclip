@@ -7,7 +7,8 @@ import { admittedNativeResourceDisposition } from "../native-runtime/native-fail
 import { readNativeWorkspaceSyncReference, resumeNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
 import { nativeWorkspaceExportPendingForLease } from "../native-runtime/native-workspace-finalization-state.js";
 import { tryLockNativeWorkspaceFinalization } from "../native-runtime/native-workspace-finalization-ownership.js";
-import { finishCancelledWarmWorkspaceExport, hasCleanStoppedSessionClose, type CancelledWarmExportOutcome } from "./cancelled-warm-workspace-export.js";
+import { finishCancelledWarmWorkspaceExport, stoppedTurnSessionDecision, type CancelledWarmExportOutcome } from "./cancelled-warm-workspace-export.js";
+import { noStoppedTurnProcessRemains } from "./stopped-turn-process-check.js";
 import { PERSON_STOP_BOUND_KEY, PERSON_STOP_PROBE_TIMEOUT_MS, PERSON_STOP_WITHOUT_FILES_LINE, readPersonStopBoundDecision, personStopExportBoundAt,
   type PersonStopBoundDecision } from "./person-stop-export-bound.js";
 export { PERSON_STOP_EXPORT_BOUND_MS, PERSON_STOP_WITHOUT_FILES_LINE, personStopExportBoundAt, personStopKeptBoxForSuccessor,
@@ -54,7 +55,10 @@ export async function decidePersonStopExportAtBound(input: {
   const boundAt = personStopExportBoundAt(lease.metadata);
   if (boundAt === null || (input.now ?? Date.now()) < boundAt) return null;
   let reason = "box_reachable_tools_stopped";
-  if (!hasCleanStoppedSessionClose(run)) reason = "tools_not_proven_stopped";
+  // adopt-stopu-proof: NSE's own decision, retained (the idle receipt) or a
+  // clean close; then the probe IS the process-gone proof on the kept box.
+  const decided = stoppedTurnSessionDecision(run);
+  if (decided !== "retained" && decided !== "closed_clean") reason = "tools_not_proven_stopped";
   else {
     const [environment] = lease.environmentId ? await db.select().from(environments)
       .where(eq(environments.id, lease.environmentId)).limit(1) : [];
@@ -64,9 +68,9 @@ export async function decidePersonStopExportAtBound(input: {
         environment, leaseId: lease.id, leaseMetadata: lease.metadata, lease: lease as never, environmentRuntime })
         .catch(() => null);
       if (!target || target.kind !== "remote" || !("runner" in target) || !target.runner) return "box_unreachable_target";
-      const result = await target.runner.execute({ command: "true", args: [], cwd: target.remoteCwd, timeoutMs: input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS })
-        .catch(() => null);
-      return result && result.exitCode === 0 && !result.timedOut ? "box_reachable_tools_stopped" : "box_unreachable_probe";
+      return await noStoppedTurnProcessRemains({ runner: target.runner, remoteCwd: target.remoteCwd }, run.startedAt,
+        { retainedSession: decided === "retained", timeoutMs: input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS })
+        ? "box_reachable_tools_stopped" : "box_unreachable_probe";
     };
     const probed = await withTimeout(probe(), input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS);
     reason = probed === "timed_out" ? "box_unreachable_probe" : probed;
@@ -150,6 +154,14 @@ export async function exportPersonStoppedWarmWorkspaceBeforeRelease(input: {
   const reference = { state: prepared.state as string };
   return await finishCancelledWarmWorkspaceExport({ db, runId: run.id, companyId: run.companyId,
     timeoutMs: input.timeoutMs, settledBy: "terminal_cancelled_run",
+    // adopt-stopu-proof: the same kept box's command path, for the process-gone proof.
+    box: async () => {
+      if (!environment) return null;
+      const target = await resolveEnvironmentExecutionTarget({ db, companyId: run.companyId, adapterType: "paperclip_runner",
+        environment, leaseId: lease.id, leaseMetadata: lease.metadata, lease: lease as never, environmentRuntime }).catch(() => null);
+      return target && target.kind === "remote" && "runner" in target && target.runner
+        ? { runner: target.runner, remoteCwd: target.remoteCwd } : null;
+    },
     nativeWorkspaceSync: { reference, restoreWorkspace: async (assertOwnership, options) => {
       if (!environment) throw new Error("person_stop_export_environment_missing");
       const target = await resolveEnvironmentExecutionTarget({ db, companyId: run.companyId, adapterType: "paperclip_runner",
