@@ -1651,6 +1651,99 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).not.toContain(WAITING_LINE);
   }, 60_000);
 
+  /** S095 turn (RFL 23:46Z + rf-3 23:48Z): the person's Stop of the owner,
+   * acknowledged, requested at `requestedAt` (before it issued the turn
+   * commands unless a test says otherwise). */
+  async function acknowledgePersonStop(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, requestedAt: Date,
+    options: Parameters<typeof stopSettledOwner>[1] = {}) {
+    await stopSettledOwner(prior, options);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...stopped.resultJson as Record<string, unknown>,
+      executionCancellation: { state: "acknowledged", requestedAt: requestedAt.toISOString() } } }).where(eq(heartbeatRuns.id, prior.runId));
+  }
+
+  /** Boat's stop receipt on the stopped run's own (old) box, bound by remoteTerminationReceipt's shape. */
+  async function recordOldBoxStopReceipt(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
+    const environmentId = randomUUID(), leaseId = randomUUID(), providerLeaseId = `sandbox-${prior.runId}`;
+    await db.insert(environments).values({ id: environmentId, name: `stopped-${environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "boat", providerLeaseId, status: "released", releasedAt: new Date(),
+      cleanupStatus: "success", metadata: { remoteCwd: "/workspace", remoteExecutionTermination: {
+        schema: "paperclip.remote-termination.v1", companyId, runId: prior.runId, leaseId, provider: "boat", providerLeaseId,
+        state: "stopped", confirmedAt: new Date().toISOString() } } });
+  }
+
+  const TURN_EXEMPT_LINE = "its person's Stop's unanswered turn commands no longer hold this conversation";
+  const TURN_WAIT_LINE = "waiting for proof that the Runner of run";
+
+  async function stopTurnShape(options: { receipt?: boolean; preStop?: boolean; stop?: Parameters<typeof stopSettledOwner>[1];
+    actor?: string; between?: boolean } = {}) {
+    const stopRequestedAt = new Date(Date.now() - 1_000);
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm", pendingCommands: STOP_TURN_COMMANDS });
+    if (options.between) {
+      // Another run of this conversation, created after the stopped run.
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+      await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId, agentId, status: "failed", runtimeMode: "native",
+        nativeIssueId: prior.issueId, nativeSessionId: prior.native.normalizedSessionId, contextSnapshot: { issueId: prior.issueId },
+        createdAt: new Date(stopped.createdAt.getTime() + 1) });
+    }
+    const followUp = await admitFollowUp(prior);
+    await acknowledgePersonStop(prior, options.preStop ? new Date(Date.now() + 1_000) : stopRequestedAt, options.stop);
+    if (options.actor) {
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+      await db.update(heartbeatRuns).set({ resultJson: { ...stopped.resultJson, cancelledByActorType: options.actor } })
+        .where(eq(heartbeatRuns.id, prior.runId));
+    }
+    if (options.receipt !== false) await recordOldBoxStopReceipt(prior);
+    return { prior, followUp };
+  }
+
+  it("S095 turn: live 7e625560 at the production entry: the acknowledged person's Stop's own pending turn.interrupt + turn.stop, "
+    + "the old box's Boat stop receipt, the successor on a created box -> admitted once, no quarantined copy, same provider session", async () => {
+    const { prior, followUp } = await stopTurnShape();
+    const { outcome, elapsedMs } = await executeFollowUp(prior, followUp, 5_000);
+    expect.soft(await quarantined(), "no quarantined copy").toEqual([]);
+    expect.soft(failureText(outcome)).not.toContain(STRANDED);
+    expect.soft(outcome).not.toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect.soft(failureText(outcome), "admission reached tool authority").toContain(ADMITTED);
+    expect.soft(toolDefinitions).toHaveBeenCalledTimes(1);
+    expect.soft(elapsedMs).toBeLessThan(5_000);
+    expect.soft(followUp.logs.join("")).toContain(`run ${prior.runId}'s Runner is gone; ${TURN_EXEMPT_LINE}`);
+    expect.soft(followUp.logs.join("")).not.toContain(TURN_WAIT_LINE);
+    expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    expect((successor.runnerProfileJson as { sessionCheckpoint?: { providerSessionId?: string } }).sessionCheckpoint?.providerSessionId)
+      .toBe("provider-session-before-recovery");
+  }, 60_000);
+
+  it("S095 turn: no Boat stop receipt and no holder retirement -> waits once, then the typed pre-claim deferral, never the quarantine",
+    async () => {
+      const { prior, followUp } = await stopTurnShape({ receipt: false });
+      const { outcome } = await executeFollowUp(prior, followUp, 300);
+      expect.soft(await quarantined()).toEqual([]);
+      expect.soft(outcome).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+      expect.soft(followUp.logs.join("")).toContain(`${TURN_WAIT_LINE} ${prior.runId}`);
+      expect.soft(followUp.logs.join("")).not.toContain(TURN_EXEMPT_LINE);
+      const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, followUp.runId));
+      expect.soft(finalization).toMatchObject({ phase: "retryable_failure", attempt: 0, failureCode: "native_controller_recovery_waiting_for_owner" });
+      expect(followUp.remoteExecute).not.toHaveBeenCalled();
+    }, 60_000);
+
+  it.each([
+    ["an automatic (agent) Stop", { actor: "agent" }],
+    ["a Stop receipt of another run (foreign Stop)", { stop: { ack: "other-run" as const } }],
+    ["a successor that is not the direct one", { between: true }],
+    ["turn commands journaled before the person's Stop", { preStop: true }],
+  ])("S095 turn: keeps today's refusal and quarantine with %s", async (_label, options) => {
+    const { prior, followUp } = await stopTurnShape(options);
+    const { outcome, elapsedMs } = await executeFollowUp(prior, followUp, 5_000);
+    expect(failureText(outcome)).toContain(stranded(STOP_TURN_REFUSAL));
+    expect(elapsedMs).toBeLessThan(5_000);
+    expect(await quarantined()).toHaveLength(1);
+    expect(followUp.logs.join("")).not.toContain(TURN_EXEMPT_LINE);
+    expect(followUp.logs.join("")).not.toContain(TURN_WAIT_LINE);
+  }, 60_000);
+
   it("keeps a finished owner held by an unclassified root entry and names it", async () => {
     const prior = await seedRecoveredPriorRun();
     const followUp = await admitFollowUp(prior);
