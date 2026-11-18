@@ -1022,6 +1022,31 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
+  // adopt-stopu-proof (rf-4 F21 (4), never-OK, SCREEN FAIL live on U): the
+  // hard shape - a person's Stop of the running turn, a message sent at +0,
+  // its run queued behind the held box - must never show the waiting note.
+  it("person-Stop: the held message after a person's Stop never shows 'will start by itself' / 'waiting for the agent to be free' / 'Your message is waiting to start'", async () => {
+    const f = await fixture();
+    const first = await f.message("Edit notes.md, then run the long command.");
+    const stoppedRunId = await f.run({ commentId: first, status: "cancelled", errorCode: "cancelled" });
+    await db.update(heartbeatRuns).set({ resultJson: { cancelledByActorType: "user", cancelledByUserId: f.userId,
+      executionCancellation: { state: "requested" },
+      nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: stoppedRunId, companyId: f.companyId,
+        issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+        intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: new Date().toISOString() } } })
+      .where(eq(heartbeatRuns.id, stoppedRunId));
+    await f.reply(stoppedRunId);
+    const commentId = await f.message("Now do this instead.");
+    await f.run({ commentId, status: "queued" });
+    await f.sweep();
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    await settleAt(f, AFTER_WAKE_BOUND_MS + 60_000);
+    const shown = (await f.visible()).map(notice => JSON.stringify([notice.body, notice.presentation])).join("\n");
+    for (const forbidden of ["will start by itself", "waiting for the agent to be free", "Your message is waiting to start"]) {
+      expect(shown).not.toContain(forbidden);
+    }
+  });
+
   // RFL 03:26Z: "it will start by itself" must stay TRUE. A carrying run that
   // still has not started by T0 + 10 min turns the SAME note into the failure
   // text; the waiting note carries no failure code.
