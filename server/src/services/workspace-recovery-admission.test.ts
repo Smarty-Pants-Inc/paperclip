@@ -1722,6 +1722,112 @@ describe("automatic retained workspace recovery", () => {
     } finally { deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId); }
   }, 30_000);
 
+  // pl/s3-fence-b: the user queued messages, pressed Stop, then pressed Send.
+  // Queued input written before the Stop is not a new direction on its own,
+  // but the queue owner's later Send receipt (queuedCommentInterrupt) is. The
+  // dispatch fallback must save and deliver the queued messages once, in order,
+  // with their ids and authors; Stop alone, a Send by someone else, a Send
+  // recorded before the Stop, or a malformed receipt keeps them undelivered.
+  // The Send click writes its receipt on the saved queue, and the successor
+  // adopts that queue as a coalesced source receipt. A receipt on the run's own
+  // wake is never Send authority: wake callers cannot supply it.
+  it.each([
+    { send: "owner_after_stop", on: "queue", drains: true },
+    { send: "none", on: "queue", drains: false },
+    { send: "other_actor_after_stop", on: "queue", drains: false },
+    { send: "owner_before_stop", on: "queue", drains: false },
+    { send: "owner_invalid_time", on: "queue", drains: false },
+    { send: "owner_after_stop", on: "wake", drains: false },
+  ] as const)("Stop with messages queued before it, then Send, at the dispatch fallback: $send on the $on", async ({ send, on, drains }) => {
+    const t = await queuedResetFixture(false);
+    const { f, original, reset: first, wake, queued, deps, control, execution, queueDeps, queue } = t;
+    await db.update(issueComments).set({ body: "First: outline the essay." }).where(eq(issueComments.id, first.id));
+    const { followup: second, receipt: sendQueue } = await coalesceQueuedReset(t);
+    await db.update(issueComments).set({ body: "Second: then keep it under 200 words." }).where(eq(issueComments.id, second.id));
+    const expectedIds = [first.id, second.id];
+    // Both messages were queued before the Stop was requested.
+    const stoppedAt = new Date(Math.max(first.createdAt.getTime(), second.createdAt.getTime()) + 1_000), stopped = await run(f.runId);
+    await db.update(heartbeatRuns).set({ finishedAt: stoppedAt, resultJson: { ...stopped.resultJson,
+      cancellation: { ...(stopped.resultJson?.cancellation as Record<string, unknown>), recordedAt: stoppedAt.toISOString() } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const sendAt = send === "owner_before_stop" ? new Date(stoppedAt.getTime() - 500) : new Date(stoppedAt.getTime() + 500);
+    // The successor names the adopted queue as its source receipt.
+    const queuedContext = (await run(queued.id)).contextSnapshot ?? {};
+    const sourceWakeIds = [...new Set([...((queuedContext.queuedCommentSourceWakeIds as string[] | undefined) ?? []), sendQueue.id])];
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...queuedContext, queuedCommentSourceWakeIds: sourceWakeIds } })
+      .where(eq(heartbeatRuns.id, queued.id));
+    if (send !== "none") {
+      const target = on === "queue" ? sendQueue.id : wake.id;
+      const [current] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, target));
+      await db.update(agentWakeupRequests).set({ payload: { ...current.payload, queuedCommentInterrupt: {
+        actorId: send === "other_actor_after_stop" ? "other-operator" : "operator",
+        requestedAt: send === "owner_invalid_time" ? "not-a-time" : sendAt.toISOString() } } })
+        .where(eq(agentWakeupRequests.id, target));
+    }
+    const commentsBefore = await db.select().from(issueComments).where(inArray(issueComments.id, expectedIds));
+    try {
+      expect(await queue.claimQueuedRun(queued)).toBeNull();
+      expect((await run(queued.id)).status).toBe("queued");
+      await recordRequiredWorkspaceRestoreFailure(db, await run(f.runId), { workspaceRestoreFailure: "restore_failed" }, f.lease);
+      const [hold] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
+        eq(issueRecoveryActions.sourceIssueId, f.issueId), eq(issueRecoveryActions.fingerprint, `native-workspace:${f.runId}`)));
+      f.actionId = hold.id; f.input.actionId = hold.id;
+      await recoverRetainedWorkspace(f.input);
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success", metadata: { ...f.lease.metadata,
+        remoteExecutionTermination: remoteTerminationReceipt(f.lease, { providerLeaseId: f.providerLeaseId, state: "stopped" }) } }).where(eq(environmentLeases.id, f.lease.id));
+      await control.acknowledgeRemoteStop(f.runId, f.companyId);
+      deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId);
+      await control.resumeRemoteStopComments(await run(f.runId));
+      await vi.waitFor(async () => {
+        await Promise.all(await reconcileRetainedWorkspaces(db, f.environmentRuntime, async current => {
+          if (current.id === f.runId) await control.resumeRemoteStopComments(current);
+        }) ?? []);
+        expect(readSystemRecovery((await action(f.actionId)).evidence)?.state).toBe("complete");
+      }, { timeout: 10_000, interval: 10 });
+
+      // The settled hold withholds the queued run through the verified pre-dispatch wait.
+      expect(await queue.claimQueuedRun(await run(queued.id))).toBeNull();
+      expect(await run(queued.id)).toMatchObject({ status: "cancelled", errorCode: "execution_reconciliation_required", startedAt: null });
+      expect(await isPreDispatchExecutionWaitVerified(db, await run(queued.id))).toBe(true);
+      const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+      // Message ids, order, text and attribution are never rewritten.
+      expect(await db.select().from(issueComments).where(inArray(issueComments.id, expectedIds))).toEqual(expect.arrayContaining(commentsBefore));
+      if (!drains) {
+        expect(saved.status).toBe("skipped");
+        await control.resumeRemoteStopComments(await run(f.runId));
+        await queue.resumeDeferredExecutionReceipts({ companyId: f.companyId });
+        expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`, eq(heartbeatRuns.status, "queued")))).toHaveLength(0);
+        expect(deps.enqueueWakeup).not.toHaveBeenCalled();
+        expect(queueDeps.executeRun).not.toHaveBeenCalled();
+        return;
+      }
+      expect(saved).toMatchObject({ status: "deferred_issue_execution", runId: null, requestedByActorType: "user", requestedByActorId: "operator",
+        payload: { commentId: second.id, executionWait: { reason: "execution_recovery", recoveryActionId: hold.id } } });
+      expect(saved.payload?._paperclipWakeContext).toMatchObject({ wakeCommentIds: expectedIds });
+
+      // Ordinary deferred-receipt delivery re-enters admission exactly once.
+      await Promise.all([control.resumeRemoteStopComments(await run(f.runId)), control.resumeRemoteStopComments(await run(f.runId))]);
+      await queue.resumeDeferredExecutionReceipts({ companyId: f.companyId });
+      await queue.resumeDeferredExecutionReceipts({ companyId: f.companyId });
+      const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`, eq(heartbeatRuns.status, "queued")));
+      expect(successors).toHaveLength(1);
+      expect(successors[0].id).not.toBe(queued.id);
+      expect(successors[0].contextSnapshot?.wakeCommentIds).toEqual(expectedIds);
+      // Concurrent deliveries consume the saved queue into that one run.
+      const [consumed] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+      expect(consumed).toMatchObject({ status: "coalesced", runId: successors[0].id });
+      expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`, sql`${heartbeatRuns.id} not in (${f.runId}, ${queued.id})`)))
+        .toHaveLength(1);
+      expect(deps.enqueueWakeup).toHaveBeenCalledWith(original.agentId,
+        expect.objectContaining({ requestedByActorType: "user", requestedByActorId: "operator" }), wake.id);
+      expect(await db.select().from(issueComments).where(inArray(issueComments.id, expectedIds))).toEqual(expect.arrayContaining(commentsBefore));
+      expect(queueDeps.executeRun).not.toHaveBeenCalled();
+    } finally { deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId); }
+  }, 30_000);
+
   it.each([
     { retried: false, title: "continues a message written during Stop settlement once, without a second message, after recovery already resolved" },
     { retried: true, title: "continues a message carried by a workspace-busy retry once, without a second message, after recovery already resolved" },
