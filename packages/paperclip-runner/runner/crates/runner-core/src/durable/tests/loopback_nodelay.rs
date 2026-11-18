@@ -9,14 +9,14 @@ fn loopback_listener_enables_tcp_nodelay() {
         let url = format!("ws://127.0.0.1:{port}{path}");
         move || client(url, stream).unwrap()
     });
-    let endpoint = RunnerTransportEndpoint::Listen { listener, path };
+    let endpoint = RunnerTransportEndpoint::from_listener(listener, path);
+    let _client = client.join().unwrap();
     let Some(RunnerSocket::Listen(socket)) = endpoint
         .open(64 * 1024, None, Instant::now() + Duration::from_secs(5))
         .unwrap()
     else {
         panic!("expected an accepted PRP socket");
     };
-    client.join().unwrap();
     assert!(socket.get_ref().nodelay().unwrap());
 }
 

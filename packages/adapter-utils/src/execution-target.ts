@@ -1482,8 +1482,16 @@ export function normalizeAdapterExecutionTargetSessionIdentity(value: unknown): 
     return buildRemoteExecutionSessionIdentity(fields as unknown as SshRemoteExecutionSpec);
   }
   if (saved.transport === "sandbox" && readStringMeta(saved, "remoteCwd")) {
-    return adapterExecutionTargetSessionIdentity({ kind: "remote", transport: "sandbox", remoteCwd: readStringMeta(saved, "remoteCwd")!,
+    const normalized = adapterExecutionTargetSessionIdentity({ kind: "remote", transport: "sandbox", remoteCwd: readStringMeta(saved, "remoteCwd")!,
       providerKey: readStringMeta(saved, "providerKey"), environmentId: readStringMeta(saved, "environmentId"), leaseId: readStringMeta(saved, "leaseId") });
+    // Reusable sandboxes retain session files across Paperclip lease rows.
+    // Normalizing a saved physical identity must not turn it into leaseId:null.
+    const providerLeaseId = readStringMeta(saved, "providerLeaseId");
+    if (normalized && providerLeaseId) {
+      delete normalized.leaseId;
+      return { ...normalized, providerLeaseId };
+    }
+    return normalized;
   }
   return null;
 }
