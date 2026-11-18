@@ -86,6 +86,74 @@ describe("runner PRP websocket route", () => {
     server.close();
   });
 
+  // b1-prp-revoke (RFL rf-4 fence (c)): the route registry is where every
+  // registered run's PRP authority is finalized or superseded.
+  it("R1 wiring: finalizing a run's route (Stop) revokes that run's PRP credentials once", async () => {
+    const server = createBoundServer(3216);
+    const runId = "00000000-0000-4000-8000-000000000791";
+    const revokeRunCredentials = vi.fn(async () => 1);
+    const registration = await registerRunnerPrpAuthority({
+      companyId: "company-1", issueId: "issue-1", agentId: "agent-1", runId,
+      authority: { revokeRunCredentials } as unknown as DurablePrpControlPlane,
+    });
+    expect(revokeRunCredentials).not.toHaveBeenCalled();
+    await registration.release("finalize");
+    expect(revokeRunCredentials).toHaveBeenCalledExactlyOnceWith(runId, "run_finalized");
+    await registration.release("finalize");
+    expect(revokeRunCredentials).toHaveBeenCalledTimes(1);
+    server.close();
+  });
+
+  it.each([undefined, "detach"] as const)("keeps credentials when the route is released without finalize (%s)", async (reason) => {
+    const server = createBoundServer(3217);
+    const runId = "00000000-0000-4000-8000-000000000792";
+    const revokeRunCredentials = vi.fn(async () => 1);
+    const registration = await registerRunnerPrpAuthority({
+      companyId: "company-1", runId,
+      authority: { revokeRunCredentials } as unknown as DurablePrpControlPlane,
+    });
+    await registration.release(reason);
+    expect(revokeRunCredentials).not.toHaveBeenCalled();
+    server.close();
+  });
+
+  it("R2 wiring: a successor's registration revokes only the predecessor's credentials", async () => {
+    const server = createBoundServer(3218);
+    const oldRunId = "00000000-0000-4000-8000-000000000793";
+    const newRunId = "00000000-0000-4000-8000-000000000794";
+    const oldRevoke = vi.fn(async () => 1);
+    const newRevoke = vi.fn(async () => 1);
+    const binding = { companyId: "company-1", issueId: "issue-1", agentId: "agent-1" };
+    const oldRegistration = await registerRunnerPrpAuthority({ ...binding, runId: oldRunId,
+      authority: { revokeRunCredentials: oldRevoke } as unknown as DurablePrpControlPlane });
+    const newRegistration = await registerRunnerPrpAuthority({ ...binding, runId: newRunId,
+      authority: { revokeRunCredentials: newRevoke } as unknown as DurablePrpControlPlane });
+    expect(oldRevoke).toHaveBeenCalledExactlyOnceWith(oldRunId, "run_superseded");
+    expect(newRevoke).not.toHaveBeenCalled();
+    await oldRegistration.release("finalize");
+    expect(oldRevoke).toHaveBeenCalledTimes(2);
+    expect(newRevoke).not.toHaveBeenCalled();
+    await newRegistration.release("finalize");
+    expect(newRevoke).toHaveBeenCalledExactlyOnceWith(newRunId, "run_finalized");
+    server.close();
+  });
+
+  it("does not revoke through an authority a warm transition still routes for another run", async () => {
+    const server = createBoundServer(3219);
+    const oldRunId = "00000000-0000-4000-8000-000000000795";
+    const newRunId = "00000000-0000-4000-8000-000000000796";
+    const revokeRunCredentials = vi.fn(async () => 1);
+    const authority = { revokeRunCredentials } as unknown as DurablePrpControlPlane;
+    const binding = { companyId: "company-1", issueId: "issue-1", agentId: "agent-1", authority };
+    const oldRegistration = await registerRunnerPrpAuthority({ ...binding, runId: oldRunId });
+    const newRegistration = await registerRunnerPrpAuthority({ ...binding, runId: newRunId });
+    await oldRegistration.release("finalize");
+    expect(revokeRunCredentials).not.toHaveBeenCalled();
+    await newRegistration.release("finalize");
+    expect(revokeRunCredentials).toHaveBeenCalledExactlyOnceWith(newRunId, "run_finalized");
+    server.close();
+  });
+
   it("does not replace an active registration", async () => {
     const server = createBoundServer(3212);
     const runId = "00000000-0000-4000-8000-000000000779";

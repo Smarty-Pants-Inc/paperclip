@@ -2472,6 +2472,150 @@ it.each(["expired", "revoked", "wrong-run", "wrong-connection", "wrong-epoch", "
   },
 );
 
+// b1-prp-revoke (RFL rf-4 fence (c)): a run that is terminal or superseded
+// loses its PRP credential, so a revived runner cannot keep sending frames or
+// resume its session. The revoke is the recovery rotation's own revoke; it
+// waits for every frame the authority already received (no committed event is
+// lost), records a typed refusal, and never deletes the journal.
+describe("run credential revocation at finalization and supersession", () => {
+  const successorIdentity: DurableRecoveryIdentity = { ...identity, runId: "00000000-0000-4000-8000-000000000002" };
+
+  async function authenticatedCore(prefix: string, runIdentity: DurableRecoveryIdentity,
+    onCommittedEvent?: (event: unknown) => Promise<void>) {
+    const root = mkdtempSync(resolve(tmpdir(), prefix));
+    const core = new DurablePrpControlPlane({ stateDirectory: root, identity: runIdentity, expectedRunnerVersion,
+      expectedRunnerDigest, ...(onCommittedEvent ? { onCommittedEvent } : {}) });
+    await core.start();
+    const client = (await authenticate(core, core.issueBootstrapTicket(), runIdentity))!;
+    const expiry = Number((client.welcome.payload as Record<string, unknown>).connectionLeaseExpiresAtUnixMs);
+    return { root, core, client, expiry };
+  }
+
+  function renewal(client: AuthenticatedClient, runIdentity: DurableRecoveryIdentity, expiry: number) {
+    return { ...renewalRequest(client, expiry), ...runIdentity };
+  }
+
+  it("R1: after a Stop finalizes the run, its credential is refused for frames and for a revived runner's resume", async () => {
+    const p = await authenticatedCore("runner-revoke-r1-", identity);
+    try {
+      sendSecure(p.client, credentialEvent(1));
+      expect(await receiveSecure(p.client)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 1 } });
+      expect(await p.core.revokeRunCredentials(identity.runId, "run_finalized")).toBe(1);
+      expect(Object.values(p.core.store.state.leases).every((lease) => lease.revokedAt !== null)).toBe(true);
+      // The live socket is cut; a frame presented with P's credential is refused.
+      sendSecure(p.client, renewal(p.client, identity, p.expiry));
+      expect(await receiveSecure(p.client)).toBeNull();
+      // A revived runner (resumed box) presenting P's resumable credential is refused.
+      expect(await authenticate(p.core, p.client.leaseToken!, identity)).toBeNull();
+      expect(p.core.store.state.ackedSourceSeq).toBe(1);
+    } finally {
+      await p.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+    }
+  });
+
+  it("R2: after supersession the predecessor's credential is refused and the successor's is accepted", async () => {
+    const p = await authenticatedCore("runner-revoke-r2p-", identity);
+    const s = await authenticatedCore("runner-revoke-r2s-", successorIdentity);
+    try {
+      expect(await p.core.revokeRunCredentials(identity.runId, "run_superseded")).toBe(1);
+      // Supersession never touches the successor's own grant.
+      expect(await s.core.revokeRunCredentials(identity.runId, "run_superseded")).toBe(0);
+      sendSecure(p.client, renewal(p.client, identity, p.expiry));
+      expect(await receiveSecure(p.client)).toBeNull();
+      sendSecure(s.client, renewal(s.client, successorIdentity, s.expiry));
+      expect(await receiveSecure(s.client)).toMatchObject({ kind: "lease_renewed" });
+      expect(Object.values(s.core.store.state.leases).every((lease) => lease.revokedAt === null)).toBe(true);
+    } finally {
+      await p.core.stop();
+      await s.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+      rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  it("R3: a live run's credential still works (control)", async () => {
+    const p = await authenticatedCore("runner-revoke-r3-", identity);
+    try {
+      sendSecure(p.client, renewal(p.client, identity, p.expiry));
+      expect(await receiveSecure(p.client)).toMatchObject({ kind: "lease_renewed" });
+      expect(Object.values(p.core.store.state.leases)[0]!.revokedAt).toBeNull();
+      expect(p.core.credentialRefusal).toBeNull();
+    } finally {
+      await p.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+    }
+  });
+
+  it("R4: revocation is idempotent (finalize twice)", async () => {
+    const p = await authenticatedCore("runner-revoke-r4-", identity);
+    try {
+      expect(await p.core.revokeRunCredentials(identity.runId, "run_finalized")).toBe(1);
+      const first = structuredClone(p.core.store.state.leases);
+      expect(await p.core.revokeRunCredentials(identity.runId, "run_finalized")).toBe(0);
+      expect(p.core.store.state.leases).toEqual(first);
+      const persisted = JSON.parse(readFileSync(p.core.store.path, "utf8"));
+      expect(Object.values(persisted.leases as Record<string, { revokedAt: string | null }>)
+        .every((lease) => lease.revokedAt !== null)).toBe(true);
+    } finally {
+      await p.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+    }
+  });
+
+  it("R5+R6: a revoke during P's flush waits; the server holds P's last committed seq before the credential dies", async () => {
+    let releaseCommit!: () => void;
+    const barrier = new Promise<void>(resolveCommit => { releaseCommit = resolveCommit; });
+    const commits = vi.fn(async () => { if (commits.mock.calls.length === 1) await barrier; });
+    const p = await authenticatedCore("runner-revoke-r6-", identity, commits);
+    try {
+      // P's runner journal holds seq 1..2; seq 1's commit is in flight and
+      // seq 2 is received and queued behind it when finalization revokes.
+      sendSecure(p.client, credentialEvent(1));
+      await vi.waitFor(() => expect(commits).toHaveBeenCalledTimes(1));
+      sendSecure(p.client, credentialEvent(2));
+      await new Promise(resolveWait => setTimeout(resolveWait, 250));
+      let revoked = false;
+      const revocation = p.core.revokeRunCredentials(identity.runId, "run_finalized").then((count) => { revoked = true; return count; });
+      await new Promise(resolveWait => setTimeout(resolveWait, 50));
+      expect(revoked).toBe(false);
+      expect(Object.values(p.core.store.state.leases)[0]!.revokedAt).toBeNull();
+      releaseCommit();
+      expect(await revocation).toBe(1);
+      // Trace complete: the server's last seq equals P's runner journal.
+      expect(commits).toHaveBeenCalledTimes(2);
+      expect(p.core.store.state.ackedSourceSeq).toBe(2);
+      expect(Object.values(p.core.store.state.leases)[0]!.revokedAt).not.toBeNull();
+    } finally {
+      releaseCommit();
+      await p.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+    }
+  });
+
+  it("R7: a frame or resume refused after revocation has a typed reason, and the journal is kept", async () => {
+    const p = await authenticatedCore("runner-revoke-r7-", identity);
+    try {
+      sendSecure(p.client, credentialEvent(1));
+      expect(await receiveSecure(p.client)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 1 } });
+      const leaseId = Object.values(p.core.store.state.leases)[0]!.leaseId;
+      expect(await p.core.revokeRunCredentials(identity.runId, "run_superseded")).toBe(1);
+      expect(p.core.credentialRefusal).toMatchObject({ code: "connection_lease_revoked", reason: "run_superseded", leaseId });
+      expect(await authenticate(p.core, p.client.leaseToken!, identity)).toBeNull();
+      expect(p.core.credentialRefusal).toMatchObject({ code: "connection_lease_revoked", reason: "run_superseded", leaseId });
+      // Revocation is not expiry: the lease-expiry signal stays clear.
+      expect(p.core.connectionLeaseFailure).toBeNull();
+      // The durable journal is kept, not deleted.
+      const saved = JSON.parse(readFileSync(p.core.store.path, "utf8"));
+      expect(saved.ackedSourceSeq).toBe(1);
+      expect(p.core.store.state.ackedSourceSeq).toBe(1);
+    } finally {
+      await p.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+    }
+  });
+});
+
 it("persists the initial warm attachment seed idempotently and rejects replacement", () => {
   const root = mkdtempSync(
     resolve(tmpdir(), "runner-initial-attachment-seed-test-"),
