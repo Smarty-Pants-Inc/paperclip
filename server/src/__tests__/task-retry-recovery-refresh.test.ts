@@ -6,7 +6,7 @@ import request from "supertest";
 import { and, eq, ne } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  agents, authUsers, agentWakeupRequests, closeRegisteredClients, companies, createDb,
+  agents, authUsers, agentWakeupRequests, budgetPolicies, closeRegisteredClients, companies, costEvents, createDb,
   environments, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issueRelations, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -274,6 +274,42 @@ describe("Task Retry recovery-card refresh", () => {
   it("JUDGE paused agent WITH a blocker: no Press Retry; route 202 but no run starts", async () => {
     const row = await judge(await judgeFixture({ paused: true, blocker: true }));
     expect(row).toMatchObject({ admits: false, pressRetry: false, status: 202, runStarted: false });
+  }, 60_000);
+
+  // (u) rf-5 judge-r4-offered-true: a LEGACY attempt whose execution
+  // provenance is unproved; its board hold says canRetry=true.
+  it("JUDGE (u) unproven legacy execution: notice and screen agree with dispatch", async () => {
+    const f = await judgeFixture({ adapterType: "paperclip_runner" });
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", ownerType: "board",
+      fingerprint: randomUUID(), status: "resolved", outcome: "blocked", nextAction: "Press Retry to continue.",
+      evidence: { runId: f.run.id, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true });
+    const row = await judge(f);
+    expect(row).toMatchObject({ status: 202, runStarted: false, savedWait: "previous_execution_unverified" });
+    expect(row).toMatchObject({ admits: false, refusal: "previous_execution_unverified", pressRetry: false, screenCanRetry: false });
+  }, 60_000);
+
+  // (b) the agent's budget hard stop is reached; the queued budget evaluation
+  // has not yet paused the agent, but admission (budgets.getInvocationBlock) refuses.
+  it("JUDGE (b) budget exhausted: notice and screen agree with dispatch", async () => {
+    const f = await judgeFixture();
+    await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "agent", scopeId: f.agentId,
+      windowKind: "calendar_month_utc", amount: 100, hardStopEnabled: true });
+    await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, heartbeatRunId: f.run.id,
+      provider: "openai", model: "gpt", costCents: 500, occurredAt: new Date() });
+    const row = await judge(f);
+    expect(row).toMatchObject({ status: 202, runStarted: false });
+    expect(row).toMatchObject({ admits: false, pressRetry: false, screenCanRetry: false });
+  }, 60_000);
+
+  // (c) the agent's daily run cap (enqueueWakeup getHeartbeatDailyCapBlock).
+  it("JUDGE (c) daily run cap reached: notice and screen agree with dispatch", async () => {
+    const f = await judgeFixture({ heartbeat: { maxDailyRuns: 1 } });
+    await db.update(heartbeatRuns).set({ startedAt: new Date(), finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.run.id));
+    const row = await judge(f);
+    expect(row).toMatchObject({ status: 202, runStarted: false });
+    expect(row).toMatchObject({ admits: false, pressRetry: false, screenCanRetry: false });
   }, 60_000);
 
   it("quota-failure refresh creates no scheduled run, quota wake, comment, or hold mutation", async () => {

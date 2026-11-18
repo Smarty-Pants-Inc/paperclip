@@ -34,5 +34,9 @@ export function strandedRetryAdmissionFromPresentation(presentation: Presentatio
   if (presentation?.userAction === "confirm_run_stopped" || presentation?.retryWait?.reason === "previous_execution_unverified")
     return { admits: false, refusal: "previous_execution_unverified" };
   if (presentation?.retryWait?.reason === "workspace_repair_required") return { admits: false, refusal: "workspace_repair_required" };
+  if (presentation?.userAction === "budget" || presentation?.retryWait?.reason === "budget.blocked")
+    return { admits: false, refusal: "budget_blocked" };
+  if (presentation?.retryWait?.reason === "heartbeat.daily_run_limit" || presentation?.retryWait?.reason === "heartbeat.daily_cost_limit")
+    return { admits: false, refusal: "daily_limit", agentName };
   return { admits: false, refusal: "none" };
 }

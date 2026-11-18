@@ -180,6 +180,9 @@ const retryWaitMessages: Record<string, string> = {
   // fresh attempt under the clicker's access, so Retry stays available.
   retry_authority_denied: "Retry could not start with the requesting user's access. Press Retry to start it with yours.",
   previous_execution_unverified: "Retry can't continue because Paperclip can't confirm that the previous attempt stopped before it started work. Your message is saved.",
+  // The agent's per-day limits (heartbeat/timer-policy.ts getHeartbeatDailyCapBlock).
+  "heartbeat.daily_run_limit": "Retry can't start because the agent reached its daily run limit. Raise the limit in the agent's settings; it resets at 00:00 UTC. Your message is saved.",
+  "heartbeat.daily_cost_limit": "Retry can't start because the agent reached its daily cost limit. Raise the limit in the agent's settings; it resets at 00:00 UTC. Your message is saved.",
   // An edited saved message can never be replayed; only new input continues.
   retry_source_changed: "Retry cannot continue because its saved message changed. Send a new message to continue from saved work.",
 };
@@ -869,6 +872,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         presentation.retryWait = { reason: "workspace_repair_required", message: retryWaitMessages.workspace_repair_required! };
     }
   }
+  await withholdRetryDispatchRefuses(db, companyId, selected, result);
   // Redact each explanation with the registry of the run that recorded it: the
   // workspace failure is the observed run's, while a scheduled retry's provider
   // failure may be its predecessor's.
@@ -926,6 +930,68 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     }
   }
   return result;
+}
+
+// Not a real person: a Retry is authorized by whoever presses it. The dispatch
+// gate below is asked in preview only, and no gate it reaches depends on who.
+const RETRY_PREVIEW_ACTOR = "task-interruption-presentation";
+
+/**
+ * POST /issues/:id/retry accepts (202) and then dispatch
+ * (resumeTaskRetry -> enqueueWakeup, heartbeat/queue.ts) applies its gates.
+ * Where one of those gates would refuse the Retry right now, the screen (and
+ * the stranded notice, which reads this projection) must not offer it, and
+ * names the action that works instead. Each check calls the SAME reader the
+ * dispatch gate calls; no condition is repeated here:
+ * - budget: budgets.getInvocationBlock + isBoardOwnedBudgetBlock (queue.ts budget gate)
+ * - execution blocker: admitExplicitNativeContinuation({ dryRun: true }) (queue.ts continuation gate)
+ * - daily cap: getHeartbeatDailyCapBlock (queue.ts daily-cap gate)
+ */
+async function withholdRetryDispatchRefuses(db: Db, companyId: string, selected: ProjectionIssue[],
+  result: Map<string, TaskInterruptionPresentation | null>) {
+  const offered = selected.filter(issue => result.get(issue.id)?.canRetry && issue.assigneeAgentId);
+  if (!offered.length) return;
+  const [{ budgetService }, { isBoardOwnedBudgetBlock }, { createHeartbeatTimerPolicy, parseHeartbeatPolicy },
+    { admitExplicitNativeContinuation }, { getExecutionBlocker }, { randomUUID }] = await Promise.all([
+    import("./budgets.js"), import("./budget-block-ownership.js"), import("./heartbeat/timer-policy.js"),
+    import("./explicit-native-continuation.js"), import("./execution-blocker.js"), import("node:crypto")]);
+  const agentRows = await db.select().from(agents).where(and(eq(agents.companyId, companyId),
+    inArray(agents.id, [...new Set(offered.map(issue => issue.assigneeAgentId!))])));
+  const agentById = new Map(agentRows.map(agent => [agent.id, agent]));
+  for (const issue of offered) {
+    const presentation = result.get(issue.id)!;
+    const agent = agentById.get(issue.assigneeAgentId!);
+    if (!agent) continue;
+    const withhold = (change: Partial<TaskInterruptionPresentation>) => {
+      Object.assign(presentation, { canRetry: false, ...change });
+      delete presentation.retryAction;
+    };
+    const budget = await budgetService(db).getInvocationBlock(companyId, agent.id, { issueId: issue.id, projectId: issue.projectId });
+    if (budget) {
+      // A reached hard stop is the board's to raise; any other budget hold settles by itself.
+      if (await isBoardOwnedBudgetBlock(db, companyId, budget)) withhold({ responsibility: "user", state: "waiting_for_user", userAction: "budget" });
+      else withhold({ retryWait: { reason: "budget.blocked", message: retryWaitMessages["budget.blocked"]! } });
+      continue;
+    }
+    const blocker = await getExecutionBlocker(db, companyId, issue.id);
+    if (blocker?.runId) {
+      let refusal: { reason: string; message: string } | null = null;
+      await admitExplicitNativeContinuation({ db, companyId, issueId: issue.id, agentId: agent.id,
+        actorType: "user", actorId: RETRY_PREVIEW_ACTOR, reason: "retry_failed_run", failedRunId: blocker.runId,
+        commentId: null, successorRunId: randomUUID(), dryRun: true,
+        onBlocked: (reason, message) => { refusal = { reason, message }; } });
+      // Only a refusal no later state change can lift is shown before the
+      // press. Settling and stop-proof refusals (process_identity_missing,
+      // execution_settling, ...) keep Retry: the press itself saves that wait
+      // and the projection above shows it (retryWait.executionWaitReason).
+      if ((refusal as { reason: string } | null)?.reason === "previous_execution_unverified") {
+        withhold({ retryWait: { reason: "previous_execution_unverified", message: retryWaitMessages.previous_execution_unverified! } });
+        continue;
+      }
+    }
+    const cap = await createHeartbeatTimerPolicy(db).getHeartbeatDailyCapBlock(agent, parseHeartbeatPolicy(agent));
+    if (cap) withhold({ retryWait: { reason: cap.reason, message: retryWaitMessages[cap.reason]! } });
+  }
 }
 
 export async function taskInterruptionPresentation(db: Db, issue: ProjectionIssue) {
