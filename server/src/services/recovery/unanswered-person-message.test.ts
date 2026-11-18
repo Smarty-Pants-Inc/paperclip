@@ -25,6 +25,9 @@ import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
+import { createHeartbeatQueue } from "../heartbeat/queue.js";
+import { createHeartbeatQueueTestDependencies } from "../../__tests__/helpers/heartbeat-queue.js";
+import { armCrashPointForTest } from "@paperclipai/shared/crash-points";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
@@ -547,6 +550,63 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       payload: { issueId: f.issueId, commentId: messageId, _paperclipWakeContext: { issueId: f.issueId, wakeCommentId: messageId } } });
     expect((await settleUnansweredPersonMessage(db, f)).kind).toBe("pending");
     expect(await f.visible()).toHaveLength(0);
+  });
+
+  // rf5 A7-running (03:20Z): the REAL claim crash point leaves a RUNNING run + a QUEUED wake. The sweep keeps a
+  // RUNNING run pending (unanswered-person-message.ts 'liveRuns ... running'); the existing lost-process reaper
+  // (heartbeat/recovery.ts recoverActiveExecutions: running, not locally tracked, no live process, past the 5-minute
+  // stale threshold; the residual 'active' recovery work, 30s reconstruction) ends it process_lost, and the sweep then
+  // posts ONE true notice. Crash state -> the reaper's real function -> the sweep -> ONE notice.
+  it("A7-running: the real claim crash leaves RUNNING + QUEUED; the existing lost-process reaper ends it; the sweep posts ONE notice", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = `user-${randomUUID()}`;
+    const old = new Date(Date.now() - 900_000);
+    await db.insert(companies).values({ id: companyId, name: "A7 claim crash", issuePrefix: companyId.slice(0, 8) });
+    const [agent] = await db.insert(agents).values({ id: agentId, companyId, name: "Managed Pi", status: "idle", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "pi_rpc", lifecycleMode: "warm", instructionsBundleMode: "managed", instructionsEntryFile: "AGENTS.md" } }).returning();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Finish the saved report", status: "in_progress", assigneeAgentId: agentId, responsibleUserId: userId });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId, body: "Finish the report after the cut.", authorType: "user",
+      authorUserId: userId, createdAt: old }).returning();
+    const [origin] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "failed", runtimeMode: "native", nativeIssueId: issueId,
+      errorCode: "native_run_failed", createdAt: new Date(old.getTime() + 1000), finishedAt: new Date(old.getTime() + 2000),
+      contextSnapshot: { issueId, wakeCommentId: message!.id } }).returning();
+    const context = { issueId, taskId: issueId, wakeReason: "issue_status_changed", source: "native_status_decision",
+      conversationReplyBoundaryCommentId: message!.id };
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", reason: "issue_status_changed",
+      status: "queued", requestedByActorType: "system", payload: { issueId, _paperclipWakeContext: context } }).returning();
+    const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", runtimeMode: "native", nativeIssueId: issueId,
+      invocationSource: "automation", responsibleUserId: userId, wakeupRequestId: wake!.id, retryOfRunId: origin!.id, contextSnapshot: context }).returning();
+    await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id));
+    const deps = createHeartbeatQueueTestDependencies(db); deps.getAgent.mockResolvedValue(agent!);
+    deps.setWakeupStatus.mockImplementation(async (id, status, patch) => {
+      if (id) await db.update(agentWakeupRequests).set({ status, ...patch }).where(eq(agentWakeupRequests.id, id)); });
+    const disarm = armCrashPointForTest("wake.claim.after_run_running_before_wakeup_claimed");
+    await expect(createHeartbeatQueue(db, deps).claimQueuedRun(queued!)).rejects.toThrow("wake.claim.after_run_running_before_wakeup_claimed");
+    disarm();
+    const read = async () => ({
+      run: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id)))[0]!,
+      wake: (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id)))[0]! });
+    const crashed = await read();
+    expect([crashed.run.status, crashed.wake.status, crashed.run.finishedAt], "the crash state").toEqual(["running", "queued", null]);
+    const startedAt = crashed.run.startedAt!;
+    const notes = async () => (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+      .filter(n => n.authorType === "system" && !n.deletedAt);
+    expect((await settleUnansweredPersonMessage(db, { companyId, issueId, now: startedAt })).kind, "a RUNNING run is in progress").toBe("pending");
+    // The reaper's 5-minute stale threshold has passed since the claim's last write (it reads updated_at).
+    await db.update(heartbeatRuns).set({ updatedAt: new Date(Date.now() - 5 * 60_000 - 1000) }).where(eq(heartbeatRuns.id, queued!.id));
+    const reap = await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 5 * 60_000 });
+    const reaped = await read();
+    console.log("A7_RUNNING_REAPER", JSON.stringify({ run: queued!.id, wake: wake!.id, message: message!.id, reap,
+      after: { run: reaped.run.status, errorCode: reaped.run.errorCode, finishedAt: reaped.run.finishedAt, wake: reaped.wake.status } }));
+    expect(reap.runIds).toContain(queued!.id);
+    expect([reaped.run.status, reaped.run.errorCode, reaped.wake.status]).toEqual(["failed", "process_lost", "failed"]);
+    const decisions: string[] = [];
+    for (const elapsed of [PENDING_WAIT_START_BOUND_MS, PENDING_WAIT_START_BOUND_MS + 1000, 60 * 60_000]) {
+      decisions.push((await settleUnansweredPersonMessage(db, { companyId, issueId, now: new Date(startedAt.getTime() + elapsed) })).kind);
+      expect(await notes(), `ONE true notice at +${elapsed}ms`).toHaveLength(1);
+    }
+    const [note] = await notes();
+    console.log("A7_RUNNING_SWEEP", JSON.stringify({ decisions, note: { id: note!.id, reason: note!.metadata?.authorizationReason, body: note!.body } }));
+    expect(note!.metadata?.authorizationReason).toBe(`unanswered_message:${message!.id}`);
   });
 
   it("REG-21: after a gateway key rotation the person's wake FAILED 'provider or completion contract changed', no run, blocked -> exactly one notice", async () => {
