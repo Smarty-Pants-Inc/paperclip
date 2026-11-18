@@ -4,7 +4,7 @@ import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteraction
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
 import { notifyDeferredExecutionWork } from "../services/deferred-execution-notifications.js";
-import { UNNAMED_EXECUTION_WAIT } from "../services/deferred-execution-wait.js";
+import { STOPPED_EXECUTION_WAIT, UNNAMED_EXECUTION_WAIT } from "../services/deferred-execution-wait.js";
 import { notifyNativeRecoveryNotices } from "../services/native-recovery-notice-notifications.js";
 import { notifyNativeStatusReassessment } from "../services/native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../services/unsafe-workspace-export-notifications.js";
@@ -7868,7 +7868,8 @@ export function issueRoutes(
     const savedWait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
     // Behind a running turn, a wait no gate named is the ordinary busy turn:
     // the queue shows its normal queued state. Every named wait still shows.
-    const wait = savedWait.reason === UNNAMED_EXECUTION_WAIT.reason && input.activeRun?.status === "running"
+    const unnamed = savedWait.reason === UNNAMED_EXECUTION_WAIT.reason || savedWait.reason === STOPPED_EXECUTION_WAIT.reason;
+    const wait = unnamed && input.activeRun?.status === "running"
       ? {} : savedWait;
     // The user's Interrupt click is delivering these messages. Its stopped run
     // settling is not something to read about under the composer; the task

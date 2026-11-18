@@ -1424,7 +1424,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     if (keepResolvedHold) {
       expect(result).toMatchObject({ outcome: "cancelled", errorCode: "execution_reconciliation_required" });
       expect(saved.status).toBe("deferred_issue_execution");
-      expect(saved.payload?.executionWait?.message).not.toBe("Waiting for execution recovery. Your message is saved.");
+      expect((saved.payload?.executionWait as { message?: unknown } | undefined)?.message).not.toBe("Waiting for execution recovery. Your message is saved.");
     } else {
       expect(result).toMatchObject({ outcome: "not_stale" });
       expect(saved.payload?.executionWait).toBeUndefined();

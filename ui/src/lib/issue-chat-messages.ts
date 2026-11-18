@@ -535,6 +535,14 @@ function effectiveCommentAuthorType(comment: IssueChatComment) {
   return effectiveCommentAuthorAgentId(comment) ? "agent" : comment.authorType;
 }
 
+/** The server's unanswered-message notice (recovery/unanswered-person-message.ts
+ * UNANSWERED_MESSAGE_REASON_PREFIX): the only system comment that is withdrawn
+ * by supersession rather than deleted by someone. */
+function isSupersededUnansweredNotice(comment: IssueChatComment) {
+  const reason = (comment.metadata as { authorizationReason?: unknown } | null | undefined)?.authorizationReason;
+  return typeof reason === "string" && reason.startsWith("unanswered_message:");
+}
+
 function authorNameForComment(
   comment: IssueChatComment,
   agentMap?: Map<string, Agent>,
@@ -1216,9 +1224,11 @@ export function buildIssueChatMessages(args: {
   for (const comment of sortByCreated(comments)) {
     if (isRedundantAiRecoveryNotice(comment, interactions)) continue;
     if (hiddenIds.has(comment.id)) continue;
-    // A superseded system notice is withdrawn, not something a person deleted:
-    // it leaves no placeholder. Deleted person and agent comments keep theirs.
-    if (comment.deletedAt && effectiveCommentAuthorType(comment) === "system") continue;
+    // A superseded unanswered-message notice is withdrawn, not something a
+    // person deleted: it leaves no placeholder. Every other deleted comment
+    // (person, agent, or an unrelated system one) keeps its placeholder.
+    if (comment.deletedAt && effectiveCommentAuthorType(comment) === "system" &&
+        isSupersededUnansweredNotice(comment)) continue;
     orderedMessages.push({
       createdAtMs: toTimestamp(comment.createdAt),
       order: 1,

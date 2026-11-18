@@ -54,8 +54,9 @@ export function reorderQueuedMessageEntries(
   activeId: string,
   overId: string,
 ) {
-  if (entries.some((entry) => entry.source?.kind === "interaction") ||
-      new Set(entries.map((entry) => entry.queueId)).size > 1) return null;
+  // Agent Chat keeps one wake per waiting message; the server reorders those
+  // wakes (PUT queued-comments/order), so entries may span several queueIds.
+  if (entries.some((entry) => entry.source?.kind === "interaction")) return null;
   const from = entries.findIndex((entry) => entry.comment.id === activeId);
   const to = entries.findIndex((entry) => entry.comment.id === overId);
   if (from < 0 || to < 0 || from === to) return null;
@@ -148,7 +149,7 @@ function SortableQueuedMessage({
   const label = stripStandaloneImageEmbeds(body);
   const sortable = useSortable({
     id: entry.comment.id,
-    disabled: queueMutationDisabled || reorderDisabled || immutableResponse,
+    disabled: reorderDisabled || immutableResponse,
   });
   const style = {
     transform: CSS.Transform.toString(sortable.transform),
@@ -179,8 +180,7 @@ function SortableQueuedMessage({
         ref={sortable.setActivatorNodeRef}
         {...sortable.attributes}
         {...sortable.listeners}
-        disabled={queueMutationDisabled || reorderDisabled || immutableResponse}
-        title={reorderDisabled ? "Messages in separate turns cannot be reordered together" : undefined}
+        disabled={reorderDisabled || immutableResponse}
         aria-label={`Reorder queued message: ${label || "Images"}`}
         className="flex h-7 w-7 shrink-0 cursor-grab items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:bg-accent hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40"
       >
@@ -370,7 +370,6 @@ export function TaskChatQueuedMessages({
     () => entries.map((entry) => entry.comment.id),
     [entries],
   );
-  const hasLaterWakes = entries.some((entry) => entry.queueId && entry.queueId !== queue.queueId);
 
   // Send decisions read the current queue snapshot, not the local copy that a
   // sync effect updates one render later: a saved edit must get its new
@@ -432,8 +431,7 @@ export function TaskChatQueuedMessages({
       !over ||
       active.id === over.id ||
       reordering ||
-      pending ||
-      hasLaterWakes
+      pending
     )
       return;
     const previous = entries;
@@ -595,7 +593,7 @@ export function TaskChatQueuedMessages({
                 queue={queue}
                 busy={busy}
                 queueMutationDisabled={queueMutationDisabled}
-                reorderDisabled={hasLaterWakes}
+                reorderDisabled={Boolean(!queue.queueId || pending || reordering)}
                 action={action}
                 autoSteerSecondsLeft={(() => {
                   const deadline = autoSteerDeadlines.get(entry.comment.id);

@@ -19,6 +19,14 @@ export const UNNAMED_EXECUTION_WAIT = {
   reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved.",
 } as const;
 
+/** The wait saved for a message sent after a Stop when the stopped run's hold
+ * is no longer a pending recovery (only its resolved no-replay record is
+ * left). It names no recovery, and like the unnamed wait it is not shown
+ * behind a running turn. */
+export const STOPPED_EXECUTION_WAIT = {
+  reason: "stopped_execution", message: "Waiting behind the stopped run. Your message is saved.",
+} as const;
+
 /** A saved wait is well formed when it has the shape every writer below
  * stores: a JSON object with a non-empty string `reason` and a string
  * `message` (writeDeferredExecutionWait's callers in heartbeat/queue.ts and

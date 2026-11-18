@@ -831,7 +831,15 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const source = latest ? await getRunExecutionWait(companyId, latest.id) : null;
     if (!source || source.runtimeMode !== "native" || source.status !== "cancelled" || !source.finishedAt) return null;
     const stoppedAt = userStopBoundaryAt(source);
-    if (!stoppedAt || wake.requestedAt.getTime() <= stoppedAt.getTime()) return null;
+    // A chat-queue reorder permutes requestedAt (routes/issues.ts
+    // reorderChatQueue), so it cannot tell old input from new. The message's
+    // own createdAt, which no reorder moves, decides the side of the Stop.
+    const commentIds = queuedCommentIdsFromWakePayload(wake.payload).filter(isUuidLike);
+    const [message] = commentIds.length ? await db.select({ createdAt: sql<Date>`max(${issueComments.createdAt})`.mapWith(issueComments.createdAt) })
+      .from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+        inArray(issueComments.id, commentIds))) : [];
+    const sentAt = message?.createdAt ?? wake.requestedAt;
+    if (!stoppedAt || sentAt.getTime() <= stoppedAt.getTime()) return null;
     return await nativeStopExecutionProven(companyId, source.id) ? source : null;
   }
 
