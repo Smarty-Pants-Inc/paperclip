@@ -11,7 +11,7 @@ vi.mock("@/lib/router", () => ({
 }));
 
 // The held notice's one wording (server native-runtime/held-predecessor-notice-text.ts).
-const HELD = "Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.";
+const HELD = "Your message and saved work are kept, but the previous run of this conversation did not finish. Assign this agent a new task to continue.";
 const failed: TaskInterruptionPresentation = {
   intentId: "intent", responsibility: "system", state: "failed", nextRetryAt: null,
   canRetry: true, userAction: null, sourceRunIds: ["source"], observedRunId: "source",

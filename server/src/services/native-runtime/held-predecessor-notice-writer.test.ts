@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { agents, companies, completionContracts, createDb, heartbeatRuns, issueComments, issues, nativeRunFinalizations,
-  nativeRunResults } from "@paperclipai/db";
+import { agents, authUsers, companies, completionContracts, createDb, environmentLeases, heartbeatRuns, issueComments,
+  issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { HELD_PREDECESSOR_NOTICE, noticeHeldUnfinishedPredecessor } from "./native-session-executor.js";
 import { readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
+import { HELD_PREDECESSOR_NEW_TASK_ACTION, HELD_PREDECESSOR_SEND_NOTICE } from "./held-predecessor-notice-text.js";
+import { settleUnansweredPersonMessagesForTask } from "../recovery/unanswered-person-message.js";
 
 it.each([
   "runner_harness_state_mismatch: backup_without_reusable_lease",
@@ -46,6 +48,124 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
     expect(notices).toHaveLength(1);
     // RFL 20:36Z: a note the person must read is written open, not folded behind a chevron.
     expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice", detailsDefaultOpen: true });
+  });
+
+
+  // RF5 held-note truth (rf-5 RF5-HELDNOTE-RESULT §2): BOTH held writers name the remedy by ONE rule. The default
+  // is the new task (true in all 24 states); "Send a new message" only where the comment route's own explicit
+  // continuation admission admits a new message (V02/V13: recorded local PID absent, no other hold).
+  const HELD_STATES = ["missing_identity", "dead_pid", "controller", "live_pid", "legacy_unknown", "remote_unconfirmed",
+    "restore_unsafe", "retained_result", "prior_cancelled", "prior_interrupted", "prior_timed_out", "quarantined"] as const;
+  type HeldState = typeof HELD_STATES[number];
+  const vRow = (kind: "chat" | "task", state: HeldState) => {
+    const i = HELD_STATES.indexOf(state);
+    return `V${String(state === "quarantined" ? (kind === "chat" ? 23 : 24) : (kind === "chat" ? 1 : 12) + i).padStart(2, "0")}`;
+  };
+  const QUARANTINE = "native_session_cleanup_quarantined:provider_close_unconfirmed";
+  const PRIOR_OWNER = "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate";
+  async function seedHeld(kind: "chat" | "task", state: HeldState) {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID(), userId = `held-${randomUUID()}`;
+    const error = state === "quarantined" ? QUARANTINE : PRIOR_OWNER;
+    await db.insert(authUsers).values({ id: userId, name: "Held person", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companies).values({ id: companyId, name: "Held truth", issuePrefix: `T${companyId.slice(0, 7)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Held agent", role: "engineer", status: "idle", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "pi_rpc", model: "paperclip/faux", lifecycleMode: "cold" } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Held truth", status: "in_progress", assigneeAgentId: agentId,
+      ...(kind === "chat" ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" as const } : {}) });
+    const t = Date.now() - 3_600_000;
+    const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "Earlier request that received no answer", createdAt: new Date(t) }).returning();
+    const [source] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, nativeIssueId: issueId, nativeSessionId: sessionId,
+      runtimeMode: state === "legacy_unknown" ? "legacy" : "native",
+      status: state.startsWith("prior_") ? state.slice(6) as "cancelled" : "failed",
+      startedAt: new Date(t + 1000), finishedAt: new Date(t + 2000), createdAt: new Date(t + 500), errorCode: error.split(":")[0], error,
+      contextSnapshot: { issueId, wakeCommentId: message!.id },
+      processPid: ["dead_pid", "quarantined", "legacy_unknown"].includes(state) ? 999_999_999 : state === "live_pid" ? process.pid : null,
+      ...(state === "restore_unsafe" ? { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } } : {}) }).returning();
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: source!.id, phase: "terminal_failure", failureCode: error,
+      ...(state === "controller" ? { leaseOwner: "unverified-prior-controller" } : {}) });
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "resolved",
+      outcome: "blocked", ownerType: "board", cause: "native_continuation_requires_reconciliation", fingerprint: `held-truth:${source!.id}`,
+      nextAction: "Inspect the previous execution.", evidence: { runId: source!.id,
+        ...(state === "restore_unsafe" ? { workspaceRestoreFailure: "restore_unsafe_archive" } : {}),
+        automaticRecovery: { policy: "preserve_without_replay_v1", runId: source!.id, replay: "blocked", actionOutcome: "unknown",
+          recordedAt: new Date().toISOString() } } });
+    if (state === "remote_unconfirmed") await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: source!.id,
+      provider: "daytona", providerLeaseId: "held-truth-retained-box", status: "active", leasePolicy: "ephemeral" });
+    if (state === "retained_result") {
+      const contractId = randomUUID();
+      await db.insert(completionContracts).values({ id: contractId, companyId, issueId, revision: 1, schemaVersion: "v1", policyVersion: "v1",
+        risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block", contractJson: {}, canonicalSha256: "45".repeat(32),
+        createdByActorType: "system", createdByActorId: "held-truth" });
+      await db.update(heartbeatRuns).set({ completionContractId: contractId }).where(eq(heartbeatRuns.id, source!.id));
+      const [result] = await db.insert(nativeRunResults).values({ companyId, issueId, runId: source!.id, completionContractId: contractId,
+        serverFingerprint: "held-truth", schemaStatus: "accepted", resultJson: { terminal: { runTerminalState: "succeeded" } },
+        canonicalSha256: "held-truth" }).returning();
+      await db.update(nativeRunFinalizations).set({ phase: "result_accepted", resultId: result!.id }).where(eq(nativeRunFinalizations.runId, source!.id));
+    }
+    return { companyId, agentId, issueId, sessionId, userId, error, sourceId: source!.id };
+  }
+  // The executor writes from the refused run's failure boundary. currentStatus "failed" is that refused run once it
+  // has settled; "running" is the moment the executor calls the writer, where the admission says execution_active.
+  async function writeHeld(f: Awaited<ReturnType<typeof seedHeld>>, writer: "executor" | "sweep",
+    currentStatus: "failed" | "running" = "failed") {
+    if (writer === "sweep") await settleUnansweredPersonMessagesForTask(db, { companyId: f.companyId, issueId: f.issueId, now: new Date() });
+    else {
+      const [current] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+        nativeIssueId: f.issueId, nativeSessionId: f.sessionId, runtimeMode: "native", status: currentStatus, contextSnapshot: { issueId: f.issueId },
+        ...(currentStatus === "failed" ? { startedAt: new Date(), finishedAt: new Date() } : {}) }).returning();
+      await noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" }, binding: { companyId: f.companyId,
+        agentId: f.agentId, issueId: f.issueId, runId: current!.id }, session: { normalizedSessionId: f.sessionId } } as never }, new Error(f.error));
+    }
+    return (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+      .filter(c => c.authorType === "system" && /^(native_prior_owner_held|unanswered_message):/.test(
+        String((c.metadata as Record<string, unknown> | null)?.authorizationReason ?? "")));
+  }
+  const nextActionOf = (note: { metadata: unknown }) => JSON.stringify(note.metadata ?? {});
+  for (const writer of ["executor", "sweep"] as const) for (const kind of ["chat", "task"] as const) for (const state of HELD_STATES) {
+    const admits = state === "dead_pid";
+    it(`${vRow(kind, state)} ${writer} ${kind} ${state}: ${admits ? "admission admits, so 'Send a new message'"
+      : "'Assign this agent a new task to continue.', never 'Send a new message'"}`, async () => {
+      const notes = await writeHeld(await seedHeld(kind, state), writer);
+      // The executor writes nothing behind a predecessor that kept a result (its existing early return).
+      if (writer === "executor" && state === "retained_result") { expect(notes).toEqual([]); return; }
+      expect(notes, `${writer} wrote the held notice`).toHaveLength(1);
+      if (admits) {
+        expect(notes[0]!.body).toBe(HELD_PREDECESSOR_SEND_NOTICE);
+        if (writer === "sweep") expect(nextActionOf(notes[0]!)).toContain("Send a new message to try again.");
+      } else {
+        expect(notes[0]!.body).toBe(HELD_PREDECESSOR_NOTICE);
+        expect(notes[0]!.body).toContain(HELD_PREDECESSOR_NEW_TASK_ACTION);
+        expect(`${notes[0]!.body}\n${nextActionOf(notes[0]!)}`).not.toMatch(/send a new message/i);
+        if (writer === "sweep") expect(nextActionOf(notes[0]!)).toContain(HELD_PREDECESSOR_NEW_TASK_ACTION);
+      }
+    });
+  }
+
+  it("V02/V13 executor while the refused run is still active: admission does not admit (execution_active) -> the new task", async () => {
+    for (const kind of ["chat", "task"] as const) {
+      const notes = await writeHeld(await seedHeld(kind, "dead_pid"), "executor", "running");
+      expect(notes.map(note => note.body)).toEqual([HELD_PREDECESSOR_NOTICE]);
+    }
+  });
+
+  it("V02/V13 retire: the held banner stands until a later person message is REALLY answered (answeredPersonMessageSql)", async () => {
+    for (const kind of ["chat", "task"] as const) {
+      const f = await seedHeld(kind, "dead_pid");
+      expect((await writeHeld(f, "executor"))[0]!.body).toBe(HELD_PREDECESSOR_SEND_NOTICE);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      const [sent] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "user",
+        authorUserId: f.userId, body: "This is a NEW person message." }).returning();
+      const [answering] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+        nativeIssueId: f.issueId, nativeSessionId: randomUUID(), runtimeMode: "native", status: "succeeded",
+        contextSnapshot: { issueId: f.issueId, wakeCommentId: sent!.id } }).returning();
+      // Sent but not yet answered (a run alone is no answer): the banner still stands.
+      expect(await readUnsupersededHeldConversationNotice(db, f)).not.toBeNull();
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+        createdByRunId: answering!.id, body: "The answer." });
+      expect(await readUnsupersededHeldConversationNotice(db, f), `${kind}: retired after a real answer`).toBeNull();
+    }
   });
 
   it("writes one notice per hold: none while it stands, one new notice after the same session continued", async () => {
