@@ -7564,6 +7564,7 @@ export function agentRoutes(
       ? "Cancelled by a managing agent" : "Cancelled by a board operator", {
       ...(requestId ? { cancellationRequestId: requestId, cancellationRequestedByUserId: req.actor.userId ?? null } : {}),
       ...(req.actor.type === "agent" ? { errorCode: "operator_interrupted", managementActor: req.actor } : {}),
+      ...(req.actor.type === "board" && req.actor.userId ? { stopAcceptance: "person_stop" as const } : {}),
       resultJson: req.actor.type === "agent" ? {
         cancelledByActorType: "agent",
         cancelledByAgentId: actor.agentId,
