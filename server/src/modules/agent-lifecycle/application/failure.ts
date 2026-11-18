@@ -2,6 +2,7 @@ import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { readHttpErrorCode } from "../../../lib/http-error-code.js";
 import { readAiConnectionConfigurationFailure } from "../../../lib/ai-connection-configuration-failure.js";
 import type { LifecycleFailure } from "./ports.js";
+import { LIFECYCLE_PROBE_CLEANUP_BOUND_MS, LIFECYCLE_PROBE_CLEANUP_PARKED_MESSAGE, LIFECYCLE_PROBE_CLEANUP_PENDING_MESSAGE } from "./retry.js";
 
 // Only fixed text may leave this boundary. Provider errors can contain secrets.
 const connectionReasons = {
@@ -34,10 +35,19 @@ const configurationFailures = new Set([
   "harness_command_unavailable", "harness_cwd_invalid", "harness_probe_unexpected_output",
 ]);
 
+/** An unproven probe retirement past its bound: measured from the durable
+ * transientFailureSince, or already expired on its retained entry (a Retry). */
+function probeCleanupExpired(context: LifecycleFailure, error: unknown): boolean {
+  if (lifecycleFailureCode(error) !== "native_probe_cleanup_pending") return false;
+  if ((error as { details?: { expired?: unknown } } | null)?.details?.expired === true) return true;
+  const since = context.transientFailureSince ? Date.parse(context.transientFailureSince) : NaN;
+  return Number.isFinite(since) && Date.now() - since >= LIFECYCLE_PROBE_CLEANUP_BOUND_MS;
+}
+
 export function lifecycleVerificationNeedsRetry(context: LifecycleFailure, error: unknown): boolean {
   const code = lifecycleFailureCode(error) ?? "";
   return ["verifying", "resuming"].includes(context.phase ?? "") && context.stage === "host"
-    && (readAiConnectionConfigurationFailure(error) !== null || configurationFailures.has(code)
+    && (readAiConnectionConfigurationFailure(error) !== null || configurationFailures.has(code) || probeCleanupExpired(context, error)
       || (context.phase === "verifying" && code === "harness_test_failed" && (context.verificationFailures ?? 0) >= 3));
 }
 
@@ -66,6 +76,7 @@ export function lifecycleFailureMessage(context: LifecycleFailure, error: unknow
       ? `${phase}: saving progress` : phase;
   const code = lifecycleFailureCode(error);
   const retryRequired = lifecycleVerificationNeedsRetry(context, error);
+  if (code === "native_probe_cleanup_pending") return retryRequired ? LIFECYCLE_PROBE_CLEANUP_PARKED_MESSAGE : LIFECYCLE_PROBE_CLEANUP_PENDING_MESSAGE;
   const reason = code && Object.hasOwn(connectionReasons, code) ? connectionReasons[code as keyof typeof connectionReasons]
     : code && Object.hasOwn(reasons, code) ? reasons[code as keyof typeof reasons]
     : retryRequired ? `The host step failed (${code ?? "unclassified"}). Contact your instance administrator.`
