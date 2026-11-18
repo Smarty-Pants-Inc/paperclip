@@ -304,7 +304,7 @@ describe.skipIf(!support.supported)("adopt-stopu-compose6 (c): a late export of 
       return originalRename(from, to);
     });
     const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
-      nativeWorkspaceSync: f.prepared, timeoutMs: 1000, ...({ stoppedTurnBox: async () => ({ runner: f.target.runner, remoteCwd: f.remoteCwd }) } as {}) });
+      nativeWorkspaceSync: f.prepared, timeoutMs: 1000, ...({ stoppedTurnBox: async () => ({ remoteCwd: f.remoteCwd, runner: { execute: async () => ({ exitCode: 0, signal: null, timedOut: false, stdout: "NONE scoped=1 killed=", stderr: "", pid: null, startedAt: null }) } }) } as {}) });
     try {
       await entered;
       expect(await work).toEqual({ outcome: "unproven", reason: "timed_out" });
