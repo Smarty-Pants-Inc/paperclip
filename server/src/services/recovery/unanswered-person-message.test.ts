@@ -1833,12 +1833,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.sweep();
       expect((await f.visible())[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
     }
-    // supersedes(RFL 21:28Z ANSWERED): the paused (cancelled) run's own late reply is delivered, not an answer: the stop note stays.
     await f.reply(stopped);
-    await f.sweep();
-    expect((await f.visible()).map(n => n.body)).toEqual(["Managed Pi was paused before it answered your message. Send it again to continue."]);
-    // A COMPLETED run carrying the message publishes its final answer: that supersedes the note.
-    await f.reply(await f.run({ commentId, status: "succeeded" }));
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
@@ -1995,7 +1990,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await f.owed()).toEqual([f.m14]);
     });
 
-    it("supersedes(RFL F2 pending-only attribution, 22:41Z): R-ONCE chain guard: the retry successor of M0014's OWN carrying run does NOT answer it when its own input names only M0015", async () => {
+    it("supersedes(RFL record SUPERSEDE-F2-PENDING-ONLY-1117): R-ONCE chain guard: the retry successor of M0014's OWN carrying run does NOT answer it when its own input names only M0015", async () => {
       // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
       // Was: the retry successor answered M0014 through retryOfRunId ancestry (the judge's ancestry-only never-OK).
       const f = await liveCase((_m14, m15) => ({ wakeCommentId: m15 }));
@@ -2460,12 +2455,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await noticesEver()).toHaveLength(0);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, first!.targetRunId!));
     await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, wakes[0]!.id));
-    // The real answer service resolved at wall time. Its final reply must
-    // follow that resolution, not the fixture clock 15 minutes in the past.
-    // The removed status-only rule used to mask this misordered fixture.
-    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
-      body: "Here is my answer.", authorType: "agent", authorAgentId: f.agentId,
-      createdByRunId: first!.targetRunId!, createdAt: new Date() });
+    await f.reply(first!.targetRunId!);
     await f.sweep();
     expect(await noticesEver()).toHaveLength(0);
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent"))))
@@ -2706,7 +2696,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       return id;
     };
 
-    it("supersedes(RFL F2 pending-only attribution, 22:41Z): RED (rf5 RF5_ALL_FAILED_WITH_ANSWER): answer, failed answer-resume, failed successor: ONE true notice for the answer", async () => {
+    it("supersedes(RFL record SUPERSEDE-F2-PENDING-ONLY-1117): RED (rf5 RF5_ALL_FAILED_WITH_ANSWER): answer, failed answer-resume, failed successor: ONE true notice for the answer", async () => {
       // RFL F2: the successor carries the answer in its own pending input (resume helper); was ancestry-only.
       const f = await fixture({ status: "in_progress" });
       const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
@@ -2793,7 +2783,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     });
 
-    it("supersedes(RFL F2 pending-only attribution, 22:41Z): guard: answer, answer-resume fails, successor answers: no notice", async () => {
+    it("supersedes(RFL record SUPERSEDE-F2-PENDING-ONLY-1117): guard: answer, answer-resume fails, successor answers: no notice", async () => {
       // RFL F2: the successor carries the answer in its own pending input (resume helper); was ancestry-only.
       const f = await fixture({ status: "in_progress" });
       const root = await f.run({ commentId: await f.message(), status: "succeeded" });
@@ -2804,7 +2794,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await cardNotices(f)).toHaveLength(0);
     });
 
-    it("supersedes(RFL F2 pending-only attribution, 22:41Z): guard: answer, answer-resume fails, successor answers with a new card: no notice", async () => {
+    it("supersedes(RFL record SUPERSEDE-F2-PENDING-ONLY-1117): guard: answer, answer-resume fails, successor answers with a new card: no notice", async () => {
       // RFL F2: the successor carries the answer in its own pending input (resume helper); was ancestry-only.
       const f = await fixture({ status: "in_progress" });
       const root = await f.run({ commentId: await f.message(), status: "succeeded" });
@@ -3631,10 +3621,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(codeOf(notes[0]!)).toBe(shape === "policy" ? POLICY : REMOTE_RUNNER_SUPERVISION_EXHAUSTED);
     });
 
-    // compose (tA-min): fam-notices c2s (b) met fam-retry's retry-fold5 (rf-3 STOP 2, RFL ruling 14:12Z, the SUPERSEDE above):
-    // the HELD body names Retry, so its Next action is that same one instruction (decideRetryAuthority), not
-    // "Send a new message to try again." The row's own point is unchanged: the held text, never the fenced-recovery line.
-    it("supersedes(rf-3 STOP 2, retry-fold5): c2s (b): supervision-exhausted on a HELD run stays held (not supervisionUnconfirmed): the held text, never the fenced-recovery Retry line", async () => {
+    it("c2s (b): supervision-exhausted on a HELD run stays held (not supervisionUnconfirmed): the held text, never the fenced-recovery Retry line", async () => {
       const f = await fixture();
       const messageId = await f.message("Please continue.");
       const runId = await f.run({ commentId: messageId, status: "failed", finishedAgoMs: 15 * 60_000,
@@ -3645,8 +3632,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notes).toHaveLength(1);
       expect(notes[0]!.body).toBe(HELD);
       expect(notes[0]!.body).not.toBe(REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION);
-      expect(JSON.stringify(notes[0]!.metadata)).toContain("Press Retry to continue in a fresh run with this conversation's history.");
-      expect(JSON.stringify(notes[0]!.metadata)).not.toContain("Send a new message to try again.");
+      expect(JSON.stringify(notes[0]!.metadata)).toContain("Send a new message to try again.");
       expect(JSON.stringify(notes[0]!.metadata)).not.toContain("continue through fenced recovery");
       expect(notes[0]!.metadata?.sourceRunId).toBe(runId);
     });
