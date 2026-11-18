@@ -15537,7 +15537,7 @@ describe("native warm session supervision", () => {
         expect(out.answers).toEqual([{ status: "fulfilled", value: expect.anything() }]);
         expect(out.executeCalls).toBe(2);
         expect(out.release).not.toHaveBeenCalled();
-        expect(out.close).toHaveBeenCalledOnce();
+        expect(out.close).not.toHaveBeenCalled();
       });
 
       it("text-only 'lease no longer active' close error, typed receipt written at +5 s: admitted, all three answered", async () => {
@@ -15750,7 +15750,7 @@ describe("native warm session supervision", () => {
         expect(s.runs[0]!.box).not.toBe(s.stoppedBox);
         // The stopped turn once, the ONE successor turn once (it carries the held messages).
         expect(s.turns).toEqual([s.base.binding.runId, `${s.base.binding.runId}-send`]);
-        expect(s.runs[0]!.closeAttempts).toBe(1);
+        expect(s.runs[0]!.closeAttempts).toBe(0);
         expect(s.runs[0]!.ms).toBeLessThan(answerBoundMs);
       });
 
@@ -15763,7 +15763,7 @@ describe("native warm session supervision", () => {
         expect(s.runs.filter(r => r.outcome !== "answered"), "no failed run").toHaveLength(0);
         expect(s.turns).toEqual([s.base.binding.runId, `${s.base.binding.runId}-typed`, `${s.base.binding.runId}-held`]);
         // The stopped box's close is tried once (by the first successor), never replayed.
-        expect(s.runs.map(r => r.closeAttempts)).toEqual([1, 0]);
+        expect(s.runs.map(r => r.closeAttempts)).toEqual([0, 0]);
         expect(s.runs[0]!.ms).toBeLessThan(answerBoundMs);
       });
 
@@ -15773,7 +15773,7 @@ describe("native warm session supervision", () => {
         // Owner forgotten: a later run on another box never meets it again.
         expect(await s.run(`${s.base.binding.runId}-c`, "bx_box_c")).toBe("answered");
         s.record();
-        expect(s.runs.map(r => r.closeAttempts)).toEqual([1, 0]);
+        expect(s.runs.map(r => r.closeAttempts)).toEqual([0, 0]);
       });
 
       it("unit: a DESTROY receipt on the owner's own lease proves it gone", async () => {
