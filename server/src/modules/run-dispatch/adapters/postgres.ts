@@ -13,7 +13,7 @@ import { notifyInstructionCollection } from "../../../services/instruction-colle
 import { notifyScheduledRetryCancellation } from "../../../services/scheduled-retry-cancellation-notifications.js";
 import { readClaimedNativeStopRecovery } from "../../../services/native-runtime/native-cancellation-request.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { recordedUserStop, userStopBoundaryAt } from "../../../services/run-cancellation.js";
+import { QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, recordedUserStop, userStopBoundaryAt } from "../../../services/run-cancellation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { continueFreshInTransaction, recordFreshContinuationCheck } from "../../../services/fresh-continuation-fallback.js";
 import { validateReconstructedWorkspaceDispatch } from "../../../services/native-runtime/native-workspace-reconstruction.js";
@@ -1158,7 +1158,6 @@ export function createPostgresRunDispatchAdapter(
       comments.find(comment => comment.id === originalCommentId)?.authorUserId !== wake.requestedByActorId) return null;
     const latest = comments.find(comment => comment.id === commentId);
     const stoppedAt = userStopBoundaryAt(source);
-    if (!copybackReplay && (!stoppedAt || !latest || latest.createdAt <= stoppedAt)) return null;
     const sourceIds = runContext.queuedCommentSourceWakeIds;
     if (sourceIds !== undefined && (!Array.isArray(sourceIds) || sourceIds.some(id => typeof id !== "string" || !isUuidLike(id)))) return null;
     const sourceWakeIds = Array.isArray(sourceIds) ? [...new Set(sourceIds as string[])] : [];
@@ -1169,6 +1168,12 @@ export function createPostgresRunDispatchAdapter(
       sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
     )).for("update") : [];
     if (adopted.length !== sourceWakeIds.length) return null;
+    // Input queued before the Stop is not a new direction on its own. The
+    // requesting user's Send of that queue after the Stop is: the board route
+    // records it on the queue receipt this run adopted, and it saves the input.
+    const sentAfterStop = stoppedAt ? adopted.map(receipt => queuedSendAfterStop(receipt.payload, {
+      stoppedAt, actorId: wake.requestedByActorId })).find(Boolean) ?? null : null;
+    if (!copybackReplay && !sentAfterStop && (!stoppedAt || !latest || latest.createdAt <= stoppedAt)) return null;
     const mergeTargets = [...new Set([wake.id, ownWake.id, ...(origin?.chainWakeIds ?? []), ...adopted.map(receipt => receipt.id)])];
     const coalesced = await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
@@ -1190,6 +1195,7 @@ export function createPostgresRunDispatchAdapter(
     const [deferred] = await tx.update(agentWakeupRequests).set({
       status: "deferred_issue_execution", runId: null, claimedAt: null, finishedAt: null, error: null,
       payload: withQueuedCommentIdsInWakePayload({ ...payload, _paperclipWakeContext: context,
+        ...(sentAfterStop ? { [QUEUED_SEND_AFTER_STOP_KEY]: sentAfterStop } : {}),
         executionWait: { ...parseObject(run.resultJson?.executionWait), reason: "execution_recovery",
           message: "Waiting for execution recovery. Your message is saved." } }, commentIds), updatedAt: now,
     }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, run.companyId),
