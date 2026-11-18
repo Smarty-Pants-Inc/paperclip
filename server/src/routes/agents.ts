@@ -57,6 +57,7 @@ import { isAiConnectionCompatible } from "@paperclipai/shared";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { canRetryStoppedRun } from "../services/cancelled-native-startup.js";
+import { readRetryAdmissionAuthority } from "../services/task-retry-eligibility.js";
 import { rejectedModelRetryRefusal } from "../services/native-runtime/model-rejected-retry.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "../services/native-runtime/native-review-participant.js";
 import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaperclipRunnerProvider, PAPERCLIP_RUNNER_ACPX_PROFILES } from "@paperclipai/adapter-utils";
@@ -6523,6 +6524,23 @@ export function agentRoutes(
         }
         const modelRefusal = await rejectedModelRetryRefusal(db, { failedRun, agent, issue });
         if (modelRefusal) throw conflict(modelRefusal.message, modelRefusal.details);
+        // rf-5 condition (2), ONE retry predicate: the run page's exact retry
+        // is admitted by the task's one Retry authority (decideRetryAuthority,
+        // read for THIS failed run), as the card's Retry and the chat Retry
+        // are. It refuses with the authority's typed reason (the run's own
+        // input is ANSWERED: "Already answered above."), and a Retry the
+        // authority only holds (a restore hold, a paused agent's preservation)
+        // is answered held: this route starts no run of its own beside it.
+        const authority = await readRetryAdmissionAuthority(db, {
+          companyId: agent.companyId, issueId: issue.id, sourceRunId: failedRun.id,
+        });
+        if (!authority.canRetry || authority.admission) {
+          throw conflict(authority.cardText ?? "This run can no longer be retried.", {
+            code: authority.canRetry && authority.admission === "held" ? "retry_held" : "retry_not_available",
+            reason: authority.reason, userAction: authority.userAction, nextAction: authority.nextAction,
+            ...(authority.admission ? { admission: authority.admission } : {}),
+          });
+        }
         if (issue.conversationAgentId) {
           // Agent Chat has no task description to replay. Recover the exact
           // request from the selected server-owned run, never caller markers.
