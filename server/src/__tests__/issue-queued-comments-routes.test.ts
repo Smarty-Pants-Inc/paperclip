@@ -1610,6 +1610,83 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       expect(refused.body.details?.code).toBe("queued_comment_stop_line_crossing");
       expect(await saved(f.companyId)).toEqual(stored);
     });
+    // catch: https://github.com/Smarty-Pants-Inc/paperclip/commit/c4417929ebb77b2611e3460a6df05a2f7ad4329d
+    // RFL rfl-qfix4d condition 1: run creation and person-Stop clocks can disagree.
+    it.each([false, true])("RFL latest Stop TIME binds two person Stops (inverted creation=%s)", async inverted => {
+      const f = await fixture(true), [a, b, c] = f.commentIds;
+      const [old] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const t1 = new Date(String((old.resultJson?.cancellation as any).recordedAt));
+      const t2 = new Date(t1.getTime() + 150);
+      const oldStop = inverted ? t2 : t1;
+      const newStop = inverted ? t1 : t2;
+      await db.update(heartbeatRuns).set({ createdAt: new Date(t1.getTime() - 2000),
+        finishedAt: new Date(t2.getTime() + 1000), resultJson: { ...old.resultJson,
+          cancellation: { ...(old.resultJson?.cancellation as object), recordedAt: oldStop.toISOString() } },
+      }).where(eq(heartbeatRuns.id, f.runId));
+      const newId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: newId, companyId: f.companyId, agentId: f.agentId,
+        status: "cancelled", runtimeMode: "native", nativeIssueId: f.issueId, contextSnapshot: {},
+        createdAt: new Date(t1.getTime() - 1000), finishedAt: new Date(t2.getTime() + 2000),
+        resultJson: { cancellation: { source: "operator", expected: true, initiator: { type: "user", id: "queue-owner" },
+          reason: "Other person Stop", recordedAt: newStop.toISOString() } } });
+      expect(oldStop > newStop).toBe(inverted);
+      const original = (await request(f.client).get(f.path).expect(200)).body;
+      expect(original.entries.map((e: any) => e.comment.id)).toEqual([a, b, c]);
+      // A < T1 < B < T2 < C. Moving B across A crosses T1 only: legal at T2.
+      const allowed = await request(f.client).put(`${f.path}/order`).send({ queueId: original.queueId,
+        revision: original.revision, orderedCommentIds: [b, a, c] });
+      judgeReceipt({ row: "RFL-latest-stop-time", kind, inverted, oldRunId: f.runId, newRunId: newId,
+        t1, t2, oldStop, newStop, chosen: [b, a, c], expected: 200, actual: allowed.status });
+      expect(allowed.status, JSON.stringify(allowed.body)).toBe(200);
+      expect(allowed.body.entries.map((e: any) => e.comment.id)).toEqual([b, a, c]);
+      expect((await request(f.client).get(f.path).expect(200)).body.entries.map((e: any) => e.comment.id)).toEqual([b, a, c]);
+      // Both directions cross T2 and must preserve every persisted queue value.
+      for (const chosen of [[b, c, a], [c, b, a]]) {
+        const current = (await request(f.client).get(f.path).expect(200)).body;
+        const before = await saved(f.companyId);
+        const refused = await request(f.client).put(`${f.path}/order`).send({ queueId: current.queueId,
+          revision: current.revision, orderedCommentIds: chosen });
+        const after = await saved(f.companyId);
+        judgeReceipt({ row: "RFL-latest-stop-time", kind, inverted, oldRunId: f.runId, newRunId: newId,
+          t1, t2, chosen, expected: 409, actual: refused.status, code: refused.body.details?.code, before, after });
+        expect(refused.status).toBe(409);
+        expect(refused.body.details?.code).toBe("queued_comment_stop_line_crossing");
+        expect(after).toEqual(before);
+        expect((await request(f.client).get(f.path).expect(200)).body.entries.map((e: any) => e.comment.id)).toEqual([b, a, c]);
+      }
+    });
+    it.each([
+      ["system", "control_plane"], ["system", "controller_lease"],
+      ["agent", "control_plane"], ["provider", "provider"],
+    ] as const)("RFL newer non-person cancellation %s/%s does not move an existing person Stop", async (actor, source) => {
+      const f = await fixture(true), [a, b, c] = f.commentIds;
+      const [person] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const boundary = new Date(String((person.resultJson?.cancellation as any).recordedAt));
+      const nonPersonTime = new Date(boundary.getTime() + 1000);
+      const nonPersonId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: nonPersonId, companyId: f.companyId, agentId: f.agentId,
+        status: "cancelled", runtimeMode: "native", nativeIssueId: f.issueId, contextSnapshot: {},
+        createdAt: new Date(Date.now() + 5000), finishedAt: new Date(nonPersonTime.getTime() + 1),
+        resultJson: { ...(source === "controller_lease" ? { timeoutFired: true } : {}),
+          cancellation: { source, expected: false, initiator: { type: actor },
+            reason: "Non-person cancellation after person Stop", recordedAt: nonPersonTime.toISOString() } } });
+      const original = (await request(f.client).get(f.path).expect(200)).body;
+      // B and C remain post-person-Stop, so their swap is legal.
+      const allowed = await request(f.client).put(`${f.path}/order`).send({ queueId: original.queueId,
+        revision: original.revision, orderedCommentIds: [a, c, b] }).expect(200);
+      expect(allowed.body.entries.map((e: any) => e.comment.id)).toEqual([a, c, b]);
+      const before = await saved(f.companyId);
+      const refused = await request(f.client).put(`${f.path}/order`).send({ queueId: allowed.body.queueId,
+        revision: allowed.body.revision, orderedCommentIds: [c, b, a] });
+      const after = await saved(f.companyId);
+      judgeReceipt({ row: "RFL-non-person-after-stop", kind, actor, source, personRunId: f.runId,
+        nonPersonId, boundary, nonPersonTime, expected: 409, actual: refused.status,
+        code: refused.body.details?.code, before, after });
+      expect(refused.status).toBe(409);
+      expect(refused.body.details?.code).toBe("queued_comment_stop_line_crossing");
+      expect(after).toEqual(before);
+      expect((await request(f.client).get(f.path).expect(200)).body.entries.map((e: any) => e.comment.id)).toEqual([a, c, b]);
+    });
     it("does not invent a person-Stop boundary from a provider cancellation", async () => {
       const f = await fixture(false), [a, b, c] = f.commentIds;
       const [first] = await db.select().from(issueComments).where(eq(issueComments.id, a));

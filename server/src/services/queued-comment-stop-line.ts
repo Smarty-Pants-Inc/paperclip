@@ -29,8 +29,10 @@ export async function assertQueuedCommentStopLinePreserved(db: Db, input: {
     // userStopBoundaryAt also falls back to finishedAt for non-person stops;
     // those must neither establish nor replace this person's Stop line.
     if (!recordedUserStop(source)) continue;
-    boundary = userStopBoundaryAt(source);
-    if (boundary) break;
+    const candidate = userStopBoundaryAt(source);
+    // Run creation and Stop order can disagree. Keep the latest Stop clock;
+    // the query's createdAt/id order breaks ties within the same bounded set.
+    if (candidate && (!boundary || candidate > boundary)) boundary = candidate;
   }
   if (!boundary) return;
   const stopTime = boundary.getTime();
