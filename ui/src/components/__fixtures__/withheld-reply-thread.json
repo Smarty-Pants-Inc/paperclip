@@ -2,7 +2,7 @@
   "comments": [
     {
       "authorType": "agent",
-      "body": "Done. I renamed the helper and updated its two callers.\n\n- `src/util.ts`\n- `src/app.ts`  \nTests pass ✅\n\nThe file changes from this reply couldn't be saved.",
+      "body": "Done. I renamed the helper and updated its two callers.\n\n- `src/util.ts`\n- `src/app.ts`  \nTests pass ✅",
       "byRun": true,
       "isMessage": false
     },
@@ -14,11 +14,23 @@
     }
   ],
   "issueStatus": "blocked",
+  "run": {
+    "status": "failed",
+    "replyFileLine": {
+      "onTheReply": true,
+      "state": "lost",
+      "deadlineAfterAcceptanceMs": null
+    }
+  },
   "recoveryAction": {
     "kind": "active_run_watchdog",
     "status": "active",
     "ownerType": "board",
     "cause": "native_workspace_sync_out_unrecoverable",
-    "nextAction": "Restore the exact sandbox containing the unexported workspace changes, or resolve the task manually from durable evidence."
+    "nextAction": "Restore the exact sandbox containing the unexported workspace changes, or resolve the task manually from durable evidence.",
+    "evidenceRunIsThisRun": true,
+    "workspaceRecovery": null,
+    "systemRecovery": null,
+    "sourceInspection": "verified"
   }
 }

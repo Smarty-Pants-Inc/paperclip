@@ -30,6 +30,13 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // PLANTED (named, no real-path twin in this file; see result.md): the run row that carries M
 // and its sandbox lease. The heartbeat executor that would create them needs a live provider.
 const box = vi.hoisted(() => ({ resume: vi.fn() }));
+// The ONE switch, WITHHELD_REPLY_TRIGGER. It ships as "terminal" (row T0 reads the real module);
+// the acceptance rows flip it here, exactly as the one-line change would.
+const setting = vi.hoisted(() => ({ trigger: "terminal" as "terminal" | "acceptance" }));
+vi.mock("./native-withheld-reply-trigger.js", async importOriginal => {
+  const original = await importOriginal<typeof import("./native-withheld-reply-trigger.js")>();
+  return { ...original, get WITHHELD_REPLY_TRIGGER() { return setting.trigger; } };
+});
 vi.mock("../environment-execution-target.js", async importOriginal => ({
   ...await importOriginal<typeof import("../environment-execution-target.js")>(),
   resolveEnvironmentExecutionTarget: async () => ({ kind: "remote", transport: "sandbox", remoteCwd: "/work",
@@ -39,6 +46,10 @@ vi.mock("./native-workspace-sync.js", async importOriginal => ({
   ...await importOriginal<typeof import("./native-workspace-sync.js")>(),
   resumeNativeWorkspaceSync: box.resume,
 }));
+import { FILE_LINE_KEPT_NO_BUTTON, FILE_LINE_NOT_SAVED_YET, FILE_LINE_SAVING, readReplyFileLine, replyFileLineText } from "@paperclipai/shared";
+import { nativeRunResults } from "@paperclipai/db";
+import { activityRoutes } from "../../routes/activity.js";
+import { publishWithheldAcceptedReply } from "./native-withheld-reply.js";
 import { agentRoutes } from "../../routes/agents.js";
 import { issueRoutes } from "../../routes/issues.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -52,15 +63,13 @@ import { nativeResponsePresentationWork } from "./native-response-presentation-w
 import { retryNativeWorkspaceExport } from "./native-workspace-export-retry.js";
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 
-// The words are RFL's to finalize; the constants live in native-withheld-reply.ts.
-// At the base commit that module does not exist, so the drafts stand in and every row is red on behaviour.
-const withheldModule = "./native-withheld-reply.js";
-const words: { FILE_LINE_LOST?: string; FILE_LINE_KEPT?: string } = await import(/* @vite-ignore */ withheldModule).catch(() => ({}));
-const FILE_LINE_LOST = words.FILE_LINE_LOST ?? "The file changes from this reply couldn't be saved.";
-const FILE_LINE_KEPT = words.FILE_LINE_KEPT ?? "The file changes from this reply are kept and can be recovered from the task's saved files.";
+// The words are RFL's to finalize; every one lives in packages/shared/src/reply-file-line.ts.
+import { FILE_LINE_KEPT, FILE_LINE_LOST } from "./native-withheld-reply.js";
 
-const RENDER_FIXTURE = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
-  "../../../../ui/src/components/__fixtures__/withheld-reply-thread.json");
+const RENDER_FIXTURES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../ui/src/components/__fixtures__");
+const SAVING_DEADLINE_MS = 10 * 60_000;
+/** The task row after a healthy commit in this file's scenario (no status worker runs here); the same under both settings. */
+const HEALTHY_TASK_AFTER_COMMIT = (runId: string) => ({ status: "in_progress", executionRunId: runId });
 const PERSON = "withheld-person";
 /** Measured waits, for the record (WITHHELD_REPLY_TIMINGS=<file>). */
 function timing(label: string, since: number) {
@@ -81,7 +90,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await db.insert(environments).values({ id: environmentId, name: `Box ${environmentId}`, driver: "sandbox" });
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
   }, 120_000);
-  afterEach(() => { vi.useRealTimers(); box.resume.mockReset(); });
+  afterEach(() => { vi.useRealTimers(); box.resume.mockReset(); setting.trigger = "terminal"; });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); });
 
   // The streamed answer, in the pieces the person watched arrive.
@@ -104,7 +113,8 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     const app = express(); app.use(express.json());
     app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: PERSON, companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "owner", status: "active" }], isInstanceAdmin: true }; next(); });
-    app.use("/api", agentRoutes(db, {} as never)); app.use("/api", issueRoutes(db, {} as never, {})); app.use(errorHandler);
+    app.use("/api", agentRoutes(db, {} as never)); app.use("/api", issueRoutes(db, {} as never, {}));
+    app.use("/api", activityRoutes(db)); app.use(errorHandler);
 
     // REAL: the person's message M.
     const sent = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Please rename the helper.", clientRequestId: randomUUID() });
@@ -152,6 +162,9 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     const copyBack = () => reconcileNativeFinalizations(db, [runId], { environmentRuntime: runtime as never });
     const coordinator = async () => (await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)))[0];
     const run = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0];
+    /** What the commit did to the task itself: the committed path's other effects, beside the reply. */
+    const task = async () => { const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      return { status: row.status, executionRunId: row.executionRunId }; };
     /** REAL: the reply-presentation worker's own discovery and check, as after a restart. */
     async function presentationWorker() {
       const work = nativeResponsePresentationWork(db);
@@ -164,6 +177,55 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
       return got.body as Array<{ id: string; body: string; authorType: string; authorAgentId: string | null; createdByRunId: string | null; metadata?: any }>;
     }
     const replies = async () => (await thread()).filter(comment => comment.authorType === "agent");
+    /** REAL: the run as the person's thread loads it beside the comments (GET /api/issues/:id/runs). */
+    async function servedRun() {
+      const got = await request(app).get(`/api/issues/${issueId}/runs`);
+      expect(got.status, JSON.stringify(got.body)).toBe(200);
+      return (got.body as Array<{ runId: string; status: string; resultJson: Record<string, any> | null }>).find(row => row.runId === runId)!;
+    }
+    /** REAL: the stored file-line state as served to the thread: { commentId, state, deadlineAt? } or null. */
+    const fileLine = async () => (await servedRun()).resultJson?.replyFileLine ?? null;
+    /** The ONE renderer (replyFileLineText, the function the ui thread calls) on the served state. */
+    const line = async (options: { nowMs?: number; recoverSavedFilesShown?: boolean } = {}) =>
+      replyFileLineText(readReplyFileLine(await fileLine()),
+        { nowMs: options.nowMs ?? Date.now(), recoverSavedFilesShown: options.recoverSavedFilesShown ?? false });
+    /** When the result was accepted (the saved row's own time). */
+    const acceptedAt = async () => (await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, runId)))[0].createdAt.getTime();
+    /** The same function the worker calls, called again: idempotent by (run, resultId, canonicalSha256). */
+    const publishAgain = async () => [await publishWithheldAcceptedReply(db, { companyId, issueId, runId }, "acceptance"),
+      await publishWithheldAcceptedReply(db, { companyId, issueId, runId }, "terminal")];
+    /** REAL: everything the rendered rows need, from the real GETs, with the random ids and times removed. */
+    async function renderSource() {
+      const comments = (await thread()).map(comment => ({ authorType: comment.authorType, body: comment.body,
+        byRun: comment.createdByRunId === runId, isMessage: comment.id === messageId }));
+      const detail = await request(app).get(`/api/issues/${issueId}`);
+      expect(detail.status, JSON.stringify(detail.body)).toBe(200);
+      const action = detail.body.recoveryAction ?? detail.body.activeRecoveryAction ?? null;
+      const served = await servedRun(), state = served.resultJson?.replyFileLine ?? null;
+      const [reply] = await replies();
+      const recovery = action?.evidence?.workspaceRecovery ?? null, system = action?.evidence?.systemRecovery ?? null;
+      // REAL: the saved-files source the top panel inspects before it offers "Recover saved files".
+      const inspected = action ? await request(app).get(`/api/issues/${issueId}/recovery-actions`)
+        .query({ inspectSourceRunId: runId, inspectSourceActionId: action.id }) : null;
+      return { comments, issueStatus: detail.body.status as string,
+        run: { status: served.status, replyFileLine: state && { onTheReply: state.commentId === reply?.id, state: state.state,
+          deadlineAfterAcceptanceMs: state.deadlineAt ? Date.parse(state.deadlineAt) - await acceptedAt() : null } },
+        recoveryAction: action && { kind: action.kind, status: action.status, ownerType: action.ownerType, cause: action.cause,
+          nextAction: action.nextAction, evidenceRunIsThisRun: action.evidence?.runId === runId,
+          workspaceRecovery: recovery && { status: recovery.status ?? null, retryable: recovery.retryable ?? null },
+          systemRecovery: system && { state: system.state ?? null },
+          sourceInspection: (inspected?.body.sourceInspection?.status as string | undefined) ?? null } };
+    }
+    /** The fixture file the ui rows render IS this real source (UPDATE_WITHHELD_REPLY_FIXTURE=1 rewrites it). */
+    async function expectRenderFixture(name: string) {
+      const file = path.join(RENDER_FIXTURES, name), fixture = await renderSource();
+      if (process.env.UPDATE_WITHHELD_REPLY_FIXTURE === "1") {
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.writeFile(file, `${JSON.stringify(fixture, null, 2)}\n`);
+      }
+      expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual(fixture);
+      return fixture;
+    }
     /** The ONE answered rule, asked about M. */
     async function answered() {
       const m = { id: sql`m.id`, companyId: sql`m.company_id`, issueId: sql`m.issue_id`, createdAt: sql`m.created_at` };
@@ -226,7 +288,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
         .send({ actionId: action.id, runId, idempotencyKey: randomUUID() });
       return { status: got.status, state: got.body.status as string | undefined };
     }
-    return { savedFilesSource, recoverSavedFiles, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
+    return { task, servedRun, fileLine, line, acceptedAt, publishAgain, expectRenderFixture, savedFilesSource, recoverSavedFiles, app, companyId, agentId, issueId, runId, leaseId, messageId, streamAndAccept, copyBack, coordinator, run, presentationWorker,
       thread, replies, answered, expectAnsweredOnceAndNoNotice, failCopyBackThreeTimes, boardRetrySucceeds };
   }
 
@@ -247,13 +309,17 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
       expect(errors).toEqual([]);
     } finally { worker.stop(); await delivery.stop(); }
     const [reply] = await s.replies();
-    expect(reply).toMatchObject({ body: `${ANSWER}\n\n${FILE_LINE_KEPT}`, authorAgentId: s.agentId, createdByRunId: s.runId });
+    // The body is the answer alone; the file line is the stored state, written directly as kept (never saving).
+    expect(reply).toMatchObject({ body: ANSWER, authorAgentId: s.agentId, createdByRunId: s.runId });
+    expect(await s.fileLine()).toEqual({ commentId: reply.id, state: "kept" });
+    expect(await s.line({ recoverSavedFilesShown: true })).toBe(FILE_LINE_KEPT);
+    expect(await s.line({ recoverSavedFilesShown: false })).toBe(FILE_LINE_KEPT_NO_BUTTON);
     // The box is retained for the board's "Recover saved files": the terminal write tagged its lease.
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, s.leaseId)))[0])
       .toMatchObject({ status: "pending_cleanup", metadata: { nativeWorkspaceExportResume: { runId: s.runId } } });
     expect((await s.run()).resultJson).toMatchObject({
-      presentationDecision: { commentAction: "create", commentId: reply.id },
-      nativeWithheldReply: { state: "published", fileLine: "kept", commentId: reply.id,
+      presentationDecision: { commentAction: "create", commentId: reply.id, fileLine: { state: "kept", deadlineAt: null } },
+      nativeWithheldReply: { state: "published", trigger: "terminal", fileLine: "kept", commentId: reply.id,
         resultId: (await s.coordinator()).resultId, canonicalSha256: expect.any(String),
         failureCode: "native_workspace_sync_out_retry_exhausted" } });
     // The board's open recovery for this run names the retained files, and their recorded source verifies.
@@ -262,6 +328,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await s.expectAnsweredOnceAndNoNotice();
     // A restarted worker finds nothing left to publish.
     await s.presentationWorker(); await s.presentationWorker();
+    expect(await s.publishAgain()).toEqual([false, false]);
     expect(await s.replies()).toHaveLength(1);
     // REAL: the request behind the board's "Recover saved files" button is accepted for this state
     // (POST /api/issues/:id/recovery-actions/recover-workspace, routes/issues.ts).
@@ -293,13 +360,15 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
       .toEqual([["failed", "workspace_sync_out_unrecoverable\n"]]);
     // Until the worker publishes, the one answered rule says M is unanswered.
     expect(await s.answered()).toEqual([false]);
+    expect(await s.fileLine()).toBeNull();
     await s.presentationWorker();
     timing("R2 start of the first copy-back -> published reply (one worker pass)", startedAt);
     const replies = await s.replies();
     expect(replies).toHaveLength(1);
     // R2s: byte for byte the streamed text, then the one file line.
-    expect(Buffer.from(replies[0].body).equals(Buffer.from(`${ANSWER}\n\n${FILE_LINE_LOST}`))).toBe(true);
-    expect(Buffer.from(replies[0].body.slice(0, ANSWER.length)).equals(Buffer.from(STREAM.join("")))).toBe(true);
+    expect(Buffer.from(replies[0].body).equals(Buffer.from(STREAM.join("")))).toBe(true);
+    expect(await s.fileLine()).toEqual({ commentId: replies[0].id, state: "lost" });
+    expect(await s.line()).toBe(FILE_LINE_LOST);
     expect((await s.run()).resultJson).toMatchObject({ nativeWithheldReply: { state: "published", fileLine: "lost",
       failureCode: "native_workspace_sync_out_unrecoverable" } });
     await s.expectAnsweredOnceAndNoNotice();
@@ -320,7 +389,8 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
     const replies = await s.replies();
     expect(replies).toHaveLength(1);
-    expect(replies[0].body).toBe(`${ANSWER}\n\n${FILE_LINE_LOST}`);
+    expect(replies[0].body).toBe(ANSWER);
+    expect(await s.line()).toBe(FILE_LINE_LOST);
     expect((await db.select().from(agents).where(eq(agents.id, s.agentId)))[0].status).toBe("paused");
     await s.expectAnsweredOnceAndNoNotice();
     await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
@@ -332,6 +402,7 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await s.streamAndAccept();
     await s.presentationWorker();
     expect(await s.replies()).toEqual([]);
+    expect((await s.run()).resultJson ?? {}).not.toHaveProperty("nativeWithheldReply");
     expect((await s.coordinator()).phase).not.toBe("committed");
     box.resume.mockResolvedValue(true);
     await s.copyBack();
@@ -342,6 +413,9 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     expect(replies[0].body).toBe(ANSWER);
     expect((await s.run()).status).toBe("succeeded");
     expect((await s.run()).resultJson).not.toHaveProperty("nativeWithheldReply");
+    expect(await s.fileLine()).toBeNull();
+    expect(await s.line()).toBeNull();
+    expect(await s.task()).toEqual(HEALTHY_TASK_AFTER_COMMIT(s.runId));
     await s.expectAnsweredOnceAndNoNotice();
   }, 120_000);
 
@@ -352,11 +426,15 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     await s.presentationWorker();
     const before = await s.replies();
     expect(before).toHaveLength(1);
+    expect(await s.line({ recoverSavedFilesShown: true })).toBe(FILE_LINE_KEPT);
     await s.boardRetrySucceeds();
     await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
     const after = await s.replies();
     expect(after).toHaveLength(1);
-    expect(after[0]).toMatchObject({ id: before[0].id, body: `${ANSWER}\n\n${FILE_LINE_KEPT}` });
+    expect(after[0]).toMatchObject({ id: before[0].id, body: ANSWER });
+    // The copy-back succeeded: the files are saved now, so the kept line clears.
+    expect(await s.fileLine()).toEqual({ commentId: before[0].id, state: "saved" });
+    expect(await s.line()).toBeNull();
     await s.expectAnsweredOnceAndNoNotice();
   }, 120_000);
 
@@ -375,35 +453,224 @@ describe.skipIf(!support.supported)("withheld accepted reply: published once whe
     const replies = await s.replies();
     expect(replies).toHaveLength(1);
     expect(replies[0].body).toBe(ANSWER);
-    expect(replies[0].body).not.toContain(FILE_LINE_LOST);
-    expect(replies[0].body).not.toContain(FILE_LINE_KEPT);
-    expect((await s.run()).resultJson).toMatchObject({ nativeWithheldReply: { state: "published", fileLine: null, failureCode: null } });
+    expect(await s.fileLine()).toEqual({ commentId: replies[0].id, state: "saved" });
+    expect(await s.line()).toBeNull();
+    expect((await s.run()).resultJson).toMatchObject({ nativeWithheldReply: { state: "published", fileLine: "saved", failureCode: null } });
     await s.expectAnsweredOnceAndNoNotice();
     await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
     expect(await s.replies()).toHaveLength(1);
   }, 120_000);
 
-  it("RENDERED-THREAD source: the real GET after a LOST publish is the fixture the ui test renders", async () => {
+  it("RENDERED source, LOST (terminal): the real GETs after a LOST publish are the fixture the ui rows render", async () => {
     const s = await scenario();
     await s.streamAndAccept();
     await db.update(environmentLeases).set({ status: "expired", releasedAt: new Date() }).where(eq(environmentLeases.id, s.leaseId));
     await s.copyBack();
     await s.presentationWorker();
-    const comments = (await s.thread()).map(comment => ({ authorType: comment.authorType, body: comment.body,
-      byRun: comment.createdByRunId === s.runId, isMessage: comment.id === s.messageId }));
-    // REAL: the card's source, the recovery action the terminal write opened (GET /api/issues/:id).
-    const detail = await request(s.app).get(`/api/issues/${s.issueId}`);
-    expect(detail.status, JSON.stringify(detail.body)).toBe(200);
-    const action = detail.body.recoveryAction ?? detail.body.activeRecoveryAction;
-    expect(action).toMatchObject({ cause: "native_workspace_sync_out_unrecoverable", ownerType: "board" });
-    const fixture = { comments, issueStatus: detail.body.status,
-      recoveryAction: { kind: action.kind, status: action.status, ownerType: action.ownerType, cause: action.cause, nextAction: action.nextAction } };
-    if (process.env.UPDATE_WITHHELD_REPLY_FIXTURE === "1") {
-      await fs.mkdir(path.dirname(RENDER_FIXTURE), { recursive: true });
-      await fs.writeFile(RENDER_FIXTURE, `${JSON.stringify(fixture, null, 2)}\n`);
-    }
-    expect(JSON.parse(await fs.readFile(RENDER_FIXTURE, "utf8"))).toEqual(fixture);
-    expect(comments.filter(comment => comment.authorType === "agent")).toEqual([
-      { authorType: "agent", body: `${ANSWER}\n\n${FILE_LINE_LOST}`, byRun: true, isMessage: false }]);
+    const fixture = await s.expectRenderFixture("withheld-reply-thread.json");
+    expect(fixture.recoveryAction).toMatchObject({ cause: "native_workspace_sync_out_unrecoverable", ownerType: "board" });
+    expect(fixture.comments.filter(comment => comment.authorType === "agent")).toEqual([
+      { authorType: "agent", body: ANSWER, byRun: true, isMessage: false }]);
+    expect(fixture.run.replyFileLine).toEqual({ onTheReply: true, state: "lost", deadlineAfterAcceptanceMs: null });
+  }, 120_000);
+
+  it("RENDERED source, KEPT (terminal): the real GETs after a KEPT publish are the fixture the ui rows render", async () => {
+    const s = await scenario();
+    await s.streamAndAccept();
+    await s.failCopyBackThreeTimes();
+    await s.presentationWorker();
+    const fixture = await s.expectRenderFixture("withheld-reply-kept-thread.json");
+    expect(fixture.recoveryAction).toMatchObject({ cause: "native_workspace_sync_out_retry_exhausted" });
+    expect(fixture.run.replyFileLine).toEqual({ onTheReply: true, state: "kept", deadlineAfterAcceptanceMs: null });
+  }, 120_000);
+
+  it("RENDERED source, SAVING (acceptance): the real GETs after publishing at acceptance are the fixture the ui rows render", async () => {
+    setting.trigger = "acceptance";
+    const s = await scenario();
+    await s.streamAndAccept();
+    await s.presentationWorker();
+    const fixture = await s.expectRenderFixture("withheld-reply-saving-thread.json");
+    expect(fixture.run).toEqual({ status: "running", replyFileLine: { onTheReply: true, state: "saving", deadlineAfterAcceptanceMs: SAVING_DEADLINE_MS } });
+    expect(fixture.recoveryAction).toBeNull();
+  }, 120_000);
+
+  it("T0: the switch ships as 'terminal', and under it nothing is published or marked at acceptance", async () => {
+    const shipped = await vi.importActual<typeof import("./native-withheld-reply-trigger.js")>("./native-withheld-reply-trigger.js");
+    expect(shipped.WITHHELD_REPLY_TRIGGER).toBe("terminal");
+    expect(shipped.WITHHELD_REPLY_SAVING_DEADLINE_MS).toBe(SAVING_DEADLINE_MS);
+    const s = await scenario();
+    await s.streamAndAccept();
+    await s.presentationWorker();
+    expect(await s.publishAgain()).toEqual([false, false]);
+    expect(await s.replies()).toEqual([]);
+    expect(await s.fileLine()).toBeNull();
+    expect((await s.run()).resultJson ?? {}).not.toHaveProperty("nativeWithheldReply");
+  }, 120_000);
+
+  it("A1 (acceptance, healthy): the registered worker posts the reply at acceptance with 'Saving…'; the commit clears the line and posts nothing more", async () => {
+    setting.trigger = "acceptance";
+    const s = await scenario();
+    const errors: unknown[] = [];
+    const delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
+    const worker = nativeResponsePresentationWork(db).register(delivery, () => true);
+    let replyId = "";
+    try {
+      await worker.ready;
+      await s.streamAndAccept();
+      const acceptedAt = performance.now();
+      // No copy-back has run and no test-side call into the worker: the acceptance write alone makes it publish.
+      await vi.waitFor(async () => expect(await s.replies()).toHaveLength(1), { timeout: 15_000, interval: 25 });
+      timing("A1 acceptance -> published reply (registered worker)", acceptedAt);
+      const [reply] = await s.replies();
+      replyId = reply.id;
+      expect(reply).toMatchObject({ body: ANSWER, authorAgentId: s.agentId, createdByRunId: s.runId });
+      // Earlier than today: the copy-back has not ended, and the run is still running.
+      expect(await s.coordinator()).toMatchObject({ phase: "workspace_finalizing" });
+      expect((await s.run()).status).toBe("running");
+      expect(await s.fileLine()).toEqual({ commentId: reply.id, state: "saving",
+        deadlineAt: new Date(await s.acceptedAt() + SAVING_DEADLINE_MS).toISOString() });
+      expect(await s.line()).toBe(FILE_LINE_SAVING);
+      expect(await s.answered()).toEqual([true]);
+      expect(await s.publishAgain()).toEqual([false, false]);
+      // The healthy copy-back, then the committed path with the worker still registered.
+      box.resume.mockResolvedValue(true);
+      await s.copyBack();
+      expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+      await vi.waitFor(async () => expect((await s.run()).status).toBe("succeeded"), { timeout: 15_000, interval: 25 });
+      expect(errors).toEqual([]);
+    } finally { worker.stop(); await delivery.stop(); }
+    await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+    expect(await s.publishAgain()).toEqual([false, false]);
+    const replies = await s.replies();
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ id: replyId, body: ANSWER });
+    // The commit's other effects on the task are the healthy control's (R3), unchanged by the earlier reply.
+    expect(await s.task()).toEqual(HEALTHY_TASK_AFTER_COMMIT(s.runId));
+    // The line showed, then cleared.
+    expect(await s.fileLine()).toEqual({ commentId: replyId, state: "saved" });
+    expect(await s.line()).toBeNull();
+    expect((await s.run()).resultJson).toMatchObject({ presentationDecision: { commentId: replyId, fileLine: { state: "saved", deadlineAt: null } },
+      nativeWithheldReply: { state: "published", trigger: "acceptance", commentId: replyId } });
+    await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  it("A2 (acceptance -> terminal failure, box retained): still exactly 1 reply; 'Saving…' settles to the KEPT line", async () => {
+    setting.trigger = "acceptance";
+    const s = await scenario();
+    await s.streamAndAccept();
+    await s.presentationWorker();
+    const [reply] = await s.replies();
+    expect(reply.body).toBe(ANSWER);
+    expect(await s.line()).toBe(FILE_LINE_SAVING);
+    await s.failCopyBackThreeTimes();
+    // The terminal write queued the same outbox entry again; until the worker serves it the line is still bounded.
+    expect((await s.run()).resultJson).toMatchObject({ nativeWithheldReply: { state: "pending", trigger: "terminal" } });
+    await s.presentationWorker();
+    const replies = await s.replies();
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ id: reply.id, body: ANSWER });
+    expect(await s.fileLine()).toEqual({ commentId: reply.id, state: "kept" });
+    expect(await s.line({ recoverSavedFilesShown: true })).toBe(FILE_LINE_KEPT);
+    expect(await s.line({ recoverSavedFilesShown: false })).toBe(FILE_LINE_KEPT_NO_BUTTON);
+    expect((await s.run()).resultJson).toMatchObject({ nativeWithheldReply: { state: "published", trigger: "terminal", fileLine: "kept",
+      commentId: reply.id, failureCode: "native_workspace_sync_out_retry_exhausted" } });
+    await s.expectAnsweredOnceAndNoNotice();
+    await s.presentationWorker(); await s.presentationWorker();
+    expect(await s.publishAgain()).toEqual([false, false]);
+    expect(await s.replies()).toHaveLength(1);
+    // A board Retry that then succeeds clears the line; still 1 reply.
+    await s.boardRetrySucceeds();
+    await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+    expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
+    expect(await s.line()).toBeNull();
+  }, 120_000);
+
+  it("A3 (acceptance -> pause -> the box is gone): still exactly 1 reply; 'Saving…' settles to the LOST line", async () => {
+    setting.trigger = "acceptance";
+    const s = await scenario();
+    await s.streamAndAccept();
+    await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
+    const [reply] = await s.replies();
+    expect(await s.replies()).toHaveLength(1);
+    expect(await s.line()).toBe(FILE_LINE_SAVING);
+    const paused = await request(s.app).post(`/api/agents/${s.agentId}/pause`).send({});
+    expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+    await db.update(environmentLeases).set({ status: "expired", releasedAt: new Date() }).where(eq(environmentLeases.id, s.leaseId));
+    await s.copyBack();
+    expect(await s.coordinator()).toMatchObject({ phase: "terminal_failure", failureCode: "native_workspace_sync_out_unrecoverable" });
+    await Promise.all([s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
+    const replies = await s.replies();
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ id: reply.id, body: ANSWER });
+    expect(await s.fileLine()).toEqual({ commentId: reply.id, state: "lost" });
+    expect(await s.line()).toBe(FILE_LINE_LOST);
+    await s.expectAnsweredOnceAndNoNotice();
+    await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+    expect(await s.replies()).toHaveLength(1);
+  }, 120_000);
+
+  it("A4 (acceptance -> pause before the worker -> the retried copy-back succeeds): exactly 1 reply, no line", async () => {
+    setting.trigger = "acceptance";
+    const s = await scenario();
+    await s.streamAndAccept();
+    const paused = await request(s.app).post(`/api/agents/${s.agentId}/pause`).send({});
+    expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+    expect(await s.run()).toMatchObject({ status: "cancelled" });
+    box.resume.mockResolvedValue(true);
+    // The commit and four workers at once: whichever publisher takes the row lock first posts, the others post nothing.
+    await Promise.all([s.copyBack(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
+    await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+    expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+    const replies = await s.replies();
+    expect(replies).toHaveLength(1);
+    expect(replies[0].body).toBe(ANSWER);
+    expect(await s.line()).toBeNull();
+    expect((await s.fileLine())?.state ?? "saved").toBe("saved");
+    await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  it("A5 (acceptance, healthy, the commit races the workers): exactly 1 reply and no line left", async () => {
+    setting.trigger = "acceptance";
+    const s = await scenario();
+    await s.streamAndAccept();
+    box.resume.mockResolvedValue(true);
+    await Promise.all([s.copyBack(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker(), s.presentationWorker()]);
+    await s.presentationWorker(); await s.copyBack(); await s.presentationWorker();
+    expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+    expect((await s.run()).status).toBe("succeeded");
+    const replies = await s.replies();
+    expect(replies).toHaveLength(1);
+    expect(replies[0].body).toBe(ANSWER);
+    expect(await s.line()).toBeNull();
+    expect(["published", "skipped"]).toContain(((await s.run()).resultJson as any).nativeWithheldReply.state);
+    await s.expectAnsweredOnceAndNoNotice();
+  }, 120_000);
+
+  it("A6 (acceptance, the deadline; FAKE CLOCK, for the deadline only): past acceptance + 10 min the line is never 'Saving…'", async () => {
+    setting.trigger = "acceptance";
+    const s = await scenario();
+    await s.streamAndAccept();
+    await s.presentationWorker();
+    const [reply] = await s.replies();
+    const deadline = await s.acceptedAt() + SAVING_DEADLINE_MS;
+    expect(await s.fileLine()).toEqual({ commentId: reply.id, state: "saving", deadlineAt: new Date(deadline).toISOString() });
+    expect(await s.line()).toBe(FILE_LINE_SAVING);
+    // FAKE CLOCK (named): only Date moves, to the deadline. No copy-back ran and no saved state was edited.
+    vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+    vi.setSystemTime(deadline - 1_000);
+    expect(await s.line()).toBe(FILE_LINE_SAVING);
+    vi.setSystemTime(deadline);
+    expect(await s.line()).toBe(FILE_LINE_NOT_SAVED_YET);
+    vi.setSystemTime(deadline + 24 * 3_600_000);
+    await s.presentationWorker();
+    expect(await s.line()).toBe(FILE_LINE_NOT_SAVED_YET);
+    expect(await s.replies()).toHaveLength(1);
+    // A copy-back that succeeds after the deadline still clears the line; still 1 reply.
+    box.resume.mockResolvedValue(true);
+    await s.copyBack();
+    await s.presentationWorker();
+    expect(await s.coordinator()).toMatchObject({ phase: "committed" });
+    expect(await s.line()).toBeNull();
+    expect((await s.replies()).map(comment => comment.id)).toEqual([reply.id]);
   }, 120_000);
 });
