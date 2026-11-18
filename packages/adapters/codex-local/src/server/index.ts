@@ -64,6 +64,7 @@ export {
   codexHomeDir,
 } from "./quota.js";
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
+import { normalizeAdapterExecutionTargetSessionIdentity } from "@paperclipai/adapter-utils/execution-target";
 import { sessionCodec as acpxSessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-codec";
 
 function readNonEmptyString(value: unknown): string | null {
@@ -72,13 +73,9 @@ function readNonEmptyString(value: unknown): string | null {
 
 // The saved remote execution identity is what the resume gate compares with
 // the next run's target. Dropping it here made every remote session look like
-// it came from another target, so no remote run could ever resume.
-function readRecord(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? { ...(value as Record<string, unknown>) }
-    : null;
-}
-
+// it came from another target, so no remote run could ever resume. Save only
+// the normalized guard identity (upstream's way): a raw copy would persist an
+// SSH privateKey or a local tailscaleSocket into the session row.
 export const sessionCodec: AdapterSessionCodec = {
   deserialize(raw: unknown) {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
@@ -92,7 +89,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
     const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
-    const remoteExecution = readRecord(record.remoteExecution);
+    const remoteExecution = normalizeAdapterExecutionTargetSessionIdentity(record.remoteExecution);
     return {
       sessionId,
       ...(cwd ? { cwd } : {}),
@@ -113,7 +110,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(params.workspaceId) ?? readNonEmptyString(params.workspace_id);
     const repoUrl = readNonEmptyString(params.repoUrl) ?? readNonEmptyString(params.repo_url);
     const repoRef = readNonEmptyString(params.repoRef) ?? readNonEmptyString(params.repo_ref);
-    const remoteExecution = readRecord(params.remoteExecution);
+    const remoteExecution = normalizeAdapterExecutionTargetSessionIdentity(params.remoteExecution);
     return {
       sessionId,
       ...(cwd ? { cwd } : {}),
