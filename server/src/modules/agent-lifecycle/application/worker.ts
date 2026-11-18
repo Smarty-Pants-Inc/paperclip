@@ -86,8 +86,7 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
         // harness test ran. Claims deferred before the host do not spend it.
         const verificationFailures = failureContext.stage === "host" && ["verifying", "resuming"].includes(agent.lifecycleState)
           ? (agent.lifecycleOperation?.verificationFailures ?? 0) + 1 : undefined;
-        failureContext = { ...failureContext, verificationFailures,
-          transientFailureSince: agent.lifecycleOperation?.transientFailureSince };
+        failureContext = { ...failureContext, verificationFailures };
         const message = lifecycleFailureMessage(failureContext, error);
         const retryRequired = lifecycleVerificationNeedsRetry(failureContext, error);
         if (!await runStep("defer", () => retryRequired || verificationFailures !== undefined

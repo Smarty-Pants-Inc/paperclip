@@ -1,6 +1,8 @@
 import { connectionIntentService } from "./connection-intents.js";
 import { readAiConnectionConfigurationFailure } from "./ai-connection-configuration-failure.js";
 import { logger } from "../middleware/logger.js";
+import { HttpError, unprocessable } from "../errors.js";
+import { reconcileRetainedAiCleanup } from "./retained-ai-credential-cleanup.js";
 import { createHmac } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import { agents, companies, companySecrets, type Db } from "@paperclipai/db";

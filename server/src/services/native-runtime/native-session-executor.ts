@@ -989,7 +989,6 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string, s
     await entry.instructionWorkingCopy?.retirementFailed?.().catch(receiptError => {
       logger.warn({ err: receiptError, runId: entry.runId }, "could not keep the predecessor's agent files for later collection");
     });
-    await markWarmNativeHarnessBackupMissing(entry, "close_failed");
     logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
       providerLeaseId: entry.providerLeaseId ?? null, reason },
     "superseded warm owner's sandbox lease already has Boat's stop or destroy receipt; retirement proven without a close attempt");
@@ -1012,7 +1011,6 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string, s
         throw new NativePredecessorRetirementDirectoryBusyError(entry.runId, error);
       }
       if (await warmOwnerStopReceiptWithinBound(entry, successor)) {
-        await markWarmNativeHarnessBackupMissing(entry, "close_failed");
         logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
           providerLeaseId: entry.providerLeaseId ?? null, reason, closeFailure: describeWarmCloseFailure(error) },
         "superseded warm owner's sandbox lease has Boat's stop or destroy receipt; retirement proven");
