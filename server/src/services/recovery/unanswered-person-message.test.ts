@@ -53,7 +53,6 @@ import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotic
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING,
-  UNANSWERED_CARD_ANSWER_TEXT,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
 import * as sweepModule from "./unanswered-person-message.js";
 import * as pendingModule from "./automatic-recovery-pending.js";
@@ -62,6 +61,10 @@ import { enqueueNativeContinuationWake } from "../native-runtime/status-decision
 import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
 import { claimFirstTurnQueuedInput } from "../native-runtime/first-turn-queued-input.js";
 import { completedPersonMessageAnswerSql, unansweredCardAnswerSql } from "../person-message-answer.js";
+import * as unansweredPersonMessage from "./unanswered-person-message.js";
+// h3-c1x port: the card-answer notice text is app-lead's card-answer-duty line ('without' c531cc3e/0483f7f3), not on c1x.
+// Read it without a static import so the file typechecks on c1x; the H3 rows that need that notice stay RED here.
+const UNANSWERED_CARD_ANSWER_TEXT = (unansweredPersonMessage as Record<string, unknown>).UNANSWERED_CARD_ANSWER_TEXT as string | undefined;
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
