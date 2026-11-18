@@ -153,7 +153,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         idempotencyKey: `native-status:${decision!.id}:retry`, payload: {} });
       const wakeContext = ((wake!.payload as Record<string, unknown>)._paperclipWakeContext ?? {}) as Record<string, unknown>;
       // ownInput=false: the pre-carry successor shape (no own pending input), for ancestry-only guards.
-      if (options.ownInput === false) delete wakeContext.conversationReplyBoundaryCommentId;
+      if (options.ownInput === false) { delete wakeContext.conversationReplyBoundaryCommentId; delete wakeContext.attributionCommentIds; }
       await db.update(heartbeatRuns).set({ contextSnapshot: { ...wakeContext, issueId, taskId: issueId, wakeReason: "issue_status_changed",
         source: "native_status_decision", statusDecisionSource: "native_status_decision", nativeStatusWakeIntentId: wake!.id } })
         .where(eq(heartbeatRuns.id, target));
@@ -2254,6 +2254,40 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       isNull(issueComments.deletedAt), sql`${issueComments.metadata}->>'authorizationReason' = ${`unanswered_message:${messageId}`}`));
     expect(notices, "exactly ONE true notice").toHaveLength(1);
     expect(await f.visible()).toHaveLength(1);
+  });
+
+  // RFL 01:14Z (attributionCommentIds): a batched M1+M2 on a failed turn. The one-id boundary attributed only M2,
+  // so M1 got a FALSE 'not answered' after the continuation answered both. The array attributes BOTH.
+  it("attrarray: a batched M1+M2 on a failed turn, the native-status continuation answers both: NO notice for EITHER", async () => {
+    const f = await fixture();
+    const m1 = await f.message("First: write the report.");
+    const m2 = await f.message("Second: and add a summary.");
+    const root = await f.run({ commentId: m2, status: "failed", errorCode: "native_run_failed" });
+    const [rootRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, root));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...(rootRow!.contextSnapshot as Record<string, unknown>),
+      wakeCommentIds: [m1, m2] } }).where(eq(heartbeatRuns.id, root));
+    expect(await readContinuationCommentInput(db, { ...f, runId: root })).toMatchObject({ wakeCommentIds: [m1, m2] });
+    const successor = await f.nativeSuccessor(root);
+    await f.reply(successor);
+    const outcomes: string[] = [];
+    for (let pass = 0; pass < 3; pass++) {
+      outcomes.push((await settleUnansweredPersonMessage(db, f)).kind);
+      await f.sweep();
+    }
+    const noticesEver = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
+    const label = (reason: unknown) => reason === `unanswered_message:${m1}` ? "M1" : reason === `unanswered_message:${m2}` ? "M2" : reason;
+    expect(noticesEver.map(n => label(n.metadata?.authorizationReason)), "no notice for M1 or M2").toEqual([]);
+    expect(outcomes, "never noticed").not.toContain("noticed");
+    expect(await f.visible()).toHaveLength(0);
+    expect(await messageState(f, m1), "M1 answered").toMatchObject({ answered: true });
+    expect(await messageState(f, m2), "M2 answered").toMatchObject({ answered: true });
+    const [successorRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor));
+    const context = successorRow!.contextSnapshot as Record<string, unknown>;
+    expect(context).toMatchObject({ conversationReplyBoundaryCommentId: m2, attributionCommentIds: [m1, m2] });
+    // Attribution only: no prompt field carries either message.
+    for (const key of ["wakeCommentId", "wakeCommentIds", "commentId", "commentContinuation", "firstTurnQueuedInput", "interactionId", "interactionIds"])
+      expect(context, key).not.toHaveProperty(key);
   });
 
   it("contcarry: NO duplicated user turn: the successor's provider input holds the person's message zero additional times", async () => {
