@@ -719,6 +719,12 @@ function redactStandaloneBearerCredentials(input: string): string {
       continue;
     }
 
+    // A prior layer already masked this value. Require a complete marker,
+    // not a marker-shaped prefix of a credential, and retain its exact bytes.
+    if (/^(?:\[redacted\]|\*\*\*redacted\*\*\*)(?=$|[\s.,;:!?)\]}"'`])/i.test(input.slice(credentialStart))) {
+      continue;
+    }
+
     let end: number;
     let replacement = REDACTED_EVENT_VALUE;
     const rawQuote = input[credentialStart];

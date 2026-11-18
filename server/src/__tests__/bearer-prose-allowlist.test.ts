@@ -1,6 +1,7 @@
 // Task-authorized never-OK guard: a prose exception must not expose credentials.
 import { describe, expect, it } from "vitest";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { createPiEventProjector } from "../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.js";
 import { redactProviderAnswer } from "../../../packages/paperclip-runner/src/drivers/diagnostic-redaction.js";
 
 const prose = [
@@ -64,6 +65,22 @@ const credentials = [
 ];
 
 describe("standalone bearer prose allowlist", () => {
+  it.each(["[REDACTED]", "***REDACTED***", "[redacted]"])("leaves an existing bearer marker intact: %s", marker => {
+    const input = `Bearer ${marker}`;
+    expect(redactSensitiveText(input)).toBe(input);
+    expect(redactSensitiveText(redactSensitiveText(input))).toBe(input);
+    expect(redactEventPayload({ text: input })).toEqual({ text: input });
+  });
+  it("preserves prose and masks the credential once through Pi then server", () => {
+    const input = 'the Bearer of bad news arrived\n"Bearer SYNTHabcdefghij"';
+    const projector = createPiEventProjector({ runId: "r", turnId: "t" });
+    const events = projector.project({ type: "message_end", message: { role: "assistant", provider: "neutral", model: "model", timestamp: 1, responseId: "reply", stopReason: "stop", content: [{ type: "text", text: input }] } });
+    const answer = events.find(event => event.eventType === "item.completed" && event.payload.kind === "agentMessage")!.payload.text as string;
+    const composed = redactSensitiveText(answer);
+    expect(composed).toMatch(/^the Bearer of bad news arrived\n"Bearer (?:\[REDACTED\]|\*\*\*REDACTED\*\*\*)"$/);
+    expect(redactSensitiveText(composed)).toBe(composed);
+    expect(redactEventPayload({ text: answer })).toEqual({ text: composed });
+  });
   it.each(prose)("preserves prose: %s", input => {
     expect(redactSensitiveText(input)).toBe(input);
     expect(redactEventPayload({ text: input })).toEqual({ text: input });
