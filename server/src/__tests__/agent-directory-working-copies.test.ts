@@ -2115,6 +2115,39 @@ describe("persistent agent directories", () => {
       return row;
     }
     const cases = [false, true].flatMap(warm => (["apply", "quota", "authorization", "timeout"] as const).map(kind => [warm ? "warm" : "cold", kind] as const));
+    // review-fleet-3 (rf3-port-collector, smarty-dev#20787), inherited from the
+    // judged source: live() was checked around store.apply but no signal reached
+    // it, so an abort raised once the real apply had started still let the
+    // canonical write land while 'aborted' was reported.
+    it.each([false, true])("RF3 ABORT DURING APPLY: an abort raised at entry to the real store.apply lands no canonical write (warm=%s)", async warm => {
+      const copy = await run({ warm });
+      const note = `run bytes ${randomUUID()}\n`;
+      await fs.writeFile(path.join(copy.localRoot, "abort-note.txt"), note);
+      const controller = new AbortController();
+      const reason = new Error("RF3 abort during apply");
+      const actual = fileStoreModule.agentFileStore;
+      let applies = 0;
+      vi.spyOn(fileStoreModule, "agentFileStore").mockImplementation((...args) => {
+        const store = actual(...args);
+        const realApply = store.apply.bind(store);
+        vi.spyOn(store, "apply").mockImplementation(async (...applyArgs: Parameters<typeof realApply>) => {
+          applies++;
+          controller.abort(reason);
+          return realApply(...applyArgs);
+        });
+        return store;
+      });
+      const service = agentInstructionWorkingCopyService(db);
+      vi.mocked(fileStoreModule.agentFileStore).mockRestore();
+      await expect(service.collectStopped({ companyId, runId: copy.runId, signal: controller.signal })).rejects.toBe(reason);
+      expect(applies).toBe(1);
+      // No canonical write: the durable store (read under its lock, which
+      // restores the projection) holds no run bytes, and neither does the tree.
+      await expect(agentFileStore(db).read(companyId, agentId, "abort-note.txt", board())).resolves.toBeNull();
+      await expect(fs.stat(path.join(root, "abort-note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      // The run's source copy is kept for the deadline owner's hold.
+      expect(await fs.readFile(path.join(copy.localRoot, "abort-note.txt"), "utf8")).toBe(note);
+    }, 30_000);
     it.each(cases)("stopped agent-directory save failure retains exact source and lease across teardown/restart, then retries to a verified save (%s, local, %s)", async (mode, kind) => {
       const warm = mode === "warm";
       const { copy, note, failing, held } = await holdUnsavedNote(warm, kind);
