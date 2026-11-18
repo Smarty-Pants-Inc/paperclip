@@ -13,7 +13,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // Independent reviewer regression: real person HTTP Stop, real DB cancellation,
 // real release/orchestrator/provider receipts and admission. No release or hold
 // producer is mocked. Only native provider execution/cancel delivery is scripted.
-const fixture = vi.hoisted(() => ({ calls: [] as string[], firstRun: "", onFirst: undefined as undefined | (() => Promise<void>), successorThrows: false }));
+const fixture = vi.hoisted(() => ({ calls: [] as string[], firstRun: "", onFirst: undefined as undefined | (() => Promise<void>), successorThrows: false,
+  closeSession: undefined as undefined | (() => Promise<void>), remoteCleanupScope: "" }));
 vi.mock("../services/heartbeat/runtime-selection.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/heartbeat/runtime-selection.js")>();
   return { ...actual, prepareAndSelectHeartbeatRuntime: (async (db, input, deps) => actual.prepareAndSelectHeartbeatRuntime(db,
@@ -31,7 +32,27 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
     }) as typeof actual.cancelNativeSession,
     executePaperclipNativeSession: (async input => {
       const runId = input.execution.binding.runId; fixture.calls.push(runId);
-      if (runId === fixture.firstRun && fixture.onFirst) { await fixture.onFirst(); throw new actual.NativeCancellationPendingRecoveryError(); }
+      if (runId === fixture.firstRun && fixture.onFirst) {
+        if (fixture.closeSession) {
+          const { executeNativeSession } = await import("../vendor/paperclip-runner/index.js");
+          const identity = { ...input.execution.binding, sessionId: `silent-wait-${runId}` };
+          const capabilities = { resume: true, typedEvents: true, steering: false, interruption: false, structuredResult: true };
+          await executeNativeSession({ input: input.execution, runnerInstanceId: randomUUID(), controlPlaneInstanceId: "silent-wait-control",
+            remoteCleanupScope: fixture.remoteCleanupScope,
+            backend: { descriptor: async () => ({ kind: "runner", name: "silent-wait-provider", version: "1", capabilities, runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } }), openSession: async () => ({
+              identity: () => identity, capabilities: async () => capabilities,
+              async *events() { await fixture.onFirst!(); throw new actual.NativeCancellationPendingRecoveryError(); },
+              startTurn: async () => ({ turnId: "silent-wait-turn" }), result: async () => null,
+              snapshot: async () => ({ backendKind: "mock", sessionId: identity.sessionId, identity, providerSessionId: "silent-wait-provider",
+                cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }), close: () => fixture.closeSession!(),
+            }) },
+            controlPlane: { openRun: async () => {}, checkpointSession: async () => {},
+              appendEvent: async () => ({ cursor: 0, highestContiguousSourceSeq: 0, disposition: "committed" }),
+              replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }), completeRun: async () => {} },
+          });
+        } else await fixture.onFirst();
+        throw new actual.NativeCancellationPendingRecoveryError();
+      }
       if (fixture.successorThrows) throw new Error("rf4_successor_provider_turn_reached");
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "rf4 successor answered" };
     }) as typeof actual.executePaperclipNativeSession };
@@ -48,6 +69,7 @@ import { taskInterruptionPresentation } from "../services/task-interruption-pres
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { acknowledgedNativeStopExecutionHasStopped } from "../services/acknowledged-native-stop.js";
+import { nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 async function waitFor(check: () => Promise<boolean>, ms = 10_000) {
@@ -70,7 +92,8 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
   });
   // a8 (D2): opts.chat makes the task a chat and sends the message through the real chat
   // route POST /api/issues/:id/comments (routes/issues.ts:20130-20162).
-  async function exercise(mode: "waiting" | "mid_turn", label: string, opts: { chat?: boolean } = {}) {
+  async function exercise(mode: "waiting" | "mid_turn", label: string, opts: { chat?: boolean;
+    silentWait?: "settling" | "pending" | "confirmed" } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID(), wakeId = randomUUID();
     const providerLeaseId = `sandbox://fake/${runId}/${randomUUID()}`;
     const remoteCwd = path.join(home, runId); await fs.mkdir(remoteCwd); await fs.writeFile(path.join(remoteCwd, "notes.md"), "stopped edit\n");
@@ -120,11 +143,68 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       expect(result.status).toBe(200); expect(result.body.status).toBe("cancelled");
       await waitFor(async () => ((await heartbeat.getRun(runId))?.resultJson?.nativeCancellation as { dispatchState?: string } | undefined)?.dispatchState === "acknowledged");
       await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "native_retry_cancelled", leaseOwner: null, leaseExpiresAt: null }).where(eq(nativeRunFinalizations.runId, runId));
-      if (mode === "mid_turn") waitingWakes = await message();
+      if (mode === "mid_turn" && opts.silentWait !== "pending") waitingWakes = await message();
     };
-    const provider = getSandboxProvider("fake")!, stop = vi.spyOn(provider, "stopLease");
+    const provider = getSandboxProvider("fake")!;
+    let stop = vi.spyOn(provider, "stopLease");
+    const readThread = async () => {
+      const response = await request(app).get(`/api/issues/${issueId}/comments`);
+      expect(response.status).toBe(200);
+      return response.body as Array<Record<string, unknown>>;
+    };
+    const snapshots: Record<string, Array<Record<string, unknown>>> = {};
+    let failStop = opts.silentWait !== "confirmed";
+    const realSetTimeout = globalThis.setTimeout;
+    // Timing-only injection: spend the real nine-attempt retry budget without
+    // waiting six minutes. No gate/attempt counter is assigned by the fixture.
+    const retryTimer = opts.silentWait ? vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback, delay, ...args) =>
+      realSetTimeout(callback, delay === 60_000 && new Error().stack?.includes("native-session-runtime") ? 5 : delay, ...args)
+    ) as typeof setTimeout) : undefined;
+    if (opts.silentWait) {
+      // NAMED injection: only the provider stop RPC refuses to confirm. The real
+      // Stop route/ack, active executor, close retries, gate and comments are product-written.
+      stop.mockRestore();
+      const originalStop = getSandboxProvider("fake")!.stopLease.bind(provider);
+      stop = vi.spyOn(provider, "stopLease").mockImplementation(async input => {
+        if (failStop) throw new Error("SILENT_WAIT_PROVIDER_STOP_NEVER_CONFIRMS");
+        return originalStop(input);
+      });
+      fixture.remoteCleanupScope = JSON.stringify(["fake", providerLeaseId]);
+      fixture.closeSession = () => provider.stopLease({ config: { driver: "sandbox", provider: "fake", image: "fixture:test", reuseLease: true }, providerLeaseId }).then(() => undefined);
+      const originalOnFirst = fixture.onFirst;
+      fixture.onFirst = async () => {
+        await originalOnFirst!();
+        if (opts.silentWait !== "pending") {
+          await heartbeat.resumeQueuedRuns();
+          snapshots.settling = await readThread();
+          // A second claim is a later dispatch/poll, not a second notification.
+          await heartbeat.resumeQueuedRuns();
+          snapshots.settlingPoll = await readThread();
+        }
+      };
+    }
     try {
       await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
+      if (opts.silentWait) {
+        if (opts.silentWait === "pending") waitingWakes = await message();
+        await heartbeat.resumeQueuedRuns();
+        snapshots.pending = await readThread();
+        if (opts.silentWait !== "confirmed") {
+          await waitFor(async () => nativeSessionCleanupBlock({ companyId, issueId }) === "operator_required", 20_000);
+          await heartbeat.resumeQueuedRuns();
+          snapshots.operatorRequired = await readThread();
+          await heartbeat.resumeQueuedRuns();
+          snapshots.operatorRequiredPoll = await readThread();
+        }
+        await fs.writeFile(path.join(process.env.TASK_OUT!, `sw-${opts.silentWait}-thread.json`), JSON.stringify({ companyId, issueId, runId, commentId, snapshots }, null, 2));
+        // End the injected outage through the real provider/teardown boundary;
+        // never clear a cleanup gate or plant a stop receipt in the database.
+        failStop = false;
+        const stopped = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        await heartbeat.releaseEnvironmentLeasesForRun({ runId, companyId, agentId, status: stopped[0]!.status, providerResourceDisposition: "stop_and_retain" });
+        await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+        await heartbeat.releaseEnvironmentLeasesForRun({ runId, companyId, agentId, status: stopped[0]!.status, providerResourceDisposition: "stop_and_retain" });
+      }
       const admittedAt = Date.now();
       do { await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions(); if (fixture.calls.length > 1) break; await new Promise(r => setTimeout(r, 100)); } while (Date.now() - admittedAt < 10_000);
       const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
@@ -138,9 +218,34 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       const evidence = { mode, opts, runId, companyId, agentId, issueId, commentId, lease, allLeases, holds, runs, calls: [...fixture.calls], blocker, projection, interruption,
         stopMs, stopResponse, waitingWakes, stopCalls: stop.mock.calls, observedMs: Date.now() - admittedAt, confirmed: hasConfirmedSandboxStopAndRetain(lease) };
       await fs.writeFile(path.join(process.env.TASK_OUT!, `own-${label}.json`), JSON.stringify(evidence, null, 2));
-      return { ...evidence, app, heartbeat };
-    } finally { fixture.onFirst = undefined; await heartbeat.drainActiveRunExecutions(); stop.mockRestore(); }
+      return { ...evidence, app, heartbeat, snapshots };
+    } finally { fixture.onFirst = undefined; await heartbeat.drainActiveRunExecutions(); retryTimer?.mockRestore(); stop.mockRestore(); fixture.closeSession = undefined; }
   }
+  const waitLine = "The previous session is still shutting down. Your work is saved, and Paperclip finishes the cleanup automatically. This turn starts when the old Runner is confirmed stopped. Paperclip is stopping it and keeps its files.";
+  const operatorLine = "This message hasn't started: Paperclip couldn't confirm the previous session stopped, and has stopped trying. Your message is saved; tell us and we'll start it.";
+  const bodies = (comments: Array<Record<string, unknown>>) => comments.map(comment => comment.body);
+  it("SW R1/R2: real Stop + ack, settling wait at once, then exhausted stop has its own line once", async () => {
+    const r = await exercise("mid_turn", "sw-settling", { chat: true, silentWait: "settling" });
+    expect.soft(bodies(r.snapshots.settling).filter(body => body === waitLine), "R1 immediate wait line").toHaveLength(1);
+    expect.soft(bodies(r.snapshots.settlingPoll).filter(body => body === waitLine), "R1 dedupe on later polls").toHaveLength(1);
+    expect.soft(bodies(r.snapshots.operatorRequired).filter(body => body === operatorLine), "R2 exhausted line").toHaveLength(1);
+    expect.soft(bodies(r.snapshots.operatorRequiredPoll).filter(body => body === operatorLine), "R2 dedupe on later polls").toHaveLength(1);
+    expect(r.snapshots.settling.some(comment => comment.id === r.commentId && comment.body === "Please answer next."), "typed message saved").toBe(true);
+    expect(r.runs, "one successor after a confirmed provider stop").toHaveLength(1);
+    expect(r.calls).toEqual([r.runId, r.runs[0]!.id]);
+  }, 60_000);
+  it("SW R3: pending cleanup keeps the existing wait line once", async () => {
+    const r = await exercise("mid_turn", "sw-pending", { chat: true, silentWait: "pending" });
+    expect(bodies(r.snapshots.pending).filter(body => body === waitLine)).toHaveLength(1);
+  }, 60_000);
+  it("SW R4: confirmed stop runs the saved message once with no exhausted line", async () => {
+    const r = await exercise("mid_turn", "sw-confirmed", { chat: true, silentWait: "confirmed" });
+    expect(r.confirmed).toBe(true);
+    expect(r.runs).toHaveLength(1);
+    expect(r.calls).toEqual([r.runId, r.runs[0]!.id]);
+    expect(bodies(r.snapshots.pending).filter(body => body === operatorLine)).toHaveLength(0);
+    expect(bodies(r.snapshots.pending).filter(body => body === waitLine).length).toBeLessThanOrEqual(1);
+  }, 60_000);
   // RFL 05:07Z: a message waiting BEFORE the person's Stop is not run by itself
   // after that Stop. It stays HELD (the deferred wake the queued list shows with
   // Send) and is answered exactly once on Send or with the next new message.
