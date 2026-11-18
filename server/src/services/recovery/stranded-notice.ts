@@ -1,5 +1,6 @@
 import type { IssueCommentMetadata, IssueCommentPresentation } from "@paperclipai/shared";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "../environment-provider-unavailable-error.js";
+import { NEW_TASK_CONTINUE_ACTION } from "../execution-blocker.js";
 import {
   agentLinkRow,
   keyValueRow,
@@ -50,6 +51,7 @@ export type StrandedRetryAdmission =
   | { admits: false; refusal: "previous_execution_unverified"; agentName?: string | null }
   | { admits: false; refusal: "system_waiting"; waitMessage: string }
   | { admits: false; refusal: "saved_work_recovering" }
+  | { admits: false; refusal: "held_source_unbound" }
   | { admits: false; refusal: "budget_blocked" }
   | { admits: false; refusal: "daily_limit"; agentName?: string | null; kind?: "runs" | "cost"; limit?: number | null }
   | { admits: false; refusal: "none" };
@@ -120,6 +122,14 @@ export function strandedRetryRefusalCopy(retry: Exclude<StrandedRetryAdmission, 
         nextAction: `To continue now, create a new task for ${name}; your message here is saved. This task continues once a board user records that the previous attempt stopped; there is no button for that on the task yet.`,
       };
     }
+    // #21914: the hold the attempt waited on is another agent's run, which this
+    // task's Retry cannot bind; Retry admits nothing there. A new task does
+    // (rf5-heldnote). The step is upstream's own new-task wording.
+    case "held_source_unbound":
+      return {
+        body: `This attempt could not be finished automatically. It was held behind saved work from another agent's attempt, so Retry on this task could not continue from it. ${NEW_TASK_CONTINUE_ACTION}`,
+        nextAction: NEW_TASK_CONTINUE_ACTION,
+      };
     // A system-owned wait the screen names itself (retryWait.message, no button).
     case "system_waiting":
       return {

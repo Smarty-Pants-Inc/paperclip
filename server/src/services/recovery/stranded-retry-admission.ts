@@ -40,13 +40,26 @@ async function admissionFollowingPresentation(db: Db, issue: { id: string; compa
   // workspaceRecoveryDisplay; or the hold's RECOVERING_SAVED_WORK_NEXT_ACTION),
   // the system state wins over the person action workspace_repair_required
   // would name: no "Press Recover saved files" while the system holds it.
-  if (admission.refusal !== "none" && admission.refusal !== "workspace_repair_required") return admission;
-  const { getExecutionBlocker } = await import("../execution-blocker.js");
-  const blocker = await getExecutionBlocker(db, issue.companyId, issue.id);
-  const { RECOVERING_SAVED_WORK_NEXT_ACTION } = await import("../legacy-execution-recovery.js");
-  if (blocker?.workspaceRecovery && ["queued", "recovering"].includes(blocker.workspaceRecovery.status)
-    || blocker?.nextAction === RECOVERING_SAVED_WORK_NEXT_ACTION)
-    return { admits: false, refusal: "saved_work_recovering" };
+  if (admission.refusal === "none" || admission.refusal === "workspace_repair_required") {
+    const { getExecutionBlocker } = await import("../execution-blocker.js");
+    const blocker = await getExecutionBlocker(db, issue.companyId, issue.id);
+    const { RECOVERING_SAVED_WORK_NEXT_ACTION } = await import("../legacy-execution-recovery.js");
+    if (blocker?.workspaceRecovery && ["queued", "recovering"].includes(blocker.workspaceRecovery.status)
+      || blocker?.nextAction === RECOVERING_SAVED_WORK_NEXT_ACTION)
+      return { admits: false, refusal: "saved_work_recovering" };
+  }
+  // #21914 (9c008635): the observed run is a stale-run gate's pre-start
+  // cancellation whose hold's source Retry cannot bind for the assignee (another
+  // agent's run). The screen's wait ("Retry is waiting for execution checks")
+  // never ends in a run there: Retry binds and admits nothing. The step that
+  // works is a new task. An input of this one decision, not a second reading.
+  if ((admission.refusal === "system_waiting" || admission.refusal === "none") && issue.assigneeAgentId
+    && presentation?.observedRunId) {
+    const { preDispatchHeldSourceUnbound } = await import("../pre-dispatch-execution-wait.js");
+    if (await preDispatchHeldSourceUnbound(db, { companyId: issue.companyId, issueId: issue.id,
+      agentId: issue.assigneeAgentId, runId: presentation.observedRunId }))
+      return { admits: false, refusal: "held_source_unbound" };
+  }
   return admission;
 }
 

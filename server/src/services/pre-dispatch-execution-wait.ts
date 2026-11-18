@@ -53,6 +53,29 @@ export function preDispatchHeldSourceRunId(input: { runId: SQL; companyId: strin
     limit 1)`;
 }
 
+/** Whether a person's Retry from `runId` cannot reach the hold it waits on: the
+ * run is a stale-run gate's pre-start cancellation whose receipt names a live
+ * (not exhausted) hold of this task, and that hold's source is not one
+ * `preDispatchHeldSourceRunId` binds for `agentId` (another agent's run, or a
+ * run of another task). Retry then binds nothing and admits nothing (#21914). */
+export async function preDispatchHeldSourceUnbound(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; runId: string;
+}): Promise<boolean> {
+  const [row] = await db.select({ heldSource: preDispatchHeldSourceRunId({ runId: sql`${input.runId}::uuid`,
+    companyId: input.companyId, issueId: input.issueId, agentId: input.agentId }) })
+    .from(heartbeatRuns).innerJoin(issueRecoveryActions, and(
+      eq(issueRecoveryActions.companyId, heartbeatRuns.companyId),
+      sql`${issueRecoveryActions.id} = ${canonicalExecutionUuid(sql`${heartbeatRuns.resultJson}->'executionWait'->>'recoveryActionId'`)}`,
+      sql`${issueRecoveryActions.sourceIssueId}::text = ${input.issueId}`,
+      sql`${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' is distinct from 'exhausted'`,
+      sql`${issueRecoveryActions.evidence}->>'runId' is not null`))
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), sql`${heartbeatRuns.id} = ${input.runId}::uuid`,
+      sql`${heartbeatRuns.retryOfRunId} is null and ${heartbeatRuns.startedAt} is null`,
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`, preDispatchExecutionWaitPredicate()))
+    .limit(1);
+  return Boolean(row) && row!.heldSource === null;
+}
+
 /** Re-evaluate old false incidents with the same proof; retain their audit rows
  * and leave the original execution/workspace hold to its own recovery policy. */
 export function preDispatchExecutionWaitRecoveryActionPredicate() {
