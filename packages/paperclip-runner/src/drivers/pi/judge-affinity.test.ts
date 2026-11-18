@@ -47,5 +47,5 @@ it('independent actual managed driver: cold recover retains identity AND deliver
     expect(proof.envLeaks).toEqual([false,false,false]);
     expect(proof.sessionHeader).toEqual([proof.first.ids.providerSessionId,proof.first.ids.providerSessionId,proof.other.ids.providerSessionId]);
   }catch(e){proof.error=String(e);proof.status='failed';throw e;}
-  finally{await session?.close({reason:'cleanup'});for(const t of native)if(!t.exited)await t.close();peer.closeAllConnections();await new Promise<void>(r=>peer.close(()=>r()));proof.children=native.map(t=>({pid:t.pid,exited:t.exited,absent:!existsSync(`/proc/${t.pid}`)}));await writeFile(join(process.env.TASK_OUT!,'driver-cold-proof.json'),JSON.stringify(proof,null,2));}
+  finally{await session?.close({reason:'cleanup'});for(const t of native)if(!t.exited)await t.close();peer.closeAllConnections();await new Promise<void>(r=>peer.close(()=>r()));proof.children=native.map(t=>({pid:t.pid,exited:t.exited,absent:!existsSync(`/proc/${t.pid}`)}));if(process.env.TASK_OUT)await writeFile(join(process.env.TASK_OUT,'driver-cold-proof.json'),JSON.stringify(proof,null,2));}
 },100000);
