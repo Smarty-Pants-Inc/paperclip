@@ -1227,24 +1227,55 @@ suite("fresh-continuation fallback", () => {
     // A person-agent conversation cannot be closed or reassigned (issues_conversation_identity_check): those two
     // leave the conversation as the product does, and become an ordinary task.
     const leaveConversation = { conversationAgentId: null, conversationUserId: null, conversationState: null };
-    for (const [label, change] of [["closed", { status: "done", ...leaveConversation }], ["backlog", { status: "backlog" }],
-      ["another assignee", { assigneeAgentId: otherAgent!.id, ...leaveConversation }]] as const) {
+    for (const [label, change, reason, message] of [
+      ["closed", { status: "done", ...leaveConversation }, "task_closed", "This task is Done. Move it to To do to run it."],
+      ["cancelled", { status: "cancelled", ...leaveConversation }, "task_closed", "This task is Cancelled. Move it to To do to run it."],
+      ["backlog", { status: "backlog", ...leaveConversation }, "task_backlog", "This task is in Backlog. Move it to To do to run it."],
+      ["another assignee", { assigneeAgentId: otherAgent!.id, ...leaveConversation }, "task_reassigned",
+        "This task is assigned to another agent. Reassign it to the previous agent to retry this attempt."],
+    ] as const) {
       // One person-agent conversation per company: retire the previous fixture's conversation identity.
       await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null })
         .where(and(eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId)));
       const g = await judgeQueued(false);
       await db.update(issues).set(change as never).where(eq(issues.id, g.issueId));
+      const wakesBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      const cardBefore = await taskInterruptionPresentation(db, await issue(g.issueId));
       const press = await request(app).post(`/api/issues/${g.issueId}/retry`).send({ observedRunId: g.queued.id, idempotencyKey: randomUUID() });
       await heartbeat.drainActiveRunExecutions();
       const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, g.issueId));
       const [kept] = rows.filter(r => r.id === g.queued.id);
       const started = rows.filter(r => r.id !== g.source.id && r.startedAt);
       const created = rows.filter(r => r.id !== g.source.id && r.id !== g.queued.id);
-      console.info(JSON.stringify({ fix13NotOpenWork: { label, route: press.status, body: press.body,
-        old: { status: kept!.status, startedAt: kept!.startedAt, errorCode: kept!.errorCode }, created: created.map(r => r.id), started: started.map(r => r.id) } }));
+      const cardAfter = await taskInterruptionPresentation(db, await issue(g.issueId));
+      console.info(JSON.stringify({ fix14NotOpenWork: { label, issueId: g.issueId, route: press.status, body: press.body, cardBefore, cardAfter,
+        old: { id: kept!.id, status: kept!.status, startedAt: kept!.startedAt, errorCode: kept!.errorCode }, created: created.map(r => r.id), started: started.map(r => r.id) } }));
+      expect.soft(press.status, `${label}: TRUE refusal, never 202`).toBe(200);
+      expect.soft(press.body, `${label}: named refusal`).toMatchObject({ accepted: false, requestId: null, refused: { reason, message } });
+      for (const card of [cardBefore, cardAfter, press.body.presentation]) {
+        expect.soft(card, `${label}: no Retry`).toMatchObject({ canRetry: false, notice: { code: reason, text: message } });
+        expect.soft(card?.state, `${label}: never working`).not.toBe("working");
+      }
       expect(created, `${label}: no fresh run`).toEqual([]);
       expect(started, `${label}: nothing started`).toEqual([]);
-      expect(kept!.errorCode, `${label}: the Retry did not replace the run`).not.toBe("person_queued_run_replaced");
+      expect(kept, `${label}: the old run is unchanged`).toMatchObject({ status: "queued", startedAt: null, errorCode: g.queued.errorCode });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
+        `${label}: no wake queued, cancelled or changed`).toEqual(wakesBefore);
+      if (label === "backlog") {
+        // Remove only the fixture's independent predecessor cleanup hold; the person changes status through the real route.
+        await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, g.lease.id));
+        const move = await request(app).patch(`/api/issues/${g.issueId}`).send({ status: "todo" });
+        expect(move.status, JSON.stringify(move.body)).toBe(200);
+        await heartbeat.drainActiveRunExecutions();
+        for (let pass = 0; pass < 2; pass++) {
+          await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+        }
+        const movedRuns = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, g.issueId)))
+          .filter(r => r.id !== g.source.id && r.startedAt);
+        console.info(JSON.stringify({ fix14MoveToTodo: { issueId: g.issueId, route: move.status,
+          started: movedRuns.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+        expect(movedRuns, "Moving to To do starts exactly ONE run, including later queue passes").toHaveLength(1);
+      }
     }
   }, 120_000);
 
