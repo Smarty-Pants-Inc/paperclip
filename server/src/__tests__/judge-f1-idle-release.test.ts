@@ -5573,7 +5573,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     return { runtime, call, input, predecessor, predecessorRunId, nextRunId };
   }
 
-  it.each([["succeeded", 0], ["failed", 0], ["failed", 1_500]] as const)("resumes a warm lease that its %s predecessor is still releasing (stop reply after %i ms) instead of creating a fresh sandbox", async (predecessorStatus, stopReplyDelayMs) => {
+  it.each([["succeeded", 0]] as const)("resumes a warm lease that its %s predecessor is still releasing (stop reply after %i ms) instead of creating a fresh sandbox", async (predecessorStatus, stopReplyDelayMs) => {
     const f = await seedSettlingWarmLease(new Date(), predecessorStatus, stopReplyDelayMs);
     const released = new Promise<void>(resolve => setTimeout(() => {
       void f.runtime.releaseRunLeases(f.predecessorRunId, "released", undefined, "stop_and_retain").then(() => resolve());
@@ -5583,6 +5583,27 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(next.lease.providerLeaseId).toBe(f.predecessor.lease.providerLeaseId);
     expect(next.lease.heartbeatRunId).toBe(f.nextRunId);
     expect(f.call.mock.calls.filter(call => call[1] === "environmentAcquireLease")).toHaveLength(1);
+  });
+
+  // CHANGED BY DESIGN (B1 fence a, the judges' joint line, smarty-dev#4605
+  // comment 6992985316): a FAILED predecessor's stopped box may still hold its
+  // processes in memory, so within PREDECESSOR_LONG_STOP_MS (15 min) of its
+  // 'stopped' receipt no other run resumes it: the next run waits for the
+  // release to settle, then gets a fresh box (not resumed within the window).
+  it.each([["failed", 0], ["failed", 1_500]] as const)("does not resume a warm lease that its %s predecessor is still releasing (stop reply after %i ms): a fresh box within the long-stop window", async (predecessorStatus, stopReplyDelayMs) => {
+    const f = await seedSettlingWarmLease(new Date(), predecessorStatus, stopReplyDelayMs);
+    const released = new Promise<void>(resolve => setTimeout(() => {
+      void f.runtime.releaseRunLeases(f.predecessorRunId, "released", undefined, "stop_and_retain").then(() => resolve());
+    }, 400));
+    const next = await f.runtime.acquireRunLease({ ...f.input, heartbeatRunId: f.nextRunId });
+    await released;
+    expect(next.lease.providerLeaseId).not.toBe(f.predecessor.lease.providerLeaseId);
+    expect(next.lease.heartbeatRunId).toBe(f.nextRunId);
+    expect(f.call.mock.calls.filter(call => call[1] === "environmentResumeLease")).toHaveLength(0);
+    expect(f.call.mock.calls.filter(call => call[1] === "environmentAcquireLease")).toHaveLength(2);
+    // The predecessor's box is kept (stopped, with its receipt), not stranded.
+    const kept = await environmentService(db).getLeaseById(f.predecessor.lease.id);
+    expect((kept?.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state).toBe("stopped");
   });
 
   it("does not wait for a warm lease that a predecessor finished long ago and never released", async () => {
