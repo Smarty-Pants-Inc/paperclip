@@ -83,6 +83,25 @@ describe("TaskChatQueuedMessages", () => {
     return props;
   }
 
+  it("AUDIT offers mid-turn reorder handles for the Agent Chat per-message wake queue", () => {
+    const entries = [queue.entries[0],
+      { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" },
+      { ...queue.entries[1], comment: { ...queue.entries[1].comment, id: "comment-3", body: "Third queued message" },
+        queueId: "wake-3", queueRevision: "rev-3", position: 2 }];
+    render({ queue: { ...queue, steeringDisposition: "unsupported", entries } });
+    const handles = [...container.querySelectorAll<HTMLButtonElement>('[aria-label^="Reorder queued message:"]')];
+    console.log("AUDIT QUEUE HANDLES", JSON.stringify(handles.map(button => ({ label: button.getAttribute("aria-label"), disabled: button.disabled, title: button.title }))));
+    expect(handles).toHaveLength(3);
+    expect(handles.map(button => button.disabled)).toEqual([false, false, false]);
+  });
+
+  it("AUDIT can calculate a reorder across the Agent Chat per-message wakes", () => {
+    const entries = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" }];
+    const reordered = reorderQueuedMessageEntries(entries, "comment-1", "comment-2");
+    console.log("AUDIT QUEUE HELPER", JSON.stringify({ reordered }));
+    expect(reordered?.map(entry => entry.comment.id)).toEqual(["comment-2", "comment-1"]);
+  });
+
   it("keeps saved input visible without duplicating the task status", () => {
     const message = "Waiting for the previous environment to stop. Your message will start automatically.";
     render({ queue: { ...queue, executionWait: { reason: "remote_cleanup", message } } });

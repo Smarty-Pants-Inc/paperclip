@@ -22,6 +22,26 @@ import type { IssueTimelineEvent } from "./issue-timeline-events";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import { registerUIAdapter, unregisterUIAdapter } from "../adapters/registry";
 
+describe("AUDIT notice scope", () => {
+  it.each([
+    { name: "superseded unanswered notice", authorType: "system", reason: "unanswered_message:message-1", kind: "system_notice", deleted: true, expected: false },
+    { name: "unrelated system comment", authorType: "system", reason: "unrelated_audit_event", kind: undefined, deleted: true, expected: true },
+    { name: "unrelated system notice", authorType: "system", reason: "other_notice", kind: "system_notice", deleted: true, expected: true },
+    { name: "deleted person with notice metadata", authorType: "user", reason: "unanswered_message:message-1", kind: "system_notice", deleted: true, expected: true },
+    { name: "deleted agent with notice metadata", authorType: "agent", reason: "unanswered_message:message-1", kind: "system_notice", deleted: true, expected: true },
+    { name: "live empty system notice", authorType: "system", reason: "unanswered_message:message-1", kind: "system_notice", deleted: false, expected: true },
+  ])("$name", ({ name, authorType, reason, kind, deleted, expected }) => {
+    const comments = [createComment({ id: "audit-comment", authorType: authorType as any,
+      authorUserId: authorType === "user" ? "user-1" : null,
+      authorAgentId: authorType === "agent" ? "agent-1" : null,
+      body: "", deletedAt: deleted ? new Date("2026-11-17T18:10:30Z") : null,
+      metadata: { authorizationReason: reason }, presentation: kind ? { kind: kind as any, title: name } : null })];
+    const messages = buildIssueChatMessages({ comments, timelineEvents: [], linkedRuns: [], liveRuns: [] });
+    console.log("AUDIT NOTICE", JSON.stringify({ name, expected, shown: messages.map(m => m.id) }));
+    expect(messages.map(m => m.id)).toEqual(expected ? ["audit-comment"] : []);
+  });
+});
+
 describe("connection intents in the task feed", () => {
   it("orders the card chronologically and collapses live/polling snapshots into one updated message", () => {
     const pending = {
@@ -1574,6 +1594,23 @@ describe("buildIssueChatMessages", () => {
       status: { type: "complete", reason: "stop" },
       metadata: { custom: { runStatus: "cancelled" } },
     });
+  });
+
+  it.each([
+    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "viewer" }, label: "Stopped by you", detail: "You stopped this run before it finished." },
+    { resultJson: { interruptedByActorType: "user", interruptedByActorId: "viewer", operatorInterrupted: true }, label: "Interrupted by you", detail: "You interrupted this run." },
+    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "other" }, label: "Stopped by Alex" },
+    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "unknown" }, label: "Stopped by a board member" },
+    { resultJson: { cancelledByActorType: "system", cancelledByUserId: "viewer" }, label: "Cancelled after 1 minute" },
+    { resultJson: { cancelledByActorType: "agent", cancelledByUserId: "viewer" }, label: "Cancelled after 1 minute" },
+  ])("attributes a cancelled run to its recorded actor ($label)", ({ resultJson, label, detail }) => {
+    const messages = buildIssueChatMessages({ comments: [], timelineEvents: [], liveRuns: [],
+      currentUserId: "viewer", userLabelMap: new Map([["other", "Alex"]]),
+      linkedRuns: [{ runId: "stop", status: "cancelled", agentId: "agent", resultJson,
+        createdAt: "2026-04-06T12:01:00Z", startedAt: "2026-04-06T12:01:00Z", finishedAt: "2026-04-06T12:02:00Z" }],
+    });
+    expect(messages[0]?.metadata.custom).toMatchObject({ chainOfThoughtLabel: label });
+    if (detail) expect(messages[0]?.metadata.custom).toMatchObject({ notices: [detail] });
   });
 
   it("labels pause-caused cancelled runs as paused by board", () => {
