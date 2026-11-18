@@ -13,7 +13,7 @@ import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-m
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
 import { createHash } from "node:crypto";
-import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
+import { appendHeartbeatRunEvent, stopAcceptanceEventSql } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun, QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, userStopBoundaryAt } from "./run-cancellation.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { isCancelledNativeStartup, isFailedNativePreparation, isFailedNativePreparationRetryAncestor } from "./cancelled-native-startup.js";
@@ -24,7 +24,7 @@ import { z } from "zod";
 import { and, desc, eq, gt, inArray, isNull, ne, not, or, sql, type SQL } from "drizzle-orm";
 import {
   agents, agentWakeupRequests, approvals, issueApprovals, issueThreadInteractions,
-  environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
+  environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, type Db,
 } from "@paperclipai/db";
 import { executionBlockerPredicate, getExecutionBlocker, hasPendingRunCleanup, nativeExecutionRecoveryActionPredicate, restoreHoldReleasedForCurrentOwnerPredicate } from "./execution-blocker.js";
@@ -40,6 +40,7 @@ import { canResumePreservedResultFinalization } from "./preserved-result-finaliz
 import { isServerReplacementInterruption } from "./server-replacement-interruption.js";
 import { normalizeAgentNameKey } from "./agent-name-key.js";
 import { liftInterruptionBlock } from "./interruption-block-release.js";
+import { isAcknowledgedNativeStop } from "./acknowledged-native-stop.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "agentId" | "status" | "startedAt" | "finishedAt" | "createdAt" |
@@ -315,7 +316,8 @@ export async function admitExplicitNativeContinuation(input: {
   const sourceChecks: Array<{ id?: string; cause: string; evidence: Record<string, unknown> }> =
     actions.map(action => ({ id: action.id, cause: action.cause, evidence: action.evidence }));
   if (nativeQueuedSend) {
-    const [latest] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode })
+    const [latest] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode,
+      companyId: heartbeatRuns.companyId, nativeIssueId: heartbeatRuns.nativeIssueId, resultJson: heartbeatRuns.resultJson, finishedAt: heartbeatRuns.finishedAt })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
         eq(heartbeatRuns.runtimeMode, "native"),
         or(eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.issueId, issueId),
@@ -343,7 +345,28 @@ export async function admitExplicitNativeContinuation(input: {
       if (!result || await hasPendingRunCleanup(db, companyId, latest.id))
         return blocked("cleanup_pending", "Waiting for the previous run to finish cleanup. Your message is saved.");
     }
-    if (latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) &&
+    // Option S: the chat owner's Send after an acknowledged person Stop takes the
+    // same ordinary admission as a typed message; no synthetic stopped-run source.
+    const ownerSendAfterPersonStop = !blocker && !sourceChecks.length && task.conversationAgentId === agentId
+      && interruptIntent?.actorId === task.conversationUserId && !!latest && isAcknowledgedNativeStop(latest)
+      && !!latest.finishedAt && latest.finishedAt <= interruptRequestedAt!
+      // Only when nothing else is active or queued on this chat (the same source as
+      // run-control resumeSavedComments); otherwise the Send takes the ordinary path.
+      && !(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId), ne(heartbeatRuns.id, latest.id),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+        inArray(heartbeatRuns.status, ["running", "queued", "scheduled_retry"]),
+      )).limit(1)).length
+      // Positive proof: the Stop route's server-owned acceptance row, and no acceptance of any other kind (an Interrupt or a malformed row denies).
+      // Adapter events can write a caller-chosen lifecycle row (source ids NULL) but always add their receipt stamp, so the exact keys,
+      // the chat owner and a write before the run finished bind the row to the Stop route's acceptance (forgery.md).
+      && ((rows: { payload: Record<string, unknown> | null; createdAt: Date }[]) => rows.length > 0 && rows.every(({ payload, createdAt }) =>
+        Object.keys(payload ?? {}).sort().join() === "acceptedAt,issueId,kind,schema,userId" && payload!.schema === "paperclip.stop-acceptance.v1"
+        && payload!.kind === "person_stop" && payload!.userId === task.conversationUserId && payload!.issueId === issueId
+        && typeof payload!.acceptedAt === "string" && Date.parse(payload!.acceptedAt) <= latest.finishedAt!.getTime() && createdAt <= latest.finishedAt!))(
+        await db.select({ payload: heartbeatRunEvents.payload, createdAt: heartbeatRunEvents.createdAt }).from(heartbeatRunEvents)
+          .where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, latest.id), stopAcceptanceEventSql())));
+    if (latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) && !ownerSendAfterPersonStop &&
         !sourceChecks.some(source => (source.evidence.runId ?? source.evidence.sourceRunId) === latest.id)) {
       sourceChecks.push({ cause: "native_continuation_requires_reconciliation", evidence: { runId: latest.id } });
     }

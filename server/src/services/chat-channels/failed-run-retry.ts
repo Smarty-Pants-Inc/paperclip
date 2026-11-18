@@ -33,9 +33,11 @@ import {
   like,
   ne,
   notInArray,
+  not,
   or,
   sql,
 } from "drizzle-orm";
+import { seqPastStopAcceptance, stopAcceptanceEventSql } from "../heartbeat-run-events.js";
 
 import type { Db } from "@paperclipai/db";
 import {
@@ -297,18 +299,19 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       run.logCompressed
     )
       return false;
-    const events = await tx
+    const events = await seqPastStopAcceptance(tx as unknown as Db, run.companyId, run.id, await tx
       .select()
       .from(heartbeatRunEvents)
       .where(
         and(
           eq(heartbeatRunEvents.companyId, run.companyId),
           eq(heartbeatRunEvents.runId, run.id),
+          not(stopAcceptanceEventSql()),
         ),
       )
       .orderBy(asc(heartbeatRunEvents.seq))
       .limit(workspacePreparation ? 4 : 3)
-      .for("share", { noWait: true });
+      .for("share", { noWait: true }));
     let preparationOffset = 0;
     const warning = events[0];
     if (workspacePreparation && warning?.eventType === "agent_observability.unavailable") {

@@ -66226,7 +66226,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   }
 
   it.each((["github", "telegram"] as const).flatMap(provider =>
-    (["writer_setup", "other_setup", "late_event", "retained_native", "accepted_result", "source_changed", "untrusted_metadata", "live_controller", "process", "environment", "prior_writer"] as const).map(mode => ({ provider, mode }))))(
+    (["writer_setup", "stop_accepted", "null_tail", "stop_null_tail", "other_setup", "late_event", "retained_native", "accepted_result", "source_changed", "untrusted_metadata", "live_controller", "process", "environment", "prior_writer"] as const).map(mode => ({ provider, mode }))))(
     "retries a fully recorded never-dispatched $provider setup through HTTP: $mode", async ({ provider, mode }) => {
       const f = provider === "github" ? await currentGitHubTaskRetryFixture() : await failedChatRetryFixture("telegram", undefined, true);
       const { issueRoutes } = await import("../routes/issues.js");
@@ -66259,13 +66259,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           ...(mode === "live_controller" ? { controllerLeaseExpiresAt: new Date(Date.now() + 60_000) } : {}),
           ...(mode === "process" ? { processPid: 999999999, processGroupId: 999999999 } : {}),
         }).where(eq(heartbeatRuns.id, f.runId));
+        // optS-dd condition 1: a Stop accepted before the failure leaves run-control's acceptance row first;
+        // the exact-sequence readers read past it, so Retry works as on B. Mutation: drop a reader's skip.
+        const stopRow = mode === "stop_accepted" || mode === "stop_null_tail" ? 1 : 0;
+        if (stopRow) await db.insert(heartbeatRunEvents).values({ companyId, agentId: f.fixture.assignedAgentId, runId: f.runId, seq: 1,
+          eventType: "lifecycle", stream: "system", level: "info", message: "run.stop.accepted",
+          payload: { schema: "paperclip.stop-acceptance.v1", kind: "interrupt", issueId, userId: "owner-user", acceptedAt: new Date().toISOString() } });
         await db.insert(heartbeatRunEvents).values([
-          { companyId, agentId: f.fixture.assignedAgentId, runId: f.runId, seq: 1,
+          { companyId, agentId: f.fixture.assignedAgentId, runId: f.runId, seq: 1 + stopRow,
             eventType: "error", stream: "system", level: "error", message: diagnostic },
-          { companyId, agentId: f.fixture.assignedAgentId, runId: f.runId, seq: 2,
+          { companyId, agentId: f.fixture.assignedAgentId, runId: f.runId, seq: 2 + stopRow,
             eventType: "lifecycle", stream: "system", message: "task.run.measured",
             payload: { phase: "task.run.measured", outcome: "failed", durableSettlement: true, durationMs: 5 } },
         ]);
+        // optS-dd fix F1 (rf-4's chat-reader): a source-NULL lifecycle row whose message IS NULL stays disqualifying, as on B
+        // (no stop row), also after a Stop's row. Mutation: the shared predicate's nullable equality drops it under NOT.
+        if (mode === "null_tail" || mode === "stop_null_tail") await db.insert(heartbeatRunEvents).values({ companyId,
+          agentId: f.fixture.assignedAgentId, runId: f.runId, seq: 3 + stopRow, eventType: "lifecycle", stream: "system", level: "info", message: null });
         if (mode === "late_event") await db.insert(heartbeatRunEvents).values({ companyId,
           agentId: f.fixture.assignedAgentId, runId: f.runId, seq: 3, eventType: "session.started",
           sourceInstanceId: randomUUID(), payload: { prpEvent: { sourceKind: "runner" } } });
@@ -66304,7 +66314,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const original = (await readHeartbeatRunsById(f.runId))[0];
         const response = await request(app).post(`/api/issues/${issueId}/retry`).send({ observedRunId: f.runId,
           idempotencyKey: randomUUID() });
-        if (mode === "writer_setup" || mode === "other_setup") {
+        if (mode === "writer_setup" || mode === "other_setup" || mode === "stop_accepted") {
           expect(response.status, JSON.stringify(response.body)).toBe(202);
           await f.service.processFailedChatRunRetry(response.body.chatActionId);
           await expect.poll(async () => (await readAgentWakeupRequestsById(response.body.requestId))[0]?.runId).toBeTruthy();
