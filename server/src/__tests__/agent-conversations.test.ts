@@ -887,7 +887,7 @@ import {
           const taskQueue = (await request(routes(null)).get(queuePath).expect(200)).body;
           expect(taskQueue.entries.length).toBeGreaterThan(0);
           expect(taskQueue.executionWait).toEqual({ reason: "stopped_by_person",
-            message: "Stopped. These messages are waiting: Send them, or delete any first." });
+            message: "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first." });
           // Its one action, Send, sends the waiting messages.
           const sentTask = await request(routes(null)).post(`${queuePath}/interrupt`)
             .send({ queueId: taskQueue.queueId, revision: taskQueue.revision, targetRunId: null });
@@ -910,7 +910,7 @@ import {
         expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
         expect(queue.entries.every((entry: { queueId?: string }) => !entry.queueId || entry.queueId === queue.queueId)).toBe(true);
         expect(queue.executionWait).toEqual({ reason: "stopped_by_person",
-          message: "Stopped. These messages are waiting: Send them, or delete any first." });
+          message: "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first." });
         const reloaded = await readQueue();
         expect(reloaded.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
         expect(reloaded.executionWait?.reason).toBe("stopped_by_person");

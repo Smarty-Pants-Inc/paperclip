@@ -832,11 +832,19 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(history[0]!.deletedAt).not.toBeNull();
     });
 
-  // SCREEN row 3 (Stop means stop): two messages saved behind a PERSON's Stop
-  // are held (nothing promotes them), on an Agent Chat and on its task twin.
-  // They get the HELD notice, never "it will start by itself". The S10-1 case
-  // above (a cancel with no person's Stop record) is the unchanged control.
-  it.each([true, false])("SCREEN row 3: two messages held behind a person's Stop get the HELD notice (chat=%s)", async chat => {
+  // SCREEN row 3 (Stop means stop, RFL 06:40Z): two messages saved behind a
+  // PERSON's Stop are held (nothing promotes them), on an Agent Chat and on its
+  // task twin. They get the person-Stop notice: never "it will start by itself",
+  // and never HELD_PREDECESSOR_NOTICE's "Send a new message to try again" (a
+  // retype is answered twice: the held one is sent right after the new one).
+  // The S10-1 case above (a cancel with no person's Stop record) and the
+  // non-Stop held control below are unchanged.
+  const PERSON_STOP_HELD = "Stopped. This message is waiting and will be sent when you send your next message. Send it now, or delete it.";
+  const nextActionOf = (comment: { metadata: unknown }) => {
+    const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
+    return sections.flatMap(section => section.rows).find(row => row.label === "Next action")?.value;
+  };
+  it.each([true, false])("SCREEN row 3: two messages held behind a person's Stop get the person-Stop notice (chat=%s)", async chat => {
     const f = await fixture({ chat });
     const stoppedRunId = await f.run({ commentId: await f.message("Run the long job"), status: "cancelled", errorCode: "cancelled" });
     await db.update(heartbeatRuns).set({ resultJson: { cancelledByActorType: "user", cancelledByUserId: f.userId } })
@@ -853,8 +861,29 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleAt(f, PENDING_WAIT_BOUND_MS + 1_000);
     const bodies = (await f.visible()).map(note => note.body);
     expect(bodies).not.toContain(WAITING);
+    expect(bodies).not.toContain(HELD);
     expect(bodies.length).toBeGreaterThan(0);
-    expect(bodies.every(body => body === HELD)).toBe(true);
+    expect(bodies.every(body => body === PERSON_STOP_HELD)).toBe(true);
+    for (const note of await f.visible()) {
+      expect(note.presentation).toMatchObject({ title: "Stopped: your message is waiting" });
+      expect(nextActionOf(note)).toBe("Send it now, or delete it.");
+      expect(JSON.stringify(note.metadata)).not.toMatch(/send a new message/i);
+    }
+  });
+
+  // SCREEN row 3 control: a NON-Stop held case (a pre-turn refusal, G4's shape)
+  // keeps HELD_PREDECESSOR_NOTICE, its title and its "Send a new message" action.
+  it.each([true, false])("SCREEN row 3 control: a non-Stop held message keeps HELD_PREDECESSOR_NOTICE (chat=%s)", async chat => {
+    expect(HELD).toBe("Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.");
+    const f = await fixture({ chat });
+    await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
+      error: "runner_state_identity_mismatch: legacy_owner_unverified" });
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(HELD);
+    expect(notices[0]!.presentation).toMatchObject({ title: "Your message wasn't answered" });
+    expect(nextActionOf(notices[0]!)).toBe("Send a new message to try again.");
   });
 
   it("waitnote: execution_recovery uses the existing start bound and upgrades the SAME waiting note after it", async () => {
