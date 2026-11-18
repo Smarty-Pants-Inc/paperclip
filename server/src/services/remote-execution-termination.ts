@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
-import { environmentLeases, heartbeatRunEvents, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { retiredReusableLeasePredecessors } from "./environment-lease-handoff.js";
 import { OWN_PROCESS_START_EVENT_TYPES } from "./native-process-start-events.js";
 
@@ -26,6 +26,67 @@ export function remoteTerminationReceipt(lease: LeaseIdentity, value: unknown, p
     providerLeaseId: lease.providerLeaseId, state: receipt!.state,
     confirmedAt: new Date().toISOString(),
   };
+}
+
+/** Boat (docs.boat.dev/snapshots/stop.md, "Resume within 10 minutes"): after
+ * 10 minutes stopped, a resume always starts a new machine from the snapshot.
+ * Core requires 15. (Re-exported by native-session-executor.ts.) */
+export const PREDECESSOR_LONG_STOP_MS = 15 * 60_000;
+
+/** P's run statuses that keep its box fenced (B): a person's Stop
+ * (cancelled), a failure (failed, timed_out) or an interruption. A succeeded
+ * run finished its work: its successor's ordinary warm reuse stays allowed. */
+export const RESUME_FENCED_PREDECESSOR_RUN_STATUSES: ReadonlySet<string> =
+  new Set(["cancelled", "failed", "timed_out", "interrupted"]);
+
+/** B1 (fence a, the judges' joint line, smarty-dev#4605 comment 6992985316):
+ * a released lease whose typed termination receipt is "stopped" or
+ * "destroyed" (alike, as ownLeaseTerminated reads them) may still hold its
+ * run P's provider and tool processes in memory: a short-stopped box resumes
+ * with memory and processes alive (environment-execution-target.ts, Boat's
+ * memory window). When (B) P's run (the lease's heartbeatRunId) ended NOT
+ * succeeded, NO other run may resume that box, whoever it is (the same
+ * conversation's later run too), until PREDECESSOR_LONG_STOP_MS after the
+ * receipt was confirmed. Only P's own run is exempt. Window-only: c1 records
+ * no typed, lease-bound proof that the Runner was gone before the box froze.
+ * `predecessorRunStatus` is P's run status as the caller read it (selection
+ * reads all candidates' runs in one query: loadResumeFencePredecessorRunStatuses).
+ * Selection (reusableLeaseCanBeResumed) and the handoff (environments
+ * acquireLease replacesReusableLeaseId) both use this one predicate. */
+export function stoppedReceiptFencesOtherRunResume(input: {
+  lease: { heartbeatRunId: string | null; metadata: Record<string, unknown> | null };
+  heartbeatRunId: string | null;
+  predecessorRunStatus: string | null | undefined;
+  now?: number;
+}): boolean {
+  if (input.heartbeatRunId !== null && input.lease.heartbeatRunId === input.heartbeatRunId) return false;
+  if (!hasResumeFenceReceipt(input.lease)) return false;
+  // (B) only a run that did not succeed.
+  if (!input.predecessorRunStatus || !RESUME_FENCED_PREDECESSOR_RUN_STATUSES.has(input.predecessorRunStatus)) return false;
+  const receipt = input.lease.metadata!.remoteExecutionTermination as { confirmedAt?: unknown };
+  const confirmedAt = typeof receipt.confirmedAt === "string" ? Date.parse(receipt.confirmedAt) : Number.NaN;
+  // A receipt without a readable confirmation time proves no window ended.
+  if (!Number.isFinite(confirmedAt)) return true;
+  return (input.now ?? Date.now()) < confirmedAt + PREDECESSOR_LONG_STOP_MS;
+}
+
+/** Whether a lease carries a receipt the B1 fence reads. */
+export function hasResumeFenceReceipt(lease: { metadata: Record<string, unknown> | null }): boolean {
+  const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
+  return state === "stopped" || state === "destroyed";
+}
+
+/** P's run status for every candidate lease that carries a fence receipt, in
+ * ONE query (no round trip per candidate). Keyed by run id. */
+export async function loadResumeFencePredecessorRunStatuses(
+  db: Db,
+  leases: ReadonlyArray<{ companyId: string; heartbeatRunId: string | null; metadata: Record<string, unknown> | null }>,
+): Promise<Map<string, string>> {
+  const runIds = [...new Set(leases.filter(hasResumeFenceReceipt).flatMap(lease => lease.heartbeatRunId ? [lease.heartbeatRunId] : []))];
+  if (runIds.length === 0) return new Map();
+  const rows = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+    .where(inArray(heartbeatRuns.id, runIds));
+  return new Map(rows.map(row => [row.id, row.status]));
 }
 
 type ReceiptLease = LeaseIdentity & {
