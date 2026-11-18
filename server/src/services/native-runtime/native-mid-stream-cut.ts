@@ -3,6 +3,8 @@ import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, readThinkingOnlyCapStop,
   THINKING_CAP_STOP_AGAIN_NOTE, type CompletedFinalAgentMessageCandidate } from "../heartbeat-run-summary.js";
 import { readRunAnswerEvents } from "../thinking-cap-stop.js";
+import { isAiAuthenticationFailure } from "../ai-auth-failure.js";
+import { readProviderFailure } from "@paperclipai/shared";
 
 export { NATIVE_MID_STREAM_CUT_CODE, NATIVE_MID_STREAM_CUT_MESSAGE,
   type NativeMidStreamCut } from "./native-mid-stream-cut-cause.js";
@@ -33,6 +35,39 @@ export function isNativeProviderRefusal(error: unknown): boolean {
   try { return REFUSAL_PATTERN.test(JSON.stringify(detail)); } catch { return false; }
 }
 
+/** Account rejections keep their existing failure/recovery owner, never the cut lane. */
+export function isNativeProviderAccountFailure(error: unknown): boolean {
+  const detail = record(error);
+  const category = readProviderFailure(detail.providerFailure)?.category;
+  if (category === "quota_exhausted" || category === "authentication" || category === "permission") return true;
+  if ([detail.code, detail.providerCode].some(code =>
+    isAiAuthenticationFailure(typeof code === "string" ? code : null))) return true;
+  const status = Number(detail.httpStatus ?? detail.statusCode ?? detail.status);
+  if (status === 401 || status === 402 || status === 403) return true;
+  // Pi's untyped provider terminals carry only code + message, not ProviderFailure.
+  // Typed quota/auth categories above reuse the existing provider classifier.
+  const message = typeof detail.message === "string" ? detail.message : "";
+  return /insufficient[_ ]quota|\bbilling\b|\bquota (?:limit )?(?:exceeded|exhausted)|\b(?:credit balance|account on hold)\b|\b(?:401|402|403)\b|\b(?:authentication[_ ](?:error|failed|required)|unauthorized|forbidden|invalid[_ ]api[_ ]key)\b/iu.test(message);
+}
+
+/** An account rejection is a normal provider failure, not an exhausted-cut reply. */
+export function readNativeProviderAccountFailureCandidate(
+  rows: readonly { seq: number; payload: unknown }[],
+): CompletedFinalAgentMessageCandidate | null {
+  const terminal = [...rows].sort((a, b) => b.seq - a.seq).find(row =>
+    /^turn\.(completed|failed|cancelled|interrupted)$/u.test(String(record(record(row.payload).prpEvent).eventType)));
+  if (!terminal) return null;
+  const event = record(record(terminal.payload).prpEvent);
+  const error = record(record(event.payload).error);
+  if (event.eventType !== "turn.failed" || !["pi_provider_error", "pi_rpc_transport_failed"].includes(String(error.code))
+    || !isNativeProviderAccountFailure(error)) return null;
+  const message = typeof error.message === "string" ? error.message : readProviderFailure(error.providerFailure)?.message;
+  if (!message?.trim()) return null;
+  const prefix = readFailedTurnStreamedAnswer(rows)?.text;
+  return { seq: terminal.seq, sourceEventId: typeof event.sourceEventId === "string" ? event.sourceEventId : null,
+    channel: "final", text: prefix ? `${prefix}${prefix.endsWith("\n") ? "" : "\n"}\n— ${message}` : message };
+}
+
 /** How the run's LAST turn was cut, from its turn terminals and answer items. */
 export function classifyNativeMidStreamCut(rows: readonly { seq: number; payload: unknown }[]): NativeMidStreamCut | null {
   let last: Record<string, unknown> | null = null;
@@ -44,6 +79,7 @@ export function classifyNativeMidStreamCut(rows: readonly { seq: number; payload
   const error = record(record(last.payload).error);
   if (error.code === "pi_output_truncated") return readThinkingOnlyCapStop(rows) ? "output_cap_no_text" : "output_cap";
   if (error.code === "pi_provider_error" || error.code === "pi_rpc_transport_failed") {
+    if (isNativeProviderAccountFailure(error)) return null;
     return isNativeProviderRefusal(error) ? "provider_refusal" : "provider_error";
   }
   return null;
@@ -102,7 +138,14 @@ export function isNativeMidStreamCutRecoveryRun(
 }
 
 export const NATIVE_MID_STREAM_CUT_CONNECTION_EXHAUSTED_NOTE =
-  "The connection to the model dropped before the answer finished, twice. Press Retry to try once more.";
+  "The connection to the model dropped before the answer finished. Press Retry to try once more.";
+export const NATIVE_MID_STREAM_CUT_PROVIDER_EXHAUSTED_NOTE =
+  "The model provider returned an error before the answer finished. Press Retry to try once more.";
+
+function isNativeProviderConnectionFailure(error: Record<string, unknown>): boolean {
+  return error.code === "pi_rpc_transport_failed" || (typeof error.message === "string"
+    && /\bEOF\b|\bECONNRESET\b|\bEPIPE\b|\b(?:stream|connection) (?:reset|closed|dropped|disconnected)|\bsocket hang up\b|\bfetch failed\b/iu.test(error.message));
+}
 
 /**
  * The cut lane's ONE automatic successor also failed: publish the last cut's
@@ -127,7 +170,9 @@ export async function readExhaustedNativeMidStreamCutCandidate(
   const event = record(record(terminal.payload).prpEvent);
   const prefix = readFailedTurnStreamedAnswer(rows)?.text;
   const note = cut === "provider_refusal" ? PROVIDER_POLICY_REFUSAL_MESSAGE
-    : cut === "provider_error" ? NATIVE_MID_STREAM_CUT_CONNECTION_EXHAUSTED_NOTE : THINKING_CAP_STOP_AGAIN_NOTE;
+    : cut !== "provider_error" ? THINKING_CAP_STOP_AGAIN_NOTE
+    : isNativeProviderConnectionFailure(record(record(event.payload).error))
+      ? NATIVE_MID_STREAM_CUT_CONNECTION_EXHAUSTED_NOTE : NATIVE_MID_STREAM_CUT_PROVIDER_EXHAUSTED_NOTE;
   return {
     seq: terminal.seq,
     sourceEventId: typeof event.sourceEventId === "string" ? event.sourceEventId : null,
