@@ -427,7 +427,7 @@ export async function endSupersededNativeFinalizationRuns(db: Db, runIds?: reado
         updatedAt: now,
       }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running"))).returning();
       if (updated) {
-        publishTerminalRunLifecyclePluginEventAfterCommit(tx, run, updated);
+        await publishTerminalRunLifecyclePluginEventAfterCommit(tx, run, updated);
         await settleNativeTerminalWake(tx as unknown as Db, updated);
       }
       return updated ?? null;
@@ -718,7 +718,7 @@ async function recordRetryableFailure(input: {
       .where(eq(heartbeatRuns.id, input.run.id))
       .returning();
     if (projectsTerminalStatus && updatedRun) {
-      if (before) publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, updatedRun);
+      if (before) await publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, updatedRun);
       await settleNativeTerminalWake(tx as unknown as Db, updatedRun);
     }
     if (projectsTerminalStatus) terminalRunToEmit = updatedRun ?? null;
@@ -2206,7 +2206,7 @@ async function finalizeNativeRunAndProject(input: {
         await notifyChatRunMilestones(tx, { companyId: run.companyId, issueId: coordinator.issueId });
         const [after] = await projectRun(tx);
         if (after && input.projectRunStatus) {
-          publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, after);
+          await publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, after);
           await settleNativeTerminalWake(tx, after);
         }
         return after ? { before, after } : null;

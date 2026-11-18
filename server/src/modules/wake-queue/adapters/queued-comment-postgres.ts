@@ -150,7 +150,7 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
         .where(and(eq(heartbeatRuns.id, queueRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")))
         .returning()
         .then((rows) => rows[0] ?? null);
-      if (row) publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "queued" }, row);
+      if (row) await publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "queued" }, row);
       return row ? { id: row.id } : null;
     },
 

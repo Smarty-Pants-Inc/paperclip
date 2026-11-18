@@ -891,7 +891,7 @@ export function createPostgresRunDispatchAdapter(
       )
       .returning();
     if (!row) return { applied: false };
-    publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "scheduled_retry" }, row);
+    await publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "scheduled_retry" }, row);
 
     if (row.wakeupRequestId) {
       await tx
@@ -1259,7 +1259,7 @@ export function createPostgresRunDispatchAdapter(
       // `expectedStatus`: the caller's staleness decision lost the race, so
       // this write must not overwrite whatever status won it.
       if (!row) return { outcome: "lost_race" };
-      publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: expectedStatus }, row);
+      await publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: expectedStatus }, row);
 
       const deferredWakeRequestId = expectedStatus === "queued" && decision.errorCode === "execution_reconciliation_required"
         ? await deferUnstartedUserComment(tx, row, issueId, now) : null;

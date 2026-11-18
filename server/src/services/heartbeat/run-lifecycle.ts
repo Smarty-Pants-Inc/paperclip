@@ -1179,7 +1179,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .for("update").limit(1);
     const after = await write();
     if (before && after) {
-      if (isHeartbeatRunTerminalStatus(after.status)) publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, after);
+      if (isHeartbeatRunTerminalStatus(after.status)) await publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, after);
       else afterDatabaseCommit(tx, () => publishRunLifecyclePluginEvent(after));
     }
     return after;
