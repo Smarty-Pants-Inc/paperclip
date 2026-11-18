@@ -3680,7 +3680,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(codeOf(notes[0]!)).toBe(shape === "policy" ? POLICY : REMOTE_RUNNER_SUPERVISION_EXHAUSTED);
     });
 
-    it("c2s (b): supervision-exhausted on a HELD run stays held (not supervisionUnconfirmed): the held text, never the fenced-recovery Retry line", async () => {
+    // compose (tA-min): fam-notices c2s (b) met fam-retry's retry-fold5 (rf-3 STOP 2): the HELD body names Retry, so
+    // its Next action is that same one instruction (decideRetryAuthority), not "Send a new message to try again."
+    // The Retry it names is proven ADMITTED, and the message answered exactly once, through the real routes in
+    // __tests__/c2s-held-supervision-retry-admit.test.ts. The row's own point is unchanged: the held text, never the
+    // fenced-recovery line.
+    it("supersedes(c2s (b): supervision-exhausted on a HELD run stays held (not supervisionUnconfirmed): the held text, never the fenced-recovery Retry line; RFL record PENDING: held remedy follows decideRetryAuthority)", async () => {
       const f = await fixture();
       const messageId = await f.message("Please continue.");
       const runId = await f.run({ commentId: messageId, status: "failed", finishedAgoMs: 15 * 60_000,
@@ -3691,7 +3696,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notes).toHaveLength(1);
       expect(notes[0]!.body).toBe(HELD);
       expect(notes[0]!.body).not.toBe(REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION);
-      expect(JSON.stringify(notes[0]!.metadata)).toContain("Send a new message to try again.");
+      expect(JSON.stringify(notes[0]!.metadata)).toContain("Press Retry to continue in a fresh run with this conversation's history.");
+      expect(JSON.stringify(notes[0]!.metadata)).not.toContain("Send a new message to try again.");
       expect(JSON.stringify(notes[0]!.metadata)).not.toContain("continue through fenced recovery");
       expect(notes[0]!.metadata?.sourceRunId).toBe(runId);
     });
