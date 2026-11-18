@@ -412,6 +412,8 @@ describe("native mid-stream cut: one successor, through recovery", () => {
   it.each([
     { message: "unexpected EOF while fetching billing tables" },
     { message: "Account billing requires attention." },
+    { message: "billing" },
+    { message: "The billing service is temporarily unavailable." },
     { message: "unexpected EOF while checking quota" },
     { message: "connection reset while checking auth" },
     { message: "unexpected EOF while reading the credit balance table" },
@@ -517,6 +519,14 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     expect(classifyNativeMidStreamCut(failed({ code: "pi_provider_error", message: "429 rate_limit_error: This request triggered rate limit restrictions." }))).toBe("provider_error");
     expect(classifyNativeMidStreamCut(failed({ code: "pi_rpc_transport_failed", message: "upstream connect error: stream reset" }))).toBe("provider_error");
     expect(classifyNativeMidStreamCut(failed({ code: "pi_output_truncated" }))).toBe("output_cap_no_text");
+    // u1h: an UNTYPED provider error that only mentions billing, with no
+    // transport code, status or typed category, is not an account rejection:
+    // it stays a cut with its one recovery run.
+    const billingTopic = { code: "pi_provider_error", message: "upstream error while loading the billing export for this workspace" };
+    expect(isNativeProviderAccountFailure(billingTopic)).toBe(false);
+    expect(cutLane.classifyNativeProviderAccountFailure(failed(billingTopic))).toBe(false);
+    expect(classifyNativeMidStreamCut(failed(billingTopic))).toBe("provider_error");
+    expect(cutLane.classifyNativeProviderAccountFailure(failed({ code: "pi_provider_error", httpStatus: 402, message: "402 Payment Required" }))).toBe(true);
     // compose: an account or key rejection that names the Terms of Service is an
     // ordinary provider error; a request the provider says violates them is a refusal.
     expect(isNativeProviderRefusal({ code: "pi_provider_error", message: "400 invalid_request_error: Account blocked until Terms of Service are accepted. See https://www.anthropic.com/legal/commercial-terms." })).toBe(false);
