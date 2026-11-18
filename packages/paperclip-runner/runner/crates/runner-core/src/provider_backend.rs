@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::acpx_provider_backend::registered_asset_suffix;
 use crate::codex_provider::{
     CodexProvider, CodexProviderConfig, CodexProviderEvent, CodexSkillInput, CodexTurnOptions,
     ProviderStartupObservation, ProviderStartupStage, RejectedAcceptedTurn,
@@ -2305,6 +2306,22 @@ impl CodexCommandExecutor {
         if !matches!(next.provider.as_str(), "codex" | "pi_rpc")
             || state.thread_id.is_none()
             || next.instructions == state.config.instructions
+            || (next.provider == "pi_rpc"
+                && provider
+                    .get("runtimeContext")
+                    .and_then(registered_asset_suffix)
+                    .zip(registered_asset_suffix(&state.pi_runtime_context))
+                    .is_some_and(|(next_suffix, saved_suffix)| {
+                        next.instructions
+                            .strip_suffix(&format!("\n\n{next_suffix}"))
+                            .zip(
+                                state
+                                    .config
+                                    .instructions
+                                    .strip_suffix(&format!("\n\n{saved_suffix}")),
+                            )
+                            .is_some_and(|(next, saved)| next == saved)
+                    }))
         {
             return Ok(None);
         }
