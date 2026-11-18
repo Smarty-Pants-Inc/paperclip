@@ -6,7 +6,7 @@ import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { assignmentWakePayloadSql, type DeferredExecutionScope, type DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { dependencyResolvedWakePayloadSql } from "../issue-dependency-wakeups.js";
-import { anchorParkedWake, noticeParkedWakeDeadline, PARKED_WAKE_RETRY_MS, parkedWakeAnchor, parkedWakeDeadlineMs,
+import { anchorParkedWake, noticeParkedWakeDeadline, PARKED_WAKE_CARRIER_ACTIVE, PARKED_WAKE_RETRY_MS, parkedWakeAnchor, parkedWakeDeadlineMs,
   parkedWake, parkedWakeNoticedSql, parkedWakeSql, personSendSql } from "./parked-wake-deadline.js";
 
 type Entry = { id: string; companyId: string; dueAt: number; immediate: boolean; operatorRetry?: boolean };
@@ -204,7 +204,9 @@ export function registerDeferredReceiptWork(
           const anchor = parked ? parkedWakeAnchor(current.payload) ?? await anchorParkedWake(db, scope0(entry)) : null;
           if (anchor !== null && anchor + parkedWakeDeadlineMs() <= Date.now()) {
             // Past the deadline: ONE true note (+ Retry), no further silent retry.
-            await noticeParkedWakeDeadline(db, scope0(entry));
+            // A run carrying a held message is still live: no note yet, next pass.
+            if (await noticeParkedWakeDeadline(db, scope0(entry)) === PARKED_WAKE_CARRIER_ACTIVE)
+              return { ...entry, dueAt: Date.now() + PARKED_WAKE_RETRY_MS, immediate: false };
             return null;
           }
           const due = kind === "native" && current.status === "claimed" && current.claimedAt
