@@ -1,7 +1,13 @@
+import { stripVTControlCharacters } from "node:util";
+
 /** Redact diagnostic text without importing the provider process or its credentials. */
 export function redactProviderDiagnostic(message: string): string {
-  const sanitized = message
-    .replaceAll(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+  // Normalize terminal escapes (including OSC, not just CSI colors) before
+  // scanning: an escape may occur inside the scheme or credential itself.
+  const normalized = stripVTControlCharacters(
+    message.replaceAll(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, ""),
+  );
+  const sanitized = normalized
     .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
     .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (match, encoded: string) => {
       try {
