@@ -233,7 +233,11 @@ async function loadAppModules() {
 }
 
 async function createApp(transaction: (callback: (tx: Record<string, never>) => Promise<unknown>) => Promise<unknown> =
-  async (callback) => callback({ select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([]), { for: async () => [{ id: "comment-3" }] }) }) }) } as any)) {
+  async (callback) => callback({
+    select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([]), { for: async () => [{ id: "comment-3" }] }) }) }),
+    // S004: the comment transaction also writes the durable wake intent row.
+    insert: () => ({ values: async () => [] }),
+  } as any)) {
   const [{ errorHandler }, { issueRoutes }] = await loadAppModules();
   const app = express();
   app.use(express.json());
@@ -251,6 +255,8 @@ async function createApp(transaction: (callback: (tx: Record<string, never>) => 
   app.use("/api", issueRoutes({
     transaction,
     select: () => ({ from: () => ({ where: async () => [] }) }),
+    // S004: a dispatched (or not owed) wake settles the intent by deleting it.
+    delete: () => ({ where: async () => [] }),
   } as any, {} as any));
   app.use(errorHandler);
   return app;
