@@ -1084,10 +1084,19 @@ export function redactAgentAdapterConfig(
   return { ...(redactEventPayload(rest) ?? {}), env: redactedEnv };
 }
 
+// AWS access key IDs and `aws_secret_access_key = <40 chars>` assignments. The
+// shared command patterns cover neither: the ID carries no secret hint word.
+const AWS_ACCESS_KEY_ID_RE = /\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
+const AWS_SECRET_ACCESS_KEY_ASSIGNMENT_RE =
+  /(\baws[_-]?secret[_-]?access[_-]?key["']?\s*[=:]\s*["']?)[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/gi;
+
 export function redactSensitiveText(input: string): string {
-  if (!maybeContainsSecretText(input)) return input;
+  const text = input
+    .replace(AWS_ACCESS_KEY_ID_RE, REDACTED_EVENT_VALUE)
+    .replace(AWS_SECRET_ACCESS_KEY_ASSIGNMENT_RE, `$1${REDACTED_EVENT_VALUE}`);
+  if (!maybeContainsSecretText(text)) return text;
   return redactCommandText(
-    redactStandaloneBearerCredentials(redactAuthorizationCredentials(input))
+    redactStandaloneBearerCredentials(redactAuthorizationCredentials(text))
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
       .replace(
         ESCAPED_JSON_SECRET_FIELD_TEXT_RE,

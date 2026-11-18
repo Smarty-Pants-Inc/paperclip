@@ -16,6 +16,72 @@ import {
   redactSensitive,
   stripSecretBearingUrlParts,
 } from "./redact-sensitive.js";
+import { redactSensitiveText } from "../redaction.js";
+
+const MAX_LOG_REDACTION_DEPTH = 8;
+
+// Mask credential shapes in every string of a serialized log value. Nested
+// objects are copied, never mutated: they can be live application objects.
+function redactLogValue(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
+  if (typeof value === "string") return redactSensitiveText(value);
+  if (!value || typeof value !== "object" || depth > MAX_LOG_REDACTION_DEPTH) return value;
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((item) => redactLogValue(item, depth + 1, seen));
+  if (value instanceof Date || Buffer.isBuffer(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, redactLogValue(item, depth + 1, seen)]),
+  );
+}
+
+/**
+ * Pino `err` serializer: Pino's standard error serializer (which folds the
+ * `cause` chain into `message` and `stack`, and copies enumerable extras and
+ * AggregateError children), then the shared credential mask on every string.
+ */
+export function redactedErrSerializer(err: unknown): unknown {
+  // pino-http hands over an already standard-serialized error; serializing it
+  // a second time would rename its type to "Object", so only mask its strings.
+  if (!(err instanceof Error)) return redactLogValue(err);
+  const serialized = pino.stdSerializers.err(err) as unknown;
+  if (!serialized || typeof serialized !== "object") return redactLogValue(serialized);
+  // The standard serializer returns a fresh object whose prototype carries the
+  // non-enumerable `raw` reference; redact its own fields in place.
+  const record = serialized as Record<string, unknown>;
+  for (const key of Object.keys(record)) record[key] = redactLogValue(record[key]);
+  return record;
+}
+
+const redactedTextSerializer = (value: unknown) => redactLogValue(value);
+
+export const logSerializers = {
+  err: redactedErrSerializer,
+  stderr: redactedTextSerializer,
+  stdout: redactedTextSerializer,
+};
+
+// With no message argument Pino copies the raw `err.message` into `msg`
+// before any serializer runs; supply the masked message instead.
+function defaultMessageFromError(first: unknown): string | undefined {
+  if (first instanceof Error) return first.message;
+  if (!first || typeof first !== "object" || "msg" in first) return undefined;
+  const err = (first as { err?: unknown }).err;
+  return err && typeof (err as { message?: unknown }).message === "string"
+    ? (err as { message: string }).message
+    : undefined;
+}
+
+export const baseLoggerOptions = {
+  redact: [...HTTP_LOG_REDACT_PATHS],
+  serializers: logSerializers,
+  hooks: {
+    logMethod(this: Logger, args: Parameters<pino.LogFn>, method: pino.LogFn) {
+      const message = args[1] === undefined ? defaultMessageFromError(args[0]) : undefined;
+      if (message === undefined) return method.apply(this, args);
+      return method.call(this, args[0] as object, redactSensitiveText(message));
+    },
+  },
+};
 
 const sharedOpts = {
   translateTime: "SYS:HH:MM:ss",
@@ -26,13 +92,13 @@ const sharedOpts = {
 const isProduction = process.env.NODE_ENV === "production";
 export const logger = isProduction
   ? pino({
+      ...baseLoggerOptions,
       level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "info",
-      redact: [...HTTP_LOG_REDACT_PATHS],
     })
   : pino(
       {
+        ...baseLoggerOptions,
         level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "debug",
-        redact: [...HTTP_LOG_REDACT_PATHS],
       },
       pino.transport({
         target: "pino-pretty",
@@ -95,6 +161,9 @@ export function createHttpLogger(baseLogger: Logger) {
   return pinoHttp({
     logger: baseLogger,
     serializers: {
+      // pino-http installs its own standard err serializer on its child logger
+      // unless one is given here, which would bypass the base logger's mask.
+      err: redactedErrSerializer,
       req(req: Record<string, unknown> & { url?: unknown }) {
         if (isPrivateAgentObservabilityHttpRequest(typeof req.url === "string" ? req.url : undefined)) {
           return { id: req.id, method: req.method, url: "/api/companies/:companyId/observability" };

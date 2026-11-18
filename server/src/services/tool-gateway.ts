@@ -9639,7 +9639,7 @@ export function createToolGatewayService(
       if (actionRequest?.status !== "executing" || actionRequest.updatedAt.getTime() !== input.claimUpdatedAt.getTime()) return false;
       await notifyToolReviewChange(tx, actionRequest.companyId);
       await tx.update(toolInvocations).set({
-        status: "awaiting_approval", startedAt: null, errorCode: "provider_task_pending", errorMessage: input.message, updatedAt: now,
+        status: "awaiting_approval", startedAt: null, errorCode: "provider_task_pending", errorMessage: redactSensitiveText(input.message), updatedAt: now,
       }).where(and(eq(toolInvocations.id, input.invocationId), eq(toolInvocations.status, "executing")));
       await tx.update(toolActionRequests).set({ status: "approved", updatedAt: now })
         .where(and(eq(toolActionRequests.id, input.actionRequestId), eq(toolActionRequests.status, "executing"), eq(toolActionRequests.updatedAt, input.claimUpdatedAt)));
