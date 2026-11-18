@@ -66,6 +66,58 @@ describe("redact-store G1/G4 durable boundaries", () => {
     return { issueId, runId, port, event, stored, sourceInstanceId };
   }
 
+  // Never-OK: every durable delta must be safe, not only the final receipt.
+  it.each([
+    { name: "quote-split", parts: ["'", "Bearer abcdefgh", "'"], secret: "abcdefgh" },
+    { name: "header-split", parts: ["Authorization: ", "Bearer abcdefgh"], secret: "abcdefgh" },
+    { name: "padded-quote-split", parts: ['\"  ', "Bearer abcdefgh", '  \"'], secret: "abcdefgh" },
+    { name: "ansi-scheme", parts: ["Authorization: \u001b[31mBearer abcdefgh\u001b[0m"], secret: "abcdefgh" },
+    { name: "ansi-token", parts: ["Authorization: Bearer \u001b[31mabcdefgh\u001b[0m"], secret: "abcdefgh" },
+    { name: "ansi-osc", parts: ["Bearer abcd\u001b]0;terminal title\u0007efgh"], secret: "efgh" },
+    { name: "live-bearer", parts: ['the Bearer of bad news arrived\n\"Bearer SYNTHabcdefghij\"'], secret: "SYNTHabcdefghij" },
+    ...[".", ":", "!", "?", ")", "}", "]", '\"', "'", "`", ",", ";", "a", "-", "_", "/"].map(tail => ({
+      name: `marker-tail-${tail.charCodeAt(0)}`, parts: [`Bearer ***REDACTED***${tail}abc123def456ghi789`], secret: "abc123def456ghi789",
+    })),
+    { name: "bracket-marker-key-tail", parts: ["Bearer [REDACTED]" + keys[0]], secret: keys[0]! },
+    { name: "unclosed-marker-tail", parts: ["Bearer [REDACTEDabc123def456ghi789"], secret: "abc123def456ghi789" },
+    { name: "marker-space-key", parts: ["Bearer [REDACTED] " + keys[0]], secret: keys[0]! },
+    { name: "marker-newline-key", parts: ["Bearer [REDACTED]\n" + keys[0]], secret: keys[0]! },
+  ])("rf-2 $name through Pi -> append -> Postgres -> agent comment", async ({ name, parts, secret }) => {
+    const f = await fixture();
+    const projector = createPiEventProjector({ runId: f.runId, turnId: "turn", spillDirectory: directory });
+    const projected = parts.flatMap(delta => projector.project({
+      type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+    }));
+    projected.push(...projector.project({ type: "message_end", message: {
+      role: "assistant", provider: "neutral", model: "model", responseId: "reply", stopReason: "stop",
+      content: [{ type: "text", text: parts.join("") }],
+    } }));
+    let seq = 0;
+    for (const event of projected.filter(event => event.payload.kind === "agentMessage")) {
+      await f.port.appendEvent({ ...f.event("", ++seq, event.payload), eventType: event.eventType as PrpEvent["eventType"] });
+    }
+    const rows = await f.stored();
+    expect(rows.some(row => (row.payload!.prpEvent as unknown as PrpEvent).eventType === "item.delta")).toBe(true);
+    expect(JSON.stringify(rows)).not.toContain(secret);
+    const stored = rows.map(row => {
+      const event = row.payload!.prpEvent as unknown as PrpEvent;
+      expect(row.sourcePayloadSha256).toBe(nativeSha256(event));
+      return { eventType: event.eventType, text: event.payload.text, hashAgrees: row.sourcePayloadSha256 === nativeSha256(event) };
+    });
+    const final = stored.find(row => row.eventType === "item.completed")!;
+    const posted = await issueService(db).addComment(f.issueId, String(final.text), { agentId, runId: f.runId });
+    const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, posted.id));
+    expect(comment!.body).toBe(final.text);
+    expect(comment!.body).not.toContain(secret);
+    if (name === "live-bearer") {
+      expect(final.text).toBe('the Bearer [REDACTED] bad news arrived\n\"Bearer [REDACTED]\"');
+      expect(stored.filter(row => row.eventType === "item.delta").map(row => row.text).join("")).toBe(final.text);
+    }
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `durable-${name}.json`), JSON.stringify({
+      name, runId: f.runId, issueId: f.issueId, parts, stored, comment: comment!.body, syntheticOccurrences: JSON.stringify(rows).split(secret).length - 1,
+    }, null, 2) + "\n");
+  });
+
   it("r1 shell-printed provider keys are masked before hash, retry, replay and exporter integrity checks", async () => {
     const f = await fixture();
     const printed = execFileSync("/bin/sh", ["-c", 'printf "%s" "$1"', "guard", echo], { encoding: "utf8" });
