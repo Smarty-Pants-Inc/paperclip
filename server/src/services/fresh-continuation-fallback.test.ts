@@ -1100,13 +1100,25 @@ suite("fresh-continuation fallback", () => {
     expect(nativeSessionCleanupBlock({companyId,issueId:f.issueId})).toBe("operator_required");
   }
 
-  it.each(["dispatcher_first", "retry_first"] as const)("JUDGE Retry CAS race %s never starts two runs or cancels a started run", async order => {
+  // Superseded by replacement (RFL record SUPERSEDE-B-STARTABLE-SINCE-1117, ruling (a)): the cleanup success is a
+  // clear that starts the 10-min window, so Retry is offered only past stamp + 10 min. ONLY the precondition changes:
+  // the clock advances to stamp + 10 min + 1 ms, the card offers Retry, then the press. Every race assertion is unchanged.
+  it.each(["dispatcher_first", "retry_first"] as const)("(superseded by replacement: startable-since clock, RFL record SUPERSEDE-B-STARTABLE-SINCE-1117) JUDGE Retry CAS race %s never starts two runs or cancels a started run", async order => {
     const f = await judgeQueued();
     await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+    vi.setSystemTime(stamped!.startableSince!.getTime() + 600_001);
+    expect(await taskInterruptionPresentation(db, await issue(f.issueId)), "past stamp + 10 min the card offers Retry")
+      .toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
     const heartbeat = heartbeatService(db);
     const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId,
       observedRunId: f.queued.id, idempotencyKey: randomUUID() });
     expect(receipt).toMatchObject({ startQueuedRunId: f.queued.id });
+    // The press happened past the bound; the race itself runs on the real clock (a faked clock
+    // would expire the dispatcher's controller lease, controller_lease_lost, not the race under test).
+    vi.useRealTimers();
     const { startPersonQueuedRunFresh } = await import("./task-retry.js");
     const cancel = async (id: string) => {
       if (order === "dispatcher_first") {
@@ -1132,6 +1144,7 @@ suite("fresh-continuation fallback", () => {
       expect(old).toMatchObject({ status:"cancelled", startedAt:null });
       expect(runs).toHaveLength(2);
     }
+    } finally { vi.useRealTimers(); }
   }, 120_000);
 
   // Superseded by replacement (RFL record SUPERSEDE-B-NOCOMMENT-RETRY-1117; rf-3 ruling 11-17): the judge's
@@ -1314,9 +1327,12 @@ suite("fresh-continuation fallback", () => {
   }, 120_000);
 
   // fix12 item 2b clock (rf-3 22:23Z): a 20-min hold (the task's previous run, on another agent, still
-  // running, its sandbox cleanup pending) clears; the dispatcher is slow. The card is working for 10 min
-  // from the CLEAR, not from enqueue, then failed + Retry if the run is still untaken.
-  it("fix12 clock from the clear: a 20-min hold clears, a slow dispatcher shows working for 10 min after the clear", async () => {
+  // running, its sandbox cleanup pending) clears; the dispatcher is slow. Superseded by replacement (RFL
+  // record SUPERSEDE-B-STARTABLE-SINCE-1117, ruling (a)): the cleanup success is the clear and stamps
+  // startable_since (0496 lease trigger). No flash at the clear: working, no Retry, at stamp + 1 ms /
+  // +300 s / +599.999 s; a Retry pressed inside the window starts nothing extra; failed + Retry at
+  // stamp + 10 min with no run. The from-enqueue mutation turns this red.
+  it("(superseded by replacement: startable-since clock, RFL record SUPERSEDE-B-STARTABLE-SINCE-1117) fix12 clock from the clear: a 20-min hold clears, a slow dispatcher shows working for 10 min after the clear", async () => {
     const f = await judgeQueued();
     const enqueued = new Date(Date.now() - 1_500_000);
     await db.update(heartbeatRuns).set({ createdAt: enqueued }).where(eq(heartbeatRuns.id, f.queued.id));
@@ -1324,23 +1340,37 @@ suite("fresh-continuation fallback", () => {
     await db.update(heartbeatRuns).set({ agentId: previousAgent!.id, status: "running", finishedAt: null, errorCode: null,
       createdAt: new Date(enqueued.getTime() - 60_000), startedAt: new Date(enqueued.getTime() - 59_000) }).where(eq(heartbeatRuns.id, f.source.id));
     await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
+    const card = async () => taskInterruptionPresentation(db, await issue(f.issueId));
+    expect(await card(), "held 25 min: working, never failed").toMatchObject({ state: "working", canRetry: false });
+    // The hold clears: the previous run ends and its sandbox cleanup settles (the 0496 trigger stamps).
+    const clear = new Date();
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: clear }).where(eq(heartbeatRuns.id, f.source.id));
+    await db.update(environmentLeases).set({ cleanupStatus: "success", updatedAt: clear }).where(eq(environmentLeases.id, f.lease.id));
+    const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+    expect(stamped!.startableSince, "the clear wrote the startable-since stamp").not.toBeNull();
+    const stamp = stamped!.startableSince!.getTime();
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
-      const card = async () => taskInterruptionPresentation(db, await issue(f.issueId));
-      expect(await card(), "held 25 min: working, never failed").toMatchObject({ state: "working", canRetry: false });
-      // The hold clears: the previous run ends and its sandbox cleanup settles.
-      const clear = new Date();
-      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: clear }).where(eq(heartbeatRuns.id, f.source.id));
-      await db.update(environmentLeases).set({ cleanupStatus: "success", updatedAt: clear }).where(eq(environmentLeases.id, f.lease.id));
       const seen: Array<{ after: number; state: string | undefined; canRetry: boolean | undefined; observedRunId: string | null | undefined }> = [];
-      for (const after of [1_000, 300_000, 599_999, 600_000]) {
-        vi.setSystemTime(clear.getTime() + after);
+      for (const after of [1, 300_000, 599_999]) {
+        vi.setSystemTime(stamp + after);
         const c = await card();
         seen.push({ after, state: c?.state, canRetry: c?.canRetry, observedRunId: c?.observedRunId });
       }
-      console.info(JSON.stringify({ fix12ClockFromClear: { enqueued, clear, seen } }));
-      expect(seen.slice(0, 3).map(s => s.state), "working for 10 min after the clear").toEqual(["working", "working", "working"]);
-      expect(seen[3], "still untaken 10 min after the clear: failed + Retry").toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
+      vi.setSystemTime(stamp + 1_000);
+      const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId,
+        observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+      const startQueuedRunId = "startQueuedRunId" in receipt ? receipt.startQueuedRunId : undefined;
+      vi.setSystemTime(stamp + 600_000);
+      const lapsed = await card();
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).filter(r => r.id !== f.source.id);
+      console.info(JSON.stringify({ fix12ClockFromClear: { enqueued, clear, stamp: stamped!.startableSince, seen, retry: startQueuedRunId ?? null,
+        lapsed: lapsed && { state: lapsed.state, canRetry: lapsed.canRetry }, runs: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+      expect(seen.map(s => s.state), "working at stamp + 1 ms, +300 s, +599.999 s").toEqual(["working", "working", "working"]);
+      expect(seen.map(s => s.canRetry ?? false), "no Retry inside the window").toEqual([false, false, false]);
+      expect(startQueuedRunId, "a Retry inside the window starts nothing").toBeUndefined();
+      expect(runs.map(r => ({ id: r.id, startedAt: r.startedAt })), "nothing extra exists or started").toEqual([{ id: f.queued.id, startedAt: null }]);
+      expect(lapsed, "still untaken at stamp + 10 min: failed + Retry").toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
     } finally { vi.useRealTimers(); }
   }, 120_000);
 
@@ -1348,15 +1378,24 @@ suite("fresh-continuation fallback", () => {
   // writer. The card counts its 10-min bound from the LATER of enqueue and heartbeat_runs.startable_since:
   // working inside the bound, a Retry press then starts nothing, failed + Retry only at stamp + 10 min,
   // and the dispatcher taking it starts exactly one run.
-  it.each(["sandbox_cleanup", "agent_setup", "ordinary_pause"] as const)("FIX15 %s clears: no failed flash inside the bound, one run, failed + Retry at stamp + 10 min", async hold => {
+  it.each(["sandbox_cleanup", "agent_setup", "ordinary_pause", "budget_pause"] as const)("FIX15 %s clears: no failed flash inside the bound, one run, failed + Retry at stamp + 10 min", async hold => {
     const f = await judgeQueued(), heartbeat = heartbeatService(db);
     const { createLifecycleStore } = await import("../modules/agent-lifecycle/adapters/postgres.js");
     const { createAgentLifecycleEffects } = await import("./agent-lifecycle.js");
     const { startPersonQueuedRunFresh } = await import("./task-retry.js");
     const [agentBefore] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const [companyBefore] = await db.select().from(companies).where(eq(companies.id, companyId));
+    const { budgetPolicies } = await import("@paperclipai/db");
     const enqueued = f.queued.createdAt; // 11 min ago: already past the bound from enqueue
     if (hold === "sandbox_cleanup") await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
-    else {
+    else if (hold === "budget_pause") {
+      await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+      await db.update(heartbeatRuns).set({ startableSince: null }).where(eq(heartbeatRuns.id, f.queued.id));
+      // A company budget hard stop; the policy's spend is now under its limit, so the budget writer lifts it.
+      await db.update(companies).set({ status: "paused", pauseReason: "budget", pausedAt: new Date() }).where(eq(companies.id, companyId));
+      await db.insert(budgetPolicies).values({ companyId, scopeType: "company", scopeId: companyId, windowKind: "calendar_month_utc",
+        amount: 1_000_000, hardStopEnabled: true, unpricedUsagePolicy: "allow" });
+    } else {
       await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
       await db.update(heartbeatRuns).set({ startableSince: null }).where(eq(heartbeatRuns.id, f.queued.id));
       await db.update(agents).set({ lifecycleState: hold === "agent_setup" ? "verifying" : "paused", lifecycleHolds: [], status: "paused",
@@ -1372,7 +1411,12 @@ suite("fresh-continuation fallback", () => {
         leaseUntil: new Date(Date.now() + 3_600_000).toISOString(), resumeState: "ready" as const };
       const before = Date.now();
       if (hold === "sandbox_cleanup") await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
-      else {
+      else if (hold === "budget_pause") {
+        const { budgetServiceInTransaction } = await import("./budgets.js");
+        await db.transaction(async tx => { await budgetServiceInTransaction(tx as unknown as typeof db).reconcileScope(companyId, "company", companyId); });
+        const [lifted] = await db.select().from(companies).where(eq(companies.id, companyId));
+        expect(lifted, "the budget writer lifts the company budget pause").toMatchObject({ status: "active", pauseReason: null });
+      } else {
         if (hold === "ordinary_pause") expect(await store.change(agentId, "resume", { reason: "manual" }), "resume").toMatchObject({ lifecycleState: "resuming" });
         await db.update(agents).set({ lifecycleOperation: owned }).where(eq(agents.id, agentId));
         expect(await store.change(agentId, "complete", { owner: "fix15" }), "the lifecycle writer makes it ready").toMatchObject({ lifecycleState: "ready" });
@@ -1414,6 +1458,9 @@ suite("fresh-continuation fallback", () => {
       await db.update(agents).set({ lifecycleState: agentBefore!.lifecycleState, lifecycleHolds: agentBefore!.lifecycleHolds,
         status: agentBefore!.status, lifecycleOperation: agentBefore!.lifecycleOperation,
         lifecycleRequiredPluginIds: agentBefore!.lifecycleRequiredPluginIds }).where(eq(agents.id, agentId));
+      await db.delete(budgetPolicies).where(eq(budgetPolicies.companyId, companyId));
+      await db.update(companies).set({ status: companyBefore!.status, pauseReason: companyBefore!.pauseReason,
+        pausedAt: companyBefore!.pausedAt }).where(eq(companies.id, companyId));
     }
   }, 120_000);
 
