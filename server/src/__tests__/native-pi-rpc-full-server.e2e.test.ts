@@ -12,6 +12,7 @@ import { expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
 import { prepareNativePiHomeProof, readNativePiHomeProof, assertNativePiHomeProof } from "./helpers/native-pi-home-load-proof.js";
+import { FRESH_THREAD_STARTED_NOTE } from "../services/native-runtime/fresh-thread-stop-gate.js";
 
 // Explicit-only, real process/user-flow qualification. No paid model, sandbox,
 // backend, HTTP-route, database or runner doubles. Keep reason: the hq native Pi
@@ -636,6 +637,41 @@ it.skipIf(!enabled)(`runs native Pi through the full server twice on the same Pi
       nativeProbeProofs.push(row); stage("durable PRP finish started -> completed", row);
     }
     await assertNativePiHomeProof(nativeHomeProof!, pid.piPid);
+    const piThread = () => { const proof = readNativePiHomeProof(nativeHomeProof!.receiptPath)!; return { id: proof.sessionId as string, file: proof.sessionFile as string }; };
+    const setAside = () => (readdirSync(join(root, "runner-state"), { recursive: true }) as string[]).filter(name => name.includes("codex-provider-state.json.retained-")).sort();
+    const threadBefore = piThread(), setAsideBefore = setAside();
+    for (const writer of ["own-bash", "files-route"] as const) {
+      const callId = `call-n4b-note-${writer}`;
+      pendingProbe = { callId, name: "bash", input: { command: writer === "own-bash"
+        ? 'mkdir -p "$AGENT_HOME/memory" && printf "N4B own\\n" > "$AGENT_HOME/memory/n4b-own.md"' : "true" } };
+      await api("POST", `/issues/${issueId}/comments`, { body: `Save a short note (${writer}), then confirm briefly.` }, 201);
+      expect((await waitFor(`note tool result ${writer}`, async () => pendingProbe?.result ?? null)).is_error).not.toBe(true);
+      pendingProbe = undefined;
+      const noteRun = await drainLatest();
+      if (writer === "own-bash") {
+        const saves = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, noteRun.id)))
+          .filter(event => event.eventType === "instruction_save").map(event => (event.payload as { state?: string } | null)?.state);
+        expect(saves, "turn 1 saved the note to the agent's folder").toContain("saved");
+      } else {
+        await api("PUT", `/agents/${agentId}/instructions-bundle/file`, { path: "memory/n4b-route.md", content: "N4B route\n", baseHash: null });
+      }
+      const nextReplyNumber = replyCount + 1;
+      await api("POST", `/issues/${issueId}/comments`, { body: `After the saved note (${writer}): reply with the next local faux token.` }, 201);
+      await waitFor(`reply after the saved note ${writer}`, async () => (await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .find(row => row.authorAgentId === agentId && row.body.includes(`LOCAL_PI_FULL_SERVER_REPLY_${nextReplyNumber}`)) ?? null);
+      const [turn2] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, (await drainLatest()).id));
+      expect(turn2!.status, `${writer}: the person's message is answered by its own first run`).toBe("succeeded");
+      expect(setAside(), `${writer}: the runner did not set the provider thread aside for a fresh one`).toEqual(setAsideBefore);
+      expect(piThread(), `${writer}: same provider session id and session file as before the note`).toEqual(threadBefore);
+      const thread = readFileSync(piThread().file, "utf8");
+      expect(thread, `${writer}: turn 1's tool call is on the thread that answered turn 2`).toContain(callId);
+      expect(thread, `${writer}: turn 2's answer is on that same thread`).toContain(`LOCAL_PI_FULL_SERVER_REPLY_${nextReplyNumber}`);
+      const notices = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(row => row.authorType === "system" && row.body.includes(FRESH_THREAD_STARTED_NOTE));
+      expect(notices, `${writer}: no fresh-thread notice`).toEqual([]);
+      const events = JSON.stringify(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, turn2!.id)));
+      expect(events, `${writer}: no refresh refusal, no fresh provider thread`).not.toMatch(/provider_refresh_required|fresh provider (thread|session)/);
+    }
     stage("GREEN", { companyId, agentId, issueId, requests: requests.length, bigOutputCases });
   } catch (error) {
     await snapshotFinishState("blocked");
