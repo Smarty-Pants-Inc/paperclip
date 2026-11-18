@@ -5,6 +5,7 @@ import { createStorageWaitNotice } from "./heartbeat/storage-wait-notice.js";
 import { createStalledQueuedRunCancel } from "./heartbeat/stalled-queued-run.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import { isProcessRunAdmissionClosed } from "./heartbeat/run-admission.js";
+import { fenceUnverifiedPredecessorsAtAdmission } from "./heartbeat/predecessor-admission.js";
 import { isYieldingRunStarts, refreshRunStartYieldIfStale, RUN_START_YIELD_RECHECK_MS, type RunStartHandover } from "./run-start-handover.js";
 import type { StopInvocationOptions } from "./heartbeat/run-control.js";
 import { isContextCompactionRun } from "./context-compaction.js";
@@ -2268,6 +2269,10 @@ export function heartbeatService(
         await finalizeAgentStatus(agent.id, "succeeded");
         return;
       }
+      // Shared execution admission for next messages, Retry and automatic
+      // successors: contain unverified predecessors BEFORE any session/root is
+      // selected. Callers and the unanswered-message sweep cannot own safety.
+      run = await fenceUnverifiedPredecessorsAtAdmission(db, run);
       const preparedConversation = await timePreparation("conversation", () => prepareConversationTurn(db, run));
       run = { ...run, contextSnapshot: preparedConversation.context };
       if (preparedConversation.reset) {
