@@ -971,7 +971,7 @@ async function retireInProcessWarmOwnerOnSandbox(runId: string, providerLeaseId:
 }
 
 async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
-  options?: Parameters<typeof closeWarmNativeSession>[2]) {
+  options?: Parameters<typeof closeWarmNativeSession>[2] & { successorProviderLeaseId?: string | null }) {
   // Chaos cell SR1U: a sandbox owner whose stop stays unconfirmed even when
   // forced. Test instrumentation only: armed only in a NODE_ENV=test server.
   if (process.env.NODE_ENV === "test" && process.env.PAPERCLIP_TEST_WARM_RETIREMENT_FAULT === "unconfirmed" && entry.providerLeaseId) {
@@ -995,10 +995,29 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
         });
         throw new NativePredecessorRetirementDirectoryBusyError(entry.runId, error);
       }
+      // c3 (org 07:14Z): only a typed stop/destroy receipt on the owner's OWN lease proves it gone, never the close error.
+      if (await ownLeaseReceiptProvesOwnerGone(entry, options?.successorProviderLeaseId).catch(() => false)) {
+        await markWarmNativeHarnessBackupMissing(entry, "close_failed").catch(markError => logger.warn({ err: markError, runId: entry.runId }, "could not record the retired owner's missing harness backup"));
+        logger.warn({ runId: entry.runId, providerLeaseId: entry.providerLeaseId ?? null, reason }, "warm predecessor's own lease carries its stop receipt; released its owner");
+        return;
+      }
       entry.retirementUnproven = true;
       throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId ?? null, error);
     }
   }
+}
+
+/** 'destroyed' on the owner's own lease proves it gone; 'stopped' only when the successor is on another box. */
+async function ownLeaseReceiptProvesOwnerGone(entry: WarmNativeSession, successorProviderLeaseId?: string | null): Promise<boolean> {
+  if (!entry.sandboxLeaseDb || !entry.providerLeaseId || !entry.environmentId) return false;
+  const leases = await entry.sandboxLeaseDb.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, entry.companyId),
+    eq(environmentLeases.environmentId, entry.environmentId), eq(environmentLeases.providerLeaseId, entry.providerLeaseId),
+    eq(environmentLeases.heartbeatRunId, entry.runId)));
+  return leases.some(lease => {
+    if (lease.heartbeatRunId !== entry.runId || lease.providerLeaseId !== entry.providerLeaseId || !hasRemoteTerminationReceipt(lease)) return false;
+    const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
+    return state === "destroyed" || (state === "stopped" && !!successorProviderLeaseId && successorProviderLeaseId !== entry.providerLeaseId);
+  });
 }
 
 // chat-retire3 F2: a follow-up may first wait out its predecessor's release
@@ -1173,7 +1192,7 @@ export async function claimWarmNativeInstructionCopy(input: {
     if (warmNativeSessions.get(scope) !== entry) return;
     entry.closeOnReleaseReason = reason;
     try {
-      await retireWarmPredecessor(entry, reason);
+      await retireWarmPredecessor(entry, reason, { successorProviderLeaseId: sandboxProviderLeaseId(input.target) });
       forgetWarmNativeSession(scope, entry);
     } finally { entry.busy = false; }
   };
@@ -1235,7 +1254,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
     const retire = async (reason: string) => {
       entry.closeOnReleaseReason = reason;
       try {
-        await retireWarmPredecessor(entry, reason);
+        await retireWarmPredecessor(entry, reason, { successorProviderLeaseId: sandboxProviderLeaseId(input.target) });
         forgetWarmNativeSession(id, entry);
       } finally {
         // Failed containment remains registered and cannot be adopted. The next
@@ -2848,6 +2867,7 @@ async function retireSupersededWarmNativeSessions(
     entry.closeOnReleaseReason = logicalOwner ? "warm native session identity changed" : "warm native ingress requires another session";
     try {
       await retireWarmPredecessor(entry, entry.closeOnReleaseReason, {
+        successorProviderLeaseId: sandboxProviderLeaseId(target),
         discardUnsettledSession: logicalOwner && entry.normalizedSessionId !== nextSessionId,
         ...(ownReservation ? { preserveInstructionsForRunId: runId } : {}),
       });
@@ -13059,7 +13079,8 @@ async function executePaperclipNativeSessionAttempt(
         entry.busy = true;
         entry.closeOnReleaseReason = "warm native session configuration changed";
         try {
-          await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId });
+          await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId,
+            successorProviderLeaseId: sandboxProviderLeaseId(input.runnerExecutionTarget) });
           forgetWarmNativeSession(warmSessionId, entry);
         } catch (error) {
           // This late preparation step is outside the earlier task-prepare
