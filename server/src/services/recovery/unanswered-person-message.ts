@@ -59,6 +59,9 @@ export const UNANSWERED_MESSAGE_NO_RUN_GRACE_MS = 120_000;
 /** A native same-run retry that is this late is not going to start by itself. */
 const OVERDUE_NATIVE_RETRY_MS = 5 * 60_000;
 
+/** Earlier owed messages settled per task per pass; discovery keeps flagging the task until none is left. */
+const EARLIER_OWED_PER_PASS = 20;
+
 export const UNANSWERED_MESSAGE_NO_REPLY_CODE = "no_reply";
 export const UNANSWERED_MESSAGE_NO_RUN_CODE = "no_run";
 export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
@@ -307,13 +310,29 @@ export async function settleUnansweredPersonMessage(
   input: { companyId: string; issueId: string; now?: Date; issueCreatedAtGte?: Date | null;
     nativeBlockedRepairApplies?: NativeBlockedRepairApplies },
 ): Promise<UnansweredMessageOutcome> {
+  // One outcome for the task: the latest message's, unless only an earlier owed message was noticed or still waits.
+  const outcomes = await settleOwedPersonMessages(db, input);
+  const last = outcomes[outcomes.length - 1];
+  return last.kind === "noticed" ? last : outcomes.find(outcome => outcome.kind === "noticed")
+    ?? outcomes.filter((outcome): outcome is { kind: "pending"; recheckAt: number } => outcome.kind === "pending")
+      .sort((a, b) => a.recheckAt - b.recheckAt)[0] ?? last;
+}
+
+/** The task's owed set, one entry per message (the joint rule): every earlier person message discovery flags
+ * (unansweredPersonMessageCommentCondition: in scope, unanswered by the one function, no notice yet), oldest
+ * first, then the latest message LAST. Each gets its own decision and its own ONE notice. */
+async function settleOwedPersonMessages(
+  db: Db,
+  input: { companyId: string; issueId: string; now?: Date; issueCreatedAtGte?: Date | null;
+    nativeBlockedRepairApplies?: NativeBlockedRepairApplies },
+): Promise<UnansweredMessageOutcome[]> {
   const now = input.now ?? new Date();
   const [issue] = await db.select({
     id: issues.id, companyId: issues.companyId, status: issues.status, hiddenAt: issues.hiddenAt,
     assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, createdAt: issues.createdAt,
   }).from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
-  if (!issue) return { kind: "none" };
-  if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return { kind: "out_of_scope" };
+  if (!issue) return [{ kind: "none" }];
+  if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return [{ kind: "out_of_scope" }];
 
   // An answer to a message supersedes that message's notice (and its
   // retrying line): the relation is message -> answer, not the notice's time.
@@ -336,7 +355,23 @@ export async function settleUnansweredPersonMessage(
         and ${answeredSql(rawMessage("m"))})`);
   });
 
-  const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
+  const earlierOwed = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), eq(issueComments.authorType, "user"),
+    unansweredPersonMessageCommentCondition(),
+    sql`${issueComments.id} <> (select l.id from ${issueComments} l where l.company_id = ${issue.companyId} and l.issue_id = ${issue.id}
+      and l.author_type = 'user' and l.deleted_at is null order by l.created_at desc, l.id desc limit 1)`))
+    .orderBy(issueComments.createdAt, issueComments.id).limit(EARLIER_OWED_PER_PASS);
+  const outcomes: UnansweredMessageOutcome[] = [];
+  for (const messageId of [...earlierOwed.map(row => row.id), undefined]) {
+    outcomes.push(await settleOnePersonMessage(db, issue, now, input.nativeBlockedRepairApplies, messageId));
+  }
+  return outcomes;
+}
+
+/** One message of the task (the latest when messageId is not given): decide, then write its notice under the fence. */
+async function settleOnePersonMessage(db: Db, issue: DecisionIssue, now: Date,
+  nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined, messageId: string | undefined): Promise<UnansweredMessageOutcome> {
+  const decision = await decideUnansweredMessage(db, issue, now, nativeBlockedRepairApplies, messageId);
   if (decision.kind === "pending") {
     if (decision.recordDeferral) {
       await appendHeartbeatRunEvent(db, { companyId: issue.companyId, runId: decision.recordDeferral.runId,
@@ -360,7 +395,7 @@ export async function settleUnansweredPersonMessage(
     // means no notice.
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies);
+    const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies, messageId);
     if (fenced.kind !== "notice" || fenced.reason !== decision.reason
       || fenced.upgradeCommentId !== decision.upgradeCommentId) return null;
     if (fenced.upgradeCommentId) {
@@ -406,14 +441,14 @@ export const PENDING_WAIT_BOUND_MS = 2 * 60_000;
 /** The one predicate: run outside the fence to skip the lock in the common
  * case, and again unchanged inside it before writing. Reads only. */
 async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
-  nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<Decision> {
+  nativeBlockedRepairApplies?: NativeBlockedRepairApplies, messageId?: string): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
 
   const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-    eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
+    eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), messageId ? eq(issueComments.id, messageId) : undefined))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
   // No age cut here: discovery (inScopeSql) decides which messages are in
   // scope, so an open obligation is never dropped silently by age.
@@ -705,9 +740,15 @@ export async function settleUnansweredPersonMessagesForTask(
   input: { companyId: string; issueId: string; issueCreatedAtGte?: Date | null; onDeferredDeadline?: (at: number) => void; now?: Date;
     nativeBlockedRepairApplies?: NativeBlockedRepairApplies },
 ): Promise<{ noticed: number; pending: number }> {
-  const outcome = await settleUnansweredPersonMessage(db, input);
-  if (outcome.kind === "pending") input.onDeferredDeadline?.(outcome.recheckAt);
-  return { noticed: outcome.kind === "noticed" ? 1 : 0, pending: outcome.kind === "pending" ? 1 : 0 };
+  const result = { noticed: 0, pending: 0 };
+  for (const outcome of await settleOwedPersonMessages(db, input)) {
+    if (outcome.kind === "noticed") result.noticed += 1;
+    if (outcome.kind === "pending") {
+      result.pending += 1;
+      input.onDeferredDeadline?.(outcome.recheckAt);
+    }
+  }
+  return result;
 }
 
 /** The sweep's pass outside the worker (startup, a direct call): every task in
@@ -725,12 +766,13 @@ export async function settleUnansweredPersonMessages(
   )).limit(200);
   const result = { noticed: 0, pending: 0 };
   for (const candidate of candidates) {
-    const outcome = await settleUnansweredPersonMessage(db, { companyId: candidate.companyId, issueId: candidate.id, now: input.now,
-      nativeBlockedRepairApplies: input.nativeBlockedRepairApplies });
-    if (outcome.kind === "noticed") result.noticed += 1;
-    if (outcome.kind === "pending") {
-      result.pending += 1;
-      input.onDeferredDeadline?.(outcome.recheckAt);
+    for (const outcome of await settleOwedPersonMessages(db, { companyId: candidate.companyId, issueId: candidate.id, now: input.now,
+      nativeBlockedRepairApplies: input.nativeBlockedRepairApplies })) {
+      if (outcome.kind === "noticed") result.noticed += 1;
+      if (outcome.kind === "pending") {
+        result.pending += 1;
+        input.onDeferredDeadline?.(outcome.recheckAt);
+      }
     }
   }
   return result;
