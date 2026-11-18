@@ -19,12 +19,15 @@ import {
 import { redactSensitiveText } from "../redaction.js";
 
 const MAX_LOG_REDACTION_DEPTH = 8;
+const TRUNCATED_LOG_VALUE = "[Truncated]";
 
 // Mask credential shapes in every string of a serialized log value. Nested
 // objects are copied, never mutated: they can be live application objects.
+// Past the depth bound a subtree is replaced, never passed through unread.
 function redactLogValue(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
   if (typeof value === "string") return redactSensitiveText(value);
-  if (!value || typeof value !== "object" || depth > MAX_LOG_REDACTION_DEPTH) return value;
+  if (!value || typeof value !== "object") return value;
+  if (depth > MAX_LOG_REDACTION_DEPTH) return TRUNCATED_LOG_VALUE;
   if (seen.has(value)) return "[Circular]";
   seen.add(value);
   if (Array.isArray(value)) return value.map((item) => redactLogValue(item, depth + 1, seen));
@@ -58,29 +61,16 @@ export const logSerializers = {
   err: redactedErrSerializer,
   stderr: redactedTextSerializer,
   stdout: redactedTextSerializer,
+  // The one choke point for `msg`. Pino runs the message-key serializer on the
+  // final message it emits (after %s/%o formatting, the msgPrefix, and the
+  // message it infers from `err` when none is given), and on a `msg` property
+  // of the merging object. Child loggers, including pino-http's, inherit it.
+  msg: redactedTextSerializer,
 };
-
-// With no message argument Pino copies the raw `err.message` into `msg`
-// before any serializer runs; supply the masked message instead.
-function defaultMessageFromError(first: unknown): string | undefined {
-  if (first instanceof Error) return first.message;
-  if (!first || typeof first !== "object" || "msg" in first) return undefined;
-  const err = (first as { err?: unknown }).err;
-  return err && typeof (err as { message?: unknown }).message === "string"
-    ? (err as { message: string }).message
-    : undefined;
-}
 
 export const baseLoggerOptions = {
   redact: [...HTTP_LOG_REDACT_PATHS],
   serializers: logSerializers,
-  hooks: {
-    logMethod(this: Logger, args: Parameters<pino.LogFn>, method: pino.LogFn) {
-      const message = args[1] === undefined ? defaultMessageFromError(args[0]) : undefined;
-      if (message === undefined) return method.apply(this, args);
-      return method.call(this, args[0] as object, redactSensitiveText(message));
-    },
-  },
 };
 
 const sharedOpts = {

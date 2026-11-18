@@ -160,3 +160,143 @@ describe("error text that is not a credential stays as written", () => {
     expect(record.msg).toBe(`kept ${value}`);
   });
 });
+
+// Six credential kinds in one line: provider key, GitHub token, JWT, AWS key id,
+// AWS secret assignment and a bare Bearer credential.
+const CANARIES = [
+  SECRETS.openai,
+  SECRETS.github,
+  SECRETS.jwt,
+  SECRETS.aws,
+  "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  "Q7x9A2b4C6d8E0f2G4h6",
+];
+const CANARY_LINE =
+  `kept diagnostic ${CANARIES[0]} ${CANARIES[1]} ${CANARIES[2]} ${CANARIES[3]} aws_secret_access_key=${CANARIES[4]} Bearer ${CANARIES[5]} end`;
+const MASKED_LINE =
+  "kept diagnostic ***REDACTED*** ***REDACTED*** ***REDACTED*** ***REDACTED*** aws_secret_access_key=***REDACTED*** Bearer ***REDACTED*** end";
+
+function records(text: string) {
+  return text.trim().split("\n").map((line) => JSON.parse(line));
+}
+
+function expectNoCanary(text: string) {
+  for (const canary of CANARIES) expect(text).not.toContain(canary);
+}
+
+describe("every msg Pino emits is masked", () => {
+  it("masks the msg Pino infers from err when the object's msg is undefined", () => {
+    const { log, output } = capture();
+    log.error({ err: new Error(CANARY_LINE), msg: undefined });
+    const text = output();
+    expectNoCanary(text);
+    expect(records(text)[0].msg).toBe(MASKED_LINE);
+  });
+
+  it("masks an explicit message argument, with and without a merging object", () => {
+    const { log, output } = capture();
+    const err = new Error(CANARY_LINE);
+    log.error({ err }, err.message);
+    log.info(CANARY_LINE);
+    log.warn(err, `wrapped: ${CANARY_LINE}`);
+    const text = output();
+    expectNoCanary(text);
+    const [first, second, third] = records(text);
+    expect(first.msg).toBe(MASKED_LINE);
+    expect(second.msg).toBe(MASKED_LINE);
+    expect(third.msg).toBe(`wrapped: ${MASKED_LINE}`);
+  });
+
+  it("masks %s / %o format arguments after Pino formats the message", () => {
+    const { log, output } = capture();
+    log.info("provider said %s", CANARY_LINE);
+    log.warn({ runId: "run-3" }, "first %s then %s", CANARIES[0], `Bearer ${CANARIES[5]}`);
+    log.error("details %o", { detail: CANARY_LINE });
+    const text = output();
+    expectNoCanary(text);
+    const [first, second, third] = records(text);
+    expect(first.msg).toBe(`provider said ${MASKED_LINE}`);
+    expect(second.msg).toBe("first ***REDACTED*** then Bearer ***REDACTED***");
+    expect(second.runId).toBe("run-3");
+    expect(third.msg).toContain(MASKED_LINE);
+  });
+
+  it("masks a string or object msg property on the merging object", () => {
+    const { log, output } = capture();
+    log.error({ err: new Error("provider failed"), msg: CANARY_LINE });
+    log.warn({ msg: { detail: CANARY_LINE } });
+    log.info({ msg: CANARY_LINE }, "explicit wins");
+    const text = output();
+    expectNoCanary(text);
+    const [first, second, third] = records(text);
+    expect(first.msg).toBe(MASKED_LINE);
+    expect(first.err.message).toBe("provider failed");
+    expect(second.msg).toEqual({ detail: MASKED_LINE });
+    expect(third.msg).toBe("explicit wins");
+  });
+
+  it("masks every msg shape in child loggers, including ones with their own serializers and prefix", () => {
+    const { log, output } = capture();
+    const child = log.child({ module: "x" });
+    child.error({ err: new Error(CANARY_LINE), msg: undefined });
+    child.info("child said %s", CANARY_LINE);
+    const own = log.child({ module: "y" }, { serializers: { req: (value: unknown) => value }, msgPrefix: "[y] " });
+    own.warn(CANARY_LINE);
+    own.child({ module: "z" }).error({ msg: CANARY_LINE });
+    const text = output();
+    expectNoCanary(text);
+    const [first, second, third, fourth] = records(text);
+    expect(first.msg).toBe(MASKED_LINE);
+    expect(second.msg).toBe(`child said ${MASKED_LINE}`);
+    expect(third.msg).toBe(`[y] ${MASKED_LINE}`);
+    expect(fourth.msg).toBe(MASKED_LINE);
+  });
+
+  it("masks messages logged through pino-http's request logger", async () => {
+    const { log, output } = capture();
+    const app = express();
+    app.use(createHttpLogger(log));
+    app.get("/api/talk", (req, res) => {
+      req.log.warn("upstream said %s", CANARY_LINE);
+      req.log.error({ err: new Error(CANARY_LINE), msg: undefined });
+      res.status(200).json({ ok: true });
+    });
+    await request(app).get("/api/talk");
+    const text = output();
+    expectNoCanary(text);
+    const [first, second] = records(text);
+    expect(first.msg).toBe(`upstream said ${MASKED_LINE}`);
+    expect(second.msg).toBe(MASKED_LINE);
+  });
+
+  it("keeps a message with no credential exactly as written", () => {
+    const { log, output } = capture();
+    log.info("run %s finished in %d ms at %s", "run_01JD8X4ZK7Q2M9N3P5R6S7T8V9", 42, "2026-11-18T17:36:04.512Z");
+    expect(records(output())[0].msg).toBe("run run_01JD8X4ZK7Q2M9N3P5R6S7T8V9 finished in 42 ms at 2026-11-18T17:36:04.512Z");
+  });
+});
+
+describe("the log mask fails closed past its depth bound", () => {
+  it("replaces an err extra deeper than the bound with a marker, never the raw subtree", () => {
+    const { log, output } = capture();
+    let details: Record<string, unknown> = { leaf: CANARY_LINE, keys: [...CANARIES] };
+    for (let level = 0; level < 10; level += 1) details = { child: details };
+    log.error({ err: Object.assign(new Error("provider failed"), { details }) }, "provider failed");
+    const text = output();
+    expectNoCanary(text);
+    expect(text).toContain('"[Truncated]"');
+    let node = records(text)[0].err.details;
+    while (node && typeof node === "object") node = node.child;
+    expect(node).toBe("[Truncated]");
+  });
+
+  it("replaces a deep stderr / stdout slice the same way", () => {
+    const { log, output } = capture();
+    let deep: unknown = [CANARY_LINE];
+    for (let level = 0; level < 10; level += 1) deep = [deep];
+    log.warn({ stderr: deep, stdout: { a: { b: { c: { d: { e: { f: { g: { h: { i: { j: CANARY_LINE } } } } } } } } } } }, "box output");
+    const text = output();
+    expectNoCanary(text);
+    expect(text).toContain('"[Truncated]"');
+  });
+});
