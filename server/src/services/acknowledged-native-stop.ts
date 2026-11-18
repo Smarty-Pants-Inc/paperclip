@@ -68,6 +68,32 @@ export function isAcknowledgedNativeStop(run: Parameters<typeof hasAcknowledgedN
   return run.status === "cancelled" && hasAcknowledgedNativeStopIntent(run);
 }
 
+/**
+ * Option S (ac067fa884): the chat owner's Send after an acknowledged person
+ * Stop takes the same ordinary admission as a typed message. ONE predicate:
+ * admission (explicit-native-continuation) decides with it, and the held bar
+ * (routes/issues.ts) shows "will be sent when you send your next message" only
+ * when it holds. It is the owner's Agent Chat, the sender is its owner, the
+ * agent's latest native turn is an acknowledged person Stop (not a non-person
+ * cancel) finished before the Send, and no reconciliation
+ * source or execution blocker stands.
+ */
+export function isOwnerSendAfterAcknowledgedPersonStop(input: {
+  task: { conversationAgentId?: string | null; conversationUserId?: string | null };
+  agentId: string;
+  senderId: unknown;
+  latest: (Parameters<typeof isAcknowledgedNativeStop>[0] & { finishedAt: Date | null }) | null | undefined;
+  sentAt: Date;
+  blockedOrReconciling: boolean;
+}): boolean {
+  const { task, latest } = input;
+  return !input.blockedOrReconciling && task.conversationAgentId === input.agentId
+    && input.senderId === task.conversationUserId && !!latest && isAcknowledgedNativeStop(latest)
+    // Narrowed Option S (6102b5d4): an operator Interrupt is not a person Stop.
+    && latest.resultJson?.operatorInterrupted !== true && !latest.resultJson?.queuedCommentInterruptQueueId
+    && !!latest.finishedAt && latest.finishedAt <= input.sentAt;
+}
+
 /** API-owned execution has no Computer lease. Its provider terminal and retired
  * local controller must both be recorded before publishing shared Stop proof. */
 export async function acknowledgedNativeApiStopExecutionHasStopped(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect,
