@@ -1,5 +1,6 @@
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
-import { personStopPendingLine } from "./recovery/stop-pending.js";
+import { isPersonStop, PERSON_STOP_SETTLING_LINE, personStopPendingLine } from "./recovery/stop-pending.js";
+import { hasRecordedUserStopRequest } from "./acknowledged-native-stop.js";
 import { agentDirectoryPreparationWaitPredicate, isAgentDirectoryPreparationWait } from "./pre-dispatch-execution-evidence.js";
 import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
@@ -386,7 +387,16 @@ export async function admitExplicitNativeContinuation(input: {
         (run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId) !== issueId ||
         !run.finishedAt) return blocked("source_unavailable", "The previous execution has not finished or its owner changed. Your message is saved.");
     if (!queuedInterrupt && !queuedRequest && authorizedAt <= userStopBoundaryAt(run)!) return blocked("message_predates_stop", "This message arrived before the previous run stopped. Send a new message to continue.");
-    if (adapterExecutionControls.has(run.id)) return blocked("execution_settling", "Waiting for the previous run to stop. Your message will start automatically.");
+    // adopt-stopu-twoclock5 (rf-4 NEW 1): the person-Stop check comes BEFORE every
+    // generic settling return below. After a person's Stop no return promises an
+    // automatic start: an open Stop-pending card gives its own line, else the
+    // settling line (it names no wait and promises nothing).
+    const personStopped = isPersonStop(run) || hasRecordedUserStopRequest(run);
+    const personStopCardLine = personStopped ? await personStopPendingLine(db, { companyId, issueId, runId: run.id }) : null;
+    const settling = (kind: typeof blocked) => !personStopped
+      ? kind("execution_settling", "Waiting for the previous run to stop. Your message will start automatically.")
+      : personStopCardLine ? kind("execution_stop_pending", personStopCardLine) : kind("execution_settling", PERSON_STOP_SETTLING_LINE);
+    if (adapterExecutionControls.has(run.id)) return settling(blocked);
     const [coordinator] = await db.select().from(nativeRunFinalizations).where(and(
       eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, run.id),
     )).for("update");
@@ -394,7 +404,7 @@ export async function admitExplicitNativeContinuation(input: {
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, run.id),
     )).for("update");
     if (!lockedRun || lockedRun.status !== run.status || lockedRun.agentId !== run.agentId ||
-        lockedRun.finishedAt?.getTime() !== run.finishedAt.getTime()) return refused("execution_settling", "Waiting for the previous run to stop. Your message will start automatically.");
+        lockedRun.finishedAt?.getTime() !== run.finishedAt.getTime()) return settling(refused);
     run = lockedRun;
     // A user's message written after their Stop request is new direction even
     // when the stopped native run settled later.
@@ -433,7 +443,7 @@ export async function admitExplicitNativeContinuation(input: {
               historicalAdapter === "paperclip_runner" && run.status === "failed"))
           return refused("previous_execution_unverified", PREVIOUS_EXECUTION_UNVERIFIED);
         if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())
-          return refused("execution_settling", "Waiting for the previous run to stop. Your message will start automatically.");
+          return settling(refused);
         if (await hasPendingRunCleanup(db, companyId, run.id))
           return refused("cleanup_pending", "Waiting for the previous run to finish cleanup. Your message is saved.");
         if (!await isFailedNativePreparationRetryAncestor(db, run, coordinator))

@@ -35,6 +35,10 @@ export const STOP_PENDING_PERSON_ACTION_EXECUTOR_ALIVE =
 export function personStopCardLine(runIds: readonly string[]): string {
   return runIds.some(runId => activeRunExecutions.has(runId)) ? STOP_PENDING_PERSON_ACTION_EXECUTOR_ALIVE : STOP_PENDING_PERSON_ACTION;
 }
+/** adopt-stopu-twoclock5 (rf-4 NEW 1): a person's held message after their Stop
+ * while the previous run still settles and no card is open. It names no wait
+ * length and promises no automatic start. */
+export const PERSON_STOP_SETTLING_LINE = "Stopping the previous run. Your message is saved.";
 /** ONE bound for a person's Stop card, read by BOTH writers: the recovery sweep's
  * deferral (recovery/service.ts) and the cleanup retry (recordPersonStopCleanupPending,
  * called from heartbeat/recovery.ts). Measured from nativeCancellation.recordedAt. */

@@ -3191,4 +3191,78 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
+
+  // adopt-stopu-twoclock5 (rf-4 NEW 1): after a person's Stop no generic settling
+  // return may promise an automatic start. One RED per return (:389 adapter
+  // control still live, :397 the run row changed under the lock).
+  const FORBIDDEN = [/will start automatically/i, /waiting for the agent to be free/i, /Your message is waiting to start/i];
+  async function personStopped() {
+    const f = await seed();
+    const recordedAt = "2026-09-11T10:00:00.000Z";
+    await db.update(heartbeatRuns).set({ status: "cancelled", processPid: null, resultJson: {
+      cancelledByActorType: "user", cancelledByUserId: "board", executionCancellation: { state: "acknowledged" },
+      nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.sourceRunId, companyId: f.companyId,
+        issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+        intentAuditId: "intent-1", acknowledgementAuditId: "ack-1", recordedAt } } }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    return f;
+  }
+  async function linesOf(f: Fixture, database: Db = db) {
+    const lines: Array<[string, string]> = [];
+    await admitExplicitNativeContinuation({ ...f, db: database, dryRun: true, onBlocked: (reason, message) => lines.push([reason, message]) });
+    return lines;
+  }
+  it("twoclock5 RED :389: a live adapter control after a person's Stop never promises an automatic start", async () => {
+    const f = await personStopped();
+    const control = createAdapterExecutionControl();
+    adapterExecutionControls.set(f.sourceRunId, control);
+    try {
+      const lines = await linesOf(f);
+      expect(lines).toEqual([["execution_settling", "Stopping the previous run. Your message is saved."]]);
+      for (const [, message] of lines) for (const forbidden of FORBIDDEN) expect(message).not.toMatch(forbidden);
+    } finally { adapterExecutionControls.delete(f.sourceRunId); control.finish(); }
+  });
+  it("twoclock5 RED :397: the run row changing under the lock after a person's Stop never promises an automatic start", async () => {
+    const f = await personStopped();
+    // The second (locked) read of the source run sees a different finishedAt.
+    let reads = 0;
+    const racing = new Proxy(db, { get(target, key) {
+      if (key !== "select") return Reflect.get(target, key);
+      return (...fields: Parameters<Db["select"]>) => {
+        const builder = target.select(...fields), from = builder.from.bind(builder);
+        builder.from = ((...args: Parameters<typeof from>) => {
+          const query = from(...args);
+          if (args[0] === nativeRunFinalizations) {
+            const forUpdate = query.for.bind(query);
+            query.for = ((...lock: Parameters<typeof forUpdate>) => {
+              const locked = forUpdate(...lock);
+              if (++reads !== 1) return locked;
+              const then = locked.then.bind(locked);
+              locked.then = ((resolve, reject) => db.update(heartbeatRuns).set({ finishedAt: new Date("2026-09-11T10:00:05Z") })
+                .where(eq(heartbeatRuns.id, f.sourceRunId)).then(() => then(resolve, reject))) as typeof locked.then;
+              return locked;
+            }) as typeof query.for;
+          }
+          return query;
+        }) as typeof from;
+        return builder;
+      };
+    } }) as Db;
+    const lines = await linesOf(f, racing);
+    expect(reads).toBeGreaterThan(0);
+    expect(lines).toEqual([["execution_settling", "Stopping the previous run. Your message is saved."]]);
+    for (const [, message] of lines) for (const forbidden of FORBIDDEN) expect(message).not.toMatch(forbidden);
+  });
+  it("twoclock5: with the person's Stop card open, the settling return gives the card's line", async () => {
+    const f = await personStopped();
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
+      status: "escalated", ownerType: "board", cause: "execution_stop_pending", fingerprint: `execution_stop_pending:${f.sourceRunId}`,
+      nextAction: "card", evidence: { runId: f.sourceRunId, stopPending: { schema: "paperclip.task-stop-pending.v1",
+        code: "execution_stop_pending", runIds: [f.sourceRunId], personStop: true } } });
+    const control = createAdapterExecutionControl();
+    adapterExecutionControls.set(f.sourceRunId, control);
+    try {
+      const lines = await linesOf(f);
+      expect(lines).toEqual([["execution_stop_pending", "Stop pending: Paperclip cannot confirm that the previous execution stopped. Your message is saved."]]);
+    } finally { adapterExecutionControls.delete(f.sourceRunId); control.finish(); }
+  });
 });
