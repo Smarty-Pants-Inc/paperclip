@@ -990,8 +990,10 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   async function holdUnsaved(row: Copy, errorCode: string, failure: unknown, storageWarning: string | null, mirrorHash?: string,
     state: "unavailable" | "pending_collection" = "unavailable", snapshot?: DirectorySnapshot) {
     const reason = failure instanceof HttpError || failure instanceof AgentFileLimitError || failure instanceof Error ? failure.message : String(failure);
-    // B0a: a refused save of a copy with nothing to save is never held.
-    if (errorCode !== AGENT_FILES_ASIDE_UNSURFACED && nothingToSave(row)) return settleNothingToSave(row, reason);
+    // B0a: a refused save of a copy with nothing to save is never held. An
+    // authorization refusal (403) never records unchanged (b13 guards).
+    if (errorCode !== AGENT_FILES_ASIDE_UNSURFACED && !(failure instanceof HttpError && failure.status === 403) && nothingToSave(row))
+      return settleNothingToSave(row, reason);
     const stoppedAt = row.processStoppedAt ?? new Date();
     const previous = row.receipt?.savePending as { since?: string; failures?: number; permanentAt?: string; heldFiles?: AgentFileHeldFile[]; noticeActivityId?: string } | undefined;
     const since = typeof previous?.since === "string" ? new Date(previous.since) : stoppedAt;
@@ -1060,9 +1062,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (row.receipt?.retainedByRunId) return row;
     if (!await owns(row) || row.state === "superseded") return row;
     const held = agentFileSaveHeld(row);
-    // B0a: an existing hold on a copy with nothing to save settles; no retry.
-    if (held && (row.receipt?.savePending as { code?: unknown } | undefined)?.code !== AGENT_FILES_ASIDE_UNSURFACED && nothingToSave(row))
-      return settleNothingToSave(row, String((row.receipt?.savePending as { reason?: unknown }).reason ?? "refused"));
+    // B0a: an existing LEASE-GONE hold (its recorded refusal is source-unavailable,
+    // never an authorization refusal) on a copy with nothing to save settles; no retry.
+    const heldReason = String((row.receipt?.savePending as { reason?: unknown } | undefined)?.reason ?? "");
+    if (held && (row.receipt?.savePending as { code?: unknown } | undefined)?.code !== AGENT_FILES_ASIDE_UNSURFACED
+      && agentFileSourceLeaseGone(new Error(heldReason)) && nothingToSave(row)) return settleNothingToSave(row, heldReason);
     // B1/B0b: a parked hold is never retried here (only its notice is ensured);
     // a LEASE-GONE hold is re-armed by rearmAgentFileHoldsOnLeaseActive.
     if (held && agentFileHoldParked(row.receipt?.savePending)) return noticePermanentHold(row);
