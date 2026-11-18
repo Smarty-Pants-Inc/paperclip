@@ -166,8 +166,10 @@ export function agentHarnessVerificationService(db: Db, manager: PluginWorkerMan
     if (selected) {
       try { await reconcileRetainedAiCleanup({ companyId: agent.companyId, accountKey: selected.grant.id }); }
       catch (error) {
-        if (error instanceof HttpError && (error.details as { code?: unknown } | null)?.code === "ai_credential_cleanup_pending") {
-          throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
+        const details = error instanceof HttpError ? error.details as { code?: unknown; expired?: unknown } | null : null;
+        if (details?.code === "ai_credential_cleanup_pending") {
+          throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.",
+            { code: "native_probe_cleanup_pending", ...(details.expired === true ? { expired: true } : {}) });
         }
         throw error;
       }

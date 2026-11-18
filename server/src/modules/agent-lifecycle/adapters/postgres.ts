@@ -378,7 +378,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
         ? agent.lifecycleOperation?.transientFailureSince ?? now.toISOString() : undefined;
       const transientFailures = options?.transientFailure
         ? (agent.lifecycleOperation?.transientFailures ?? 0) + 1 : undefined;
-      const visibleError = transientFailureSince
+      const visibleError = transientFailureSince && !options?.showTransientError
         ? now.getTime() - Date.parse(transientFailureSince) >= LIFECYCLE_ENVIRONMENT_WAIT_MS
           ? LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE : null
         : error;

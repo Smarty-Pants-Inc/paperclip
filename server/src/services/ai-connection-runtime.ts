@@ -7,7 +7,8 @@ import { mkdtemp, mkdir, writeFile, readFile, realpath, rm } from "node:fs/promi
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
-import { type Db, companySecrets, connectionGrants } from "@paperclipai/db";
+import { type Db, companySecrets, connectionGrants, environmentLeases } from "@paperclipai/db";
+import { ownLeaseTerminated } from "./remote-execution-termination.js";
 import {
   AI_CONNECTION_CAPABILITIES,
   aiConnectionMetadataSchema, aiRoutingHarness,
@@ -649,9 +650,39 @@ export async function prepareManagedAiRuntime(
   }
 }
 
+/** Keep the selected credential generation until the native owner has retired
+ * and completed its refresh handoff. The probe's own durable proof is the
+ * receipt its release wrote on the probe's EXACT lease (the verifier's target
+ * holds that id); it is read once per same-account retry, never an error code. */
+export function retainManagedAiProbeCleanup(db: Db, runtime: { retainedCleanupScope?: { companyId: string; accountKey: string } | null; home?: string | null; cleanup: () => Promise<void> },
+  input: { companyId: string; agentId?: string; executionTarget?: unknown }, error: NativeEnvironmentProbeCleanupError): never {
+  const retryCleanup = (error as { retryCleanup?: () => Promise<void> }).retryCleanup;
+  const target = input.executionTarget as { kind?: unknown; transport?: unknown; leaseId?: unknown } | null | undefined;
+  const probeLeaseId = target?.kind === "remote" && target.transport === "sandbox" && typeof target.leaseId === "string" ? target.leaseId : null;
+  retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home ? path.join(runtime.home, "provider") : undefined, cleanup: runtime.cleanup, retired: error.retired,
+    agentId: input.agentId,
+    ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}),
+    ...(probeLeaseId ? { proveRetired: () => probeLeaseTerminated(db, input.companyId, probeLeaseId) } : {}) });
+  try {
+    warnNativeProbeCleanupPending({ accountKeyHash: retainedAiAccountKeyHash(runtime.retainedCleanupScope!.accountKey),
+      agentId: input.agentId, cleanupErrors: error.cleanupErrors, operationError: error.operationError });
+  } catch { /* Diagnostics must not change the HTTP response. */ }
+  throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
+}
+
+/** The probe's own lease (no run, exact id) carries Boat's typed "destroyed"
+ * receipt. C3: a "stopped" probe box is archived and can be resumed, so a
+ * single-use credential must not be released on "stopped" alone. */
+async function probeLeaseTerminated(db: Db, companyId: string, leaseId: string): Promise<boolean> {
+  const [lease] = await db.select({ environmentId: environmentLeases.environmentId, providerLeaseId: environmentLeases.providerLeaseId })
+    .from(environmentLeases).where(and(eq(environmentLeases.id, leaseId), eq(environmentLeases.companyId, companyId)));
+  return Boolean(lease) && await ownLeaseTerminated(db, { companyId, environmentId: lease!.environmentId,
+    providerLeaseId: lease!.providerLeaseId, runId: null, leaseId }, { ownLeaseOnly: true, successorOnOwnerSandbox: true });
+}
+
 export async function withManagedAiProbe<T>(
   db: Db,
-  input: Parameters<typeof prepareManagedAiRuntime>[1],
+  input: Parameters<typeof prepareManagedAiRuntime>[1] & { executionTarget?: unknown },
   probe: (runtime: Awaited<ReturnType<typeof prepareManagedAiRuntime>>) => Promise<T>,
 ): Promise<T> {
   const runtime = await prepareManagedAiRuntime(db, input);
@@ -661,18 +692,8 @@ export async function withManagedAiProbe<T>(
   }
   catch (error) {
     if (error instanceof NativeEnvironmentProbeCleanupError) {
-      // Keep the selected credential generation until the native owner has
-      // retired and completed its refresh handoff. HTTP need not wait for it.
       retained = true;
-      const retryCleanup = (error as { retryCleanup?: () => Promise<void> }).retryCleanup;
-      retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, retired: error.retired,
-        agentId: input.agentId,
-        ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}) });
-      try {
-        warnNativeProbeCleanupPending({ accountKeyHash: retainedAiAccountKeyHash(runtime.retainedCleanupScope!.accountKey),
-          agentId: input.agentId, cleanupErrors: error.cleanupErrors, operationError: error.operationError });
-      } catch { /* Diagnostics must not change the HTTP response. */ }
-      throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
+      retainManagedAiProbeCleanup(db, runtime, input, error);
     }
     throw error;
   } finally {
