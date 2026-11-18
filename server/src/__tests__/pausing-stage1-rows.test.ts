@@ -14,7 +14,8 @@ import { configureAgentLifecycle } from "../services/agent-lifecycle.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
+import { hasRecoveredCleanupStopReceipt, ownLeaseTerminated, remoteTerminationReceipt } from "../services/remote-execution-termination.js";
+import { parkedCleanupDisposition } from "../services/environment-retained-orphan-settlement.js";
 import { nextEnvironmentCleanupAt } from "../services/environment-cleanup-state.js";
 import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 
@@ -199,7 +200,7 @@ describe("pausing stage 1 rows", () => {
     expect(await leaseRow(leaseId)).toMatchObject({ status: "expired", cleanupStatus: "success" });
   });
 
-  it("row B-unproved: no proved stop is neither parked nor destroyed (retainOnDestroy and a save hold alone never park); the pause keeps its true line", async () => {
+  it("row B-unproved: with a NEVER-OK hold present, an unproved stop neither parks nor destroys (retainOnDestroy and a save hold alone never park); the pause keeps its true line", async () => {
     providerAnswer = () => undefined;
     const { agent, leaseId } = await pendingDestroy(() => ({ retainOnDestroy: true }), () => {
       throw new Error("Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.");
@@ -243,5 +244,46 @@ describe("pausing stage 1 rows", () => {
       runIds: [run.id], leases: [expect.objectContaining({ id: lease.id, status: "expired", cleanupStatus: "success" })] })] });
     expect((await request(app()).get(`/api/companies/${companyId}/agents/pausing-report`)).body).toEqual(first.body);
     expect({ agent: await agentRow(agent.id), lease: await leaseRow(lease.id) }).toEqual(before);
+  });
+
+  // RFL F1 (judge's negatives): the park key's stop proof is this exact lease of this run.
+  it.each(["other-run-destroyed", "same-run-carried-stopped", "same-run-stopped"])("JUDGE exact-own-lease proof rejects sibling receipt: %s", async mode => {
+    const { run, leaseId } = await pendingDestroy(() => ({ retainOnDestroy: true }), () => { throw new Error("held"); }, true);
+    const target = await leaseRow(leaseId);
+    let siblingRunId = run.id;
+    if (mode === "other-run-destroyed") {
+      siblingRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: siblingRunId, companyId, agentId: run.agentId, status: "cancelled", invocationSource: "on_demand" });
+    }
+    const sibling = { id: randomUUID(), companyId, heartbeatRunId: siblingRunId, provider: "boat", providerLeaseId: target.providerLeaseId };
+    const receipt = remoteTerminationReceipt(sibling, { providerLeaseId: target.providerLeaseId, state: mode === "other-run-destroyed" ? "destroyed" : "stopped" });
+    await db.insert(environmentLeases).values({ ...sibling, environmentId, status: "released", cleanupStatus: "success", releasedAt: new Date(), leasePolicy: "ephemeral",
+      metadata: mode === "same-run-carried-stopped" ? { workspaceRecoveryCleanup: { runId: siblingRunId, stopReceipt: receipt } } : { remoteExecutionTermination: receipt } });
+    expect(await parkedCleanupDisposition(db, target, new Date()), "A different lease receipt is never the exact owner's receipt").toBeUndefined();
+    expect(await parkedCleanupDisposition(db, target, new Date(), { providerLeaseId: target.providerLeaseId, state: "stopped" })).toBeUndefined();
+  });
+
+  // RFL F3 (M5): a carried cleanup note proves Stop only through its typed receipt bound to this exact lease.
+  const carriedNoteRows: [string, (identity: { id: string; heartbeatRunId: string; providerLeaseId: string }) => unknown][] = [
+    ["without stopReceipt", () => undefined],
+    ["with a malformed stopReceipt", identity => ({ schema: "paperclip.remote-termination.v1", leaseId: identity.id, state: "stopped" })],
+    ["bound to another company", identity => remoteTerminationReceipt({ ...identity, companyId: randomUUID(), provider: "boat" }, { providerLeaseId: identity.providerLeaseId, state: "stopped" })],
+    ["bound to another run", identity => remoteTerminationReceipt({ ...identity, heartbeatRunId: randomUUID(), companyId, provider: "boat" }, { providerLeaseId: identity.providerLeaseId, state: "stopped" })],
+    ["bound to another lease", identity => remoteTerminationReceipt({ ...identity, id: randomUUID(), companyId, provider: "boat" }, { providerLeaseId: identity.providerLeaseId, state: "stopped" })],
+    ["bound to another provider", identity => remoteTerminationReceipt({ ...identity, companyId, provider: "other-boat" }, { providerLeaseId: identity.providerLeaseId, state: "stopped" })],
+    ["bound to another providerLeaseId", identity => remoteTerminationReceipt({ ...identity, companyId, provider: "boat", providerLeaseId: "boat-other" }, { providerLeaseId: "boat-other", state: "stopped" })],
+  ];
+  it.each(carriedNoteRows)("a carried cleanup note %s never proves Stop or parks", async (_name, stopReceipt) => {
+    const { leaseId } = await pendingDestroy(identity => ({ retainOnDestroy: true, workspaceRecoveryCleanup: {
+      runId: identity.heartbeatRunId, reason: "retained_orphan_sandbox_released", stopReceipt: stopReceipt(identity) } }), () => {
+      throw new Error("Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.");
+    }, true);
+    const target = await leaseRow(leaseId);
+    expect(hasRecoveredCleanupStopReceipt(target)).toBe(false);
+    expect(await ownLeaseTerminated(db, { companyId, environmentId, providerLeaseId: target.providerLeaseId,
+      runId: target.heartbeatRunId, leaseId }, { carriedCleanupStop: true })).toBe(false);
+    expect(await disposition(leaseId)).toBeUndefined();
+    expect(await parkedCleanupDisposition(db, target, new Date(), { providerLeaseId: target.providerLeaseId, state: "stopped" })).toBeUndefined();
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "pending_cleanup" });
   });
 });
