@@ -436,7 +436,33 @@ export async function settleConversationTurn(
               eq(issueComments.issueId, issueId),
               isNull(issueComments.deletedAt),
               sql`${issueComments.authorUserId} is not null`,
-              wake ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (select cursor.created_at, cursor.id from issue_comments cursor where cursor.id = ${wake.id}::uuid)` : undefined,
+              currentConversationCommentCondition(),
+              // Reordering and Interrupt can answer a newer comment first.
+              // Creation time is provenance, not outstanding delivery order.
+              // As in historical-question progress above, only a successful,
+              // durably answered turn in this session can retire newer work.
+              wake ? sql`(exists (select 1 from ${agentWakeupRequests} waiting
+                where waiting.company_id = ${run.companyId}::uuid
+                  and waiting.agent_id = ${issue.conversationAgentId}::uuid
+                  and waiting.payload->>'issueId' = ${issueId}
+                  and waiting.status in ('deferred_issue_execution', 'queued')
+                  and (waiting.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${issueComments.id}::text
+                    or coalesce(waiting.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${issueComments.id}::text))
+                or ((${issueComments.createdAt}, ${issueComments.id}) > (select cursor.created_at, cursor.id from issue_comments cursor where cursor.id = ${wake.id}::uuid)
+                  and not exists (select 1 from ${heartbeatRuns} completed
+                    where completed.company_id = ${run.companyId}::uuid
+                      and completed.agent_id = ${issue.conversationAgentId}::uuid
+                      and completed.status = 'succeeded' and completed.context_snapshot->>'issueId' = ${issueId}
+                      and completed.context_snapshot->>'conversationSessionGeneration' = ${String(issue.conversationSessionGeneration)}
+                      and (coalesce(completed.context_snapshot->>'wakeCommentId', completed.context_snapshot->>'commentId') = ${issueComments.id}::text
+                        or coalesce(completed.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${issueComments.id}::text)
+                      and (exists (select 1 from issue_comments reply where reply.company_id = ${run.companyId}::uuid
+                        and reply.issue_id = ${issueId}::uuid and reply.created_by_run_id = completed.id
+                        and reply.origin = 'comment' and reply.author_agent_id = ${issue.conversationAgentId}::uuid
+                        and reply.deleted_at is null)
+                        or exists (select 1 from issue_thread_interactions question where question.company_id = ${run.companyId}::uuid
+                          and question.issue_id = ${issueId}::uuid and question.source_run_id = completed.id
+                          and question.created_by_agent_id = ${issue.conversationAgentId}::uuid)))))` : undefined,
             ),
           )
           .limit(1)

@@ -3,6 +3,7 @@ import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../../
 import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restore-recovery-state.js";
 import { readNativeWorkspaceSyncReference } from "../../../services/native-runtime/native-workspace-sync.js";
 import { isPreDispatchExecutionWaitVerified } from "../../../services/pre-dispatch-execution-wait.js";
+import { STOPPED_EXECUTION_WAIT, UNNAMED_EXECUTION_WAIT } from "../../../services/deferred-execution-wait.js";
 import { isAgentDirectoryPreparationWait } from "../../../services/pre-dispatch-execution-evidence.js";
 import { isUserCommentContinuationReason } from "../../../services/explicit-native-continuation.js";
 import { queuedCommentIdsFromRunContext, withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../../../services/issue-queued-comment-queue.js";
@@ -1196,8 +1197,11 @@ export function createPostgresRunDispatchAdapter(
       status: "deferred_issue_execution", runId: null, claimedAt: null, finishedAt: null, error: null,
       payload: withQueuedCommentIdsInWakePayload({ ...payload, _paperclipWakeContext: context,
         ...(sentAfterStop ? { [QUEUED_SEND_AFTER_STOP_KEY]: sentAfterStop } : {}),
-        executionWait: { ...parseObject(run.resultJson?.executionWait), reason: "execution_recovery",
-          message: "Waiting for execution recovery. Your message is saved." } }, commentIds), updatedAt: now,
+        // "Waiting for execution recovery" is true only while that recovery is
+        // pending. A resolved hold (kept for its no-replay evidence) is not one.
+        executionWait: { ...parseObject(run.resultJson?.executionWait),
+          ...(["active", "escalated"].includes(preservation.status) ? UNNAMED_EXECUTION_WAIT : STOPPED_EXECUTION_WAIT) } },
+        commentIds), updatedAt: now,
     }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, run.companyId),
       eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, receiptRunId),
       inArray(agentWakeupRequests.status, origin ? ["cancelled", "skipped"] : ["queued", "claimed"])))

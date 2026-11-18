@@ -110,6 +110,7 @@ function createFakeTransaction(overrides: Partial<QueuedCommentQueueTransaction>
   return {
     updateCommentBody: vi.fn(async () => true),
     touchIssueUpdatedAt: vi.fn(async () => {}),
+    assertReorderPreservesStopLine: vi.fn(async () => {}),
     updateWakeQueuedCommentIds: vi.fn(async (input) => wakeRow({ id: input.wakeId })),
     updateQueueRunCommentIds: vi.fn(async (input) => runRow({ id: input.queueRunId })),
     deleteComment: vi.fn(async () => commentFixture()),
