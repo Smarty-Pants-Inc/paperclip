@@ -48,6 +48,34 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
     expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice", detailsDefaultOpen: true });
   });
 
+  // S6 (rf5 round 2): after a PERSON's Stop the held writer wrote H, whose
+  // "Send a new message to try again" invites a retype answered twice. It writes
+  // R3 then. Controls: a non-person cancel and the Send's interrupt stop keep H.
+  it.each(["person stop", "system cancel", "interrupt stop"] as const)("SCREEN S6: the held writer after a %s", async cause => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Held stop", issuePrefix: companyId.slice(0, 8) });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Held agent", adapterType: "paperclip_runner", status: "active" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Held task", status: "in_progress", assigneeAgentId: agentId });
+    const resultJson = cause === "system cancel" ? { stopReason: "execution_reconciliation_required" }
+      : { cancelledByActorType: "user", cancelledByUserId: "owner", ...(cause === "interrupt stop" ? { queuedCommentInterruptQueueId: randomUUID() } : {}) };
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "cancelled", runtimeMode: "native", nativeIssueId: issueId,
+      nativeSessionId: sessionId, resultJson });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId,
+      nativeSessionId: sessionId }).returning();
+    await noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
+      binding: { companyId, agentId, issueId, runId: row!.id }, session: { normalizedSessionId: sessionId } } as never },
+    new Error("runner_process_termination_unconfirmed: stop not confirmed"));
+    const notices = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+      .filter(comment => String((comment.metadata as Record<string, unknown> | null)?.authorizationReason ?? "")
+        === `native_prior_owner_held:${sessionId}`);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(cause === "person stop"
+      ? "Stopped. This message is waiting and will be sent when you send your next message. Send it now, or delete it."
+      : HELD_PREDECESSOR_NOTICE);
+    expect(notices[0]!.body.toLowerCase().includes("send a new message")).toBe(cause !== "person stop");
+  });
+
   it("writes one notice per hold: none while it stands, one new notice after the same session continued", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID(), contractId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Held writer", issuePrefix: companyId.slice(0, 8) });
