@@ -51,6 +51,7 @@ import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
 import * as sweepModule from "./unanswered-person-message.js";
 import * as pendingModule from "./automatic-recovery-pending.js";
+import * as providerFailureModule from "../native-runtime/native-provider-failure.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -2265,6 +2266,44 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await cardNotices(f)).toHaveLength(1);
     });
 
+    // c2s (c2): a card answer whose answer-resume chain ends on a c2a code. One true note: c2a's own text.
+    it.each([
+      ["policy", "provider_policy_refusal: The provider refused this request.", "provider_policy_refusal"],
+      ["supervision", `${REMOTE_RUNNER_SUPERVISION_EXHAUSTED}: ${REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION}`, REMOTE_RUNNER_SUPERVISION_EXHAUSTED],
+    ] as const)("c2s (c2): a card answer whose answer-resume chain ends with %s: ONE true note", async (shape, error, errorCode) => {
+      const f = await fixture({ status: "in_progress" });
+      const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      const last = await resume(f, card.id, "failed", first);
+      await db.update(heartbeatRuns).set({ error, errorCode }).where(eq(heartbeatRuns.id, last));
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      const shown = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+        eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
+      console.log("C2S_ROW_C2", shape, JSON.stringify(shown.map(n => ({ title: n.presentation?.title, body: n.body,
+        reason: n.metadata?.authorizationReason ?? null, responsibility: n.metadata?.recoveryResponsibility ?? null }))));
+      expect(shown, "ONE note").toHaveLength(1);
+      if (shape === "policy") {
+        // The stranded recovery's own non-retryable notice explains the run first (recovery/service.ts
+        // nonRetryableContinuationNotice); the unanswered sweep then adds none ("explained").
+        expect(notices).toHaveLength(0);
+        expect(shown[0]!.presentation?.title).toBe("Continuation failed");
+        expect(shown[0]!.body).toBe("The agent's run stopped for a reason that retrying alone would not fix, so Paperclip did not retry it. "
+          + "Fix the reason shown in the details, then press Retry.");
+        // Recorded, not endorsed: that notice is system-responsibility (the v2 chat panel's visible() hides it).
+        expect(shown[0]!.metadata?.recoveryResponsibility).toBe("system");
+        expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "explained" });
+      } else {
+        expect(notices).toHaveLength(1);
+        expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${card.id}`);
+        expect(notices[0]!.metadata?.sourceRunId).toBe(last);
+        expect(notices[0]!.body).toBe(REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION);
+        expect(JSON.stringify(notices[0]!.metadata)).toContain("Retry or send a new message to continue through fenced recovery.");
+        expect(await f.visible()).toHaveLength(1);
+      }
+    });
+
     it.each(["accept", "reject"] as const)("a %sed confirmation whose answer-resume chain all failed gets ONE notice", async how => {
       const f = await fixture({ status: "in_progress" });
       const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
@@ -3068,6 +3107,107 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       }
       expect((await waits()).map(wait => ({ id: wait.id, createdAt: wait.createdAt })))
         .toEqual(recorded.map(wait => ({ id: wait.id, createdAt: wait.createdAt })));
+    });
+
+    // c2s (fam-notices on c2a): a provider policy refusal (retry disabled) and a NON-held
+    // supervision-exhausted run never restart by themselves. Even with a system recovery
+    // record pending for the run, the family's "Recovering" waiting note is false: the
+    // one note is c2a's own text, never a waiting note first.
+    const POLICY = "provider_policy_refusal";
+    const policyText = () => (providerFailureModule as Record<string, unknown>).PROVIDER_POLICY_REFUSAL_MESSAGE as string;
+    const c2aShapes = {
+      policy: { error: `${POLICY}: The provider refused this request.`, errorCode: POLICY },
+      supervision: { error: `${REMOTE_RUNNER_SUPERVISION_EXHAUSTED}: ${REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION}`,
+        errorCode: REMOTE_RUNNER_SUPERVISION_EXHAUSTED },
+    } as const;
+    const c2aNote = {
+      policy: () => ({ body: policyText(), title: "The provider refused this request", nextAction: "Automatic retry is disabled for this request." }),
+      supervision: () => ({ body: REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION, title: "Your message wasn't answered",
+        nextAction: "Retry or send a new message to continue through fenced recovery." }),
+    } as const;
+    it.each(["policy", "supervision"] as const)("c2s (a): a NON-held %s run with a pending system recovery record: no Recovering/waiting note through T0+9, ONE note with c2a's text", async shape => {
+      const f = await fixture();
+      const base = Date.now() - 90_000;
+      const messageId = await f.message("Please continue.");
+      await db.update(issueComments).set({ createdAt: new Date(base) }).where(eq(issueComments.id, messageId));
+      const runId = await f.run({ commentId: messageId, status: "failed", ...c2aShapes[shape] });
+      await db.update(heartbeatRuns).set({ createdAt: new Date(base + 63), startedAt: new Date(base + 211),
+        finishedAt: new Date(base + 5_885) }).where(eq(heartbeatRuns.id, runId));
+      const g = { ...f, messageId, runId, base };
+      const actionId = await hold(g);
+      await recordDelivery(g, actionId); // a system restore recorded, its delivery pending: automaticRecoveryPending is true
+      expect(await pending(g, runId)).toBe(true);
+      const systemNotes = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, g.issueId),
+        eq(issueComments.authorType, "system")));
+      const trace: Array<{ at: string; kind: string; notes: Array<{ id: string; title: unknown; body: string }> }> = [];
+      let noteId: string | undefined;
+      for (const [label, ms] of [["END+1.5", 90_000], ["T0+1", 150_000], ["T0+3", 270_000], ["T0+9", 630_000],
+        ["T0+10", 690_000], ["T0+11", 750_000]] as const) {
+        const outcome = await at(g, ms);
+        const notes = await systemNotes();
+        trace.push({ at: label, kind: outcome.kind, notes: notes.map(note => ({ id: note.id, title: note.presentation?.title, body: note.body })) });
+        for (const note of notes) {
+          expect(note.body).not.toBe(recoveringText());
+          expect(note.body).not.toBe(WAITING);
+          expect(note.presentation?.title).not.toBe("Paperclip is recovering this run");
+          expect(note.presentation?.title).not.toBe("Your message is waiting to start");
+        }
+        expect(notes.length).toBeLessThanOrEqual(1);
+        if (notes[0]) { noteId ??= notes[0].id; expect(notes[0].id).toBe(noteId); }
+      }
+      console.log("C2S_ROW_A", shape, JSON.stringify(trace));
+      const notes = await systemNotes();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toBe(c2aNote[shape]().body);
+      expect(notes[0]!.presentation?.title).toBe(c2aNote[shape]().title);
+      expect(JSON.stringify(notes[0]!.metadata)).toContain(c2aNote[shape]().nextAction);
+      expect(codeOf(notes[0]!)).toBe(shape === "policy" ? POLICY : REMOTE_RUNNER_SUPERVISION_EXHAUSTED);
+    });
+
+    it("c2s (b): supervision-exhausted on a HELD run stays held (not supervisionUnconfirmed): the held text, never the fenced-recovery Retry line", async () => {
+      const f = await fixture();
+      const messageId = await f.message("Please continue.");
+      const runId = await f.run({ commentId: messageId, status: "failed", finishedAgoMs: 15 * 60_000,
+        error: "runner_state_identity_mismatch: prior_owner_active", errorCode: REMOTE_RUNNER_SUPERVISION_EXHAUSTED });
+      expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: REMOTE_RUNNER_SUPERVISION_EXHAUSTED });
+      const notes = await f.visible();
+      console.log("C2S_ROW_B", JSON.stringify(notes.map(note => ({ title: note.presentation?.title, body: note.body, metadata: note.metadata }))));
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toBe(HELD);
+      expect(notes[0]!.body).not.toBe(REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION);
+      expect(JSON.stringify(notes[0]!.metadata)).toContain("Send a new message to try again.");
+      expect(JSON.stringify(notes[0]!.metadata)).not.toContain("continue through fenced recovery");
+      expect(notes[0]!.metadata?.sourceRunId).toBe(runId);
+    });
+
+    it("c2s (c1): a policy refusal on a HELD run: ONE note, the refusal text, no 'send it again'", async () => {
+      const f = await fixture();
+      const messageId = await f.message("Please continue.");
+      await f.run({ commentId: messageId, status: "failed", finishedAgoMs: 15 * 60_000,
+        error: `${POLICY}: The provider refused this request.`, errorCode: "runner_state_identity_mismatch: prior_owner_active" });
+      expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: POLICY });
+      const notes = await f.visible();
+      console.log("C2S_ROW_C1", JSON.stringify(notes.map(note => ({ title: note.presentation?.title, body: note.body }))));
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toBe(policyText());
+      expect(notes[0]!.presentation?.title).toBe("The provider refused this request");
+      expect(JSON.stringify(notes[0]!.metadata)).toContain("Automatic retry is disabled for this request.");
+      expect(notes[0]!.body).not.toMatch(/send(?:ing)? it again/i);
+    });
+
+    it.each(["policy", "supervision"] as const)("c2s (c3): a pauseStopped run (cancelled agent_paused) whose error names %s: ONE true note", async shape => {
+      const f = await fixture();
+      const messageId = await f.message("Please continue.");
+      await f.run({ commentId: messageId, status: "cancelled", finishedAgoMs: 15 * 60_000,
+        error: c2aShapes[shape].error, errorCode: "agent_paused" });
+      const outcome = await settleUnansweredPersonMessage(db, f);
+      const notes = await f.visible();
+      console.log("C2S_ROW_C3", shape, JSON.stringify({ outcome, notes: notes.map(note => ({ title: note.presentation?.title, body: note.body })) }));
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.presentation?.title).toBe("Managed Pi was paused before it answered");
+      expect(notes[0]!.body).toBe("Managed Pi was paused before it answered your message. Send it again to continue.");
+      await settleUnansweredPersonMessage(db, f);
+      expect(await f.visible()).toHaveLength(1);
     });
 
     // RFL 00:10Z option (b): runend's END bound applies ONLY to the HELD class. gate1's run

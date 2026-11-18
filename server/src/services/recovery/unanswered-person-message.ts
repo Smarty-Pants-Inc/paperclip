@@ -649,6 +649,13 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const runCode = run ? unansweredMessageCode(run) : null;
   const held = (isNativeContinuationRefusal(run) || (runCode !== null && HELD_CODES.has(runCode)))
     && !(run && isFreshThreadRefusal(run));
+  // c2a: nothing restarts these runs by itself. A provider policy refusal has
+  // automatic retry disabled; a NON-held supervision-exhausted run waits for a
+  // person's Retry or new message (fenced recovery). A pending recovery record
+  // for such a run must not produce the "Recovering" waiting note: the one
+  // note is c2a's own text. A held supervision run keeps the held path.
+  const noAutomaticRestart = runCode === PROVIDER_POLICY_REFUSAL_CODE
+    || (runCode === REMOTE_RUNNER_SUPERVISION_EXHAUSTED && !held);
   // The system's own automatic recovery of the message's failed run
   // (automaticRecoveryPending). Only for the HELD class (heldRecoveryDeadline
   // below; RFL 00:10Z (b)) is its wait bounded from that run's END: its finishedAt,
@@ -658,7 +665,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const automaticRecoveryDeadline = async (): Promise<number | null> => {
     if (recoveryDeadline !== undefined) return recoveryDeadline;
     recoveryDeadline = null;
-    if (run && TERMINAL.includes(run.status) && run.status !== "succeeded"
+    if (run && !noAutomaticRestart && TERMINAL.includes(run.status) && run.status !== "succeeded"
       && await automaticRecoveryPending(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) {
       // The shared predicate scopes automatic recovery to THIS run. An older
       // predecessor's board stop must not veto it, but a real stop on this run
