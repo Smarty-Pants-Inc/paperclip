@@ -257,7 +257,7 @@ it. Workspace recovery, retry, restart and resumption must not clear it when
 reopening the same run. Later terminal writes may repair status and diagnostics,
 but cannot publish another lifecycle end for that run.
 
-Migration `0493` adds one nullable UUID to the existing run row, with no table,
+Migration `0503` adds one nullable UUID to the existing run row, with no table,
 index or backfill. A dedicated column survives full result/context JSON rewrites
 and can be claimed atomically. Historical nulls do not assert that an older
 release published an event; no historical publication is replayed by migration.
