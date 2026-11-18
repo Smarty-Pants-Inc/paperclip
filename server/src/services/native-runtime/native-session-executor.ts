@@ -974,7 +974,9 @@ async function retireInProcessWarmOwnerOnSandbox(runId: string, providerLeaseId:
     entry.busy = true;
     entry.closeOnReleaseReason = "warm Runner held the sandbox Runner port for another session";
     try {
-      await retireWarmPredecessor(entry, entry.closeOnReleaseReason);
+      // The Runner port holder is on the successor's own sandbox.
+      await retireWarmPredecessor(entry, entry.closeOnReleaseReason,
+        { providerLeaseId: providerLeaseId ?? entry.providerLeaseId ?? entry.sandboxProviderLeaseId ?? null });
       forgetWarmNativeSession(scope, entry);
     } finally { entry.busy = false; }
     return true;
@@ -982,7 +984,45 @@ async function retireInProcessWarmOwnerOnSandbox(runId: string, providerLeaseId:
   return false;
 }
 
-async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
+/** The successor that retires a warm predecessor: the providerLeaseId of the
+ * sandbox it runs on (null when it is not on a sandbox lease). A "stopped"
+ * receipt on the owner's own lease proves the owner gone only to a successor
+ * on a different sandbox (see warmSandboxTerminated). */
+type WarmPredecessorSuccessor = { providerLeaseId: string | null };
+
+function successorOnOwnerSandbox(entry: WarmNativeSession, successor: WarmPredecessorSuccessor): boolean {
+  return successor.providerLeaseId !== null
+    && [entry.providerLeaseId, entry.sandboxProviderLeaseId].includes(successor.providerLeaseId);
+}
+
+/** A person's Stop stops the box: Boat writes its typed stop (or destroy)
+ * receipt on the owner's own lease a few seconds after the Stop, and the
+ * plugin refuses the warm close meanwhile. Re-read the lease (no transaction)
+ * within warmSessionReleaseWait for that receipt; only the typed receipt
+ * proves the owner gone, never the close error's text, a 503 or a timeout. */
+async function warmOwnerStopReceiptWithinBound(entry: WarmNativeSession, successor: WarmPredecessorSuccessor): Promise<boolean> {
+  const db = entry.sandboxLeaseDb;
+  if (!db || !entry.providerLeaseId || !entry.environmentId) return false;
+  const scope = { successorOnOwnerSandbox: successorOnOwnerSandbox(entry, successor) };
+  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+  for (;;) {
+    try {
+      if (await warmSandboxTerminated(db, entry, scope)) return true;
+      // Only a lease row on the owner's own box can receive the receipt; with none there is nothing to wait for.
+      const [ownerLease] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, entry.companyId), eq(environmentLeases.environmentId, entry.environmentId),
+        eq(environmentLeases.providerLeaseId, entry.providerLeaseId), eq(environmentLeases.heartbeatRunId, entry.runId)));
+      if (!ownerLease) return false;
+    } catch (readError) {
+      logger.warn({ err: readError, runId: entry.runId }, "could not read the warm owner's sandbox lease");
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    await new Promise(resolve => setTimeout(resolve, Math.min(left, warmRetirementDirectoryWait.pollMs)));
+  }
+}
+
+async function retireWarmPredecessor(entry: WarmNativeSession, reason: string, successor: WarmPredecessorSuccessor,
   options?: Parameters<typeof closeWarmNativeSession>[2]) {
   // Chaos cell SR1U: a sandbox owner whose stop stays unconfirmed even when
   // forced. Test instrumentation only: armed only in a NODE_ENV=test server.
@@ -1006,6 +1046,13 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
           logger.warn({ err: receiptError, runId: entry.runId }, "could not keep the predecessor's agent files for later collection");
         });
         throw new NativePredecessorRetirementDirectoryBusyError(entry.runId, error);
+      }
+      if (await warmOwnerStopReceiptWithinBound(entry, successor)) {
+        await markWarmNativeHarnessBackupMissing(entry, "close_failed");
+        logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+          providerLeaseId: entry.providerLeaseId ?? null, reason, closeFailure: describeWarmCloseFailure(error) },
+        "superseded warm owner's sandbox lease has Boat's stop or destroy receipt; retirement proven");
+        return;
       }
       entry.retirementUnproven = true;
       throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId ?? null, error);
@@ -1185,7 +1232,7 @@ export async function claimWarmNativeInstructionCopy(input: {
     if (warmNativeSessions.get(scope) !== entry) return;
     entry.closeOnReleaseReason = reason;
     try {
-      await retireWarmPredecessor(entry, reason);
+      await retireWarmPredecessor(entry, reason, { providerLeaseId: sandboxProviderLeaseId(input.target) });
       forgetWarmNativeSession(scope, entry);
     } finally { entry.busy = false; }
   };
@@ -1247,7 +1294,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
     const retire = async (reason: string) => {
       entry.closeOnReleaseReason = reason;
       try {
-        await retireWarmPredecessor(entry, reason);
+        await retireWarmPredecessor(entry, reason, { providerLeaseId: sandboxProviderLeaseId(input.target) });
         forgetWarmNativeSession(id, entry);
       } finally {
         // Failed containment remains registered and cannot be adopted. The next
@@ -1291,7 +1338,11 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
   return closeIdleWarmNativeSessions(input);
 }
 
-async function warmSandboxTerminated(db: Db, entry: WarmNativeSession): Promise<boolean> {
+/** Boat's typed teardown receipt on the owner's lease: "destroyed" proves the
+ * owner gone anywhere; "stopped" by the owner's own run proves it only when the
+ * successor is not on that same sandbox. */
+async function warmSandboxTerminated(db: Db, entry: WarmNativeSession,
+  scope: { successorOnOwnerSandbox?: boolean } = {}): Promise<boolean> {
   if (!entry.providerLeaseId || !entry.environmentId) return false;
   const leases = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.companyId, entry.companyId),
@@ -1302,7 +1353,8 @@ async function warmSandboxTerminated(db: Db, entry: WarmNativeSession): Promise<
   return resolved.some(lease => {
     if (!hasRemoteTerminationReceipt(lease)) return false;
     const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
-    return state === "destroyed" || (state === "stopped" && lease.heartbeatRunId === entry.runId);
+    return state === "destroyed"
+      || (state === "stopped" && lease.heartbeatRunId === entry.runId && scope.successorOnOwnerSandbox !== true);
   });
 }
 
@@ -2923,7 +2975,7 @@ async function retireSupersededWarmNativeSessions(
     entry.busy = true;
     entry.closeOnReleaseReason = logicalOwner ? "warm native session identity changed" : "warm native ingress requires another session";
     try {
-      await retireWarmPredecessor(entry, entry.closeOnReleaseReason, {
+      await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { providerLeaseId: sandboxProviderLeaseId(target) }, {
         discardUnsettledSession: logicalOwner && entry.normalizedSessionId !== nextSessionId,
         ...(ownReservation ? { preserveInstructionsForRunId: runId } : {}),
       });
@@ -13261,7 +13313,9 @@ async function executePaperclipNativeSessionAttempt(
         entry.busy = true;
         entry.closeOnReleaseReason = "warm native session configuration changed";
         try {
-          await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId });
+          await retireWarmPredecessor(entry, entry.closeOnReleaseReason,
+            { providerLeaseId: sandboxProviderLeaseId(input.runnerExecutionTarget) },
+            { preserveInstructionsForRunId: input.execution.binding.runId });
           forgetWarmNativeSession(warmSessionId, entry);
         } catch (error) {
           // This late preparation step is outside the earlier task-prepare
