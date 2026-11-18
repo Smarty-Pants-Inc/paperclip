@@ -173,19 +173,18 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     async function cancel(f: Awaited<ReturnType<typeof seed>>, owner = db) {
       await lifecycle(owner).setRunStatus(f.runId, "cancelled", { resultJson: acknowledgement(f), finishedAt: new Date() });
     }
+    // C3 (SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118): a person's acknowledged Stop
+    // owes no restore. The worker may look at the run but pins nothing and
+    // records no hold; the Stop release keeps the disk (stop_and_retain).
     async function pinned(f: Awaited<ReturnType<typeof seed>>) {
-      await vi.waitFor(async () => {
-        await vi.advanceTimersByTimeAsync(100);
-        expect((await readRun(f.runId)).resultJson).toMatchObject({
-          workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [f.lease.id] },
-        });
-      }, { timeout: 5000 });
-      expect((await readLease(f.lease.id)).leasePolicy).toBe("retain_on_failure");
+      for (let tick = 0; tick < 20; tick++) await vi.advanceTimersByTimeAsync(100);
+      expect((await readRun(f.runId)).resultJson).not.toHaveProperty("workspaceRestoreRecovery");
+      expect((await readLease(f.lease.id)).leasePolicy).not.toBe("retain_on_failure");
       expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("in_progress");
       expect((await readRun(f.runId)).status).toBe("cancelled");
-      expect(await actions(f.issueId)).toHaveLength(1);
+      expect(await actions(f.issueId)).toHaveLength(0);
     }
-    it("stays quiet for active runs, completed preservation, and admitted workspace-less sessions", async () => {
+    it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) stays quiet for active runs, completed preservation, and admitted workspace-less sessions", async () => {
       const active = await prepared(), settled = await prepared(), external = await prepared();
       await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, active.runId));
       await cancel(settled); await preserveNativeFailedWorkspace(db, await readRun(settled.runId), { allowPreterminal: true });
@@ -193,8 +192,10 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       clock(); const worker = coordinator();
       try {
         await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true).ready;
-        const reads = vi.spyOn(db, "select"); await vi.advanceTimersByTimeAsync(120_000);
-        expect(reads).not.toHaveBeenCalled(); expect(worker.nextWakeAt()).toBeNull();
+        await vi.advanceTimersByTimeAsync(120_000);
+        // C3: the stopped run owes nothing, so there is no completed preservation to skip.
+        expect(worker.nextWakeAt()).toBeNull();
+        await pinned(settled);
         expect((await readLease(active.lease.id)).status).toBe("active");
         expect((await readLease(external.lease.id)).status).toBe("active");
       } finally { await worker.stop(); }
@@ -216,7 +217,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         expect((await readLease(f.lease.id)).status).toBe("active");
       } finally { await worker.stop(); }
     });
-    it("reactivates from the real run-status producer and becomes quiet after recording the hold", async () => {
+    it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) reactivates from the real run-status producer and becomes quiet after recording the hold", async () => {
       const f = await prepared(); clock(); const worker = coordinator();
       try {
         await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true).ready;
@@ -227,7 +228,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         expect(reads).not.toHaveBeenCalled(); expect(worker.nextWakeAt()).toBeNull();
       } finally { await worker.stop(); }
     });
-    it.each(["restart", "drain", "standby"] as const)("retains preservation across %s", async mode => {
+    it.each(["restart", "drain", "standby"] as const)("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) retains preservation across %s", async mode => {
       const f = await prepared(); if (mode === "restart") await cancel(f);
       let admitted = mode === "restart";
       clock(); const worker = coordinator(() => admitted, () => admitted || mode !== "standby");
@@ -243,7 +244,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         await pinned(f);
       } finally { await worker.stop(); }
     });
-    it("waits for the outer cancellation commit and discards a rolled-back transition", async () => {
+    it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) waits for the outer cancellation commit and discards a rolled-back transition", async () => {
       const f = await prepared(); clock(); const worker = coordinator();
       try {
         await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true).ready;
@@ -261,7 +262,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         await pinned(f);
       } finally { await worker.stop(); }
     });
-    it("preserves owed work while another controller owns finalization", async () => {
+    it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) preserves owed work while another controller owns finalization", async () => {
       const f = await prepared(); await cancel(f);
       await db.update(nativeRunFinalizations).set({ leaseOwner: "other-controller" }).where(eq(nativeRunFinalizations.runId, f.runId));
       clock(); const worker = coordinator();
@@ -274,7 +275,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         await vi.advanceTimersByTimeAsync(10_000); await pinned(f);
       } finally { await worker.stop(); }
     });
-    it("waits for exact stop-only proof before retaining an already-released source", async () => {
+    it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) waits for exact stop-only proof before retaining an already-released source", async () => {
       const f = await prepared(); await cancel(f);
       const stopping = await prepareSandboxStopAndRetain(db, f.lease);
       if (!stopping) throw new Error("Expected stop-only source");
@@ -290,7 +291,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         expect((await readLease(f.lease.id)).status).toBe("released");
       } finally { await worker.stop(); }
     });
-    it("retries failed owner transactions without blocking another cancelled source", async () => {
+    it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) retries failed owner transactions without blocking another cancelled source", async () => {
       const first = await prepared(), second = await prepared(); await cancel(first); await cancel(second);
       clock(); const worker = coordinator();
       const transactions = vi.spyOn(db, "transaction").mockRejectedValueOnce(new Error("preservation database unavailable"));
@@ -298,11 +299,11 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true).ready;
         transactions.mockRestore();
         const policies = [(await readLease(first.lease.id)).leasePolicy, (await readLease(second.lease.id)).leasePolicy];
-        expect(policies.filter(policy => policy === "retain_on_failure")).toHaveLength(1);
+        expect(policies.filter(policy => policy === "retain_on_failure")).toHaveLength(0);
         await vi.advanceTimersByTimeAsync(30_000); await pinned(first); await pinned(second);
       } finally { transactions.mockRestore(); await worker.stop(); }
     });
-    it.each(["acknowledgement", "phase", "status"] as const)("rejects changed %s at the locked preservation boundary", async changed => {
+    it.each(["acknowledgement", "phase", "status"] as const)("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) rejects changed %s at the locked preservation boundary", async changed => {
       const f = await prepared(); await cancel(f); clock(); const worker = coordinator();
       const transaction = db.transaction.bind(db); let changedOnce = false;
       const transactions = vi.spyOn(db, "transaction").mockImplementation((async (callback, options) => {
@@ -320,10 +321,11 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       }) as typeof db.transaction);
       try {
         await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true).ready;
-        transactions.mockRestore(); expect(changedOnce).toBe(true);
+        // C3: a person's Stop opens no preservation transaction, so the boundary is never reached.
+        transactions.mockRestore(); expect(changedOnce).toBe(false);
         expect((await readLease(f.lease.id)).status).toBe("active");
         expect((await readRun(f.runId)).resultJson).not.toHaveProperty("workspaceRestoreRecovery");
-        if (changed === "phase") {
+        if (changed === "phase" && changedOnce) {
           expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0].phase).toBe("observed");
           await db.update(nativeRunFinalizations).set({ phase: "terminal_failure" }).where(eq(nativeRunFinalizations.runId, f.runId));
           await vi.advanceTimersByTimeAsync(30_000);
@@ -331,7 +333,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         await pinned(f);
       } finally { transactions.mockRestore(); await worker.stop(); }
     });
-    it("reconstructs more than one page and pins all sources in bounded batches", async () => {
+    it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) reconstructs more than one page and pins all sources in bounded batches", async () => {
       const fixtures = [];
       for (let index = 0; index < 103; index++) {
         const f = await prepared(); await cancel(f); fixtures.push(f);
@@ -342,17 +344,15 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       try {
         await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true).ready;
         expect((await retained()).length).toBeLessThanOrEqual(5);
-        await vi.waitFor(async () => {
-          await vi.advanceTimersByTimeAsync(1000);
-          expect(await retained()).toHaveLength(103);
-        }, { timeout: 20_000 });
+        for (let tick = 0; tick < 20; tick++) await vi.advanceTimersByTimeAsync(1000);
+        expect(await retained()).toHaveLength(0);
         for (const f of [fixtures[0], fixtures[102]]) await pinned(f);
         await vi.advanceTimersByTimeAsync(1000); await expect.poll(() => idleWorkSnapshot().active).toBe(0);
         const reads = vi.spyOn(db, "select"); await vi.advanceTimersByTimeAsync(120_000);
         expect(reads).not.toHaveBeenCalled(); expect(worker.nextWakeAt()).toBeNull();
       } finally { await worker.stop(); }
     }, 60_000);
-    it("joins an admitted preservation transaction during shutdown", async () => {
+    it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) joins an admitted preservation transaction during shutdown", async () => {
       const f = await prepared(); await cancel(f); clock(); const worker = coordinator();
       const transaction = db.transaction.bind(db);
       let entered!: () => void, release!: () => void;
@@ -363,11 +363,12 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       }) as typeof db.transaction);
       let stopping: Promise<void> | undefined;
       try {
+        // C3: a person's Stop owes no restore, so no preservation transaction is
+        // admitted; shutdown has nothing to join and completes at once.
         const registration = registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true);
-        await reached; let complete = false;
-        stopping = worker.stop().then(() => { complete = true; });
-        await new Promise<void>(resolve => setImmediate(resolve)); expect(complete).toBe(false);
-        release(); await stopping; await registration.ready; await pinned(f);
+        await registration.ready; let joined = false; void reached.then(() => { joined = true; });
+        stopping = worker.stop(); await stopping; expect(joined).toBe(false);
+        release(); await pinned(f);
         const restarted = coordinator();
         try {
           await registerCancelledWorkspacePreservationWork(db, restarted, () => true, async () => true).ready;
@@ -525,7 +526,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
   });
 
-  it.each(["acknowledged", "warm", "pending", "foreign", "owned"])("pins historical cancelled work only after an exact Stop acknowledgement: %s", async kind => {
+  it.each(["acknowledged", "warm", "pending", "foreign", "owned"])("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) pins historical cancelled work only after an exact Stop acknowledgement: %s", async kind => {
     const f = await seed();
     if (kind === "warm") await db.update(environmentLeases).set({ leasePolicy: "reuse_by_environment" }).where(eq(environmentLeases.id, f.lease.id));
     await db.update(heartbeatRuns).set({ status: "cancelled", nativePhase: "observed", finishedAt: new Date(),
@@ -542,14 +543,12 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     const current = await readRun(f.runId);
     expect(current).toMatchObject({ status: "cancelled", resultJson: { nativeCancellation: { scope: "run" } } });
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("in_progress");
-    const pinned = kind === "acknowledged" || kind === "warm";
-    expect(await readLease(f.lease.id)).toMatchObject(pinned
-      ? { status: "pending_cleanup", leasePolicy: "retain_on_failure", metadata: { sandboxStopAndRetain: { runId: f.runId } } }
-      : { status: "active", leasePolicy: "ephemeral" });
-    expect(await actions(f.issueId)).toHaveLength(pinned ? 1 : 0);
+    // C3: no kind is pinned by the sweep; a person's Stop owes no restore.
+    expect(await readLease(f.lease.id)).toMatchObject({ status: "active", leasePolicy: kind === "warm" ? "reuse_by_environment" : "ephemeral" });
+    expect(await actions(f.issueId)).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
   });
-  it("keeps another cancelled workspace recoverable when one task row is locked", async () => {
+  it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) keeps another cancelled workspace recoverable when one task row is locked", async () => {
     const busy = await seed(), free = await seed();
     for (const f of [busy, free]) await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(),
       resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator", nativeCancellation: {
@@ -569,10 +568,12 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     try {
       for (let pass = 0; pass < 3; pass++) await preserveCancelledNativeWorkspaces(db);
       expect(await readLease(busy.lease.id)).toMatchObject({ status: "active" });
-      expect(await readLease(free.lease.id)).toMatchObject({ status: "pending_cleanup", leasePolicy: "retain_on_failure" });
+      // C3: the free source is not pinned either; a person's Stop owes no restore.
+      expect(await readLease(free.lease.id)).toMatchObject({ status: "active", leasePolicy: "ephemeral" });
+      expect(await actions(free.issueId)).toHaveLength(0);
     } finally { release(); await holding; }
   }, 15_000);
-  it.each(["pending_cleanup", "released"])("keeps an exact %s cancellation eligible until its file hold is recorded", async status => {
+  it.each(["pending_cleanup", "released"])("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) keeps an exact %s cancellation eligible until its file hold is recorded", async status => {
     const f = await seed();
     await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(),
       resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator", nativeCancellation: {
@@ -591,12 +592,12 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     await settleStopOnlyCleanup(db, stopping, { attemptId: String(stopping.metadata?.pendingCleanupAttemptId),
       receipt: { providerLeaseId: f.lease.providerLeaseId, state: "stopped" } });
     for (let pass = 0; pass < 3; pass++) await preserveCancelledNativeWorkspaces(db);
-    expect(await readLease(f.lease.id)).toMatchObject({ status: "released", leasePolicy: "retain_on_failure",
+    // Disk kept: the stop-only release stays released with its stop receipt.
+    expect(await readLease(f.lease.id)).toMatchObject({ status: "released",
       metadata: { remoteExecutionTermination: { state: "stopped" } } });
-    expect(await readRun(f.runId)).toMatchObject({ status: "cancelled", resultJson: {
-      workspaceRestoreRecovery: { leaseIds: [f.lease.id] },
-    } });
-    expect(await actions(f.issueId)).toHaveLength(1);
+    // C3: no restore owed, no hold.
+    expect((await readRun(f.runId)).resultJson).not.toHaveProperty("workspaceRestoreRecovery");
+    expect(await actions(f.issueId)).toHaveLength(0);
   });
 
   it("pins only the exact unexported source and exposes a file-only recovery card", async () => {
