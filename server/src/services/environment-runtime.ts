@@ -45,12 +45,12 @@ import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/nati
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSandboxStop, preparePreviousBootClosedTipStop, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
-import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, hasProbeLeaseTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { currentControllerBootId, currentControllerProcess } from "./controller-process-identity.js";
-import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companySecrets, companySecretVersions, environments, environmentLeases, heartbeatRuns, nativeRunFinalizations } from "@paperclipai/db";
 import type {
@@ -1410,12 +1410,22 @@ function adaptDuplexChannelHostSession(
   };
 }
 
+/** A setup test's own lease (no run, no issue, never reusable: :2511-2516)
+ * once it is closed. Nothing may start its box again: a stopped one-off test
+ * box keeps the test's files, and only this fence is durable across a
+ * provider worker restart (Boat's own admission fences are in memory). */
+export function closedSetupTestLease(lease: { status: string; heartbeatRunId: string | null; issueId: string | null; leasePolicy: string | null }): boolean {
+  return lease.heartbeatRunId === null && lease.issueId === null && lease.leasePolicy !== "reuse_by_environment"
+    && ["released", "failed", "expired"].includes(lease.status);
+}
+
 async function assertLeaseStartable(db: Db, companyId: string, providerLeaseId: string) {
-  const tips = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata })
+  const tips = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata,
+    heartbeatRunId: environmentLeases.heartbeatRunId, issueId: environmentLeases.issueId, leasePolicy: environmentLeases.leasePolicy })
     .from(environmentLeases).where(and(eq(environmentLeases.companyId, companyId),
       eq(environmentLeases.providerLeaseId, providerLeaseId),
       sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableLeaseSuccessor')`)).for("share");
-  if (tips.some(tip => tip.status === "expired" || Object.hasOwn(tip.metadata ?? {}, "reusableSandboxLeaseSuperseded"))) {
+  if (tips.some(tip => tip.status === "expired" || closedSetupTestLease(tip) || Object.hasOwn(tip.metadata ?? {}, "reusableSandboxLeaseSuperseded"))) {
     throw new SandboxLeaseStartDeniedError();
   }
 }
@@ -4976,6 +4986,36 @@ export function environmentRuntimeService(
       const environment = lease.environmentId ? await environmentsSvc.getById(lease.environmentId) : null;
       const observation = await getDriver(getLeaseDriverKey(lease, environment))?.inspectLeaseResource?.({ environment, lease });
       return predecessorSandboxRecordFromObservation(observation, lease.providerLeaseId);
+    },
+
+    /**
+     * A setup probe's own closed lease (upstream #20766's confirm shape, ported:
+     * its confirmRemoteRunTermination needs a run). Re-read the provider's TYPED
+     * state through the driver's read-only inspect and, only on "stopped" or
+     * "destroyed", write the release's own receipt on THAT lease. Never sends a
+     * destroy, stop, release or resume. True only when the existing reader
+     * accepts the written row. An unproven or failed read changes nothing.
+     */
+    async confirmProbeLeaseTermination(input: { companyId: string; leaseId: string }): Promise<boolean> {
+      const [row] = await db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.id, input.leaseId), eq(environmentLeases.companyId, input.companyId)));
+      if (!row || !row.releasedAt || !closedSetupTestLease(row) || !row.environmentId || !row.provider
+          || row.provider === "local" || !row.providerLeaseId) return false;
+      const environment = await environmentsSvc.getById(row.environmentId);
+      if (!environment) return false;
+      const lease = toEnvironmentLeaseSnapshot(row);
+      const observation = await getDriver(getLeaseDriverKey(lease, environment))?.inspectLeaseResource?.({ environment, lease });
+      const state = (observation as { state?: unknown } | undefined)?.state;
+      if (state !== "stopped" && state !== "destroyed") return false;
+      const termination = remoteTerminationReceipt(lease, observation, row.id);
+      if (!termination) return false;
+      const [updated] = await db.update(environmentLeases).set({
+        cleanupStatus: "success",
+        metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: termination })}::jsonb`,
+        updatedAt: new Date(),
+      }).where(and(eq(environmentLeases.id, row.id), eq(environmentLeases.companyId, row.companyId),
+        eq(environmentLeases.status, row.status), isNotNull(environmentLeases.releasedAt))).returning();
+      return Boolean(updated && hasProbeLeaseTerminationReceipt(updated, row.id));
     },
 
     async inspectLeaseResource(leaseId: string, options?: { freshThreadStop?: true }): Promise<PluginEnvironmentLeaseObservation | undefined> {
