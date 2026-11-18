@@ -2550,6 +2550,71 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             send(notification)?;
                         }
                     }
+                    if state.next_turn == 1 {
+                        if let Some(gate) =
+                            argument(&args, "--settled-tail-burst-gate").map(PathBuf::from)
+                        {
+                            // A suspended box resuming (slow thaw) delivers the
+                            // settled turn's tail as a paced burst that can span
+                            // more than the warm-attach drain's 100 ms clock.
+                            let frames = argument(&args, "--settled-tail-burst-frames")
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(120);
+                            let interval = Duration::from_millis(
+                                argument(&args, "--settled-tail-burst-interval-ms")
+                                    .and_then(|value| value.parse::<u64>().ok())
+                                    .unwrap_or(2),
+                            );
+                            let unsafe_at = argument(&args, "--settled-tail-burst-turn-started-at")
+                                .and_then(|value| value.parse::<usize>().ok());
+                            let thread_id = state.thread_id.clone();
+                            let turn_id = provider_turn_id.clone();
+                            thread::spawn(move || {
+                                let result = (|| -> io::Result<()> {
+                                    let deadline = std::time::Instant::now() + TEST_GATE_TIMEOUT;
+                                    while !gate.is_file() {
+                                        if std::time::Instant::now() >= deadline {
+                                            return Err(io::Error::new(
+                                                io::ErrorKind::TimedOut,
+                                                "settled tail burst gate timed out",
+                                            ));
+                                        }
+                                        thread::sleep(Duration::from_millis(1));
+                                    }
+                                    for index in 0..frames {
+                                        if unsafe_at == Some(index) {
+                                            send(json!({
+                                                "method": "turn/started",
+                                                "params": {"threadId": thread_id, "turn": {"id": "burst-unowned-turn"}}
+                                            }))?;
+                                        }
+                                        // Alternate a frame naming the settled turn with
+                                        // a thread-level status frame; neither starts work.
+                                        send(if index % 2 == 0 {
+                                            json!({
+                                                "method": "rawResponseItem/completed",
+                                                "params": {"threadId": thread_id, "turnId": turn_id, "item": {"id": format!("burst-tail-{index}"), "type": "reasoning"}}
+                                            })
+                                        } else {
+                                            json!({
+                                                "method": "warning",
+                                                "params": {"threadId": thread_id, "message": format!("resumed box tail {index}")}
+                                            })
+                                        })?;
+                                        if index == 0 {
+                                            fs::write(gate.with_extension("started"), b"started")?;
+                                        }
+                                        thread::sleep(interval);
+                                    }
+                                    fs::write(gate.with_extension("emitted"), b"emitted")?;
+                                    Ok(())
+                                })();
+                                if let Err(error) = result {
+                                    eprintln!("failed to emit settled tail burst: {error}");
+                                }
+                            });
+                        }
+                    }
                     if emit_post_completion_foreign_turn {
                         let gate = post_completion_notification_gate.clone();
                         let thread_id = state.thread_id.clone();
