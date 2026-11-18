@@ -92,45 +92,72 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
-/** Encode parsed JSON without putting its nesting depth on the JS call stack. */
+/** Encode parsed JSON once, with depth-sized frames rather than width-sized work queues. */
 function stringifyNativeTextJson(value: unknown): string {
-  type Part = { value: unknown } | { text: string };
-  const pending: Part[] = [{ value }];
-  const output: string[] = [];
-  while (pending.length) {
-    const part = pending.pop()!;
-    if ("text" in part) {
-      output.push(part.text);
-    } else if (part.value && typeof part.value === "object") {
-      const array = Array.isArray(part.value);
-      const entries = Object.entries(part.value);
-      output.push(array ? "[" : "{");
-      pending.push({ text: array ? "]" : "}" });
-      for (let index = entries.length - 1; index >= 0; index--) {
-        const [key, child] = entries[index]!;
-        pending.push({ value: child });
-        if (!array) pending.push({ text: `${JSON.stringify(key)}:` });
-        if (index > 0) pending.push({ text: "," });
-      }
+  type Frame = { value: unknown[] | Record<string, unknown>; keys: string[] | null; nextIndex: number };
+  const pending: Frame[] = [];
+  const chunks: string[] = [];
+  const pieces: string[] = [];
+  let chunkLength = 0;
+  const write = (text: string) => {
+    // A large scalar already is a complete flat token. Do not copy it into
+    // an intermediate chunk as well as the final output.
+    if (text.length >= 16_384) {
+      if (pieces.length) chunks.push(pieces.join(""));
+      pieces.length = 0;
+      chunkLength = 0;
+      chunks.push(text);
+      return;
+    }
+    pieces.push(text);
+    chunkLength += text.length;
+    // Flatten each bounded chunk; retaining concatenation ropes would still
+    // retain a string node for every child until the final join.
+    if (chunkLength >= 16_384) {
+      chunks.push(pieces.join(""));
+      pieces.length = 0;
+      chunkLength = 0;
+    }
+  };
+  let current = value;
+  for (;;) {
+    if (current && typeof current === "object") {
+      const array = Array.isArray(current);
+      pending.push({ value: current as Frame["value"], keys: array ? null : Object.keys(current), nextIndex: 0 });
+      write(array ? "[" : "{");
     } else {
-      output.push(JSON.stringify(part.value)!);
+      write(JSON.stringify(current)!);
+    }
+    for (;;) {
+      const frame = pending[pending.length - 1];
+      if (!frame) {
+        chunks.push(pieces.join(""));
+        return chunks.join("");
+      }
+      const length = frame.keys ? frame.keys.length : (frame.value as unknown[]).length;
+      if (frame.nextIndex < length) {
+        const index = frame.nextIndex++;
+        if (index > 0) write(",");
+        const key = frame.keys ? frame.keys[index]! : index;
+        if (frame.keys) write(`${JSON.stringify(key)}:`);
+        current = (frame.value as Record<string | number, unknown>)[key];
+        break;
+      }
+      write(frame.keys ? "}" : "]");
+      pending.pop();
     }
   }
-  return output.join("");
 }
 
 /** Text leaves only: do not apply field-name masking to protocol objects. */
 function redactNativeText<T>(value: T): T {
-  type Work = { value: unknown; apply: (masked: unknown) => void } | { finish: () => void };
-  let result: unknown = value;
-  const pending: Work[] = [{ value, apply: masked => { result = masked; } }];
-  while (pending.length) {
-    const work = pending.pop()!;
-    if ("finish" in work) {
-      work.finish();
-      continue;
-    }
-    const { value: current, apply } = work;
+  type Container = unknown[] | Record<string, unknown>;
+  type Frame =
+    | { kind: "json"; text: string; decoded: unknown }
+    | { kind: "container"; value: Container; masked: Container; keys: string[] | null; nextIndex: number };
+  const pending: Frame[] = [];
+  let current: unknown = value;
+  for (;;) {
     if (typeof current === "string") {
       // Pi inputs include JSON string scalars. Scan only decoded leaves:
       // an escaped newline's `n` otherwise hides the following key boundary.
@@ -144,42 +171,65 @@ function redactNativeText<T>(value: T): T {
           // Malformed JSON is ordinary prose, not serialized protocol data.
         }
         if (parsed) {
-          pending.push({ value: decoded, apply: masked => {
-            // Preserve formatting/escapes byte-for-byte unless a leaf changed.
-            apply(masked === decoded ? current : stringifyNativeTextJson(masked));
-          } });
+          pending.push({ kind: "json", text: current, decoded });
+          current = decoded;
           continue;
         }
       }
-      apply(redactSensitiveText(current));
-    } else if (Array.isArray(current)) {
-      let changed = false;
-      const masked = current.slice();
-      pending.push({ finish: () => apply(changed ? masked : current) });
-      for (let index = current.length - 1; index >= 0; index--) {
-        const child = current[index];
-        pending.push({ value: child, apply: next => {
-          masked[index] = next;
-          if (next !== child) changed = true;
-        } });
-      }
+      current = redactSensitiveText(current);
     } else if (current && typeof current === "object") {
-      let changed = false;
-      const entries = Object.entries(current);
-      pending.push({ finish: () => apply(changed ? Object.fromEntries(entries) : current) });
-      for (let index = entries.length - 1; index >= 0; index--) {
-        const entry = entries[index]!;
-        const child = entry[1];
-        pending.push({ value: child, apply: next => {
-          entry[1] = next;
-          if (next !== child) changed = true;
-        } });
+      const container = current as Container;
+      const keys = Array.isArray(container) ? null : Object.keys(container);
+      const length = keys ? keys.length : (container as unknown[]).length;
+      if (length > 0) {
+        pending.push({ kind: "container", value: container, masked: container, keys, nextIndex: 1 });
+        current = (container as Record<string | number, unknown>)[keys ? keys[0]! : 0];
+        continue;
       }
-    } else {
-      apply(current);
+    }
+    // Complete one child, then descend into only its next sibling. Clean
+    // containers keep their identity; copy-on-write avoids wide clean copies.
+    for (;;) {
+      const frame = pending[pending.length - 1];
+      if (!frame) return current as T;
+      if (frame.kind === "json") {
+        // Preserve formatting/escapes byte-for-byte unless a leaf changed.
+        current = current === frame.decoded ? frame.text : stringifyNativeTextJson(current);
+        pending.pop();
+        continue;
+      }
+      const key = frame.keys ? frame.keys[frame.nextIndex - 1]! : frame.nextIndex - 1;
+      if (current !== (frame.value as Record<string | number, unknown>)[key]) {
+        if (frame.masked === frame.value) {
+          if (frame.keys) {
+            const copy: Record<string, unknown> = {};
+            for (const name of frame.keys) {
+              // Match Object.fromEntries, including an own __proto__ property.
+              const child = (frame.value as Record<string, unknown>)[name];
+              if (name === "__proto__") {
+                Object.defineProperty(copy, name, { value: child, enumerable: true, configurable: true, writable: true });
+              } else {
+                copy[name] = child;
+              }
+            }
+            frame.masked = copy;
+          } else {
+            frame.masked = (frame.value as unknown[]).slice();
+          }
+        }
+        (frame.masked as Record<string | number, unknown>)[key] = current;
+      }
+      const length = frame.keys ? frame.keys.length : (frame.value as unknown[]).length;
+      if (frame.nextIndex < length) {
+        const nextKey = frame.keys ? frame.keys[frame.nextIndex]! : frame.nextIndex;
+        frame.nextIndex++;
+        current = (frame.value as Record<string | number, unknown>)[nextKey];
+        break;
+      }
+      current = frame.masked;
+      pending.pop();
     }
   }
-  return result as T;
 }
 
 function assertTerminal(value: unknown): asserts value is PrpTerminalState {
