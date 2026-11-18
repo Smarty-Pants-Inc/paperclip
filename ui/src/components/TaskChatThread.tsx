@@ -1925,8 +1925,12 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         const responseBoundary = sourceHasNativeResponse
           ? " after returning a final response"
           : "";
+        // A person's Stop: the unfinished reply never reaches the next model
+        // call (Pi drops the aborted assistant message); finished steps stay.
         const detail =
-          source.status === "cancelled"
+          source.status === "cancelled" && meta?.resultJson?.cancelledByActorType === "user"
+            ? "Stopped. The unfinished reply is not sent to the agent; finished steps are kept."
+            : source.status === "cancelled"
             ? `The run was cancelled${responseBoundary}.`
             : source.status === "interrupted"
               ? `The run was interrupted${responseBoundary}.`
