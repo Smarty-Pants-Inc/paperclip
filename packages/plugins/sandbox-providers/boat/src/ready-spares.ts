@@ -21,6 +21,12 @@ const CREATE_WINDOW_MS = 60 * 60 * 1000;
 /** Repeat a refusal event for the same pool and reason at most this often; the counter counts every refusal. */
 const CREATE_CAP_EVENT_INTERVAL_MS = 60_000;
 export const READY_SPARE_TTL_SECONDS = 1_800;
+/**
+ * After a spare stop fails (Boat: "Boat stop ... did not complete"), the pool
+ * creates no new spare for this long; each further failure restarts it. Boat
+ * retries a failing final snapshot itself (bx_h63drzhu: ~39 min on 2026-11-18).
+ */
+export const READY_SPARE_STOP_BACKOFF_MS = 15 * 60_000;
 export const DEFAULT_READY_SPARE_IDLE_MINUTES = 60;
 export const MIN_READY_SPARE_IDLE_MINUTES = 15;
 export const MAX_READY_SPARE_IDLE_MINUTES = 1_440;
@@ -85,6 +91,19 @@ export type ReadySpareOperations = {
 export type ProviderCreateTimes = { spare: readonly number[]; run: readonly { createdAt: number; attempt?: string }[] };
 
 export type CreateCapReason = "churn_cap" | "ceiling";
+
+/** The operator event when a pool's failed spare stops hold its creates back. */
+export type StopBackoff = {
+  companyId: string;
+  environmentId: string;
+  configHash: string;
+  /** Consecutive failed spare stops for this pool. */
+  stopFailures: number;
+  backoffMs: number;
+  until: string;
+  /** The last stop failure, e.g. "Boat stop stop_... did not complete". */
+  error: string;
+};
 
 /** The named operator event at a spare refusal or over-ceiling run, and its health reason. */
 export type CreateCapRefusal = {
@@ -288,6 +307,9 @@ export class ReadySpareKeeper {
   private readonly capped = new Map<string, { refusal: CreateCapRefusal; until: number; loggedAt: number; suppressed: number }>();
   private readonly refusalCounts = new Map<string, Record<CreateCapReason, number>>();
   private refusalListener?: (refusal: CreateCapRefusal) => void;
+  private stopBackoffListener?: (backoff: StopBackoff) => void;
+  /** Pools whose spare stops failed: no spare create before `until`. */
+  private readonly stopBackoffs = new Map<string, { failures: number; until: number; error: string; logged: boolean }>();
   private readonly failures = new Map<string, { count: number; retryAt: number }>();
   private readonly demandEvents = new Map<string, number[]>();
   private readonly stoppingSpares = new Set<string>();
@@ -302,6 +324,28 @@ export class ReadySpareKeeper {
   setClaimStore(claimStore: ReadySpareClaimStore | undefined): void { this.claimStore = claimStore; }
   /** Called at every refusal that should be logged (throttled per pool and reason). */
   setRefusalListener(listener: ((refusal: CreateCapRefusal) => void) | undefined): void { this.refusalListener = listener; }
+  /** Called once per back-off episode, when it first holds a create back. */
+  setStopBackoffListener(listener: ((backoff: StopBackoff) => void) | undefined): void { this.stopBackoffListener = listener; }
+  /** The stop back-off in effect for this pool now, if any. */
+  stopBackoffUntil(key: ReadySpareKey): number | undefined {
+    const entry = this.stopBackoffs.get(readySparePoolKey(key));
+    return entry && this.now() < entry.until ? entry.until : undefined;
+  }
+  /** True (and logged once per episode) while the pool's stop back-off holds creates back. */
+  private stopBackoffHolds(key: ReadySpareKey): boolean {
+    const poolId = readySparePoolKey(key);
+    const entry = this.stopBackoffs.get(poolId);
+    if (!entry) return false;
+    if (this.now() >= entry.until) { this.stopBackoffs.delete(poolId); return false; }
+    if (!entry.logged) {
+      entry.logged = true;
+      try {
+        this.stopBackoffListener?.({ companyId: key.companyId, environmentId: key.environmentId, configHash: key.configHash,
+          stopFailures: entry.failures, backoffMs: READY_SPARE_STOP_BACKOFF_MS, until: new Date(entry.until).toISOString(), error: entry.error });
+      } catch { /* Reporting never changes admission. */ }
+    }
+    return true;
+  }
   setCreateCeiling(companyId: string, ceiling: number): void {
     this.createCeilings.set(companyId, Number.isInteger(ceiling) && ceiling >= MIN_CREATE_CEILING_PER_HOUR && ceiling <= MAX_CREATE_CEILING_PER_HOUR
       ? ceiling : DEFAULT_CREATE_CEILING_PER_HOUR);
@@ -478,6 +522,7 @@ export class ReadySpareKeeper {
     this.stoppingSpares.clear();
     this.runCreates.clear(); this.usedCredits.clear(); this.providerCreates.clear(); this.tentativeCreates.clear(); this.createCeilings.clear(); this.capped.clear(); this.refusalCounts.clear();
     this.refusalListener = undefined;
+    this.stopBackoffs.clear(); this.stopBackoffListener = undefined;
   }
 
   /**
@@ -498,7 +543,15 @@ export class ReadySpareKeeper {
     }
     this.stoppingSpares.add(spare.id);
     try { await operations.stop(spare); }
+    catch (error) {
+      const poolId = readySparePoolKey(key);
+      const failures = (this.stopBackoffs.get(poolId)?.failures ?? 0) + 1;
+      this.stopBackoffs.set(poolId, { failures, until: this.now() + READY_SPARE_STOP_BACKOFF_MS,
+        error: error instanceof Error ? error.message : String(error), logged: false });
+      throw error;
+    }
     finally { this.stoppingSpares.delete(spare.id); }
+    this.stopBackoffs.delete(readySparePoolKey(key));
     return true;
   }
 
@@ -780,7 +833,7 @@ export class ReadySpareKeeper {
     const reservations: string[] = [];
     const scope = { companyId: key.companyId, environmentId: key.environmentId, kind: "spare" as const };
     for (let i = 0; i < missing; i++) {
-      if (this.stopping || this.now() < (this.failures.get(poolId)?.retryAt ?? 0)) break;
+      if (this.stopping || this.now() < (this.failures.get(poolId)?.retryAt ?? 0) || this.stopBackoffHolds(key)) break;
       const local = this.createCounts(key.companyId);
       const ceiling = this.createCeiling(key.companyId);
       // The ceiling counts every create, used or not; the churn cap counts only

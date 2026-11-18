@@ -1664,6 +1664,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     preparedEnvDirectories.clear();
     readySpares.start();
     readySpares.setRefusalListener(reportCreateCapRefusal);
+    readySpares.setStopBackoffListener(backoff => {
+      try { duplexLogger?.warn("Boat ready spare pool backing off after stop failures; no new spare until the back-off ends", { ...backoff }); } catch { /* Logging never changes admission. */ }
+    });
     knownSparePools.clear();
     claimedSpareLeases.clear();
     runCreateLedgerReads.clear();

@@ -281,3 +281,27 @@ describe("Boat ready spares: a claim never takes a sick spare (gate 5 bx_yntyy5t
     expect(h.boat.creates("run")).toHaveLength(runCreates);
   });
 });
+
+describe("Boat ready spares: the pool backs off while its stops fail (gate 5 stop_aa50aed8569db22a, 20:33:26Z)", () => {
+  it("RED-3 after a failed spare stop no new spare is created within the back-off, a log line says so, and creation resumes after it", async () => {
+    const h = await harness("backoff");
+    const s1 = await seed(h);
+    h.boat.stopMode = "failing-stopping"; // Boat shows the box 'stopping' with its stop failing (bx_7qu5sy5t).
+    const stopAt = await idleStopAttempt(h, s1);
+    expect(h.boat.boxes.get(s1)!.stop?.status).toBe("failing");
+    expect(h.boat.boxes.get(s1)!.state).toBe("stopping");
+    const sparesAfterFailure = h.boat.creates("spare").length;
+    // Activity inside the back-off: each wake would refill the pool.
+    await settle(h.emit("issue.comment.created"));
+    await advance(TICK_MS);
+    await settle(h.emit("agent.run.started"));
+    await advance(4 * TICK_MS);
+    expect(h.boat.creates("spare"), "no new spare while the pool's stop is failing").toHaveLength(sparesAfterFailure);
+    expect(h.warnings.some(w => /Boat ready spare pool backing off after stop failures/.test(w)), JSON.stringify(h.warnings)).toBe(true);
+    // After the named interval, creation resumes.
+    await advance(stopAt + 120_000 + READY_SPARE_STOP_BACKOFF_MS + 1_000 - Date.now());
+    await settle(h.emit("issue.comment.created"));
+    await advance(5_000);
+    expect(h.boat.creates("spare").length, "creation resumes after the back-off").toBe(sparesAfterFailure + 1);
+  });
+});
