@@ -15687,6 +15687,88 @@ describe("native warm session supervision", () => {
       });
     });
 
+    // R4-601 live RED (2026-11-18, gate 4, Interrupt): the interrupted run
+    // cf6ced71's lease 5b5e7b88 on box bx_ap4288gv was released at
+    // 09:59:23.959Z with cleanup success by the active-run watchdog's
+    // stop-and-retain (recovery action c087e71a, environmentStopLease). Its
+    // metadata carries BOTH sandboxStopAndRetainReceipt and the typed
+    // remoteExecutionTermination {state 'stopped'}. The successor 16eef8f3 got
+    // a NEW box bx_ydk4uk4z; its retirement of the warm owner tried the close
+    // first, the Boat plugin refused it (-32002 'Boat sandbox lease is no longer
+    // active.') and the run failed native_predecessor_retirement_unproven.
+    // The second live case (fresh 41c89265, lease 69d58658 on bx_3ufgv4h4,
+    // successor a6c42327 on NEW bx_n32scp8j) has the same shape.
+    describe("R4-601 Interrupt: the watchdog's stop-and-retain released the owner's lease; the successor on a NEW box", () => {
+      const ownerRunId = "cf6ced71-a3a0-4528-8bef-a4a4898fa64a", ownerLeaseId = "5b5e7b88-47af-42d3-9b54-5ab9eafd7adb";
+      const ownerBox = "bx_ap4288gv", successorRunId = "16eef8f3-8542-4e74-95b3-ed2a8ce14d6b";
+      const successorLeaseId = "67531c6c-188c-46df-87c8-6e4c79302781", successorBox = "bx_ydk4uk4z";
+      const confirmedAt = "2026-11-18T09:59:23.959Z", boatPluginId = "83323bdb-4bb4-44b5-b7a8-f59dc32cf288";
+      const closeError = "Boat sandbox lease is no longer active.";
+      const run = async (name: string, shape: "both" | "stop-and-retain-only", boundMs = 200) => {
+        const { base: fixtureShape } = fixture(`r4-601-${name}`);
+        const owner = { ...fixtureShape, binding: { ...fixtureShape.binding, runId: ownerRunId,
+          agentId: "5364666e-7466-4708-9174-99af6864697a" } } as unknown as NativeExecutionInputV1;
+        const companyId = owner.binding.companyId, environmentId = `r4-601-environment-${name}`;
+        const closeFailure = Object.assign(new Error(closeError), { name: "JsonRpcCallError", code: -32002 });
+        const close = vi.fn().mockRejectedValue(closeFailure);
+        const release = vi.spyOn(nativeLeaseRenewal, "releaseUnstartedNativeExecutionClaim").mockResolvedValue(true);
+        state.execute.mockReset().mockImplementationOnce(async options => {
+          options.onSession?.({ close }); return result;
+        }).mockResolvedValue(result);
+        const leaseRows: Array<Record<string, unknown>> = [];
+        const target = (leaseId: string, providerLeaseId: string) => ({ kind: "remote" as const, transport: "sandbox" as const,
+          providerKey: "boat", environmentId, leaseId, remoteCwd: `/tmp/${environmentId}`,
+          sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId } });
+        const binding = { companyId, runId: ownerRunId, leaseId: ownerLeaseId, provider: "boat", providerLeaseId: ownerBox };
+        const original = { ...warmSessionReleaseWait };
+        warmSessionReleaseWait.timeoutMs = boundMs;
+        try {
+          await executePaperclipNativeSession({ db: leaseDb(owner, {}, {}, [], {}, "running", [], leaseRows), execution: owner,
+            runnerInstanceId: "runner", useRunnerd: false, backend: {} as never, runnerExecutionTarget: target(ownerLeaseId, ownerBox) });
+          // The row as the DB holds it after the watchdog's stop-and-retain confirmed (09:59:23.959Z).
+          leaseRows.push({ id: ownerLeaseId, companyId, environmentId, heartbeatRunId: ownerRunId, provider: "boat",
+            providerLeaseId: ownerBox, status: "released", acquiredAt: new Date("2026-11-18T09:58:28.074Z"),
+            releasedAt: new Date(confirmedAt), lastUsedAt: new Date(confirmedAt), updatedAt: new Date(confirmedAt),
+            failureReason: null, cleanupStatus: "success", leasePolicy: "reuse_by_environment", metadata: {
+              resumed: true, systemRecoveryAdoption: { policyVersion: 1, actionId: "c087e71a" },
+              sandboxStopAndRetainReceipt: { schema: "paperclip.sandbox-stop-and-retain-receipt.v1", requestId: "af126616",
+                ...binding, pluginId: boatPluginId, method: "environmentStopLease", confirmedAt },
+              ...(shape === "both" ? { remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", ...binding,
+                state: "stopped", confirmedAt } } : {}) } });
+          release.mockClear();
+          const successor = { ...owner, binding: { ...owner.binding, runId: successorRunId } } as NativeExecutionInputV1;
+          const started = Date.now(), closesBefore = close.mock.calls.length;
+          const [answer] = await Promise.allSettled([executePaperclipNativeSession({ db: leaseDb(successor), execution: successor,
+            runnerInstanceId: "runner", useRunnerd: false, backend: {} as never, refreshTools: true,
+            runnerExecutionTarget: target(successorLeaseId, successorBox) })]);
+          return { answer: answer!, successorCloseAttempts: close.mock.calls.length - closesBefore, release, ms: Date.now() - started,
+            executeCalls: state.execute.mock.calls.length };
+        } finally {
+          Object.assign(warmSessionReleaseWait, original);
+          close.mockResolvedValue(undefined);
+          await closeIdleWarmNativeSessionsForRestart();
+          release.mockRestore();
+        }
+      };
+
+      it("RED live row: stop-and-retain receipt AND typed 'stopped' termination on the owner's own lease => admitted WITHOUT a close, answered", async () => {
+        const out = await run("live-both", "both");
+        expect(out.answer).toEqual({ status: "fulfilled", value: expect.anything() });
+        expect(out.successorCloseAttempts, "the stopped box's close is never tried").toBe(0);
+        expect(out.executeCalls).toBe(2);
+        expect(out.release).not.toHaveBeenCalled();
+      });
+
+      it("N-row: ONLY sandboxStopAndRetainReceipt, NO remoteExecutionTermination => unproven after the bound", async () => {
+        const out = await run("stop-and-retain-only", "stop-and-retain-only", 300);
+        expect(out.answer).toEqual({ status: "rejected", reason: expect.objectContaining({
+          code: "native_predecessor_retirement_unproven", predecessorRunId: ownerRunId, providerLeaseId: ownerBox,
+          cause: expect.objectContaining({ message: closeError }) }) });
+        expect(out.executeCalls).toBe(1);
+        expect(out.ms).toBeGreaterThanOrEqual(300);
+      });
+    });
+
     describe("RF4 independent: a person's Stop retained the box; the successor's retirement of its warm owner", () => {
       // Q5 (test determinism only): the 'unproven' controls would wait the product's full
       // 30 s warmSessionReleaseWait bound, past vitest's 15 s test timeout. Shorten the bound
