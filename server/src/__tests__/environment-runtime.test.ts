@@ -82,6 +82,8 @@ import { agentInstructionWorkingCopyService } from "../services/agent-instructio
 import { directorySnapshotSha256 as afAbortSnapshotSha256, serializeDirectorySnapshot as afAbortSerializeSnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
 import { NATIVE_PREPARATION_FENCING_VERSION } from "../services/native-runtime/native-active-runs.js";
+import * as agentFileSaveHoldModule from "../services/agent-file-save-hold.js";
+import pino from "pino";
 
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 
@@ -6727,6 +6729,95 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     // The late failure never clears the hold.
     const [after] = await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, runId));
     expect(after?.receipt).toHaveProperty("savePending");
+  }, 60_000);
+
+  // RFL 16:10Z no-secret canary: both retirement-collection failure logs are
+  // content-free. The thrown error carries credential-shaped strings in its
+  // message and stack; the real Pino output records only errorKind and ids.
+  it.each([
+    { path: "collection", message: "agent-file collection before source-change retirement failed",
+      errorKind: "agent_file_retirement_collection_failed" },
+    { path: "hold write", message: "agent-file retirement hold write failed; the box is still stopped and kept",
+      errorKind: "agent_file_retirement_hold_write_failed" },
+  ])("no-secret canary: the agent-file retirement $path failure log never carries the error's message or stack", async ({ path: failingPath, message, errorKind }) => {
+    const secrets = ["sk-live-CANARY0123456789abcdef", "ghp_CANARY0123456789abcdefABCDEF012345",
+      "eyJhbGciOiJIUzI1NiJ9.eyJjYW5hcnkiOnRydWV9.CANARYsig0123456789"];
+    const canary = new Error(`provider said: token=${secrets[0]} auth=${secrets[1]}`);
+    canary.stack = `Error: ${canary.message}\n    at bearer ${secrets[2]} (/srv/app.js:1:1)`;
+    const pluginId = randomUUID();
+    const { companyId, agentId, environment: baseEnvironment, runId } = await seedEnvironment();
+    const providerConfig = { provider: "fake-plugin", image: "template-a", region: "eu", timeoutMs: 1234, reuseLease: true };
+    const environment: Environment = { ...baseEnvironment, name: "Reusable Plugin Sandbox", driver: "sandbox", config: providerConfig };
+    await environmentService(db).update(environment.id, { driver: "sandbox", name: environment.name, config: providerConfig });
+    await insertSandboxProviderPlugin(pluginId, {
+      pluginKey: "acme.fake-sandbox-provider", packageName: "@acme/fake-sandbox-provider", displayName: "Fake Sandbox Provider",
+      description: "Test schema-driven provider",
+      environmentDrivers: [{ driverKey: "fake-plugin", kind: "sandbox_provider", displayName: "Fake Plugin", supportsReusableLeases: true,
+        configSchema: { type: "object", properties: { image: { type: "string" }, timeoutMs: { type: "number" }, reuseLease: { type: "boolean" } } } }],
+    });
+    const executionWorkspaceId = randomUUID();
+    const projectId = randomUUID();
+    await insertReusableProject(projectId, companyId);
+    await insertReusableExecutionWorkspace(executionWorkspaceId, companyId, projectId);
+    let acquisitions = 0;
+    let boxState = "running";
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        if (method === "environmentAcquireLease") {
+          return { providerLeaseId: `lease-${params.config.image}${++acquisitions > 1 ? "-replacement" : ""}`,
+            metadata: { provider: "fake-plugin", image: params.config.image, timeoutMs: params.config.timeoutMs, reuseLease: true, remoteCwd: "/workspace" } };
+        }
+        if (["environmentDestroyLease", "environmentReleaseLease"].includes(method)) return undefined;
+        if (method === "environmentStopLease") boxState = "stopped";
+        if (["environmentStopLease", "environmentInspectLease"].includes(method)) return { providerLeaseId: params.providerLeaseId, state: boxState };
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease",
+        "environmentStopLease", "environmentInspectLease"] })),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager,
+      agentFileRetirementCollectionDeadlineMs: 300 } as any);
+    const first = await runtimeWithPlugin.acquireRunLease({ companyId, environment, issueId: null, agentId, adapterType: "process",
+      heartbeatRunId: runId, persistedExecutionWorkspace: { id: executionWorkspaceId, mode: "shared_workspace" } });
+    await runtimeWithPlugin.releaseRunLeases(runId);
+    const released = (await environmentService(db).getLeaseById(first.lease.id))!;
+    const { remoteExecutionTermination: _termination, sandboxStopAndRetainReceipt: _stopReceipt, ...warmMetadata } = released.metadata!;
+    await db.update(environmentLeases).set({ status: "retained", releasedAt: null, metadata: warmMetadata })
+      .where(eq(environmentLeases.id, first.lease.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(agentInstructionWorkingCopies).values({ runId, companyId, agentId, responsibleUserId: "user-1", entryFile: "AGENTS.md",
+      baseHash: "base", localRoot: "/tmp/canary/live", executionRoot: "/workspace/.paperclip-runtime/agent-files/x", location: `remote:${environment.id}`,
+      state: "warm_saved", receipt: { schema: "paperclip.agent-files.v1", warm: true, cleanup: { leaseId: first.lease.id, remoteCwd: "/workspace" } } });
+    // collection: the collector throws the canary. hold write: the collector
+    // hangs past the deadline and the savePending hold write throws the canary.
+    runtimeWithPlugin.bindAgentFileRetirementCollector?.(failingPath === "collection"
+      ? async () => { throw canary; }
+      : async ({ signal }) => new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("aborted")))));
+    const hold = vi.spyOn(agentFileSaveHoldModule, "holdUncollectedAgentFileCopy");
+    if (failingPath === "hold write") hold.mockRejectedValue(canary);
+    // The real Pino serializers (err -> message + stack) into an in-memory sink.
+    const lines: string[] = [];
+    const sink = pino({ level: "debug" }, { write: (line: string) => { lines.push(line); } });
+    const warn = vi.spyOn(logger, "warn").mockImplementation(((...args: any[]) => (sink.warn as any)(...args)) as any);
+    try {
+      const nextRunId = randomUUID();
+      await insertRunningManualRun(nextRunId, companyId, agentId);
+      const updatedEnvironment: Environment = { ...environment, config: { ...providerConfig, image: "template-b" } };
+      await environmentService(db).update(environment.id, { config: updatedEnvironment.config });
+      const second = await runtimeWithPlugin.acquireRunLease({ companyId, environment: updatedEnvironment, issueId: null, agentId,
+        adapterType: "process", heartbeatRunId: nextRunId, persistedExecutionWorkspace: { id: executionWorkspaceId, mode: "shared_workspace" } });
+      expect(second.lease.providerLeaseId).toBe("lease-template-b-replacement");
+    } finally {
+      warn.mockRestore();
+      hold.mockRestore();
+    }
+    const rows = lines.map(line => JSON.parse(line) as Record<string, unknown>).filter(row => row.msg === message);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ errorKind, leaseId: first.lease.id, runId });
+    const output = lines.join("");
+    for (const secret of secrets) expect(output).not.toContain(secret);
+    expect(output).not.toContain("provider said");
   }, 60_000);
 
   // AF-ABORT (RFL row-22 wedge class, rf-4 binding bar): the REAL Stop collector

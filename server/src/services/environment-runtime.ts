@@ -145,6 +145,8 @@ import { crashPoint } from "@paperclipai/shared/crash-points";
 // credential in its name, code, message, cause, or stack. So the log records
 // this constant and the plain provider identifiers only.
 const SANDBOX_ORPHAN_CLEANUP_WRITE_ERROR_KIND = "sandbox_orphan_cleanup_write_failed";
+const AGENT_FILE_RETIREMENT_COLLECTION_ERROR_KIND = "agent_file_retirement_collection_failed";
+const AGENT_FILE_RETIREMENT_HOLD_WRITE_ERROR_KIND = "agent_file_retirement_hold_write_failed";
 
 // The fixed non-secret refusal a duplex channel open returns when the lease does
 // not grant the opt-in `duplexCommandStream` capability. The service resolves the
@@ -1985,8 +1987,8 @@ function createSandboxEnvironmentDriver(
       if (collectionTimedOut && !uncollected.length) uncollected.push(...copiesToCollect);
       for (const runId of canCollect ? copiesToCollect : []) {
         const work = collectionTimedOut ? null : options.agentFileCollector?.current?.({ environment: input.environment, lease, runId, signal: collectionAbort.signal })
-          .catch((error: unknown) => {
-            if (!collectionAbort.signal.aborted) logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file collection before source-change retirement failed");
+          .catch(() => {
+            if (!collectionAbort.signal.aborted) logger.warn({ errorKind: AGENT_FILE_RETIREMENT_COLLECTION_ERROR_KIND, leaseId: lease.id, runId }, "agent-file collection before source-change retirement failed");
             return null;
           }) ?? Promise.resolve(null);
         const collected = work === null ? RETIREMENT_COLLECTION_TIMED_OUT : await settleBeforeDeadline(work, collectionDeadline());
@@ -2007,7 +2009,7 @@ function createSandboxEnvironmentDriver(
           "agent-file collection before source-change retirement exceeded its deadline; stopping and keeping the box without collection");
         await holdUncollectedAgentFileCopy(db, { companyId: lease.companyId, runId,
           reason: `Collection before retirement exceeded ${agentFileRetirementCollectionDeadlineMs} ms; the box is stopped and kept.` })
-          .catch((error: unknown) => logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file retirement hold write failed; the box is still stopped and kept"));
+          .catch(() => logger.warn({ errorKind: AGENT_FILE_RETIREMENT_HOLD_WRITE_ERROR_KIND, leaseId: lease.id, runId }, "agent-file retirement hold write failed; the box is still stopped and kept"));
       }
       // Destroying an obsolete source deletes its box. A native session there
       // needs verified custody first: upstream's own resume-replacement guard
