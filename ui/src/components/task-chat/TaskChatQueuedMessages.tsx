@@ -370,6 +370,7 @@ export function TaskChatQueuedMessages({
     () => entries.map((entry) => entry.comment.id),
     [entries],
   );
+  const holdsCardResponse = queue.entries.some(entry => entry.source?.kind === "interaction");
 
   // Send decisions read the current queue snapshot, not the local copy that a
   // sync effect updates one render later: a saved edit must get its new
@@ -593,7 +594,7 @@ export function TaskChatQueuedMessages({
                 queue={queue}
                 busy={busy}
                 queueMutationDisabled={queueMutationDisabled}
-                reorderDisabled={Boolean(!queue.queueId || pending || reordering)}
+                reorderDisabled={Boolean(!queue.queueId || pending || reordering || holdsCardResponse)}
                 action={action}
                 autoSteerSecondsLeft={(() => {
                   const deadline = autoSteerDeadlines.get(entry.comment.id);

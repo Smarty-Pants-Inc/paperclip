@@ -8019,6 +8019,13 @@ export function issueRoutes(
       if (wakes.length !== order.length) throw new QueuedCommentMutationError("queued_comment_already_dispatching",
         "The queued message is already being dispatched");
       const slots = wakes.map((wake) => wake.requestedAt).sort((a, b) => a.getTime() - b.getTime());
+      // Postgres send slots can differ only in microseconds, which Date drops.
+      // Writing those back as ties would silently answer a different order.
+      // Keep the chosen order strict at the precision our writer can preserve.
+      for (let index = 1; index < slots.length; index++) {
+        if (slots[index]!.getTime() <= slots[index - 1]!.getTime())
+          slots[index] = new Date(slots[index - 1]!.getTime() + 1);
+      }
       const now = new Date();
       for (const [index, wakeId] of order.entries()) {
         const wake = wakes.find((candidate) => candidate.id === wakeId)!;

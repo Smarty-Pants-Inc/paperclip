@@ -31,6 +31,9 @@ import { errorHandler } from "../middleware/index.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { issueRoutes } from "../routes/issues.js";
+import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
+import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -226,6 +229,114 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     }
     return { ...f, commentIds, wakeIds };
   }
+
+  // RFL SUPERSEDE-QUEUEFIX-WAKE-REORDER-1118 amendment: the queue must
+  // answer in SEND order without a drag, and in exactly the displayed order
+  // after a drag. Exercise HTTP mutation AND the production Postgres release
+  // drain; do not simulate promotion by inserting the desired successor.
+  describe.each(["ordinary", "card response", "Interrupt", "Stop", "capacity retry"] as const)("chosen order across %s", kind => {
+    let chatWasEnabled: boolean;
+    beforeAll(async () => {
+      chatWasEnabled = (await instanceSettingsService(db).getExperimental()).enableAgentChat;
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    });
+    afterAll(async () => {
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: chatWasEnabled });
+      expect((await instanceSettingsService(db).getExperimental()).enableAgentChat).toBe(chatWasEnabled);
+    });
+    it.each([false, true])("honours displayed order (drag=%s), including sub-millisecond send slots", async drag => {
+      const f = await seedChatTail(["First sent", "Second sent", "Third sent"]);
+      const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+      // Postgres preserves microseconds; its JS Date reader does not. These
+      // are three distinct SEND slots, not a timestamp-tie invented by a drag.
+      for (let i = 0; i < f.wakeIds.length; i++) {
+        await db.update(agentWakeupRequests).set({
+          requestedAt: sql`'2026-08-22T15:01:00Z'::timestamptz + ${i + 1} * interval '1 microsecond'`,
+        }).where(eq(agentWakeupRequests.id, f.wakeIds[i]));
+      }
+      if (kind === "card response") {
+        const interactionId = randomUUID();
+        await db.insert(issueThreadInteractions).values({ id: interactionId, companyId: f.companyId, issueId: f.issueId,
+          kind: "request_confirmation", status: "accepted", createdByAgentId: f.agentId,
+          resolvedByUserId: "queue-owner", resolvedAt: new Date(), continuationPolicy: "wake_assignee",
+          requestedResolverPolicy: "human_only", effectiveResolverPolicy: "human_only", resolverPolicyProvenance: "explicit",
+          payload: { version: 1, prompt: "Continue?" }, result: { version: 1, outcome: "accepted" } });
+        // The current turn is answering this saved card. The plain messages
+        // behind it still keep their own wakes and their chosen order.
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, interactionId,
+          interactionKind: "request_confirmation", interactionStatus: "accepted" } }).where(eq(heartbeatRuns.id, f.runId));
+      }
+      if (kind === "capacity retry") {
+        await db.update(heartbeatRuns).set({ status: "scheduled_retry", scheduledRetryAt: new Date(0),
+          scheduledRetryAttempt: 1, startedAt: null }).where(eq(heartbeatRuns.id, f.runId));
+        const retried = await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: f.companyId,
+          runId: f.runId, now: new Date() });
+        expect(retried.outcome).toBe("promoted");
+      }
+      if (kind === "Stop" || kind === "Interrupt") {
+        // Occupy the adapter slot, so real admission can queue a successor but
+        // cannot start a provider. The release use case below never applies
+        // provider-start post-commit effects either.
+        await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+        await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+          status: "running", contextSnapshot: { issueId: randomUUID() } });
+        await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId, responsibleUserId: "queue-owner" }).where(eq(heartbeatRuns.id, f.runId));
+        await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "observed" });
+        if (kind === "Stop") {
+          await heartbeatService(db).cancelRun(f.runId, "Cancelled by a board operator", {
+            cancellationRequestId: randomUUID(), cancellationRequestedByUserId: "queue-owner",
+            resultJson: { cancelledByActorType: "user", cancelledByUserId: "queue-owner" } });
+        }
+      }
+      const initial = (await request(client).get(path).expect(200)).body;
+      expect(initial.entries.map((entry: any) => entry.comment.id)).toEqual(f.commentIds);
+      const chosen = drag ? [f.commentIds[2], f.commentIds[0], f.commentIds[1]] : f.commentIds;
+      if (drag) {
+        const reordered = await request(client).put(`${path}/order`).send({ queueId: initial.queueId,
+          revision: initial.revision, orderedCommentIds: chosen }).expect(200);
+        expect(reordered.body.entries.map((entry: any) => entry.comment.id)).toEqual(chosen);
+      }
+      const visible = (await request(client).get(path).expect(200)).body;
+      expect(visible.entries.map((entry: any) => entry.comment.id)).toEqual(chosen);
+      let finishingRunId: string = f.runId;
+      const answered: string[] = [];
+      if (kind === "Stop" || kind === "Interrupt") {
+        await request(client).post(`${path}/interrupt`).send({ queueId: visible.queueId, revision: visible.revision,
+          targetRunId: kind === "Interrupt" ? f.runId : null }).expect(200);
+        const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+        await db.update(heartbeatRuns).set({ processPid: 999999999, resultJson: { ...source.resultJson,
+          nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId,
+            issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
+            dispatched: true, intentAuditId: "order-intent", acknowledgementAuditId: "order-ack" } } }).where(eq(heartbeatRuns.id, f.runId));
+        await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+        await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, visible.queueId);
+        const [firstWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, visible.queueId));
+        expect(firstWake.runId).not.toBeNull();
+        const [firstRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, firstWake.runId!));
+        answered.push(...(firstRun.contextSnapshot?.wakeCommentIds as string[] ?? []));
+        expect(answered).toEqual(chosen.slice(0, 1));
+        finishingRunId = firstRun.id;
+      }
+      const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => "queue-owner",
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      }), recovery: { escalateStrandedAssignedIssue: async () => undefined,
+        escalateStrandedRecoveryIssueInPlace: async () => undefined } });
+      while (answered.length < chosen.length) {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, finishingRunId));
+        const result = await release({ companyId: f.companyId, runId: finishingRunId, now: new Date(), suppressImmediateRecovery: true });
+        expect(result.outcome.kind).toBe("promoted");
+        const [next] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.executionRunId!));
+        answered.push(...(run.contextSnapshot?.wakeCommentIds as string[] ?? []));
+        expect(answered).toEqual(chosen.slice(0, answered.length));
+        finishingRunId = run.id;
+      }
+      expect(answered).toEqual(chosen);
+      console.log("CHOSEN-ORDER", JSON.stringify({ kind, drag, send: f.commentIds, shown: chosen, answered }));
+    });
+  });
 
   it("lists the chat tail across /new and marks the reset and every message behind it", async () => {
     const f = await seedChatTail(["A", "/new", "B"]);

@@ -5,6 +5,18 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
+import type { DragEndEvent } from "@dnd-kit/core";
+
+// Only the browser sensor boundary is substituted. The production drag
+// handler, optimistic rendering and submitted order all run unchanged.
+const dragSensor = vi.hoisted(() => ({ end: null as null | ((event: DragEndEvent) => void) }));
+vi.mock("@dnd-kit/core", async importOriginal => {
+  const actual = await importOriginal<typeof import("@dnd-kit/core")>();
+  return { ...actual, DndContext: (props: ComponentProps<typeof actual.DndContext>) => {
+    dragSensor.end = props.onDragEnd ?? null;
+    return <actual.DndContext {...props} />;
+  } };
+});
 import { mergePendingIssueQueuedComments } from "@/lib/issue-queued-comment-queue";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { MemoryRouter } from "@/lib/router";
@@ -164,6 +176,46 @@ describe("TaskChatQueuedMessages", () => {
   it("does not offer a reorder across distinct chat wakes", () => {
     const entries = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" }];
     expect(reorderQueuedMessageEntries(entries, "comment-1", "comment-2")).toBeNull();
+  });
+
+  it("offers no reorder for a queue holding a saved card response", () => {
+    const entries = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2",
+      source: { kind: "interaction" } as never }];
+    render({ queue: { ...queue, entries } });
+    expect(reorderQueuedMessageEntries(entries, "comment-1", "comment-2")).toBeNull();
+    expect([...container.querySelectorAll<HTMLButtonElement>('[aria-label^="Reorder queued message:"]')]
+      .every(button => button.disabled)).toBe(true);
+  });
+
+  describe.each(["ordinary", "card response", "Interrupt", "Stop", "capacity retry"] as const)("shown order across %s", kind => {
+    it.each([false, true])("shows send order unless dragged, then exactly the submitted order (drag=%s)", async drag => {
+      // The saved card itself stays immutable (the row above); these are
+      // ordinary messages waiting behind the card-response turn.
+      const entries = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" }];
+      const candidate: IssueQueuedCommentQueue = { ...queue, entries,
+        targetRunId: kind === "Stop" ? null : queue.targetRunId,
+        steeringDisposition: "unsupported",
+        ...(kind === "Stop" ? { executionWait: { reason: "stopped_by_person",
+          message: "Stopped. These messages are waiting: Send them, or delete any first." } } : {}),
+        ...(kind === "capacity retry" ? { executionWait: { reason: "heartbeat.daily_run_limit",
+          message: "Waiting for capacity. Your messages are saved." } } : {}),
+      };
+      const props = render({ queue: candidate });
+      const shown = () => [...container.querySelectorAll('[data-testid^="task-chat-queued-message-"]')]
+        .map(row => row.getAttribute("data-testid")!.replace("task-chat-queued-message-", ""));
+      expect(shown()).toEqual(["comment-1", "comment-2"]);
+      if (drag) {
+        expect([...container.querySelectorAll<HTMLButtonElement>('[aria-label^="Reorder queued message:"]')]
+          .map(button => button.disabled)).toEqual([false, false]);
+        await act(async () => { dragSensor.end!({ active: { id: "comment-2" }, over: { id: "comment-1" } } as DragEndEvent); });
+        expect(props.onReorder).toHaveBeenCalledWith(["comment-2", "comment-1"], "rev-1");
+        expect(shown()).toEqual(["comment-2", "comment-1"]);
+      } else {
+        expect(props.onReorder).not.toHaveBeenCalled();
+        expect(shown()).toEqual(["comment-1", "comment-2"]);
+      }
+      expect(props.onSteer).not.toHaveBeenCalled();
+    });
   });
 
   it("renders queued Markdown and screenshot thumbnails without showing image syntax", () => {
