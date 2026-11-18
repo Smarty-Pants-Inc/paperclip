@@ -14635,7 +14635,7 @@ async function executePaperclipNativeSessionAttempt(
           })
           .where(eq(heartbeatRuns.id, input.execution.binding.runId))
           .returning();
-        if (updatedRun && runBeforeWrite) publishTerminalRunLifecyclePluginEventAfterCommit(tx, runBeforeWrite, updatedRun);
+        if (updatedRun && runBeforeWrite) await publishTerminalRunLifecyclePluginEventAfterCommit(tx, runBeforeWrite, updatedRun);
         if (updatedRun && exhausted && !ownershipUnverified && !updated.resultId) {
           updatedRun = await preserveNativeFailedWorkspace(tx as unknown as Db, updatedRun) ?? updatedRun;
         }

@@ -1058,7 +1058,7 @@ async function endNamespaceUnverifiedRun(tx: Db, row: {
       maxAttempts: 3, wakePolicy: null, supersedeOnIdentityChange: true });
   }
   if (updatedRun) {
-    publishTerminalRunLifecyclePluginEventAfterCommit(tx, row.run, updatedRun);
+    await publishTerminalRunLifecyclePluginEventAfterCommit(tx, row.run, updatedRun);
     await preserveNativeFailedWorkspace(tx, updatedRun);
   }
 }
@@ -1964,7 +1964,7 @@ export async function claimNativeRestartRecoveries(input: {
           })
           .where(eq(heartbeatRuns.id, row.run.id))
           .returning();
-        if (updatedRun) publishTerminalRunLifecyclePluginEventAfterCommit(tx, row.run, updatedRun);
+        if (updatedRun) await publishTerminalRunLifecyclePluginEventAfterCommit(tx, row.run, updatedRun);
         if (updatedRun && isNewTerminalRunFailure(row.run, updatedRun)) {
           terminalRunToReport = updatedRun;
         }

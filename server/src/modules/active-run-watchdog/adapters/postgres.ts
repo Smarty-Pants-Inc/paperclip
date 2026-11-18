@@ -396,7 +396,7 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
         .returning();
       if (!updatedRun) return null;
       // The CAS above proves the locked source status was running, not a repair.
-      publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "running" }, updatedRun);
+      await publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "running" }, updatedRun);
 
       if (input.run.wakeupRequestId) {
         await tx
