@@ -52,7 +52,20 @@ vi.mock("../services/native-runtime/native-session-executor.js", async (importOr
   return { ...actual, steerNativeSession: steerNativeSessionMock };
 });
 const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
+// S004: inject a failing comment wake after the 201 without touching any other case.
+const wakeupOverride = vi.hoisted(() => ({ current: null as null | ((agentId: string, options: unknown) => Promise<unknown>) }));
+vi.mock("../services/heartbeat.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/heartbeat.js")>();
+  return { ...actual, heartbeatService: ((...args: Parameters<typeof actual.heartbeatService>) => {
+    const service = actual.heartbeatService(...args);
+    const wakeup = service.wakeup;
+    return Object.assign(service, { wakeup: (agentId: string, options: Parameters<typeof wakeup>[1]) =>
+      wakeupOverride.current ? wakeupOverride.current(agentId, options) as ReturnType<typeof wakeup> : wakeup(agentId, options) });
+  }) as typeof actual.heartbeatService };
+});
 
+// S004: the comment's durable wake intent is a transient marker, never a wake.
+const notCommentWakeIntent = sql`${agentWakeupRequests.status} <> 'comment_wake_pending'`;
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -561,7 +574,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const client = app(seeded.companyId);
     await request(client).post(`/api/issues/${seeded.issueId}/comments`)
       .send({ body: "Keep this message too" }).expect(201);
-    await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests)).toHaveLength(2));
+    await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests).where(notCommentWakeIntent)).toHaveLength(2));
     let wakes = await db.select().from(agentWakeupRequests);
     expect(wakes.find(w => w.id === seeded.wakeId)?.payload).not.toHaveProperty("commentId");
     // A second resolved card must not overwrite either existing receipt.
@@ -2996,7 +3009,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       const client = app(seeded.companyId);
       const sent = await request(client).post(`/api/issues/${seeded.issueId}/comments`)
         .send({ body: "Skip Slack for now and continue" }).expect(201);
-      await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests)).toHaveLength(2));
+      await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests).where(notCommentWakeIntent)).toHaveLength(2));
       const queue = await request(client).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
       const next = queue.body.entries.find((entry: any) => entry.comment.id === sent.body.id);
       expect(next, JSON.stringify(queue.body.entries.map((entry: any) => entry.comment.body.split("\n")[0])))
@@ -3034,7 +3047,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       const client = app(seeded.companyId);
       const sent = await request(client).post(`/api/issues/${seeded.issueId}/comments`)
         .send({ body: "Skip Slack for now and continue" }).expect(201);
-      await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests)).toHaveLength(2),
+      await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests).where(notCommentWakeIntent)).toHaveLength(2),
         { timeout: 10_000, interval: 50 });
       const [{ calls }] = await db.execute(sql.raw("select last_value as calls from hold50_forced_deadlock")) as unknown as
         [{ calls: string }];
@@ -3058,7 +3071,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       const client = app(seeded.companyId);
       const first = await request(client).post(`/api/issues/${seeded.issueId}/comments`)
         .send({ body: "Skip Slack for now" }).expect(201);
-      await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests)).toHaveLength(2));
+      await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests).where(notCommentWakeIntent)).toHaveLength(2));
       const second = await request(client).post(`/api/issues/${seeded.issueId}/comments`)
         .send({ body: "Use email updates instead" }).expect(201);
       await vi.waitFor(async () => {
@@ -3119,5 +3132,90 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId!));
     expect(successor.status).toBe("queued");
     expect(successor.contextSnapshot?.wakeCommentIds).toEqual(seeded.commentIds);
+  });
+  describe("S004 durable comment wake", () => {
+    afterEach(() => { wakeupOverride.current = null; });
+
+    async function seedAssigned() {
+      const companyId = randomUUID(); const agentId = randomUUID(); const issueId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "S004", issuePrefix: "SWK", requireBoardApprovalForNewAgents: false });
+      // One live run elsewhere holds new runs in the ordinary queue, so no provider launches.
+      await db.insert(agents).values({ id: agentId, companyId, name: "S004 Runner", role: "engineer", status: "idle",
+        adapterType: "paperclip_runner", adapterConfig: {}, runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } }, permissions: {} });
+      await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "queue-owner",
+        status: "active", membershipRole: "operator" });
+      await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
+      await db.insert(issues).values({ id: issueId, companyId, identifier: "SWK-1", title: "Durable wake",
+        status: "todo", priority: "medium", assigneeAgentId: agentId });
+      return { companyId, agentId, issueId };
+    }
+    const issueRuns = async (f: { companyId: string; issueId: string }) => (await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, f.companyId))).filter(run => run.contextSnapshot?.issueId === f.issueId);
+    const wakeRows = async (companyId: string) => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    async function drain(f: { companyId: string; issueId: string }) {
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+      const work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true);
+      try {
+        await work.ready;
+        await db.transaction(async tx => {
+          await notifyDeferredExecutionWork(tx, { companyId: f.companyId });
+          await notifyDeferredWakesForIssue(tx, { companyId: f.companyId, issueId: f.issueId });
+        });
+        await new Promise(resolve => setTimeout(resolve, 1_500));
+      } finally { await work.stop(); }
+    }
+
+    it("RED: a wake that throws after the 201 still runs the message, exactly once", async () => {
+      const f = await seedAssigned();
+      let calls = 0;
+      wakeupOverride.current = async () => { calls += 1; throw new Error("injected wake failure after commit"); };
+      const posted = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/comments`).send({ body: "Please answer this" });
+      expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+      await vi.waitFor(() => expect(calls).toBe(1), { timeout: 5_000, interval: 25 });
+      wakeupOverride.current = null;
+      // The saved message is the outbox's receipt, not a lost wake.
+      await vi.waitFor(async () => {
+        expect((await wakeRows(f.companyId)).some(row => row.status === "deferred_issue_execution")).toBe(true);
+      }, { timeout: 5_000, interval: 50 });
+      await drain(f);
+      await vi.waitFor(async () => expect(await issueRuns(f)).toHaveLength(1), { timeout: 10_000, interval: 100 });
+      await drain(f);
+      const runs = await issueRuns(f);
+      expect(runs).toHaveLength(1);
+      expect(JSON.stringify(runs[0].contextSnapshot)).toContain(posted.body.id);
+      expect((await wakeRows(f.companyId)).filter(row => row.status === "comment_wake_pending")).toEqual([]);
+    }, 60_000);
+
+    it("guard: the normal path wakes once and the drain never repeats a wake that succeeded", async () => {
+      const f = await seedAssigned();
+      const posted = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/comments`).send({ body: "Normal message" });
+      expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+      await vi.waitFor(async () => expect(await issueRuns(f)).toHaveLength(1), { timeout: 10_000, interval: 100 });
+      await vi.waitFor(async () => expect((await wakeRows(f.companyId))
+        .filter(row => row.status === "comment_wake_pending")).toEqual([]), { timeout: 5_000, interval: 50 });
+      await drain(f);
+      expect(await issueRuns(f)).toHaveLength(1);
+      expect((await wakeRows(f.companyId)).filter(row => row.status === "deferred_issue_execution")).toEqual([]);
+    }, 60_000);
+
+    it("guard: a comment deleted before the retry gets no run", async () => {
+      const f = await seedAssigned();
+      let calls = 0;
+      wakeupOverride.current = async (_agentId, options) => {
+        calls += 1;
+        const commentId = (options as { payload?: { commentId?: string } }).payload?.commentId;
+        await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, commentId!));
+        throw new Error("injected wake failure after commit");
+      };
+      const posted = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/comments`).send({ body: "Then deleted" });
+      expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+      await vi.waitFor(() => expect(calls).toBe(1), { timeout: 5_000, interval: 25 });
+      wakeupOverride.current = null;
+      await vi.waitFor(async () => expect((await wakeRows(f.companyId))
+        .filter(row => row.status === "comment_wake_pending")).toEqual([]), { timeout: 5_000, interval: 50 });
+      await drain(f);
+      expect(await issueRuns(f)).toEqual([]);
+      expect((await wakeRows(f.companyId)).filter(row => row.status === "deferred_issue_execution")).toEqual([]);
+    }, 60_000);
   });
 });

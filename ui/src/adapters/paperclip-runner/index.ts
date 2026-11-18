@@ -72,6 +72,16 @@ function itemText(item: JsonRecord, payload: JsonRecord): string {
     .join("\n");
 }
 
+// runner-core's durable text cap is a lossy snapshot, not an authoritative
+// correction to text we already streamed. Keep the completion lifecycle/channel.
+export function runnerSnapshotText(value: string, previous: string | undefined, kind: "thinking" | "response"): string {
+  const marker = "…[truncated]";
+  if (!value.endsWith(marker)) return value;
+  const body = value.slice(0, -marker.length);
+  if (previous && previous.startsWith(body)) return previous;
+  return `${body}\n\nThe full ${kind} is kept in the run log.`;
+}
+
 function normalizedItemType(item: JsonRecord, payload: JsonRecord): string {
   return text(item.type, text(payload.kind)).replaceAll("_", "").toLowerCase();
 }
@@ -246,7 +256,7 @@ function parseItemEvent(
   if (phase === "started") state.itemChannels.set(id, channel);
   const resolvedChannel = channel === "unknown" ? state.itemChannels.get(id) ?? "unknown" : channel;
   if (type === "agentmessage") {
-    const value = itemText(item, payload);
+    const value = runnerSnapshotText(itemText(item, payload), state.assistantTextById.get(id), "response");
     if (phase === "completed") state.itemChannels.delete(id);
     if (!value || (phase === "started" && state.assistantTextById.has(id))) return [];
     if (phase === "completed" && state.completedTextItemIds.has(id)) return [];
@@ -264,9 +274,9 @@ function parseItemEvent(
     return [{ kind: "assistant", ts, text: value, channel: resolvedChannel === "final" ? "final" : resolvedChannel === "progress" ? "progress" : "unknown", itemId: id }];
   }
   if (type === "reasoning") {
-    const value = itemText(item, payload);
-    if (phase === "completed") state.itemChannels.delete(id);
     const previous = state.reasoningTextById.get(id);
+    const value = runnerSnapshotText(itemText(item, payload), previous, "thinking");
+    if (phase === "completed") state.itemChannels.delete(id);
     if (value) state.reasoningTextById.set(id, value);
     const suffix = previous && value.startsWith(previous) ? value.slice(previous.length) : null;
     return [{

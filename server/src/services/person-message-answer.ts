@@ -1,5 +1,5 @@
 import { sql, type SQL } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
+import { activityLog, heartbeatRunEvents, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues } from "@paperclipai/db";
 import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
@@ -9,12 +9,34 @@ export const COMPANY_IMPORTED_ACTION = "company.imported";
 
 type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
 
+/** A wait for a further attempt stays true only this long from its fixed
+ * durable start (a failed run's end, a card's answer time): past it, ONE true
+ * notice. Shared by the unanswered-message sweep and the card-answer duty. */
+export const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
+
+// A person input is a typed message (a comment id) or a person's answer to an
+// agent's card (the interaction id): its answer-resume run carries it as
+// context.interactionId (routes/issues.ts wake contexts). Ids never collide.
+// R-ONCE (RFL 18:19Z): this is the run's PENDING input. A message steered into
+// the run is pending input too: the steer route records the provider's
+// acknowledgement on the run (result_json.queuedSteeringAcknowledgements,
+// routes/issues.ts) and the run log (a validated steering_acknowledgement item
+// '...:steer:<id>', which a restart restores: unread-steered-messages.ts).
+// Transcript history is never pending input.
 function carriesCommentSql(alias: string, commentId: SQL): SQL {
-  const context = sql`${sql.identifier(alias)}.context_snapshot`;
+  const run = sql.identifier(alias);
+  const context = sql`${run}.context_snapshot`;
   return sql`(${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
     or ${context}->>'conversationReplyBoundaryCommentId' = ${commentId}::text
+    or ${context}->>'interactionId' = ${commentId}::text
     or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
-    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text)`;
+    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text
+    or (jsonb_typeof(${run}.result_json->'queuedSteeringAcknowledgements') = 'object'
+      and ${run}.result_json->'queuedSteeringAcknowledgements' ? ${commentId}::text)
+    or exists (select 1 from ${heartbeatRunEvents} steer where steer.company_id = ${run}.company_id
+      and steer.run_id = ${run}.id and steer.source_event_id is not null and steer.event_type = 'item.completed'
+      and steer.payload->'prpEvent'->'payload'->>'kind' = 'steering_acknowledgement'
+      and steer.payload->'prpEvent'->>'itemId' like '%:steer:' || ${commentId}::text))`;
 }
 
 /** A reply/card can belong to a later run without copying the original input
@@ -34,8 +56,9 @@ function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageS
 // delivery; cancelled cards need evidence of a human skip/withdraw/cancel reply.
 const PERSON_MESSAGE_ANSWER_CARD_STATUSES = ["pending", "answered", "accepted", "rejected"] as const;
 
-/** A person message is answered by a published agent reply attributed to it or to a later person input,
- * an open or resolved interaction card on its run chain, or imported history. Answering the card is new input;
+/** A person message is answered by a published agent reply from a run whose chain had THAT message as its
+ * pending input (R-ONCE, RFL 18:19Z: a reply to a later input answers M only when its run carried M too;
+ * transcript history never counts), an open or resolved interaction card on its run chain, or imported history. Answering the card is new input;
  * it never makes the original message unanswered again. Shared by recovery input selection (continuation-comment-input.ts) and the
  * unanswered-person-message notice, so the carry and the notice never disagree on a message.
  * - Provider acceptance/delivery alone is NOT an answer.
@@ -51,10 +74,18 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
     join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
     where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
       and a.created_at > ${m.createdAt}
-      and exists (select 1 from ${issueComments} b
+      and (exists (select 1 from ${issueComments} b
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
-          and (b.id = ${m.id} or b.created_at > ${m.createdAt})
-          and ${chainCarriesCommentSql("r", sql`b.id`, m)}))
+          and b.id = ${m.id}
+          and ${chainCarriesCommentSql("r", sql`b.id`, m)})
+        -- A card answer is an input with no comment row: its own chain carries it. Its rule is unchanged by
+        -- R-ONCE: a reply to a later person input still settles it (owedCardAnswerSql owes none after one).
+        or (not exists (select 1 from ${issueComments} own where own.id::text = ${m.id}::text)
+          and (${chainCarriesCommentSql("r", m.id, m)}
+            or exists (select 1 from ${issueComments} b
+              where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
+                and b.created_at > ${m.createdAt}
+                and ${chainCarriesCommentSql("r", sql`b.id`, m)})))))
     or exists (select 1 from ${issueThreadInteractions} q
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
       where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId}
@@ -66,6 +97,35 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
         -- A card answers only inputs carried on its chain, never queued inputs by time.
         and ${chainCarriesCommentSql("r", m.id, m)})
     or ${importedPersonHistorySql(m)})`;
+}
+
+/** Card statuses a person's own answer leaves; administrative ends (withdraw,
+ * cancel, expiry) are not an answer and create no duty. */
+const CARD_ANSWER_STATUSES = ["answered", "accepted", "rejected"] as const;
+
+/** SQL over an issue_thread_interactions alias: a person's answer to an
+ * agent's card that started an answer-resume run and that no agent answered
+ * yet (a reply or a new card on that run's chain, after the answer). The SAME
+ * rule as a typed message (answeredPersonMessageSql), keyed by the card id and
+ * its answer time. It is an owed person input like a typed message.
+ * A response delivery still pending or delivering is a further attempt only
+ * within PENDING_WAIT_START_BOUND_MS of the answer (resolvedAt): a dead
+ * delivery worker never leaves the answer silent. */
+export function unansweredCardAnswerSql(alias: string, now: Date = new Date()): SQL {
+  const q = sql.identifier(alias);
+  const deliveryCutoff = new Date(now.getTime() - PENDING_WAIT_START_BOUND_MS).toISOString();
+  return sql`(${q}.resolved_by_user_id is not null and ${q}.resolved_at is not null
+    and ${q}.status in (${sql.join(CARD_ANSWER_STATUSES.map(status => sql`${status}`), sql`, `)})
+    and exists (select 1 from ${heartbeatRuns} resume where resume.company_id = ${q}.company_id
+      and (resume.native_issue_id = ${q}.issue_id or resume.context_snapshot->>'issueId' = ${q}.issue_id::text)
+      and resume.context_snapshot->>'interactionId' = ${q}.id::text)
+    -- An answer still being delivered to the agent is a pending attempt, not a
+    -- silent one, until the bound from its answer time.
+    and (${q}.resolved_at <= ${deliveryCutoff}::timestamptz or not exists (select 1 from ${issueQuestionResponseDeliveries} delivery
+      where delivery.company_id = ${q}.company_id and delivery.interaction_id = ${q}.id
+        and delivery.status in ('pending', 'delivering')))
+    and not ${answeredPersonMessageSql({ id: sql`${q}.id`, companyId: sql`${q}.company_id`,
+      issueId: sql`${q}.issue_id`, createdAt: sql`${q}.resolved_at` })})`;
 }
 
 /** SQL: message m is a PERSON comment that arrived by a company import (see answeredPersonMessageSql). */

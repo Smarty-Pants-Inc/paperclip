@@ -111,6 +111,21 @@ describeEmbeddedPostgres("activity service", () => {
     expect((await service.getById(task.id))?.workMode).toBe(nextMode);
   });
 
+  it.each([false, true])("retains human stop attribution in the task chat run projection (interrupt=%s)", async (interrupt) => {
+    const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Stop attribution", issuePrefix: `S${companyId.slice(0, 6)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Writer", role: "engineer", status: "idle", adapterType: "paperclip_runner" });
+    const task = await issueService(db).create(companyId, { title: "Retain the stop actor", status: "in_progress", assigneeAgentId: agentId });
+    const attribution = { cancelledByActorType: "user", cancelledByUserId: "viewer", ...(interrupt ? {
+      interruptedByActorType: "user", interruptedByActorId: "viewer", operatorInterrupted: true, interruptionSource: "issue_comment_interrupt",
+    } : {}) };
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "cancelled", issueId: task.id,
+      contextSnapshot: { issueId: task.id }, resultJson: { ...attribution, providerPrivateOutput: "Do not project" } });
+    const [run] = await activityService(db).runsForIssue(companyId, task.id);
+    expect(run?.resultJson).toMatchObject(attribution);
+    expect(run?.resultJson).not.toHaveProperty("providerPrivateOutput");
+  });
+
   it("names each activity actor for the person instead of showing a raw id such as local-board", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), userId = `member-${companyId}`;
     await db.insert(companies).values({ id: companyId, name: "Names", issuePrefix: `N${companyId.slice(0, 6)}` });
