@@ -1307,6 +1307,34 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(rowsOf(notices[0]!).some(row => row.label === "Failure code")).toBe(false);
   });
 
+  // Keep: S10 gate 3, 2026-11-18 04:54Z: after a person's Stop and a Send the
+  // chat said '<agent> is paused'; nobody paused it. A 'pausing'/'resuming'
+  // transition with no hold, pause reason or error ends by itself, so the
+  // Send gets the waiting note, never the paused line.
+  it.each(["pausing", "resuming"] as const)("paused-line: %s with no hold after a person's Stop, then a Send -> the waiting note, never the paused line", async lifecycleState => {
+    const f = await fixture();
+    await f.run({ commentId: await f.message("Before Stop"), status: "cancelled", errorCode: "cancelled" });
+    await db.update(agents).set({ status: "paused", lifecycleState, lifecycleHolds: [], pauseReason: null, lifecycleError: null })
+      .where(eq(agents.id, f.agentId));
+    await f.message("After Stop, please continue.");
+    await f.sweep();
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    const notices = await f.visible();
+    expect(notices.map(n => n.body)).toEqual([WAITING]);
+    expect(JSON.stringify(notices)).not.toMatch(/is paused|resume/i);
+  });
+
+  it("paused-line control: the pause route's hold on a pausing agent keeps the paused line", async () => {
+    const f = await fixture();
+    await f.run({ commentId: await f.message("Before Stop"), status: "cancelled", errorCode: "cancelled" });
+    await db.update(agents).set({ status: "paused", lifecycleState: "pausing", lifecycleHolds: ["manual"], pauseReason: "manual" })
+      .where(eq(agents.id, f.agentId));
+    await f.message("After Stop, please continue.");
+    await f.sweep();
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    expect((await f.visible()).map(n => n.body)).toEqual([PAUSED_TEXT]);
+  });
+
   it("paused agent, then resumed: the saved message's run is the only run (B' starts none), no second note, the answer supersedes it", async () => {
     const f = await fixture();
     await pause(f);
