@@ -35,9 +35,9 @@ const heldMarkerLength = (tail: string) => {
 
 /**
  * Most characters of one delta text field held back because they may still
- * become a strict credential shape. Past it the joined text is scanned and
- * released, and the rest of a credential the scanner already masked is dropped
- * up to the next whitespace, so a longer value cannot print its remainder.
+ * become a strict credential shape. Past it the fragment is treated as a
+ * credential even when unfinished (a JWT may not have reached its first dot).
+ * Emit a marker and drop its continuation up to the next whitespace.
  */
 export const CREDENTIAL_SHAPE_HOLD_CAP = 16_384;
 const SHAPE_HEADER = STRICT_CREDENTIAL_SHAPES.headerWord.toLowerCase();
@@ -345,15 +345,29 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
     }
     shapeHeld.delete(key);
     const released = redactSensitiveText(text);
-    if (released.endsWith(REDACTED_EVENT_VALUE) && !/\s$/.test(text)) shapeSuppressed.add(key);
-    return released;
+    // A whole-text scan cannot recognise an unfinished JWT or provider key.
+    // Crossing the bound is fail-closed: never release the raw held fragment.
+    if (!/\s$/.test(text)) shapeSuppressed.add(key);
+    return released.endsWith(REDACTED_EVENT_VALUE) ? released
+      : (safe ? scanned.slice(0, -1) : "") + REDACTED_EVENT_VALUE;
   };
   /** The held fragment joined with the known-secret tail, scanned whole: never released unmasked. */
   const shapeFinish = (key: string, tail: string): string => {
     const held = shapeHeld.get(key);
     shapeHeld.delete(key);
-    shapeSuppressed.delete(key);
-    return held === undefined ? tail : redactSensitiveText(held + tail);
+    // Known-secret finish() can still supply a suffix after the shape cap.
+    // It belongs to the suppressed credential, not to a new output tail.
+    if (shapeSuppressed.delete(key)) {
+      const space = tail.search(/\s/);
+      return space < 0 ? "" : redactSensitiveText(tail.slice(space));
+    }
+    if (held === undefined) return tail;
+    const joined = held + tail;
+    const scanned = redactSensitiveText(joined);
+    // A terminal may interrupt a strict bare-token shape before the scanner's
+    // minimum/closing delimiter. Do not copy that raw held material to outputTails.
+    return scanned === joined && SHAPE_TOKEN_PREFIXES.some(prefix => held.startsWith(prefix))
+      ? REDACTED_EVENT_VALUE : scanned;
   };
   const deltaStreams = new Map<string, {
     scope: string; itemId?: string; payload: Record<string, unknown>; paths: string[];

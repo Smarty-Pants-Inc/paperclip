@@ -117,6 +117,21 @@ describe("strict credential shapes split across answer deltas", () => {
     }
     return parts;
   }
+  it("an interrupted bare shape and a known-secret tail after the cap cannot enter outputTails raw", () => {
+    for (const prefix of ["eyJhbGciOiJIUzI1NiJ9", "sk-proj-"]) {
+      const result = throughBuffer([prefix]);
+      expect(result).toEqual({ deltas: [""], tails: ["***REDACTED***"] });
+    }
+    const redactor = createAgentIdentityRedactor();
+    redactor.values.push("ZZZZZZZZZZ");
+    const first = redactor.delta("source:turn:item", { text: "eyJ" + "QUJD".repeat(5_000) });
+    const last = redactor.delta("source:turn:item", { text: "ZZZZ" });
+    const settled = redactor.settleDeltas("source:turn:item", {}, false);
+    expect(first.text).toBe("***REDACTED***");
+    expect(last.text).toBe("");
+    expect(settled).toEqual({});
+  });
+
   it("ordinary prose is neither lost, repeated nor reordered, and stays progressive", () => {
     expect(redactSensitiveText(prose)).toBe(prose);
     const report: Record<string, unknown>[] = [];
@@ -157,7 +172,10 @@ describe("strict credential shapes split across answer deltas", () => {
     const long = "Q7ZX".repeat(6_000);
     const credential = throughBuffer(["Bearer ", ...chunked(long, 997, 7), " tail words"]);
     expect([...credential.deltas, ...credential.tails].join("")).toBe("Bearer ***REDACTED*** tail words");
-    const blob = "eyJ" + "QUJD".repeat(10_000);
+    // A non-shape blob is prose; an open eyJ shape past the bound is not.
+    const suspicious = throughBuffer(["eyJ" + "QUJD".repeat(10_000)]);
+    expect([...suspicious.deltas, ...suspicious.tails].join("")).toBe("***REDACTED***");
+    const blob = "QUJD".repeat(10_000);
     const plain = throughBuffer(["blob ", ...chunked(blob, 997, 7), " end"]);
     expect([...plain.deltas, ...plain.tails].join("")).toBe(`blob ${blob} end`);
     expect(CREDENTIAL_SHAPE_HOLD_CAP).toBe(16_384);
@@ -245,6 +263,32 @@ describe("split credential shapes through the real append, Postgres and the live
     }
     out("rows-append-postgres-live.json", report);
   }, 280_000);
+
+  // Never-OK: rf-2's 26,765-character JWT crosses the cap before its first dot.
+  it("G1 capped unfinished JWT never releases raw held bytes in deltas or outputTails", async () => {
+    const f = await fixture();
+    const header = Buffer.from(JSON.stringify({ alg: "HS256", padding: "x".repeat(19_996) })).toString("base64url");
+    const payload = Buffer.from('{"sub":"synthetic"}').toString("base64url");
+    const signature = "Q7ZXa9KpW8rL2mN6vC4zB0tH5efS3jD1xABCDE";
+    const jwt = `${header}.${payload}.${signature}`;
+    expect(jwt.length).toBe(26_765);
+    const parts = [jwt.slice(0, CREDENTIAL_SHAPE_HOLD_CAP + 1), jwt.slice(CREDENTIAL_SHAPE_HOLD_CAP + 1)];
+    for (const text of parts) await f.port.appendEvent(f.event("item.delta", "item", { kind: "agentMessage", text }));
+    await f.port.appendEvent(f.event("item.completed", "item", { kind: "agentMessage", text: jwt }));
+    const events = await f.stored();
+    out("g1-cap-jwt.json", { length: jwt.length, events, live: f.live() });
+    for (const event of events) {
+      const own = JSON.stringify(event.payload);
+      for (const raw of [header.slice(0, 16), header.slice(-16), payload, signature]) expect(own).not.toContain(raw);
+      for (const tail of tailsOf(event)) expect(tail.payload.text).not.toContain(payload + "." + signature);
+    }
+    for (const entry of f.live()) {
+      const own = JSON.stringify(entry);
+      for (const raw of [header.slice(0, 16), header.slice(-16), payload, signature]) expect(own).not.toContain(raw);
+    }
+    expect(events.slice(0, 2).map(event => event.payload.text).join("") + events.flatMap(tailsOf).map(tail => tail.payload.text).join("")).toBe("***REDACTED***");
+    expect(events.at(-1)!.payload.text).toBe("***REDACTED***");
+  });
 
   it.each([
     ["final", "item.completed", true], ["item error", "item.failed", true],
