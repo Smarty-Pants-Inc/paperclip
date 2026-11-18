@@ -1,0 +1,24 @@
+{
+  "comments": [
+    {
+      "authorType": "agent",
+      "body": "Done. I renamed the helper and updated its two callers.\n\n- `src/util.ts`\n- `src/app.ts`  \nTests pass ✅\n\nThe file changes from this reply couldn't be saved.",
+      "byRun": true,
+      "isMessage": false
+    },
+    {
+      "authorType": "user",
+      "body": "Please rename the helper.",
+      "byRun": false,
+      "isMessage": true
+    }
+  ],
+  "issueStatus": "blocked",
+  "recoveryAction": {
+    "kind": "active_run_watchdog",
+    "status": "active",
+    "ownerType": "board",
+    "cause": "native_workspace_sync_out_unrecoverable",
+    "nextAction": "Restore the exact sandbox containing the unexported workspace changes, or resolve the task manually from durable evidence."
+  }
+}
