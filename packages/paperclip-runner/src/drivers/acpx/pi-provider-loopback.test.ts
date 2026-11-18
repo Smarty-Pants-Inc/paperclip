@@ -17,7 +17,7 @@ afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await 
 const key = "reusable-provider-key-canary";
 const childFallback = { id: "vendor/model", input: ["text"], contextWindow: 128000, maxTokens: 8192, reasoning: true,
   thinkingLevelMap: { off: "off", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } };
-// P1c5f (15fde892): the managed loopback model also carries Pi's session-affinity compat flags.
+// P1c5f (15fde892): the managed overlay always adds both session-affinity flags to the child model.
 const managedChildFallback = { ...childFallback, compat: { sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" } };
 function environment(url: string) {
   const routing = { PAPERCLIP_AI_PROVIDER_URL: url, PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "api_key", PAPERCLIP_AI_PROVIDER_KEY: key };
@@ -50,7 +50,7 @@ describe("Pi managed provider loopback", () => {
     expect(binding.provider.models).toEqual([{ id: "vendor/model" }]);
   });
 
-  it("materializes documented child fallback capabilities without a selected catalog or config", async () => {
+  it("supersedes(pre-overlay affinity expectation; RFL record P1C5-OVERLAY-EXPECTATIONS) materializes documented child fallback capabilities without a selected catalog or config", async () => {
     const binding = await startPiProviderLoopback({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1") });
     cleanups.push(binding.close);
     const provider = JSON.parse(binding.json).providers.paperclip;
@@ -71,7 +71,7 @@ describe("Pi managed provider loopback", () => {
       .rejects.toThrow("Pi managed model thinking level");
   });
 
-  it("writes only the session capability to models.json and routes a real Messages request", async () => {
+  it("supersedes(pre-overlay affinity expectation; RFL record P1C5-OVERLAY-EXPECTATIONS) writes only the session capability to models.json and routes a real Messages request", async () => {
     let received: { path?: string; key?: string; body: unknown } | undefined;
     const upstream = createServer(async (req, res) => {
       const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(Buffer.from(chunk));
