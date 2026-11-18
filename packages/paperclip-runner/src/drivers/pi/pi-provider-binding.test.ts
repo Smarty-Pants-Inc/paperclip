@@ -115,6 +115,7 @@ describe("Pi in-memory provider binding", () => {
       baseUrl: expect.stringMatching(route.protocol === "messages" ? /^http:\/\/127\.0\.0\.1:\d+$/ : /^http:\/\/127\.0\.0\.1:\d+\/v1$/),
       api: route.api, apiKey: expect.any(String),
       models: [{ id: "vendor/model", input: ["text"], reasoning: true, contextWindow: 128000, maxTokens: 8192,
+        compat: { sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" },
         thinkingLevelMap: { off: "off", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } }],
     } } });
     expect(provider.apiKey.length).toBeGreaterThanOrEqual(32);

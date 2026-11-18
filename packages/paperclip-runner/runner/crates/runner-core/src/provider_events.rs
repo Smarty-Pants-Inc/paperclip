@@ -965,7 +965,7 @@ fn provider_performance_spans(params: &Value) -> Vec<Value> {
 
 /// A Codex reasoning item's provider-written summary parts, joined the same
 /// way the live stream separates them. `None` when the provider sent none.
-fn reasoning_summary_text(provider_item: &Value) -> Option<String> {
+fn reasoning_summary_text(provider_item: &Value, completed: bool) -> Option<String> {
     let parts: Vec<&str> = provider_item
         .get("summary")
         .and_then(Value::as_array)?
@@ -976,7 +976,16 @@ fn reasoning_summary_text(provider_item: &Value) -> Option<String> {
         })
         .filter(|part| !part.is_empty())
         .collect();
-    (!parts.is_empty()).then(|| bounded_text(&parts.join("\n\n"), MAX_TEXT_CHARS))
+    // P1c5: a completed thinking summary is person-visible text, kept whole
+    // (redacted) for the durable outbox to deliver whole or paged.
+    (!parts.is_empty()).then(|| {
+        let text = parts.join("\n\n");
+        if completed {
+            redact_sensitive_text_values(&text)
+        } else {
+            bounded_text(&text, MAX_TEXT_CHARS)
+        }
+    })
 }
 
 fn optional_bounded_text(value: Option<&Value>, max_chars: usize) -> Value {
@@ -1607,11 +1616,15 @@ pub fn normalize_codex_notification_in(
                     "text": provider_item.get("text").and_then(Value::as_str).map(|value| {
                         if completed && item_type == "agentMessage" && provider_phase == "final_answer" {
                             final_agent_message_text(value)
+                        } else if completed && item_type == "reasoning" {
+                            // P1c5: completed thinking is person-visible; the
+                            // durable outbox keeps it whole or paged.
+                            redact_sensitive_text_values(value)
                         } else {
                             bounded_text(value, MAX_TEXT_CHARS)
                         }
                     })
-                        .or_else(|| (item_type == "reasoning").then(|| reasoning_summary_text(provider_item)).flatten()),
+                        .or_else(|| (item_type == "reasoning").then(|| reasoning_summary_text(provider_item, completed)).flatten()),
                 });
                 // Preserve only actual terminal invocation identity in the compatibility
                 // projection. Arguments, arbitrary tool names and result bodies stay omitted.
@@ -1679,8 +1692,9 @@ pub(crate) fn normalize_pi_notification_in(
     let streamed = match method {
         "item/agentMessage/delta" => Some(("agentMessage", "progress", params.get("delta"))),
         "item/reasoning/summaryTextDelta" => Some(("reasoning", "summary", params.get("delta"))),
-        // Pi's facade forwards reasoning item.delta as item/delta (not the
-        // Codex summary notification). Do not drop this real wire shape.
+        "item/reasoning/textDelta" => Some(("reasoning", "summary", params.get("delta"))),
+        // Older Pi facades forward reasoning item.delta as item/delta. Keep
+        // accepting that wire shape alongside the current textDelta method.
         "item/delta" => match string(params.get("kind").or_else(|| item(params).get("type"))) {
             "agentMessage" => Some((
                 "agentMessage",
@@ -2668,6 +2682,127 @@ fn has_rfc_uri_scheme_prefix(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // KEEP: P1c3 renamed the producer method and silently lost all Pi thinking.
+    // Both languages read this exact facade output, including >6,000 chars and UTF-8.
+    #[test]
+    fn pi_facade_reasoning_fixture_reaches_outbox_once_and_whole() {
+        use crate::durable::{DurableRunnerConfig, DurableState};
+        use std::time::Duration;
+
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../test/fixtures/pi-facade-reasoning-delta.json"
+        ))
+        .unwrap();
+        let text = fixture["params"]["delta"].as_str().unwrap();
+        assert!(text.chars().count() >= 6_000);
+        assert!(text.len() > text.chars().count());
+        let events = normalize_pi_notification_in(
+            fixture["method"].as_str().unwrap(),
+            &fixture["params"],
+            None,
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "facade reasoning must normalize exactly once"
+        );
+        let config = DurableRunnerConfig {
+            connect_url: "ws://127.0.0.1:3000/api/runner/v1/connect/run_1".into(),
+            ca_bundle_path: None,
+            state_dir: std::env::temp_dir().join("pi-facade-outbox-unused"),
+            runner_instance_id: "runner_1".into(),
+            environment_lease_id: "environment_1".into(),
+            run_id: "run_1".into(),
+            normalized_session_id: "session_1".into(),
+            turn_id: "turn_1".into(),
+            item_id: "item_1".into(),
+            runner_version: "0.0.0".into(),
+            runner_digest: "sha256:test".into(),
+            acpx_launch_profile: None,
+            pi_launch_profile: None,
+            opencode_launch_profile: None,
+            cursor_cloud_launch_profile: None,
+            max_outbox_bytes: 65_536,
+            p0_reserve_bytes: 4096,
+            max_frame_bytes: 65_536,
+            reconnect_delay: Duration::from_millis(1),
+            reconnect_grace: None,
+            max_runtime: Duration::from_secs(1),
+            turn_scoped: false,
+        };
+        let mut state = DurableState::new(&config);
+        for event in events {
+            assert_eq!(event.event_type, "item.delta");
+            assert_eq!(event.payload["kind"], "reasoning");
+            assert_eq!(event.payload["channel"], "summary");
+            assert_eq!(
+                event.payload["text"].as_str().unwrap().as_bytes(),
+                text.as_bytes()
+            );
+            state
+                .enqueue_event(&config, event.event_type, event.priority, event.payload)
+                .unwrap();
+        }
+        assert_eq!(state.outbox.len(), 1);
+        let envelope = &state.outbox[0].envelope;
+        assert_eq!(envelope["payload"]["eventType"], "item.delta");
+        assert_eq!(envelope["payload"]["payload"]["kind"], "reasoning");
+        assert_eq!(
+            envelope["payload"]["payload"]["text"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            text.as_bytes()
+        );
+        // Serialization is the actual durable transport seam; not a length-only check.
+        let wire: Value = serde_json::from_slice(&serde_json::to_vec(envelope).unwrap()).unwrap();
+        assert_eq!(
+            wire["payload"]["payload"]["text"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn pi_facade_method_table_has_no_silent_drops() {
+        let rows: Value = serde_json::from_str(include_str!(
+            "../../../../test/fixtures/pi-facade-methods.json"
+        ))
+        .unwrap();
+        // Named, intentional drop: generic tool deltas are not prose; typed
+        // tool.execution.* lifecycle frames carry their output instead.
+        const INTENTIONAL_DROPS: &[(&str, &str)] =
+            &[("item/delta", "unsupported_generic_tool_delta")];
+        for row in rows.as_array().unwrap() {
+            let method = row["method"].as_str().unwrap();
+            let kind = row["kind"].as_str().unwrap_or("builtinToolCall");
+            let params = json!({"threadId":"pi-session", "turnId":"turn-1", "itemId":"fixture-item",
+                "kind":kind, "text":"fixture text", "delta":"fixture text",
+                "item":{"id":"fixture-item", "type":kind, "text":"fixture text", "output":"tool output"},
+                "turn":{"id":"turn-1", "status":row["eventType"].as_str().unwrap().strip_prefix("turn.").unwrap_or("completed")}});
+            let events = normalize_pi_notification_in(method, &params, None);
+            if let Some(drop) = row["drop"].as_str() {
+                assert!(
+                    INTENTIONAL_DROPS.contains(&(method, drop)),
+                    "unnamed drop: {row}"
+                );
+                assert!(events.is_empty(), "remove obsolete drop: {row}");
+            } else {
+                assert_eq!(events.len(), 1, "unhandled facade method: {row}");
+                assert_eq!(
+                    events[0].event_type,
+                    row["event"].as_str().unwrap(),
+                    "{row}"
+                );
+                if row["kind"].is_string() {
+                    assert_eq!(events[0].payload["kind"], kind, "{row}");
+                }
+            }
+        }
+    }
 
     // Keep reason: Paul NOTE 5's real Pi facade -> PRP boundary must not
     // turn a live answer into a preview (or drop a reasoning delta).
@@ -4068,6 +4203,26 @@ mod tests {
             &json!({"item": {"id": "rs_2", "type": "reasoning", "summary": [], "content": []}}),
         );
         assert_eq!(empty[0].payload["text"], Value::Null);
+    }
+
+    // P1c5: a completed Codex thinking item over 4,096 bytes keeps its whole
+    // redacted text (summary or text), never the "…[truncated]" preview.
+    #[test]
+    fn p1c5_completed_codex_reasoning_keeps_whole_redacted_text() {
+        let thinking = format!(
+            "token=secret-value {}",
+            "Weighing the retry path. ".repeat(2_000)
+        );
+        assert!(thinking.len() > 4_096);
+        let whole = thinking.replace("secret-value", "[REDACTED]");
+        for item in [
+            json!({"id": "rs_3", "type": "reasoning", "summary": [thinking], "content": []}),
+            json!({"id": "rs_4", "type": "reasoning", "text": thinking}),
+        ] {
+            let completed = normalize_codex_notification("item/completed", &json!({"item": item}));
+            assert_eq!(completed[0].event_type, "item.completed");
+            assert_eq!(completed[0].payload["text"], whole);
+        }
     }
 
     #[test]

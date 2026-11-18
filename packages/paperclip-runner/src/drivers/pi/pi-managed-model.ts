@@ -42,7 +42,9 @@ export async function buildPiManagedModel(input: {
         ...(configured.contextWindow === undefined ? { contextWindow: limits.contextWindow } : {}),
         ...(configured.maxTokens === undefined ? { maxTokens: limits.maxTokens } : {}) };
     }
-    return resolvePiManagedModel(configured, input.catalog, input.api, message => messages.add(message));
+    const model = resolvePiManagedModel(configured, input.catalog, input.api, message => messages.add(message));
+    // Managed gateway routing uses Pi's own session id, never prompt text.
+    return { ...model, compat: { ...model.compat, sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" } };
   } finally {
     reportDiagnostics(messages, input.warn ?? diagnose);
   }

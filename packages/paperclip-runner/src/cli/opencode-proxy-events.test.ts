@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -5,12 +6,64 @@ import {
   openCodeProxyAssistantText,
   openCodeProxyItemNotification,
   openCodeProxyTerminalNotification,
+  openCodeProxyToolNotification,
   shouldAnnounceOpenCodeProxyTurn,
   shouldForwardOpenCodeProxyItem,
 } from "./opencode-proxy-events.js";
 import { createOpenCodeProxyOutput } from "./opencode-proxy-output.js";
 
+// Shared with runner-core: the exact producer frame, not a hand-built Rust shape.
+const reasoningFixture = JSON.parse(readFileSync(new URL("../../test/fixtures/pi-facade-reasoning-delta.json", import.meta.url), "utf8"));
+const methodRows = JSON.parse(readFileSync(new URL("../../test/fixtures/pi-facade-methods.json", import.meta.url), "utf8")) as Array<{
+  producer: "item" | "tool" | "terminal"; eventType: string; kind?: string; method: string; event?: string; drop?: string;
+}>;
+
 describe("OpenCode runnerd proxy event boundary", () => {
+  it("pins the whole Pi reasoning notification shared with the Rust outbox test", () => {
+    // delta and item are facade output, not fields supplied by the Pi projector.
+    const { delta: _delta, item: _item, threadId, turnId, itemId, ...payload } = reasoningFixture.params;
+    expect([...payload.text].length).toBeGreaterThanOrEqual(6_000);
+    expect(Buffer.byteLength(payload.text)).toBeGreaterThan(payload.text.length);
+    expect(openCodeProxyItemNotification({ eventType: "item.delta", threadId, turnId, itemId, payload })).toEqual(reasoningFixture);
+  });
+
+  it("keeps the shared method table exhaustive against the facade source", () => {
+    const source = readFileSync(new URL("./opencode-proxy-events.ts", import.meta.url), "utf8");
+    const body = (name: string) => source.split(`export function ${name}(`)[1]!.split("\nexport function ")[0]!;
+    const item = body("openCodeProxyItemNotification");
+    const terminal = body("openCodeProxyTerminalNotification");
+    const tool = body("openCodeProxyToolNotification");
+    const eventTypes = (text: string) => [...text.split("threadId:")[0]!.matchAll(/"([^"]+)"/g)].map(match => match[1]!);
+    const itemTypes = eventTypes(item);
+    const terminalTypes = eventTypes(terminal);
+    const toolPhases = [...tool.split("if (!phase)")[0]!.matchAll(/"([^"]+)": "([^"]+)"/g)];
+    const methodExpression = item.split("const method =")[1]!.split("const providerItem")[0]!;
+    const explicitMethods = [...methodExpression.matchAll(/"([^"]+)"/g)].map(match => match[1]!)
+      .filter(value => !itemTypes.includes(value) && value !== "." && value !== "/");
+    // Derive the fallback family from EVERY eventType in the real signature,
+    // all explicit method literals (not just names starting item/), and tools.
+    const methods = new Set([
+      ...itemTypes.map(type => type.replace(".", "/")),
+      ...terminalTypes.map(type => type.replace(".", "/")),
+      ...explicitMethods,
+      ...[...source.matchAll(/method: "([^"]+)"/g)].map(match => match[1]!),
+      ...toolPhases.map(match => `item/${match[2]}`),
+    ]);
+    expect([...new Set(methodRows.map(row => row.method))].sort()).toEqual([...methods].sort());
+    const inputs = [...itemTypes.map(type => `item:${type}`), ...terminalTypes.map(type => `terminal:${type}`), ...toolPhases.map(match => `tool:${match[1]}`)];
+    expect([...new Set(methodRows.map(row => `${row.producer}:${row.eventType}`))].sort()).toEqual(inputs.sort());
+  });
+
+  it.each(methodRows)("emits shared method row $producer/$eventType/$kind -> $method", row => {
+    const input = { eventType: row.eventType, threadId: "pi-session", turnId: "turn-1", itemId: "fixture-item",
+      payload: row.producer === "tool"
+        ? { schema: "paperclip.tool.execution.v1", executionId: "fixture-item", transport: "builtin", name: "read", output: "tool output" }
+        : { kind: row.kind, text: "fixture text" } };
+    const frame = row.producer === "tool" ? openCodeProxyToolNotification(input)
+      : row.producer === "terminal" ? openCodeProxyTerminalNotification(input as Parameters<typeof openCodeProxyTerminalNotification>[0])
+      : openCodeProxyItemNotification(input as Parameters<typeof openCodeProxyItemNotification>[0]);
+    expect(frame?.method).toBe(row.method);
+  });
   it("drops only the duplicate session-scoped model item", () => {
     expect(shouldForwardOpenCodeProxyItem({ payload: { kind: "model" } })).toBe(false);
     expect(

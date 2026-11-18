@@ -63,6 +63,17 @@ Absent canonical id/API/compat is diagnosed and skipped. Copying fallback emits
 a bounded diagnostic naming the canonical provider. Noncanonical catalog entries
 supply only API-neutral fields.
 
+After capability resolution, the managed builder overlays
+`compat.sendSessionAffinityHeaders: true` and
+`compat.sessionAffinityFormat: "openrouter"`, preserving all other resolved
+compat fields. These two routing controls are managed policy, even when source
+config disables affinity. Pi 1.5.2's `docs/models-configuration.md` documents the
+flags: its real client sends `options.sessionId` as `x-session-id`. Pi supplies
+its own persisted session id; Paperclip does not add identity to instructions or
+messages. This does not enable other OpenRouter behavior or change provider URLs.
+The shared validator checks the boolean and documented format enum while retaining
+its existing acceptance of other lossless JSON compat metadata.
+
 The whole model definition crosses the broker and private bind boundaries.
 There is no capability allowlist: `input`, names, costs (including tiers),
 `inputLimits`, prompt-cache settings, thinking maps and future JSON metadata
@@ -125,6 +136,7 @@ From `packages/paperclip-runner`:
 pnpm exec vitest run src/drivers/pi/pi-managed-definition.test.ts --maxWorkers=2
 pnpm exec vitest run src/drivers/pi/pi-managed-model-sampling.test.ts --maxWorkers=2
 pnpm exec vitest run src/drivers/pi/pi-managed-compat.test.ts --maxWorkers=2
+pnpm exec vitest run src/drivers/pi/pi-session-affinity.test.ts --maxWorkers=1
 node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit
 ```
 
