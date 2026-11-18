@@ -8,12 +8,14 @@ import { REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT } from "./remote-runner-recovery-d
 
 export const SANDBOX_RUNNER_HOLDER_LIST_SCRIPT = [
   "set -eu",
-  'root=$1; own=$2',
+  // B1 fence (b) G1 (from 2edb1a05): this run's own session directory is listed too. A finished run's Runner left
+  // there (this run continues its conversation) is classified like any other; this run's own live Runner is
+  // excluded by run id in retireSandboxRunnerPortHolders, never by directory.
+  'root=$1',
   'test -d "$root/sessions" && test ! -L "$root/sessions" || exit 0',
   'for session in "$root"/sessions/*; do',
   '  test -d "$session" && test ! -L "$session" || continue',
   '  case "${session##*/}" in *.*) continue;; esac',
-  '  test "$session" = "$own" && continue',
   '  identity="$session/runner/runner-process.identity"; state="$session/runner/runner-state.json"',
   '  test -f "$identity" && test ! -L "$identity" || continue',
   '  encoded_state=""',
@@ -69,11 +71,119 @@ export function parseSandboxRunnerHolders(stdout: string): SandboxRunnerHolder[]
 
 type HolderProbe = "alive" | "gone" | "unproven";
 
+/**
+ * B1 fence (b), rf-4 shape: a Runner is every process group it RECORDED, not only runnerd.
+ *
+ * runnerd starts each provider in the provider's own process group (process_supervisor.rs `spawn_command`:
+ * `command.process_group(0)`), so signalling runnerd's group leaves the provider alive. runnerd records
+ * those groups durably: before any provider starts it calls `process_lineage::enable_journal(state_dir)`
+ * (bin/paperclip-runnerd.rs, `run_durable`), which writes `<state-dir>/process-lineage/writer-<pid>.json`;
+ * every SupervisedProcess then journals its lineage (`LineageTracker::start` -> `Journal::create`) to
+ * `lineage-<pid>-<n>.json`: `groups` [[pgid, leader start ticks]] and `members` [[pid, start ticks]]
+ * (process_lineage/journal.rs `JournalRecord`). A journal is removed by runnerd only once that lineage was
+ * proven gone (`Journal::retire`).
+ *
+ * The check below (node, after the marker-verified leader check; $5 the leader's exit code) reads that
+ * record read-only and, from one /proc table:
+ * - recorded groups: runnerd's own group (pid, its start ticks) and every journalled group. A group
+ *   counts while any process is in it that started no earlier than its leader; a group whose leader PID
+ *   now names a process with another start time is a reused ID and is never touched.
+ * - recorded members: runnerd itself and every journalled member, by PID and exact start ticks (a
+ *   no-setsid runnerd that leads no group is signalled by its PID only, never its parent's group).
+ * - with a signal: TERM or KILL to each live recorded group and each live recorded member outside one.
+ * Exit 0 while any recorded process is left, 45 when none is; 46 a signal failed. 49 unclassifiable:
+ * a live runnerd keeps no journal (its writer marker is missing or names another generation), a
+ * journal or the marker cannot be read or parsed, or /proc cannot be read. Unclassifiable fails closed.
+ * Nothing is written or deleted. Journals of another LIVE writer are that writer's and are skipped.
+ * The script is embedded in single quotes: it must not contain a single quote.
+ */
+export const RECORDED_GROUPS_CHECK_SCRIPT = String.raw`
+const fs = require("node:fs"), path = require("node:path");
+const [identityPath, rawPid, fingerprint, leaderCode, signal] = process.argv.slice(1);
+const pid = Number(rawPid), leaderAlive = leaderCode === "0";
+const unclassifiable = reason => { process.stderr.write("runner_recorded_groups_unclassifiable: " + reason + "\n"); process.exit(49); };
+const self = new Set([process.pid, process.ppid]);
+const stat = p => {
+  try {
+    const s = fs.readFileSync("/proc/" + p + "/stat", "utf8"), f = s.slice(s.lastIndexOf(") ") + 2).trim().split(/\s+/);
+    return { state: f[0], pgrp: Number(f[2]), start: Number(f[19]) };
+  } catch (error) { if (error.code === "ENOENT" || error.code === "ESRCH") return null; unclassifiable("process " + p + " unreadable"); }
+};
+let entries;
+try { entries = fs.readdirSync("/proc"); } catch { unclassifiable("no process table"); }
+if (!fs.existsSync("/proc/self/stat")) unclassifiable("no process table");
+const table = new Map();
+for (const d of entries) { if (String(Number(d)) !== d) continue; const s = stat(d); if (s && s.state !== "Z") table.set(Number(d), s); }
+const read = file => {
+  let info;
+  try { info = fs.lstatSync(file); } catch (error) { if (error.code === "ENOENT") return null; unclassifiable(file + " unreadable"); }
+  if (!info.isFile()) unclassifiable(file + " is not a regular file");
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch (error) { if (error.code === "ENOENT") return null; unclassifiable(file + " unreadable"); }
+};
+const id = v => Number.isSafeInteger(v) && v > 0;
+const identity = v => v !== null && typeof v === "object" && id(v.pid) && id(v.started);
+const pairs = v => Array.isArray(v) && v.every(e => Array.isArray(e) && e.length === 2 && id(e[0]) && Number.isSafeInteger(e[1]) && e[1] >= 0);
+const directory = path.join(path.dirname(identityPath), "process-lineage");
+const ticks = /^linux:[-a-fA-F0-9]+:([0-9]+)$/.exec(fingerprint || "");
+let writer = read(path.join(directory, "writer-" + pid + ".json"));
+if (writer !== null && (writer.schema !== "paperclip.runner.process-lineage-writer.v1" || !identity(writer.writer) || writer.writer.pid !== pid)) unclassifiable("writer marker invalid");
+const leader = table.get(pid);
+const runnerStart = ticks ? Number(ticks[1]) : leaderAlive && leader ? leader.start : writer ? writer.writer.started : null;
+if (writer !== null && runnerStart !== null && writer.writer.started !== runnerStart) {
+  if (leaderAlive) unclassifiable("writer marker names another runnerd generation");
+  writer = null;
+}
+if (leaderAlive && writer === null) unclassifiable("the live runnerd keeps no process lineage journal");
+const groups = new Map(), members = new Map();
+if (runnerStart !== null) { groups.set(pid, runnerStart); members.set(pid, runnerStart); }
+let names = [];
+try { names = fs.readdirSync(directory); } catch (error) { if (error.code !== "ENOENT") unclassifiable("journal directory unreadable"); }
+for (const name of names) {
+  if (!name.startsWith("lineage-") || !name.endsWith(".json")) continue;
+  const record = read(path.join(directory, name));
+  if (record === null) continue;
+  if (record.schema !== "paperclip.runner.process-lineage.v1" || !identity(record.writer) || !pairs(record.groups) || !pairs(record.members)
+    || (record.root != null && !pairs([record.root]))) unclassifiable(name + " is not a lineage record");
+  const own = record.writer.pid === pid && (runnerStart === null || record.writer.started === runnerStart);
+  const writerProcess = table.get(record.writer.pid);
+  if (!own && writerProcess && writerProcess.start === record.writer.started) continue;
+  for (const [g, s] of record.groups) groups.set(g, Math.min(groups.get(g) ?? s, s));
+  for (const [p, s] of record.members) members.set(p, s);
+  if (record.root != null && record.root[1] !== 0) members.set(record.root[0], record.root[1]);
+}
+const live = new Set(), liveGroups = new Set(), liveMembers = new Set();
+for (const [g, s] of groups) {
+  const groupLeader = table.get(g);
+  if (groupLeader && groupLeader.start !== s) continue;
+  for (const [p, e] of table) if (!self.has(p) && e.pgrp === g && e.start >= s) { live.add(p); liveGroups.add(g); }
+}
+for (const [p, s] of members) {
+  const e = table.get(p);
+  if (e && e.start === s && !self.has(p)) { live.add(p); if (!liveGroups.has(e.pgrp)) liveMembers.add(p); }
+}
+if (signal && live.size > 0) {
+  let failed = false;
+  const send = target => { try { process.kill(target, "SIG" + signal); } catch (error) { if (error.code !== "ESRCH") failed = true; } };
+  for (const g of liveGroups) send(-g);
+  for (const p of liveMembers) send(p);
+  if (failed) process.exit(46);
+}
+process.exit(live.size > 0 ? 0 : 45);
+`;
+
+const HOLDER_CHECK_SCRIPT = [
+  `(${REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT})`,
+  "leader=$?",
+  // 0 the marker-verified runnerd is alive; 45 it exited; 47 its PID now names another process.
+  'case "$leader" in 0|45|47) ;; *) exit "$leader";; esac',
+  `exec node -e '${RECORDED_GROUPS_CHECK_SCRIPT}' "$1" "$4" "\${5:-}" "$leader" "\${6:-}"`,
+].join("\n");
+
 async function checkHolder(runner: CommandManagedRuntimeRunner, holder: SandboxRunnerHolder, label: string,
   signal?: "TERM" | "KILL"): Promise<number | null> {
   const result = await runner.execute({
     command: "sh",
-    args: ["-c", REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT + (signal ? '; kill -"$6" "$pid"' : ""),
+    args: ["-c", HOLDER_CHECK_SCRIPT,
       label, holder.identityPath, holder.nonce, holder.runnerInstanceId, String(holder.pid),
       holder.processStartFingerprint ?? "", ...(signal ? [signal] : [])],
     bypassSession: true,
@@ -90,10 +200,10 @@ async function probeHolder(runner: CommandManagedRuntimeRunner, holder: SandboxR
   return "unproven";
 }
 
-async function listSandboxRunnerHolders(runner: CommandManagedRuntimeRunner, runtimeRoot: string, ownSessionRoot: string) {
+async function listSandboxRunnerHolders(runner: CommandManagedRuntimeRunner, runtimeRoot: string) {
   const listed = await runner.execute({
     command: "sh",
-    args: ["-c", SANDBOX_RUNNER_HOLDER_LIST_SCRIPT, "paperclip-runner-port-holders", runtimeRoot, ownSessionRoot],
+    args: ["-c", SANDBOX_RUNNER_HOLDER_LIST_SCRIPT, "paperclip-runner-port-holders", runtimeRoot],
     bypassSession: true,
     timeoutMs: 15_000,
   }).catch(() => null);
@@ -109,7 +219,7 @@ export async function sandboxSessionRunnerExited(input: {
   runtimeRoot: string;
   sessionDirectory: string;
 }): Promise<boolean> {
-  const { holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot, "");
+  const { holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot);
   const holder = holders?.find(candidate => holderSessionDirectory(candidate) === input.sessionDirectory);
   return holder !== undefined && await checkHolder(input.runner, holder, "paperclip-runner-exit-check") === 45;
 }
@@ -175,6 +285,20 @@ async function waitUntilGone(runner: CommandManagedRuntimeRunner, holder: Sandbo
   }
 }
 
+/** TERM, then KILL, every process group and member the Runner recorded (runnerd's and each provider's),
+ * each step verified: "gone" only once no member of ANY recorded group is left. */
+async function stopRecordedGroups(runner: CommandManagedRuntimeRunner, holder: SandboxRunnerHolder, waitMs: number, pollMs: number) {
+  let outcome: "stopped" | "killed" = "stopped";
+  let probe = await probeHolder(runner, holder, "TERM");
+  if (probe === "alive") probe = await waitUntilGone(runner, holder, waitMs, pollMs);
+  if (probe === "alive") {
+    outcome = "killed";
+    probe = await probeHolder(runner, holder, "KILL");
+    if (probe === "alive") probe = await waitUntilGone(runner, holder, waitMs, pollMs);
+  }
+  return { probe, outcome };
+}
+
 export async function retireSandboxRunnerPortHolders(input: {
   db: Db;
   companyId: string;
@@ -191,7 +315,7 @@ export async function retireSandboxRunnerPortHolders(input: {
   waitMs?: number;
   pollMs?: number;
 }): Promise<string[]> {
-  const { listed, holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot, input.ownSessionRoot);
+  const { listed, holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot);
   if (!holders) {
     throw new NativePredecessorRetirementUnprovenError(null, input.providerLeaseId,
       new Error(`runner_port_holder_inventory_unavailable: exit=${listed?.exitCode ?? "none"} timedOut=${listed?.timedOut ?? false}`));
@@ -206,7 +330,11 @@ export async function retireSandboxRunnerPortHolders(input: {
       new Error(`runner_port_holder_${reason}`));
     if (initial === "unproven") throw unproven("unverifiable");
     if (holder.runId && await input.retireInProcess(holder.runId)) {
-      if (await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500) !== "gone") throw unproven("still_running");
+      // The server's own close ends runnerd; its providers run in their own groups and may outlive it. Proven
+      // gone only when every group the Runner recorded is empty: else TERM then KILL them and verify again.
+      let closed = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500);
+      if (closed === "alive") closed = (await stopRecordedGroups(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500)).probe;
+      if (closed !== "gone") throw unproven("still_running");
       retired.push(holder.runId);
       continue;
     }
@@ -217,19 +345,15 @@ export async function retireSandboxRunnerPortHolders(input: {
     if (!RETIRABLE_HOLDER_RUN_STATUSES.has(owner.status) || owner.agentId !== input.agentId || !holder.idle) {
       throw unproven("owner_not_settled");
     }
-    let outcome: "stopped" | "killed" = "stopped";
-    let probe = await probeHolder(input.runner, holder, "TERM");
-    if (probe === "alive") probe = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500);
-    if (probe === "alive") {
-      outcome = "killed";
-      probe = await probeHolder(input.runner, holder, "KILL");
-      if (probe === "alive") probe = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500);
-    }
+    // TERM then KILL runnerd and every provider group it recorded; nothing is deleted (the session's
+    // journal, state and lineage files stay on disk as its trace).
+    const { probe, outcome } = await stopRecordedGroups(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500);
     if (probe !== "gone") throw unproven("stop_unconfirmed");
     await persistActivity(input.db, {
       companyId: input.companyId, actorType: "system", actorId: "native-runtime", agentId: input.agentId,
       action: "native.runner_port_holder_retired", entityType: "heartbeat_run", entityId: input.runId, runId: input.runId,
       details: { holderRunId: holder.runId, holderRunnerInstanceId: holder.runnerInstanceId, holderStatus: owner.status, outcome,
+        holderInOwnSession: input.ownSessionRoot !== "" && posix.dirname(posix.dirname(holder.identityPath)) === input.ownSessionRoot,
         providerLeaseId: input.providerLeaseId },
     });
     await input.onLog?.("stdout",

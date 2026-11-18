@@ -58,10 +58,21 @@ describeEmbeddedPostgres("a sandbox Runner port held by another session's Runner
     await mkdir(directory, { recursive: true });
     await writeFile(join(directory, "runner-process.identity"),
       `holdernonce\n${holder.pid}\n${new Date().toISOString()}\n${runnerInstanceId}\n${await processFingerprint(holder.pid!)}`);
+    // PLANTED: this Node substitute starts no provider; it gets the journal writer marker paperclip-runnerd writes
+    // (process_lineage::enable_journal) with no lineage records. The real-producer rows
+    // (sandbox-runner-port-holders.real-producer.integration.test.ts) cover the real shape with provider groups.
+    await mkdir(join(directory, "process-lineage"), { recursive: true });
+    await writeFile(join(directory, "process-lineage", `writer-${holder.pid}.json`), JSON.stringify({
+      schema: "paperclip.runner.process-lineage-writer.v1", writer: { pid: holder.pid, started: await startTicks(holder.pid!) } }));
     await writeFile(join(directory, "runner-state.json"), JSON.stringify({ runnerInstanceId, runId: input.runId,
       lifecycle: input.lifecycle ?? "ready", outbox: input.outbox ?? [], pendingTerminalDelivery: null,
       pendingProviderCleanup: input.pendingProviderCleanup ?? null, warmTransition: null }));
     return holder;
+  }
+
+  async function startTicks(pid: number) {
+    const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+    return Number(stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[19]);
   }
 
   async function processFingerprint(pid: number) {
