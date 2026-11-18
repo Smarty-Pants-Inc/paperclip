@@ -1,3 +1,4 @@
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "../../../services/heartbeat/run-lifecycle-plugin-events.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { assertAgentInteraction } from "../../../services/agent-interaction-policy.js";
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
@@ -147,8 +148,9 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
         .update(heartbeatRuns)
         .set({ status: "cancelled", finishedAt: now, error: reason, errorCode: "queued_comment_discarded", updatedAt: now })
         .where(and(eq(heartbeatRuns.id, queueRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")))
-        .returning({ id: heartbeatRuns.id })
+        .returning()
         .then((rows) => rows[0] ?? null);
+      if (row) publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "queued" }, row);
       return row ? { id: row.id } : null;
     },
 

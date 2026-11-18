@@ -1195,7 +1195,7 @@ export function heartbeatService(
             contextSnapshot: { source: effect.contextSource },
           }),
         });
-        publishRunLifecyclePluginEventData(effect);
+        if (effect.runtimeMode !== "native") publishRunLifecyclePluginEventData(effect);
         if (
           isHeartbeatRunTerminalStatus(effect.status) &&
           effect.previousStatus !== effect.status

@@ -1,3 +1,4 @@
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { currentProcessSpaceHash } from "../controller-process-identity.js";
 import type { ExecutionReconciliation } from "@paperclipai/shared";
 import { nativeControllerAuthorityDigest, readNativeRemoteExecutionOwnership, isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
@@ -379,6 +380,7 @@ async function settleFailedRunOwner(db: Db, release: Release, now: Date): Promis
         errorCode: failureCode, error: "The original controller and provider were contained by a board operator. Review the recorded action outcomes before explicitly retrying.",
         processPid: null, processGroupId: null, processStartedAt: null, executionControlDeadlineAt: null } : {}),
     }).where(eq(heartbeatRuns.id, run.id)).returning();
+    if (settledRun) publishTerminalRunLifecyclePluginEventAfterCommit(tx, run, settledRun);
     if (release.kind === "stopped_remote_owner" && settledRun) {
       await preserveNativeFailedWorkspace(tx, settledRun);
       await settleNativeTerminalWake(tx, settledRun);

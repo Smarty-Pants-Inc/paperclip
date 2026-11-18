@@ -1,3 +1,4 @@
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "../../../services/heartbeat/run-lifecycle-plugin-events.js";
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
 import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../../../services/deferred-execution-notifications.js";
 import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restore-recovery-state.js";
@@ -217,6 +218,7 @@ function queuedEffect(run: HeartbeatRun): PostCommitEffect {
 function statusEffect(run: HeartbeatRun, previousStatus: string | null): PostCommitEffect {
   return {
     kind: "run_status_published",
+    ...(run.runtimeMode === "native" ? { runtimeMode: run.runtimeMode } : {}),
     companyId: run.companyId,
     runId: run.id,
     agentId: run.agentId,
@@ -889,6 +891,7 @@ export function createPostgresRunDispatchAdapter(
       )
       .returning();
     if (!row) return { applied: false };
+    publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "scheduled_retry" }, row);
 
     if (row.wakeupRequestId) {
       await tx
@@ -1256,6 +1259,7 @@ export function createPostgresRunDispatchAdapter(
       // `expectedStatus`: the caller's staleness decision lost the race, so
       // this write must not overwrite whatever status won it.
       if (!row) return { outcome: "lost_race" };
+      publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: expectedStatus }, row);
 
       const deferredWakeRequestId = expectedStatus === "queued" && decision.errorCode === "execution_reconciliation_required"
         ? await deferUnstartedUserComment(tx, row, issueId, now) : null;

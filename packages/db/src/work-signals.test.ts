@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createDb, withDedicatedDbConnection } from "./client.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./test-embedded-postgres.js";
 import { workSignalDebug } from "./work-signal-debug.js";
-import { DATABASE_WORK_CHANNEL, DATABASE_WORK_NOTIFICATION_MAX_BYTES, DATABASE_WORK_TOPIC_NOTIFICATIONS_MAX_BYTES, databaseWorkScopeKey, databaseWorkPending, enableDatabaseWorkNotifications, installDatabaseWorkSignals, notifyDatabaseWorkOnCommit, primeDatabaseWorkTransactionId, publishDatabaseWorkSettled, receiveDatabaseWorkNotification, reconcileDatabaseWork, reconcileDatabaseWorkNotifications, setDatabaseWorkReconnectHint, signalDatabaseWork, subscribeDatabaseWork } from "./work-signals.js";
+import { afterDatabaseCommit, DATABASE_WORK_CHANNEL, DATABASE_WORK_NOTIFICATION_MAX_BYTES, DATABASE_WORK_TOPIC_NOTIFICATIONS_MAX_BYTES, databaseWorkScopeKey, databaseWorkPending, enableDatabaseWorkNotifications, installDatabaseWorkSignals, notifyDatabaseWorkOnCommit, primeDatabaseWorkTransactionId, publishDatabaseWorkSettled, receiveDatabaseWorkNotification, reconcileDatabaseWork, reconcileDatabaseWorkNotifications, setDatabaseWorkReconnectHint, signalDatabaseWork, subscribeDatabaseWork } from "./work-signals.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("database work signals", () => {
@@ -41,6 +41,67 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(received).toEqual(expect.arrayContaining([["hinted", ["{\"reload\":true}"]], ["plain", undefined]]));
       expect(received).toHaveLength(2);
     } finally { stopHinted(); stopPlain(); }
+  });
+
+  it("runs effects only after the outer commit, including released nested savepoints", async () => {
+    const effects: string[] = [];
+    const result = await db.transaction(async tx => {
+      afterDatabaseCommit(tx, () => effects.push("outer"));
+      await tx.transaction(async nested => {
+        afterDatabaseCommit(nested, () => effects.push("savepoint"));
+        await nested.transaction(async inner => {
+          afterDatabaseCommit(inner, () => effects.push("inner"));
+        });
+      });
+      expect(effects).toEqual([]);
+      return 123;
+    });
+    expect(result).toBe(123);
+    expect(effects).toEqual(["outer", "savepoint", "inner"]);
+  });
+
+  it("discards rolled-back effects but retains a surviving parent's effects", async () => {
+    const effects: string[] = [];
+    await db.transaction(async tx => {
+      afterDatabaseCommit(tx, () => effects.push("parent"));
+      await expect(tx.transaction(async nested => {
+        afterDatabaseCommit(nested, () => effects.push("discarded"));
+        await nested.transaction(async inner => afterDatabaseCommit(inner, () => effects.push("discarded-inner")));
+        throw new Error("savepoint rollback");
+      })).rejects.toThrow("savepoint rollback");
+      await tx.transaction(async nested => afterDatabaseCommit(nested, () => effects.push("survivor")));
+      expect(effects).toEqual([]);
+    });
+    expect(effects).toEqual(["parent", "survivor"]);
+    await expect(db.transaction(async tx => {
+      await tx.transaction(async nested => afterDatabaseCommit(nested, () => effects.push("discarded-root")));
+      throw new Error("root rollback");
+    })).rejects.toThrow("root rollback");
+    expect(effects).toEqual(["parent", "survivor"]);
+  });
+
+  it("rejects effects registered outside a live transaction", async () => {
+    const effect = vi.fn();
+    expect(() => afterDatabaseCommit(db, effect)).toThrow("require a createDb transaction");
+    expect(() => afterDatabaseCommit({}, effect)).toThrow("require a createDb transaction");
+    let ended: object = {};
+    await db.transaction(async tx => { ended = tx; });
+    expect(() => afterDatabaseCommit(ended, effect)).toThrow("after its transaction or savepoint ended");
+    expect(effect).not.toHaveBeenCalled();
+  });
+
+  it("does not turn a successful commit into a failure when one effect throws", async () => {
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    const later = vi.fn();
+    try {
+      await expect(db.transaction(async tx => {
+        afterDatabaseCommit(tx, () => { throw new Error("effect failed"); });
+        afterDatabaseCommit(tx, later);
+        return 7;
+      })).resolves.toBe(7);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("effect failed"));
+      expect(later).toHaveBeenCalledTimes(1);
+    } finally { warn.mockRestore(); }
   });
 
   it("defers nested savepoint notifications until the outer commit and preserves return values", async () => {
@@ -151,12 +212,14 @@ const support = await getEmbeddedPostgresTestSupport();
     }) as typeof raw.transaction;
     const owner = installDatabaseWorkSignals(raw);
     const topic = `late-${outcome}`;
+    const effects = vi.fn();
     const settled: string[][] = [];
     const unsubscribe = subscribeDatabaseWork(owner, topic, (event, hints) => {
       if (event === "settled") settled.push([...(hints ?? [])]);
     });
     try {
       await expect(owner.transaction(async tx => {
+        afterDatabaseCommit(tx, effects);
         await signalDatabaseWork(tx, topic, "connection-late");
         await tx.execute(sql`insert into work_signal_test values (${topic})`);
       })).rejects.toThrow("lost transaction response");
@@ -167,6 +230,9 @@ const support = await getEmbeddedPostgresTestSupport();
       release(); await serverDone.catch(() => {});
       await reconcileDatabaseWork(owner, topic);
       expect(settled).toEqual([["connection-late"]]);
+      // A lost commit response is not a confirmed commit: these best-effort
+      // effects are never replayed by queue reconciliation.
+      expect(effects).not.toHaveBeenCalled();
       expect(databaseWorkPending(owner, topic)).toBe(false);
       expect(await db.execute(sql`select * from work_signal_test where id = ${topic}`)).toHaveLength(outcome === "commit" ? 1 : 0);
     } finally { release(); await serverDone?.catch(() => {}); unsubscribe(); }
@@ -256,6 +322,14 @@ describe("work signal query boundaries", () => {
     const execute = vi.fn();
     const connection = installDatabaseWorkSignals({ execute, transaction: async (callback: any) => callback({ execute, transaction: async () => {} }) });
     await expect(connection.transaction(async () => 19)).resolves.toBe(19);
+    expect(execute).not.toHaveBeenCalled();
+  });
+  it("adds no SQL for a post-commit effect alone", async () => {
+    const execute = vi.fn();
+    const effect = vi.fn();
+    const connection = installDatabaseWorkSignals({ execute, transaction: async (callback: any) => callback({ execute, transaction: async () => {} }) });
+    await expect(connection.transaction(async (tx: object) => { afterDatabaseCommit(tx, effect); return 19; })).resolves.toBe(19);
+    expect(effect).toHaveBeenCalledTimes(1);
     expect(execute).not.toHaveBeenCalled();
   });
   it("fails before the write if XID acquisition fails, without retaining uncertainty", async () => {

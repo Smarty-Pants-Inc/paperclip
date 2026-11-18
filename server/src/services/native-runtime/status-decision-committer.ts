@@ -88,6 +88,7 @@ import {
   type ActivityPublication,
 } from "../activity-log.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { materializeNativeEnvironmentBlockerRetry, materializeNativeProviderCapacityRetry, materializeNativeToolReceiptLimitContinuation } from "./native-provider-capacity-retry.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_EXHAUSTED_CODE } from "./native-environment-blocker.js";
 import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
@@ -1178,6 +1179,9 @@ async function materializeDecisionEffect(input: {
     await notifyCancelledWorkspacePreservation(input.tx, { companyId: input.companyId, runId: input.runId });
     await notifyUnsafeWorkspaceExportRecovery(input.tx, { companyId: input.companyId, issueId: input.issue.id });
     await notifyDeliveryWork(input.tx, DELIVERY_QUEUES.accounting, input.companyId);
+    const [before] = await input.tx.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
+      .for("update").limit(1);
     const [run] = await input.tx
       .update(heartbeatRuns)
       .set({
@@ -1193,6 +1197,7 @@ async function materializeDecisionEffect(input: {
       )
       .returning();
     if (!run) throw new Error("native_continuation_cancellation_run_missing");
+    if (before) publishTerminalRunLifecyclePluginEventAfterCommit(input.tx, before, run);
     input.terminalRunsToEmit?.push(run);
     return {
       effectKind: effect.kind,

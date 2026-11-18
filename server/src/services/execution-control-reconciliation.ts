@@ -1,3 +1,4 @@
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "./heartbeat/run-lifecycle-plugin-events.js";
 import { notifyNativeEnvironmentSettlement } from "./native-environment-settlement-notifications.js";
 import { notifyExternalAgentSettlement } from "../modules/external-agents/index.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
@@ -290,6 +291,7 @@ export async function reconcileAbandonedExecutionControl(
             })
             .where(eq(heartbeatRuns.id, run.id))
             .returning();
+          if (updatedRun) publishTerminalRunLifecyclePluginEventAfterCommit(tx, run, updatedRun);
           if (updatedRun && updatedRun.status !== run.status) {
             terminalRunToReport = updatedRun;
           }

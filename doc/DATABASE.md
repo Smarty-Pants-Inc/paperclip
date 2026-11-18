@@ -231,6 +231,22 @@ The database mode is controlled by `DATABASE_URL`:
 
 Your Drizzle schema (`packages/db/src/schema/`) stays the same regardless of mode.
 
+## Transaction-bound best-effort effects
+
+`afterDatabaseCommit(tx, effect)` registers a synchronous best-effort effect on
+an active `createDb` transaction. The existing work-signal transaction wrapper
+owns these effects: a successful savepoint transfers them to its parent; a
+rolled-back savepoint discards them; only the confirmed outermost commit runs
+them. Register inside the owning write transaction, not after a nested service
+returns. Root or ended transaction handles are rejected. An effect failure is
+warned without changing the committed transaction's result or suppressing later
+effects. Registration alone adds no SQL.
+
+This is not an outbox: process loss or an unconfirmed/lost commit response can
+lose effects, and reconciliation does not replay them. Durable delivery must
+still use a durable queue. Native run lifecycle plugin publications use this
+boundary; existing database work hints retain their own settlement semantics.
+
 ## Schema change workflow
 
 When you change the data model:

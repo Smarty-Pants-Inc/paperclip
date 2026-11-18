@@ -1,3 +1,4 @@
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { sameRunResumeClaimEntry } from "./scheduled-resume-continuation.js";
 import { liveNativeFinalizationReserved } from "./live-native-finalization.js";
 import { appendBoundedRecoveryHistory } from "./native-restart-recovery.js";
@@ -279,6 +280,7 @@ export async function claimNativeSessionResumptions(input: {
             : "Persisted native session state is ambiguous and cannot be resumed safely",
           updatedAt: now,
         }).where(eq(heartbeatRuns.id, row.run.id)).returning();
+        if (updatedRun) publishTerminalRunLifecyclePluginEventAfterCommit(tx, row.run, updatedRun);
         // Only a genuine transition into "failed" is a new terminal failure.
         // A candidate that is already "failed" (the filter above admits
         // both "running" and "failed") must not send a second Sentry event,

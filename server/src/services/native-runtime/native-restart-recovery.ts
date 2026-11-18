@@ -1,3 +1,4 @@
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { carriesInheritedRunnerIdentity } from "./native-inherited-runner-retry.js";
 import { readPendingNativeRunStop } from "./native-cancellation-request.js";
 import { nativeRunHandedOffTask } from "./native-human-self-handoff.js";
@@ -1056,7 +1057,10 @@ async function endNamespaceUnverifiedRun(tx: Db, row: {
       nextAction: "The server running this task restarted. Paperclip continues the task in a fresh run from its saved work.",
       maxAttempts: 3, wakePolicy: null, supersedeOnIdentityChange: true });
   }
-  if (updatedRun) await preserveNativeFailedWorkspace(tx, updatedRun);
+  if (updatedRun) {
+    publishTerminalRunLifecyclePluginEventAfterCommit(tx, row.run, updatedRun);
+    await preserveNativeFailedWorkspace(tx, updatedRun);
+  }
 }
 
 export function settledNativeControllerNamespaceAttention(owner: {
@@ -1977,6 +1981,7 @@ export async function claimNativeRestartRecoveries(input: {
           })
           .where(eq(heartbeatRuns.id, row.run.id))
           .returning();
+        if (updatedRun) publishTerminalRunLifecyclePluginEventAfterCommit(tx, row.run, updatedRun);
         if (updatedRun && isNewTerminalRunFailure(row.run, updatedRun)) {
           terminalRunToReport = updatedRun;
         }

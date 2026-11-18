@@ -79,7 +79,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import { afterDatabaseCommit, type Db } from "@paperclipai/db";
 import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   type HeartbeatRunStatusPhase,
@@ -146,10 +146,8 @@ import {
   classifyRunLiveness,
   type RunLivenessClassificationInput,
 } from "../run-liveness.js";
-import {
-  logActivity,
-  publishPluginDomainEvent,
-} from "../activity-log.js";
+import { logActivity } from "../activity-log.js";
+import { publishRunLifecyclePluginEvent, publishRunLifecyclePluginEventData, publishTerminalRunLifecyclePluginEventAfterCommit } from "./run-lifecycle-plugin-events.js";
 import { runnerGoalService } from "../runner-goals.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
 import {
@@ -1175,6 +1173,25 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     });
   }
 
+  async function writeNativeStatusAndQueuePluginEvent(
+    tx: Db,
+    previous: Pick<HeartbeatRun, "id" | "companyId" | "runtimeMode"> | null,
+    write: () => Promise<HeartbeatRun | null>,
+  ) {
+    if (previous?.runtimeMode !== "native") return write();
+    // Take this lock after any coordinator lock the caller requires. A stale
+    // admission snapshot cannot authorize a second terminal publication.
+    const [before] = await tx.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, previous.id), eq(heartbeatRuns.companyId, previous.companyId)))
+      .for("update").limit(1);
+    const after = await write();
+    if (before && after) {
+      if (isHeartbeatRunTerminalStatus(after.status)) publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, after);
+      else afterDatabaseCommit(tx, () => publishRunLifecyclePluginEvent(after));
+    }
+    return after;
+  }
+
   async function setRunStatus(
     runId: string,
     status: string,
@@ -1216,7 +1233,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       };
     }
     const updated = await writeRunStatus(status, previousStatus, writer =>
-      previousStatus && previousStatus.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(status)
+      writeNativeStatusAndQueuePluginEvent(writer, previousStatus, () => previousStatus && previousStatus.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(status)
         ? terminalizeLegacyExecution({
             db: writer,
             run: previousStatus,
@@ -1235,7 +1252,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
             })
             .where(eq(heartbeatRuns.id, runId))
             .returning()
-            .then((rows) => rows[0] ?? null));
+            .then((rows) => rows[0] ?? null)));
 
     if (updated) {
       publishLiveEvent({
@@ -1243,7 +1260,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         type: "heartbeat.run.status",
         payload: buildHeartbeatRunStatusLiveEventPayload(updated),
       });
-      publishRunLifecyclePluginEvent(updated);
+      if (updated.runtimeMode !== "native") publishRunLifecyclePluginEvent(updated);
       emitTerminalAgentTaskRun(updated, previousStatus?.status ?? null);
     }
 
@@ -1339,7 +1356,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
             eq(nativeRunFinalizations.companyId, previousStatus.companyId)))
           .for("update");
       }
-      return previousStatus && legacyTerminalization
+      return writeNativeStatusAndQueuePluginEvent(writer, previousStatus, () => previousStatus && legacyTerminalization
         ? terminalizeLegacyExecution({
             db: writer,
             run: previousStatus,
@@ -1392,7 +1409,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
             .catch((error: unknown) => {
               if (cancellationCondition) rethrowNativeCancellationLockConflict(error);
               throw error;
-            });
+            }));
     });
     // Legacy terminalization takes the task row under a short lock_timeout so
     // it never queues behind a slow task writer. Losing that race rolls back
@@ -1407,7 +1424,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         type: "heartbeat.run.status",
         payload: buildHeartbeatRunStatusLiveEventPayload(updated),
       });
-      publishRunLifecyclePluginEvent(updated);
+      if (updated.runtimeMode !== "native") publishRunLifecyclePluginEvent(updated);
       emitTerminalAgentTaskRun(updated, previousStatus?.status ?? null, failureReport);
       return { run: updated, updated: true as const };
     }
@@ -1528,74 +1545,6 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       });
     }
     return terminalRun ?? run;
-  }
-
-  function publishRunLifecyclePluginEvent(
-    run: typeof heartbeatRuns.$inferSelect,
-  ) {
-    publishRunLifecyclePluginEventData({
-      companyId: run.companyId,
-      runId: run.id,
-      agentId: run.agentId,
-      status: run.status,
-      invocationSource: run.invocationSource,
-      triggerDetail: run.triggerDetail,
-      error: run.error,
-      errorCode: run.errorCode,
-      issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
-      startedAt: run.startedAt,
-      finishedAt: run.finishedAt,
-    });
-  }
-
-  function publishRunLifecyclePluginEventData(run: {
-    companyId: string;
-    runId: string;
-    agentId: string;
-    status: string;
-    invocationSource: string;
-    triggerDetail: string | null;
-    error: string | null;
-    errorCode: string | null;
-    issueId: string | null;
-    startedAt: Date | null;
-    finishedAt: Date | null;
-  }) {
-    const eventType =
-      run.status === "running"
-        ? "agent.run.started"
-        : run.status === "succeeded"
-          ? "agent.run.finished"
-          : run.status === "failed" || run.status === "timed_out"
-            ? "agent.run.failed"
-            : run.status === "cancelled"
-              ? "agent.run.cancelled"
-              : null;
-    if (!eventType) return;
-    publishPluginDomainEvent({
-      eventId: randomUUID(),
-      eventType,
-      occurredAt: new Date().toISOString(),
-      actorId: run.agentId,
-      actorType: "agent",
-      entityId: run.runId,
-      entityType: "heartbeat_run",
-      companyId: run.companyId,
-      payload: {
-        runId: run.runId,
-        agentId: run.agentId,
-        status: run.status,
-        invocationSource: run.invocationSource,
-        triggerDetail: run.triggerDetail,
-        error: run.error ?? null,
-        errorCode: run.errorCode ?? null,
-        issueId: run.issueId,
-        startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
-        finishedAt: run.finishedAt
-          ? new Date(run.finishedAt).toISOString()
-          : null,
-      },
-    });
   }
 
   async function setWakeupStatus(

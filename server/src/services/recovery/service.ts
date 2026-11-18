@@ -1,3 +1,4 @@
+import { publishTerminalRunLifecyclePluginEventAfterCommit } from "../heartbeat/run-lifecycle-plugin-events.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
 import { INTERACTION_DELIVERY_DENIED, isInteractionDeliveryDeniedRun } from "../agent-interaction-delivery.js";
@@ -6878,7 +6879,7 @@ export function recoveryService(
         await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: run.companyId, issueId: boundIssueId });
         await notifyChatRunMilestones(tx, { companyId: run.companyId, issueId: boundIssueId });
       }
-      return tx
+      const [terminalRun] = await tx
         .update(heartbeatRuns)
         .set({
           status: terminalStatus,
@@ -6890,8 +6891,9 @@ export function recoveryService(
           updatedAt: now,
         })
         .where(eligible)
-        .returning()
-        .then((rows) => rows[0] ?? null);
+        .returning();
+      if (terminalRun) publishTerminalRunLifecyclePluginEventAfterCommit(tx, candidate, terminalRun);
+      return terminalRun ?? null;
     });
     if (!updated) {
       // Another path finalized the run between the read and this write. Keep
