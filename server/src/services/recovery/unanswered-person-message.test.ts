@@ -2976,7 +2976,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await f.visible()).toHaveLength(0);
     });
 
-    it("RED scope: a message the stopped run carried but had NOT read (acked, unread steer), neither carried on nor held -> its notice stays", async () => {
+    it("supersedes(RED scope: a message the stopped run carried but had NOT read (acked, unread steer), neither carried on nor held -> its notice stays; RFL record SUPERSEDE-BPRIME3-NOTICE-WORDING-1118)", async () => {
       const f = await stopCase(f => stopFields(f.userId));
       const steer = await f.message("Also add a test.");
       const t = new Date(f.t.getTime() + 20_000);
@@ -2987,7 +2987,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const notes = await f.visible();
       expect(notes).toHaveLength(1);
       expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${steer}`);
-      expect(notes[0]!.body).toBe(NO_RUN);
+      expect(notes[0]!.body).toBe(NOT_ANSWERED);
     });
 
     it("RED scope: the run's own message that the model had NOT read yet (no userMessage item) -> its notice stays", async () => {
@@ -3377,12 +3377,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         eq(activityLog.action, PENDING_WAIT_ACTION)))).toHaveLength(0);
     });
 
-    it("guard: a NON-held message past END keeps today's no-run notice", async () => {
+    it("supersedes(guard: a NON-held message past END keeps today's no-run notice; RFL record SUPERSEDE-BPRIME3-NOTICE-WORDING-1118)", async () => {
       const f = await conversation(false);
       await pendingRecovery(f);
       await sweep(f, 11 * 60_000);
       await sweep(f, 12 * 60_000);
-      expect((await oneSweepNotice(f)).body).toBe(NO_RUN);
+      expect((await oneSweepNotice(f)).body).toBe(NOT_ANSWERED);
     });
   });
 
