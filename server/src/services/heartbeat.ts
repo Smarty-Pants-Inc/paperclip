@@ -4826,6 +4826,7 @@ export function heartbeatService(
     resumeTaskRetry: runControl.resumeTaskRetry,
     resumeQueuedCommentInterrupt,
     queuedCommentInterruptTargetStopped,
+    releaseWakesBehindDeadPress: heartbeatQueue.releaseWakesBehindDeadPress,
     resumeExecutionWaitComments,
 
     sweepStaleIssueLocks,
