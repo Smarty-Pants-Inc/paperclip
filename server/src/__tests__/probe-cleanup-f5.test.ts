@@ -468,6 +468,8 @@ const support = await getEmbeddedPostgresTestSupport();
     await untilRetryAt(f.agent.id);
     await work.process(f.agent.id);
     expect(boundary.retry, "the retained retry ran the transport step (cleanup rm)").toHaveBeenCalledOnce();
+    expect(f.boat.calls.slice(mark).filter(c => c.providerLeaseId === probeLease.providerLeaseId && STARTS.includes(c.method)),
+      "the plugin's call log after the restart: the retry's rm never reaches Boat").toEqual([]);
     expect(boundary.rmErrors, "the rm is refused by the server's durable fence").toEqual([expect.objectContaining({ code: "sandbox_lease_start_denied" })]);
     expect((await row(f.agent.id)).lifecycleState).toBe("verifying");
     // Retry 2: Boat reads the box archived → typed `stopped`.
