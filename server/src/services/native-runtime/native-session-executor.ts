@@ -289,7 +289,7 @@ import {
   nativeRunResults,
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
-import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
+import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery, RETAINED_OWNER_LEASE_WAIT_MESSAGE, STOPPED_RUN_TOOLS_WAIT_MESSAGE } from "./native-controller-recovery.js";
 import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 import type { EnvironmentDriverExecuteInput } from "../environment-runtime.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
@@ -6901,6 +6901,17 @@ async function ownerStopAwaitingAcknowledgement(input: { db: Db; execution: Nati
   return run !== undefined && personStopAwaitingAcknowledgement(run);
 }
 
+/** The S095 deferral's words, true to the stopped run's state: a lease of it
+ * still held (active, not yet stopped) -> the retained owner's lease words;
+ * no held lease (NULL) -> its tools are not yet confirmed exited. */
+async function stoppedRunWaitMessage(input: { db: Db; execution: NativeExecutionInput }, stoppedRunId: unknown): Promise<string> {
+  if (typeof stoppedRunId !== "string") return STOPPED_RUN_TOOLS_WAIT_MESSAGE;
+  const [held] = await input.db.select({ id: environmentLeases.id }).from(environmentLeases)
+    .where(and(eq(environmentLeases.companyId, input.execution.binding.companyId),
+      eq(environmentLeases.heartbeatRunId, stoppedRunId), eq(environmentLeases.status, "active"))).limit(1);
+  return held ? RETAINED_OWNER_LEASE_WAIT_MESSAGE : STOPPED_RUN_TOOLS_WAIT_MESSAGE;
+}
+
 /** Waits within warmSessionReleaseWait (outside any transaction) for the
  * acknowledgement, then lets today's retirement decide. Still pending at the
  * bound: the typed pre-claim recovery wait, never the quarantine. */
@@ -6912,7 +6923,8 @@ async function retireAfterPersonStopAcknowledged(input: Parameters<typeof retire
     await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
   }
   if (await ownerStopAwaitingAcknowledgement(input, input.identity)) {
-    throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs));
+    throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs), undefined,
+      { message: await stoppedRunWaitMessage(input, input.identity.runId) });
   }
   return retireFinishedPerTurnRunnerdOwner(input);
 }
@@ -7026,10 +7038,11 @@ async function retireAfterStopIssuedTurnCommands(input: Parameters<typeof inspec
       exempt = await stopIssuedTurnCommandsOfDirectSuccessor(input);
     }
     if (!exempt) return retireFinishedPerTurnRunnerdOwner(input);
-    if (!exempt.generationGone) throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs));
+    if (!exempt.generationGone) throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs), undefined,
+      { message: await stoppedRunWaitMessage(input, input.identity.runId) });
   }
   await input.onLog?.("stderr", `[paperclip-runner] run ${String(input.identity.runId)}'s Runner is gone; `
-    + "its person's Stop's unanswered turn commands no longer hold this conversation\n");
+    + "its unanswered turn commands issued after the person's acknowledged Stop no longer hold this conversation\n");
   return retireFinishedPerTurnRunnerdOwner({ ...input, projectedControlBytes: exempt.projected });
 }
 
@@ -11641,7 +11654,7 @@ async function executePaperclipNativeSessionUnnoticed(input: {
     executionFailure = error;
     if (error instanceof NativeControllerRecoveryWaitingError) {
       await deferNativeControllerRecovery(input.db, { ...input.execution.binding,
-        leaseOwner: input.leaseOwner, retryAt: error.retryAt, waitingForOwner: error.owner });
+        leaseOwner: input.leaseOwner, retryAt: error.retryAt, waitingForOwner: error.owner, message: error.detail?.message });
     }
     if (!(error instanceof NativeRunnerOwnershipUnverifiedError) && !(error instanceof NativeStartupCleanupPendingError) && startup.stopRequested && startup.executionContext?.signal.reason instanceof Error &&
         startup.executionContext.signal.reason.message === "native_session_cancelled") {
