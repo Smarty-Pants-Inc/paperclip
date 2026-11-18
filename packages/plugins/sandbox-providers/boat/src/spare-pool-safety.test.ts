@@ -238,3 +238,46 @@ describe("Boat ready spares: off stays off (gate 5 bx_dyr9gyf6, 20:33:18Z)", () 
     expect(h.boat.creates("spare"), "the wake refills while spares are on").toHaveLength(2);
   });
 });
+
+describe("Boat ready spares: a claim never takes a sick spare (gate 5 bx_yntyy5tj, stop failed 18:25:08Z, claimed 18:36:47Z)", () => {
+  it("RED-2a a spare whose idle stop failed (Boat: stop failing, box idle) is not claimed; the run gets a fresh box", async () => {
+    const h = await harness("claim-failing");
+    const s1 = await seed(h);
+    h.boat.stopMode = "failing-idle"; // Boat's final snapshot fails from here on.
+    await idleStopAttempt(h, s1);
+    expect(h.boat.boxes.get(s1)!.stop?.status, "Boat GET shows S1's stop failing").toBe("failing");
+    expect(h.boat.boxes.get(s1)!.state, "and S1 still running idle").toBe("idle");
+    await settle(h.emit("issue.created"));
+    await advance(5_000);
+    const patchesBefore = h.boat.patchesOf(s1).length;
+    const lease = await settle(h.acquire("run-after-failed-stop"));
+    expect(lease.providerLeaseId, "the claim skips S1").not.toBe(s1);
+    expect(h.boat.boxes.get(lease.providerLeaseId!), "the run gets a fresh box").toBeDefined();
+    expect(h.boat.boxes.get(lease.providerLeaseId!)!.state).not.toBe("idle");
+    expect(h.boat.patchesOf(s1).slice(patchesBefore), "S1 is never renamed to a claim").toHaveLength(0);
+    expect(h.boat.boxes.get(s1)!.name).toMatch(/^paperclip-spare:ready:/);
+  });
+
+  it("RED-2b a spare whose Boat GET shows a pending stop (planted) is not claimed; the run gets a fresh box", async () => {
+    const h = await harness("claim-pending");
+    const s1 = await seed(h);
+    // planted: a stop another actor requested, still pending at Boat; the box reads idle.
+    const box = h.boat.boxes.get(s1)!;
+    box.state = "idle";
+    box.stop = { id: "stop_planted", status: "pending" };
+    const lease = await settle(h.acquire("run-after-pending-stop"));
+    expect(lease.providerLeaseId, "the claim skips S1").not.toBe(s1);
+    expect(h.boat.boxes.get(lease.providerLeaseId!)).toBeDefined();
+    expect(h.boat.boxes.get(s1)!.name).toMatch(/^paperclip-spare:ready:/);
+  });
+
+  it("CONTROL a healthy idle spare with no stop record is still claimed warm", async () => {
+    const h = await harness("claim-healthy");
+    const s1 = await seed(h);
+    h.boat.boxes.get(s1)!.state = "idle";
+    const runCreates = h.boat.creates("run").length;
+    const lease = await settle(h.acquire("run-healthy"));
+    expect(lease.providerLeaseId).toBe(s1);
+    expect(h.boat.creates("run")).toHaveLength(runCreates);
+  });
+});

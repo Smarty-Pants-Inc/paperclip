@@ -239,6 +239,21 @@ function readyAndHealthy(spare: ReadySpare, key: ReadySpareKey, now: number): bo
 }
 
 /**
+ * A box Boat was asked to stop is never claimable: its fresh GET shows a stop
+ * record (pending, failing or done). A failing final snapshot leaves the box
+ * running 'idle' with the stop still failing (bx_yntyy5tj, 2026-11-18).
+ */
+function stopRequested(spare: ReadySpare): boolean {
+  const stop = spare.providerObservation?.stop;
+  return stop !== undefined && stop !== null;
+}
+
+/** Claimable now: Boat's fresh record of the box is a ready, idle-clean spare of this pool. */
+function claimableNow(spare: ReadySpare, key: ReadySpareKey, now: number): boolean {
+  return readyAndHealthy(spare, key, now) && !stopRequested(spare);
+}
+
+/**
  * Worker-local index of already-warmed Boat boxes. Boat labels/name are the
  * durable record; after a worker restart, `reconcile` rebuilds this index from
  * the provider inventory before starting replacements.
@@ -601,11 +616,28 @@ export class ReadySpareKeeper {
       if (this.isRefilling(key)) return { outcome: "cold", reason: "refill_in_flight" };
       return { outcome: "cold", reason: "no_ready_spare" };
     }
-    const [spare] = pool.splice(index, 1);
+    let [spare] = pool.splice(index, 1);
     this.claiming.add(spare.id);
     this.inFlightClaims.set(poolId, (this.inFlightClaims.get(poolId) ?? 0) + 1);
     const reason: "claim_conflict" = "claim_conflict";
+    const unknown: ReadySpare[] = [];
     try {
+      // Re-read each candidate from Boat before the claim. A spare whose stop
+      // is pending or failing, or that is no longer a ready idle spare, leaves
+      // the claim index; an unreadable one stays indexed but is not claimed.
+      for (;;) {
+        let fresh: ReadySpare | undefined;
+        let known = true;
+        try { fresh = await operations.get(spare); } catch { known = false; }
+        if (this.stopping) return { outcome: "cold", reason };
+        if (known && fresh?.id === spare.id && claimableNow(fresh, key, this.now())) break;
+        if (!known) unknown.push(spare);
+        this.claiming.delete(spare.id);
+        const next = pool.findIndex(item => !this.claiming.has(item.id) && !this.stoppingSpares.has(item.id) && readyAndHealthy(item, key, this.now()));
+        if (next < 0) return { outcome: "cold", reason: "no_ready_spare" };
+        [spare] = pool.splice(next, 1);
+        this.claiming.add(spare.id);
+      }
       const claimToken = `paperclip-claim:${attemptId}`;
       if (!await claimStore.reserve(spare, claimToken, runId) || this.stopping) return { outcome: "cold", reason };
       const claimed = await operations.claim(spare, claimToken, ttlSeconds);
@@ -614,6 +646,7 @@ export class ReadySpareKeeper {
       return { outcome: "cold", reason };
     } finally {
       this.claiming.delete(spare.id);
+      for (const item of unknown) if (!pool.some(entry => entry.id === item.id)) pool.push(item);
       const remainingClaims = (this.inFlightClaims.get(poolId) ?? 1) - 1;
       if (remainingClaims > 0) this.inFlightClaims.set(poolId, remainingClaims);
       else this.inFlightClaims.delete(poolId);
