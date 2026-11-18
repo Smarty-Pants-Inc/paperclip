@@ -49,9 +49,13 @@ describe("issuesApi.list", () => {
   it.each([
     { queueId: null, targetRunId: null, revision: "empty", entries: [] },
     { queueId: "queue-1", targetRunId: "new-run", revision: "changed", entries: [{ comment: { id: "waiting" } }] },
-  ])("rejects a changed or empty queue before interruption", async queue => {
+  ])("supersedes(rejects a changed or empty queue before interruption; RFL record SUPERSEDE-QUEUEUX-CONFLICT-WORDING-1118) — each neutral sentence is exact on its own path", async queue => {
     mockApi.get.mockResolvedValueOnce(queue);
-    await expect(issuesApi.interruptLatestQueuedComments("issue-1", "old-run")).rejects.toThrow(queue.entries.length ? "The queue changed" : "Nothing is waiting.");
+    if (queue.entries.length) {
+      await expect(issuesApi.interruptLatestQueuedComments("issue-1", "old-run")).rejects.toThrow(/^The queue changed\. Review it and try again\.$/);
+    } else {
+      await expect(issuesApi.interruptLatestQueuedComments("issue-1", "old-run")).rejects.toThrow(/^Nothing is waiting\.$/);
+    }
     expect(mockApi.post).not.toHaveBeenCalled();
   });
 

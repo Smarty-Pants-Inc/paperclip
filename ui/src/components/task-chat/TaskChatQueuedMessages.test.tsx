@@ -152,7 +152,7 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.disabled).toBe(true);
   });
 
-  it("renders each queued message once as a compact one-line row", () => {
+  it("supersedes(renders each queued message once as a compact one-line row; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — no one-sided border", () => {
     render();
     const pane = container.querySelector(
       '[data-testid="task-chat-queued-messages"]',
@@ -169,13 +169,13 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.textContent).toContain("Second queued message");
   });
 
-  it("supersedes(renders every later-wake message with safe controls and its own deletion target; RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118)", async () => {
+  it("supersedes(renders every later-wake message but disables its row controls with a reason; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — later-wake controls work, with each row's own target", async () => {
     const entries = [queue.entries[0],
       { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" },
       { ...queue.entries[1], comment: { ...queue.entries[1].comment, id: "comment-3", body: "Third queued message" },
         queueId: "wake-3", queueRevision: "rev-3", position: 2 }];
     const props = render({ queue: { ...queue, steeringDisposition: "unsupported", entries },
-      onInterrupt: vi.fn().mockResolvedValue(undefined) });
+      onInterrupt: vi.fn().mockRejectedValue(new Error("Retry later-wake interrupt")) });
     expect(container.querySelectorAll('[data-testid^="task-chat-queued-message-"]')).toHaveLength(3);
     expect(container.textContent).toContain("Third queued message");
     for (const id of ["comment-2", "comment-3"]) {
@@ -185,12 +185,21 @@ describe("TaskChatQueuedMessages", () => {
       expect(edit.title).toBe("Edit message");
       await act(async () => edit.click());
       expect(props.onEdit).toHaveBeenCalledWith(id);
-      const discard = row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${id}"]`)!;
+      expect(row.querySelector('[title="Queued message actions"]')).toBeNull();
+      expect(row.textContent).not.toContain("Edit and delete are available when this message reaches the front.");
+      const interrupt = row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-interrupt-${id}"]`)!;
+      expect(interrupt.disabled).toBe(false);
+      expect(row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-grip-${id}"]`)?.disabled).toBe(false);
+      if (id === "comment-2") {
+        await act(async () => interrupt.click());
+        expect(props.onInterrupt).toHaveBeenCalledWith("comment-2");
+        expect(container.querySelector(`[data-testid="task-chat-queued-message-${id}"]`)).not.toBeNull();
+      }
+      const discard = container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${id}"]`)!;
       expect(discard.disabled).toBe(false);
       await act(async () => discard.click());
       expect(props.onDiscard).toHaveBeenCalledWith(id, id === "comment-2" ? "rev-2" : "rev-3", id === "comment-2" ? "wake-2" : "wake-3");
-      expect(row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-interrupt-${id}"]`)?.disabled).toBe(true);
-      expect(row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-grip-${id}"]`)?.disabled).toBe(true);
+      expect(container.querySelector(`[data-testid="task-chat-queued-message-${id}"]`)).toBeNull();
     }
     expect(props.onDiscard).toHaveBeenCalledTimes(2);
     expect(container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.disabled).toBe(false);
@@ -219,9 +228,11 @@ describe("TaskChatQueuedMessages", () => {
   // SUPERSEDE: "does not offer a reorder across distinct chat wakes".
   // Paul NOTE 6 #20994 / PART B permits ordinary per-message wakes; only
   // an explicit /new boundary keeps the old refusal. The assertion is retained.
-  it("refuses a reorder across /new, not across ordinary per-message wakes", () => {
+  it("supersedes(does not offer a reorder across distinct chat wakes; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — /new is the boundary, not an ordinary wake", () => {
     const entries = [queue.entries[0], { ...queue.entries[1], behindReset: true, queueId: "wake-2", queueRevision: "rev-2" }];
     expect(reorderQueuedMessageEntries(entries, "comment-1", "comment-2")).toBeNull();
+    const ordinary = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" }];
+    expect(reorderQueuedMessageEntries(ordinary, "comment-1", "comment-2")?.map(entry => entry.comment.id)).toEqual(["comment-2", "comment-1"]);
   });
 
   it("saves a within-Stop-side cross-wake drag through HTTP 200 and renders exactly the submitted order", async () => {
@@ -344,7 +355,7 @@ describe("TaskChatQueuedMessages", () => {
     expect(row.querySelector("img")).toBeNull();
   });
 
-  it.each(["legacy", "native", "native-plan"] as const)("shows a read-only response and sends it only on click for %s", async (runtime) => {
+  it.each(["legacy", "native", "native-plan"] as const)("supersedes(shows a read-only response and sends it only on click for %s; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — Interrupt now is a separate action", async (runtime) => {
     const entry = { ...queue.entries[0], canEdit: false, canDiscard: false,
       comment: { ...queue.entries[0].comment, body: 'Accepted: Build the app\n\n{"revision": "v1"}' },
       source: { kind: "interaction" as const, interactionId: "confirmation-1", interactionKind: "request_confirmation",
@@ -447,7 +458,7 @@ describe("TaskChatQueuedMessages", () => {
     });
   });
 
-  it("clears the entire interrupt queue immediately and restores it inline on failure", async () => {
+  it("supersedes(clears the entire interrupt queue immediately and restores it inline on failure; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — only the selected row leaves", async () => {
     let rejectInterrupt!: (error: Error) => void;
     const interrupted = new Promise<void>((_, reject) => { rejectInterrupt = reject; });
     const props = render({ queue: { ...queue, protocol: "legacy", steeringDisposition: "unsupported" },
@@ -456,6 +467,7 @@ describe("TaskChatQueuedMessages", () => {
       container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-interrupt-comment-1"]')!.click();
     });
     // Interrupt now sends this one message first; the rest stay queued.
+    expect(props.onInterrupt).toHaveBeenCalledOnce();
     expect(props.onInterrupt).toHaveBeenCalledWith("comment-1");
     expect(container.querySelector('[data-testid="task-chat-queued-message-comment-1"]')).toBeNull();
     expect(container.querySelector('[data-testid="task-chat-queued-message-comment-2"]')).not.toBeNull();
@@ -505,15 +517,16 @@ describe("TaskChatQueuedMessages", () => {
     );
   });
 
-  it("does not steer when the provider does not advertise it: Steering waits for the turn boundary (D5)", async () => {
+  it("supersedes(disables steering when the provider does not advertise it; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — Steering stays listed and paused", async () => {
     const props = render({ autoSteerDelayMs: 0, queue: { ...queue, steeringDisposition: "unsupported" } });
     await act(async () => { await Promise.resolve(); });
     expect(props.onSteer).not.toHaveBeenCalled();
-    expect(container.querySelector('[data-testid="task-chat-queued-steering-paused"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-queued-steering-paused"]')?.textContent).toBe("Steering paused: will send after this turn");
+    expect(container.querySelectorAll('[data-testid^="task-chat-queued-message-"]')).toHaveLength(2);
   });
 
   it.each(["temporarily_unavailable", "unsupported"] as const)(
-    "offers an explicit interrupt fallback when native steering is %s",
+    "supersedes(offers an explicit interrupt fallback when native steering is %s; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — this message first, the rest wait",
     async (steeringDisposition) => {
       const props = render({
         queue: { ...queue, steeringDisposition },
@@ -526,6 +539,7 @@ describe("TaskChatQueuedMessages", () => {
       expect(interrupt!.disabled).toBe(false);
       expect(interrupt!.textContent).toContain("Interrupt");
       await act(async () => { interrupt!.click(); });
+      expect(props.onInterrupt).toHaveBeenCalledOnce();
       expect(props.onInterrupt).toHaveBeenCalledWith("comment-1");
       expect(props.onSteer).not.toHaveBeenCalled();
       expect(container.querySelector('[data-testid="task-chat-queued-message-comment-1"]')).toBeNull();
@@ -533,11 +547,20 @@ describe("TaskChatQueuedMessages", () => {
     },
   );
 
-  it("keeps same-turn steering when the provider is available, even with an interrupt callback", async () => {
-    const props = render({ autoSteerDelayMs: 0, onInterrupt: vi.fn().mockResolvedValue(undefined) });
-    await act(async () => { await Promise.resolve(); });
-    expect(props.onSteer).toHaveBeenCalledWith("comment-1", "rev-1");
-    expect(props.onInterrupt).not.toHaveBeenCalled();
+  it("supersedes(keeps same-turn steering when the provider is available, even with an interrupt callback; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — Interrupt now coexists with automatic Steering", async () => {
+    vi.useFakeTimers();
+    try {
+      const props = render({ autoSteerDelayMs: 5_000, onInterrupt: vi.fn().mockResolvedValue(undefined) });
+      const interrupt = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-interrupt-comment-1"]');
+      expect(interrupt?.textContent).toBe("Interrupt now");
+      expect(interrupt?.disabled).toBe(false);
+      expect(props.onSteer).not.toHaveBeenCalled();
+      await act(async () => { vi.advanceTimersByTime(5_100); await Promise.resolve(); });
+      expect(props.onSteer).toHaveBeenCalledWith("comment-1", "rev-1");
+      expect(props.onInterrupt).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("waits for authoritative discard acknowledgement before removing the row", async () => {
@@ -613,7 +636,7 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.textContent).not.toContain("Queued message discarded.");
   });
 
-  it("can discard a saved message while queue acknowledgement is pending", async () => {
+  it("supersedes(can discard a saved message while queue acknowledgement is pending; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — visible toggle replaces the explicit Steer action", async () => {
     const merged = mergePendingIssueQueuedComments({
       issueId: queue.issueId,
       authoritativeQueue: queue,
@@ -632,6 +655,8 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.querySelector<HTMLButtonElement>(
       '[data-testid="task-chat-queued-grip-comment-1"]',
     )?.disabled).toBe(true);
+    expect(container.querySelector('[data-testid="task-chat-queued-mode-comment-1"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-queued-steer-comment-1"]')).toBeNull();
     await act(async () => { discard!.click(); });
     expect(props.onDiscard).toHaveBeenCalledWith("comment-1", "rev-1");
     expect(container.querySelector('[data-testid="task-chat-queued-message-comment-1"]')).toBeNull();
@@ -841,7 +866,7 @@ describe("TaskChatQueuedMessages", () => {
     beforeEach(() => { vi.useFakeTimers({ now: new Date("2026-11-07T12:00:00Z") }); });
     afterEach(() => { vi.useRealTimers(); });
 
-    it("shows a countdown with Edit and Cancel, then steers into the live turn", async () => {
+    it("supersedes(shows a countdown with Edit and Cancel, then steers into the live turn; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — countdown names Steering", async () => {
       const props = render({ queue: fresh(), autoSteerDelayMs: delay });
       expect(countdown()?.textContent).toContain("Steers in 5s");
       expect(container.querySelector('[data-testid="task-chat-queued-steer-comment-1"]')).toBeNull();
@@ -853,7 +878,7 @@ describe("TaskChatQueuedMessages", () => {
       expect(props.onSteer).toHaveBeenCalledWith("comment-1", "rev-1");
     });
 
-    it("gives a saved edit a full window while another row's countdown keeps the clock running", async () => {
+    it("supersedes(gives a saved edit a full window while another row's countdown keeps the clock running; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — edit pauses Steering", async () => {
       const start = Date.now();
       const twoRows: IssueQueuedCommentQueue = { ...queue, entries: queue.entries.slice(0, 2).map((entry, index) => {
         const at = new Date(start + index * 4_000);
@@ -877,7 +902,7 @@ describe("TaskChatQueuedMessages", () => {
       expect(props.onSteer).toHaveBeenCalledWith("comment-1", "rev-2");
     });
 
-    it("keeps a cancelled message in the queue with its explicit Steer button", async () => {
+    it("supersedes(keeps a cancelled message in the queue with its explicit Steer button; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — row retains the Queue/Steer toggle", async () => {
       const props = render({ queue: fresh(), autoSteerDelayMs: delay });
       await act(async () => {
         container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-auto-steer-cancel-comment-1"]')?.click();
@@ -889,7 +914,7 @@ describe("TaskChatQueuedMessages", () => {
       expect(container.querySelector('[data-testid="task-chat-queued-mode-comment-1"]')).not.toBeNull();
     });
 
-    it("waits while the message is being edited and restarts from the saved revision", async () => {
+    it("supersedes(waits while the message is being edited and restarts from the saved revision; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — saved revision resumes Steering", async () => {
       const queued = fresh();
       const props = render({ queue: queued, autoSteerDelayMs: delay });
       await act(async () => {
