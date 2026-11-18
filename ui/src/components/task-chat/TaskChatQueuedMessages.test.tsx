@@ -119,6 +119,34 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.textContent).toContain("Second queued message");
   });
 
+  it("renders every later-wake message but disables its row controls with a reason", () => {
+    const entries = [queue.entries[0],
+      { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" },
+      { ...queue.entries[1], comment: { ...queue.entries[1].comment, id: "comment-3", body: "Third queued message" },
+        queueId: "wake-3", queueRevision: "rev-3", position: 2 }];
+    const props = render({ queue: { ...queue, steeringDisposition: "unsupported", entries },
+      onInterrupt: vi.fn().mockResolvedValue(undefined) });
+    expect(container.querySelectorAll('[data-testid^="task-chat-queued-message-"]')).toHaveLength(3);
+    expect(container.textContent).toContain("Third queued message");
+    for (const id of ["comment-2", "comment-3"]) {
+      const row = container.querySelector(`[data-testid="task-chat-queued-message-${id}"]`)!;
+      expect(row.textContent).toContain("Edit and delete are available when this message reaches the front.");
+      const discard = row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-discard-${id}"]`)!;
+      expect(discard.disabled).toBe(true);
+      flushSync(() => discard.click());
+      expect(row.querySelector<HTMLButtonElement>('[title="Queued message actions"]')?.disabled).toBe(true);
+      expect(row.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-interrupt-${id}"]`)?.disabled).toBe(true);
+    }
+    expect(props.onDiscard).not.toHaveBeenCalled();
+    expect(container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.disabled).toBe(false);
+    expect([...container.querySelectorAll<HTMLButtonElement>('[aria-label^="Reorder queued message:"]')].every(button => button.disabled)).toBe(true);
+  });
+
+  it("does not offer a reorder across distinct chat wakes", () => {
+    const entries = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" }];
+    expect(reorderQueuedMessageEntries(entries, "comment-1", "comment-2")).toBeNull();
+  });
+
   it("renders queued Markdown and screenshot thumbnails without showing image syntax", () => {
     const body = "Check **mobile** and *desktop* with `pnpm verify`.\n\n![mobile.png](/api/attachments/mobile/content)\n![desktop.png](/api/attachments/desktop/content)";
     render({ queue: { ...queue, entries: [{ ...queue.entries[0], comment: { ...queue.entries[0].comment, body } }] } });

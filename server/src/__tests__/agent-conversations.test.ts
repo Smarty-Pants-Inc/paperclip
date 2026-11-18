@@ -806,10 +806,14 @@ import {
       };
       const queuePath = `/api/issues/${issue.id}/queued-comments`;
       const send = async (body: string) => {
+        if (chatMode) {
+          const response = await request(routes(null)).post(`/api/issues/${issue.id}/comments`)
+            .send({ body, clientRequestId: randomUUID() }).expect(201);
+          return response.body;
+        }
         const comment = await issueService(db).addComment(issue.id, body, { userId: "local-board" },
           { clientRequestId: randomUUID() });
-        if (chatMode) await deliverConversationComments(db, issue, heartbeat.wakeup);
-        else await heartbeat.wakeup(runtimeAgent, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+        await heartbeat.wakeup(runtimeAgent, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
           requestedByActorType: "user", requestedByActorId: "local-board",
           payload: { issueId: issue.id, commentId: comment.id },
           contextSnapshot: { issueId: issue.id, taskKey: issue.id, commentId: comment.id, wakeCommentId: comment.id,
@@ -845,6 +849,16 @@ import {
         // All three are saved behind the running turn, none dispatched yet.
         expect(await heldIds()).toEqual(queuedIds);
         expect(turns).toHaveLength(1);
+        if (chatMode) {
+          // FALLBACK 2 gives each posted message its own wake. The read must
+          // show the whole waiting list even BEFORE Stop gathers those wakes.
+          const busyQueue = (await request(routes(null)).get(queuePath).expect(200)).body;
+          expect(busyQueue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
+          expect(busyQueue.entries.map((entry: { comment: { body: string } }) => entry.comment.body)).toEqual(["A", "B", "C"]);
+          expect(busyQueue.entries.slice(1).every((entry: { queueId?: string; queueRevision?: string }) =>
+            entry.queueId && entry.queueId !== busyQueue.queueId && entry.queueRevision)).toBe(true);
+          expect(new Set([busyQueue.queueId, ...busyQueue.entries.slice(1).map((entry: { queueId: string }) => entry.queueId)]).size).toBe(3);
+        }
 
         // Gate 5 runs a conversation runtime. A legacy conversation adapter
         // records this policy on its run; the bare process adapter used here
@@ -876,6 +890,7 @@ import {
         };
         let queue = await readQueue();
         expect(queue.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(queuedIds);
+        expect(queue.entries.every((entry: { queueId?: string }) => !entry.queueId || entry.queueId === queue.queueId)).toBe(true);
         expect(queue.executionWait).toEqual({ reason: "stopped_by_person",
           message: "Stopped. These messages are waiting: Send them, or delete any first." });
         const reloaded = await readQueue();

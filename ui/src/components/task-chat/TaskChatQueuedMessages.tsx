@@ -54,7 +54,8 @@ export function reorderQueuedMessageEntries(
   activeId: string,
   overId: string,
 ) {
-  if (entries.some((entry) => entry.source?.kind === "interaction")) return null;
+  if (entries.some((entry) => entry.source?.kind === "interaction") ||
+      new Set(entries.map((entry) => entry.queueId)).size > 1) return null;
   const from = entries.findIndex((entry) => entry.comment.id === activeId);
   const to = entries.findIndex((entry) => entry.comment.id === overId);
   if (from < 0 || to < 0 || from === to) return null;
@@ -111,6 +112,7 @@ function SortableQueuedMessage({
   queue,
   busy,
   queueMutationDisabled,
+  reorderDisabled,
   action,
   autoSteerSecondsLeft,
   onEdit,
@@ -124,6 +126,7 @@ function SortableQueuedMessage({
   queue: IssueQueuedCommentQueue;
   busy: boolean;
   queueMutationDisabled: boolean;
+  reorderDisabled: boolean;
   action: QueueAction;
   /** Seconds until this message is steered automatically, or null when it waits in the queue. */
   autoSteerSecondsLeft: number | null;
@@ -136,13 +139,16 @@ function SortableQueuedMessage({
   sendOnLine?: boolean;
 }) {
   const immutableResponse = entry.source?.kind === "interaction";
+  // This UI still mutates the head wake. Later wakes remain visible, but must
+  // never send their edits/deletes with the head's queue identity or revision.
+  const laterWake = Boolean(entry.queueId && entry.queueId !== queue.queueId);
   const body = queuedMessageLabel(entry);
   const images = extractImageRefs(body).filter(image =>
     /^\/api\/(?:attachments|assets)\/[^/?#\\]+\/content(?:\?[^#\\]*)?$/.test(image.url));
   const label = stripStandaloneImageEmbeds(body);
   const sortable = useSortable({
     id: entry.comment.id,
-    disabled: queueMutationDisabled || immutableResponse,
+    disabled: queueMutationDisabled || reorderDisabled || immutableResponse,
   });
   const style = {
     transform: CSS.Transform.toString(sortable.transform),
@@ -173,7 +179,8 @@ function SortableQueuedMessage({
         ref={sortable.setActivatorNodeRef}
         {...sortable.attributes}
         {...sortable.listeners}
-        disabled={queueMutationDisabled || immutableResponse}
+        disabled={queueMutationDisabled || reorderDisabled || immutableResponse}
+        title={reorderDisabled ? "Messages in separate turns cannot be reordered together" : undefined}
         aria-label={`Reorder queued message: ${label || "Images"}`}
         className="flex h-7 w-7 shrink-0 cursor-grab items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:bg-accent hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40"
       >
@@ -199,6 +206,10 @@ function SortableQueuedMessage({
         </div> : null}
       </div>
 
+      {laterWake ? <span className="text-xs text-muted-foreground">
+        Edit and delete are available when this message reaches the front.
+      </span> : null}
+
       {sendOnLine ? null : autoSteerSecondsLeft !== null ? (
         <span className="flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
           <span className="px-1 text-xs text-muted-foreground tabular-nums">
@@ -207,7 +218,7 @@ function SortableQueuedMessage({
           <button
             type="button"
             onClick={onEdit}
-            disabled={!entry.canEdit}
+            disabled={laterWake || !entry.canEdit}
             title="Edit before it is sent"
             className="flex h-7 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
             data-testid={`task-chat-queued-auto-steer-edit-${entry.comment.id}`}
@@ -230,7 +241,7 @@ function SortableQueuedMessage({
           type="button"
           onClick={onInterrupt}
           aria-label={!queue.targetRunId ? "Send queued messages" : undefined}
-          disabled={busy || !queue.queueId || !onInterrupt}
+          disabled={laterWake || busy || !queue.queueId || !onInterrupt}
           title={queue.targetRunId ? "Interrupt the active turn and send queued messages" : "Send queued messages now"}
           className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
           data-testid={`task-chat-queued-interrupt-${entry.comment.id}`}
@@ -263,7 +274,7 @@ function SortableQueuedMessage({
       <button
         type="button"
         onClick={onDiscard}
-        disabled={busy || !entry.canDiscard}
+        disabled={laterWake || busy || !entry.canDiscard}
         title="Discard queued message"
         aria-label={`Discard queued message: ${label}`}
         className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
@@ -359,6 +370,7 @@ export function TaskChatQueuedMessages({
     () => entries.map((entry) => entry.comment.id),
     [entries],
   );
+  const hasLaterWakes = entries.some((entry) => entry.queueId && entry.queueId !== queue.queueId);
 
   // Send decisions read the current queue snapshot, not the local copy that a
   // sync effect updates one render later: a saved edit must get its new
@@ -420,7 +432,8 @@ export function TaskChatQueuedMessages({
       !over ||
       active.id === over.id ||
       reordering ||
-      pending
+      pending ||
+      hasLaterWakes
     )
       return;
     const previous = entries;
@@ -461,6 +474,7 @@ export function TaskChatQueuedMessages({
     if (
       pending ||
       reordering ||
+      entries.some((entry) => entry.comment.id === commentId && entry.queueId && entry.queueId !== queue.queueId) ||
       (!queue.queueId && action !== "interrupt" && action !== "discard")
     ) {
       return;
@@ -572,7 +586,7 @@ export function TaskChatQueuedMessages({
               pending?.commentId === entry.comment.id ? pending.action : null;
             const busy = Boolean(pending || reordering);
             const queueMutationDisabled = Boolean(
-              !queue.queueId || pending || reordering,
+              !queue.queueId || pending || reordering || (entry.queueId && entry.queueId !== queue.queueId),
             );
             return (
               <SortableQueuedMessage
@@ -581,6 +595,7 @@ export function TaskChatQueuedMessages({
                 queue={queue}
                 busy={busy}
                 queueMutationDisabled={queueMutationDisabled}
+                reorderDisabled={hasLaterWakes}
                 action={action}
                 autoSteerSecondsLeft={(() => {
                   const deadline = autoSteerDeadlines.get(entry.comment.id);
