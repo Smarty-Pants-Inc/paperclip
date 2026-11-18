@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { agents, companies, completionContracts, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
 import { settleConversationTurnForRun } from "../agent-conversations.js";
 import { PaperclipControlPlanePort } from "../native-runtime/paperclip-control-plane-port.js";
 import { recoveryService } from "./service.js";
+import { answeredPersonMessageSql } from "../person-message-answer.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition, unansweredPersonMessageCondition } from "./unanswered-person-message.js";
 
 // Keep reason: recorded N1/SMAA-501/25-SILENT-BLOCK and a safety guard that can
@@ -49,7 +50,17 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     });
     const sweep = (worker = false) => heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId,
       skipRelatedRecovery: true, skipExternalConversationSettlement: true, ...(worker ? { unanswered: true } : {}) });
-    return { companyId, agentId, issueId, userId, base, message, run, reply, notices, flags, sweep };
+    /** Per message, in the order given: how many times the ONE function counts it answered (1 or 0), by the product's SQL. */
+    const answerCounts = async (...ids: string[]) => {
+      const rows = await db.select({ id: issueComments.id, answered: answeredPersonMessageSql({ id: sql`${issueComments.id}`,
+        companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) })
+        .from(issueComments).where(inArray(issueComments.id, ids));
+      expect(rows, "every message row exists (a deleted row cannot pass)").toHaveLength(ids.length);
+      return ids.map(id => rows.find(row => row.id === id)!.answered ? 1 : 0);
+    };
+    const agentReplies = async () => (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, issueId),
+      eq(issueComments.authorType, "agent")))).length;
+    return { companyId, agentId, issueId, userId, base, message, run, reply, notices, flags, sweep, answerCounts, agentReplies };
   }
 
   // The sweep owes every unanswered message (joint rule): with 3 messages, the two the first run's reply does not
@@ -78,9 +89,17 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
   function carry(key: typeof keys[number], id: string) {
     return key === "wakeCommentIds" ? { [key]: [id] } : key === "firstTurnQueuedInput" ? { [key]: { commentIds: [id] } } : { [key]: id };
   }
-  for (const key of keys) it(`attribution by ${key} answers the carried later message, not semantic analysis of prose`, async () => {
+  // RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118, rows 2-6, ruling row (b): a reply counts for message M only if its run's
+  // OWN input names M; a reply to a LATER message never answers M.
+  // OLD: the task is not flagged (discovered/batched false) and has no notice: the earlier message read as answered
+  //   by the later message's reply.
+  // NEW: exact answer counts [earlier, later] = [0, 1] from ONE agent reply; the earlier message is owed and gets its
+  //   ONE notice; the later (answered) message gets none.
+  // Control (still ANSWERED): the same run and reply with the earlier message in the run's own input too -> [1, 1],
+  //   and the earlier message's notice is retired.
+  for (const key of keys) it(`supersedes(attribution by ${key} answers the carried later message, not semantic analysis of prose; RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118)`, async () => {
     const f = await fixture();
-    await f.message("Production version?", f.base);
+    const first = await f.message("Production version?", f.base);
     const second = await f.message("Staging version?", f.base + 10_000);
     const run = await f.run(second, f.base + 11_000, carry(key, second));
     // Deliberately answers only the first question. Native finalization judges
@@ -89,12 +108,34 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     await settleConversationTurnForRun(db, f.companyId, run);
     const [native] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     expect(native).toMatchObject({ status: "in_review", conversationState: "waiting" });
+    // The carried (latest) message is answered once; the earlier one, which the run's own input does not name, is owed.
+    expect(await f.agentReplies()).toBe(1);
+    expect(await f.answerCounts(first, second)).toEqual([0, 1]);
+    expect(await f.flags()).toEqual({ discovered: true, batched: true });
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "no_run" });
+    await f.sweep();
+    expect((await f.notices()).map(n => n.metadata?.authorizationReason), "ONE notice, the earlier message's; none for the answered one")
+      .toEqual([`unanswered_message:${first}`]);
     expect(await f.flags()).toEqual({ discovered: false, batched: false });
+    // Control: the same run and reply, with the earlier message in the run's own input too, answers both.
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented",
+      conversationSessionGeneration: 0, ...carry(key, second), ...(key === "wakeCommentIds" ? { wakeCommentIds: [first, second] }
+        : { wakeCommentIds: [first] }) } }).where(eq(heartbeatRuns.id, run));
+    expect(await f.answerCounts(first, second)).toEqual([1, 1]);
+    expect(await f.flags()).toEqual({ discovered: true, batched: true }); // the earlier message's notice needs retiring
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
-    await f.sweep(); expect(await f.notices()).toHaveLength(0);
+    expect(await f.notices()).toHaveLength(0);
+    expect(await f.flags()).toEqual({ discovered: false, batched: false });
   });
 
-  it("supersession across a soft-deleted later carrying boundary uses the same predicate everywhere", async () => {
+  // RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118, row 7, ruling row (b).
+  // OLD: a reply whose run named only the later (then soft-deleted) message retired the FIRST message's notice
+  //   (flags true/true "notice needs retiring", settle answered, 0 notices).
+  // NEW: that reply never answers the first message: answer count [first] = 0 with ONE agent reply on the task, the
+  //   first message's ONE notice stays, nothing is flagged.
+  // Control (still ANSWERED): a reply from a succeeded run whose own input names the first message -> count 1, and
+  //   the notice is retired, by the same predicate in discovery, the worker flag and the settle.
+  it("supersedes(supersession across a soft-deleted later carrying boundary uses the same predicate everywhere; RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118)", async () => {
     const f = await fixture();
     const first = await f.message("Production version?", f.base);
     await f.sweep(); const [notice] = await f.notices(); expect(notice?.metadata?.authorizationReason).toBe(`unanswered_message:${first}`);
@@ -102,6 +143,15 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     const run = await f.run(second, f.base + 11_000, { conversationReplyBoundaryCommentId: second });
     await f.reply(run, f.base + 40_000);
     await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, second));
+    expect(await f.agentReplies()).toBe(1);
+    expect(await f.answerCounts(first)).toEqual([0]);
+    expect(await f.flags()).toEqual({ discovered: false, batched: false }); // the first message is still owed and has its notice
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
+    expect((await f.notices()).map(n => n.metadata?.authorizationReason)).toEqual([`unanswered_message:${first}`]);
+    // A reply from a succeeded run whose own input names the first message retires it.
+    const own = await f.run(first, f.base + 50_000);
+    await f.reply(own, f.base + 80_000);
+    expect(await f.answerCounts(first)).toEqual([1]);
     expect(await f.flags()).toEqual({ discovered: true, batched: true }); // notice needs retiring
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     expect(await f.notices()).toHaveLength(0);
