@@ -983,3 +983,73 @@ describe("redaction of long letter/digit runs", () => {
     }
   });
 });
+
+// catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21230
+// Keep reason: credential non-disclosure and preservation of ordinary terminal output.
+describe("ANSI-stripped credential view", () => {
+  const colour = "\u001b[31m";
+  const reset = "\u001b[0m";
+  const shapes = [
+    ["sk-proj-", "sk-proj-", "rf2SyntheticOnly0123456789ABCDEF"],
+    ["sk-ant-", "sk-ant-", "rf2SyntheticOnly0123456789ABCDEF"],
+    ["ghp_", "ghp_", "rf2SyntheticOnly0123456789ABCDEF"],
+    ["github_pat_", "github_pat_", "rf2SyntheticOnly0123456789ABCDEF"],
+    ["AKIA", "AKIA", "RF2SYNTH01234567"],
+    ["JWT", "eyJ", "hbGciOiJIUzI1NiJ9.eyJzdWIiOiJyZjJzeW50aGV0aWMifQ.c3ludGhldGljU2lnbmF0dXJl"],
+    ["Bearer", "Bearer ", "rf2SyntheticOnly0123456789ABCDEF"],
+  ] as const;
+
+  function masked(prefix: string) {
+    return prefix === "Bearer " ? `Bearer ${REDACTED_EVENT_VALUE}` : REDACTED_EVENT_VALUE;
+  }
+
+  it.each(shapes)("(a) masks %s with a colour immediately after its prefix", (_shape, prefix, body) => {
+    expect(redactSensitiveText(`${prefix}${colour}${body}${reset}`))
+      .toBe(`${prefix === "Bearer " ? `Bearer ${colour}${REDACTED_EVENT_VALUE}` : REDACTED_EVENT_VALUE}${reset}`);
+  });
+
+  it("(a) masks a realistic grep --color pty line, including erase-line CSI", () => {
+    expect(redactSensitiveText("\u001b[01;31m\u001b[Ksk-proj-\u001b[m\u001b[Krf2SyntheticOnly0123456789ABCDEF"))
+      .toBe(`\u001b[01;31m\u001b[K${REDACTED_EVENT_VALUE}`);
+  });
+
+  const ordinary = [
+    "completed work successfully", "request id rf2-run-218 finished", "/srv/workspaces/rf2/src/main.ts",
+    `sha256:${"0123456789abcdef".repeat(4)}`, "612a1fce4e6bc5e4693461070b20eb24c56e55b5",
+    "123e4567-e89b-42d3-a456-426614174000", "bearer of good news",
+    "standard bearer marks every room", "Authorization policy passed", "aws_region=us-east-1",
+  ].flatMap(text => [
+    `${colour}${text}${reset}`, `INFO ${colour}${text}${reset} done`,
+    `${text.slice(0, 3)}${colour}${text.slice(3)}${reset}`,
+  ]);
+  it.each(ordinary)("(b) keeps ordinary coloured output byte-equal: %j", input => {
+    expect(redactSensitiveText(input)).toBe(input);
+  });
+
+  it.each(shapes)("(c) masks %s with codes before and after the token", (_shape, prefix, body) => {
+    expect(redactSensitiveText(`${colour}${prefix}${body}${reset}`))
+      .toBe(`${colour}${masked(prefix)}${reset}`);
+    expect(redactSensitiveText(`${prefix}${body}${colour}${reset}`))
+      .toBe(`${masked(prefix)}${colour}${reset}`);
+  });
+
+  it.each(shapes)("(d/e) masks all of %s with codes between body characters, without an ESC fragment", (_shape, prefix, body) => {
+    const result = redactSensitiveText(`${colour}${prefix}${body.slice(0, 3)}\u001b[01;31m\u001b[K${body.slice(3)}${reset}`);
+    expect(result).toBe(`${colour}${masked(prefix)}${reset}`);
+    expect(result.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")).toBe(masked(prefix));
+  });
+
+  const corpus = JSON.parse(readFileSync(
+    new URL("./fixtures/redact-store-corpus.json", import.meta.url), "utf8",
+  )) as Array<{ input: string; expected: string }>;
+  const sweep = [
+    ...corpus.filter(row => row.input === row.expected).map(row => `${colour}${row.input}${reset}`),
+    `the ${colour}bearer of${reset} good news`,
+    `Use ${colour}bearer authentication${reset} here`,
+    `a ${colour}bearer bond${reset} matured`,
+    `${colour}bearer A${reset}`, `${colour}bearer word.${reset}`, `${colour}bearer Well-known${reset}`,
+  ];
+  it.each(sweep)("(f) preserves accepted ANSI prose and every reset: %j", input => {
+    expect(redactSensitiveText(input)).toBe(input);
+  });
+});
