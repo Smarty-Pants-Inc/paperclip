@@ -19,7 +19,9 @@ describe("native retry phase alone does not own a retained task Stop", () => {
   beforeEach(async () => { await db.execute(sql`truncate companies cascade`); });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); });
 
-  async function fixture(status: string, processPid: number | null = null) {
+  // C1: a Stop-pending card needs a recorded person Stop (the board Stop button's record).
+  const PERSON_STOP = { cancelledByActorType: "user", cancelledByUserId: "board-user" };
+  async function fixture(status: string, processPid: number | null = null, resultJson: Record<string, unknown> | null = null) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const old = new Date(Date.now() - 30 * 86_400_000);
     await db.insert(companies).values({ id: companyId, name: "Native retry ownership", issuePrefix: `N${companyId.slice(0, 7)}` });
@@ -27,7 +29,7 @@ describe("native retry phase alone does not own a retained task Stop", () => {
       status: "active", lifecycleState: "ready", lifecycleHolds: [], lifecycleRequiredPluginIds: [] });
     await db.insert(issues).values({ id: issueId, companyId, title: "Native Stop obligation", status: "in_progress" });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status, runtimeMode: "native", nativeIssueId: issueId,
-      invocationSource: "manual", executionStage: "dispatching", startedAt: old, finishedAt: status === "running" ? null : old, processPid });
+      invocationSource: "manual", executionStage: "dispatching", startedAt: old, finishedAt: status === "running" ? null : old, processPid, resultJson });
     await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId, executionLockedAt: old }).where(eq(issues.id, issueId));
     await db.insert(nativeRunFinalizations).values({ companyId, runId, issueId, phase: "retryable_failure",
       resultId: null, leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: null });
@@ -35,8 +37,8 @@ describe("native retry phase alone does not own a retained task Stop", () => {
   }
   async function task(issueId: string) { return (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!; }
 
-  it.each(["cancelled", "succeeded", "timed_out", "interrupted"])("escalates a failed Stop inspection for a non-resumable %s run, once", async status => {
-    const f = await fixture(status, status === "cancelled" ? null : process.pid);
+  it.each(["cancelled", "succeeded", "timed_out", "interrupted"])("supersedes(C1 no-Stop card): escalates a failed Stop inspection for a non-resumable %s run, once", async status => {
+    const f = await fixture(status, status === "cancelled" ? null : process.pid, PERSON_STOP);
     const before = await task(f.issueId);
     const coordinator = (await db.select().from(nativeRunFinalizations))[0];
     const enqueueWakeup = vi.fn();
@@ -64,8 +66,8 @@ describe("native retry phase alone does not own a retained task Stop", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("resolves the diagnostic only after positive Stop proof, retaining the native coordinator as history", async () => {
-    const f = await fixture("cancelled");
+  it("supersedes(C1 no-Stop card): resolves the diagnostic only after positive Stop proof, retaining the native coordinator as history", async () => {
+    const f = await fixture("cancelled", null, PERSON_STOP);
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
     expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
     await db.update(heartbeatRuns).set({ processPid: 2_000_000_000 }).where(eq(heartbeatRuns.id, f.runId));

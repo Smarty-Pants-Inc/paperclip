@@ -27,7 +27,8 @@ describe("ordinary recovery writers cannot replace an unproved task Stop", () =>
       status: "active", lifecycleState: "ready", lifecycleHolds: [], lifecycleRequiredPluginIds: [] });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "cancelled", invocationSource: "manual",
       runtimeMode: "legacy", executionStage: "dispatching", startedAt: new Date(0), finishedAt: new Date(0),
-      runnerProfileJson: { adapterDispatch: { adapterType: "http" } }, resultJson: {} });
+      // C1: a Stop-pending card needs a recorded person Stop (the board Stop button's record).
+      runnerProfileJson: { adapterDispatch: { adapterType: "http" } }, resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-user" } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Retained execution", status: "in_progress",
       checkoutRunId: runId, executionRunId: runId });
     if (stronger) await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
@@ -50,7 +51,7 @@ describe("ordinary recovery writers cannot replace an unproved task Stop", () =>
       nextAction: "Inspect the new failure.", attemptCount: 1, maxAttempts: 8, wakePolicy: { kind: "resume_native_run", runId: f.runId } };
   }
 
-  it.each([false, true])("preserves the exact held action, owner and budget across every upsert mode (stronger=%s)", async stronger => {
+  it.each([false, true])("supersedes(C1 no-Stop card): preserves the exact held action, owner and budget across every upsert mode (stronger=%s)", async stronger => {
     const f = await fixture(stronger);
     const before = await hold(f.companyId, f.issueId);
     for (const mode of [ {}, { supersedeOnIdentityChange: true }, { preserveExistingOwner: true }, { createOnly: true },
@@ -69,7 +70,7 @@ describe("ordinary recovery writers cannot replace an unproved task Stop", () =>
     expect(released.maxAttempts).toBe(8);
   });
 
-  it.each(["update", "exhaust", "supersede", "exhausted-copyback"] as const)("fences a %s writer that read before the Stop annotation committed", async mode => {
+  it.each(["update", "exhaust", "supersede", "exhausted-copyback"] as const)("supersedes(C1 no-Stop card): fences a %s writer that read before the Stop annotation committed", async mode => {
     const f = await fixture(true);
     if (mode === "exhausted-copyback") {
       const row = await active(f.issueId);
