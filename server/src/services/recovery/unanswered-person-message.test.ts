@@ -3086,11 +3086,27 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         expect((await systemNotesOf(g)).map(note => note.id)).toEqual(ten.map(note => note.id));
         expect((await waitsOf(g)).map(wait => wait.id)).toEqual(firstWaits.map(wait => wait.id));
       });
-      it(`${"supersedes(RFL 00:10Z (b), run-end bound is held-only): "}${shape}: a delayed FIRST sweep at END+11 min -> no failure notice yet; it starts the base T0 wait`, async () => {
+      it(`${"supersedes(RFL 00:10Z (b), run-end bound is held-only): "}${shape}: a delayed FIRST sweep at END+11 min -> no failure notice yet; ONE true notice at T0+10 on the same comment, never a second note or wait`, async () => {
         const g = await endShape(shape, END + 11 * 60_000);
         expect(await at(g, END + 11 * 60_000)).toMatchObject({ kind: "pending" });
         expect(await systemNotesOf(g)).toHaveLength(0);
-        expect(await waitsOf(g)).toHaveLength(1);
+        const firstWaits = await waitsOf(g);
+        expect(firstWaits).toHaveLength(1);
+        const t0 = firstWaits[0]!.createdAt.getTime() - g.base; // the durable first-sweep T0 (database clock)
+        expect((await at(g, t0 + 9 * 60_000)).kind).toBe("noticed");
+        const waiting = await systemNotesOf(g);
+        expect(waiting.map(note => note.body)).toEqual([recoveringText()]);
+        expect(codeOf(waiting[0]!)).toBeUndefined();
+        expect(await at(g, t0 + 10 * 60_000)).toMatchObject({ kind: "noticed", code: "native_session_supervisor_busy" });
+        const ten = await systemNotesOf(g);
+        expect(ten.map(note => ({ id: note.id, body: note.body, code: codeOf(note) })))
+          .toEqual([{ id: waiting[0]!.id, body: NOT_ANSWERED, code: "native_session_supervisor_busy" }]);
+        expect((await g.visible()).map(note => note.id)).toEqual([waiting[0]!.id]);
+        expect((await at(g, t0 + 11 * 60_000)).kind).toBe("noticed_before");
+        expect((await systemNotesOf(g)).map(note => ({ id: note.id, body: note.body })))
+          .toEqual([{ id: waiting[0]!.id, body: NOT_ANSWERED }]);
+        expect((await waitsOf(g)).map(wait => ({ id: wait.id, createdAt: wait.createdAt })))
+          .toEqual(firstWaits.map(wait => ({ id: wait.id, createdAt: wait.createdAt })));
       });
     }
 
