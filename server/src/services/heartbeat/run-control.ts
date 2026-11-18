@@ -1434,6 +1434,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const attribution = {
       cancelledByActorType: options.resultJson?.cancelledByActorType,
       cancelledByUserId: options.resultJson?.cancelledByUserId,
+      // Durable before any terminal CAS, so a recovery that wins terminalization
+      // cannot make an operator Interrupt look like a person Stop.
+      ...(options.resultJson?.operatorInterrupted === true ? { operatorInterruptRequested: true } : {}),
     };
     const handoffIssueId = run.nativeIssueId ?? run.issueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
     const supersedesCaseHandoff = options.resultJson?.cancelledByActorType === "user" || options.errorCode === "issue_reassigned";

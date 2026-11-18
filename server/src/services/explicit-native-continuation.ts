@@ -350,6 +350,9 @@ export async function admitExplicitNativeContinuation(input: {
     const ownerSendAfterPersonStop = !blocker && !sourceChecks.length && task.conversationAgentId === agentId
       && interruptIntent?.actorId === task.conversationUserId && !!latest && isAcknowledgedNativeStop(latest)
       && latest.resultJson?.operatorInterrupted !== true && !latest.resultJson?.queuedCommentInterruptQueueId
+      // The Interrupt's own late markers can lose terminalization to native recovery;
+      // its cancel acceptance records this first (run-control attribution).
+      && latest.resultJson?.operatorInterruptRequested !== true
       && !!latest.finishedAt && latest.finishedAt <= interruptRequestedAt!
       // Only when nothing else is active or queued on this chat (the same source as
       // run-control resumeSavedComments); otherwise the Send takes the ordinary path.
