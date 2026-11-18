@@ -242,7 +242,7 @@ export function agentFileStore(db: Db) {
   db = fileStorageDb(db);
   async function locked<T>(companyId: string, agentId: string, actor: AuthorizationActor, write: boolean,
     fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor, onRollback: (restore: () => Promise<void>) => void) => Promise<T>, texts: string[] = [],
-    prepared?: PreparedAgentFileObjects) {
+    prepared?: PreparedAgentFileObjects, signal?: AbortSignal) {
     return withAgentFilesRestoredBeforeLock(() => db.transaction(async tx => {
       if (write) await assertAgentInteraction(tx, { companyId, actorAgentId: actor.type === "agent" ? actor.agentId : null,
         operation: "configure", targetAgentId: agentId, lockAgentIds: texts.flatMap(extractAgentMentionIds), lock: "update" });
@@ -255,6 +255,10 @@ export function agentFileStore(db: Db) {
       try {
         const result = await fn(tx, agent, root, bound, callback => { restore = callback; });
         if (write) await persistDurableAgentFiles(tx, agent, root, false, prepared);
+        // The canonical commit boundary: a caller's cancellation raised before
+        // this point rolls the whole write back (the projection was
+        // invalidated above, so it is restored before the next lock).
+        signal?.throwIfAborted();
         return result;
       } catch (error) {
         await restore?.();
@@ -393,7 +397,12 @@ export function agentFileStore(db: Db) {
         await audit(tx, agent, bound, { path: relative, contentHash: incomingHash, created: previous === null && input.bytes !== null, ...(input.bytes ? { byteLength: input.bytes.length } : {}) });
         return { contentHash: incomingHash, changed: true };
       }, input.bytes && input.bytes.length <= MAX_INSTRUCTION_BYTES ? [input.bytes.toString("utf8")] : []),
-    apply: async (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor) => {
+    /** `signal`: once aborted, the save stops before its next step and, at the
+     * latest, before the canonical commit (the write is rolled back). */
+    apply: async (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor,
+      options: { signal?: AbortSignal } = {}) => {
+      const { signal } = options;
+      signal?.throwIfAborted();
       const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : await snapshotAgentFiles(input.sourceDir);
       const [target] = await db.select().from(agents).where(and(eq(agents.companyId, input.companyId), eq(agents.id, input.agentId)));
       if (!target) throw notFound("Agent not found");
@@ -415,7 +424,9 @@ export function agentFileStore(db: Db) {
       const prepared = input.checkpoint ? await uploadAgentFilesBeforeCommit(db, target, input.sourceDir, input.checkpoint.entries
         .filter(([name, entry]) => entry.kind === "file" && JSON.stringify(incoming.entries.get(name)) !== JSON.stringify(input.baseline.entries.get(name)))
         .map(([name, entry]) => ({ path: name, size: entry.size!, sha256: entry.hash! }))) : undefined;
+      signal?.throwIfAborted();
       return locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
+        signal?.throwIfAborted();
         if (deriveBundleState(agent).entryFile !== requestedEntry) throw conflict("Agent instructions entry changed; retry the file synchronization");
         const entryPath = deriveBundleState(agent).entryFile;
         if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
@@ -529,7 +540,7 @@ export function agentFileStore(db: Db) {
           ...(entry ? { path: entryPath, contentHash: fileHash(entry), byteLength: entry.length } : {}),
           ...(conflicts.length ? { conflicts } : {}) });
         return { storageWarning: storageWarning(total, finalEntries.size, fullFile), conflicts };
-      }, [...changedMentions.values()].map(value => value.text), prepared);
+      }, [...changedMentions.values()].map(value => value.text), prepared, signal);
     },
   };
 }
