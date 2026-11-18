@@ -719,7 +719,7 @@ describe("Codex ACPX runtime adapter", () => {
       guard("outbound", { id: 1, method: "session/set_config_option", params: { sessionId: "backend-1", configId: input.key, value: input.value } });
       guard("inbound", { id: 1, result: { configOptions: [{ id: "thought_level", currentValue: native }] } });
     });
-    const port = await openCodexAcpxRuntime(options, {
+    const port = await openQualifiedAcpxRuntime(options, {
       createRegistry: () => registry(), createStore: () => store(),
       createRuntime: value => { created = value; return runtime; },
     });
