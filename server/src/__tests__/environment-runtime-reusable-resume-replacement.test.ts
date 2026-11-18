@@ -211,6 +211,35 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     });
   });
 
+  // RFL SUPERSEDE-REUSABLE-RESUME-PREVLEASE-1118: configuration rollover
+  // has its own producer branch, distinct from a failed resume's replacement.
+  it("records the rolled-over provider lease exactly after a compatible environment change", async () => {
+    const seeded = await seed();
+    const normalizedSessionId = randomUUID();
+    // Backup verification is this file's existing boundary; the real rollover
+    // admission still parses its stamp and checks for later provider work.
+    await environmentService(db).updateLeaseMetadata(seeded.lease.id, { ...seeded.lease.metadata,
+      nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2",
+        normalizedSessionId, runnerInstanceId: "rollover-runner", sessionScopeSha256: "a".repeat(64),
+        sourceProviderLeaseId: seeded.lease.providerLeaseId, authorizedProviderLeaseId: seeded.lease.providerLeaseId,
+        manifestSha256: `sha256:${"b".repeat(64)}`, completedAt: new Date().toISOString() } });
+    await db.update(heartbeatRuns).set({ nativeSessionId: normalizedSessionId })
+      .where(eq(heartbeatRuns.id, seeded.lease.heartbeatRunId!));
+    // Timing is compatible with the admitted source, but changes the exact
+    // fingerprint. A terminal owner and clean committed workspace permit drain.
+    seeded.environment = { ...seeded.environment, config: { ...seeded.environment.config, timeoutMs: 120_000 } };
+    await environmentService(db).update(seeded.environment.id, { config: seeded.environment.config });
+    const { runtime } = worker(seeded, async () => { throw new Error("A compatible rollover must not resume the old sandbox"); });
+
+    const acquired = await acquire(seeded, runtime);
+
+    expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement",
+      reason: "compatible_environment_change", previousProviderLeaseId: seeded.lease.providerLeaseId });
+    await expect(environmentService(db).getLeaseById(seeded.lease.id)).resolves.toMatchObject({
+      status: "pending_cleanup", failureReason: "compatible_environment_change" });
+  });
+
   it("keeps the preserved lease when the replacement cannot be created, so the next attempt replaces it", async () => {
     const seeded = await seed();
     const refuse = async () => { throw new JsonRpcCallError({ code: -32000, message: STAGING_REFUSAL }); };
