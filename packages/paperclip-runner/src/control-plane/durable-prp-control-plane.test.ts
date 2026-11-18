@@ -6472,3 +6472,172 @@ describe("host-tool callback orphaned by a server restart", () => {
     }
   });
 });
+
+// b1-prp-effects (RFL rf-3 fence (c), redo): fence what a finalized or
+// superseded run P can CHANGE, never what it can RECORD. P's late frames are
+// stored as trace with a persisted post-terminal marker; their effects (the
+// committed-event business callback that accepts results and projects
+// requests, and semantic dispatch) are refused; an earlier-issued bootstrap
+// ticket cannot mint a lease. The credential is never revoked for frames.
+describe("run effect fence for a finalized or superseded run (trace kept)", () => {
+  type Reason = "run_finalized" | "run_superseded";
+  async function fencedCore(prefix: string, runIdentity: DurableRecoveryIdentity = identity) {
+    const root = mkdtempSync(resolve(tmpdir(), prefix));
+    let refusal: Reason | null = null;
+    const effects = vi.fn(async (_event: unknown) => {});
+    const traces = vi.fn(async (_event: unknown, _refusal: unknown) => {});
+    const dispatch = vi.fn(async () => ({ result: { ok: true } }));
+    const options = { stateDirectory: root, identity: runIdentity, expectedRunnerVersion, expectedRunnerDigest,
+      onCommittedEvent: effects, onSemanticToolInput: dispatch,
+      runEffectAuthority: () => refusal, onPostTerminalEvent: traces };
+    const core = new DurablePrpControlPlane(options as ConstructorParameters<typeof DurablePrpControlPlane>[0]);
+    await core.start();
+    return { root, core, effects, traces, dispatch, options, set(reason: Reason | null) { refusal = reason; } };
+  }
+  function journal(core: DurablePrpControlPlane) {
+    return core.store.state.committedEvents as Array<{ sourceSeq: number; effectRefusal?: Record<string, unknown> }>;
+  }
+
+  it("R1: after P is finalized its late frame is stored, marked post-terminal, and its effect refused", async () => {
+    const p = await fencedCore("runner-effects-r1-");
+    try {
+      const client = (await authenticate(p.core, p.core.issueBootstrapTicket()))!;
+      sendSecure(client, credentialEvent(1));
+      expect(await receiveSecure(client)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 1 } });
+      expect(p.effects).toHaveBeenCalledTimes(1);
+      p.set("run_finalized"); // the run's terminal result was accepted
+      sendSecure(client, credentialEvent(2));
+      // Stored and acknowledged: the runner journal and the server agree.
+      expect(await receiveSecure(client)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 2 } });
+      expect(p.traces).toHaveBeenCalledTimes(1);
+      expect(p.traces.mock.calls[0]![0]).toMatchObject({ sourceSeq: 2 });
+      expect(p.traces.mock.calls[0]![1]).toMatchObject({ code: "run_effect_refused", reason: "run_finalized" });
+      expect(p.effects).toHaveBeenCalledTimes(1);
+      expect(journal(p.core).find(event => event.sourceSeq === 2)?.effectRefusal)
+        .toMatchObject({ code: "run_effect_refused", reason: "run_finalized" });
+      expect(journal(p.core).find(event => event.sourceSeq === 1)?.effectRefusal).toBeUndefined();
+      client.socket.destroy();
+    } finally {
+      await p.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+    }
+  });
+
+  it("R2: after supersession P's unsent frame is stored (count = journal), its effect refused; S unaffected", async () => {
+    const successorIdentity: DurableRecoveryIdentity = { ...identity, runId: "00000000-0000-4000-8000-000000000002" };
+    const p = await fencedCore("runner-effects-r2p-");
+    const s = await fencedCore("runner-effects-r2s-", successorIdentity);
+    try {
+      const client = (await authenticate(p.core, p.core.issueBootstrapTicket()))!;
+      sendSecure(client, credentialEvent(1));
+      expect(await receiveSecure(client)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 1 } });
+      p.set("run_superseded"); // S registered for the same task
+      sendSecure(client, credentialEvent(2));
+      expect(await receiveSecure(client)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 2 } });
+      // Server count equals the runner journal: seq 1 (live) + seq 2 (trace).
+      expect(p.effects.mock.calls.length + p.traces.mock.calls.length).toBe(2);
+      expect(p.core.store.state.ackedSourceSeq).toBe(2);
+      expect(p.traces.mock.calls[0]![1]).toMatchObject({ reason: "run_superseded" });
+      // P's credential is not revoked for frames.
+      expect(Object.values(p.core.store.state.leases).every(lease => lease.revokedAt === null)).toBe(true);
+      const successor = (await authenticate(s.core, s.core.issueBootstrapTicket(), successorIdentity))!;
+      expect(successor).not.toBeNull();
+      successor.socket.destroy();
+      client.socket.destroy();
+    } finally {
+      await p.core.stop();
+      await s.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+      rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  it("R3: P's bootstrap ticket issued before supersession mints no lease afterwards", async () => {
+    const p = await fencedCore("runner-effects-r3-");
+    try {
+      const ticket = p.core.issueBootstrapTicket(60_000);
+      p.set("run_superseded");
+      expect(await authenticate(p.core, ticket)).toBeNull();
+      expect(Object.keys(p.core.store.state.leases)).toHaveLength(0);
+      expect(p.effects).not.toHaveBeenCalled();
+      expect(p.traces).not.toHaveBeenCalled();
+    } finally {
+      await p.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+    }
+  });
+
+  it("R4: the refusal reason survives a reload of P's authority", async () => {
+    const p = await fencedCore("runner-effects-r4-");
+    try {
+      const client = (await authenticate(p.core, p.core.issueBootstrapTicket()))!;
+      p.set("run_superseded");
+      sendSecure(client, credentialEvent(1));
+      expect(await receiveSecure(client)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 1 } });
+      const ticket = p.core.issueBootstrapTicket(60_000);
+      expect(await authenticate(p.core, ticket)).toBeNull();
+      client.socket.destroy();
+      await p.core.stop();
+      const saved = JSON.parse(readFileSync(p.core.store.path, "utf8"));
+      expect(saved.committedEvents[0].effectRefusal).toMatchObject({ code: "run_effect_refused", reason: "run_superseded" });
+      const reloaded = new DurablePrpControlPlane(p.options as ConstructorParameters<typeof DurablePrpControlPlane>[0]);
+      expect((reloaded.store.state.committedEvents[0] as { effectRefusal?: unknown }).effectRefusal)
+        .toMatchObject({ code: "run_effect_refused", reason: "run_superseded", sourceSeq: 1 });
+      expect((reloaded.store.state as { effectRefusals?: unknown[] }).effectRefusals?.at(-1))
+        .toMatchObject({ code: "run_effect_refused", reason: "run_superseded", frame: "bootstrap" });
+    } finally {
+      await p.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+    }
+  });
+
+  it("R5: a live run's frames and effects work, and a same-run reconnect is unaffected", async () => {
+    const p = await fencedCore("runner-effects-r5-");
+    try {
+      const client = (await authenticate(p.core, p.core.issueBootstrapTicket()))!;
+      sendSecure(client, semanticInputEvent(1));
+      expect(await receiveSecure(client)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 1 } });
+      expect(p.effects).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(p.dispatch).toHaveBeenCalledTimes(1));
+      client.socket.destroy();
+      const resumed = (await authenticate(p.core, client.leaseToken!, identity, expectedRunnerDigest, undefined, false, 1, 1))!;
+      expect(resumed).not.toBeNull();
+      sendSecure(resumed, credentialEvent(2));
+      expect(await receiveSecure(resumed)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 2 } });
+      expect(p.effects).toHaveBeenCalledTimes(2);
+      expect(p.traces).not.toHaveBeenCalled();
+      resumed.socket.destroy();
+    } finally {
+      await p.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+    }
+  });
+
+  it("R6: P's late agent-file save after supersession is stored as trace, refused into canonical, canonical bytes unchanged", async () => {
+    const canonicalRoot = mkdtempSync(resolve(tmpdir(), "runner-effects-r6-canonical-"));
+    const canonicalFile = resolve(canonicalRoot, "AGENTS.md");
+    writeFileSync(canonicalFile, "canonical v1\n");
+    const p = await fencedCore("runner-effects-r6-");
+    // The server-side save: the dispatched operation writes into canonical.
+    p.dispatch.mockImplementation(async () => {
+      writeFileSync(canonicalFile, "late P bytes\n");
+      return { result: { ok: true } };
+    });
+    try {
+      const client = (await authenticate(p.core, p.core.issueBootstrapTicket()))!;
+      p.set("run_superseded");
+      sendSecure(client, semanticInputEvent(1, { path: "AGENTS.md", content: "late P bytes\n" }));
+      expect(await receiveSecure(client)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 1 } });
+      expect(p.traces).toHaveBeenCalledTimes(1);
+      expect(p.traces.mock.calls[0]![0]).toMatchObject({ eventType: "semantic_tool.input" });
+      await new Promise(resolveWait => setTimeout(resolveWait, 100));
+      expect(p.dispatch).not.toHaveBeenCalled();
+      expect(readFileSync(canonicalFile, "utf8")).toBe("canonical v1\n");
+      client.socket.destroy();
+    } finally {
+      await p.core.stop();
+      rmSync(p.root, { recursive: true, force: true });
+      rmSync(canonicalRoot, { recursive: true, force: true });
+    }
+  });
+});
