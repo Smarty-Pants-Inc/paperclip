@@ -1,5 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
-import { agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim } from "./agent-file-save-hold.js";
+import { agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, nativeHarnessBackupMissingOnAllocation, releaseLeaseDestroyClaim } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -4888,6 +4888,9 @@ export function environmentRuntimeService(
       // The destroy authority, serialized with the save-hold write (lease row lock).
       const claim = await claimLeaseForDestroyUnlessHeld(db, input.lease);
       if (!claim) {
+        if (await nativeHarnessBackupMissingOnAllocation(db, input.lease)) {
+          throw new Error("Native harness backup is missing; destructive cleanup is forbidden.");
+        }
         throw new Error("Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.");
       }
       try {
