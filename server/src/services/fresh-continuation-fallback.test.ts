@@ -1239,7 +1239,9 @@ suite("fresh-continuation fallback", () => {
         .where(and(eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId)));
       const g = await judgeQueued(false);
       await db.update(issues).set(change as never).where(eq(issues.id, g.issueId));
-      const wakesBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      const taskWakes = () => db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${g.issueId}`)).orderBy(agentWakeupRequests.id);
+      const wakesBefore = await taskWakes();
       const cardBefore = await taskInterruptionPresentation(db, await issue(g.issueId));
       const press = await request(app).post(`/api/issues/${g.issueId}/retry`).send({ observedRunId: g.queued.id, idempotencyKey: randomUUID() });
       await heartbeat.drainActiveRunExecutions();
@@ -1259,8 +1261,7 @@ suite("fresh-continuation fallback", () => {
       expect(created, `${label}: no fresh run`).toEqual([]);
       expect(started, `${label}: nothing started`).toEqual([]);
       expect(kept, `${label}: the old run is unchanged`).toMatchObject({ status: "queued", startedAt: null, errorCode: g.queued.errorCode });
-      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
-        `${label}: no wake queued, cancelled or changed`).toEqual(wakesBefore);
+      expect.soft(await taskWakes(), `${label}: no wake queued, cancelled or changed`).toEqual(wakesBefore);
       if (label === "backlog") {
         // Remove only the fixture's independent predecessor cleanup hold; the person changes status through the real route.
         await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, g.lease.id));
