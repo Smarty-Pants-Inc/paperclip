@@ -2118,11 +2118,31 @@ describe("persistent agent directories", () => {
         executionRoot: path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", agentId, copy.runId),
         receipt: { ...held.receipt, cleanup: { leaseId, remoteCwd }, savePending: { ...(held.receipt?.savePending as object),
           since: new Date(Date.now() - 48 * 3600_000).toISOString() } } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
-      const before = Date.now();
       const retry = (await copies.collectStopped({ companyId, runId: copy.runId }))!;
+      expect(retry.state).toBe("pending_collection");
+      expect(retry.receipt?.savePending).toBeUndefined();
+      expect(agentFileSaveHeld(retry)).toBe(false);
+      expect(await fs.readFile(path.join(copy.localRoot, "unsaved-note.txt"), "utf8")).toContain("unsaved note");
+    });
+
+    it("warm-remote hold without collector on an ACTIVE lease keeps its hold, backoff and one instruction", async () => {
+      const { copy, held } = await holdUnsavedNote(true, "quota");
+      const environmentId = randomUUID(), leaseId = randomUUID(), remoteCwd = "/fixture/active-hold";
+      await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: copy.runId,
+        provider: "boat", providerLeaseId: leaseId, status: "active", metadata: { remoteCwd } });
+      const savePending = { ...(held.receipt?.savePending as object), since: new Date(Date.now() - 48 * 3600_000).toISOString() };
+      await db.update(agentInstructionWorkingCopies).set({ location: `remote:${environmentId}`,
+        executionRoot: path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", agentId, copy.runId),
+        receipt: { ...held.receipt, cleanup: { leaseId, remoteCwd }, savePending } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      const before = Date.now();
+      // No collector and no target: collectStopped routes the held copy to recoverStoppedRemote.
+      const retry = (await copies.collectStopped({ companyId, runId: copy.runId }))!;
+      expect(retry.state).toBe("unavailable");
       expect(retry.errorMessage).toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
       expect(retry.nextAttemptAt!.getTime() - before).toBeGreaterThanOrEqual(6 * 3600_000);
       expect(agentFileSaveHeld(retry)).toBe(true);
+      expect(retry.receipt?.savePending).toEqual(savePending);
       expect(await fs.readFile(path.join(copy.localRoot, "unsaved-note.txt"), "utf8")).toContain("unsaved note");
     });
 

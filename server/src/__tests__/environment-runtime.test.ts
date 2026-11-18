@@ -62,6 +62,9 @@ import { environmentService } from "../services/environments.ts";
 import { resumePluginEnvironmentLease } from "../services/plugin-environment-driver.js";
 import { remoteExecutionHasStopped } from "../services/remote-execution-termination.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { agentExecutionStopBlocker } from "../services/agent-execution-stop.ts";
+import { configureAgentLifecycle } from "../services/agent-lifecycle.ts";
+import { createLifecycleDriver } from "../services/agent-lifecycle-driver.ts";
 import { secretService } from "../services/secrets.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 import type { Environment, EnvironmentDriver, EnvironmentStatus } from "@paperclipai/shared";
@@ -956,6 +959,41 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       } else expect(call).toHaveBeenCalledOnce();
     },
   );
+
+  // Gate 4 (lease a8a58439): the stuck copy (unavailable + savePending 'lease no
+  // longer active', failures 15) pinned its pending_cleanup box and the pause
+  // never finished. Through the real sweep the destroy claim is now granted.
+  it("gate 4 live shape: the sweep destroys a pending_cleanup box despite its stuck savePending copy, and the pause completes", async () => {
+    const f = await seedReusablePluginSandboxLease("paperclip_runner");
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(environmentLeases).set({ status: "pending_cleanup", cleanupStatus: "failed" }).where(eq(environmentLeases.id, f.reusableLease.id));
+    const since = new Date(Date.now() - 4 * 3600_000);
+    await db.insert(agentInstructionWorkingCopies).values({ runId: f.runId, companyId: f.companyId, agentId: f.agentId, responsibleUserId: "user-1",
+      entryFile: "AGENTS.md", baseHash: "base", localRoot: "/tmp/gate4/live", executionRoot: "/workspace/.paperclip-runtime/agent-files/gate4",
+      location: `remote:${f.environment.id}`, state: "unavailable", processStoppedAt: since, errorCode: "AGENT_FILES_SAVE_FAILED",
+      receipt: { schema: "paperclip.agent-files.v1", warm: true, cleanup: { leaseId: f.reusableLease.id, remoteCwd: "/workspace" },
+        savePending: { code: "AGENT_FILES_SAVE_FAILED", since: since.toISOString(), reason: "Boat sandbox lease is no longer active.", failures: 15 } } });
+    await db.update(agents).set({ status: "paused", lifecycleState: "pausing", lifecycleHolds: ["manual"], lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).where(eq(agents.id, f.agentId));
+    const call = vi.fn(async (_pluginId: string, method: string, input: any) => {
+      if (method !== "environmentDestroyLease") throw new Error(`Unexpected method: ${method}`);
+      return { providerLeaseId: input.providerLeaseId, state: "destroyed" };
+    });
+    const workerManager = { isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentDestroyLease"] }) } as unknown as PluginWorkerManager;
+    expect(await agentExecutionStopBlocker(db, [f.agentId])).not.toBeNull();
+    await heartbeatService(db, { environmentRuntime: environmentRuntimeService(db, { pluginWorkerManager: workerManager }), pluginWorkerManager: workerManager })
+      .sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(call).toHaveBeenCalledWith(f.pluginId, "environmentDestroyLease", expect.objectContaining({ providerLeaseId: f.reusableLease.providerLeaseId }), expect.any(Number));
+    const settled = (await environmentService(db).getLeaseById(f.reusableLease.id))!;
+    expect(settled.status).not.toBe("pending_cleanup");
+    expect(settled.cleanupStatus).toBe("success");
+    expect(await agentExecutionStopBlocker(db, [f.agentId])).toBeNull();
+    const work = configureAgentLifecycle(db, createLifecycleDriver(db, workerManager));
+    try { await work.process(f.agentId); } finally { await work.stop(); }
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(agent).toMatchObject({ lifecycleState: "paused", status: "paused", lifecycleError: null });
+  });
 
   it.each([true, false])("nativeHarnessBackupMissing guards the reusable driver's expiry destroy (flagged=%s)", async flagged => {
     // Expiry delegates straight to destroyReusableSandboxLease, not the public
