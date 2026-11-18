@@ -362,6 +362,7 @@ describe.skipIf(!support.supported)("optS-dd staged race (rf-4)", () => {
         wakes: wakes.map(w => ({ status: w.status, wait: (w.payload as any)?.executionWait })) });
       expect(turns).toHaveLength(1);
       expect(turns[0]!.commentIds).toEqual(s.held);
+      expect(s.held.length).toBe(2);
       expect([...s.answered().values()]).toEqual(s.held.map(() => 1));
       expect(Date.now() - pressedAt).toBeLessThan(15_000);
     } finally { s.done(); }
