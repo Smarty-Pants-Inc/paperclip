@@ -27,7 +27,7 @@ import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const FIRST_LINE = "The last account test has not confirmed its test computer stopped; Paperclip will retry automatically.";
-const PARKED_LINE = "The last account test has not confirmed its test computer stopped. Press Retry after a few minutes; if it stays stuck, tell your operator.";
+const PARKED_LINE = "The last account test has not confirmed its test computer stopped. Choose Retry after a few minutes; if it stays stuck, tell your operator.";
 const BOAT_REFUSAL = "Boat sandbox lease is no longer active.";
 const MINUTE = 60_000;
 
