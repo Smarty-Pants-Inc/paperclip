@@ -3,7 +3,7 @@ import { WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT, WORKSPACE_RESTORE_COPYBACK_STOP
   WORKSPACE_RESTORE_PERSON_BOUND_MS } from "@paperclipai/shared";
 import { agents, agentWakeupRequests, heartbeatRuns, issueComments, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
-import { answeredPersonMessageSql } from "./person-message-answer.js";
+import { completedPersonMessageAnswerSql } from "./person-message-answer.js";
 import { executionBlockerPredicate, NEW_TASK_CONTINUE_ACTION, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate,
   withoutUnavailableRetry } from "./execution-blocker.js";
 import { RECOVERING_SAVED_WORK_NEXT_ACTION, WORKSPACE_RESTORE_PENDING_KEY, workspaceRestoreHoldNextAction } from "./legacy-execution-recovery.js";
@@ -61,9 +61,10 @@ export type RetryUserAction = "retry" | "message" | "resume" | "new_task" | "wai
  * decideRetryAuthority, so the button and the words cannot disagree. */
 export type RetryAuthorityFacts = {
   /** fam-retry3 (RFL 20:33Z): every person message Retry's source run carried
-   * already has an answer (person-message-answer.ts answeredPersonMessageSql,
-   * the predicate the unanswered-person-message notice and the continuation
-   * carry use): a Retry would only answer it again. */
+   * is ANSWERED (person-message-answer.ts completedPersonMessageAnswerSql: a
+   * COMPLETED run's final answer, attributed through the answering run's OWN
+   * pending input; a failed run's progress comment is DELIVERED only and keeps
+   * the Retry): a Retry would only answer it again. */
   personMessageAnswered?: boolean;
   /** The assignee (or its project / company) is paused: only Resume continues. */
   agentPaused?: boolean;
@@ -217,10 +218,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** fam-retry3: the personMessageAnswered fact. Retry's source run (the given
  * run, else the task's latest run, as readRestoreStopWait reads it) carried
  * person messages (carryContinuationCommentInput, the continuation seam), and
- * every one of them is answered by the ONE shared predicate
- * (answeredPersonMessageSql). A run that carried no person message, or a
- * message with no published answer (a cancelled or partial run posted
- * nothing), keeps its Retry. */
+ * every one of them is ANSWERED by the ONE shared predicate
+ * (completedPersonMessageAnswerSql, RFL F1/F2). A run that carried no person
+ * message, or a message with no completed run's final answer (a cancelled run
+ * posted nothing; a failed run posted only a progress comment), keeps its Retry. */
 async function readPersonMessageAnswered(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
   const [source] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), input.sourceRunId ? eq(heartbeatRuns.id, input.sourceRunId) : or(
@@ -230,7 +231,7 @@ async function readPersonMessageAnswered(db: Db, input: { companyId: string; iss
   const carried = ((carryContinuationCommentInput(source?.contextSnapshot).wakeCommentIds as string[] | undefined) ?? [])
     .filter(id => UUID.test(id));
   if (!carried.length) return false;
-  const rows = await db.select({ id: issueComments.id, answered: sql<boolean>`${answeredPersonMessageSql({ id: sql`${issueComments.id}`,
+  const rows = await db.select({ id: issueComments.id, answered: sql<boolean>`${completedPersonMessageAnswerSql({ id: sql`${issueComments.id}`,
     companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}` })
     .from(issueComments).where(and(eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
       inArray(issueComments.id, carried), eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)));

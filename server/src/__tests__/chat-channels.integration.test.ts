@@ -66701,7 +66701,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   // before the hold), so the API refuses with "Already answered above." and the
   // card must say that line too: not the hold's "your message is kept and runs
   // when it's back", and not the accept-held state (no Retry is held).
-  it.each(["pending", "recovery_owned"] as const)("retry-fold / fam-retry3 / fam-retry-r2: an answered message under a %s restore hold: card and Retry route say the one line", async kind => {
+  it.each(["pending", "recovery_owned"] as const)("supersedes(RFL F1 ANSWERED is a completed run's final answer, 22:41Z): retry-fold / fam-retry3 / fam-retry-r2: an answered message under a %s restore hold: card and Retry route say the one line", async kind => {
+    // RFL F1 (22:41Z): Retry's answered-already fact reads ANSWERED (completedPersonMessageAnswerSql): a COMPLETED run's
+    // final answer through its own pending input. Was: the failed source run's own reply counted (DELIVERED only now).
     const f = await boatRetryRouteFixture();
     if (kind === "pending") await insertPendingRestoreHold(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId });
     else await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
@@ -66715,8 +66717,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       authorUserId: "board", body: "Please summarise the report.", createdAt: new Date(Date.now() - 5 * 60_000) }).returning();
     await db.update(heartbeatRuns).set({ contextSnapshot: { ...(run!.contextSnapshot as Record<string, unknown> ?? {}),
       wakeCommentId: message!.id, wakeCommentIds: [message!.id] } }).where(eq(heartbeatRuns.id, f.runId));
+    // A completed run that held the message as its own pending input posted the final answer; it is older than the
+    // failed source run, which stays the task's latest run (Retry's observed run).
+    const answering = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: answering, companyId: f.companyId, agentId: f.fixture.assignedAgentId,
+      issueId: f.issueId, status: "succeeded", createdAt: new Date(run!.createdAt.getTime() - 60_000),
+      startedAt: new Date(run!.createdAt.getTime() - 60_000), finishedAt: new Date(run!.createdAt.getTime() - 30_000),
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: message!.id, wakeCommentIds: [message!.id] } });
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
-      authorAgentId: f.fixture.assignedAgentId, createdByRunId: f.runId, body: "Here is the summary of the report.",
+      authorAgentId: f.fixture.assignedAgentId, createdByRunId: answering, body: "Here is the summary of the report.",
       createdAt: new Date(Date.now() - 4 * 60_000) });
     const before = await f.counts();
     const response = await request(f.app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: f.runId, idempotencyKey: randomUUID() });
