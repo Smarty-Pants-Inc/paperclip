@@ -32,6 +32,33 @@ export function isOperatorInterruptedRun(
   return resultJson.interruptionSource === "issue_comment_interrupt";
 }
 
+/** Attribute only recorded human stops, never an inferred operator or display name. */
+export function userRunStopPresentation(
+  run: { status: string; errorCode?: string | null; resultJson?: Record<string, unknown> | null },
+  currentUserId?: string | null,
+  userLabelMap?: ReadonlyMap<string, string> | null,
+): { label: string; detail: string } | null {
+  if (run.status !== "cancelled" && run.status !== "interrupted") return null;
+  const result = run.resultJson;
+  const interrupted = run.status === "interrupted" || isOperatorInterruptedRun(result, run.errorCode);
+  const actorType = interrupted
+    ? result?.cancelledByActorType ?? result?.interruptedByActorType
+    : result?.cancelledByActorType;
+  if (actorType !== "user") return null;
+  const actorId = interrupted
+    ? result?.cancelledByUserId ?? result?.interruptedByActorId
+    : result?.cancelledByUserId;
+  const ownStop = Boolean(currentUserId && actorId === currentUserId);
+  const name = typeof actorId === "string" ? userLabelMap?.get(actorId) : undefined;
+  const actor = ownStop ? "you" : name || "a board member";
+  return {
+    label: `${interrupted ? "Interrupted" : "Stopped"} by ${actor}`,
+    detail: ownStop
+      ? interrupted ? "You interrupted this run." : "You stopped this run before it finished."
+      : `${name || "A board member"} ${interrupted ? "interrupted this run." : "stopped this run before it finished."}`,
+  };
+}
+
 export function runStatusClassName(status: string): string {
   switch (status) {
     case "succeeded":

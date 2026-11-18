@@ -10,6 +10,7 @@ import {
   findPlainAgentNameCandidate,
   isOperatorInterruptedRun,
   resolveRunStatusPresentation,
+  userRunStopPresentation,
   type PauseAffectsIssueLike,
 } from "./interrupt-handoff";
 
@@ -35,6 +36,13 @@ describe("isOperatorInterruptedRun", () => {
 });
 
 describe("resolveRunStatusPresentation", () => {
+  it("attributes Interrupt to the recorded cancelling user, as the unanswered-message sweep does", () => {
+    expect(userRunStopPresentation({ status: "cancelled", errorCode: "operator_interrupted", resultJson: {
+      cancelledByActorType: "user", cancelledByUserId: "sender",
+      interruptedByActorType: "user", interruptedByActorId: "other-board-user",
+    } }, "sender")).toEqual({ label: "Interrupted by you", detail: "You interrupted this run." });
+  });
+
   it("renders an operator-interrupted cancel as amber 'interrupted'", () => {
     const p = resolveRunStatusPresentation("cancelled", { operatorInterrupted: true });
     expect(p.label).toBe("interrupted");

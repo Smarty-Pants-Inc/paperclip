@@ -75,9 +75,11 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
   function carry(key: typeof keys[number], id: string) {
     return key === "wakeCommentIds" ? { [key]: [id] } : key === "firstTurnQueuedInput" ? { [key]: { commentIds: [id] } } : { [key]: id };
   }
-  for (const key of keys) it(`attribution by ${key} answers the carried later message, not semantic analysis of prose`, async () => {
+  // Reason (R-ONCE): the reply's run carried only the later message, so its answer settles that message alone; the
+  // earlier, never-carried message is now owed one true notice (old rule: any later input's answer settled it).
+  for (const key of keys) it(`supersedes(R-ONCE carried, RFL 18:33Z): attribution by ${key} answers only the carried later message, not semantic analysis of prose; the uncarried earlier message gets one true notice`, async () => {
     const f = await fixture();
-    await f.message("Production version?", f.base);
+    const first = await f.message("Production version?", f.base);
     const second = await f.message("Staging version?", f.base + 10_000);
     const run = await f.run(second, f.base + 11_000, carry(key, second));
     // Deliberately answers only the first question. Native finalization judges
@@ -86,12 +88,16 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     await settleConversationTurnForRun(db, f.companyId, run);
     const [native] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     expect(native).toMatchObject({ status: "in_review", conversationState: "waiting" });
-    expect(await f.flags()).toEqual({ discovered: false, batched: false });
-    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
-    await f.sweep(); expect(await f.notices()).toHaveLength(0);
+    expect(await f.flags()).toEqual({ discovered: true, batched: true });
+    await f.sweep(); await f.sweep();
+    // ONE notice, for the uncarried earlier message; none for the carried, answered later message.
+    expect((await f.notices()).map(n => n.metadata?.authorizationReason)).toEqual([`unanswered_message:${first}`]);
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
   });
 
-  it("supersession across a soft-deleted later carrying boundary uses the same predicate everywhere", async () => {
+  // Reason (R-ONCE): the reply's run carried only the (now deleted) later message, never the first, so the first
+  // message's notice is still true and stays; discovery, the batch flag and the decision agree on that.
+  it("supersedes(R-ONCE carried, RFL 18:33Z): a reply carrying only a soft-deleted later boundary does not supersede the earlier message's notice; the same predicate everywhere", async () => {
     const f = await fixture();
     const first = await f.message("Production version?", f.base);
     await f.sweep(); const [notice] = await f.notices(); expect(notice?.metadata?.authorizationReason).toBe(`unanswered_message:${first}`);
@@ -99,9 +105,9 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     const run = await f.run(second, f.base + 11_000, { conversationReplyBoundaryCommentId: second });
     await f.reply(run, f.base + 40_000);
     await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, second));
-    expect(await f.flags()).toEqual({ discovered: true, batched: true }); // notice needs retiring
-    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
-    expect(await f.notices()).toHaveLength(0);
+    expect(await f.flags()).toEqual({ discovered: false, batched: false }); // the standing notice is still true
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
+    expect((await f.notices()).map(n => n.metadata?.authorizationReason)).toEqual([`unanswered_message:${first}`]);
     expect(await f.flags()).toEqual({ discovered: false, batched: false });
   });
 

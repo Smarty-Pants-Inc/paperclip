@@ -11,7 +11,7 @@ import type {
 import type { Agent, IssueComment } from "@paperclipai/shared";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import { formatAssigneeUserLabel } from "./assignees";
-import { isOperatorInterruptedRun } from "./interrupt-handoff";
+import { isOperatorInterruptedRun, userRunStopPresentation } from "./interrupt-handoff";
 import {
   buildIssueThreadInteractionSummary,
   shouldHideInteractionCard,
@@ -803,7 +803,9 @@ function runDurationLabel(run: {
   finishedAt?: Date | string | null;
   errorCode?: string | null;
   resultJson?: Record<string, unknown> | null;
-}) {
+}, currentUserId?: string | null, userLabelMap?: ReadonlyMap<string, string> | null) {
+  const userStop = userRunStopPresentation(run, currentUserId, userLabelMap);
+  if (userStop) return userStop.label;
   const start = run.startedAt ?? run.createdAt;
   const end = run.finishedAt ?? null;
   const durationMs = end ? Math.max(0, toTimestamp(end) - toTimestamp(start)) : null;
@@ -862,8 +864,11 @@ function createHistoricalTranscriptMessage(args: {
   transcript: readonly IssueChatTranscriptEntry[];
   hasOutput: boolean;
   agentMap?: Map<string, Agent>;
+  currentUserId?: string | null;
+  userLabelMap?: ReadonlyMap<string, string> | null;
 }) {
-  const { run, transcript, hasOutput, agentMap } = args;
+  const { run, transcript, hasOutput, agentMap, currentUserId, userLabelMap } = args;
+  const userStop = userRunStopPresentation(run, currentUserId, userLabelMap);
   const agentName = run.agentName ?? agentMap?.get(run.agentId)?.name ?? run.agentId.slice(0, 8);
   const compactedTranscript = compactIssueChatTranscript(transcript, issueChatTranscriptMaxVisibleEntries(run.adapterType));
   const { parts, notices, segments } = buildAssistantPartsFromTranscript(compactedTranscript);
@@ -889,9 +894,9 @@ function createHistoricalTranscriptMessage(args: {
       runStatus: run.status,
       execution: run.execution,
       runOperatorInterrupted: isOperatorInterruptedRun(run.resultJson, run.errorCode),
-      notices,
+      notices: userStop ? [...notices, userStop.detail] : notices,
       waitingText,
-      chainOfThoughtLabel: runDurationLabel(run),
+      chainOfThoughtLabel: runDurationLabel(run, currentUserId, userLabelMap),
       chainOfThoughtSegments: segments,
     }),
   };
@@ -1285,6 +1290,8 @@ export function buildIssueChatMessages(args: {
           transcript,
           hasOutput: hasRunOutput,
           agentMap,
+          currentUserId,
+          userLabelMap,
         }),
       });
       continue;

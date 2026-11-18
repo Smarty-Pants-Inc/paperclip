@@ -28,6 +28,8 @@ import { createLifecycleStore as createStore } from "../adapters/postgres.js";
 import { transition } from "../domain/policy.js";
 import type { LifecycleAgent, LifecycleDriver } from "../application/ports.js";
 import { budgetService } from "../../../services/budgets.js";
+import { agentWakeupRequests, issueComments } from "@paperclipai/db";
+import { settleUnansweredPersonMessage } from "../../../services/recovery/unanswered-person-message.js";
 import { agentConfigurationRevision } from "../../../lib/agent-configuration-revision.js";
 
 const createLifecycleStore = (db: Db) => createStore(db, createAgentLifecycleEffects());
@@ -76,6 +78,41 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect((await current(hired.id)).adapterConfig).toMatchObject({ ...adapterConfig, lifecycleMode: "warm" });
     await createAgentLifecycle(db).updateConfiguration(hired.id, { adapterConfig: { ...(await current(hired.id)).adapterConfig, lifecycleMode: "per_turn" } });
     expect((await current(hired.id)).adapterConfig.lifecycleMode).toBe("per_turn");
+  });
+
+  it("pause-stopped message: HTTP resume twice leaves one truthful note and no automatic replay (option B)", async () => {
+    const agent = await hire();
+    const [issue] = await db.insert(issues).values({ companyId, title: "Answer my message", status: "in_progress", assigneeAgentId: agent.id }).returning();
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user", authorUserId: "board",
+      body: "Please continue.", createdAt: new Date(Date.now() - 60_000) }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, nativeIssueId: issue.id,
+      status: "cancelled", errorCode: "agent_paused", error: "Cancelled due to agent pause",
+      contextSnapshot: { issueId: issue.id, wakeCommentId: message.id }, createdAt: new Date(Date.now() - 50_000),
+      finishedAt: new Date(Date.now() - 30_000) }).returning();
+    await db.update(agents).set({ status: "paused", lifecycleState: "paused", lifecycleHolds: ["manual"], pauseReason: "manual" })
+      .where(eq(agents.id, agent.id));
+    await settleUnansweredPersonMessage(db, { companyId, issueId: issue.id });
+    const notes = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id), eq(issueComments.authorType, "system")));
+    const [pausedNote] = await notes();
+    expect(pausedNote.body).toContain("is paused");
+    const work = worker();
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: "board", companyIds: [companyId] }; next(); });
+    app.use("/api", agentRoutes(db)); app.use(errorHandler);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await request(app).post(`/api/agents/${agent.id}/resume`).expect(200);
+      await work.process(agent.id);
+      expect((await current(agent.id)).lifecycleState).toBe("ready");
+      await settleUnansweredPersonMessage(db, { companyId, issueId: issue.id });
+      const after = await notes();
+      expect(after).toHaveLength(1);
+      expect(after[0]).toMatchObject({ id: pausedNote.id, createdAt: pausedNote.createdAt,
+        body: "Agent was paused before it answered your message. Send it again to continue.",
+        presentation: { title: "Agent was paused before it answered" } });
+      expect(JSON.stringify(after)).not.toMatch(/unclassified_failure|if it fails again/);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agent.id))).toHaveLength(0);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agent.id))).map(row => row.id)).toEqual([run.id]);
+    }
   });
 
   it("rejects an outdated configuration snapshot under the write lock", async () => {
