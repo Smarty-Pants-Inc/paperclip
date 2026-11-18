@@ -6,6 +6,7 @@ import {
   approvals,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issueComments,
@@ -133,7 +134,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         agentId, decisionId: decision!.id, originRunId: sourceRunId, cause: "native_run_failed", summary: "Resume the persisted native run." }));
       const target = await run({ status, wakeReason: "issue_status_changed" });
       const [wake] = await db.update(agentWakeupRequests).set({ status: "coalesced", runId: target })
-        .where(eq(agentWakeupRequests.id, wakeId)).returning();
+        .where(eq(agentWakeupRequests.id, wakeId!)).returning();
       await db.insert(statusDecisionEffects).values({ companyId, issueId, decisionId: decision!.id, ordinal: 0,
         effectKind: "schedule_retry", targetType: "agent_wakeup_request", targetId: wake!.id,
         idempotencyKey: `native-status:${decision!.id}:retry`, payload: {} });
@@ -420,8 +421,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
           payload: { kind: "agentMessage", text: "Section 1 of the report.\n".repeat(100) } } } },
         { seq: 2, payload: { prpEvent: { eventType: "turn.failed", turnId: "t", payload: { error: { code: "pi_provider_error" } } } } },
       ])!;
-      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: cut.candidate.text,
-        authorType: "agent", authorAgentId: f.agentId, createdByRunId: runId, createdAt: f.at() });
+      const [reply] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: cut.candidate.text,
+        authorType: "agent", authorAgentId: f.agentId, createdByRunId: runId, createdAt: f.at() }).returning();
+      // compose (fam-long + ANSWERED): under ANSWERED a failed run's PROGRESS comment owes the one true notice
+      // (RFL F1). The posted streamed prefix is the cut run's FINAL reply, so the fixture now holds what
+      // publication records for it: the final comment receipt and the run's turn.failed event.
+      await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentId: reply!.id } } }).where(eq(heartbeatRuns.id, runId));
+      await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId, agentId: f.agentId, seq: 2, eventType: "turn.failed",
+        payload: { prpEvent: { eventType: "turn.failed", turnId: "t", payload: { error: { code: "pi_provider_error" } } } } });
     }
     await f.sweep();
     const notices = await f.visible();
@@ -1741,6 +1748,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // so M1 got a FALSE 'not answered' after the continuation answered both. The array attributes BOTH.
   it("attrarray: a batched M1+M2 on a failed turn, the native-status continuation answers both: NO notice for EITHER", async () => {
     const f = await fixture();
+    // compose: 6414f5f8 calls messageState here without defining it (TS2304, a ReferenceError at run time).
+    // ANSWERED for one message, through the one shared predicate.
+    const messageState = async (_f: unknown, id: string) => (await db.select({ answered: completedPersonMessageAnswerSql({
+      id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) })
+      .from(issueComments).where(eq(issueComments.id, id)))[0];
     const m1 = await f.message("First: write the report.");
     const m2 = await f.message("Second: and add a summary.");
     const root = await f.run({ commentId: m2, status: "failed", errorCode: "native_run_failed" });

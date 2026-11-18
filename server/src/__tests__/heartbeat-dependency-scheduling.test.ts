@@ -400,7 +400,13 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       await db.insert(heartbeatRuns).values({ id, companyId, agentId, issueId, nativeIssueId: issueId,
         invocationSource: "automation", triggerDetail: "system", status: "succeeded", runtimeMode: "native", finishedAt: new Date(),
         ...(link === "column" ? { retryOfRunId: failedRunId } : {}),
+        // compose (fam-long + ANSWERED): ANSWERED attributes a reply only through the replying run's OWN pending
+        // input, never ancestry (RFL F2). A real recovery successor holds the origin's pending message itself:
+        // the cut lane as attributionCommentIds (native-provider-capacity-retry.ts), a restored run as its wake ids
+        // (execution-recovery-resolution.ts readContinuationCommentInput). The fixture now says so.
         contextSnapshot: { issueId, ...(link === "none" ? { wakeCommentId: commentId } : {}),
+          ...(link === "column" ? { attributionCommentIds: [commentId] } : {}),
+          ...(link === "restore-context" ? { wakeCommentId: commentId, wakeCommentIds: [commentId] } : {}),
           ...(link === "restore-context" ? { previousRunId: failedRunId, wakeReason: "issue_recovery_action_restored", source: "execution.reconciled" } : {}) } });
       if (answer) await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId,
         createdByRunId: id, body: "Here is the final answer." });
