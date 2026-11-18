@@ -13,6 +13,9 @@ const STOP_PENDING_ACTION = "Stop pending (execution_stop_pending): Paperclip ca
   "Inspect the bound runs and use the owning agent's Stop/cleanup controls. If its Stop work is parked, inspect its evidence before using the agent's Retry. " +
   "The task stays held until Stop is proved; starting a replacement or waiting longer is not proof.";
 
+/** A Stop's receipt can land seconds after the run finishes; the 30 s sweep must not flash a card first. */
+export const TASK_STOP_PENDING_SETTLE_MS = 60_000;
+
 type TaskBinding = { companyId: string; issueId: string; runIds: string[] };
 type StopPending = {
   schema: typeof STOP_PENDING_SCHEMA;
@@ -116,6 +119,13 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   const boundRuns = boundRunIds.length ? await tx.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, boundRunIds),
   )) : [];
+  // C1 guard 1: the card says a Stop is unproven, so it needs a recorded Stop.
+  // A failed run with only a pending lease release was never stopped.
+  const stoppedRuns = boundRuns.filter(hasRecordedStopRequest);
+  if (!stoppedRuns.length) return;
+  // C1 guard 2: give the stop receipt time to land after the run finishes.
+  const settledBefore = Date.now() - TASK_STOP_PENDING_SETTLE_MS;
+  if (!stoppedRuns.some(run => run.finishedAt && run.finishedAt.getTime() <= settledBefore)) return;
   // A provider refusal is not a Stop request. Suppress only that diagnostic,
   // never the underlying execution claims or any genuinely requested Stop.
   const noStopRefusals = new Set(boundRuns.filter(run => run.status === "failed"
