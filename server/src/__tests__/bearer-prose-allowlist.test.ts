@@ -11,9 +11,25 @@ const prose = [
   "bearer Well-known",
   "bearer abcdefghijklmnopqrs",
   "bearer abcdefghi-jklmnopqr",
+  // Quotes across a line boundary do not quote the phrase.
+  "'\n Bearer abc ",
+  "Bearer abc\n'",
+  "' note Bearer abc",
+  "Bearer abc note '",
   ...[".", ",", ";", ":", "!", "?", ")", "]", ".!?)];:"].map(p => `bearer word${p}`),
 ];
 const credentials = [
+  "' Bearer abc '",
+  '" Bearer abc "',
+  "` Bearer abc `",
+  "'\tBearer abc\t'",
+  // The opening quote is on another line; the closing quote is on this one.
+  "'\n Bearer abc '",
+  "' Bearer abc",
+  "Bearer abc.,;:!?)] \t'",
+  "Bearer abc . , ; : ! ? ) ] \t'",
+  "'\u00a0Bearer abc\u00a0'",
+  "Bearer abc\u00a0'",
   "'Bearer abc'",
   '"Bearer abc"',
   "`Bearer abc`",
