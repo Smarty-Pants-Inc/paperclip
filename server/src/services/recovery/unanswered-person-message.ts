@@ -23,6 +23,7 @@ import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from ".
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
+import { decideStrandedRetryAdmission } from "./stranded-retry-admission.js";
 import { noticeMetadataReferencesRecoveryAction } from "./successful-run-handoff.js";
 import { keyValueRow } from "./notice-format.js";
 import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
@@ -799,6 +800,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
+    retry: await decideStrandedRetryAdmission(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run?.id }),
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
     recoveryResponsibility: "user",

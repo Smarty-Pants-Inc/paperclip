@@ -63,6 +63,7 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { decideStrandedRetryAdmission } from "./stranded-retry-admission.js";
 import {
   hasCommittedNativeBoardResponseWait,
   readNativeBoardResponseWaitSource,
@@ -120,7 +121,6 @@ import { proveRunProcessGone } from "../run-process-owner.js";
 import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
-import { getExecutionBlocker, withoutUnavailableRetry } from "../execution-blocker.js";
 import { isCancelledNativeStartup } from "../cancelled-native-startup.js";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
 import { clearTaskStopPending, hasRecordedStopRequest, hasTaskStopPending, recheckTaskStopPending, recordTaskStopPending } from "./stop-pending.js";
@@ -4537,13 +4537,11 @@ export function recoveryService(
           input.successfulRunHandoffEvidence.missingDisposition,
       });
     }
-    // The notice offers Retry only when the issue's own Retry decision does.
-    const executionBlocker = await getExecutionBlocker(tx as unknown as Db, input.issue.companyId, input.issue.id);
     const escalationNotice = buildStrandedRecoveryEscalationNotice({
+      retry: await decideStrandedRetryAdmission(tx as unknown as Db, {
+        companyId: input.issue.companyId, issueId: input.issue.id, runId: input.latestRun?.id }),
       seed: input.notice,
       fallbackBody: input.comment,
-      retryDecision: executionBlocker ? { offered: executionBlocker.canRetry === true, nextAction: executionBlocker.nextAction,
-        withoutRetry: text => withoutUnavailableRetry(text, executionBlocker.canRetry === true) } : null,
       recoveryCause,
       recoveryActionId: recoveryAction.id,
       continuesAutomatically: Boolean(input.latestRun) && recoveryAction.kind === STRANDED_KIND

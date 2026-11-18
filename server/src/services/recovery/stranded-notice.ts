@@ -38,6 +38,46 @@ export const DEFAULT_STRANDED_RECOVERY_NOTICE_BODY =
 
 const DEFAULT_STRANDED_RECOVERY_NOTICE_TITLE = "Automatic recovery blocked";
 
+/**
+ * Whether `POST /issues/:id/retry` can start this task now (decideStrandedRetryAdmission).
+ * A refusal names why, so the notice offers the one action that works instead.
+ */
+export type StrandedRetryAdmission =
+  | { admits: true }
+  | { admits: false; refusal: "agent_paused"; agentName?: string | null }
+  | { admits: false; refusal: "workspace_repair_required" }
+  | { admits: false; refusal: "previous_execution_unverified" }
+  | { admits: false; refusal: "none" };
+
+const MENTIONS_RETRY = /\bretry\b/i;
+
+export function strandedRetryRefusalCopy(retry: Exclude<StrandedRetryAdmission, { admits: true }>): { body: string; nextAction: string } {
+  switch (retry.refusal) {
+    case "agent_paused": {
+      const name = retry.agentName?.trim() || "This agent";
+      return {
+        body: `This attempt could not be finished automatically, and ${name} is paused, so Retry can't start it. Your message is saved.`,
+        nextAction: `Ask a board user or ${name}'s manager to resume ${name}.`,
+      };
+    }
+    case "workspace_repair_required":
+      return {
+        body: "This attempt could not be finished automatically, and its saved files must be recovered first, so Retry can't start it. Your message is saved.",
+        nextAction: "Press Recover saved files to recover the workspace.",
+      };
+    case "previous_execution_unverified":
+      return {
+        body: "This attempt could not be finished automatically. Paperclip can't confirm that the previous attempt stopped, so Retry can't continue from it. Your message is saved.",
+        nextAction: "Press Confirm it stopped once the previous attempt has stopped.",
+      };
+    default:
+      return {
+        body: "This attempt could not be finished automatically. Your message is saved.",
+        nextAction: "Nothing restarts it by itself; a new message or a change to the task starts it again.",
+      };
+  }
+}
+
 const STRANDED_RECOVERY_NOTICE_TITLES_BY_CAUSE: Record<string, string> = {
   workspace_validation_failed: "Workspace validation failed",
   configuration_incomplete: "Configuration incomplete",
@@ -278,14 +318,10 @@ export function buildStrandedRecoveryEscalationNotice(input: {
   recoveryOwner: { id: string; name: string | null } | null | undefined;
   /** Overrides the cause-derived responsibility: "user" when the person must act. */
   recoveryResponsibility?: "system" | "user";
+  /** Required: the notice says "Retry" only when Retry would admit (decideStrandedRetryAdmission). */
+  retry: StrandedRetryAdmission;
   /** The allowlisted code when there is no source run. */
   failureCode?: string | null;
-  /**
-   * The issue's current Retry decision (its execution blocker projection). When
-   * Retry cannot admit, the notice keeps the blocker's own next action and never
-   * tells the person to press Retry (#21914). Absent: no blocker holds the task.
-   */
-  retryDecision?: { offered: boolean; nextAction: string; withoutRetry: (text: string) => string } | null;
   sourceRun: {
     id: string;
     agentId?: string | null;
@@ -307,13 +343,9 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     tone: "danger" as const,
   } : SETUP_FAILURE_NOTICES[input.sourceRun?.errorCode ?? ""] ?? input.seed;
   const fallbackBody = input.fallbackBody?.trim();
-  const retryRefused = input.retryDecision?.offered === false ? input.retryDecision : null;
+  const refusal = input.retry.admits ? null : strandedRetryRefusalCopy(input.retry);
   const offeredBody = seed?.body ?? (fallbackBody || DEFAULT_STRANDED_RECOVERY_NOTICE_BODY);
-  const body = retryRefused ? retryRefused.withoutRetry(offeredBody) : offeredBody;
-  const offeredNextAction = seed?.nextAction ?? (input.recoveryOwner
-    ? "The assigned agent continues the task from the saved work"
-    : RETRY_FROM_SAVED_WORK_NEXT_ACTION);
-  const nextAction = retryRefused && /\bRetry\b/.test(offeredNextAction) ? retryRefused.nextAction : offeredNextAction;
+  const body = refusal && MENTIONS_RETRY.test(offeredBody) ? refusal.body : offeredBody;
   const title =
     STRANDED_RECOVERY_NOTICE_TITLES_BY_RUN_ERROR_CODE[input.sourceRun?.errorCode?.trim() ?? ""] ??
     seed?.title ??
@@ -328,10 +360,16 @@ export function buildStrandedRecoveryEscalationNotice(input: {
         : keyValueRow(
             "Recovery owner",
             // A pre-dispatch provider outage needs no board decision, only Retry.
-            input.recoveryCause === ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE ? "Retry when ready" : "Waiting for you",
+            input.recoveryCause === ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE && !refusal ? "Retry when ready" : "Waiting for you",
           ),
     ]),
-    keyValueRow("Next action", nextAction),
+    keyValueRow(
+      "Next action",
+      refusal && (!seed?.nextAction || MENTIONS_RETRY.test(seed.nextAction)) ? refusal.nextAction
+        : seed?.nextAction ?? (input.recoveryOwner
+          ? "The assigned agent continues the task from the saved work"
+          : RETRY_FROM_SAVED_WORK_NEXT_ACTION),
+    ),
   ];
 
   const runRows: NoticeMetadataRow[] = [];

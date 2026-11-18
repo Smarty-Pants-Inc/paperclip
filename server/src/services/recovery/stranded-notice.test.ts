@@ -133,7 +133,7 @@ describe("stranded recovery notice seeds", () => {
       fetchError: "fatal: couldn't find remote ref refs/heads/main",
       missingBindings: [],
     });
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       seed,
       recoveryActionId: "base-ref-recovery",
       recoveryOwner: null,
@@ -162,7 +162,7 @@ describe("stranded recovery notice seeds", () => {
 
 describe("buildStrandedRecoveryEscalationNotice", () => {
   it("names a workspace timeout and its repair instead of claiming generic continuation", () => {
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
       recoveryActionId: "scan-recovery",
       recoveryOwner: null,
@@ -176,7 +176,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
   it("promises an automatic retry for a timed-out sandbox setup only when the sweep will continue it", () => {
     for (const errorCode of ["reusable_sandbox_resume_failed", "remote_workspace_prepare_timeout"]) {
       for (const continuesAutomatically of [true, false]) {
-        const notice = buildStrandedRecoveryEscalationNotice({
+        const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
           seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
           recoveryActionId: "sandbox-recovery", recoveryOwner: null, continuesAutomatically,
           sourceRun: { id: "failed-run", status: "failed", errorCode },
@@ -192,7 +192,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
     }
   });
   it("names an environment plugin that was not running after its bounded retries", () => {
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
       recoveryActionId: "worker-recovery",
       recoveryOwner: null,
@@ -203,7 +203,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
     expect(JSON.stringify(notice.metadata)).toContain("Press Retry once it is running again");
   });
   it("asks for Retry, not a board decision, when the environment provider stayed unavailable", () => {
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
       recoveryCause: ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE,
       recoveryActionId: "provider-recovery",
@@ -227,7 +227,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
 
   it("emits system_notice presentation and the required metadata rows", () => {
     const seed = buildWorkspaceValidationRecoveryNoticeSeed();
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       seed,
       recoveryActionId: actionId,
       recoveryOwner: owner,
@@ -267,7 +267,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
   });
 
   it("records board escalation when there is no invokable recovery owner", () => {
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       seed: buildConfigurationIncompleteRecoveryNoticeSeed(),
       recoveryActionId: actionId,
       recoveryOwner: null,
@@ -280,7 +280,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
   });
 
   it("derives title from the recovery cause and body from the plain-comment fallback", () => {
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       fallbackBody: "Legacy plain comment body.",
       recoveryCause: "configuration_incomplete",
       recoveryActionId: actionId,
@@ -295,7 +295,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
   });
 
   it("falls back to the default body and title when no seed or comment is given", () => {
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       recoveryActionId: actionId,
       recoveryOwner: null,
       sourceRun: null,
@@ -306,7 +306,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
   });
 
   it("omits the failure code row when the source run has no error code", () => {
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
       recoveryActionId: actionId,
       recoveryOwner: owner,
@@ -332,7 +332,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
   });
 
   it("leads with the classified run failure code over the generic seed title", () => {
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
       recoveryActionId: actionId,
       recoveryOwner: owner,
@@ -353,7 +353,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
 
   it("titles auth-required run failures as a login error", () => {
     expect(
-      buildStrandedRecoveryEscalationNotice({
+      buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
         seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "todo" }),
         recoveryActionId: actionId,
         recoveryOwner: null,
@@ -363,7 +363,7 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
   });
 
   it("is matched by the metadata-based escalation dedupe matcher", () => {
-    const notice = buildStrandedRecoveryEscalationNotice({
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
       seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "todo" }),
       recoveryActionId: actionId,
       recoveryOwner: owner,
@@ -399,7 +399,7 @@ it("names a found project authentication conflict instead of suggesting secret b
 });
 
 it("names a remote Runner that was still not updated after its retries", () => {
-  const notice = buildStrandedRecoveryEscalationNotice({
+  const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: true },
     seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
     recoveryActionId: "runner-recovery",
     recoveryOwner: null,
@@ -425,4 +425,38 @@ it("tells the operator to switch a preconfigured Runner home to an isolated one"
   expect(notice.title).toBe("Isolated Runner home required");
   expect(notice.nextAction).toContain("isolated Runner home");
   expect(notice.nextAction).not.toContain("Choose an AI connection");
+});
+
+// rf-5 on R4 #21914: the notice says "Press Retry" only where POST /issues/:id/retry admits.
+describe("stranded notice offers Retry only where Retry admits", () => {
+  const nextActionOf = (notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>) =>
+    notice.metadata.sections[0]!.rows.find(row => "label" in row && row.label === "Next action");
+  const build = (retry: Parameters<typeof buildStrandedRecoveryEscalationNotice>[0]["retry"]) =>
+    buildStrandedRecoveryEscalationNotice({ retry, recoveryActionId: "action-1", recoveryOwner: null,
+      sourceRun: { id: "run-1", status: "failed" } });
+  it.each([
+    [{ admits: false, refusal: "agent_paused", agentName: "Ada" } as const, "Ask a board user or Ada's manager to resume Ada.", "Ada is paused"],
+    [{ admits: false, refusal: "previous_execution_unverified" } as const, "Press Confirm it stopped once the previous attempt has stopped.", "can't confirm that the previous attempt stopped"],
+    [{ admits: false, refusal: "workspace_repair_required" } as const, "Press Recover saved files to recover the workspace.", "saved files must be recovered first"],
+  ])("RED %o: no Retry instruction; the true action instead", (retry, action, cause) => {
+    const notice = build(retry);
+    expect(notice.body).not.toMatch(/press retry/i);
+    expect(notice.body).toContain(cause);
+    expect(notice.body).toContain("Your message is saved.");
+    expect(JSON.stringify(nextActionOf(notice))).not.toMatch(/press retry/i);
+    expect(JSON.stringify(nextActionOf(notice))).toContain(action);
+    expect(notice.presentation.title).toBe("Automatic recovery blocked");
+  });
+  it("no action exists: says the message is saved and what moves it", () => {
+    const notice = build({ admits: false, refusal: "none" });
+    expect(notice.body).not.toMatch(/retry/i);
+    expect(notice.body).toContain("Your message is saved.");
+    expect(JSON.stringify(nextActionOf(notice))).toContain("a new message or a change to the task starts it again");
+  });
+  it("CONTROL: an admissible failure keeps Press Retry", () => {
+    const notice = build({ admits: true });
+    expect(notice.body).toBe(DEFAULT_STRANDED_RECOVERY_NOTICE_BODY);
+    expect(notice.body).toContain("Press Retry");
+    expect(JSON.stringify(nextActionOf(notice))).toContain("Press Retry");
+  });
 });
