@@ -14,7 +14,9 @@ import { answeredPersonMessageSql } from "../person-message-answer.js";
 import { settleUnansweredPersonMessage, settleUnansweredPersonMessagesForTask, unansweredPersonMessageCondition,
   UNANSWERED_MESSAGE_NO_RUN_TEXT, UNANSWERED_MESSAGE_TEXT } from "./unanswered-person-message.js";
 
-// Keep (never-OK rule: no person message is silently unanswered): the sweep's owed set is PER MESSAGE.
+// Keep (never-OK rule: no person message is silently unanswered, and never two lines for one message): the sweep
+// owes EVERY unanswered person message and writes ONE notice per owed GROUP (RFL ruling B, 11-18 17:50Z): the
+// messages one failed or reply-less run carried in its own input, or one no-run batch settled in the same pass.
 // Built on the SA-2205 fixture (sa2205-stranded-notice-survives.test.ts); was the merged2 builder's probe.
 // Only worker admission is controlled: persist the route's real wake receipt,
 // but do not launch a model/runner. Routes, authorization, comments, answer
@@ -44,7 +46,7 @@ vi.mock("../heartbeat.js", async importOriginal => {
 
 const support = await getEmbeddedPostgresTestSupport();
 if (!support.supported) console.warn(`SA-2205 embedded Postgres unsupported: ${support.reason}`);
-describe.skipIf(!support.supported)("the sweep owes every unanswered person message, not only the latest (joint rule)", () => {
+describe.skipIf(!support.supported)("the sweep owes every unanswered person message: one notice per owed group (RFL ruling B)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   beforeAll(async () => {
@@ -134,14 +136,27 @@ describe.skipIf(!support.supported)("the sweep owes every unanswered person mess
       unansweredPersonMessageCondition(issues.id, issues.companyId)))).length === 1;
     const allNotices = async () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
       eq(issueComments.authorType, "system"), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
-    /** A run whose OWN input names the message; it is left running until the caller ends it. */
-    const startRun = async (messageId: string) => {
+    /** A run whose OWN input names the message(s); it is left running until the caller ends it. */
+    const startRun = async (...messageIds: string[]) => {
+      const last = messageIds[messageIds.length - 1];
       const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", runtimeMode: "native",
         nativeIssueId: issueId, startedAt: new Date(), contextSnapshot: { issueId, conversationSessionGeneration: 0,
-          wakeReason: "issue_commented", commentId: messageId, wakeCommentId: messageId, wakeCommentIds: [messageId] } }).returning();
-      await db.update(agentWakeupRequests).set({ status: "completed", runId: run.id, error: null, finishedAt: new Date() }).where(and(
-        eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.payload}->>'commentId' = ${messageId}`));
+          wakeReason: "issue_commented", commentId: last, wakeCommentId: last, wakeCommentIds: messageIds } }).returning();
+      for (const messageId of messageIds) {
+        await db.update(agentWakeupRequests).set({ status: "completed", runId: run.id, error: null, finishedAt: new Date() }).where(and(
+          eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.payload}->>'commentId' = ${messageId}`));
+      }
       return run.id;
+    };
+    /** Every notice ever written that covers the message: its key names it, or its still-owed member list does. */
+    const coveredBy = async (messageId: string) => (await allNotices()).filter(notice => {
+      const metadata = notice.metadata as { authorizationReason?: string; unansweredMessageIds?: string[] };
+      return metadata.authorizationReason === `unanswered_message:${messageId}` || (metadata.unansweredMessageIds ?? []).includes(messageId);
+    });
+    /** What a notice names: [key message, still-owed member list]. */
+    const names = (notice: { metadata: unknown }) => {
+      const metadata = notice.metadata as { authorizationReason?: string; unansweredMessageIds?: string[] };
+      return [metadata.authorizationReason, metadata.unansweredMessageIds];
     };
     const failRun = (runId: string) => db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed",
       error: "adapter_failed: the model call failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
@@ -154,12 +169,12 @@ describe.skipIf(!support.supported)("the sweep owes every unanswered person mess
     const sweepTask = (minutes: number) => settleUnansweredPersonMessagesForTask(db, {
       companyId, issueId, now: new Date(startedAt + minutes * 60_000) });
     return { companyId, issueId, agentId, send, read, sweep, sweepTask, noticesFor, allNotices, answerState, succeedWithReply,
-      flagged, startRun, failRun, holdWake };
+      flagged, startRun, failRun, holdWake, coveredBy, names };
   }
 
   const live = (rows: Array<{ deletedAt: Date | null }>) => rows.filter(row => row.deletedAt === null);
 
-  it("(i) M1 has no notice yet when a later M2 is answered: M1 still gets its ONE notice, M2 none", async () => {
+  it("probe: M1 has no notice yet when a later M2 is answered: M1 still gets its ONE notice, M2 none", async () => {
     const f = await fixture();
     const m1 = await f.send("M1: Please investigate the deployment failure.");
     const m2 = await f.send("M2: Separately, what is the current release version?");
@@ -179,46 +194,134 @@ describe.skipIf(!support.supported)("the sweep owes every unanswered person mess
     expect(await f.flagged(), "discovery stops flagging once every owed message has its notice").toBe(false);
   }, 60_000);
 
-  it("(ii) M1 and M2 both unanswered: each gets its ONE notice, same writer and words", async () => {
+  it("probe: M1 and M2 both unanswered -> each owed message is covered by exactly ONE notice (one for the batch)", async () => {
     const f = await fixture();
     const m1 = await f.send("M1: first.");
     const m2 = await f.send("M2: second.");
     expect([await f.answerState(m1), await f.answerState(m2)]).toEqual([false, false]);
-    expect(await f.sweepTask(3), "one pass notices both").toEqual({ noticed: 2, pending: 0 });
+    expect(await f.sweepTask(3), "one pass, one notice for the no-run batch").toEqual({ noticed: 1, pending: 0 });
     expect([await f.sweepTask(10), await f.sweepTask(30)], "no second notice").toEqual([{ noticed: 0, pending: 0 }, { noticed: 0, pending: 0 }]);
-    for (const id of [m1, m2]) {
-      const notices = await f.noticesFor(id);
-      expect(notices, `message ${id === m1 ? "M1" : "M2"} has exactly ONE notice`).toHaveLength(1);
-      expect(notices[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_NO_RUN_TEXT,
-        metadata: { authorizationReason: `unanswered_message:${id}` } });
-    }
-    const [n1, n2] = [(await f.noticesFor(m1))[0], (await f.noticesFor(m2))[0]];
-    expect({ ...(n1.metadata as object), authorizationReason: null }, "same metadata shape as the latest message's notice")
-      .toEqual({ ...(n2.metadata as object), authorizationReason: null });
-    expect(n1.presentation).toEqual(n2.presentation);
-    expect(await f.allNotices()).toHaveLength(2);
+    for (const id of [m1, m2]) expect(await f.coveredBy(id), `message ${id === m1 ? "M1" : "M2"} is covered by exactly ONE notice`).toHaveLength(1);
+    expect(await f.allNotices(), "exactly one notice on the task").toHaveLength(1);
     expect(await f.flagged(), "discovery stops flagging").toBe(false);
   }, 60_000);
 
-  it("control: a later message answered never retires an earlier one's notice; M1's own answer retires it, once", async () => {
+  it("(i) one failed run carried M1+M2 in its own input -> exactly ONE notice that names both", async () => {
     const f = await fixture();
     const m1 = await f.send("M1: first.");
     const m2 = await f.send("M2: second.");
-    expect(await f.sweepTask(3)).toEqual({ noticed: 2, pending: 0 });
+    const run = await f.startRun(m1, m2);
+    await f.failRun(run);
+    expect([await f.answerState(m1), await f.answerState(m2)], "both owed").toEqual([false, false]);
+    expect(await f.sweepTask(3)).toEqual({ noticed: 1, pending: 0 });
+    expect([await f.sweepTask(10), await f.sweepTask(30)], "no second notice").toEqual([{ noticed: 0, pending: 0 }, { noticed: 0, pending: 0 }]);
+    const notices = await f.allNotices();
+    expect(notices, "exactly ONE notice for the group").toHaveLength(1);
+    expect(notices[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_TEXT });
+    expect(f.names(notices[0]), "keyed to the latest member; the list names both").toEqual([`unanswered_message:${m2}`, [m1, m2]]);
+    expect(JSON.stringify(notices[0].metadata), "it names the failed run").toContain(run);
+    for (const id of [m1, m2]) expect(await f.coveredBy(id), "each member is covered exactly once").toHaveLength(1);
+    expect(await f.flagged()).toBe(false);
+  }, 60_000);
+
+  it("(ii)+(iii) M2 answered by a run whose own input names M2 -> the notice STAYS and names only M1; M1 answered -> it retires, once", async () => {
+    const f = await fixture();
+    const m1 = await f.send("M1: first.");
+    const m2 = await f.send("M2: second.");
+    await f.failRun(await f.startRun(m1, m2));
+    expect(await f.sweepTask(3)).toEqual({ noticed: 1, pending: 0 });
+    const [notice] = await f.allNotices();
     await f.succeedWithReply(m2, "M2 only.");
-    expect(await f.sweep(4)).toEqual({ kind: "answered" });
-    expect(live(await f.noticesFor(m1)), "M1's notice is kept until M1 itself is answered").toHaveLength(1);
-    expect(live(await f.noticesFor(m2)), "M2's notice is retired by M2's answer").toHaveLength(0);
-    expect(await f.noticesFor(m2), "and it was only ever one").toHaveLength(1);
+    expect([await f.answerState(m1), await f.answerState(m2)], "the one function: M1 owed, M2 answered").toEqual([false, true]);
+    expect(await f.flagged(), "discovery flags the notice: a member was answered").toBe(true);
+    expect([await f.sweepTask(4), await f.sweepTask(5)]).toEqual([{ noticed: 0, pending: 0 }, { noticed: 0, pending: 0 }]);
+    let notices = await f.allNotices();
+    expect(notices, "(ii) still exactly one notice, the same one, live").toHaveLength(1);
+    expect(notices[0]).toMatchObject({ id: notice.id, deletedAt: null, body: UNANSWERED_MESSAGE_TEXT });
+    expect(f.names(notices[0]), "(ii) it never names the answered M2: key and list name M1 only").toEqual([`unanswered_message:${m1}`, [m1]]);
+    expect(JSON.stringify(notices[0].metadata), "(ii) no trace of the answered message").not.toContain(m2);
+    expect(await f.coveredBy(m2), "(ii) the answered M2 is covered by no notice").toHaveLength(0);
     expect(await f.flagged()).toBe(false);
     await f.succeedWithReply(m1, "M1 now.");
-    expect(await f.flagged(), "discovery flags M1's notice for retirement").toBe(true);
-    await f.sweep(5);
-    await f.sweep(6);
-    expect(live(await f.noticesFor(m1)), "M1's answer retires M1's notice").toHaveLength(0);
-    expect(await f.allNotices(), "no second notice for either message").toHaveLength(2);
+    expect(await f.flagged(), "discovery flags the notice for retirement").toBe(true);
+    await f.sweepTask(6);
+    await f.sweepTask(7);
+    notices = await f.allNotices();
+    expect(notices, "(iii) only ever one notice").toHaveLength(1);
+    expect(notices[0].id).toBe(notice.id);
+    expect(notices[0].deletedAt, "(iii) retired once every member is answered").not.toBeNull();
+    const retiredAt = notices[0].deletedAt;
+    await f.sweepTask(8);
+    expect((await f.allNotices()).map(row => row.deletedAt), "(iii) retired once, not again").toEqual([retiredAt]);
     expect([await f.answerState(m1), await f.answerState(m2)]).toEqual([true, true]);
     expect(await f.flagged()).toBe(false);
+  }, 60_000);
+
+  it("(iv) two SEPARATE failed runs (M1's, M2's) -> two notices, one per group, never two for one message", async () => {
+    const f = await fixture();
+    const m1 = await f.send("M1: first.");
+    const run1 = await f.startRun(m1);
+    await f.failRun(run1);
+    const m2 = await f.send("M2: second.");
+    const run2 = await f.startRun(m2);
+    await f.failRun(run2);
+    expect(await f.sweepTask(3)).toEqual({ noticed: 2, pending: 0 });
+    expect([await f.sweepTask(10), await f.sweepTask(30)]).toEqual([{ noticed: 0, pending: 0 }, { noticed: 0, pending: 0 }]);
+    expect(await f.allNotices(), "two notices, one per failed run").toHaveLength(2);
+    for (const [id, run] of [[m1, run1], [m2, run2]]) {
+      const covering = await f.coveredBy(id);
+      expect(covering, "each message is covered by exactly ONE notice").toHaveLength(1);
+      expect(covering[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_TEXT });
+      expect(f.names(covering[0]), "a group of one: keyed to its message, no list").toEqual([`unanswered_message:${id}`, undefined]);
+      expect(JSON.stringify(covering[0].metadata), "it names its own failed run").toContain(run);
+    }
+    expect(await f.flagged()).toBe(false);
+  }, 60_000);
+
+  it("(v) a no-run batch of M1+M2 -> ONE notice; M2 answered -> it stays for M1; retired only when both are answered", async () => {
+    const f = await fixture();
+    const m1 = await f.send("M1: first.");
+    const m2 = await f.send("M2: second.");
+    expect(await f.sweepTask(3)).toEqual({ noticed: 1, pending: 0 });
+    const [notice] = await f.allNotices();
+    expect(notice).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_NO_RUN_TEXT });
+    expect(f.names(notice)).toEqual([`unanswered_message:${m2}`, [m1, m2]]);
+    await f.succeedWithReply(m2, "M2 only.");
+    await f.sweepTask(4);
+    await f.sweepTask(5);
+    let notices = await f.allNotices();
+    expect(notices, "a later message answered never retires the notice an earlier one still needs").toHaveLength(1);
+    expect(notices[0]).toMatchObject({ id: notice.id, deletedAt: null, body: UNANSWERED_MESSAGE_NO_RUN_TEXT });
+    expect(f.names(notices[0])).toEqual([`unanswered_message:${m1}`, [m1]]);
+    expect(await f.flagged()).toBe(false);
+    await f.succeedWithReply(m1, "M1 now.");
+    expect(await f.flagged(), "discovery flags the notice for retirement").toBe(true);
+    await f.sweepTask(6);
+    await f.sweepTask(7);
+    notices = await f.allNotices();
+    expect(notices, "no second notice for either message").toHaveLength(1);
+    expect(notices[0].deletedAt, "retired when both are answered").not.toBeNull();
+    expect([await f.answerState(m1), await f.answerState(m2)]).toEqual([true, true]);
+    expect(await f.flagged()).toBe(false);
+  }, 60_000);
+
+  it("(vi) a LATER message's reply answers neither member: the group's notice stays and still names both", async () => {
+    const f = await fixture();
+    const m1 = await f.send("M1: first.");
+    const m2 = await f.send("M2: second.");
+    await f.failRun(await f.startRun(m1, m2));
+    expect(await f.sweepTask(3)).toEqual({ noticed: 1, pending: 0 });
+    const [notice] = await f.allNotices();
+    const m3 = await f.send("M3: a later, separate question.");
+    await f.succeedWithReply(m3, "M3 only.");
+    expect([await f.answerState(m1), await f.answerState(m2), await f.answerState(m3)]).toEqual([false, false, true]);
+    expect(await f.flagged(), "nothing to settle: no member was answered").toBe(false);
+    expect([await f.sweepTask(4), await f.sweepTask(30)]).toEqual([{ noticed: 0, pending: 0 }, { noticed: 0, pending: 0 }]);
+    const notices = await f.allNotices();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ id: notice.id, deletedAt: null, body: UNANSWERED_MESSAGE_TEXT });
+    expect(f.names(notices[0])).toEqual([`unanswered_message:${m2}`, [m1, m2]]);
+    expect(await f.coveredBy(m3), "the answered M3 has no notice").toHaveLength(0);
   }, 60_000);
 
   it("control: every message answered by its own succeeded run gets no notice", async () => {

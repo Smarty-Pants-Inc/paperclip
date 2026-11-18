@@ -1202,6 +1202,8 @@ export const issueCommentMetadataSchema = z
       assigneeAgentId: z.string().guid().nullable(),
     }).strict().optional(),
     sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20),
+    // An unanswered-message notice that covers an owed GROUP of person messages lists its still-owed members.
+    unansweredMessageIds: z.array(z.uuid()).min(1).max(50).optional(),
   })
   .strict();
 
