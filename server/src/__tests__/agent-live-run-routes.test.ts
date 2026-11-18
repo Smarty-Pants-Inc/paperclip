@@ -31,6 +31,9 @@ const mockIssueService = vi.hoisted(() => ({
 }));
 const mockNativeReviewAssignment = vi.hoisted(() => vi.fn());
 const mockRejectedModelRetryRefusal = vi.hoisted(() => vi.fn());
+// rf-5 condition (2): the exact retry reads the task's one Retry authority (task-retry-eligibility.ts
+// readRetryAdmissionAuthority). This file's db is a stub; the authority's read is given, as the model refusal's is.
+const mockRetryAdmissionAuthority = vi.hoisted(() => vi.fn());
 
 const mockExecutionProjection = vi.hoisted(() => ({
   executionProjectionForRun: vi.fn(async () => null),
@@ -90,6 +93,10 @@ function registerModuleMocks() {
   vi.doMock("../services/native-runtime/model-rejected-retry.js", async () => ({
     ...(await vi.importActual<typeof import("../services/native-runtime/model-rejected-retry.js")>("../services/native-runtime/model-rejected-retry.js")),
     rejectedModelRetryRefusal: mockRejectedModelRetryRefusal,
+  }));
+  vi.doMock("../services/task-retry-eligibility.js", async () => ({
+    ...(await vi.importActual<typeof import("../services/task-retry-eligibility.js")>("../services/task-retry-eligibility.js")),
+    readRetryAdmissionAuthority: mockRetryAdmissionAuthority,
   }));
   vi.doMock("../services/native-runtime/native-review-participant.js", async () => ({
     ...(await vi.importActual<typeof import("../services/native-runtime/native-review-participant.js")>("../services/native-runtime/native-review-participant.js")),
@@ -310,6 +317,8 @@ describe("agent live run routes", () => {
     mockChatRunRetries.processFailedChatRunRetry.mockReset();
     mockNativeReviewAssignment.mockReset().mockResolvedValue(null);
     mockRejectedModelRetryRefusal.mockReset().mockResolvedValue(null);
+    mockRetryAdmissionAuthority.mockReset().mockImplementation(async () => (await vi.importActual<
+      typeof import("../services/task-retry-eligibility.js")>("../services/task-retry-eligibility.js")).decideRetryAuthority({ retrySource: true }));
     mockAccessService.canUser.mockResolvedValue(true);
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
       allowed: true,
@@ -1250,6 +1259,28 @@ describe("agent live run routes", () => {
       }), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send(retryBody));
       expect(res.status).toBe(409);
       expect(res.body).toMatchObject({ error: expect.stringContaining("still shutting down") });
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(mockChatRunRetries.prepareFailedChatRunRetry).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["refuses (the run's own input is ANSWERED)", { personMessageAnswered: true, retrySource: true },
+        { error: "Already answered above.", details: { code: "retry_not_available", reason: "person_message_already_answered" } }],
+      ["holds (a restore hold Paperclip can still release)", { restoreHold: { workspaceRestorePending: true }, retrySource: true },
+        { details: { code: "retry_held", reason: "workspace_repair_required", admission: "held" } }],
+    ] as const)("starts nothing when the one Retry authority %s", async (_name, facts, body) => {
+      const { decideRetryAuthority } = await vi.importActual<typeof import("../services/task-retry-eligibility.js")>("../services/task-retry-eligibility.js");
+      const authority = decideRetryAuthority(facts);
+      mockRetryAdmissionAuthority.mockResolvedValue(authority);
+      const fixture = createFailedChatRetryDb(false);
+      mockHeartbeatService.getRun.mockResolvedValue({ ...selectedRun, contextSnapshot: { issueId: failedChatIssueId } });
+      const res = await requestApp(await createApp(fixture.db, {
+        type: "board", userId: "operator", source: "session", companyIds: ["company-1"],
+      }), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send(retryBody));
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body).toMatchObject({ error: authority.cardText, ...body });
+      expect(mockRetryAdmissionAuthority).toHaveBeenCalledExactlyOnceWith(fixture.db,
+        { companyId: "company-1", issueId: failedChatIssueId, sourceRunId: failedChatRunId });
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
       expect(mockChatRunRetries.prepareFailedChatRunRetry).not.toHaveBeenCalled();
     });
