@@ -150,10 +150,8 @@ fn listener_controller_pings_keep_an_idle_connection() {
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let path = "/api/runner/v1/connect/run_1".to_owned();
-    let endpoint = RunnerTransportEndpoint::Listen {
-        listener,
-        path: path.clone(),
-    };
+    // Fork: Listen wraps a ListenerIngress; from_listener is the fork's test constructor.
+    let endpoint = RunnerTransportEndpoint::from_listener(listener, path.clone());
     let mut config = config(address.port());
     config.controller_silence = Duration::from_millis(1_000);
     let state = test_state(&config);
@@ -214,10 +212,8 @@ fn listener_welcome_timeout_is_not_reported_as_controller_silence() {
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let path = "/api/runner/v1/connect/run_1".to_owned();
-    let endpoint = RunnerTransportEndpoint::Listen {
-        listener,
-        path: path.clone(),
-    };
+    // Fork: Listen wraps a ListenerIngress; from_listener is the fork's test constructor.
+    let endpoint = RunnerTransportEndpoint::from_listener(listener, path.clone());
     let mut config = config(address.port());
     config.controller_silence = Duration::from_millis(100);
     let state = test_state(&config);

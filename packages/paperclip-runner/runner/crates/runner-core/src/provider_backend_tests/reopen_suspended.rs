@@ -174,6 +174,7 @@ mod reopen_suspended {
             reconnect_grace: None,
             max_runtime: std::time::Duration::from_secs(10),
             turn_scoped: false,
+            controller_silence: crate::durable::DEFAULT_CONTROLLER_SILENCE,
         }
     }
 
