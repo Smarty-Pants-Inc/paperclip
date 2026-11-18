@@ -182,12 +182,11 @@ export function unansweredMessageCode(run: { status: string; error: string | nul
 const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorizationReason'`;
 
 /**
- * SQL: an agent answer ATTRIBUTED to message m, the Paperclip way: a reply
- * written by a run whose input carried m or a later person message (the native
- * conversation finalizer's reply boundary, agent-conversations.ts:406-437:
- * messages after a run's boundary stay actionable), via any carrying key. An
- * agent comment with no run counts by time. A later reply to ANOTHER message
- * never answers m.
+ * SQL: message m is ANSWERED, by the one shared rule (person-message-answer.ts):
+ * a reply after m from a run that SUCCEEDED and whose OWN input names m, via
+ * any carrying key; or m is imported history. A reply from a failed, cancelled,
+ * timed-out or interrupted run, a reply to a LATER message, a progress comment
+ * and an agent comment with no run never answer m.
  */
 function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
   // The ONE shared definition (person-message-answer.ts), so B's notice and the continuation carry never
