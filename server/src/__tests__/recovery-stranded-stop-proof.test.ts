@@ -25,46 +25,52 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
       status: "paused", pauseReason: "budget", lifecycleState: "pausing", lifecycleHolds: ["budget"],
       lifecycleRequiredPluginIds: [], lifecycleOperation: { id: randomUUID(), attempts: 1, hostComplete: false, completedPluginIds: [] } });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", status,
-      runtimeMode: "legacy", executionStage: "dispatching", startedAt: new Date(Date.now() - 60_000),
-      finishedAt: status === "running" ? null : new Date(), contextSnapshot: { issueId },
+      runtimeMode: "legacy", executionStage: "dispatching", startedAt: new Date(Date.now() - 120_000),
+      // C1: no Stop-pending card within 60 s of the Stopped run's finish.
+      finishedAt: status === "running" ? null : new Date(Date.now() - 61_000), contextSnapshot: { issueId },
       runnerProfileJson: { adapterDispatch: { adapterType: "http" } } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Still owned by its provider", status: "in_progress",
       assigneeAgentId: agentId, checkoutRunId: runId, executionRunId: runId, executionLockedAt: new Date() });
     return { companyId, agentId, issueId, runId };
   }
   async function task(id: string) { return (await db.select().from(issues).where(eq(issues.id, id)))[0]!; }
-  async function untouched(f: Awaited<ReturnType<typeof fixture>>, before: Awaited<ReturnType<typeof task>>) {
+  /** card=false (C1): a bound run nobody stopped keeps its claims with no Stop card. */
+  async function untouched(f: Awaited<ReturnType<typeof fixture>>, before: Awaited<ReturnType<typeof task>>, card = true) {
     expect(await task(f.issueId)).toEqual(before);
     const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    if (!card) {
+      expect(actions).toEqual([]);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toEqual([]);
+      return;
+    }
     expect(actions).toHaveLength(1);
     expect(actions[0]).toMatchObject({ cause: "execution_stop_pending", status: "escalated", ownerType: "board",
       attemptCount: 1, maxAttempts: 1, evidence: { stopPending: { owner: "recovery.stranded_assigned_issue", escalation: "board" } } });
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toEqual([]);
   }
 
-  it.each(["both", "checkout", "execution"] as const)("preserves a running provider's %s task lock despite a non-invokable assignee", async binding => {
+  it.each(["both", "checkout", "execution"] as const)("supersedes(C1 no-Stop card): preserves a running provider's %s task lock despite a non-invokable assignee", async binding => {
     const f = await fixture();
     if (binding !== "both") await db.update(issues).set(binding === "checkout" ? { executionRunId: null } : { checkoutRunId: null }).where(eq(issues.id, f.issueId));
     const before = await task(f.issueId);
     const result = await recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileStrandedAssignedIssues();
     expect(result.escalated).toBe(0);
-    await untouched(f, before);
+    await untouched(f, before, false);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]!.status).toBe("running");
   });
 
-  it("does not treat terminal cancellation as Stop proof, then releases after durable acknowledgement", async () => {
+  it("supersedes(C1 no-Stop card): does not treat terminal cancellation as Stop proof, then releases after durable acknowledgement", async () => {
     const f = await fixture("cancelled");
     const before = await task(f.issueId);
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
     expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(0);
-    await untouched(f, before);
+    await untouched(f, before, false);
     await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, f.runId));
     expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(1);
     expect(await task(f.issueId)).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId, checkoutRunId: null, executionRunId: null });
     const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     expect(actions.filter(action => action.status === "active" || action.status === "escalated")).toHaveLength(1);
-    expect(actions.find(action => action.cause === "execution_stop_pending"))
-      .toMatchObject({ status: "resolved", outcome: "restored" });
+    expect(actions.find(action => action.cause === "execution_stop_pending")).toBeUndefined();
     expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(0);
   });
 
@@ -108,13 +114,13 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
     await untouched(f, before);
   });
 
-  it("does not accept another company's run as Stop evidence for a bound owner", async () => {
+  it("supersedes(C1 no-Stop card): does not accept another company's run as Stop evidence for a bound owner", async () => {
     const f = await fixture("cancelled"), other = await fixture("cancelled");
     await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, other.runId));
     await db.update(issues).set({ checkoutRunId: other.runId, executionRunId: other.runId }).where(eq(issues.id, f.issueId));
     const before = await task(f.issueId);
     await recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileStrandedAssignedIssues();
-    await untouched(f, before);
+    await untouched(f, before, false);
   });
 
   it("does not let unrelated execution of the same agent prevent confirmed task recovery", async () => {
