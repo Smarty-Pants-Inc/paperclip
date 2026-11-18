@@ -18,7 +18,9 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
-import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
+import { HELD_PREDECESSOR_NOTICE, PERSON_STOP_HELD_MESSAGE_NEXT_ACTION, PERSON_STOP_HELD_MESSAGE_TEXT,
+  PERSON_STOP_HELD_MESSAGE_TITLE } from "../native-runtime/held-predecessor-notice-text.js";
+export { PERSON_STOP_HELD_MESSAGE_NEXT_ACTION, PERSON_STOP_HELD_MESSAGE_TEXT, PERSON_STOP_HELD_MESSAGE_TITLE };
 import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
@@ -98,13 +100,6 @@ export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
-/** SCREEN row 3 (RFL 06:40Z): a message held behind a PERSON's Stop. It is not a
- * failed run, and "send a new message to try again" would invite a retype that
- * gets answered twice (the held one is sent right after the next message). */
-export const PERSON_STOP_HELD_MESSAGE_TEXT =
-  "Stopped. This message is waiting and will be sent when you send your next message. Send it now, or delete it.";
-export const PERSON_STOP_HELD_MESSAGE_TITLE = "Stopped: your message is waiting";
-export const PERSON_STOP_HELD_MESSAGE_NEXT_ACTION = "Send it now, or delete it.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
 /** The ONE bound (follow-Paperclip B-2, RFL 05:51Z): the fork's K=2 fresh-continuation chain cap. */
