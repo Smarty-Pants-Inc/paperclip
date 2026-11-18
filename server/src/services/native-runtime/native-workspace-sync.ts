@@ -1404,7 +1404,13 @@ async function personStopWithoutFilesAsideDir(db: Db, runId: string, leaseId: st
   const [lease] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
     .where(eq(environmentLeases.id, leaseId)).limit(1);
   const decision = readPersonStopBoundDecision(lease?.metadata);
-  return decision?.decision === "without_files" && decision.runId === runId ? personStopAsideDirectory(runId) : null;
+  // adopt-stopu-fvc8 (Q-C), never-OK: `same_box` hands the kept box to the
+  // successor (it adopts the files in place and exports them itself). The
+  // decision is recorded under this run's finalization lock BEFORE admission,
+  // so it revokes the old run's host-export authority: an old retry that
+  // starts after it saves its files aside, never over the successor's host.
+  return (decision?.decision === "without_files" || decision?.decision === "same_box") && decision.runId === runId
+    ? personStopAsideDirectory(runId) : null;
 }
 
 export async function cleanupNativeWorkspaceSync(runId: string): Promise<void> {
