@@ -1633,6 +1633,62 @@ describe("PaperclipControlPlanePort conformance", () => {
     });
   });
 
+  // KEEP (never-OK): a run with known secrets has consumed a source event's
+  // bytes in its hold buffer; a replay with other bytes must not reach the store.
+  describe("a replayed source event on a run with known secrets", () => {
+    const secret = "tok_Q7ZXq7zx9KJWq7zx9KJWM3VB"; // synthetic output secret
+    const openPort = async () => {
+      const identity = { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, runId: randomUUID(), sessionId: randomUUID() };
+      const runnerId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: identity.runId, companyId: identity.companyId, agentId: identity.agentId,
+        status: "running", runtimeMode: "native", nativeIssueId: identity.issueId, nativeSessionId: identity.sessionId,
+        runnerInstanceId: runnerId, completionContractId: contractId, completionContractSha256: contractSha,
+        contextSnapshot: { issueId: identity.issueId } });
+      // Output secrets only: no key material and no run secret material.
+      const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: contractId,
+        completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: `replay-secrets-${identity.runId}` },
+      { secrets: [secret] });
+      await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
+      const delta = (text: string): PrpEvent => ({
+        schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${runnerId}:1`, sourceSeq: 1,
+        sourceInstanceId: runnerId, sourceKind: "runner", runId: identity.runId, normalizedSessionId: identity.sessionId,
+        turnId: "turn", itemId: "item", eventType: "item.delta", priority: 1, emittedAt: new Date(Date.UTC(2026, 10, 18)).toISOString(),
+        payload: { itemId: "item", kind: "commandExecution", text },
+      } as PrpEvent);
+      const rows = async () => db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, identity.runId)).orderBy(asc(heartbeatRunEvents.seq));
+      return { port, delta, rows };
+    };
+    const noRawByte = (stored: unknown) => {
+      const text = JSON.stringify(stored);
+      for (let at = 0; at + 8 <= secret.length; at++) expect(text.includes(secret.slice(at, at + 8))).toBe(false);
+    };
+
+    it("a CHANGED replay is a source payload conflict: nothing is stored twice and no raw byte is stored", async () => {
+      const { port, delta, rows } = await openPort();
+      await expect(port.appendEvent(delta(`first ${secret} done\n`))).resolves.toMatchObject({ disposition: "committed" });
+      const before = await rows();
+      expect(before).toHaveLength(1);
+      for (const changed of [`second ${secret} done\n`, "first ", `first ${secret} done\nand more`]) {
+        await expect(port.appendEvent(delta(changed))).rejects.toThrow("native_event_source_payload_conflict");
+      }
+      const after = await rows();
+      expect(after).toEqual(before);
+      noRawByte(after);
+    });
+
+    it("an IDENTICAL replay is accepted as a duplicate and does not throw", async () => {
+      const { port, delta, rows } = await openPort();
+      const first = await port.appendEvent(delta(`first ${secret} done\n`));
+      expect(first.disposition).toBe("committed");
+      const before = await rows();
+      await expect(port.appendEvent(delta(`first ${secret} done\n`))).resolves.toMatchObject({ disposition: "duplicate", cursor: first.cursor });
+      const after = await rows();
+      expect(after).toEqual(before);
+      expect(after).toHaveLength(1);
+      noRawByte(after);
+    });
+  });
+
   // redact-sec2 F1 (smarty-dev#20895 (a)): the port's redactor is built once; a
   // secret the agent fetches through the agent secret route later must reach it.
   it("redact-sec2 F1: a secret fetched mid-run through the agent secret route is masked in native events committed after the fetch, whole and folded; events before it are unchanged", async () => {
