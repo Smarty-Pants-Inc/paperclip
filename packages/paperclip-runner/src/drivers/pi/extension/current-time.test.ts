@@ -167,6 +167,54 @@ describe("Pi host extension: current time per run (hidden per-run message)", () 
     }
   });
 
+  // Keep reason: 84fbc3a9 sent the time message AFTER the run's prompt, so the run's prompt was no
+  // longer the latest user message. The full-server Pi e2e loopback model classifies the hire
+  // verification probe exactly as below (server/src/__tests__/helpers/native-pi-hello-model.ts:
+  // the LATEST message is the user hello prompt) and failed every Pi e2e file with "Native Pi hire
+  // verification failed". The fixture's envelope scan (every user text part JSON-parsed for a
+  // completionContract) is mirrored too. Real Pi session + shipped extension; only the model is local.
+  it("keeps each run's own prompt the LATEST user message (hello probe and JSON task envelope), the time line its own message just before it", async () => {
+    vi.stubEnv("TZ", "Europe/Berlin");
+    const { session, requests } = await warmSession();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-17T10:00:00Z"));
+    const hello = "Respond only with hello. Do not use tools or inspect files.";
+    await session.prompt(hello);
+    const envelope = JSON.stringify({ kind: "paperclip.run", completionContract: { revision: "rev-1", criteria: [{ id: "c-1", text: "do it" }] } });
+    vi.setSystemTime(new Date("2026-11-17T10:05:00Z"));
+    await session.prompt(envelope);
+    expect(requests).toHaveLength(2);
+    type Part = { type: string; text?: string };
+    const parts = (message: Context["messages"][number]): Part[] =>
+      typeof message.content === "string" ? [{ type: "text", text: message.content }] : (message.content as Part[]);
+    // Mirror of isNativePiHelloRequest: the latest message is a user message carrying the prompt.
+    const latestIsPrompt = (request: Context, prompt: string) => {
+      const latest = request.messages.at(-1)!;
+      return latest.role === "user" && parts(latest).some(part => part.type === "text" && part.text?.trim() === prompt);
+    };
+    expect(latestIsPrompt(requests[0]!, hello)).toBe(true);
+    expect(latestIsPrompt(requests[1]!, envelope)).toBe(true);
+    // Mirror of the fixture's completion-contract scan: every user text part JSON-parsed.
+    let contract: { revision?: string } | undefined;
+    for (const message of requests[1]!.messages) {
+      if (message.role !== "user") continue;
+      for (const part of parts(message)) {
+        if (part.type !== "text") continue;
+        try { const parsed = JSON.parse(part.text!); if (parsed.completionContract) contract = parsed.completionContract; } catch { /* ordinary text */ }
+      }
+    }
+    expect(contract?.revision).toBe("rev-1");
+    // The time is still sent once per run, as its own user-role message right before that run's prompt.
+    const texts = (request: Context) => request.messages.filter(message => message.role === "user").map(message => parts(message).map(part => part.text ?? "").join(""));
+    expect(texts(requests[1]!)).toEqual([
+      "Current time: 2026-11-17T11:00:00+01:00 (Europe/Berlin)", hello,
+      "Current time: 2026-11-17T11:05:00+01:00 (Europe/Berlin)", envelope,
+    ]);
+    // Cache prefix: run 2's request starts with run 1's request byte for byte.
+    expect(JSON.stringify(requests[1]!.messages.slice(0, requests[0]!.messages.length))).toBe(JSON.stringify(requests[0]!.messages));
+    expect(systemBytes(requests[1]!)).toBe(systemBytes(requests[0]!));
+  });
+
   it("also installs the time message in managed (broker-bound) mode without touching the prompt the authority handler forces", () => {
     for (const name of ["PAPERCLIP_PI_BIND_INITIAL_FILE", "PAPERCLIP_PI_INSTRUCTIONS_FILE", "PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY"]) vi.stubEnv(name, undefined);
     vi.stubEnv("PAPERCLIP_PI_BIND_SOCKET", "/pi-current-time-unopened.sock");
