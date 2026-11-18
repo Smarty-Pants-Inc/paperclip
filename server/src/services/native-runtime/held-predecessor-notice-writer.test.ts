@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { HELD_PREDECESSOR_NOTICE, noticeHeldUnfinishedPredecessor } from "./native-session-executor.js";
 import { readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
+import { PERSON_STOP_HELD_MESSAGE_TEXT } from "../recovery/unanswered-person-message.js";
 
 it.each([
   "runner_harness_state_mismatch: backup_without_reusable_lease",
@@ -46,6 +47,33 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
     expect(notices).toHaveLength(1);
     // RFL 20:36Z: a note the person must read is written open, not folded behind a chevron.
     expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice", detailsDefaultOpen: true });
+  });
+
+  it.each([
+    ["cancelled", "user", true],
+    ["cancelled", "system", false],
+    ["failed", "user", false],
+    ["failed", "system", false],
+  ] as const)("SCREEN S6: %s predecessor attributed to %s keeps the correct held advice", async (status, actor, personStop) => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Held Stop writer", issuePrefix: companyId.slice(0, 8) });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Held agent", adapterType: "paperclip_runner", status: "active" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Held task", status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status, runtimeMode: "native", nativeIssueId: issueId,
+      nativeSessionId: sessionId, createdAt: new Date(Date.now() - 1_000),
+      resultJson: { cancelledByActorType: actor, ...(actor === "user" ? { cancelledByUserId: "person" } : {}) } });
+    const [current] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", runtimeMode: "native",
+      nativeIssueId: issueId, nativeSessionId: sessionId }).returning();
+    const input = { db, execution: { provider: { kind: "pi_rpc" },
+      binding: { companyId, agentId, issueId, runId: current!.id }, session: { normalizedSessionId: sessionId } } as never };
+    const refusal = new Error("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate");
+    await noticeHeldUnfinishedPredecessor(input, refusal);
+    await noticeHeldUnfinishedPredecessor(input, refusal);
+    const notices = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(personStop ? PERSON_STOP_HELD_MESSAGE_TEXT : HELD_PREDECESSOR_NOTICE);
+    if (personStop) expect(notices[0]!.body).not.toContain("Send a new message to try again");
+    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).not.toBeNull();
   });
 
   it("writes one notice per hold: none while it stands, one new notice after the same session continued", async () => {
