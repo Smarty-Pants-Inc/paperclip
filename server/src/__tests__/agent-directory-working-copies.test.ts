@@ -966,6 +966,39 @@ describe("persistent agent directories", () => {
         } finally { await handle.close(); }
       }, 60_000);
 
+      // review-fleet-3 (rf3-port-collector, smarty-dev#20787): on an EPHEMERAL
+      // server the warm checkpoint takes upstream's pre-lock capture first. That
+      // capture predates the aside surfacing, so it must not be reused when a
+      // retained aside copy is surfaced; this is the only row that catches the
+      // removal of that guard (review-fleet-4's checks stay green without it).
+      it("RF3 EPHEMERAL ASIDE PRE-CAPTURE: a surfaced aside copy is in the capture that saves it, not the stale pre-lock capture", async () => {
+        vi.stubEnv("PAPERCLIP_EPHEMERAL_SERVER", "true");
+        onTestFinished(() => { vi.unstubAllEnvs(); });
+        await paulBundle();
+        const f = "memory/fd-writer-ephemeral.md";
+        await fs.writeFile(path.join(root, f), "checkpoint baseline\n");
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        const handle = await fs.open(path.join(chatA.executionRoot, f), "a");
+        try {
+          await boat.siblingSavesRemote(f, "sibling F'\n");
+          const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+          expect(turn2.executionRoot).toBe(chatA.executionRoot);
+          await handle.write("FD-AFTER-SWAP\n");
+          await handle.sync();
+          const asideRoot = path.join(turn2.executionRoot, ".paperclip-runtime", "notes-aside");
+          const [epoch] = await fs.readdir(asideRoot);
+          expect(await fs.readFile(path.join(asideRoot, epoch!, "0"), "utf8")).toBe("checkpoint baseline\nFD-AFTER-SWAP\n");
+          const saved = await copies.checkpointWarm({ companyId, runId: turn2.runId, target: boat.executionTarget });
+          expect(saved).toMatchObject({ state: "warm_saved", receipt: { checkpointState: "saved", notesAside: false } });
+          // Exact bytes of the surfaced copy are canonical after THIS checkpoint.
+          expect(await fs.readFile(path.join(root, `${f}.aside-${epoch}`), "utf8")).toBe("checkpoint baseline\nFD-AFTER-SWAP\n");
+          expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
+          await expect(fs.stat(asideRoot)).rejects.toMatchObject({ code: "ENOENT" });
+        } finally { await handle.close(); }
+      }, 60_000);
+
       it("REMOTE sandbox never-OK: after a failed post-check the retained aside copy is surfaced by the stopped collection", async () => {
         const f = "memory/fd-retired.md", disjoint = "memory/disjoint-racer.md";
         let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
