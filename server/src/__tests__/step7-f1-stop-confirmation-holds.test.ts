@@ -225,6 +225,26 @@ describeEmbeddedPostgres("step7-f1: upstream preparation Stop confirmation disch
     expect((await executionProjectionsForRuns(db, companyId, [run.id])).get(run.id)).toMatchObject({ phase: "completed", label: "Stopped" });
   }, 60_000);
 
+  it("F1 discharges an existing Stop-pending action when upstream confirms the preparation Stop", async () => {
+    const { companyId, agentId } = await seed();
+    const [issue] = await db.insert(issues).values({ companyId, assigneeAgentId: agentId, title: "Upgraded hold", status: "in_progress" }).returning();
+    const requestedAt = new Date().toISOString();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: issue.id,
+      status: "cancelled", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date(), errorCode: "cancelled",
+      contextSnapshot: { issueId: issue.id }, resultJson: {
+        cancellation: { source: "operator", expected: true, initiator: { type: "user", id: "responsible-user" }, reason: "Stop", recordedAt: requestedAt },
+        executionCancellation: { state: "requested", requestedAt },
+      } }).returning();
+    const hold = await insertOlderStopHold(companyId, issue.id, run.id);
+    const settled = await settleCancelledLegacyPreparation(db, { run, providerDispatchStarted: false });
+    expect(settled?.resultJson?.executionCancellation).toMatchObject({ state: "acknowledged", proof: "preparation_settled" });
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold.id));
+    expect(after).toMatchObject({ status: "resolved", outcome: "restored" });
+    expect(await openActions(issue.id)).toEqual([]);
+    const [task] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(await taskInterruptionPresentation(db, task)).toMatchObject({ state: "resolved" });
+  });
+
   it("F1 keeps a Stop-pending action that also binds another run without Stop proof", async () => {
     const { companyId, agentId } = await seed();
     const [issue] = await db.insert(issues).values({ companyId, assigneeAgentId: agentId, title: "Two owners", status: "in_progress" }).returning();
