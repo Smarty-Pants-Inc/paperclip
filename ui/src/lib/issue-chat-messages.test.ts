@@ -1878,6 +1878,23 @@ describe("AI recovery presentation", () => {
 });
 
 describe("superseded waiting notes", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/paperclip/commit/7dfac2b7273352c16c464c9c2ac0f4284a25d797 (R1 rfl-verdicts/rfl-f1judge/VERDICT.md, rfl-unionjudge/VERDICT.md)
+  it("shows only the current F1 note after its predecessor is superseded", () => {
+    const oldId = "11111111-1111-4111-8111-111111111111";
+    const nextId = "22222222-2222-4222-8222-222222222222";
+    const base = { companyId: "company", issueId: "issue", authorType: "system", authorAgentId: null, authorUserId: null,
+      deletedAt: null, presentation: { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false } };
+    const comments = [
+      { ...base, id: oldId, createdAt: new Date("2026-11-14T18:25:18Z"), updatedAt: new Date("2026-11-14T18:40:38Z"),
+        body: "I'm stopping the earlier attempt before starting fresh. Your message is saved; the fresh thread will read this conversation's history.",
+        metadata: { version: 1, authorizationReason: "fresh_provider_thread_pending:session", sections: [], supersededByCommentId: nextId } },
+      { ...base, id: nextId, createdAt: new Date("2026-11-14T18:40:38Z"), updatedAt: new Date("2026-11-14T18:40:38Z"),
+        body: "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.",
+        metadata: { version: 1, authorizationReason: "fresh_provider_thread_pending:session", sections: [] } },
+    ] as IssueChatComment[];
+    const messages = buildIssueChatMessages({ comments, interactions: [], timelineEvents: [], linkedRuns: [], liveRuns: [] });
+    expect(messages.map(m => m.id)).toEqual([nextId]);
+  });
   it("keeps a superseded note when its successor is not in the list being built", () => {
     const notice = { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false } as const;
     const old = createComment({
