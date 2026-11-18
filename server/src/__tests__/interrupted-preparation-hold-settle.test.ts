@@ -9,6 +9,7 @@ import {
   authUsers,
   companyMemberships,
   companies,
+  completionContracts,
   createDb,
   environmentLeases,
   environments,
@@ -17,6 +18,7 @@ import {
   heartbeatRuns,
   issueRecoveryActions,
   issues,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { currentProcessSpaceHash } from "../services/controller-process-identity.js";
@@ -70,13 +72,20 @@ suite("held interrupted preparations on the shared ownership path", () => {
   }, 30_000);
 
   afterEach(async () => {
+    // Existing teardown API: let the admitted replay finish writing before
+    // removing its native coordinator and completion contract.
+    await heartbeatService(db).drainActiveRunExecutions();
     await db.delete(activityLog);
     await db.delete(issueRecoveryActions);
     await db.delete(environmentLeases);
     await db.delete(executionWorkspaces);
     await db.delete(heartbeatRunEvents);
+    // A replay can reach native runtime selection, which writes its coordinator
+    // (runtime-selection.ts:1159) before this test's successor is cleaned up.
+    await db.delete(nativeRunFinalizations);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(completionContracts);
     await db.delete(issues);
   });
 
