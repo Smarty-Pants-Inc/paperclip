@@ -151,7 +151,7 @@ import { uploadVerifiedProviderPack } from "./provider-pack-upload.js";
 import { selectRemotePiCompanion } from "./remote-pi-companion.js";
 import { scheduledResumeContinuationAllowed } from "./scheduled-resume-continuation.js";
 import { readNativeLocalProcessStop, recordedLocalExecutionStopped, PRIOR_OWNER_FENCE_REFUSED, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, withReleasedNativeRunProcess } from "../native-local-process-stop.js";
-import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, remoteLeaseCleanupScope, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "../reusable-sandbox-kept-marker.js";
 import { connectorToolDefinitionsForSkills } from "../connector-runtime.js";
 import { NATIVE_PREPARATION_FENCING_VERSION, setNativeExecutionActive } from "./native-active-runs.js";
@@ -273,6 +273,7 @@ import {
   sql,
 } from "drizzle-orm";
 import {
+  activityLog,
   agentWakeupRequests,
   documentRevisions,
   environments,
@@ -290,7 +291,7 @@ import {
   nativeRunResults,
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
-import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
+import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery, RETAINED_OWNER_LEASE_WAIT_MESSAGE, STOPPED_RUN_TOOLS_WAIT_MESSAGE } from "./native-controller-recovery.js";
 import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 import type { EnvironmentDriverExecuteInput } from "../environment-runtime.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
@@ -6906,6 +6907,174 @@ async function assertPluginTaskReattachmentBinding(input: {
   return taskId;
 }
 
+/** S095 (rf-3): the person's Stop of this exact run is requested but its
+ * acknowledgement has not landed: cancelled by a user, executionCancellation
+ * still "requested", and its own run-scoped native Stop intent still
+ * dispatchState "pending". Until it lands no retirement refusal of this owner
+ * can be judged, and a quarantined copy would refuse every later admission. */
+function personStopAwaitingAcknowledgement(run: typeof heartbeatRuns.$inferSelect): boolean {
+  const result = record(run.resultJson);
+  const intent = record(result.nativeCancellation);
+  return run.status === "cancelled" && result.cancelledByActorType === "user"
+    && typeof result.cancelledByUserId === "string" && result.cancelledByUserId.length > 0
+    && record(result.executionCancellation).state === "requested"
+    && intent.schema === "paperclip.native-cancellation.v1" && intent.runId === run.id && intent.companyId === run.companyId
+    && intent.scope === "run" && intent.dispatchState === "pending";
+}
+
+async function ownerStopAwaitingAcknowledgement(input: { db: Db; execution: NativeExecutionInput },
+  identity: { runId?: unknown }): Promise<boolean> {
+  if (typeof identity.runId !== "string") return false;
+  const [run] = await input.db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, identity.runId),
+    eq(heartbeatRuns.companyId, input.execution.binding.companyId))).limit(1);
+  return run !== undefined && personStopAwaitingAcknowledgement(run);
+}
+
+/** The S095 deferral's words, true to the stopped run's state: a lease of it
+ * still held (active, not yet stopped) -> the retained owner's lease words;
+ * no held lease (NULL) -> its tools are not yet confirmed exited. */
+async function stoppedRunWaitMessage(input: { db: Db; execution: NativeExecutionInput }, stoppedRunId: unknown): Promise<string> {
+  if (typeof stoppedRunId !== "string") return STOPPED_RUN_TOOLS_WAIT_MESSAGE;
+  const [held] = await input.db.select({ id: environmentLeases.id }).from(environmentLeases)
+    .where(and(eq(environmentLeases.companyId, input.execution.binding.companyId),
+      eq(environmentLeases.heartbeatRunId, stoppedRunId), eq(environmentLeases.status, "active"))).limit(1);
+  return held ? RETAINED_OWNER_LEASE_WAIT_MESSAGE : STOPPED_RUN_TOOLS_WAIT_MESSAGE;
+}
+
+/** Waits within warmSessionReleaseWait (outside any transaction) for the
+ * acknowledgement, then lets today's retirement decide. Still pending at the
+ * bound: the typed pre-claim recovery wait, never the quarantine. */
+async function retireAfterPersonStopAcknowledged(input: Parameters<typeof retireFinishedPerTurnRunnerdOwner>[0])
+  : Promise<Awaited<ReturnType<typeof retireFinishedPerTurnRunnerdOwner>>> {
+  await input.onLog?.("stderr", `[paperclip-runner] waiting for the acknowledgement of the person's Stop of run ${String(input.identity.runId)}\n`);
+  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+  while (Date.now() < deadline && await ownerStopAwaitingAcknowledgement(input, input.identity)) {
+    await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
+  }
+  if (await ownerStopAwaitingAcknowledgement(input, input.identity)) {
+    throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs), undefined,
+      { message: await stoppedRunWaitMessage(input, input.identity.runId) });
+  }
+  return retireFinishedPerTurnRunnerdOwner(input);
+}
+
+/** When the person's acknowledged Stop of this exact run was requested, or
+ * null when the run is not terminal under such a Stop (an automatic, foreign
+ * or unacknowledged Stop has none). */
+function acknowledgedUserStopRequestedAt(run: typeof heartbeatRuns.$inferSelect): number | null {
+  if (run.status !== "cancelled" || !hasAcknowledgedNativeStopIntent(run)) return null;
+  const result = record(run.resultJson);
+  const times = [record(result.executionCancellation).requestedAt, record(result.startupCancellation).requestedAt,
+    record(result.cancellation).recordedAt, record(result.nativeCancellation).recordedAt]
+    .map(value => typeof value === "string" ? Date.parse(value) : Number.NaN).filter(Number.isFinite);
+  return times.length > 0 ? Math.min(...times) : null;
+}
+
+const STOP_ISSUED_TURN_COMMANDS: ReadonlySet<string> = new Set(["turn.interrupt", "turn.stop"]);
+
+/** S095 (RFL 23:46Z + rf-3 23:48Z). The person's acknowledged Stop of the
+ * finished owner issued turn.interrupt / turn.stop that its Runner never
+ * answered. For the stopped run's direct successor only, those pending
+ * commands do not count as unsettled when, from persisted sources:
+ * (a) every unsettled command is a pending turn.interrupt / turn.stop of that
+ *     run's own journal that the Stop issued: a command carrying an audit id
+ *     must carry that Stop's intent or acknowledgement audit id; a command
+ *     without one (the Runner's turn/interrupt carries none) must be journaled
+ *     at or after the person's acknowledged Stop;
+ * (b) the Stop is acknowledged (hasAcknowledgedNativeStopIntent), run cancelled;
+ * (d) no other run of the conversation was created between them.
+ * `generationGone` is (c): a Boat stop/destroy receipt bound to the stopped
+ * run's lease (remoteExecutionTermination, which sandboxStopAndRetainReceipt
+ * also requires) on a box this run does not hold, or a TERM/KILL-confirmed
+ * retirement of that run's exact Runner instance. Returns the journal
+ * projected without those commands, or null when (a), (b) or (d) fails. */
+async function stopIssuedTurnCommandsOfDirectSuccessor(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0])
+  : Promise<{ projected: string; generationGone: boolean } | null> {
+  const { companyId, runId: successorRunId } = input.execution.binding;
+  const stoppedRunId = input.identity.runId, sessionId = input.identity.normalizedSessionId;
+  const runnerInstanceId = input.identity.runnerInstanceId;
+  if (typeof stoppedRunId !== "string" || typeof sessionId !== "string" || typeof runnerInstanceId !== "string") return null;
+  try {
+    // (b)
+    const [stopped] = await input.db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, stoppedRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+    const stopAt = stopped ? acknowledgedUserStopRequestedAt(stopped) : null;
+    if (!stopped || stopAt === null) return null;
+    const intent = record(record(stopped.resultJson).nativeCancellation);
+    const stopAuditIds = new Set([intent.intentAuditId, intent.acknowledgementAuditId].filter(id => typeof id === "string"));
+    // (a)
+    const control = record(JSON.parse(readBoundedNativeFile(resolve(input.root, "control-plane", "control-plane-state.json"),
+      NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8")));
+    if (record(control.identity).runId !== stoppedRunId || !Array.isArray(control.commands)) return null;
+    const commands = control.commands.map(record);
+    const unsettled = new Set(unsettledControllerCommands(commands));
+    const issuedByStop = (command: Record<string, unknown>) => {
+      if (command.status !== "pending" || !STOP_ISSUED_TURN_COMMANDS.has(String(command.type))) return false;
+      const payload = record(command.payload);
+      const auditIds = [payload.intentAuditId, payload.acknowledgementAuditId, payload.stopAuditId].filter(id => id !== undefined);
+      if (auditIds.length > 0) return auditIds.every(id => typeof id === "string" && stopAuditIds.has(id));
+      const issuedAt = typeof command.issuedAt === "string" ? Date.parse(command.issuedAt) : Number.NaN;
+      return issuedAt >= stopAt;
+    };
+    if (unsettled.size === 0 || ![...unsettled].every(issuedByStop)) return null;
+    // (d)
+    const [successor] = await input.db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, successorRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+    if (!successor || successor.createdAt < stopped.createdAt) return null;
+    const [previous] = await input.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, stopped.agentId),
+        eq(heartbeatRuns.nativeSessionId, sessionId), ne(heartbeatRuns.id, successorRunId),
+        lt(heartbeatRuns.createdAt, successor.createdAt)))
+      .orderBy(desc(heartbeatRuns.createdAt)).limit(1);
+    if (previous?.id !== stoppedRunId) return null;
+    // (c)
+    const target = input.runnerExecutionTarget;
+    const successorBox = target?.kind === "remote" && target.transport === "sandbox"
+      ? { leaseId: target.leaseId, providerLeaseId: target.sandboxLeaseAcquisition?.providerLeaseId } : null;
+    const leases = await input.db.select().from(environmentLeases)
+      .where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, stoppedRunId)));
+    let generationGone = successorBox !== null && leases.some(lease => hasBoundRemoteStopReceipt(lease)
+      && lease.id !== successorBox.leaseId && lease.providerLeaseId !== successorBox.providerLeaseId);
+    if (!generationGone) {
+      const [retired] = await input.db.select({ id: activityLog.id }).from(activityLog).where(and(eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "native.runner_port_holder_retired"),
+        sql`${activityLog.details}->>'holderRunId' = ${stoppedRunId}`,
+        sql`${activityLog.details}->>'holderRunnerInstanceId' = ${runnerInstanceId}`,
+        sql`${activityLog.details}->>'outcome' in ('stopped', 'killed')`)).limit(1);
+      generationGone = retired !== undefined;
+    }
+    return { projected: JSON.stringify({ ...control, commands: commands.filter(command => !unsettled.has(command)) }), generationGone };
+  } catch {
+    return null;
+  }
+}
+
+/** The Stop's own pending turn commands with its Runner generation proven
+ * gone: retire through today's proof on the projected journal. Generation not
+ * yet proven gone: wait once within warmSessionReleaseWait (outside any
+ * transaction), then the typed pre-claim recovery wait, never the quarantine.
+ * Anything else keeps today's refusal. */
+async function retireAfterStopIssuedTurnCommands(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0],
+  refused: string): Promise<{ retired: true } | { retired: false; refused: string }> {
+  if (!refused.startsWith("journal_commands_unsettled(")) return { retired: false, refused };
+  let exempt = await stopIssuedTurnCommandsOfDirectSuccessor(input);
+  if (!exempt) return { retired: false, refused };
+  if (!exempt.generationGone) {
+    await input.onLog?.("stderr", `[paperclip-runner] waiting for proof that the Runner of run ${String(input.identity.runId)} stopped by its person's Stop is gone\n`);
+    const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+    while (Date.now() < deadline && exempt?.generationGone === false) {
+      await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
+      exempt = await stopIssuedTurnCommandsOfDirectSuccessor(input);
+    }
+    if (!exempt) return retireFinishedPerTurnRunnerdOwner(input);
+    if (!exempt.generationGone) throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs), undefined,
+      { message: await stoppedRunWaitMessage(input, input.identity.runId) });
+  }
+  await input.onLog?.("stderr", `[paperclip-runner] run ${String(input.identity.runId)}'s Runner is gone; `
+    + "its unanswered turn commands issued after the person's acknowledged Stop no longer hold this conversation\n");
+  return retireFinishedPerTurnRunnerdOwner({ ...input, projectedControlBytes: exempt.projected });
+}
+
 async function migrateRunnerdStateRootForExecution(input: {
   db: Db;
   execution: NativeExecutionInput;
@@ -7093,7 +7262,16 @@ async function migrateRunnerdStateRootForExecution(input: {
           if (await provenLostResumedSandboxRunner({ ...input, root: scoped })) return;
           retirementRefusal = "; retirement_refused=restarted_sandbox_owner_unproven";
         } else {
-          const retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
+          let retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
+          // S095: never quarantine the owner of a person's Stop whose
+          // acknowledgement is still pending; wait for it once, then decide.
+          if (!retirement.retired && await ownerStopAwaitingAcknowledgement(input, identity)) {
+            retirement = await retireAfterPersonStopAcknowledged({ ...input, root: scoped, identity });
+          }
+          // S095 (RFL + rf-3): the acknowledged Stop's own pending turn commands.
+          if (!retirement.retired) {
+            retirement = await retireAfterStopIssuedTurnCommands({ ...input, root: scoped, identity }, retirement.refused);
+          }
           if (retirement.retired) return;
           if (retirement.refused !== "lifecycle_not_per_turn") retirementRefusal = `; retirement_refused=${retirement.refused}`;
         }
@@ -11595,7 +11773,7 @@ async function executePaperclipNativeSessionUnnoticed(input: {
     executionFailure = error;
     if (error instanceof NativeControllerRecoveryWaitingError) {
       await deferNativeControllerRecovery(input.db, { ...input.execution.binding,
-        leaseOwner: input.leaseOwner, retryAt: error.retryAt, waitingForOwner: error.owner });
+        leaseOwner: input.leaseOwner, retryAt: error.retryAt, waitingForOwner: error.owner, message: error.detail?.message });
     }
     if (!(error instanceof NativeRunnerOwnershipUnverifiedError) && !(error instanceof NativeStartupCleanupPendingError) && startup.stopRequested && startup.executionContext?.signal.reason instanceof Error &&
         startup.executionContext.signal.reason.message === "native_session_cancelled") {
