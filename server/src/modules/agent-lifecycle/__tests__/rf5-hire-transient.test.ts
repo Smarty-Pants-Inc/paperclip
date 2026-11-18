@@ -16,6 +16,7 @@ import { recordAiConnectionConfigurationFailure } from "../../../lib/ai-connecti
 import { createLifecycleStore } from "../adapters/postgres.js";
 import { createLifecycleWorker } from "../application/worker.js";
 import type { LifecycleAgent } from "../application/ports.js";
+import { LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE } from "../application/retry.js";
 
 // Agreed RED only: real hire + PostgreSQL store/worker, the same DB fixtures as
 // verification-retry.test.ts. Inject only host outcomes, never retry policy.
@@ -30,7 +31,7 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
   ? new HttpError(422, PRIVATE_DETAIL, { code })
   : Object.assign(new Error(PRIVATE_DETAIL), { code });
 
-(support.supported ? describe : describe.skip)("rf5 hire transient RED v2 (rf5 18:23Z + RFL 18:17Z)", () => {
+(support.supported ? describe : describe.skip)("rf5 hire transient RED v3 (v2 + RFL record SUPERSEDE-HIRE-PROBE-1118.md)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: Db;
   let companyId: string;
@@ -185,7 +186,7 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
   // R4 is RFL bar b's TEXT CONTRACT, not merely a retry-classification check:
   // no visible lifecycleError line before 10 min; at/after 10 min exactly one
   // line containing /retrying automatically/i; keep retrying; clear on success.
-  it("supersedes(rf5-hire-transient R4; SUPERSEDE-RF5-HIRE-TRANSIENT-1117.md): continuous outage backs off for 60/120 minutes (8/12 attempts), has one line from minute ten, and clears on success", async () => {
+  it("supersedes(rf5-hire-transient v2 R4; RFL record SUPERSEDE-HIRE-PROBE-1118.md): R4a (R4 UNCHANGED, re-pinned to a GENERIC host outage test_environment_unavailable): continuous outage backs off for 60/120 minutes (8/12 attempts), has one line from minute ten, and clears on success", async () => {
     // Derive the schedule independently from the rule, not production policy:
     // 60, 120, 240, 480 seconds, then 900 seconds capped, from failure one.
     const expectedMinutes: number[] = [];
@@ -201,7 +202,7 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
     const startedAt = Date.now();
     const fixture = await hire(async () => {
       attemptMinutes.push((Date.now() - startedAt) / MINUTE);
-      if (!healthy) throw hostError("native_probe_cleanup_pending");
+      if (!healthy) throw hostError("test_environment_unavailable");
     });
     // Evaluate every minute, including minute ten BETWEEN the minute-seven and
     // minute-fifteen probes. Visibility must not be delayed to the next probe;
@@ -243,4 +244,97 @@ const hostError = (code: string) => code === "native_probe_cleanup_pending"
     });
     expect.soft(fixture.onReady).toHaveBeenCalledOnce();
   });
+
+  // R4p (RFL record SUPERSEDE-HIRE-PROBE-1118.md section A; PROBECLEANUP DESIGN §3(a)-(c)):
+  // a RETAINED probe cleanup is not a host outage. ONE true line from the FIRST
+  // deferral (never the silent ten minutes, never the generic environment wait),
+  // the SAME backoff, a durable park at the 30-minute bound with the existing
+  // Retry suffix, the clock alone never unparks, and each Retry tries the cleanup ONCE.
+  function visibleLines(row: Awaited<ReturnType<typeof current>>) {
+    return (row.lifecycleError ?? "").split(/\r?\n/).filter(line => line.trim());
+  }
+
+  it("supersedes(rf5-hire-transient v2 R4; RFL record SUPERSEDE-HIRE-PROBE-1118.md): R4p native_probe_cleanup_pending: one true line from the first deferral, the same backoff, a durable park at 30 min with Retry; Retry tries the cleanup once", async () => {
+    // Independent schedule from the rule (1, 2, 4, 8, then 15 minutes) up to the 30-minute bound.
+    const expectedMinutes = [0, 1, 3, 7, 15, 30];
+    let cleanupClear = false;
+    const attemptMinutes: number[] = [];
+    const startedAt = Date.now();
+    const fixture = await hire(async () => {
+      attemptMinutes.push((Date.now() - startedAt) / MINUTE);
+      if (!cleanupClear) throw hostError("native_probe_cleanup_pending");
+    });
+    let parkedAt: number | undefined;
+    for (let minute = 0; minute <= 60; minute++) {
+      vi.setSystemTime(startedAt + minute * MINUTE);
+      await fixture.work.process(fixture.agent.id);
+      const row = await current(fixture.agent.id);
+      const lines = visibleLines(row);
+      expect.soft(lines, `minute ${minute}: exactly ONE true line from the FIRST deferral`).toHaveLength(1);
+      expect.soft(row.lifecycleError ?? "", `minute ${minute}: never the generic environment wait`).not.toContain(LIFECYCLE_ENVIRONMENT_WAIT_MESSAGE);
+      expect.soft(row.lifecycleError ?? "", `minute ${minute}: secret-safe`).not.toContain(PRIVATE_DETAIL);
+      expect.soft(row.lifecycleOperation?.verificationFailures ?? 0, `minute ${minute}: not budgeted`).toBe(0);
+      if (row.lifecycleOperation?.retryRequired) {
+        parkedAt ??= minute;
+        expect.soft(row.lifecycleOperation, `minute ${minute}: a parked hire has no automatic deadline`).not.toHaveProperty("retryAt");
+        expect.soft(row.lifecycleError ?? "", `minute ${minute}: the park form carries the existing Retry suffix`).toContain("choose Retry");
+        expect.soft(row.lifecycleError ?? "", `minute ${minute}: the park form drops 'automatically'`).not.toMatch(/retry(ing)? automatically/i);
+      } else {
+        expect.soft(row.lifecycleError ?? "", `minute ${minute}: before the bound the line says it retries automatically`).toMatch(/retry(ing)? automatically/i);
+        expect.soft(minute, `minute ${minute}: still unparked past the 30-minute bound`).toBeLessThan(30);
+      }
+      expect.soft(attemptMinutes, `minute ${minute}: the same backoff, no early or missing attempts, none after the park`)
+        .toEqual(expectedMinutes.filter(time => time <= minute));
+    }
+    expect.soft(parkedAt, "parks AT the 30-minute bound (a durable named end state)").toBe(30);
+    expect.soft(fixture.onReady).not.toHaveBeenCalled();
+    // Retry tries the cleanup exactly once per press; still pending -> the true line, no ready.
+    const lifecycle = createAgentLifecycle(db);
+    const before = attemptMinutes.length;
+    await lifecycle.retry(fixture.agent.id);
+    await fixture.work.process(fixture.agent.id);
+    expect.soft(attemptMinutes.length, "one Retry press = exactly one cleanup attempt").toBe(before + 1);
+    const still = await current(fixture.agent.id);
+    expect.soft(visibleLines(still), "still pending after Retry: ONE true line").toHaveLength(1);
+    expect.soft(still.lifecycleError ?? "").not.toContain(PRIVATE_DETAIL);
+    expect.soft(still.lifecycleState, "still pending is not ready").not.toBe("ready");
+    // The cleanup clears (for example F4's destroyed receipt): the next Retry verifies, no restart.
+    cleanupClear = true;
+    if (still.lifecycleOperation?.retryRequired) await lifecycle.retry(fixture.agent.id);
+    else vi.setSystemTime(Date.parse(still.lifecycleOperation?.retryAt ?? new Date().toISOString()));
+    await fixture.work.process(fixture.agent.id);
+    expect.soft(await current(fixture.agent.id), "verifies once the cleanup clears; the line clears").toMatchObject({
+      lifecycleState: "ready", lifecycleError: null,
+    });
+    expect.soft(fixture.onReady).toHaveBeenCalledOnce();
+  });
+
+  it("supersedes(rf5-hire-transient v2 R4; RFL record SUPERSEDE-HIRE-PROBE-1118.md): R4p-F4 the retained cleanup clears BEFORE the bound (F4: the probe's own setup-test lease destroyed with Boat's typed receipt): the hire verifies with NO restart and NO person action, and the line clears", async () => {
+    let cleanupClear = false;
+    const startedAt = Date.now();
+    const fixture = await hire(async () => {
+      if (!cleanupClear) throw hostError("native_probe_cleanup_pending");
+    });
+    await fixture.work.process(fixture.agent.id);
+    let row = await current(fixture.agent.id);
+    expect.soft(visibleLines(row), "the one true line from the FIRST deferral").toHaveLength(1);
+    expect.soft(row.lifecycleOperation?.retryRequired ?? false).toBe(false);
+    // The cleanup clears before the bound; only the persisted retryAt wakes the worker (no Retry, no row edit, no restart).
+    vi.setSystemTime(startedAt + 3 * MINUTE);
+    await fixture.work.process(fixture.agent.id);
+    cleanupClear = true;
+    row = await current(fixture.agent.id);
+    vi.setSystemTime(Date.parse(row.lifecycleOperation?.retryAt ?? ""));
+    await fixture.work.process(fixture.agent.id);
+    expect.soft(Date.now() - startedAt, "verified before the 30-minute bound").toBeLessThan(30 * MINUTE);
+    expect.soft(await current(fixture.agent.id)).toMatchObject({ lifecycleState: "ready", lifecycleError: null });
+    expect.soft(fixture.onReady).toHaveBeenCalledOnce();
+  });
+
+  // F4-2/F4-3 (RFL record section B) are SERVER-SIDE lease rows this injected lifecycle driver can't measure:
+  // the destroy fires only on the retained entry's exact setup-test lease (closed, one-off); a closed RUN lease
+  // of the same company+account, an active probe lease, another probe's lease and a reusable lease stay
+  // undestroyed; 'destroyed' only from Boat's typed destroy success (not-found / timeout / -32002 / any text /
+  // 'stopped' = no proof -> line -> retry -> park). They belong in the builder's retained-cleanup tests, judged separately.
+  it.todo("F4-2/F4-3 lease-scope and typed-receipt rows: in the builder's retained-ai-credential-cleanup tests (server side), judged separately");
 });
