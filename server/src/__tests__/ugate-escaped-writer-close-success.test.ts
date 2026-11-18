@@ -92,6 +92,7 @@ describe.skipIf(!support.supported)("adopt-stopu-ugate (2), never-OK: close-succ
       timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => resolve({
       exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0, signal: error?.signal ?? null,
       timedOut: error?.killed ?? false, stdout, stderr, pid: null, startedAt: null }));
+    child.stdin?.on("error", () => undefined); // a check that exits at once must not EPIPE the test
     child.stdin?.end(input.stdin ?? "");
   }) };
 
