@@ -1344,6 +1344,78 @@ suite("fresh-continuation fallback", () => {
     } finally { vi.useRealTimers(); }
   }, 120_000);
 
+  // FIX15 (RFL 01:00Z ruling (a)): a hold with no other stored clear time clears through its real
+  // writer. The card counts its 10-min bound from the LATER of enqueue and heartbeat_runs.startable_since:
+  // working inside the bound, a Retry press then starts nothing, failed + Retry only at stamp + 10 min,
+  // and the dispatcher taking it starts exactly one run.
+  it.each(["sandbox_cleanup", "agent_setup", "ordinary_pause"] as const)("FIX15 %s clears: no failed flash inside the bound, one run, failed + Retry at stamp + 10 min", async hold => {
+    const f = await judgeQueued(), heartbeat = heartbeatService(db);
+    const { createLifecycleStore } = await import("../modules/agent-lifecycle/adapters/postgres.js");
+    const { createAgentLifecycleEffects } = await import("./agent-lifecycle.js");
+    const { startPersonQueuedRunFresh } = await import("./task-retry.js");
+    const [agentBefore] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const enqueued = f.queued.createdAt; // 11 min ago: already past the bound from enqueue
+    if (hold === "sandbox_cleanup") await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
+    else {
+      await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+      await db.update(heartbeatRuns).set({ startableSince: null }).where(eq(heartbeatRuns.id, f.queued.id));
+      await db.update(agents).set({ lifecycleState: hold === "agent_setup" ? "verifying" : "paused", lifecycleHolds: [], status: "paused",
+        lifecycleRequiredPluginIds: [] }).where(eq(agents.id, agentId));
+    }
+    const card = async () => taskInterruptionPresentation(db, await issue(f.issueId));
+    try {
+      const held = await card();
+      expect(held?.state, "held 11 min past enqueue: never failed").not.toBe("failed");
+      // The hold clears through its production writer.
+      const store = createLifecycleStore(db, createAgentLifecycleEffects());
+      const owned = { id: randomUUID(), hostComplete: true, completedPluginIds: [], attempts: 0, leaseOwner: "fix15",
+        leaseUntil: new Date(Date.now() + 3_600_000).toISOString(), resumeState: "ready" as const };
+      const before = Date.now();
+      if (hold === "sandbox_cleanup") await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+      else {
+        if (hold === "ordinary_pause") expect(await store.change(agentId, "resume", { reason: "manual" }), "resume").toMatchObject({ lifecycleState: "resuming" });
+        await db.update(agents).set({ lifecycleOperation: owned }).where(eq(agents.id, agentId));
+        expect(await store.change(agentId, "complete", { owner: "fix15" }), "the lifecycle writer makes it ready").toMatchObject({ lifecycleState: "ready" });
+      }
+      const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+      const stamp = stamped!.startableSince?.getTime() ?? before;
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const seen: Array<{ after: number; state?: string; canRetry?: boolean }> = [];
+      for (const after of [1, 300_000, 599_999]) {
+        vi.setSystemTime(stamp + after);
+        const c = await card();
+        seen.push({ after, state: c?.state, canRetry: c?.canRetry });
+      }
+      // A Retry pressed inside the clear window joins the queued run; it starts nothing extra.
+      vi.setSystemTime(stamp + 1_000);
+      const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId,
+        observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+      if (receipt.startQueuedRunId) await startPersonQueuedRunFresh(db, heartbeat as never,
+        { companyId, issueId: f.issueId, runId: receipt.startQueuedRunId, actorId: userId });
+      vi.setSystemTime(stamp + 600_000);
+      const lapsed = await card();
+      console.info(JSON.stringify({ fix15: { hold, enqueued, stamp: stamped!.startableSince, seen, retry: receipt.startQueuedRunId ?? null,
+        lapsed: lapsed && { state: lapsed.state, canRetry: lapsed.canRetry } } }));
+      expect(stamped!.startableSince, "the clear wrote the startable-since stamp").not.toBeNull();
+      expect(seen.map(s => s.state), "working at clear + 1 ms and throughout the bound").toEqual(["working", "working", "working"]);
+      expect(seen.map(s => s.canRetry ?? false), "no Retry inside the bound").toEqual([false, false, false]);
+      expect(receipt.startQueuedRunId, "the Retry press starts no fresh run").toBeUndefined();
+      expect(lapsed, "never taken: failed + Retry at stamp + 10 min").toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
+      vi.useRealTimers();
+      await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
+      await heartbeat.drainActiveRunExecutions();
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).filter(r => r.id !== f.source.id);
+      console.info(JSON.stringify({ fix15Runs: { hold, runs: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })) } }));
+      expect(runs.filter(r => r.startedAt).map(r => r.id), "the dispatcher takes it: exactly one run").toEqual([f.queued.id]);
+      expect(runs.map(r => r.id), "no second run exists").toEqual([f.queued.id]);
+    } finally {
+      vi.useRealTimers();
+      await db.update(agents).set({ lifecycleState: agentBefore!.lifecycleState, lifecycleHolds: agentBefore!.lifecycleHolds,
+        status: agentBefore!.status, lifecycleOperation: agentBefore!.lifecycleOperation,
+        lifecycleRequiredPluginIds: agentBefore!.lifecycleRequiredPluginIds }).where(eq(agents.id, agentId));
+    }
+  }, 120_000);
+
   it.each(["issue_owner_cleanup", "issue_owner_running", "agent_setup", "budget_accounting", "budget_hard_stop", "case_handoff", "native_cleanup"] as const)("JUDGE named hold %s has its own truthful card, not a Retry requeue loop", async hold => {
     const { budgetPolicies, cases, caseHandoffs } = await import("@paperclipai/db");
     const f = await judgeQueued(), heartbeat = heartbeatService(db);

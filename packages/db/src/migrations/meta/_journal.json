@@ -3459,6 +3459,13 @@
       "when": 1794931286874,
       "tag": "0495_retire_legacy_message_notes",
       "breakpoints": true
+    },
+    {
+      "idx": 496,
+      "version": "7",
+      "when": 1794931286876,
+      "tag": "0496_heartbeat_run_startable_since",
+      "breakpoints": true
     }
   ]
 }
