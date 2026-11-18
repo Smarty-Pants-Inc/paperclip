@@ -274,6 +274,24 @@ describe("heartbeat retry module callbacks", () => {
   });
 });
 
+describe("source-lock wait error text persistence", () => {
+  it("masks credentials in the lock error at every write, keeping the surrounding text", async () => {
+    const secrets = ["sk-live-abcdefghijklmnopqrstuvwx", "ghp_abcdefghijklmnopqrstuvwxyz0123456789", "AKIAIOSFODNN7EXAMPLE"];
+    const lockError = new IsolatedRepositorySourceBusy(`git fetch failed: remote said ${secrets.join(" ")} while locked`);
+    const writes: unknown[] = [];
+    const db = { update: () => ({ set: (values: unknown) => { writes.push(values); return { where: async () => undefined }; } }) } as unknown as Db;
+    const deps = callbacks();
+    const run = unitRun();
+    deps.setRunStatusIfRunning.mockResolvedValue({ updated: true, run: { ...run, status: "cancelled" } });
+    await extracted.createHeartbeatRetries(db, deps).finalizeWorkspaceSourceLockWait(run, lockError, { wasIssueAssignee: true });
+    const persisted = JSON.stringify([writes, deps.setRunStatusIfRunning.mock.calls, deps.setWakeupStatus.mock.calls]);
+    expect(writes).toHaveLength(1);
+    for (const secret of secrets) expect(persisted).not.toContain(secret);
+    expect((writes[0] as { error: string }).error).toBe(
+      "git fetch failed: remote said ***REDACTED*** ***REDACTED*** ***REDACTED*** while locked (last workspace source lock wait ended with SQLSTATE 55P03)");
+  });
+});
+
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_HEARTBEAT_RETRIES_TEST_DATABASE_URL");
 const support = external ? { supported: true, reason: undefined } : await getEmbeddedPostgresTestSupport();

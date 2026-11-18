@@ -69,6 +69,7 @@ import {
   notFound,
 } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
+import { redactSensitiveText } from "../../redaction.js";
 import { parseObject } from "../../adapters/utils.js";
 import { logActivity } from "../activity-log.js";
 import { readContinuationAttempt } from "../recovery/index.js";
@@ -1942,9 +1943,11 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     options: { wasIssueAssignee: boolean },
   ) {
     const now = new Date();
+    // The lock error can carry provider/shell text; mask credentials at the write.
+    const errorText = redactSensitiveText(error.message);
     const runContext = parseObject(run.contextSnapshot);
     const cancelWrite = await setRunStatusIfRunning(run.id, "cancelled", {
-      error: error.message,
+      error: errorText,
       errorCode: WORKSPACE_BUSY_ERROR_CODE,
       finishedAt: now,
       resultJson: {
@@ -1977,7 +1980,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     }
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt: now,
-      error: error.message,
+      error: errorText,
     }).catch(() => undefined);
 
     const cancelledRun =
@@ -2012,7 +2015,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         eventType: "lifecycle",
         stream: "system",
         level: "info",
-        message: `Deferred: ${error.message}. The run waits for the workspace source lock to free.`,
+        message: `Deferred: ${errorText}. The run waits for the workspace source lock to free.`,
         payload: { retryScheduled: true },
       }).catch(() => undefined);
       await finalizeAgentStatus(run.agentId, "cancelled", null, {
@@ -2025,7 +2028,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     await db.update(heartbeatRuns).set({
       status: "failed",
       errorCode: "setup_failed",
-      error: `${error.message} (last workspace source lock wait ended with SQLSTATE ${sqlstate})`,
+      error: `${errorText} (last workspace source lock wait ended with SQLSTATE ${sqlstate})`,
       updatedAt: now,
     }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
     if (cancelledRun) {
