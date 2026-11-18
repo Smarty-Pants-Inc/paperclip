@@ -2,10 +2,46 @@ import { and, eq, sql } from "drizzle-orm";
 import { agentWakeupRequests, issueRecoveryActions, statusDecisionEffects, statusDecisions, type Db, type heartbeatRuns } from "@paperclipai/db";
 import { NATIVE_RUN_FAILED_RETRY_CAUSE } from "./status-arbiter.js";
 import { NATIVE_MID_STREAM_CUT_CODE } from "./native-mid-stream-cut.js";
+import { readFailedTurnStreamedAnswer, type CompletedFinalAgentMessageCandidate } from "../heartbeat-run-summary.js";
 
 type ContinuationRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "contextSnapshot" | "wakeupRequestId">
   & Partial<Pick<typeof heartbeatRuns.$inferSelect, "retryOfRunId" | "scheduledRetryReason">>;
 const UUID = /^[0-9a-f-]{36}$/i;
+const record = (value: unknown): Record<string, unknown> =>
+  value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+
+export const NATIVE_FAILED_TURN_CONTINUATION_EXHAUSTED_NOTE =
+  "The run stopped before the answer finished, and one automatic retry stopped too. Press Retry to try again.";
+
+/**
+ * The arbiter spent the generic failed turn's one continuation. Use its applied
+ * decision, not an error string or copied retry context, as publication authority.
+ * Like the cut lane's exhausted candidate, this becomes an attributed completion
+ * reply: replay is idempotent and the unanswered sweep sees the lineage answered.
+ * The same board-owned blocker keeps the existing failed-run Retry control.
+ */
+export async function readExhaustedNativeFailedTurnCandidate(
+  db: Pick<Db, "select">, input: { companyId: string; runId: string },
+  rows: readonly { seq: number; payload: unknown }[],
+): Promise<(CompletedFinalAgentMessageCandidate & { reasonCode: string }) | null> {
+  const terminal = [...rows].sort((a, b) => b.seq - a.seq).find(row =>
+    /^turn\.(completed|failed|cancelled|interrupted)$/u.test(String(record(record(row.payload).prpEvent).eventType)));
+  if (!terminal) return null;
+  const event = record(record(terminal.payload).prpEvent);
+  if (event.eventType !== "turn.failed") return null;
+  const [decision] = await db.select({ reasonCode: statusDecisions.reasonCode }).from(statusDecisions).where(and(
+    eq(statusDecisions.companyId, input.companyId),
+    eq(statusDecisions.runId, input.runId),
+    eq(statusDecisions.applicationState, "applied"),
+    eq(statusDecisions.reasonCode, "native_run_failed_continuation_exhausted"),
+  )).limit(1);
+  if (!decision) return null;
+  const prefix = readFailedTurnStreamedAnswer(rows)?.text;
+  const note = NATIVE_FAILED_TURN_CONTINUATION_EXHAUSTED_NOTE;
+  return { seq: terminal.seq, sourceEventId: typeof event.sourceEventId === "string" ? event.sourceEventId : null,
+    channel: "final", text: prefix ? `${prefix}${prefix.endsWith("\n") ? "" : "\n"}\n— ${note}` : note,
+    reasonCode: decision.reasonCode };
+}
 
 /**
  * True when this run was dispatched from the committer's `schedule_retry` wake

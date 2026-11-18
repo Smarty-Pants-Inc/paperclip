@@ -3,6 +3,7 @@ import { writeRuntimeRunPointer } from "./runtime-run-pointer.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { readRunAnswerEvents, readThinkingCapStop, thinkingCapStopCandidate } from "../thinking-cap-stop.js";
 import { readExhaustedNativeMidStreamCutCandidate, readNativeProviderAccountFailureCandidate } from "../native-runtime/native-mid-stream-cut.js";
+import { readExhaustedNativeFailedTurnCandidate } from "../native-runtime/native-failed-turn-continuation.js";
 import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
 import { isContextCompactionRun } from "../context-compaction.js";
@@ -2558,6 +2559,10 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     // text, keep it whole but never promise another automatic continuation.
     const exhaustedCut = await readExhaustedNativeMidStreamCutCandidate(db, { companyId, runId }, streamedRows);
     if (exhaustedCut) return exhaustedCut;
+    // The generic failed-turn lane spends the same one-retry budget, but has
+    // no cut candidate (for example a runner exit with no provider text).
+    const exhaustedFailedTurn = await readExhaustedNativeFailedTurnCandidate(db, { companyId, runId }, streamedRows);
+    if (exhaustedFailedTurn) return exhaustedFailedTurn;
     const cut = readFailedTurnStreamedAnswer(streamedRows);
     // Account rejections never enter the cut lane. Keep the provider's own
     // failure text on the normal attributed reply, rather than leaving its
