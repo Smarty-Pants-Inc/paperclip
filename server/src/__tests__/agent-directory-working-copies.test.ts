@@ -954,7 +954,9 @@ describe("persistent agent directories", () => {
     try {
       await expect(copies.prepare({ ...target(), runId, cwd: home, target: { kind: "remote", transport: "ssh", environmentId: randomUUID(), remoteCwd: "/fixture/task",
         spec: { host: "unused.invalid", port: 22, username: "test", remoteCwd: "/fixture/task", remoteWorkspacePath: "/fixture/task", privateKey: null, knownHosts: null, strictHostKeyChecking: true } } })).rejects.toThrow("Could not exclude agent files from task Git staging (reason=exit_1)");
-      expect(shell.mock.calls.filter(([, , command]) => command.includes("Unsafe runtime exclusion"))).toHaveLength(1);
+      // Fork retry contract (helpers/git-exclusion-retry-contract.ts): a
+      // non-unsafe non-zero exit gets exactly one retry, never a third call.
+      expect(shell.mock.calls.filter(([, , command]) => command.includes("Unsafe runtime exclusion"))).toHaveLength(2);
       const row = (await copies.get(companyId, runId))!;
       expect(row.state).toBe("unavailable");
       expect(row.receipt?.baseline).toBeUndefined();
@@ -1710,7 +1712,7 @@ describe("persistent agent directories", () => {
         await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
         const copy = (await copies.prepare({ companyId, agentId, runId, cwd: home, target: sshTarget(path.join(home, "slow-task")) }))!;
         expect(copy.state).toBe("prepared");
-        expect(exclusions(shell).map(([, , , options]) => options.timeoutSec)).toEqual([30, 30]);
+        expect(exclusions(shell).map(([, , , options]) => options.timeoutSec)).toEqual([15, 15]); // fork contract: 15 s per attempt
         expect(stage).toHaveBeenCalledWith(expect.objectContaining({ remoteDir: copy.executionRoot }));
       } finally { stage.mockRestore(); shell.mockRestore(); }
     });
@@ -1723,7 +1725,7 @@ describe("persistent agent directories", () => {
         const failure = copies.prepare({ companyId, agentId, runId, cwd: home, target: sshTarget("/fixture/slow-task") });
         await expect(failure).rejects.toThrow("Could not exclude agent files from task Git staging (reason=timed_out)");
         await expect(failure).rejects.toBeInstanceOf(RemoteWorkspacePreparationTimeoutError);
-        expect(exclusions(shell)).toHaveLength(3);
+        expect(exclusions(shell)).toHaveLength(2); // fork contract: one retry, then fail
         expect((await copies.get(companyId, runId))!.state).toBe("unavailable");
       } finally { shell.mockRestore(); }
     });
