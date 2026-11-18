@@ -66,6 +66,7 @@ import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { nativeStopRequiresReconciliation } from "../services/explicit-native-continuation.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -452,6 +453,7 @@ function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comme
 }
 
 const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
+const STOP_BAR_RECOVERY_WAIT_REASONS = new Set(["execution_recovery", "remote_cleanup", "execution_settling"]);
 const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.";
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -7812,7 +7814,8 @@ export function issueRoutes(
 
   async function buildQueuedCommentQueue(input: {
     executor: IssueQueueDb;
-    issue: { id: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null };
+    issue: { id: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null;
+      conversationUserId?: string | null };
     activeRun: Awaited<ReturnType<typeof resolveActiveIssueRun>>;
     actor: ReturnType<typeof getActorInfo>;
     queueState?: IssueQueueState | null;
@@ -7883,24 +7886,40 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
-    // The run-dispatch fallback (deferUnstartedUserComment) saves a held wake
-    // with an execution_recovery wait. After a person's Stop that recovery does
-    // not send these messages by itself, so the Stop bar wins over it. Every
-    // other wait (the Send's interrupt_handoff, a running process, a pause)
-    // keeps its own true line.
-    const stopBarMayReplace = !queue.executionWait || queue.executionWait.reason === "execution_recovery";
+    // A well-formed recovery wait (execution_recovery from the run-dispatch
+    // fallback, remote_cleanup, execution_settling) may give way to the Stop
+    // bar ONLY when admission on this base would admit the owner's Send (RFL S7
+    // 14:32Z): then "will be sent when you send your next message" is true.
+    // Without Option S, admission holds a Send after a native turn that ended
+    // cancelled (nativeStopRequiresReconciliation), so the wait keeps its own
+    // true line, as every other wait (the Send's interrupt_handoff, a running
+    // process, a pause) does.
+    const recoveryWait = !!queue.executionWait && STOP_BAR_RECOVERY_WAIT_REASONS.has(queue.executionWait.reason);
+    const stopBarMayReplace = !queue.executionWait || recoveryWait;
     if (wake && queueState?.state === "deferred" && !input.activeRun && stopBarMayReplace && comments.length > 0 &&
         input.issue.assigneeAgentId && !queuedInteractionId(wake.payload)) {
       // Stop means stop (org 11-17): after a person's Stop the waiting messages
       // of every task (Agent Chat or not) are not sent. The person sends them,
       // or deletes some first.
-      const [lastTurn] = await input.executor.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+      const [lastTurn] = await input.executor.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+        status: heartbeatRuns.status, nativeIssueId: heartbeatRuns.nativeIssueId, runtimeMode: heartbeatRuns.runtimeMode,
+        resultJson: heartbeatRuns.resultJson, finishedAt: heartbeatRuns.finishedAt })
         .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.issue.companyId),
           eq(heartbeatRuns.agentId, input.issue.assigneeAgentId),
           sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issue.id}`))
         .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
       const stop = readObject(lastTurn?.resultJson);
-      if (lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId) {
+      const personStop = lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId;
+      const sendAdmitted = async () => {
+        if (!lastTurn || lastTurn.runtimeMode !== "native" || input.actor.actorType !== "user") return false;
+        const blocker = await getExecutionBlocker(input.executor as Db, input.issue.companyId, input.issue.id);
+        const [source] = blocker ? [] : await input.executor.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+          .where(and(eq(issueRecoveryActions.companyId, input.issue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, input.issue.id), inArray(issueRecoveryActions.status, ["active", "escalated"])))
+          .limit(1);
+        return !blocker && !source && !nativeStopRequiresReconciliation(lastTurn, []);
+      };
+      if (personStop && (!recoveryWait || await sendAdmitted())) {
         queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
       }
     }
