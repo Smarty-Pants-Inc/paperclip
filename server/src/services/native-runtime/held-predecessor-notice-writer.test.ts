@@ -70,7 +70,13 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
   // S6 (rf5 round 2): after a PERSON's Stop the held writer wrote H, whose
   // "Send a new message to try again" invites a retype answered twice. It writes
   // R3 then. Controls: a non-person cancel and the Send's interrupt stop keep H.
-  it.each(["person stop", "system cancel", "interrupt stop"] as const)("SCREEN S6: the held writer after a %s", async cause => {
+  // SUPERSEDE-C4-SCREEN-CONTROLS-HELDTEXT-1118 (rf-5's four points): the two NON-person controls pin the EXACT held-banner
+  // text for their state (the default new-task text, HELD_PREDECESSOR_NOTICE), never the old unhedged 'Send a new message to
+  // try again.'; the person-Stop half keeps its R3 assertions. Point 2 (the text is TRUE): the successor is the issue's
+  // execution run as heartbeat's claim writes it (contextSnapshot.issueId + issues.executionRunId; PLANTED, named), the
+  // notice comes from the REAL writer (noticeHeldUnfinishedPredecessor), and a REAL POST /api/issues/:id/comments of a new
+  // message is DEFERRED (its wake deferred_issue_execution, no run for it).
+  it.each(["person stop", "system cancel", "interrupt stop"] as const)("SUPERSEDE-C4-SCREEN-CONTROLS-HELDTEXT-1118 SCREEN S6: the held writer after a %s", async cause => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Held stop", issuePrefix: companyId.slice(0, 8) });
     await db.insert(agents).values({ id: agentId, companyId, name: "Held agent", adapterType: "paperclip_runner", status: "active" });
@@ -81,7 +87,8 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
       nativeSessionId: sessionId, resultJson });
     await new Promise(resolve => setTimeout(resolve, 5));
     const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId,
-      nativeSessionId: sessionId }).returning();
+      nativeSessionId: sessionId, ...(cause === "person stop" ? {} : { contextSnapshot: { issueId } }) }).returning();
+    if (cause !== "person stop") await db.update(issues).set({ executionRunId: row!.id }).where(eq(issues.id, issueId));
     await noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
       binding: { companyId, agentId, issueId, runId: row!.id }, session: { normalizedSessionId: sessionId } } as never },
     new Error("runner_process_termination_unconfirmed: stop not confirmed"));
@@ -92,7 +99,18 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
     expect(notices[0]!.body).toBe(cause === "person stop"
       ? "Stopped. This message is waiting: Send it, or delete it."
       : HELD_PREDECESSOR_NOTICE);
-    expect(notices[0]!.body.toLowerCase().includes("send a new message")).toBe(cause !== "person stop");
+    if (cause === "person stop") {
+      expect(notices[0]!.body.toLowerCase().includes("send a new message")).toBe(false);
+      return;
+    }
+    // Point 1 + 4: exactly the new-task text; never the old unhedged Send.
+    expect(notices[0]!.body).toBe("Your message and saved work are kept, but the previous run of this conversation did not finish. Assign this agent a new task to continue.");
+    expect(notices[0]!.body).not.toContain("Send a new message to try again.");
+    // Point 2: TRUE here: a real POST of a new message is deferred, no run starts for it.
+    const post = await postDeferred(await routeApp(`owner-${randomUUID()}`, companyId), { companyId, issueId });
+    console.log("C4Z_CTRL", JSON.stringify({ row: `S6 ${cause}`, wakes: post.wakes.map(w => w.status), runs: post.runs.length }));
+    expect(post.wakes.map(w => w.status), `S6 ${cause}: deferred`).toEqual(["deferred_issue_execution"]);
+    expect(post.runs, `S6 ${cause}: no run for the new message`).toHaveLength(0);
   });
 
 
