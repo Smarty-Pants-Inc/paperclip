@@ -1,5 +1,5 @@
 import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { heartbeatRuns, issueComments, issueThreadInteractions, statusDecisionEffects, statusDecisions, type Db } from "@paperclipai/db";
+import { heartbeatRuns, issueComments, issueThreadInteractions, issues, statusDecisionEffects, statusDecisions, type Db } from "@paperclipai/db";
 import { PROVIDER_POLICY_REFUSAL_CODE } from "./native-runtime/native-provider-failure.js";
 import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
 import { answeredPersonMessageSql } from "./person-message-answer.js";
@@ -77,6 +77,9 @@ export async function failedTurnPendingCommentIds(db: Pick<Db, "select">, input:
     sql`not exists ${db.select({ id: statusDecisions.id }).from(statusDecisions).innerJoin(statusDecisionEffects, and(
       eq(statusDecisionEffects.decisionId, statusDecisions.id), eq(statusDecisionEffects.effectKind, "schedule_retry"))).where(and(
       eq(statusDecisions.companyId, input.companyId), eq(statusDecisions.runId, input.runId), eq(statusDecisions.applicationState, "applied")))}`,
+    // Chats only: a typed chat message is owed a reply. A task's saved queue never redelivers what its failed run consumed.
+    sql`exists ${db.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId),
+      eq(issues.conversationAgentId, input.agentId), sql`${issues.conversationUserId} is not null`))}`,
   )).limit(1);
   if (!source) return [];
   const pending = await readContinuationCommentInput(db, input);
