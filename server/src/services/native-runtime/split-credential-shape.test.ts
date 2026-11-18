@@ -219,7 +219,7 @@ describe("split credential shapes through the real append, Postgres and the live
     const live = () => published.filter(entry => entry.payload.runId === runId);
     return { runId, port, event, stored, live };
   }
-  const tailsOf = (event: PrpEvent) => ((event.payload.outputTails ?? []) as { itemId?: string; payload: { text: string } }[]);
+  const tailsOf = (event: PrpEvent) => ((event.payload.outputTails ?? []) as { itemId?: string; payload: { text: string; executionId?: string } }[]);
 
   it("no token in any stored delta, hash or published event, at every byte boundary", async () => {
     const report: Record<string, unknown>[] = [];
@@ -263,6 +263,91 @@ describe("split credential shapes through the real append, Postgres and the live
     }
     out("rows-append-postgres-live.json", report);
   }, 280_000);
+
+  it.each([
+    ["two", ["Bearer ", T40]],
+    ["three", ["Bea", "rer ", T40]],
+    ["three-token-pieces", ["Bearer ", T40.slice(0, 17), T40.slice(17)]],
+  ] as const)("N1 tool progress %s stores and publishes zero key material before settling once", async (_name, parts) => {
+    const f = await fixture();
+    const tool = { schema: "paperclip.tool.execution.v1", executionId: "execution-a", transport: "process", operation: "execute", status: "running", outputBytes: 0, outputTruncated: false, outputDigest: null };
+    for (const output of parts) {
+      await f.port.appendEvent(f.event("tool.execution.progressed", "tool", { ...tool, output }));
+      // Own-event checks happen while the stream is still live, not after a join.
+      for (const event of await f.stored()) expect(leaked(JSON.stringify(event.payload), T40)).toBe(false);
+      for (const live of f.live()) expect(leaked(JSON.stringify(live.payload), T40)).toBe(false);
+    }
+    const terminal = f.event("tool.execution.completed", "tool", { ...tool, status: "completed", output: parts.join("") });
+    await f.port.appendEvent(terminal);
+    expect((await f.port.appendEvent(terminal)).disposition).toBe("duplicate");
+    await f.port.appendEvent(f.event("turn.completed", undefined, { status: "completed" }));
+    const events = await f.stored();
+    const final = events.find(event => event.eventType === "tool.execution.completed")!;
+    expect(final.payload.output).toBe("Bearer ***REDACTED***");
+    expect(final.payload.outputTails).toEqual([{ itemId: "tool", payload: { executionId: "execution-a", text: "Bearer ***REDACTED***" } }]);
+    const joined = events.filter(event => event.eventType === "tool.execution.progressed").map(event => event.payload.output).join("")
+      + events.flatMap(tailsOf).map(tail => tail.payload.text).join("");
+    expect(joined).toBe("Bearer ***REDACTED***");
+    expect(events.flatMap(tailsOf)).toHaveLength(1);
+    expect(f.live()).toHaveLength(events.length);
+    for (const event of events) expect(leaked(JSON.stringify(event.payload), T40)).toBe(false);
+    for (const live of f.live()) expect(leaked(JSON.stringify(live.payload), T40)).toBe(false);
+    out(`n1-${_name}.json`, { events, live: f.live() });
+  });
+
+  it.each(["failed", "cancelled"])("N1 tool terminal status %s settles its own execution, not its neighbour", async status => {
+    const f = await fixture();
+    const tool = (executionId: string) => ({ schema: "paperclip.tool.execution.v1", executionId, transport: "process", operation: "execute", status: "running", outputBytes: 0, outputTruncated: false, outputDigest: null });
+    for (const executionId of ["a", "b"]) await f.port.appendEvent(f.event("tool.execution.progressed", "shared", { ...tool(executionId), output: "Bearer " + T40 }));
+    await f.port.appendEvent(f.event("tool.execution.completed", "shared", { ...tool("a"), status, output: "Bearer " + T40 }));
+    const before = await f.stored();
+    expect(before.flatMap(tailsOf).map(tail => tail.payload.executionId)).toEqual(["a"]);
+    await f.port.appendEvent(f.event("turn.cancelled", undefined, { status: "cancelled" }));
+    const events = await f.stored();
+    expect(events.flatMap(tailsOf).map(tail => tail.payload.executionId)).toEqual(["a", "b"]);
+    for (const event of events) expect(leaked(JSON.stringify(event.payload), T40)).toBe(false);
+    for (const live of f.live()) expect(leaked(JSON.stringify(live.payload), T40)).toBe(false);
+  });
+
+  it("N1 tool progress prose joins unchanged, isolates executions and settles on run terminals", async () => {
+    for (const terminalType of ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted", "session.closed", "run.terminal"]) {
+      const f = await fixture();
+      const tool = (executionId: string, output: string) => ({ schema: "paperclip.tool.execution.v1", executionId, transport: "process", operation: "execute", status: "running", output, outputBytes: Buffer.byteLength(output), outputTruncated: false, outputDigest: null });
+      // Same envelope itemId, different executionId: no cross-tool context.
+      for (const part of ["Progress: ", "building a task-list", ", done."]) {
+        await f.port.appendEvent(f.event("tool.execution.progressed", "shared", tool("prose", part)));
+      }
+      await f.port.appendEvent(f.event("tool.execution.progressed", "shared", tool("credential", "Bearer " + T40)));
+      const terminal = f.event(terminalType, undefined, { status: "ended" });
+      await f.port.appendEvent(terminalType === "run.terminal" ? { ...terminal, schema: "paperclip.prp.event.v3", schemaVersion: 3 } : terminal);
+      const events = await f.stored();
+      const proseEvents = events.filter(event => event.payload.executionId === "prose");
+      const tails = events.flatMap(tailsOf);
+      expect(proseEvents.map(event => event.payload.output).join("") + tails.filter(tail => tail.payload.executionId === "prose").map(tail => tail.payload.text).join(""))
+        .toBe("Progress: building a task-list, done.");
+      expect(tails.filter(tail => tail.payload.executionId === "credential").map(tail => tail.payload.text)).toEqual(["Bearer ***REDACTED***"]);
+      for (const event of events) expect(leaked(JSON.stringify(event.payload), T40)).toBe(false);
+      for (const live of f.live()) expect(leaked(JSON.stringify(live.payload), T40)).toBe(false);
+    }
+  });
+
+  it("N1 actual Pi projector's duplicated tool output is safe in both progress streams", async () => {
+    const { createPiEventProjector } = await import(new URL("../../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.ts", import.meta.url).href);
+    const f = await fixture();
+    const projector = createPiEventProjector({ runId: f.runId, turnId: "turn", spillDirectory: process.env.TMPDIR! });
+    for (const [type, output] of [["tool_execution_update", "Bearer "], ["tool_execution_update", T40], ["tool_execution_end", "Bearer " + T40]]) {
+      const result = { content: [{ type: "text", text: output }] };
+      const projected = projector.project({ type, toolCallId: "shell", toolName: "bash", ...(type === "tool_execution_end" ? { result } : { partialResult: result }) });
+      for (const entry of projected) await f.port.appendEvent(f.event(entry.eventType, entry.itemId, entry.payload));
+      for (const event of await f.stored()) expect(leaked(JSON.stringify(event.payload), T40)).toBe(false);
+      for (const live of f.live()) expect(leaked(JSON.stringify(live.payload), T40)).toBe(false);
+    }
+    const events = await f.stored();
+    expect(events.some(event => event.eventType === "tool.execution.progressed")).toBe(true);
+    // The Pi projector's whole-output scanner uses its existing [REDACTED] marker.
+    expect(events.find(event => event.eventType === "tool.execution.completed")!.payload.output).toBe("Bearer [REDACTED]");
+    out("n1-real-pi.json", { events, live: f.live() });
+  });
 
   // Never-OK: rf-2's 26,765-character JWT crosses the cap before its first dot.
   it("G1 capped unfinished JWT never releases raw held bytes in deltas or outputTails", async () => {
