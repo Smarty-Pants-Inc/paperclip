@@ -50,6 +50,7 @@ function carriesCommentSql(alias: string, commentId: SQL): SQL {
   const context = sql`${run}.context_snapshot`;
   return sql`(${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
     or ${context}->>'conversationReplyBoundaryCommentId' = ${commentId}::text
+    or coalesce(${context}->'attributionCommentIds', '[]'::jsonb) ? ${commentId}::text
     or ${context}->>'interactionId' = ${commentId}::text
     or coalesce(${context}->'interactionIds', '[]'::jsonb) ? ${commentId}::text
     or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
