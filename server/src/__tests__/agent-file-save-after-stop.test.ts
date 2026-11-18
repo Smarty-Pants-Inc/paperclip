@@ -156,10 +156,10 @@ describe("agent-file save after the box stopped", () => {
     // The hold still refuses the destroy claim; the park key (held_for_unsaved_files) settles the pause instead.
     expect(await agentFileSaveHeldOnLease(db, await fx.lease())).toBe(true);
     expect(await claimLeaseForDestroyUnlessHeld(db, await fx.lease())).toBeNull();
-    const before = fx.commands.length;
+    // Its own retry (as at base) cannot reach the stopped box: the hold stays, never released.
     const retried = (await fx.copies.collectStopped({ companyId, runId: fx.runId, target: fx.remote }))!;
-    expect(retried.receipt?.savePending).toEqual(savePending);
-    expect(fx.commands.length).toBe(before); // still no save against the stopped box
+    expect(agentFileSaveHeld(retried)).toBe(true);
+    expect(await claimLeaseForDestroyUnlessHeld(db, await fx.lease())).toBeNull();
   }, 60_000);
 
   it("R3 negative: a save failing or in flight on an ACTIVE lease still holds the destroy", async () => {

@@ -1,4 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
+import { parkRetainedComputer } from "./environment-retained-orphan-settlement.js";
 import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY, agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, holdUncollectedAgentFileCopy, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
@@ -3812,6 +3813,8 @@ function createSandboxEnvironmentDriver(
             }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig))),
           );
           termination = remoteTerminationReceipt(input.lease, receipt);
+          // C2: a proved-stopped pending destroy the provider answered "stopped" (it retains it) is parked.
+          if (input.lease.status === "pending_cleanup" && await parkRetainedComputer(db, input.lease, receipt)) return null;
         }
       } else {
         const metadataConfig = sandboxConfigFromLeaseMetadata(input.lease);

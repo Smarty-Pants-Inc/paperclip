@@ -165,7 +165,8 @@ export async function nextRetainedOrphanDueAt(db: Db, now: Date): Promise<Date |
  * carried receipt scope) is parked when the provider's destroy answer was
  * "stopped" (it retains the computer) or a NEVER-OK agent-file save hold
  * refuses its destroy claim (the debt stays visible). Never a provider flag. */
-export async function parkedCleanupDisposition(db: Db, lease: LeaseRow, now: Date, destroyAnswer?: unknown) {
+type ParkLease = Pick<LeaseRow, "id" | "companyId" | "environmentId" | "heartbeatRunId" | "provider" | "providerLeaseId">;
+export async function parkedCleanupDisposition(db: Db, lease: ParkLease, now: Date, destroyAnswer?: unknown) {
   if (!await ownLeaseTerminated(db, { companyId: lease.companyId, environmentId: lease.environmentId,
     providerLeaseId: lease.providerLeaseId, runId: lease.heartbeatRunId, leaseId: lease.id }, { carriedCleanupStop: true })) return undefined;
   const code = (destroyAnswer as { state?: unknown } | undefined)?.state === "stopped" ? "provider_retains_resource"
@@ -174,7 +175,7 @@ export async function parkedCleanupDisposition(db: Db, lease: LeaseRow, now: Dat
     ...(code === "held_for_unsaved_files" ? { debt: AGENT_FILE_DESTROY_REFUSED_MESSAGE } : {}) };
 }
 /** The pending-destroy sweep parks such a row (CAS on its pending status) instead of destroying it. */
-export async function parkRetainedComputer(db: Db, lease: LeaseRow, destroyAnswer?: unknown, now = new Date()) {
+export async function parkRetainedComputer(db: Db, lease: ParkLease, destroyAnswer?: unknown, now = new Date()) {
   const cleanupDisposition = await parkedCleanupDisposition(db, lease, now, destroyAnswer);
   if (!cleanupDisposition) return false;
   const parked = await db.update(environmentLeases).set({ updatedAt: now,
