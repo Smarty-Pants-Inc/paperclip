@@ -22,6 +22,7 @@ vi.mock("postgres", () => ({
     };
     return Object.assign(sql, {
       end: transport.end,
+      reserve: async () => Object.assign(sql, { release: () => {} }),
       unsafe: (query: string) => query.startsWith("SELECT count(*)") ? Promise.resolve([{ n: transport.rows.length }])
         : query.startsWith("SELECT ") && query.includes('FROM "public"."binary_fixture"')
           ? { values: () => ({ cursor: async function* () { transport.projection = query; yield transport.rows; } }) }
