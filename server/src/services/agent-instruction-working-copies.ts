@@ -36,14 +36,9 @@ const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("h
 const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
 const completed = new Set(["saved", "unchanged", "resolved"]);
 const MAX_COLLECTION_ATTEMPTS = 3;
-export const INSTRUCTION_COPY_RETRY_MS = 30_000;
-export const INSTRUCTION_COPY_MAX_RETRY_MS = 6 * 60 * 60_000;
+import { instructionCopyRetryAt, INSTRUCTION_COPY_RETRY_MS } from "./instruction-copy-retry.js";
+export { instructionCopyRetryAt, INSTRUCTION_COPY_RETRY_MS, INSTRUCTION_COPY_MAX_RETRY_MS } from "./instruction-copy-retry.js";
 const settledStates = new Set(["saved", "unchanged", "resolved", "unavailable", "conflict"]);
-
-export function instructionCopyRetryAt(waitingSince: Date, now = Date.now()) {
-  const waited = Math.max(0, now - waitingSince.getTime());
-  return new Date(now + Math.min(INSTRUCTION_COPY_MAX_RETRY_MS, Math.max(INSTRUCTION_COPY_RETRY_MS, Math.floor(waited / 2))));
-}
 
 // Only orchestration can register a live target; tools and HTTP callers cannot
 // supply one. These handles are optional: durable captured bytes survive restart.
@@ -70,10 +65,12 @@ function serializeCopySave<T>(db: Db, companyId: string, runId: string, save: ()
 
 
 /** Finish only bounded immediate collection work; deferred ownership remains pending. */
-export async function collectStoppedInstructionCopyWithRetries<T extends Pick<Copy, "state" | "attempts" | "nextAttemptAt">>(collect: () => Promise<T | null>): Promise<T | null> {
+export async function collectStoppedInstructionCopyWithRetries<T extends Pick<Copy, "state" | "attempts" | "nextAttemptAt">>(collect: () => Promise<T | null>, signal?: AbortSignal): Promise<T | null> {
   let saved: T | null = null;
   let previousAttempts = -1;
   for (let calls = 0; calls < MAX_COLLECTION_ATTEMPTS; calls++) {
+    // AF-ABORT: an aborted collection makes no further attempt.
+    signal?.throwIfAborted();
     saved = await collect();
     if (!saved || saved.state !== "pending_collection" || saved.nextAttemptAt === null
       || saved.attempts >= MAX_COLLECTION_ATTEMPTS || saved.attempts <= previousAttempts) break;
@@ -336,13 +333,16 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
   }
 
   /** Caller must have joined the owned provider process before granting this proof. */
-  function collectStopped(input: { companyId: string; runId: string; target?: AdapterExecutionTarget | null }): Promise<Copy | null> {
+  /** `signal` (AF-ABORT): once aborted, the collection starts no further remote
+   * command or write and releases its operation-lock transaction at once. */
+  function collectStopped(input: { companyId: string; runId: string; target?: AdapterExecutionTarget | null; signal?: AbortSignal }): Promise<Copy | null> {
     return trackAgentFileCheckpoint(serializeCopySave(db, input.companyId, input.runId, () => collectStoppedOnce(input)));
   }
   async function collectStoppedOnce(input: Parameters<typeof collectStopped>[0]) {
+    input.signal?.throwIfAborted();
     let row = await get(input.companyId, input.runId);
     if (!row) return row;
-    if (isAgentDirectoryCopy(row)) return directories.collectStopped(row, input.target);
+    if (isAgentDirectoryCopy(row)) return directories.collectStopped(row, input.target, input.signal);
     if (completed.has(row.state) || row.state === "conflict") return row;
     row = await patch(row, { processStoppedAt: row.processStoppedAt ?? new Date(), attempts: row.attempts + 1 });
     if (completed.has(row.state) || row.state === "conflict") return row;
@@ -708,5 +708,5 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     }
     return row;
   }
-  return { registerStoppedCollectionWork, registerDirectoryCleanupWork, registerCapturedCommitWork, prepare, checkpointWarm, claimConflictNotice: directories.claimConflictNotice, canReuseWarm: directories.canReuse, adopt, reportRetirementUnconfirmed, get, hasChanges, acknowledgeExplicitSave, collectStopped, recoverCaptured, recoverStopped, list, resolve, reportUnavailable, release };
+  return { discardHeld: directories.discardHeld, registerStoppedCollectionWork, registerDirectoryCleanupWork, registerCapturedCommitWork, prepare, checkpointWarm, claimConflictNotice: directories.claimConflictNotice, canReuseWarm: directories.canReuse, adopt, reportRetirementUnconfirmed, get, hasChanges, acknowledgeExplicitSave, collectStopped, recoverCaptured, recoverStopped, list, resolve, reportUnavailable, release };
 }
