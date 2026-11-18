@@ -162,15 +162,16 @@ async function runExpensiveWorkspaceGit(
   return await runLocalGit(localDir, args, options);
 }
 
-const ownedSnapshots = new WeakMap<GitWorkspaceSnapshot, string>();
+// adopt-stopu-drainmanifest: the removal registered before the mkdtemp.
+const ownedSnapshots = new WeakMap<GitWorkspaceSnapshot, () => Promise<void>>();
 
 export async function disposeGitWorkspaceSnapshot(snapshot: GitWorkspaceSnapshot | null): Promise<void> {
   if (!snapshot) return;
-  const ownedDirectory = ownedSnapshots.get(snapshot);
-  if (!ownedDirectory) return;
+  const removeOwnedDirectory = ownedSnapshots.get(snapshot);
+  if (!removeOwnedDirectory) return;
   ownedSnapshots.delete(snapshot);
   for (const repository of snapshot.repositories ?? []) await disposeGitWorkspaceSnapshot(repository.snapshot);
-  await hostCleanup(() => fs.rm(ownedDirectory, { recursive: true, force: true }));
+  await removeOwnedDirectory();
 }
 
 /** Snapshot deadlines include disk backpressure. Operators can allow up to 24h. */
@@ -304,12 +305,12 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
       ...(repositories.length ? { repositories } : {}),
     };
     writer.close();
-    ownedSnapshots.set(snapshot, path.dirname(writer.filePath));
+    ownedSnapshots.set(snapshot, writer.removeDirectory);
     return snapshot;
   } catch (error) {
     writer.close(false);
     for (const repo of repositories) await disposeGitWorkspaceSnapshot(repo.snapshot);
-    await hostCleanup(() => fs.rm(path.dirname(writer.filePath), { recursive: true, force: true }));
+    await writer.removeDirectory();
     throw error;
   } finally { options.signal?.removeEventListener("abort", abort); }
 }

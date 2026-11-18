@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import type { SerializedDirectorySnapshot } from "./workspace-restore-merge.js";
 import type { WorkspacePaths } from "./workspace-manifest.js";
+import { HostMutationRefusedError, hostCleanup, hostDeferredCleanup, hostMutation, type HostCleanupHandle } from "./host-mutation-drain.js";
 
 export interface SnapshotThreadRequest {
   rootDir: string;
@@ -34,13 +35,29 @@ function release() {
 export async function runSnapshotThread(request: SnapshotThreadRequest): Promise<{
   snapshot: Extract<SerializedDirectorySnapshot, { version: 2 }>;
   directory: string;
+  /** adopt-stopu-drainmanifest: the registered removal of `directory`. */
+  removeDirectory: HostCleanupHandle;
 }> {
   await acquire();
   let directory: string | undefined;
   let worker: Worker | undefined;
   let published = false;
+  // adopt-stopu-drainmanifest (rf-4 Part A): REGISTER the cleanup with the
+  // owner's drain BEFORE the directory exists and BEFORE the worker starts. A
+  // closing drain stops the worker (its writes into `directory` end) and then
+  // removes the directory, before it is drained; the late call is a no-op.
+  let cancelled = false;
+  const removeDirectory = hostDeferredCleanup(async () => {
+    cancelled = true;
+    if (worker) await worker.terminate();
+    const created = directory;
+    if (created) await hostCleanup(() => fs.rm(created, { recursive: true, force: true }));
+  });
   try {
-    directory = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-snapshot-thread-"));
+    directory = await hostMutation(() => fs.mkdtemp(path.join(os.tmpdir(), "paperclip-snapshot-thread-")));
+    // The drain ran the registered cleanup while the mkdtemp was in flight:
+    // never start a worker that would write into the removed directory.
+    if (cancelled) throw new HostMutationRefusedError("snapshot_thread_cleanup_ran");
     const source = new URL(import.meta.url).pathname.endsWith(".ts");
     const url = new URL(source ? "./workspace-snapshot-thread-worker.ts" : "./workspace-snapshot-thread-worker.js", import.meta.url);
     const options = { workerData: request, env: { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory } };
@@ -70,11 +87,11 @@ export async function runSnapshotThread(request: SnapshotThreadRequest): Promise
     const stat = await fs.lstat(snapshot.entries.filePath);
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Workspace snapshot worker manifest is not a regular file");
     published = true;
-    return { snapshot, directory };
+    return { snapshot, directory, removeDirectory };
   } finally {
     try {
       if (worker) await worker.terminate();
-      if (directory && !published) await fs.rm(directory, { recursive: true, force: true });
+      if (!published) await removeDirectory();
     } finally { release(); }
   }
 }

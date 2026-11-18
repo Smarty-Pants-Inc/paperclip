@@ -36,8 +36,10 @@ export type SerializedDirectorySnapshot = LegacySerializedDirectorySnapshot | {
 // current owner's drain when the snapshot is created (the drain removes it at
 // close if the work has not yet disposed of it).
 const ownedDirectorySnapshots = new WeakMap<DirectorySnapshot, HostCleanupHandle>();
-function ownSnapshotDirectory(snapshot: DirectorySnapshot, directory: string): void {
-  ownedDirectorySnapshots.set(snapshot, hostDeferredCleanup(() => hostCleanup(() => fs.rm(directory, { recursive: true, force: true }))));
+// adopt-stopu-drainmanifest: the handle was registered with the drain BEFORE
+// the directory was created (createWorkspaceManifest / runSnapshotThread).
+function ownSnapshotDirectory(snapshot: DirectorySnapshot, removeDirectory: HostCleanupHandle): void {
+  ownedDirectorySnapshots.set(snapshot, removeDirectory);
 }
 export async function disposeDirectorySnapshot(snapshot: DirectorySnapshot | null): Promise<void> {
   if (!snapshot) return;
@@ -712,11 +714,11 @@ export async function captureDirectorySnapshot(
       exclude, ignoredPaths: options.ignoredPaths,
       entries: manifest ? new WorkspaceManifestMap(manifest, parseManifestEntry) : memory,
     };
-    if (writer) ownSnapshotDirectory(snapshot, path.dirname(writer.filePath));
+    if (writer) ownSnapshotDirectory(snapshot, writer.removeDirectory);
     return snapshot;
   } catch (error) {
     writer?.close(false);
-    if (writer) await hostCleanup(() => fs.rm(path.dirname(writer!.filePath), { recursive: true, force: true }));
+    if (writer) await writer.removeDirectory();
     throw error;
   } finally { ignored.close(); }
 }
@@ -729,10 +731,10 @@ export async function captureDirectorySnapshotOffThread(
   const result = await runSnapshotThread({ rootDir, exclude: options.exclude, ignoredPaths: options.ignoredPaths });
   try {
     const snapshot = openDirectorySnapshot(result.snapshot);
-    ownSnapshotDirectory(snapshot, result.directory);
+    ownSnapshotDirectory(snapshot, result.removeDirectory);
     return snapshot;
   } catch (error) {
-    await hostCleanup(() => fs.rm(result.directory, { recursive: true, force: true }));
+    await result.removeDirectory();
     throw error;
   }
 }
@@ -751,11 +753,11 @@ export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, optio
     const result: DirectorySnapshot = { exclude: options.exclude, ignoredPaths: options.ignoredPaths,
       entries: new WorkspaceManifestMap(writer.paths("baseline"), parseManifestEntry) };
     writer.close();
-    ownSnapshotDirectory(result, path.dirname(writer.filePath));
+    ownSnapshotDirectory(result, writer.removeDirectory);
     return result;
   } catch (error) {
     writer.close(false);
-    await hostCleanup(() => fs.rm(path.dirname(writer.filePath), { recursive: true, force: true }));
+    await writer.removeDirectory();
     throw error;
   }
 }

@@ -1476,8 +1476,9 @@ export async function prepareSandboxManagedRuntime(input: {
     if (input.workspaceBaseline && input.workspaceBaseline !== baselineSnapshot) await disposeDirectorySnapshot(input.workspaceBaseline);
     await disposeGitWorkspaceSnapshot(gitSnapshot);
     if (!gitSnapshot) for (const repo of repositories) await disposeGitWorkspaceSnapshot(repo.snapshot);
-    if (managedIgnored) { const dir = path.dirname(managedIgnored.filePath); await hostCleanup(() => fs.rm(dir, { recursive: true, force: true })); }
-    if (filesystemDeleted) { const dir = path.dirname(filesystemDeleted.filePath); await hostCleanup(() => fs.rm(dir, { recursive: true, force: true })); }
+    // adopt-stopu-drainmanifest: the removals registered before the mkdtemp.
+    if (managedIgnored) await managedIgnored.removeDirectory();
+    if (filesystemDeleted) await filesystemDeleted.removeDirectory();
   })();
   try {
   // A selected subfolder has no cloneable Git snapshot, but its parent

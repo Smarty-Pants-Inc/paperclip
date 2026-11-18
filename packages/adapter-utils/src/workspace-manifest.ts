@@ -4,6 +4,7 @@ import nodeFs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { hostCleanup, hostDeferredCleanup, hostMutation, type HostCleanupHandle } from "./host-mutation-drain.js";
 
 // Limits apply to one record and to SQLite's page cache, never to the list.
 export const WORKSPACE_PATH_MAX_BYTES = 64 * 1024;
@@ -58,7 +59,13 @@ export class WorkspaceManifestWriter {
   private readonly insert: StatementSync;
   private closed = false;
   private bytesSinceDiskCheck = 0;
-  constructor(readonly filePath: string) {
+  /** adopt-stopu-drainmanifest: removes this manifest's private directory. It
+   * was REGISTERED with the current owner's drain before the directory was
+   * created (createWorkspaceManifest), so a closing drain runs it before it is
+   * drained and the owner's late call is a no-op. Idempotent. */
+  readonly removeDirectory: HostCleanupHandle;
+  constructor(readonly filePath: string, removeDirectory?: HostCleanupHandle) {
+    this.removeDirectory = removeDirectory ?? (() => Promise.resolve());
     const availableBytes = assertWorkspaceManifestDiskSpace(path.dirname(filePath));
     this.db = openDatabase(filePath, false);
     try {
@@ -124,9 +131,19 @@ export class WorkspaceManifestMap<T> {
 }
 
 export async function createWorkspaceManifest(prefix = "paperclip-workspace-manifest-"): Promise<WorkspaceManifestWriter> {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  try { return new WorkspaceManifestWriter(path.join(directory, "paths.sqlite")); }
-  catch (error) { await fs.rm(directory, { recursive: true, force: true }); throw error; }
+  // adopt-stopu-drainmanifest (rf-4 Part A): REGISTER the removal with the
+  // owner's drain FIRST, then create the directory as a tracked host mutation
+  // (refused once the drain is closed). 'drained' therefore waits for the
+  // mkdtemp, and the drain itself removes the directory before it is drained.
+  let directory: string | undefined;
+  const removeDirectory = hostDeferredCleanup(async () => {
+    const created = directory;
+    if (created) await hostCleanup(() => fs.rm(created, { recursive: true, force: true }));
+  });
+  try {
+    directory = await hostMutation(() => fs.mkdtemp(path.join(os.tmpdir(), prefix)));
+    return new WorkspaceManifestWriter(path.join(directory, "paths.sqlite"), removeDirectory);
+  } catch (error) { await removeDirectory(); throw error; }
 }
 
 export function* readManifestRecords(manifest: PathManifest, reverse = false): Generator<[string, string]> {
@@ -200,10 +217,14 @@ export class WorkspaceNulParser {
 }
 
 export async function writeWorkspacePaths(paths: WorkspacePaths, target: string): Promise<void> {
-  const file = await fs.open(target, "wx", 0o600);
-  try {
-    for (const relative of workspacePaths(paths)) await file.writeFile(`${relative}\0`);
-  } finally { await file.close(); }
+  // adopt-stopu-drainmanifest: the whole create+write is one tracked host
+  // mutation (refused once the owner's drain is closed; 'drained' waits on it).
+  await hostMutation(async () => {
+    const file = await fs.open(target, "wx", 0o600);
+    try {
+      for (const relative of workspacePaths(paths)) await file.writeFile(`${relative}\0`);
+    } finally { await file.close(); }
+  });
 }
 
 export async function manifestFileSha256(filePath: string): Promise<string> {
