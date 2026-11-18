@@ -1,3 +1,4 @@
+import { redactSensitiveText } from "../redaction.js";
 import type {
   RunPresentationDecision,
   RunPresentationSource,
@@ -609,7 +610,11 @@ export function resolveHeartbeatRunResponse(input: {
   const wholeAnswer = (summary: string): string => {
     const whole = input.finalAgentMessage?.channel === "final" && input.finalAgentMessage.bounded !== true
       && rawFinalAgentText && !isBoundedRunEventText(rawFinalAgentText) ? rawFinalAgentText : null;
-    return whole && whole.length > summary.length && whole.startsWith(summary) ? whole : summary;
+    // Native event text is masked at append; accepted summaries can still be
+    // raw. Compare the same projection without shrinking the whole answer.
+    const maskedSummary = redactSensitiveText(summary);
+    const maskedWhole = whole ? redactSensitiveText(whole) : null;
+    return maskedWhole && maskedWhole.length > maskedSummary.length && maskedWhole.startsWith(maskedSummary) ? whole! : summary;
   };
   // A run-log preview is an incomplete copy of the agent's message. It never
   // outranks a complete source; it is posted only when no complete text exists.
