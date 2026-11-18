@@ -2315,6 +2315,30 @@ export function nativeToolsRefreshWaitResult(input: {
  * closed native envelope, so that exact interaction may park the continuation
  * run without requiring the model to recreate a second request.
  */
+/** The pending card that parks this run's turn (resolvePendingGovernedWait). */
+export function pendingGovernedWaitCondition(execution: NativeExecutionInput) {
+  const continuingInteractionIds = continuingPendingInteractionIds(execution);
+  return and(
+    eq(issueThreadInteractions.companyId, execution.binding.companyId),
+    eq(issueThreadInteractions.issueId, execution.binding.issueId),
+    or(
+      eq(issueThreadInteractions.sourceRunId, execution.binding.runId),
+      and(
+        eq(issueThreadInteractions.kind, "connection_intent"),
+        eq(issueThreadInteractions.createdByAgentId, execution.binding.agentId),
+      ),
+      ...(continuingInteractionIds.length > 0
+        ? [inArray(issueThreadInteractions.id, continuingInteractionIds)]
+        : []),
+    ),
+    eq(issueThreadInteractions.status, "pending"),
+    activeIssueInteractionCondition({ runId: execution.binding.runId }),
+    // Live provider questions resume their current turn; only durable
+    // wake-based cards park it. A timeout creates a separate fallback.
+    sql`not (${issueThreadInteractions.kind} = 'ask_user_questions' and ${issueThreadInteractions.continuationPolicy} = 'none' and coalesce(${issueThreadInteractions.idempotencyKey}, '') like 'paperclip-runner-question:%')`,
+  );
+}
+
 export function continuingPendingInteractionIds(
   execution: NativeExecutionInput,
 ): string[] {
@@ -13138,9 +13162,6 @@ async function executePaperclipNativeSessionAttempt(
     const handoff = await nativeCaseHandoffResult(input.db, { ...input.execution.binding,
       completionContract: input.execution.completionContract.contract });
     if (handoff) return handoff;
-    const continuingInteractionIds = continuingPendingInteractionIds(
-      input.execution,
-    );
     const interaction = await input.db
       .select({
         id: issueThreadInteractions.id,
@@ -13148,36 +13169,7 @@ async function executePaperclipNativeSessionAttempt(
         summary: issueThreadInteractions.summary,
       })
       .from(issueThreadInteractions)
-      .where(
-        and(
-          eq(
-            issueThreadInteractions.companyId,
-            input.execution.binding.companyId,
-          ),
-          eq(issueThreadInteractions.issueId, input.execution.binding.issueId),
-          or(
-            eq(
-              issueThreadInteractions.sourceRunId,
-              input.execution.binding.runId,
-            ),
-            and(
-              eq(issueThreadInteractions.kind, "connection_intent"),
-              eq(
-                issueThreadInteractions.createdByAgentId,
-                input.execution.binding.agentId,
-              ),
-            ),
-            ...(continuingInteractionIds.length > 0
-              ? [inArray(issueThreadInteractions.id, continuingInteractionIds)]
-              : []),
-          ),
-          eq(issueThreadInteractions.status, "pending"),
-          activeIssueInteractionCondition({ runId: input.execution.binding.runId }),
-          // Live provider questions resume their current turn; only durable
-          // wake-based cards park it. A timeout creates a separate fallback.
-          sql`not (${issueThreadInteractions.kind} = 'ask_user_questions' and ${issueThreadInteractions.continuationPolicy} = 'none' and coalesce(${issueThreadInteractions.idempotencyKey}, '') like 'paperclip-runner-question:%')`,
-        ),
-      )
+      .where(pendingGovernedWaitCondition(input.execution))
       .orderBy(
         desc(issueThreadInteractions.createdAt),
         desc(issueThreadInteractions.id),
