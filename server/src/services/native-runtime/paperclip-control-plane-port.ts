@@ -92,42 +92,94 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
-/** Text leaves only: do not apply field-name masking to protocol objects. */
-function redactNativeText<T>(value: T, depth = 0): T {
-  // A decoded JSON leaf must not turn a valid event into a stack overflow.
-  // Its enclosing string catches this and redacts the original text instead.
-  if (depth > 64) throw new Error("native_text_depth_exceeded");
-  if (typeof value === "string") {
-    // Pi tool inputs can themselves be serialized JSON, including string
-    // scalars. An escaped newline's `n` can hide a key's word boundary.
-    if (/^[\[{\"]/.test(value.trimStart())) {
-      try {
-        const decoded: unknown = JSON.parse(value);
-        const masked = redactNativeText(decoded, depth + 1);
-        // Preserve formatting/escapes byte-for-byte unless a leaf changed.
-        return (masked === decoded ? value : JSON.stringify(masked)) as T;
-      } catch {
-        // Parse, walk (including the depth bound), and encode errors must not
-        // refuse an event. Fall back on the whole original string.
-        return redactSensitiveText(value) as T;
+/** Encode parsed JSON without putting its nesting depth on the JS call stack. */
+function stringifyNativeTextJson(value: unknown): string {
+  type Part = { value: unknown } | { text: string };
+  const pending: Part[] = [{ value }];
+  const output: string[] = [];
+  while (pending.length) {
+    const part = pending.pop()!;
+    if ("text" in part) {
+      output.push(part.text);
+    } else if (part.value && typeof part.value === "object") {
+      const array = Array.isArray(part.value);
+      const entries = Object.entries(part.value);
+      output.push(array ? "[" : "{");
+      pending.push({ text: array ? "]" : "}" });
+      for (let index = entries.length - 1; index >= 0; index--) {
+        const [key, child] = entries[index]!;
+        pending.push({ value: child });
+        if (!array) pending.push({ text: `${JSON.stringify(key)}:` });
+        if (index > 0) pending.push({ text: "," });
       }
+    } else {
+      output.push(JSON.stringify(part.value)!);
     }
-    return redactSensitiveText(value) as T;
   }
-  if (Array.isArray(value)) {
-    const masked = value.map(child => redactNativeText(child, depth + 1));
-    return (masked.some((child, index) => child !== value[index]) ? masked : value) as T;
+  return output.join("");
+}
+
+/** Text leaves only: do not apply field-name masking to protocol objects. */
+function redactNativeText<T>(value: T): T {
+  type Work = { value: unknown; apply: (masked: unknown) => void } | { finish: () => void };
+  let result: unknown = value;
+  const pending: Work[] = [{ value, apply: masked => { result = masked; } }];
+  while (pending.length) {
+    const work = pending.pop()!;
+    if ("finish" in work) {
+      work.finish();
+      continue;
+    }
+    const { value: current, apply } = work;
+    if (typeof current === "string") {
+      // Pi inputs include JSON string scalars. Scan only decoded leaves:
+      // an escaped newline's `n` otherwise hides the following key boundary.
+      if (/^[\[{\"]/.test(current.trimStart())) {
+        let decoded: unknown;
+        let parsed = false;
+        try {
+          decoded = JSON.parse(current);
+          parsed = true;
+        } catch {
+          // Malformed JSON is ordinary prose, not serialized protocol data.
+        }
+        if (parsed) {
+          pending.push({ value: decoded, apply: masked => {
+            // Preserve formatting/escapes byte-for-byte unless a leaf changed.
+            apply(masked === decoded ? current : stringifyNativeTextJson(masked));
+          } });
+          continue;
+        }
+      }
+      apply(redactSensitiveText(current));
+    } else if (Array.isArray(current)) {
+      let changed = false;
+      const masked = current.slice();
+      pending.push({ finish: () => apply(changed ? masked : current) });
+      for (let index = current.length - 1; index >= 0; index--) {
+        const child = current[index];
+        pending.push({ value: child, apply: next => {
+          masked[index] = next;
+          if (next !== child) changed = true;
+        } });
+      }
+    } else if (current && typeof current === "object") {
+      let changed = false;
+      const entries = Object.entries(current);
+      pending.push({ finish: () => apply(changed ? Object.fromEntries(entries) : current) });
+      for (let index = entries.length - 1; index >= 0; index--) {
+        const entry = entries[index]!;
+        const child = entry[1];
+        pending.push({ value: child, apply: next => {
+          entry[1] = next;
+          if (next !== child) changed = true;
+        } });
+      }
+    } else {
+      apply(current);
+    }
   }
-  if (value && typeof value === "object") {
-    let changed = false;
-    const entries = Object.entries(value).map(([key, child]) => {
-      const masked = redactNativeText(child, depth + 1);
-      if (masked !== child) changed = true;
-      return [key, masked];
-    });
-    return changed ? Object.fromEntries(entries) as T : value;
-  }
-  return value;
+  return result as T;
 }
 
 function assertTerminal(value: unknown): asserts value is PrpTerminalState {

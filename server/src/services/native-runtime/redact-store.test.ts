@@ -333,6 +333,34 @@ describe("redact-store G1/G4 durable boundaries", () => {
     expect(row!.sourcePayloadSha256).toBe(nativeSha256(event));
   });
 
+  const four = ["sk-proj-"+"P".repeat(40), "sk-ant-api03-"+"Q".repeat(40), "sk-or-v1-"+"a2".repeat(32), "sk-"+"R".repeat(40)];
+  const projectFinal = (f: Awaited<ReturnType<typeof fixture>>, text: string) => createPiEventProjector({ runId: f.runId, turnId: "turn", spillDirectory: directory }).project({ type: "message_end", message: { role: "assistant", provider: "judge", model: "model", responseId: "reply", stopReason: "stop", content: [{type:"text",text}] } }).find(e => e.eventType === "item.completed" && e.payload.kind === "agentMessage")!;
+  async function evidence(name:string, event:PrpEvent, row:typeof heartbeatRunEvents.$inferSelect) {
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `${process.env.JUDGE_LABEL ?? "judge"}-${name}.evidence.json`), JSON.stringify({ input:event, stored:row.payload, storedSha:row.sourcePayloadSha256, recomputedSha:nativeSha256(row.payload!.prpEvent) },null,2)+"\n");
+  }
+  // KEEP: rf-2 F1/F2 guard durable confidentiality and valid-event availability.
+  it.each([64,6000])("JUDGE F-new depth %i fallback must not leak keys after escaped newlines",async depth=>{
+    const f=await fixture();const raw="[".repeat(depth)+JSON.stringify("line1\n"+four.join("\n"))+"]".repeat(depth);
+    const projected=projectFinal(f,raw);expect(projected.payload.text).toBe(raw);
+    const event=f.event("",1,projected.payload);await f.port.appendEvent(event);const [row]=await f.stored();await evidence("fallback-"+depth,event,row!);
+    const stored=row!.payload!.prpEvent as unknown as PrpEvent;
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(stored));
+    for(const key of four) expect(String(stored.payload.text)).not.toContain(key);
+    expect(String(stored.payload.text)).toContain("***REDACTED***");
+  });
+  it("JUDGE F-object credential-free structured payload at depth 70 remains appendable",async()=>{
+    const f=await fixture();let nested:unknown={status:"ready",requestId:"req_123"};for(let i=0;i<70;i++) nested={nested};
+    const event=f.event("",1,{nested});
+    await expect(f.port.appendEvent(event)).resolves.toMatchObject({disposition:"committed"});
+    const [row]=await f.stored();expect(row!.payload!.prpEvent).toEqual(event);
+  });
+  it("JUDGE F-object credential-free structured payload at depth 6000 remains appendable",async()=>{
+    const f=await fixture();let nested:unknown={status:"ready",requestId:"req_123"};for(let i=0;i<6000;i++) nested={nested};
+    const event=f.event("",1,{nested});
+    await expect(f.port.appendEvent(event)).resolves.toMatchObject({disposition:"committed"});
+    const [row]=await f.stored();expect(row!.payload!.prpEvent).toEqual(event);
+  });
+
   it("r2 agent comments echoing every provider key are stored and returned masked with run attribution and dedupe", async () => {
     const f = await fixture();
     const svc = issueService(db);
