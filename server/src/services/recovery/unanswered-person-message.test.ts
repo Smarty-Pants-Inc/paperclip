@@ -2455,7 +2455,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   // Keep: recorded PV2 gate-1 catch (11:27Z): answering the run's question
   // removed its pending-card exemption before response delivery could wake it.
-  it.each([true, false])("PV2 card-answer: no resend notice before, during or after one answer delivery (chat=%s)", async chat => {
+  // The old fixture's one agent reply was stamped on the fixture clock (about 15 minutes in the past), BEFORE the
+  // card answer the real answer service resolved at wall time. A reply that predates the answer is not an answer
+  // to it (person-message-answer.ts personMessageReplySql: a.created_at > the answer's resolved_at). The reply now
+  // follows the answer, as a real answer-resume run's reply does. Same assertions: zero notices ever, one reply.
+  it.each([true, false])("supersedes(PV2 card-answer: no resend notice before, during or after one answer delivery (chat=%s); RFL record PENDING: fixture reply moved to a completed final answer under ANSWERED)", async chat => {
     const f = await fixture({ chat, status: "in_review" });
     const messageId = await f.message("Build the landing page.");
     const sourceRunId = await f.run({ commentId: messageId, status: "running" });
@@ -2505,7 +2509,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await noticesEver()).toHaveLength(0);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, first!.targetRunId!));
     await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, wakes[0]!.id));
-    await f.reply(first!.targetRunId!);
+    // The real answer service resolved at wall time. Its final reply must
+    // follow that resolution, not the fixture clock 15 minutes in the past.
+    // The removed status-only rule used to mask this misordered fixture.
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      body: "Here is my answer.", authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: first!.targetRunId!, createdAt: new Date() });
     await f.sweep();
     expect(await noticesEver()).toHaveLength(0);
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent"))))
