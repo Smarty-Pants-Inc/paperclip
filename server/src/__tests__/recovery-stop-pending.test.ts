@@ -8,6 +8,7 @@ import { seedCompanyWithBoardAccess, routeApp } from "./helpers/route-test-harne
 import { issueRoutes } from "../routes/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { ENVIRONMENT_UNRELEASED_TEXT } from "../services/recovery/stop-pending.js";
 
 // Keep reason: #20807 RFL F2's real PostgreSQL reproduction found a stable,
 // silent Stop hold on a 30-day unassigned task. Data safety requires retaining
@@ -46,7 +47,7 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
       .where(eq(heartbeatRuns.id, runId));
   }
 
-  it("supersedes(C1 no-Stop card): gives the judge's 30-day unassigned hold a durable API-visible code, recovery owner and bounded board escalation", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): gives the judge's 30-day unassigned hold a durable API-visible code, recovery owner and bounded board escalation", async () => {
     const f = await fixture(PERSON_STOP);
     const before = await task(f.issueId);
     const runBefore = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0];
@@ -80,7 +81,7 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
       .toMatchObject({ status: "resolved", outcome: "restored" });
   });
 
-  it("supersedes(C1 no-Stop card): keeps a stronger existing recovery action and its owner, while exposing Stop escalation; proof removes only this annotation", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): keeps a stronger existing recovery action and its owner, while exposing Stop escalation; proof removes only this annotation", async () => {
     const f = await fixture(PERSON_STOP);
     const [prior] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
       kind: "active_run_watchdog", cause: "uncertain_provider_action", fingerprint: "existing-action",
@@ -101,7 +102,7 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
       attemptCount: 3, maxAttempts: 3, nextAction: prior.nextAction, evidence: prior.evidence });
   });
 
-  it("supersedes(C1 no-Stop card): does not let terminal task projection or generic recovery resolution hide an unproven Stop", async () => {
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): does not let terminal task projection or generic recovery resolution hide an unproven Stop", async () => {
     const f = await fixture(PERSON_STOP);
     await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, f.issueId));
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
@@ -136,20 +137,99 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
     return db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
   }
 
-  it("C1 RED: a failed run with a pending lease release and no person Stop never gets a card (+30 s, +2 min, +1 h)", async () => {
+  async function leaseHeldRun() {
     const f = await fixture();
     await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", runtimeMode: "native",
       issueId: f.issueId, nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.runId));
-    await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId, heartbeatRunId: f.runId,
+    const [lease] = await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId, heartbeatRunId: f.runId,
       status: "active", leasePolicy: "reuse_by_environment", provider: "plugin:boat:computer", providerLeaseId: `boat-${f.runId}`,
       expiresAt: new Date(Date.now() + 300_000), metadata: { releaseDeferral: { reason: "workspace_retention_busy", attempts: 1,
-        retryAt: new Date().toISOString() } } });
-    for (const ms of [30_000, 2 * 60_000, 60 * 60_000]) {
+        retryAt: new Date().toISOString() } } }).returning();
+    return { ...f, leaseId: lease!.id };
+  }
+
+  // RFL record SUPERSEDE-C1-NOSTOP-CARD-1118 (b): NO SILENT HOLD. Within 15 min of the finish a held lease is
+  // transient and never cards (the C1 RED); past 15 min the card says what is TRUE, never 'Stop pending'.
+  it("C1 RED (b): a failed run nobody stopped with a pending lease release gets no card for 15 min (+30 s, +2 min, +14 min), then the true environment card", async () => {
+    const f = await leaseHeldRun();
+    for (const ms of [30_000, 2 * 60_000, 14 * 60_000]) {
       await finishedAgo(f.runId, ms);
       expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks()).cleared).toBe(0);
       expect(await stopCards(f.issueId), `+${ms} ms`).toEqual([]);
     }
+    await finishedAgo(f.runId, 16 * 60_000);
+    for (let tick = 0; tick < 2; tick++) expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks()).cleared).toBe(0);
+    const cards = await stopCards(f.issueId);
+    expect(cards).toMatchObject([{ cause: "execution_environment_unreleased", status: "escalated", ownerType: "board",
+      evidence: { stopPending: { runIds: [f.runId], environmentUnreleased: true } } }]);
+    expect(cards[0]!.nextAction.startsWith(ENVIRONMENT_UNRELEASED_TEXT)).toBe(true);
+    expect(ENVIRONMENT_UNRELEASED_TEXT).toBe("The previous run's environment hasn't been released, so this task can't start yet.");
+    // The next step is the board's Force release (POST /issues/:id/admin/force-release), which really clears the hold.
+    expect(cards[0]!.nextAction).toContain("Force release");
+    expect(cards[0]!.nextAction).not.toMatch(/stop pending|execution_stop_pending/i);
+    const app = routeApp(db, f.actor, issueRoutes);
+    const shown = (await request(app).get(`/api/issues/${f.issueId}`).expect(200)).body.activeRecoveryAction;
+    expect(shown).toMatchObject({ id: cards[0]!.id, cause: "execution_environment_unreleased" });
+    expect(shown.nextAction).not.toMatch(/stop pending/i);
     expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_stop_pending"))).toEqual([]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
+    await request(app).post(`/api/issues/${f.issueId}/admin/force-release`).expect(200);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
+  });
+
+  it("C1 RED (b) transient: a lease released within 15 min never cards", async () => {
+    const f = await leaseHeldRun();
+    await finishedAgo(f.runId, 14 * 60_000);
+    expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks()).cleared).toBe(0);
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, f.leaseId));
+    await finishedAgo(f.runId, 16 * 60_000);
+    expect((await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks()).cleared).toBe(1);
+    expect(await stopCards(f.issueId)).toEqual([]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
+  });
+
+  // Guard 1 keys only on the person Stop/Interrupt routes' user actor. System, manager and Done cancels are not
+  // a person Stop: no card at 61 s, and past 15 min only the true environment card, never 'Stop pending'.
+  it.each([
+    ["system", { executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } }, null],
+    ["manager", { cancelledByActorType: "agent", cancelledByAgentId: "manager-agent" }, "operator_interrupted"],
+    ["Done", { terminalizationStopConfirmed: true, cancelledByActorType: "user", cancelledByUserId: "board-user" }, "issue_terminalized"],
+  ] as const)("C1 guard 1: a %s cancel is not a person Stop: no 'Stop pending' card", async (_kind, resultJson, errorCode) => {
+    const f = await fixture(resultJson);
+    await db.update(heartbeatRuns).set({ errorCode }).where(eq(heartbeatRuns.id, f.runId));
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+    await finishedAgo(f.runId, 61_000);
+    expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
+    expect(await stopCards(f.issueId)).toEqual([]);
+    await finishedAgo(f.runId, 16 * 60_000);
+    expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
+    expect(await stopCards(f.issueId)).toMatchObject([{ cause: "execution_environment_unreleased" }]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
+  });
+
+  it("C1 guard 2: an unfinished person Stop gets no card until 60 s after the Stop request", async () => {
+    const at = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const f = await fixture({ ...PERSON_STOP, executionCancellation: { state: "requested", requestedAt: at(20_000) } });
+    await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+    expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
+    expect(await stopCards(f.issueId)).toEqual([]);
+    await db.update(heartbeatRuns).set({ resultJson: { ...PERSON_STOP, executionCancellation: { state: "requested", requestedAt: at(61_000) } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
+    expect(await stopCards(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
+  });
+
+  it("C1: no Stop card once a successor has answered after the person's Stop", async () => {
+    const f = await fixture(PERSON_STOP);
+    await finishedAgo(f.runId, 61_000);
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "on_demand",
+      status: "succeeded", issueId: f.issueId, contextSnapshot: { issueId: f.issueId }, startedAt: new Date(), finishedAt: new Date() });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+    for (let tick = 0; tick < 2; tick++) expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
+    expect(await stopCards(f.issueId)).toEqual([]);
     expect(await task(f.issueId)).toMatchObject({ checkoutRunId: f.runId, executionRunId: f.runId });
   });
 

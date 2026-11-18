@@ -186,9 +186,11 @@ describe("Pi policy refusal: persistence, retry, unanswered message and Stop int
     expect(f.wakes).toHaveLength(1);
   });
 
-  it("retains a real requested Stop even on a policy refusal", async () => {
+  // RFL record SUPERSEDE-C1-NOSTOP-CARD-1118: guard 1 keys on the person Stop route's user actor.
+  it("supersedes(C1 no-Stop card; RFL record SUPERSEDE-C1-NOSTOP-CARD-1118): retains a real requested Stop even on a policy refusal", async () => {
     const f = await failTurn(usagePolicyError);
-    await db.update(heartbeatRuns).set({ resultJson: { ...f.failedRun.resultJson, stopRequested: true } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...f.failedRun.resultJson, stopRequested: true,
+      cancelledByActorType: "user", cancelledByUserId: "board-user" } }).where(eq(heartbeatRuns.id, f.runId));
     await db.transaction(async tx => {
       await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
       await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)).for("update");

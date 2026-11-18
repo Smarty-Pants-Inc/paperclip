@@ -15,6 +15,14 @@ const STOP_PENDING_ACTION = "Stop pending (execution_stop_pending): Paperclip ca
 
 /** A Stop's receipt can land seconds after the run finishes; the 30 s sweep must not flash a card first. */
 export const TASK_STOP_PENDING_SETTLE_MS = 60_000;
+/** A run nobody stopped whose environment is still held this long is stuck, not settling. */
+export const TASK_ENVIRONMENT_UNRELEASED_LATE_MS = 15 * 60_000;
+const ENVIRONMENT_UNRELEASED_CODE = "execution_environment_unreleased";
+export const ENVIRONMENT_UNRELEASED_TEXT = "The previous run's environment hasn't been released, so this task can't start yet.";
+// The board's Force release (POST /issues/:id/admin/force-release, routes/issues.ts) clears the
+// task's checkout and execution claims unconditionally, so it is a next step that really works.
+const ENVIRONMENT_UNRELEASED_ACTION = `${ENVIRONMENT_UNRELEASED_TEXT} ` +
+  "Check the environment with its provider, then a board user can use Force release on this task so it can start.";
 
 type TaskBinding = { companyId: string; issueId: string; runIds: string[] };
 type StopPending = {
@@ -29,6 +37,8 @@ type StopPending = {
   checkedAt: string;
   standalone: boolean;
   previousNextAction: string | null;
+  /** Option (b): no person Stop; the environment stayed unreleased past the late bound. */
+  environmentUnreleased?: true;
 };
 /** Recorded requests, not a terminal status or a paused assignee, establish intent. */
 export function hasRecordedStopRequest(run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">): boolean {
@@ -40,14 +50,36 @@ export function hasRecordedStopRequest(run: Pick<typeof heartbeatRuns.$inferSele
       .some(key => result[key] != null && result[key] !== false);
 }
 
+/** C1 guard 1 keys only on the user actor that the person Stop route (POST /heartbeat-runs/:id/cancel,
+ * routes/agents.ts) and the person Interrupt (operatorInterruptCancelOptions, routes/issues.ts) write.
+ * System, reassignment, manager (cancelledByActorType "agent") and Done (terminalizationStopConfirmed)
+ * cancels are not a person Stop. */
+export function hasPersonStopRequest(run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">): boolean {
+  const result = run.resultJson ?? {};
+  return result.cancelledByActorType === "user" && result.terminalizationStopConfirmed !== true;
+}
+/** The person Stop's request time: the 60 s clock for a Stopped run that has no finishedAt. */
+function personStopRequestedAt(run: typeof heartbeatRuns.$inferSelect): number {
+  const result = run.resultJson ?? {};
+  const read = (value: unknown) => value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>) : {};
+  const times = [read(result.executionCancellation).requestedAt, read(result.cancellation).recordedAt,
+    read(result.startupCancellation).requestedAt].map(value => typeof value === "string" ? Date.parse(value) : NaN)
+    .filter(Number.isFinite);
+  return times.length ? Math.min(...times) : (run.updatedAt ?? run.createdAt).getTime();
+}
+function pendingAction(pending: Pick<StopPending, "environmentUnreleased"> | null | undefined) {
+  return pending?.environmentUnreleased ? ENVIRONMENT_UNRELEASED_ACTION : STOP_PENDING_ACTION;
+}
+
 /** An answer can retire a no-request diagnostic, never prove execution Stop. */
-async function laterSuccessfulTaskRun(tx: Db, input: TaskBinding) {
+async function laterSuccessfulTaskRun(tx: Db, input: TaskBinding, options: { afterPersonStop?: boolean } = {}) {
   if (!input.runIds.length) return null;
   const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
   if (!issue || issue.status === "cancelled" || issue.cancelledAt) return null;
   const runs = await tx.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, input.runIds)));
-  if (runs.length !== input.runIds.length || runs.some(hasRecordedStopRequest)) return null;
+  if (runs.length !== input.runIds.length || (!options.afterPersonStop && runs.some(hasRecordedStopRequest))) return null;
   // Compare in PostgreSQL: JS Date truncates microseconds and could otherwise
   // misclassify the named succeeded run itself as a later answer.
   const sourceTime = tx.select({ at: sql<Date>`max(${heartbeatRuns.createdAt})` }).from(heartbeatRuns).where(and(
@@ -69,8 +101,10 @@ export function hasTaskStopPending(action: { evidence: Record<string, unknown> }
  * Read-model copy (for example an exhausted workspace) remains secondary, not
  * a replacement for this independent obligation. Do not duplicate saved copy. */
 export function withTaskStopPendingInstruction(action: { evidence: Record<string, unknown> }, nextAction: string): string {
-  if (!hasTaskStopPending(action) || nextAction.includes(STOP_PENDING_ACTION)) return nextAction;
-  return `${STOP_PENDING_ACTION}\n\n${nextAction}`;
+  if (!hasTaskStopPending(action)) return nextAction;
+  const instruction = pendingAction(action.evidence.stopPending as StopPending);
+  if (nextAction.includes(instruction)) return nextAction;
+  return `${instruction}\n\n${nextAction}`;
 }
 function stopPending(action: typeof issueRecoveryActions.$inferSelect): StopPending | null {
   const value = action.evidence.stopPending;
@@ -119,14 +153,26 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   const boundRuns = boundRunIds.length ? await tx.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, boundRunIds),
   )) : [];
-  // C1 guard 1: the card says a Stop is unproven, so it needs a recorded Stop.
-  // A failed run with only a pending lease release was never stopped.
-  const stoppedRuns = boundRuns.filter(hasRecordedStopRequest);
-  if (!stoppedRuns.length) return;
-  // C1 guard 2: give the stop receipt time to land after the run finishes.
-  // A Stopped run that never finishes is the true Stop-pending case: it may card.
-  const settledBefore = Date.now() - TASK_STOP_PENDING_SETTLE_MS;
-  if (!stoppedRuns.some(run => !run.finishedAt || run.finishedAt.getTime() <= settledBefore)) return;
+  // C1 guard 1: the 'Stop pending' card says a person's Stop is unproven, so it
+  // needs a person Stop recorded by the Stop/Interrupt routes' user actor.
+  const stoppedRuns = boundRuns.filter(hasPersonStopRequest);
+  const now0 = Date.now();
+  let environmentUnreleased: true | undefined;
+  if (!stoppedRuns.length) {
+    // Option (b): nobody stopped it. Within 15 min of its finish a held lease is
+    // transient and never cards; past that the task is stuck and the card says
+    // what is TRUE (the environment is not released), never 'Stop pending'.
+    const lateBefore = now0 - TASK_ENVIRONMENT_UNRELEASED_LATE_MS;
+    if (!boundRuns.length || !boundRuns.every(run => run.finishedAt && run.finishedAt.getTime() <= lateBefore)) return;
+    environmentUnreleased = true;
+  } else {
+    // C1 guard 2: give the stop receipt time to land: 60 s after the finish, or
+    // after the Stop request when the run has not finished. No exception.
+    const settledBefore = now0 - TASK_STOP_PENDING_SETTLE_MS;
+    if (!stoppedRuns.some(run => (run.finishedAt?.getTime() ?? personStopRequestedAt(run)) <= settledBefore)) return;
+    // No card once a successor has answered after the person's Stop.
+    if (await laterSuccessfulTaskRun(tx, { ...input, runIds: boundRunIds }, { afterPersonStop: true })) return;
+  }
   // A provider refusal is not a Stop request. Suppress only that diagnostic,
   // never the underlying execution claims or any genuinely requested Stop.
   const noStopRefusals = new Set(boundRuns.filter(run => run.status === "failed"
@@ -138,42 +184,46 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   if (await laterSuccessfulTaskRun(tx, { ...input, runIds })) return;
   let existing = await activeAction(tx, input);
   const prior = existing && stopPending(existing);
-  if (prior && JSON.stringify(prior.runIds) === JSON.stringify(runIds) && existing!.nextAction.includes(STOP_PENDING_CODE)) return;
+  const instruction = pendingAction({ environmentUnreleased });
+  if (prior && JSON.stringify(prior.runIds) === JSON.stringify(runIds) && Boolean(prior.environmentUnreleased) === Boolean(environmentUnreleased)
+    && existing!.nextAction.includes(environmentUnreleased ? instruction : STOP_PENDING_CODE)) return;
   const now = new Date();
   await notify(tx, input);
   // A different binding is a different hold. Retain the old standalone record
   // as history, not a refreshed budget or a claim about the old executor's Stop.
-  if (existing && prior?.standalone && existing.cause === STOP_PENDING_CODE) {
+  if (existing && prior?.standalone && [STOP_PENDING_CODE, ENVIRONMENT_UNRELEASED_CODE].includes(existing.cause)) {
     await tx.update(issueRecoveryActions).set({ status: "cancelled", outcome: "cancelled", resolvedAt: now,
       resolutionNote: "Task execution ownership changed; this inspection did not prove the earlier execution stopped.", updatedAt: now,
     }).where(eq(issueRecoveryActions.id, existing.id));
     existing = undefined;
   }
   const previousNextAction = existing
-    ? (prior && existing.nextAction.endsWith(STOP_PENDING_ACTION) ? prior.previousNextAction : existing.nextAction)
+    ? (prior && existing.nextAction.endsWith(pendingAction(prior)) ? prior.previousNextAction : existing.nextAction)
     : null;
   const pending: StopPending = { schema: STOP_PENDING_SCHEMA, code: STOP_PENDING_CODE, owner: input.source, runIds,
     escalation: "board", automaticAttemptsExhausted: true, attemptCount: 1, maxAttempts: 1,
-    checkedAt: now.toISOString(), standalone: !existing, previousNextAction };
+    checkedAt: now.toISOString(), standalone: !existing, previousNextAction, ...(environmentUnreleased ? { environmentUnreleased } : {}) };
   let actionId: string;
   if (existing) {
     // Do not consume, resolve or replace a stronger recovery obligation. Only
     // annotate its existing task-visible state; its owner and budget stay intact.
     await tx.update(issueRecoveryActions).set({ evidence: { ...existing.evidence, stopPending: pending },
-      nextAction: previousNextAction ? `${previousNextAction}\n\n${STOP_PENDING_ACTION}` : STOP_PENDING_ACTION, updatedAt: now,
+      nextAction: previousNextAction ? `${previousNextAction}\n\n${instruction}` : instruction, updatedAt: now,
     }).where(eq(issueRecoveryActions.id, existing.id));
     actionId = existing.id;
   } else {
     const [created] = await tx.insert(issueRecoveryActions).values({ companyId: input.companyId, sourceIssueId: input.issueId,
-      kind: "active_run_watchdog", status: "escalated", ownerType: "board", cause: STOP_PENDING_CODE,
-      fingerprint: `${STOP_PENDING_CODE}:${runIds.join(":")}`, evidence: { runId: runIds[0], stopPending: pending },
-      nextAction: STOP_PENDING_ACTION, attemptCount: 1, maxAttempts: 1, lastAttemptAt: now, outcome: "escalated",
+      kind: "active_run_watchdog", status: "escalated", ownerType: "board",
+      cause: environmentUnreleased ? ENVIRONMENT_UNRELEASED_CODE : STOP_PENDING_CODE,
+      fingerprint: `${environmentUnreleased ? ENVIRONMENT_UNRELEASED_CODE : STOP_PENDING_CODE}:${runIds.join(":")}`,
+      evidence: { runId: runIds[0], stopPending: pending }, nextAction: instruction, attemptCount: 1, maxAttempts: 1, lastAttemptAt: now, outcome: "escalated",
     }).returning({ id: issueRecoveryActions.id });
     actionId = created!.id;
   }
   await logActivity(tx, { companyId: input.companyId, actorType: "system", actorId: "recovery",
-    action: "issue.execution_stop_pending", entityType: "issue", entityId: input.issueId,
-    details: { code: STOP_PENDING_CODE, source: input.source, runIds, recoveryActionId: actionId,
+    action: environmentUnreleased ? "issue.execution_environment_unreleased" : "issue.execution_stop_pending",
+    entityType: "issue", entityId: input.issueId,
+    details: { code: environmentUnreleased ? ENVIRONMENT_UNRELEASED_CODE : STOP_PENDING_CODE, source: input.source, runIds, recoveryActionId: actionId,
       escalation: "board", automaticInspectionLimit: 1 },
   }, publications);
 }
@@ -186,7 +236,7 @@ export async function clearTaskStopPending(tx: Db, input: TaskBinding & { answer
   if (!existing || !pending) return;
   await notify(tx, input);
   const now = new Date();
-  if (pending.standalone && existing.cause === STOP_PENDING_CODE) {
+  if (pending.standalone && [STOP_PENDING_CODE, ENVIRONMENT_UNRELEASED_CODE].includes(existing.cause)) {
     const sameBinding = JSON.stringify(pending.runIds) === JSON.stringify([...new Set(input.runIds)].sort());
     await tx.update(issueRecoveryActions).set({ status: sameBinding ? "resolved" : "cancelled",
       outcome: sameBinding ? "restored" : "cancelled", resolvedAt: now, updatedAt: now,
@@ -198,8 +248,8 @@ export async function clearTaskStopPending(tx: Db, input: TaskBinding & { answer
   } else {
     const { stopPending: _pending, ...evidence } = existing.evidence;
     await tx.update(issueRecoveryActions).set({ evidence, updatedAt: now,
-      nextAction: existing.nextAction.endsWith(STOP_PENDING_ACTION)
-        ? pending.previousNextAction ?? "" : existing.nextAction.replace(STOP_PENDING_ACTION, "").trim(),
+      nextAction: existing.nextAction.endsWith(pendingAction(pending))
+        ? pending.previousNextAction ?? "" : existing.nextAction.replace(pendingAction(pending), "").trim(),
     }).where(eq(issueRecoveryActions.id, existing.id));
   }
   await logActivity(tx, { companyId: input.companyId, actorType: "system", actorId: "recovery",
