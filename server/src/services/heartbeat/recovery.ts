@@ -59,6 +59,7 @@ import {
 import { proveOwnerGone } from "../owner-proof.js";
 import { preparingControllerOwnerStamp } from "../native-runtime/native-owner-stamps.js";
 import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "../remote-execution-termination.js";
+import { parkRetainedComputer } from "../environment-retained-orphan-settlement.js";
 import { readEnvironmentStopFailure, type PluginEnvironmentStopFailure } from "@paperclipai/plugin-sdk";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
@@ -1913,6 +1914,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     let capped = 0;
     for (const row of rows) {
       if (pendingCleanupAttemptsInFlight.has(row.id)) continue;
+      if (await parkRetainedComputer(db, row)) continue; // C2: stop-and-retain, never destroy
       if (!hasStopOnlyCleanup(row) && hasNativeHarnessBackupMissing(row)) {
         await deferPendingCleanupLease(row.id);
         continue;
