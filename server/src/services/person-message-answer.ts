@@ -53,6 +53,7 @@ function carriesCommentSql(alias: string, commentId: SQL): SQL {
     or coalesce(${context}->'attributionCommentIds', '[]'::jsonb) ? ${commentId}::text
     or ${context}->>'interactionId' = ${commentId}::text
     or coalesce(${context}->'interactionIds', '[]'::jsonb) ? ${commentId}::text
+    or coalesce(${context}->'attributionInteractionIds', '[]'::jsonb) ? ${commentId}::text
     or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
     or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text
     or (jsonb_typeof(${run}.result_json->'queuedSteeringAcknowledgements') = 'object'

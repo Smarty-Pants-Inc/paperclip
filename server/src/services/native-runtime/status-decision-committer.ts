@@ -476,7 +476,10 @@ function failAt(
  * attributionCommentIds holds ALL of them (a batched M1+M2 on a failed turn:
  * RFL 01:14Z), read only by carriesCommentSql and the sweep's
  * runCarriesMessage/inScopeSql. conversationReplyBoundaryCommentId keeps the
- * latest one: agent-conversations.ts reads it as the turn boundary. */
+ * latest one: agent-conversations.ts reads it as the turn boundary.
+ * attributionInteractionIds holds the carried CARD answers (interaction ids)
+ * for ANSWERED attribution ONLY (carriesCommentSql), never interactionIds:
+ * runtime-selection.ts builds the prompt from interactionId(s). */
 export async function nativeContinuationAttributionContext(
   tx: Pick<Db, "select">,
   input: { companyId: string; issueId: string; originRunId: string },
@@ -485,8 +488,13 @@ export async function nativeContinuationAttributionContext(
     companyId: input.companyId, issueId: input.issueId, runId: input.originRunId });
   const ids = Array.isArray(carried.wakeCommentIds)
     ? carried.wakeCommentIds.filter((id): id is string => typeof id === "string") : [];
+  const cards = Array.isArray(carried.interactionIds)
+    ? carried.interactionIds.filter((id): id is string => typeof id === "string") : [];
   const latest = ids.at(-1);
-  return latest ? { conversationReplyBoundaryCommentId: latest, attributionCommentIds: ids } : {};
+  return {
+    ...(latest ? { conversationReplyBoundaryCommentId: latest, attributionCommentIds: ids } : {}),
+    ...(cards.length ? { attributionInteractionIds: cards } : {}),
+  };
 }
 
 /** The native-status automatic successor wake (schedule_retry: output cap,
