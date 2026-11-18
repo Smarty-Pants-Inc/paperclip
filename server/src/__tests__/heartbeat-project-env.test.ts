@@ -744,7 +744,8 @@ describe("resolveExecutionRunAdapterConfig codex_local credential pre-dispatch g
         },
       },
     });
-    // The blocker message must not leak any secret value.
+    // The blocker message must not leak any secret value. Its known fixture
+    // path is not a secret: a TMPDIR such as "sl-task-..." contains "sk-".
     await expect(
       resolveExecutionRunAdapterConfig({
         companyId: "company-1",
@@ -757,7 +758,7 @@ describe("resolveExecutionRunAdapterConfig codex_local credential pre-dispatch g
           resolveEnvBindings: vi.fn(),
           collectMissingRuntimeBindings: vi.fn().mockResolvedValue([]),
         } as any,
-      }).catch((err) => err.message),
+      }).catch((err) => err.message.replace(managedAgentHome, "<managed Codex home>")),
     ).resolves.not.toContain("sk-");
   });
 
