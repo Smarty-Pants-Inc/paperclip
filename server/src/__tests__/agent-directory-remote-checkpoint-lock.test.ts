@@ -146,6 +146,28 @@ describe("remote agent directory checkpoint locking", () => {
     expect(lockedMs).toBeLessThan(elapsedMs / 2);
   });
 
+  // review-fleet-3 (rf3-port-collector, smarty-dev#20787 comment 6987050314): the
+  // merged base's withDedicatedDbConnection caches a successful connection, so
+  // the collector's session advisory lock must be released explicitly.
+  it("RF3 LOCK RELEASE: after warm_saved an independent connection takes the collector's key immediately", async () => {
+    const { copies, copy, executionTarget } = await warmRemoteRun();
+    await fs.writeFile(path.join(copy.executionRoot, "memory.txt"), "turn one\n");
+    const saved = await copies.checkpointWarm({ companyId, runId: copy.runId, target: executionTarget });
+    expect(saved, JSON.stringify({ code: saved?.errorCode, message: saved?.errorMessage })).toMatchObject({ state: "warm_saved", errorCode: null });
+    expect(await directoryLockHeld()).toBe(false);
+    const key = `agent-directory:${companyId}:${agentId}`;
+    const independent = createDb(database.connectionString);
+    try {
+      const [taken] = await independent.execute<{ acquired: boolean }>(sql`select pg_try_advisory_lock(hashtextextended(${key}, 0)) as acquired`);
+      expect(taken?.acquired).toBe(true);
+      await independent.execute(sql`select pg_advisory_unlock(hashtextextended(${key}, 0))`);
+    } finally { await independent.$client.end({ timeout: 1 }); }
+    // A second collection on the same (possibly cached) dedicated session still acquires and releases.
+    await fs.appendFile(path.join(copy.executionRoot, "memory.txt"), "turn two\n");
+    expect(await copies.checkpointWarm({ companyId, runId: copy.runId, target: executionTarget })).toMatchObject({ state: "warm_saved", errorCode: null });
+    expect(await directoryLockHeld()).toBe(false);
+  });
+
   it("discards an early capture when a competing collector changes the copy, and keeps the collector's outcome", async () => {
     const { copies, copy, executionTarget } = await warmRemoteRun();
     await fs.writeFile(path.join(copy.executionRoot, "memory.txt"), "final turn\n");
