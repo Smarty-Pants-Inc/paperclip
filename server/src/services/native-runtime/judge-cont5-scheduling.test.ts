@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { NativeFinalizationResultV1 } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, completionContracts, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, issues, nativeRunFinalizations, statusDecisions } from "@paperclipai/db";
@@ -70,7 +71,7 @@ describe("native failed-turn continuation", () => {
     const execution: NativeExecutionInputV1 = {
       schema: "paperclip.native-execution-input.v1",
       binding: { companyId, runId, issueId, agentId, executionWorkspaceId: runId },
-      provider: { kind: "pi_rpc", model: "paperclip/gateway/claude-fable-5-2", piRpcThinkingLevel:"xhigh" },
+      provider: { kind: "pi_rpc", model: "paperclip/gateway/claude-fable-5-2", piRpcThinkingLevel:"xhigh" } as NativeExecutionInputV1["provider"],
       task: { identifier: issueId, title: issue.title, description: null, prompt: "Review the PR.", workMode: "standard" },
       workspace: { cwd: "/tmp", repoUrl: null, repoRef: null, branchName: null },
       session: { normalizedSessionId: native.normalizedSessionId, driverKind: "pi_rpc", protocolVersion: 1, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
@@ -117,7 +118,7 @@ describe("native failed-turn continuation", () => {
       run,agent,issueId,issueRef:issue,signal:new AbortController().signal,
       output:{handle:{store:"local_file",logRef:"judge"},outputProgressState:{pending:{bytes:0}},flushOutputProgress:async()=>{},stdoutExcerpt:"",stderrExcerpt:""},
       session:{runtimeForAdapter:{sessionId:null,sessionDisplayId:null},previousSessionParams:null,taskKey:issueId,configuredModel:"paperclip/gateway/claude-fable-5-2",sessionConfigMetadata:await buildEffectiveRunSessionConfigMetadata({adapterType:agent.adapterType,effectiveAdapterConfig:agent.adapterConfig,agentRuntimeConfig:{},issueOverrides:null,workspaceConfig:null,environment:null,environmentEnv:null,projectEnv:null,routineEnv:null,runtimeSkills:[]})},
-      readFailureReportSecrets:()=>[],adapterResult:{nativeFinalization:{terminal:{runTerminalState:"failed"}},exitCode:1,signal:null,timedOut:false,sessionId:"fixture-provider-session",sessionParams:{sessionId:"fixture-provider-session"},errorCode:"adapter_failed",errorMessage:"Pi's final assistant response reached its output limit.",resultJson:run.resultJson??{}},
+      readFailureReportSecrets:()=>[],adapterResult:{nativeFinalization:{terminal:{runTerminalState:"failed"}} as NativeFinalizationResultV1,exitCode:1,signal:null,timedOut:false,sessionId:"fixture-provider-session",sessionParams:{sessionId:"fixture-provider-session"},errorCode:"adapter_failed",errorMessage:"Pi's final assistant response reached its output limit.",resultJson:run.resultJson??{}},
       sessionCodec:getAdapterSessionCodec(agent.adapterType),taskSessionForRun:null,sessionCompaction:{rotate:false,reason:null},configFreshnessResultMetadata:{version:1},runLedgerScope:{},currentUserRedactionOptions:{enabled:false},providerTraceCapture:false,onProviderTraceFinalized:()=>{},issueContext:await createHeartbeatRunPreparation(db).getIssueExecutionContext(companyId,issueId),onLog:async(stream,text)=>{console.log("JUDGE PUBLICATION LOG",stream,text)}
     });
   }
