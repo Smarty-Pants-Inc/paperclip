@@ -17,6 +17,8 @@ afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await 
 const key = "reusable-provider-key-canary";
 const childFallback = { id: "vendor/model", input: ["text"], contextWindow: 128000, maxTokens: 8192, reasoning: true,
   thinkingLevelMap: { off: "off", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } };
+// P1c5f (15fde892): the managed loopback model also carries Pi's session-affinity compat flags.
+const managedChildFallback = { ...childFallback, compat: { sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" } };
 function environment(url: string) {
   const routing = { PAPERCLIP_AI_PROVIDER_URL: url, PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "api_key", PAPERCLIP_AI_PROVIDER_KEY: key };
   return { ...routing, ...configuredEnvironmentProjection(routing), PATH: process.env.PATH };
@@ -52,7 +54,7 @@ describe("Pi managed provider loopback", () => {
     const binding = await startPiProviderLoopback({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1") });
     cleanups.push(binding.close);
     const provider = JSON.parse(binding.json).providers.paperclip;
-    expect(provider).toEqual({ baseUrl: provider.baseUrl, api: "anthropic-messages", apiKey: provider.apiKey, models: [childFallback] });
+    expect(provider).toEqual({ baseUrl: provider.baseUrl, api: "anthropic-messages", apiKey: provider.apiKey, models: [managedChildFallback] });
     expect(binding.json.endsWith("\n")).toBe(true);
   });
 
@@ -89,7 +91,7 @@ describe("Pi managed provider loopback", () => {
     expect(text).not.toContain(key);
     const config = JSON.parse(text);
     const provider = config.providers.paperclip;
-    expect(provider).toEqual({ baseUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), api: "anthropic-messages", apiKey: expect.any(String), models: [childFallback] });
+    expect(provider).toEqual({ baseUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), api: "anthropic-messages", apiKey: expect.any(String), models: [managedChildFallback] });
     expect(provider.apiKey).not.toBe(key);
     expect(provider.apiKey.length).toBeGreaterThanOrEqual(32);
     expect(sensitive).toContain(provider.apiKey);
