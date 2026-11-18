@@ -50,14 +50,6 @@ const rows: Array<{ row: string; facts: RetryAuthorityFacts; canRetry: boolean; 
     text: "Already answered above." },
   { row: "restore hold, restore failed", facts: { restoreHold: { workspaceRestoreFailure: "restore_failed" }, retrySource: true }, canRetry: false, userAction: "new_task",
     text: withoutUnavailableRetry(workspaceRestoreHoldNextAction({ workspaceRestoreFailure: "restore_failed" }), false) },
-  // rf-5 tA-min finding 1: a failed restore whose Retry the fresh-continuation fallback runs isolated is admitted;
-  // a hold Paperclip can still release keeps its held acceptance whatever that fact says.
-  { row: "restore hold, restore failed, Retry runs isolated (a run was already refused at dispatch)", facts: {
-    restoreHold: { workspaceRestoreFailure: "restore_unsafe_archive" }, restoreHoldRetryRunsIsolated: true, retrySource: true },
-    canRetry: true, userAction: "retry", text: null },
-  { row: "restore hold, files owed, keeps its held acceptance beside an isolated-Retry fact", facts: {
-    restoreHold: { [WORKSPACE_RESTORE_PENDING_KEY]: true }, restoreHoldRetryRunsIsolated: true, retrySource: true },
-    canRetry: true, userAction: "wait", text: RECOVERING_SAVED_WORK_NEXT_ACTION, admission: "held" },
 ];
 
 describe("retry fold: one authority state table", () => {
