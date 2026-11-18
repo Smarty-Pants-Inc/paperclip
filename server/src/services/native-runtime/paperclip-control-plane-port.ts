@@ -156,6 +156,9 @@ function redactNativeText<T>(value: T): T {
     | { kind: "json"; text: string; decoded: unknown }
     | { kind: "container"; value: Container; masked: Container; keys: string[] | null; nextIndex: number };
   const pending: Frame[] = [];
+  // Open JSON string literals above the current node: a string scanned while
+  // this is non-zero is a decoded JSON string leaf.
+  let jsonDepth = 0;
   let current: unknown = value;
   for (;;) {
     if (typeof current === "string") {
@@ -172,11 +175,14 @@ function redactNativeText<T>(value: T): T {
         }
         if (parsed) {
           pending.push({ kind: "json", text: current, decoded });
+          jsonDepth++;
           current = decoded;
           continue;
         }
       }
-      current = redactSensitiveText(current);
+      // The decode dropped the leaf's two quotes; the bearer phrase rule
+      // still needs them as its phrase boundaries.
+      current = redactSensitiveText(current, { quotedLeaf: jsonDepth > 0 });
     } else if (current && typeof current === "object") {
       const container = current as Container;
       const keys = Array.isArray(container) ? null : Object.keys(container);
@@ -195,6 +201,7 @@ function redactNativeText<T>(value: T): T {
       if (frame.kind === "json") {
         // Preserve formatting/escapes byte-for-byte unless a leaf changed.
         current = current === frame.decoded ? frame.text : stringifyNativeTextJson(current);
+        jsonDepth--;
         pending.pop();
         continue;
       }

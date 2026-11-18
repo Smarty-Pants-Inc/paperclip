@@ -381,6 +381,65 @@ describe("redact-store G1/G4 durable boundaries", () => {
     expect(row!.sourcePayloadSha256).toBe(nativeSha256(event));
   });
 
+  // KEEP (never-OK, composition leak): the JSON decode drops a string leaf's two
+  // quote characters; the bearer phrase rule must still see them as its
+  // phrase boundaries. Stored leaf == the plain scanner on the same input in
+  // literal double quotes. (That scanner may take the outer closing quote into
+  // its mask; a JSON leaf keeps its closing quote.)
+  const leafOf = (quoted: string, leaf: unknown) => quoted === `"${String(leaf)}"` || quoted === `"${String(leaf)}`;
+  async function storedLeaves(payload: Record<string, unknown>) {
+    const f = await fixture();
+    const event: PrpEvent = { ...f.event(""), eventType: "semantic_tool.input", payload, debug: payload };
+    await f.port.appendEvent(event);
+    const [row] = await f.stored();
+    const committed = row!.payload!.prpEvent as unknown as PrpEvent;
+    expect(committed.debug).toEqual(committed.payload);
+    expect(row!.sourcePayloadSha256).toBe(nativeSha256(committed));
+    expect(f.live().map(entry => entry.payload)).toEqual([committed.payload]);
+    return committed.payload as Record<string, string>;
+  }
+  it("K1 all 218 corpus inputs as a JSON string leaf are stored as the plain scanner stores them in literal quotes", async () => {
+    const inputs = corpus.map(row => row.input);
+    const stored = await storedLeaves({ array: JSON.stringify(inputs), object: JSON.stringify(Object.fromEntries(inputs.map((input, index) => [`k${index}`, input]))),
+      ...Object.fromEntries(inputs.map((input, index) => [`scalar${index}`, JSON.stringify(input)])) });
+    const array = JSON.parse(stored.array!) as string[], object = JSON.parse(stored.object!) as Record<string, string>;
+    const mismatches: unknown[] = [];
+    inputs.forEach((input, index) => {
+      const quoted = redactSensitiveText(`"${input}"`);
+      for (const leaf of [array[index], object[`k${index}`], JSON.parse(stored[`scalar${index}`]!)]) {
+        if (!leafOf(quoted, leaf)) mismatches.push({ index, input, quoted, leaf });
+      }
+    });
+    expect(mismatches).toEqual([]);
+  });
+  it("K2 bearer prose inside a JSON string leaf stays readable", async () => {
+    // The 41 prose rows re-pinned by SUPERSEDE-BEARER-PROSE-1117.
+    const prose = [0, 1, 2, 3, 4, 8, 9, 15, 21, 26, 27, 28, 29, 30, 34, 35, 41, 47, 52, 53, 54, 55, 56, 60, 61, 67, 73, 78, 79, 80, 81, 82, 86, 87, 93, 99, 104, 110, 122, 152, 164]
+      .map(index => corpus[index]!).map(row => { expect(row.expected).toBe(row.input); return row.input; });
+    expect(prose).toHaveLength(41);
+    // A phrase that touches the leaf's own quote is a quoted phrase, exactly
+    // as in plain text (`"Bearer abcdefghijkl"` cannot differ from a quoted token).
+    const inside = prose.filter(input => redactSensitiveText(`"${input}"`) === `"${input}"`);
+    expect(inside).toHaveLength(21);
+    const stored = await storedLeaves({ text: '{"text":"the bearer of good news"}', array: JSON.stringify(inside), padded: JSON.stringify(prose.map(input => `He said: ${input} today.`)) });
+    expect(stored.text).toBe('{"text":"the bearer of good news"}');
+    expect(stored.array).toBe(JSON.stringify(inside));
+    expect(stored.padded).toBe(JSON.stringify(prose.map(input => `He said: ${input} today.`)));
+  });
+  it.each([
+    ['{"k":"Bearer abcdefgh"}', '{"k":"Bearer ***REDACTED***"}'],
+    ['{"k":"  Bearer abcdefgh  "}', '{"k":"  Bearer ***REDACTED***  "}'],
+    ['"  Bearer abcdefgh  "', '"  Bearer ***REDACTED***  "'],
+    ['"Bearer abcdefgh"', '"Bearer ***REDACTED***"'],
+    ['["x","Bearer abcdefgh"]', '["x","Bearer ***REDACTED***"]'],
+    ['{"a":{"b":["the bearer abcdefgh"]}}', '{"a":{"b":["the bearer ***REDACTED***"]}}'],
+    [JSON.stringify('{"k":"Bearer abcdefgh"}'), JSON.stringify('{"k":"Bearer ***REDACTED***"}')],
+  ])("K3 a quoted or padded token in a JSON string leaf is masked: %s", async (input, expected) => {
+    const stored = await storedLeaves({ input });
+    expect(stored.input).toBe(expected);
+    expect(JSON.stringify(stored)).not.toContain("abcdefgh");
+  });
+
   const four = ["sk-proj-"+"P".repeat(40), "sk-ant-api03-"+"Q".repeat(40), "sk-or-v1-"+"a2".repeat(32), "sk-"+"R".repeat(40)];
   const projectFinal = (f: Awaited<ReturnType<typeof fixture>>, text: string) => createPiEventProjector({ runId: f.runId, turnId: "turn", spillDirectory: directory }).project({ type: "message_end", message: { role: "assistant", provider: "judge", model: "model", responseId: "reply", stopReason: "stop", content: [{type:"text",text}] } }).find(e => e.eventType === "item.completed" && e.payload.kind === "agentMessage")!;
   async function evidence(name:string, event:PrpEvent, row:typeof heartbeatRunEvents.$inferSelect) {

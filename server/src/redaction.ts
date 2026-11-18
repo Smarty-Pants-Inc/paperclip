@@ -727,7 +727,7 @@ function redactAuthorizationCredentials(input: string): string {
   return parts.join("");
 }
 
-function redactStandaloneBearerCredentials(input: string): string {
+function redactStandaloneBearerCredentials(input: string, quotedLeaf = false): string {
   // A terminal colour sequence ends in a letter, which hides the word
   // boundary: `ESC[31mBearer <token>` is still a scheme word.
   const bearerWord = /(?:\b|(?<=\u001b\[[0-?]*[ -\/]*[@-~]))Bearer\b/gi;
@@ -785,7 +785,9 @@ function redactStandaloneBearerCredentials(input: string): string {
     // Only plain prose may bypass the base credential mask. Inspect the whole
     // whitespace-delimited word, not just the credential parser's structural
     // prefix (so `word;123` cannot pass as `word`). Quotes are never stripped,
-    // including quotes separated from the phrase by same-line whitespace.
+    // including quotes separated from the phrase by same-line whitespace. A
+    // decoded JSON string leaf has lost its two quote characters: its start
+    // and end are that opening and closing quote (`quotedLeaf`).
     let proseEnd = credentialStart;
     while (proseEnd < input.length && !/\s/.test(input[proseEnd])) proseEnd += 1;
     const proseWord = input
@@ -802,8 +804,8 @@ function redactStandaloneBearerCredentials(input: string): string {
       /[^\S\r\n]|[.,;:!?)\]]/.test(input[afterWord])
     ) afterWord += 1;
     if (
-      !/["'`]/.test(input[beforeBearer] ?? "") &&
-      !/["'`]/.test(input[afterWord] ?? "") &&
+      !(beforeBearer < 0 ? quotedLeaf : /["'`]/.test(input[beforeBearer])) &&
+      !(afterWord >= input.length ? quotedLeaf : /["'`]/.test(input[afterWord])) &&
       proseWord.length < 20 &&
       /^[A-Za-z][a-z]*(?:-[a-z]+)?$/.test(proseWord)
     ) continue;
@@ -1084,10 +1086,14 @@ export function redactAgentAdapterConfig(
   return { ...(redactEventPayload(rest) ?? {}), env: redactedEnv };
 }
 
-export function redactSensitiveText(input: string): string {
+/**
+ * `quotedLeaf`: `input` is the decoded content of a JSON string literal, so
+ * its start and end stand for the literal's opening and closing quote.
+ */
+export function redactSensitiveText(input: string, context?: { quotedLeaf?: boolean }): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(
-    redactStandaloneBearerCredentials(redactAuthorizationCredentials(input))
+    redactStandaloneBearerCredentials(redactAuthorizationCredentials(input), context?.quotedLeaf === true)
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
       .replace(
         ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
