@@ -39,6 +39,7 @@ const manifest: PaperclipPluginManifestV1 = {
       type: "object",
       properties: {
         apiKey: { type: "string", format: "secret-ref", description: "Boat API key or Paperclip secret reference." },
+        apiBaseUrl: { type: "string", description: "Test-only fault-proxy API base. Refused unless PAPERCLIP_BOAT_FAULT_PROXY_ALLOWED=1 is granted from the server process environment. HTTP(S) only; no userinfo, query or fragment." },
         duplexCarrier: { type: "string", enum: ["off", "ssh"], default: "off", description: "Resident S9 guardian over pinned SSH. Default off. Only SSH leases with successful guardian preflight carry runnerGuardianVersion:1; all other duplex opens are refused." },
         reuseLease: { type: "boolean", description: "Whether to resume the same retained sandbox across runs. Sandboxes are always stopped and kept on release.", default: false },
         runnerLifecycleMode: { type: "string", enum: ["inherit", "per_turn", "warm"], description: "paperclip_runner lifecycle for this environment. Inherit uses the agent setting; warm keeps runnerd and the sandbox available between turns.", default: "inherit" },

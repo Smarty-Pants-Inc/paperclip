@@ -1,10 +1,155 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import plugin from "./plugin.js";
 import manifest from "./manifest.js";
+import * as guardianStage from "./guardian-stage.js";
+import { OwnedSshAgent } from "./ssh-agent.js";
+import { guardianCommand } from "./guardian-contract.js";
 const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 function response(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } }); }
 beforeEach(async () => { await plugin.definition.setup({ logger: { info() {}, warn() {}, error() {}, debug() {} } } as any); });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+// Keep: bearer-key destination is a never-OK secret boundary. Exercise the
+// actual hooks and HTTP transport, not a replacement base-URL helper.
+describe("Boat fault-proxy apiBaseUrl", () => {
+  const flag = "PAPERCLIP_BOAT_FAULT_PROXY_ALLOWED";
+  const override = "http://127.0.0.1:18991/fault/api/v1";
+  const warn = vi.fn();
+  let sequence = 0;
+  beforeEach(async () => {
+    vi.stubEnv(flag, undefined);
+    warn.mockClear();
+    await plugin.definition.setup({ logger: { info() {}, warn, error() {}, debug() {} } } as any);
+  });
+  afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+  it.each([undefined, "0", "true", ""])("row 1: refuses apiBaseUrl when the server flag is %s before any override fetch", async value => {
+    vi.stubEnv(flag, value);
+    const fetch = vi.fn().mockResolvedValue(response({ limits: [] })); vi.stubGlobal("fetch", fetch);
+    const config = { ...cfg, apiBaseUrl: override, [flag]: "1" };
+    expect(await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config }))
+      .toMatchObject({ ok: false, errors: [expect.stringMatching(/apiBaseUrl.*PAPERCLIP_BOAT_FAULT_PROXY_ALLOWED/)] });
+    expect(await plugin.definition.onEnvironmentProbe!({ driverKey: "boat", companyId: "c", environmentId: "e", config }))
+      .toMatchObject({ ok: false });
+    await expect(plugin.definition.onEnvironmentExecute!({ driverKey: "boat", companyId: "c", environmentId: "e", config,
+      lease: { providerLeaseId: "bx_refused" }, command: "true", args: [] })).rejects.toThrow(/apiBaseUrl/);
+    expect(fetch.mock.calls.some(([url]) => String(url).startsWith(override))).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  async function routeFamilies(config: Record<string, unknown>, base: string) {
+    const id = `bx_proxy_${++sequence}`, snapshotId = "12345678-1234-1234-1234-123456789abc";
+    const params = { driverKey: "boat", companyId: "proxy_company", environmentId: "proxy_env", config };
+    const seen = new Set<string>();
+    // Only the unrelated resident/agent preflight is replaced. SSH API calls
+    // still travel from the real duplex hook through the real carrier adapter.
+    vi.spyOn(guardianStage, "stageGuardian").mockResolvedValue({ usable: true } as any);
+    vi.spyOn(OwnedSshAgent.prototype, "start").mockResolvedValue({ workerId: "test-worker", publicKey: "ssh-ed25519 YQ==" } as any);
+    const fetch = vi.fn(async (url: string, init: RequestInit = {}) => {
+      if (url === "https://upload.example.test/object") {
+        expect(new Headers(init.headers).has("Authorization")).toBe(false);
+        expect(init.redirect).toBe("error");
+        return response({});
+      }
+      // Assert EVERY HTTP call, including retries and cleanup, before replying.
+      expect(url.startsWith(`${base}/`)).toBe(true);
+      expect(new Headers(init.headers).get("Authorization")).toBe(`Bearer ${cfg.apiKey}`);
+      expect(init.redirect).toBe("error");
+      const route = url.slice(base.length).split("?")[0], method = init.method ?? "GET";
+      seen.add(`${method} ${route.replaceAll(id, "{id}")}`);
+      if (route === "/limits") return response({ limits: [] });
+      if (route === "/orgs") return response({ ok: true, orgs: [{ id: "org_proxy", type: "org" }] });
+      if (route === "/sandboxes/bx_23456789") return response({ code: "not_found" }, 404);
+      if (route === "/saved-snapshots") return response({ snapshots: [{ name: "proxy-image", snapshotId }] });
+      if (route === "/saved-snapshots/proxy-image") return response({ snapshot: { name: "proxy-image", snapshotId, status: "ready", createdAt: "2026-11-18T00:00:00Z" } });
+      if (route === "/sandboxes" && method === "GET") return response({ sandboxes: [], pageInfo: {} });
+      if (route === "/sandboxes" || route === `/sandboxes/${id}/resume`) return response({ sandbox: { id, state: "ready" } }, 202);
+      if (route === `/sandboxes/${id}`) return response({ sandbox: { id, state: "ready", stop: { id: "stop_proxy", status: "completed" } } });
+      if (route.endsWith("/stop")) return response({ stop: { id: "stop_proxy", status: "pending" } }, 202);
+      if (route.endsWith("/commands")) return response({ processId: "cmd_proxy" });
+      if (route.endsWith("/commands/cmd_proxy")) return response({ status: "completed", exitCode: 0, stdout: "ok", stderr: "" });
+      if (route.endsWith("/files/upload-url")) return response({ url: "https://upload.example.test/object" });
+      if (route.endsWith("/files")) return response({ success: true });
+      if (route.endsWith("/host")) return response({ port: 43127, url: "https://proxy-43127.on.boat.dev?_token=test", isProtected: true, access: "private" });
+      // Fail after the real SSH registration + forced-command edit, before any
+      // local SSH process or key generation. Destination/auth are already read.
+      if (route.endsWith("/sshkey")) return response({});
+      throw new Error(`Unexpected scripted route: ${method} ${route}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    expect(await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config })).toMatchObject({ ok: true });
+    expect(await plugin.definition.onEnvironmentProbe!(params)).toMatchObject({ ok: true });
+    const lease = await plugin.definition.onEnvironmentAcquireLease!({ ...params, runId: "proxy_run", config: { ...config, snapshot: snapshotId, duplexCarrier: "ssh" } });
+    expect(lease.providerLeaseId).toBe(id);
+    await plugin.definition.onEnvironmentInspectLease!({ ...params, providerLeaseId: "operation", creationOperation: { id: "operation", runId: "proxy_run" } } as any);
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...params, providerLeaseId: id })).toMatchObject({ state: "active" });
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...params, providerLeaseId: "bx_23456789", leaseMetadata: { boatOrgId: "org_proxy" } }))
+      .toMatchObject({ state: "destroyed" });
+    expect(await plugin.definition.onEnvironmentExecute!({ ...params, lease, command: "cat", args: [], stdin: "small" })).toMatchObject({ exitCode: 0 });
+    expect(await plugin.definition.onEnvironmentExecute!({ ...params, lease, command: "cat", args: [], stdin: "x".repeat(4_194_305) })).toMatchObject({ exitCode: 0 });
+    await plugin.definition.onEnvironmentRunnerIngressEndpoint!({ ...params, lease, port: 43127, path: "/api/runner/v1/connect/test" });
+    await expect(plugin.definition.onDuplexChannelOpen!({ ...params, providerLeaseId: id, hostRouteId: `route_${sequence}`, command: guardianCommand("test_runner") }))
+      .rejects.toMatchObject({ code: "BOAT_SSH_PREPARE_FAILED" });
+    await plugin.definition.onEnvironmentReleaseLease!({ ...params, providerLeaseId: id });
+    expect(await plugin.definition.onEnvironmentResumeLease!({ ...params, providerLeaseId: id })).toMatchObject({ providerLeaseId: id });
+    await plugin.definition.onEnvironmentDestroyLease!({ ...params, providerLeaseId: id });
+    for (const route of ["GET /limits", "GET /orgs", "GET /sandboxes", "POST /sandboxes", "GET /sandboxes/{id}",
+      "POST /sandboxes/{id}/commands", "GET /sandboxes/{id}/commands/cmd_proxy", "POST /sandboxes/{id}/stop",
+      "POST /sandboxes/{id}/resume", "PUT /sandboxes/{id}/files", "DELETE /sandboxes/{id}/files",
+      "POST /sandboxes/{id}/files/upload-url", "GET /saved-snapshots", "GET /saved-snapshots/proxy-image",
+      "POST /sandboxes/{id}/host", "POST /sandboxes/{id}/sshkey"]) expect(seen, route).toContain(route);
+    const bearerCalls = fetch.mock.calls.filter(([, init]) => new Headers(init?.headers).has("Authorization"));
+    expect(bearerCalls.every(([url]) => url.startsWith(`${base}/`))).toBe(true);
+    console.info("BOAT_APIBASE_ROUTES", JSON.stringify({ base, routes: [...seen].sort(),
+      bearerOrigins: [...new Set(bearerCalls.map(([url]) => new URL(url).origin))], signedUploadBearer: false }));
+  }
+
+  it("row 2: without flag or apiBaseUrl, every route family uses Boat", async () => {
+    await routeFamilies(cfg, "https://boat.dev/api/v1");
+    expect(warn.mock.calls.filter(([message]) => String(message).includes("apiBaseUrl"))).toHaveLength(0);
+  });
+  it.each([override, "https://proxy.example.test/fault/api/v1/"])("row 3: flag routes every family to %s, with bearer only there", async apiBaseUrl => {
+    vi.stubEnv(flag, "1");
+    await routeFamilies({ ...cfg, apiBaseUrl }, apiBaseUrl.replace(/\/+$/, ""));
+    const warnings = warn.mock.calls.filter(([message]) => String(message).includes("apiBaseUrl"));
+    expect(warnings).toHaveLength(1);
+    expect(JSON.stringify(warnings)).toContain(new URL(apiBaseUrl).host);
+    expect(JSON.stringify(warnings)).not.toContain(cfg.apiKey);
+  });
+  it("never logs the trimmed bearer key, even if it occurs in the override host", async () => {
+    vi.stubEnv(flag, "1");
+    expect(await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config: {
+      ...cfg, apiKey: ` ${cfg.apiKey} `, apiBaseUrl: `http://${cfg.apiKey}.example.test/api/v1`,
+    } })).toMatchObject({ ok: true });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(warn.mock.calls)).toContain("[REDACTED]");
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(cfg.apiKey);
+  });
+  it("rechecks the process flag if it is removed after configuration validation", async () => {
+    vi.stubEnv(flag, "1");
+    const config = { ...cfg, apiBaseUrl: override };
+    expect(await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config })).toMatchObject({ ok: true });
+    vi.stubEnv(flag, undefined);
+    const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
+    expect(await plugin.definition.onEnvironmentProbe!({ driverKey: "boat", companyId: "c", environmentId: "e", config })).toMatchObject({ ok: false });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it.each(["not a URL", "", "ftp://proxy.test", "file:///tmp/proxy", "http://user:pass@proxy.test/api", "http://@proxy.test/api",
+    "http://proxy.test/api?secret=1", "http://proxy.test/api?", "http://proxy.test/api#fragment", "http://proxy.test/api#", 42, null])
+    ("row 4: flag still refuses invalid apiBaseUrl %s", async apiBaseUrl => {
+      vi.stubEnv(flag, "1");
+      const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
+      expect(await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config: { ...cfg, apiBaseUrl } })).toMatchObject({ ok: false, errors: [expect.stringContaining("apiBaseUrl")] });
+      expect(await plugin.definition.onEnvironmentProbe!({ driverKey: "boat", companyId: "c", environmentId: "e", config: { ...cfg, apiBaseUrl } })).toMatchObject({ ok: false });
+      expect(fetch).not.toHaveBeenCalled();
+    });
+  it("row 5: flag without apiBaseUrl still uses Boat for every family", async () => {
+    vi.stubEnv(flag, "1");
+    await routeFamilies(cfg, "https://boat.dev/api/v1");
+    expect(warn.mock.calls.filter(([message]) => String(message).includes("apiBaseUrl"))).toHaveLength(0);
+  });
+});
+
 describe("Boat provider", () => {
   it("declares reusable sandbox leases and defaults reuseLease off", async () => {
     expect(manifest.environmentDrivers?.[0]?.sandboxCapabilities?.reusableLeases).toBe(true);
