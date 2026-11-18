@@ -1602,7 +1602,7 @@ function buildCodexStartupConfig(input: {
   };
 }
 
-function isCompatibleSession(
+export function isCompatibleSession(
   params: Record<string, unknown>,
   runtime: Pick<AcpxPreparedRuntime, "fingerprint" | "sessionKey" | "cwd" | "mode" | "acpxAgent" | "remoteExecutionIdentity">,
 ): boolean {
@@ -1615,7 +1615,17 @@ function isCompatibleSession(
   // Normalize both sides: old saved rows can contain raw execution-target fields.
   const savedRemote = normalizeAdapterExecutionTargetSessionIdentity(params.remoteExecution);
   const currentRemote = normalizeAdapterExecutionTargetSessionIdentity(runtime.remoteExecutionIdentity);
-  return stableJson(savedRemote ?? {}) === stableJson(currentRemote ?? {});
+  if (!savedRemote || !currentRemote) {
+    // Only absent/empty raw identities are local. A nonempty invalid remote
+    // identity must not collapse to local or match another invalid identity.
+    return [params.remoteExecution, runtime.remoteExecutionIdentity].every((value) =>
+      value == null || (typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0),
+    );
+  }
+  // The shared normalizer trims sandbox metadata. Pathname whitespace is
+  // meaningful, so preserve exact cwd identity here without changing callers.
+  if (parseObject(params.remoteExecution).remoteCwd !== parseObject(runtime.remoteExecutionIdentity).remoteCwd) return false;
+  return stableJson(savedRemote) === stableJson(currentRemote);
 }
 
 function buildSessionParams(input: {
