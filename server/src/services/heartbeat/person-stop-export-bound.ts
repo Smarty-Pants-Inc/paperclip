@@ -36,6 +36,14 @@ export function readPersonStopBoundDecision(metadata: Record<string, unknown> | 
   return value as unknown as PersonStopBoundDecision;
 }
 
+/** adopt-stopu-twoclock5 (RFL F8): BOTH bound decisions keep the box. Neither
+ * requests a box stop, so no stop receipt will ever close a Stop-pending card:
+ * same_box hands the running box to its successor, without_files keeps it with
+ * the files on it. Every card rule that holds for one holds for the other. */
+export function personStopBoundKeptBox(decision: PersonStopBoundDecision | null | undefined): boolean {
+  return decision?.decision === "same_box" || decision?.decision === "without_files";
+}
+
 /** The kept person-Stop box its own successor may resume (rf-4 22:53Z FIRST
  * choice): the lease carries the same_box decision for this provider box. */
 export function personStopKeptBoxForSuccessor(lease: { providerLeaseId: string | null; metadata?: Record<string, unknown> | null }) {

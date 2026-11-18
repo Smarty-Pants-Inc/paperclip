@@ -124,7 +124,7 @@ import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
 import { isCancelledNativeStartup } from "../cancelled-native-startup.js";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
 import { clearTaskStopPending, hasRecordedStopRequest, hasTaskStopPending, isPersonStop, personStopCardBoundAt, recheckTaskStopPending, recordTaskStopPending, supersedePersonStopCardLocked } from "./stop-pending.js";
-import { personStopExportBoundAt, readPersonStopBoundDecision } from "../heartbeat/person-stop-export-bound.js";
+import { personStopBoundKeptBox, personStopExportBoundAt, readPersonStopBoundDecision } from "../heartbeat/person-stop-export-bound.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
@@ -4322,7 +4322,8 @@ export function recoveryService(
           deadline = typeof claim === "number" && Number.isFinite(claim) ? Math.min(bound, claim) : NaN;
       } else if (lease.status !== "active" || lease.releasedAt) {
         return null;
-      } else if (readPersonStopBoundDecision(lease.metadata)?.decision === "without_files") {
+      } else if (personStopBoundKeptBox(readPersonStopBoundDecision(lease.metadata))) {
+        // adopt-stopu-twoclock5 (RFL F8): same_box keeps the box too (no stop request).
         // adopt-stopu-twoclock: the bound decided and kept the box (no stop
         // request, so no stop receipt will come); its one true line owns the
         // person's chat, not a card no receipt can close. Keep re-checking.

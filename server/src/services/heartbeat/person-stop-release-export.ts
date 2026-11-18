@@ -9,7 +9,7 @@ import { readNativeWorkspaceSyncReference, resumeNativeWorkspaceSync } from "../
 import { nativeWorkspaceExportPendingForLease } from "../native-runtime/native-workspace-finalization-state.js";
 import { tryLockNativeWorkspaceFinalization } from "../native-runtime/native-workspace-finalization-ownership.js";
 import { finishCancelledWarmWorkspaceExport, hasCleanStoppedSessionClose, type CancelledWarmExportOutcome } from "./cancelled-warm-workspace-export.js";
-import { PERSON_STOP_BOUND_KEY, PERSON_STOP_PROBE_TIMEOUT_MS, PERSON_STOP_WITHOUT_FILES_LINE, readPersonStopBoundDecision, personStopExportBoundAt,
+import { PERSON_STOP_BOUND_KEY, PERSON_STOP_PROBE_TIMEOUT_MS, PERSON_STOP_WITHOUT_FILES_LINE, readPersonStopBoundDecision, personStopExportBoundAt, personStopBoundKeptBox,
   type PersonStopBoundDecision } from "./person-stop-export-bound.js";
 export { PERSON_STOP_EXPORT_BOUND_MS, PERSON_STOP_WITHOUT_FILES_LINE, personStopExportBoundAt, personStopKeptBoxForSuccessor,
   readPersonStopBoundDecision } from "./person-stop-export-bound.js";
@@ -119,7 +119,10 @@ export async function decidePersonStopExportAtBound(input: {
   const issueId: string | null = run.nativeIssueId ?? run.issueId ?? null;
   const cardIssueId: string | null = issueId
     ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
-  const closesCard = decision.decision === "without_files" && cardIssueId !== null && isPersonStop(run);
+  // adopt-stopu-twoclock5 (RFL F8): BOTH kept decisions close the card here.
+  // same_box keeps the box running for its successor: no stop request, so no
+  // receipt, and a card left open would stay open for good.
+  const closesCard = personStopBoundKeptBox(decision) && cardIssueId !== null && isPersonStop(run);
   const publications: ActivityPublication[] = [];
   let recorded: { id: string }[] | null;
   try {

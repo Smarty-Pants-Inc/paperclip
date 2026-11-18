@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
-import { readPersonStopBoundDecision } from "../heartbeat/person-stop-export-bound.js";
+import { personStopBoundKeptBox, readPersonStopBoundDecision } from "../heartbeat/person-stop-export-bound.js";
 import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
@@ -168,7 +168,8 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   // box (no stop request, so no receipt can close a card): no card. A decision
   // committed after this read is ordered after this transaction by those locks,
   // and its supersede then closes this card.
-  if (personStop && await personStopBoundDecidedWithoutFiles(tx, input.companyId, runIds)) return;
+  // adopt-stopu-twoclock5 (RFL F8): EITHER kept decision (same_box too) refuses.
+  if (personStop && await personStopBoundDecidedKeptBox(tx, input.companyId, runIds)) return;
   const copy = personStop ? STOP_PENDING_PERSON_ACTION : STOP_PENDING_ACTION;
   const now = new Date();
   await notify(tx, input);
@@ -209,10 +210,10 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   }, publications);
 }
 
-async function personStopBoundDecidedWithoutFiles(tx: Db, companyId: string, runIds: string[]) {
+async function personStopBoundDecidedKeptBox(tx: Db, companyId: string, runIds: string[]) {
   const leases = await tx.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(and(
     eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, runIds)));
-  return leases.some(lease => readPersonStopBoundDecision(lease.metadata)?.decision === "without_files");
+  return leases.some(lease => personStopBoundKeptBox(readPersonStopBoundDecision(lease.metadata)));
 }
 
 /** Caller supplies guarded Stop proof, or a checked later answer without any
