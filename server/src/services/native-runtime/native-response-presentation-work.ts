@@ -9,6 +9,7 @@ import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { recoverCommittedNativeChatResponse } from "./native-run-finalizer.js";
 import { measureRunPhase, withRunResponsePresentationTiming } from "../execution-preparation-timing.js";
 import { recordNativeResponsePublicationAttempt } from "./native-response-publication-receipt.js";
+import { nativeWithheldReplyCandidates, publishWithheldAcceptedReply } from "./native-withheld-reply.js";
 
 export function registerNativeResponsePresentationWork(db: Db,
   coordinator: ReturnType<typeof createDeliveryWorkCoordinator>, canRun: () => boolean) {
@@ -28,6 +29,14 @@ export function nativeResponsePresentationWork(db: Db) {
     const query = nativeResponsePresentationCandidates(scope, after, runId).as("pending_native_response");
     return db.select().from(query).orderBy(asc(query.id));
   };
+  // An accepted answer whose run ended without a committed reply (a terminal
+  // copy-back failure, or a cancel whose copy-back later succeeded).
+  const withheld = async (scope?: NativeResponsePresentationScope, after?: string, runId?: string) => {
+    const query = nativeWithheldReplyCandidates(scope, after, runId).as("pending_native_withheld_reply");
+    return (await db.select().from(query).orderBy(asc(query.id))).map(row => ({ ...row, withheld: true as const }));
+  };
+  const current = async (scope: NativeResponsePresentationScope, runId: string) =>
+    (await candidates(scope, undefined, runId))[0] ?? (await withheld(scope, undefined, runId))[0];
   function load(scope?: NativeResponsePresentationScope, signal?: AbortSignal, canRun = () => true): Promise<Entry[]> {
     const work = () => loadWithinTrace(scope, signal, canRun);
     return scope?.runId ? withRunResponsePresentationTiming(scope.runId, work) : work();
@@ -38,6 +47,13 @@ export function nativeResponsePresentationWork(db: Db) {
     let after: string | undefined;
     while (canRun() && !signal?.aborted) {
       const rows = await measureRunPhase("response.resolve", () => candidates(scope, after));
+      for (const row of rows) entries.push({ id: row.id, companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, endpointId: row.endpointId, principalId: row.principalId, dueAt: dueAt(row) });
+      if (rows.length < 100) break;
+      after = rows[rows.length - 1].id;
+    }
+    after = undefined;
+    while (canRun() && !signal?.aborted) {
+      const rows = await measureRunPhase("response.resolve", () => withheld(scope, after));
       for (const row of rows) entries.push({ id: row.id, companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, endpointId: row.endpointId, principalId: row.principalId, dueAt: dueAt(row) });
       if (rows.length < 100) return entries;
       after = rows[rows.length - 1].id;
@@ -50,21 +66,22 @@ export function nativeResponsePresentationWork(db: Db) {
   async function checkWithinTrace(entry: Entry, signal?: AbortSignal): Promise<Entry | null> {
     if (signal?.aborted) throw new Error("Native response presentation recovery stopped");
     const scope = { companyId: entry.companyId, issueId: entry.issueId };
-    const [current] = await measureRunPhase("response.resolve", () => candidates(scope, undefined, entry.id));
-    if (!current) return null;
-    if (dueAt(current) > Date.now()) return { ...entry, dueAt: dueAt(current) };
+    const pending = await measureRunPhase("response.resolve", () => current(scope, entry.id));
+    if (!pending) return null;
+    if (dueAt(pending) > Date.now()) return { ...entry, dueAt: dueAt(pending) };
     if (signal?.aborted) throw new Error("Native response presentation recovery stopped");
     const recoveryStartedAt = Date.now();
     let failure: unknown = null;
     try {
-      await recoverCommittedNativeChatResponse(db, { ...scope, runId: entry.id, onlyWhenDue: true });
+      if ("withheld" in pending) await publishWithheldAcceptedReply(db, { ...scope, runId: entry.id });
+      else await recoverCommittedNativeChatResponse(db, { ...scope, runId: entry.id, onlyWhenDue: true });
     } catch (error) {
       // Ordinary task replies own a durable, bounded retry below. Other
       // presentation classes keep the coordinator's in-memory backoff.
-      if (!current.taskReply) throw error;
+      if (!pending.taskReply) throw error;
       failure = error;
     }
-    const [remaining] = await measureRunPhase("response.resolve", () => candidates(scope, undefined, entry.id));
+    const remaining = await measureRunPhase("response.resolve", () => current(scope, entry.id));
     // A published reply settles its retry receipt in the same write that
     // records the comment, so a vanished candidate needs no cleanup here.
     if (!remaining) return null;

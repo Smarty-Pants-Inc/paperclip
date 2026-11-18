@@ -7,6 +7,7 @@ import type { Issue } from "@paperclipai/shared";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { useWorkspaceIsolationControls } from "@/hooks/useWorkspaceIsolationControls";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
+import { isRetainedWorkspaceExportCause } from "@/lib/recovery-reconcile";
 import { useMemo, useState } from "react";
 import type {
   Agent,
@@ -1340,9 +1341,14 @@ export function IssueRecoveryActionCard({
             </span>
           </MetadataRow>
         ) : null}
+        {/* A failed copy-back records an operator instruction ("restore the exact
+            sandbox…", "retry workspace export…"). The reader of this thread cannot
+            take that step here; the saved-files recovery control owns the real one. */}
+        {isRetainedWorkspaceExportCause(action.cause) && !taskRetryRefusal ? null : (
         <MetadataRow label="Next action">
           {taskRetryRefusal ? <span>{taskRetryRefusal.nextAction}</span> : action.nextAction ? <span>{action.nextAction}</span> : <MissingValue />}
         </MetadataRow>
+        )}
         <MetadataRow label="Follow-up">
           <span className="inline-flex flex-wrap items-center gap-1.5">
             {wakeSummary ? <span>{wakeSummary}</span> : <MissingValue />}

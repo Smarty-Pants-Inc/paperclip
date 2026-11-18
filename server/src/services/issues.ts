@@ -48,7 +48,7 @@ import { requestRestorePointDeletion } from "./git-restore-point-ledger.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { recordChatHandoff, recordAcceptedChatHandoff, lockAcceptedChatHandoffSource, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
-import { agentRunWritesRevoked, assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
+import { agentRunWritesRevoked, assertAgentRunWriteAllowed, publishesAcceptedReplyOfCancelledRun } from "../agent-run-cancellation.js";
 import { assertHandedOffRunTaskOwnership } from "../run-task-ownership.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
@@ -13755,6 +13755,11 @@ export function issueService(db: Db) {
         authorizationReason?: string | null;
         /** Server-only final assistant response, never a tool/progress comment. */
         completionReply?: boolean;
+        /** Server-only: the server publishes the answer a run had ACCEPTED before
+         * it was cancelled (native-withheld-reply.ts). A cancel revokes the
+         * agent's own writes; it does not un-accept an answer the person already
+         * saw streamed. Superseded runs and a still-pending Stop stay refused. */
+        withheldAcceptedReply?: boolean;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
         clientRequestId?: string;
@@ -13840,7 +13845,7 @@ export function issueService(db: Db) {
         const [run] = await dbOrTx.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
           .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, actor.runId), eq(heartbeatRuns.companyId, issue.companyId),
             eq(heartbeatRuns.agentId, actor.agentId))).for("share");
-        if (agentRunWritesRevoked(run)) throw conflict("This run was cancelled or superseded; it cannot post a reply");
+        if (agentRunWritesRevoked(run) && !publishesAcceptedReplyOfCancelledRun(run, options)) throw conflict("This run was cancelled or superseded; it cannot post a reply");
       }
       if (issue.conversationAgentId && actor.agentId && issue.conversationAgentId !== actor.agentId) {
         throw forbidden("Only this conversation's agent can post agent messages");
@@ -13851,7 +13856,7 @@ export function issueService(db: Db) {
       if (issue.conversationAgentId && actor.runId) {
         const [run] = await dbOrTx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, actor.runId));
         const [current] = await dbOrTx.select().from(issues).where(eq(issues.id, issueId));
-        if (agentRunWritesRevoked(run)) throw conflict("This conversation turn was cancelled; it cannot post a reply");
+        if (agentRunWritesRevoked(run) && !publishesAcceptedReplyOfCancelledRun(run, options)) throw conflict("This conversation turn was cancelled; it cannot post a reply");
         const runTaskId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
         if (options?.proactiveChatMessage) {
           if (run?.status !== "running" || run.agentId !== actor.agentId || run.companyId !== issue.companyId
