@@ -20,7 +20,7 @@ export interface LifecycleStore {
   setRequiredPlugins(agent: LifecycleAgent, owner: string, pluginIds: string[]): Promise<boolean>;
   completeHost(agent: LifecycleAgent, owner: string): Promise<boolean>;
   completePlugin(agent: LifecycleAgent, owner: string, pluginId: string): Promise<boolean>;
-  defer(agent: LifecycleAgent, owner: string, error: string | null, now: Date, options?: { retryRequired?: boolean; verificationFailures?: number; transientFailure?: boolean; waitForSignal?: boolean; pendingReason?: string }): Promise<boolean>;
+  defer(agent: LifecycleAgent, owner: string, error: string | null, now: Date, options?: { retryRequired?: boolean; verificationFailures?: number; transientFailure?: boolean; showTransientError?: boolean; waitForSignal?: boolean; pendingReason?: string }): Promise<boolean>;
   pending(limit: number, now: Date): Promise<string[]>;
 }
 
@@ -43,5 +43,7 @@ export interface LifecycleFailure {
   version?: number;
   attempts?: number;
   verificationFailures?: number;
+  /** The durable start of this transient failure run (lifecycleOperation). */
+  transientFailureSince?: string;
   pluginId?: string;
 }
