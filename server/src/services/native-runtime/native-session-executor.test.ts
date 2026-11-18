@@ -12153,7 +12153,7 @@ describe("bounded stopped instruction collection", () => {
 });
 
 describe("native warm session supervision", () => {
-  it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-canonical", "claim-config", "claim-uncertain"])("composes remote warm ownership with real DB successor leases and current-run collection: %s", async ending => {
+  it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-remove-entry-held-person", "claim-remove-entry-held-successor", "claim-canonical", "claim-config", "claim-uncertain"])("composes remote warm ownership with real DB successor leases and current-run collection: %s", async ending => {
     const tables = await import("@paperclipai/db");
     const { eq, sql } = await import("drizzle-orm");
     const { randomUUID } = await import("node:crypto");
@@ -12206,6 +12206,101 @@ describe("native warm session supervision", () => {
         turnId: "warm-turn", normalizedSessionId: environmentId, providerSessionId: environmentId,
         driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
     });
+    // rf-3 follow-up found on this native path (not fixed here): the successor
+    // whose claim retired the old box owns the held row. heartbeat/
+    // instruction-working-copy.ts re-enters prepare(runId) once the claim returns
+    // null, and prepare returns that unsettled held row: the successor would run
+    // in the held, entry-less tree instead of its canonical directory.
+    const successorContinuesWhileHeld = async (h: { heldRunId: string; target: Record<string, unknown> }) => {
+      const { agentFileSaveHeld } = await import("../agent-directory-working-copies.js");
+      const canonicalEntry = "Retain this exact directory.\n";
+      const stillHeld = async () => agentFileSaveHeld(await copies.get(companyId, h.heldRunId));
+      const successor = await copies.prepare({ companyId, agentId, runId: h.heldRunId, target: h.target as never, cwd: remoteCwd });
+      const successorEntry = await readFile(join(successor!.executionRoot, "AGENTS.md"), "utf8").catch(error => `missing (${error.code})`);
+      const context = await buildNativeRuntimeContext({ db, agent, runId: h.heldRunId, runtimeConfig: {}, runtimeSkillEntries: [],
+        instructionWorkingCopy: { rootPath: successor!.executionRoot, entryPath: "AGENTS.md", kind: "agent_files" } })
+        .then(built => ({ ok: true, root: built.instructions.workingCopy?.rootPath }), error => ({ ok: false, error: String(error?.message ?? error).slice(0, 300) }));
+      console.log("PERSON_A_SUCCESSOR", JSON.stringify({ runId: h.heldRunId, state: successor?.state, root: successor?.executionRoot,
+        held: agentFileSaveHeld(successor), entry: successorEntry, runtimeContext: context }));
+      expect.soft(successor?.state, "the continuing successor gets a prepared copy, not the held row").toBe("prepared");
+      expect.soft(successorEntry, "the continuing successor reads canonical AGENTS.md, not the held entry-less tree").toBe(canonicalEntry);
+      expect.soft(await stillHeld(), "the hold stays").toBe(true);
+    };
+    // rf-3 (smarty-dev#20787 C1, required 1 and 3): the person's next actions
+    // while a permanent 422 save stays held, on this native path, continuing
+    // after the hold instead of discarding first. The provider turn is the
+    // suite's controlled boundary; copies, preparation, executor, events,
+    // finalization and the answer's comment row are the production owners.
+    const personNextActionsWhileHeld = async (h: { heldRunId: string; current: NativeExecutionInputV3; target: Record<string, unknown> }) => {
+      const { agentFileSaveHeld } = await import("../agent-directory-working-copies.js");
+      const canonicalEntry = "Retain this exact directory.\n";
+      const stillHeld = async () => agentFileSaveHeld(await copies.get(companyId, h.heldRunId));
+      // (a) The agent's next run: a new run, a new lease on the same environment,
+      // real preparation and the native executor while the old save is held.
+      const nextRunId = randomUUID(), nextLease = randomUUID();
+      const [issueRow] = await db.select().from(tables.issues).where(eq(tables.issues.id, issueId));
+      const [nextRun] = await db.insert(tables.heartbeatRuns).values({ id: nextRunId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId,
+        status: "running", runtimeMode: "native", nativeIssueId: issueId, nativeSessionId: environmentId, runnerInstanceId: environmentId,
+        contextSnapshot: { issueId } }).returning();
+      await db.insert(tables.nativeRunFinalizations).values({ runId: nextRunId, companyId, issueId, phase: "observed" });
+      await db.update(tables.issues).set({ executionRunId: nextRunId }).where(eq(tables.issues.id, issueId));
+      await db.insert(tables.environmentLeases).values({ id: nextLease, companyId, environmentId, heartbeatRunId: nextRunId,
+        provider: "daytona", providerLeaseId: "next-owned-allocation", leasePolicy: "ephemeral", metadata: { remoteCwd } });
+      currentLease = nextLease;
+      await prepareNativeHeartbeatRun({ db, run: nextRun!, issue: issueRow!, environmentLeaseId: nextLease });
+      const nextTarget = { ...h.target, leaseId: nextLease, runner: commandRunner(nextLease) };
+      const nextCopy = await copies.prepare({ companyId, agentId, runId: nextRunId, target: nextTarget as never, cwd: remoteCwd });
+      const nextEntry = await readFile(join(nextCopy!.executionRoot, "AGENTS.md"), "utf8").catch(error => `missing (${error.code})`);
+      const nextExecution: NativeExecutionInputV3 = { ...h.current, binding: { ...h.current.binding, runId: nextRunId, executionWorkspaceId: nextRunId },
+        session: { ...h.current.session, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } } };
+      nextExecution.runtimeContext = await buildNativeRuntimeContext({ db, agent, runId: nextRunId, runtimeConfig: {}, runtimeSkillEntries: [],
+        instructionWorkingCopy: { rootPath: nextCopy!.executionRoot, entryPath: "AGENTS.md", kind: "agent_files" } });
+      const turns = state.execute.mock.calls.length;
+      await executePaperclipNativeSession({ db, execution: nextExecution, runnerInstanceId: environmentId, runnerExecutionTarget: nextTarget as never });
+      const nextTurn = state.execute.mock.calls.at(-1)?.[0];
+      console.log("PERSON_A_NEXT", JSON.stringify({ heldRunId: h.heldRunId, nextRunId, providerTurns: state.execute.mock.calls.length - turns,
+        turnRunId: nextTurn?.input.binding.runId, root: nextTurn?.input.runtimeContext?.instructions.workingCopy?.rootPath, entry: nextEntry, held: await stillHeld() }));
+      expect.soft(state.execute.mock.calls.length - turns, "(a) the next run reaches its provider turn").toBe(1);
+      expect.soft(nextTurn?.input.binding.runId).toBe(nextRunId);
+      expect.soft(nextTurn?.input.runtimeContext?.instructions.workingCopy?.rootPath).toBe(nextCopy!.executionRoot);
+      expect.soft(nextEntry, "(a) the next run reads canonical AGENTS.md").toBe(canonicalEntry);
+      expect.soft(await stillHeld(), "(a) the hold stays").toBe(true);
+      // (b) A person's new chat message is answered while the save is held, and
+      // the answer is PERSISTED: the agent's comment row, created by its run.
+      const chatId = randomUUID(), chatRunId = randomUUID(), chatSession = randomUUID(), chatRunner = randomUUID();
+      const message = "Can you answer a new message while the previous file save is held?";
+      const answer = "Yes: answered while the earlier agent-file save is held.";
+      const [chat] = await db.insert(tables.issues).values({ id: chatId, companyId, title: "Chat with Warm remote", status: "in_progress",
+        assigneeAgentId: agentId, responsibleUserId: userId, createdByUserId: userId,
+        conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" }).returning();
+      await db.insert(tables.issueComments).values({ companyId, issueId: chatId, authorType: "user", authorUserId: userId, body: message });
+      const [chatRun] = await db.insert(tables.heartbeatRuns).values({ id: chatRunId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId,
+        status: "running", runtimeMode: "native", nativeIssueId: chatId, nativeSessionId: chatSession, runnerInstanceId: chatRunner,
+        contextSnapshot: { issueId: chatId, conversationSessionGeneration: chat!.conversationSessionGeneration } }).returning();
+      await db.insert(tables.nativeRunFinalizations).values({ runId: chatRunId, companyId, issueId: chatId, phase: "observed" });
+      await db.update(tables.issues).set({ executionRunId: chatRunId }).where(eq(tables.issues.id, chatId));
+      await prepareNativeHeartbeatRun({ db, run: chatRun!, issue: chat! });
+      const [chatContract] = await db.select().from(tables.completionContracts).where(eq(tables.completionContracts.issueId, chatId));
+      const chatExecution: NativeExecutionInputV3 = { ...h.current,
+        task: { ...h.current.task, prompt: message },
+        completionContract: { id: chatContract!.id, sha256: chatContract!.canonicalSha256, schemaVersion: "paperclip.completion-contract.v1",
+          contract: buildNativeCompletionContract(chat!, { revision: chatContract!.revision }) },
+        binding: { companyId, agentId, issueId: chatId, runId: chatRunId, executionWorkspaceId: chatRunId },
+        session: { ...h.current.session, normalizedSessionId: chatSession, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } } };
+      const { answerWithNativePeer } = await import("../../__tests__/helpers/native-answer-peer.js");
+      const runner = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>("../../vendor/paperclip-runner/index.js");
+      state.execute.mockImplementation(runner.executeNativeSession as never);
+      const answered = await answerWithNativePeer({ db, execution: chatExecution, runnerInstanceId: chatRunner, text: answer,
+        getFreshSessionHandoff: async () => null });
+      const persisted = (await db.select().from(tables.issueComments).where(eq(tables.issueComments.issueId, chatId)))
+        .filter(comment => comment.authorType === "agent" && comment.authorAgentId === agentId && comment.createdByRunId === chatRunId);
+      console.log("PERSON_B", JSON.stringify({ chatId, chatRunId, settled: answered.settled?.status, prompted: JSON.stringify(answered.prompts).includes(message),
+        persistedAnswers: persisted.map(comment => ({ id: comment.id, body: comment.body, createdByRunId: comment.createdByRunId })), held: await stillHeld() }));
+      expect.soft(answered.settled?.status, "(b) the chat run settles").toBe("succeeded");
+      expect.soft(JSON.stringify(answered.prompts), "(b) the person's message reaches the turn").toContain(message);
+      expect(persisted.map(comment => comment.body), "(b) one persisted assistant answer, by its run").toEqual([answer]);
+      expect.soft(await stillHeld(), "(b) the hold stays").toBe(true);
+    };
     let bodyFailure: unknown;
     try {
       await db.insert(tables.companies).values({ id: companyId, name: "Warm tests", issuePrefix: "WARM" });
@@ -12263,9 +12358,9 @@ describe("native warm session supervision", () => {
           if (ending === "claim-edit") await writeFile(join(originalRoot, "AGENTS.md"), "Remote edit before next claim\n");
           if (ending === "claim-add") await writeFile(join(originalRoot, "memory.txt"), "Remote addition before next claim\n");
           if (ending === "claim-remove") await rm(join(originalRoot, "optional-memory.txt"));
-          if (ending === "claim-remove-entry") await rm(join(originalRoot, "AGENTS.md"));
+          if (ending.startsWith("claim-remove-entry")) await rm(join(originalRoot, "AGENTS.md"));
           if (ending === "claim-canonical") await writeFile(join(canonical, "AGENTS.md"), "Canonical edit before next claim\n");
-          if (["claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-canonical"].includes(ending)) {
+          if (["claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-remove-entry-held-person", "claim-remove-entry-held-successor", "claim-canonical"].includes(ending)) {
             // Ordinary adoption remains unchanged-only and cannot alias this owner.
             expect(await copies.adopt({ companyId, agentId, runId, previousRunId: prior.binding.runId, target, cwd: remoteCwd })).toBeNull();
             expect((await copies.get(companyId, prior.binding.runId))?.receipt?.retainedByRunId).toBeUndefined();
@@ -12283,7 +12378,7 @@ describe("native warm session supervision", () => {
             if (ending !== "claim-config") expect(retiredReceipt).toMatchObject({ retirementRequired: true });
             expect(retiredReceipt).toMatchObject({ materializationRunId, cleanup: { leaseId: currentLease, remoteCwd } });
             expect((await copies.get(companyId, runId))?.processStoppedAt).toBeInstanceOf(Date);
-            if (ending === "claim-remove-entry") {
+            if (ending.startsWith("claim-remove-entry")) {
               const held = (await copies.get(companyId, runId))!;
               expect(held).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_FAILED" });
               expect(held.receipt).toMatchObject({ materializationRunId, savePending: {
@@ -12292,6 +12387,14 @@ describe("native warm session supervision", () => {
               expect(held.receipt?.cleanupPending).toBeUndefined(); // No compact cleanup receipt while held.
               expect((await lstat(originalRoot)).isDirectory()).toBe(true);
               expect(await readFile(join(canonical, "AGENTS.md"), "utf8")).toBe("Retain this exact directory.\n");
+              if (ending === "claim-remove-entry-held-successor") {
+                await successorContinuesWhileHeld({ heldRunId: runId, target });
+                return;
+              }
+              if (ending === "claim-remove-entry-held-person") {
+                await personNextActionsWhileHeld({ heldRunId: runId, current, target });
+                return;
+              }
               // docs/api/agents.md:37-58: only an explicit operator discard ends this unsavable hold.
               const reason = "Discard the stopped copy with its forbidden instruction-entry deletion";
               const discarded = await copies.discardHeld({ companyId, runId, actorId: userId, reason });
