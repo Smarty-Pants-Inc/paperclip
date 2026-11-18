@@ -65,6 +65,10 @@ export function parkedWakeExpiredSql(payload: SQLWrapper, now = Date.now()) {
 export const PARKED_WAKE_NOT_STARTED_TEXT =
   "Your message is saved, but it did not start. Press Retry to send it now.";
 
+/** S124e: the queue's line once the one note is written. It says what the note
+ * says (nothing started; Send/Retry sends it), never "Sending your messages.". */
+export const PARKED_WAKE_NOT_STARTED_WAIT = { reason: "parked_not_started", message: PARKED_WAKE_NOT_STARTED_TEXT } as const;
+
 /**
  * The ONE note for a parked Send past its first-park deadline, written through
  * the unanswered-message notice (same key, unanswered_message:<message id>, so

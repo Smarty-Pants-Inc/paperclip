@@ -23,6 +23,7 @@ import { activityService } from "../services/activity.js";
 import { listIssueSummaries } from "../services/issue-summaries.js";
 import { listIssueStatusBlockerAttention } from "../services/issue-status-presentation.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
+import { PARKED_WAKE_NOT_STARTED_WAIT, parkedWakeNoticed, parkedWakeNoticedSql } from "../services/heartbeat/parked-wake-deadline.js";
 import { assertHandedOffRunTaskOwnership } from "../run-task-ownership.js";
 import { recordNativeHumanSelfHandoff } from "../services/native-runtime/native-human-self-handoff.js";
 import { recordChildTaskRead } from "../services/native-runtime/native-child-completion-delivery.js";
@@ -7699,6 +7700,8 @@ export function issueRoutes(
           'mutation', ${agentWakeupRequests.payload}->'mutation',
           'interactionStatus', ${agentWakeupRequests.payload}->'interactionStatus',
           'externalChatContinuation', ${agentWakeupRequests.payload}->'externalChatContinuation',
+          -- S124e: true once this park has its one note; the queue line then reads the noted state.
+          'parkedNoticed', ${parkedWakeNoticedSql(agentWakeupRequests.payload)},
           'executionWait', jsonb_build_object(
             'reason', ${agentWakeupRequests.payload}->'executionWait'->'reason',
             'message', ${agentWakeupRequests.payload}->'executionWait'->'message'),
@@ -7868,10 +7871,15 @@ export function issueRoutes(
     // The user's Interrupt click is delivering these messages. Its stopped run
     // settling is not something to read about under the composer; the task
     // notice owns any wait that needs the user.
+    // S124e: once this park's one note is written (nothing started; Retry
+    // sends it), the line says so; it is neither a hand-off nor a wait.
+    const parkedNoticed = queueState?.state === "deferred" &&
+      (readObject(wake?.payload).parkedNoticed === true || parkedWakeNoticed(readObject(wake?.payload)));
     const interruptHandoff = queueState?.state === "deferred" && readObject(wake?.payload).queuedCommentInterrupt != null;
     const queue = buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
-      executionWait: interruptHandoff ? QUEUED_INTERRUPT_HANDOFF_WAIT
+      executionWait: parkedNoticed ? { ...PARKED_WAKE_NOT_STARTED_WAIT }
+        : interruptHandoff ? QUEUED_INTERRUPT_HANDOFF_WAIT
         : typeof wait.reason === "string" && typeof wait.message === "string"
           ? { reason: wait.reason, message: wait.message } : null,
       queueId: wake?.id ?? null,

@@ -1,5 +1,6 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
-import { anchorParkedWakePayloadSql, parkedWakeExpiredSql, personControlledWait, personSend, personSendSql } from "./parked-wake-deadline.js";
+import { anchorParkedWakePayloadSql, parkedWakeExpiredSql, parkedWakeNoticedSql, personControlledWait, personSend,
+  personSendSql } from "./parked-wake-deadline.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
@@ -2211,6 +2212,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           and ${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.payload}->>'pluginId')`,
         dependencyResolvedWakePayloadSql, assignmentWakePayloadSql),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        // S124e (RFL): as the interrupt scan above, past its first park's
+        // deadline a parked Send is never released automatically: its one
+        // note told the person it did not start, and their Retry owns it.
+        sql`not ${parkedWakeExpiredSql(agentWakeupRequests.payload)}`,
+        sql`not ${parkedWakeNoticedSql(agentWakeupRequests.payload)}`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
             AND (live_issue_run.context_snapshot->>'issueId' = ${issues.id}::text
@@ -2300,6 +2306,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(heartbeatRuns.status, "cancelled"),
         eq(heartbeatRuns.runtimeMode, "legacy"),
         eq(companies.status, "active"),
+        // S124e: the same bound for a Stop-named legacy receipt; after its
+        // deadline (and note) only the person's Retry sends it.
+        sql`not ${parkedWakeExpiredSql(agentWakeupRequests.payload)}`,
+        sql`not ${parkedWakeNoticedSql(agentWakeupRequests.payload)}`,
         cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
       ));
     for (const run of interruptedQueues) {
