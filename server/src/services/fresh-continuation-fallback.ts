@@ -511,12 +511,13 @@ const UNFINISHED_TURN_PREDECESSORS_MAX = 4;
  * existing route holds). No remote I/O; the copies and pending controls are
  * not read or touched.
  */
-export async function admitUnfinishedTurnFreshThread(db: Db, input: {
+export async function admitUnfinishedTurnFreshThread(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], input: {
   run: typeof heartbeatRuns.$inferSelect; issueId: string; sourceSessionId: string | null | undefined;
   /** The run the conversation record names as the thread's owner (Pi record runId, else task-session lastRunId). */
   sourceRunId: string | null | undefined;
 }): Promise<string | null> {
   const { run, issueId } = input;
+  const db = tx as unknown as Db; // the caller's transaction: every read/write below commits or rolls back with Pi selection
   const authorization = object(object(run.contextSnapshot).explicitUserContinuation);
   if (!input.sourceSessionId || !input.sourceRunId || typeof authorization.commentId !== "string" || run.status !== "running"
     || run.runtimeMode !== "native" || run.nativeSessionId || run.runnerProfileJson?.nativeExecutionInput !== undefined) return null;

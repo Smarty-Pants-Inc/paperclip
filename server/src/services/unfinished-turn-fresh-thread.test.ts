@@ -54,7 +54,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(agents).values({ id: agentId, companyId, name: "Native", role: "engineer", adapterType: "paperclip_runner",
       status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Paul's chat", status: "blocked", assigneeAgentId: agentId });
-    const [environment] = await db.insert(environments).values({ companyId, name: `boat-${issueId}`, driver: "sandbox" }).returning();
+    const [environment] = await db.insert(environments).values({ name: `boat-${issueId}`, driver: "sandbox" }).returning();
     const at = (min: number) => new Date(Date.parse("2026-11-17T01:00:00.000Z") + min * 60_000);
     const failed = (id: string, created: number, finished: number, extra: Record<string, unknown> = {}) => ({ id, companyId, agentId,
       nativeIssueId: issueId, runtimeMode: "native" as const, status: "failed" as const,
@@ -71,7 +71,7 @@ const support = await getEmbeddedPostgresTestSupport();
       { runId: S0, companyId, issueId, phase: "terminal_failure", attempt: 0, controllerGeneration: 0, recoveryState: "blocked",
         failureCode: "native_continuation_requires_reconciliation" },
     ]);
-    const [otherEnvironment] = await db.insert(environments).values({ companyId, name: `boat-other-${issueId}`, driver: "sandbox" }).returning();
+    const [otherEnvironment] = await db.insert(environments).values({ name: `boat-other-${issueId}`, driver: "sandbox" }).returning();
     const lease = async (runId: string, box: string, acquired: Date, released: Date | null, receipt: boolean, policy = "retain_on_failure",
       environmentId = environment!.id) => {
       const identity = { id: randomUUID(), companyId, heartbeatRunId: runId, provider: "boat", providerLeaseId: box };
