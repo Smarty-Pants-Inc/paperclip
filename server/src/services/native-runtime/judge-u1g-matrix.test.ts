@@ -264,7 +264,7 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     const accountExpected = shape.startsWith("f_") || shape.startsWith("g_");
     expect.soft(row.account).toBe(accountExpected);
     expect.soft(afterFirst.successors).toHaveLength(accountExpected ? 0 : 1);
-    if (!accountExpected) expect.soft(afterFirst.successors[0]?.scheduledRetryReason === "native_mid_stream_cut").toBe(shape.startsWith("a_") || shape.startsWith("h_"));
+    if (!accountExpected) expect.soft(afterFirst.successors[0]?.scheduledRetryReason).toBe("native_mid_stream_cut");
     expect.soft(row.successorsFinal).toHaveLength(accountExpected ? 0 : 1);
     expect.soft(publicationFinal.before.filter(c => !c.body.includes("Paperclip is continuing"))).toHaveLength(1);
     for(const sweep of publicationFinal.sweeps) expect.soft(sweep.comments.filter(c => !c.body.includes("Paperclip is continuing"))).toHaveLength(1);
