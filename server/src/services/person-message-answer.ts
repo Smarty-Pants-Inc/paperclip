@@ -1,13 +1,42 @@
 import { sql, type SQL } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
+import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
 export const ISSUE_IMPORTED_ACTION = "issue.imported";
 /** The import routes' audit row, written after a committed import (routes/companies.ts). */
 export const COMPANY_IMPORTED_ACTION = "company.imported";
 
-/** A person message is answered by a published agent reply attributed to it or to a later person input, or it is
- * imported history. Shared by recovery input selection (continuation-comment-input.ts) and the
+type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
+
+function carriesCommentSql(alias: string, commentId: SQL): SQL {
+  const context = sql`${sql.identifier(alias)}.context_snapshot`;
+  return sql`(${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
+    or ${context}->>'conversationReplyBoundaryCommentId' = ${commentId}::text
+    or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
+    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text)`;
+}
+
+/** A reply/card can belong to a later run without copying the original input
+ * ids. Follow durable continuation and answered-interaction edges, never mere
+ * session identity or a later run's timestamp. UNION makes cycles terminate. */
+function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageSql): SQL {
+  return sql`(${carriesCommentSql(alias, commentId)} or exists (
+    ${freshContinuationSourceChainSql({ companyId: m.companyId, issueId: m.issueId,
+      runId: sql`${sql.identifier(alias)}.id` }, true)}
+    select 1 from source_chain input
+      join ${heartbeatRuns} carrying on carrying.id = input.id and carrying.company_id = ${m.companyId}
+      where ${carriesCommentSql("carrying", commentId)}))`;
+}
+
+// A presented card and either kind of reply remain an answer to the input
+// carried by its source run. Administrative invalidation alone does not prove
+// delivery; cancelled cards need evidence of a human skip/withdraw/cancel reply.
+const PERSON_MESSAGE_ANSWER_CARD_STATUSES = ["pending", "answered", "accepted", "rejected"] as const;
+
+/** A person message is answered by a published agent reply attributed to it or to a later person input,
+ * an open or resolved interaction card on its run chain, or imported history. Answering the card is new input;
+ * it never makes the original message unanswered again. Shared by recovery input selection (continuation-comment-input.ts) and the
  * unanswered-person-message notice, so the carry and the notice never disagree on a message.
  * - Provider acceptance/delivery alone is NOT an answer.
  * - A run-less agent comment NEVER answers (RFL 20:22Z): the Muse external agent's task.comment and agent chat
@@ -17,7 +46,7 @@ export const COMPANY_IMPORTED_ACTION = "company.imported";
  *   made before that record existed, the company's FIRST company.imported row on a company_import issue.
  *   With neither provenance nor an arrival record, nothing is history.
  */
-export function answeredPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
+export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
   return sql`(exists (select 1 from ${issueComments} a
     join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
     where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
@@ -25,10 +54,17 @@ export function answeredPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: 
       and exists (select 1 from ${issueComments} b
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
           and (b.id = ${m.id} or b.created_at > ${m.createdAt})
-          and (r.context_snapshot->>'wakeCommentId' = b.id::text or r.context_snapshot->>'commentId' = b.id::text
-            or r.context_snapshot->>'conversationReplyBoundaryCommentId' = b.id::text
-            or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? b.id::text
-            or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? b.id::text)))
+          and ${chainCarriesCommentSql("r", sql`b.id`, m)}))
+    or exists (select 1 from ${issueThreadInteractions} q
+      join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
+      where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId}
+        and q.created_by_agent_id = r.agent_id
+        and (q.status in (${sql.join(PERSON_MESSAGE_ANSWER_CARD_STATUSES.map(status => sql`${status}`), sql`, `)})
+          or (q.status = 'cancelled' and q.resolved_by_user_id is not null
+            and (q.result->>'outcome' in ('skipped', 'withdrawn') or q.result->>'cancelled' = 'true')))
+        and q.created_at > ${m.createdAt}
+        -- A card answers only inputs carried on its chain, never queued inputs by time.
+        and ${chainCarriesCommentSql("r", m.id, m)})
     or ${importedPersonHistorySql(m)})`;
 }
 
