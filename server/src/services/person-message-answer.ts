@@ -1,5 +1,6 @@
 import { sql, type SQL } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues,
+  nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
 export const ISSUE_IMPORTED_ACTION = "issue.imported";
@@ -21,8 +22,25 @@ const ownInputNamesSql = (id: SQL) => sql`(r.context_snapshot->>'wakeCommentId' 
 const ANSWERABLE_CARD_SQL = sql`(q.status = 'pending' or (q.resolved_by_user_id is not null and (q.status in ('answered', 'accepted', 'rejected')
   or (q.status = 'cancelled' and (q.result->>'outcome' in ('skipped', 'withdrawn') or q.result->>'cancelled' = 'true')))))`;
 
+/** SQL over reply comment a and its run r: the run's ACCEPTED result, PUBLISHED ONCE (RFL 23:13Z, record
+ * SUPERSEDE-ANSWERED-ACCEPTED-PUBLISHED-1118). Comment a is THE comment the run's presentation decision recorded
+ * (result_json.presentationDecision.commentId: recordRunPresentationDecision, heartbeat/run-completion.ts; the
+ * committed-response writers, native-runtime/native-run-finalizer.ts), and the run has an accepted result row
+ * (native_run_results, schema_status 'accepted': id = the result id, canonical_sha256) that is the one its
+ * finalization committed (native_run_finalizations.result_id) and, where the publication recorded its own
+ * (resultId, canonicalSha256) (result_json.nativeCommittedChatResponse), the one that record names. */
+const ACCEPTED_RESULT_PUBLISHED_SQL = sql`(r.result_json#>>'{presentationDecision,commentId}' = a.id::text
+  and exists (select 1 from ${nativeRunResults} accepted
+    where accepted.run_id = r.id and accepted.company_id = r.company_id and accepted.issue_id = a.issue_id
+      and accepted.schema_status = 'accepted'
+      and coalesce(r.result_json#>>'{nativeCommittedChatResponse,resultId}', accepted.id::text) = accepted.id::text
+      and coalesce(r.result_json#>>'{nativeCommittedChatResponse,canonicalSha256}', accepted.canonical_sha256) = accepted.canonical_sha256
+      and not exists (select 1 from ${nativeRunFinalizations} committed where committed.run_id = r.id
+        and committed.company_id = r.company_id and committed.result_id is not null and committed.result_id <> accepted.id)))`;
+
 /** ANSWERED, the ONE rule: a person message M is answered only by a published reply that comes after M from a run
- * that SUCCEEDED and whose OWN input names M, by an ANSWERABLE card (below), or M is imported history.
+ * that SUCCEEDED and whose OWN input names M, by that run's ACCEPTED result published once whatever the run's later
+ * status (above), by an ANSWERABLE card (below), or M is imported history.
  * An ANSWERABLE card (RFL rulings 2, 3): a question or confirmation card the agent posted after M from a run whose
  * OWN input names M counts as M's response while the person can still answer it or has answered it (pending; or
  * answered, accepted or rejected by a person; or cancelled by a person's own skip or withdrawal), whatever that
@@ -33,8 +51,9 @@ const ANSWERABLE_CARD_SQL = sql`(q.status = 'pending' or (q.resolved_by_user_id 
  * (continuation-comment-input.ts) and the unanswered-person-message notice both call this; there is no second copy,
  * so the carry and the notice never disagree on a message.
  * Never an answer:
- * - a reply from a cancelled, failed, timed-out, interrupted or still-running run (run status alone is not one either:
- *   a succeeded run with no reply answers nothing);
+ * - a reply from a cancelled, failed, timed-out, interrupted or still-running run that is not its accepted result's
+ *   one published comment: partial text, an error line, a comment with no accepted result behind it (run status
+ *   alone is not an answer either: a succeeded run with no reply answers nothing);
  * - a reply to a LATER message: the replying run's own input must name M itself (never a later input, history or ancestry);
  * - a progress comment: one the run posted through report_progress, by that run's own tool receipt
  *   (the server's rule for "not the final answer", findHeartbeatRunCompletionComment);
@@ -52,7 +71,7 @@ export function answeredPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: 
     join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
     where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
       and a.created_at > ${m.createdAt}
-      and r.status = 'succeeded'
+      and (r.status = 'succeeded' or ${ACCEPTED_RESULT_PUBLISHED_SQL})
       and ${ownInputNamesSql(m.id)}
       and (exists (select 1 from ${issueComments} b
         where b.id = ${m.id} and b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user')
