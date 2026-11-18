@@ -17,7 +17,7 @@ import { acquireRunnerIngress, DEFAULT_WARM_RUNNER_IDLE_TIMEOUT_MS, effectiveTtl
 import { closedTransportCode, isOwnDeadline, TRANSPORT_ERROR_CODES, transientWords } from "./provider-error-codes.js";
 import { BOAT_RESTORING, BOAT_RESTORING_RESEND_MS, boatDirectFields, classifyDirectFailure, COMMAND_HISTORY_READ_MS, commandEvidence,
   commandPossiblyRanError, withCommandNonce, type BoatDirectFields, type PossiblyRanReason } from "./command-outcome.js";
-import { definePlugin, PluginEnvironmentCreationCleanupError, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
+import { definePlugin, PluginEnvironmentCreationCleanupError, PluginEnvironmentStopError, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams, PluginEnvironmentDestroyLeaseParams, PluginEnvironmentExecuteParams,
   PluginEnvironmentExecuteResult, PluginEnvironmentLease, PluginEnvironmentProbeParams, PluginEnvironmentProbeResult,
@@ -136,6 +136,29 @@ const boxLifecycles = new Map<string, number>();
 // An explicit stop also fences NEW calls under another lease scope. Only an
 // explicit resume reopens recovery; a command refusal can never undo our Stop.
 const stoppedBoxes = new Set<string>();
+/** First wait after Boat refuses a stop (stop record `failing`); doubles per refusal. */
+export const BOAT_STOP_REFUSAL_BACKOFF_MS = 60_000;
+/** Cap of that doubling: 1, 2, 4, 8, 16 min, then 16 min. */
+export const BOAT_STOP_REFUSAL_BACKOFF_CAP_MS = 16 * 60_000;
+/** At most this many boxes' refusals are kept; the oldest is forgotten first. */
+const BOAT_STOP_REFUSAL_MEMORY = 1_000;
+/** Boat refused our stop: its stop record reads `failing` (Boat keeps the box
+ * running, retries the save itself and only a resume ends the stop). Non-terminal
+ * `recovery_incomplete` from the SDK; never forced, never deleted. */
+export class BoatStopRefusedError extends PluginEnvironmentStopError {
+  readonly code = "boat_stop_refused";
+  constructor(readonly providerLeaseId: string, readonly stopId: string, readonly boatStatus: string,
+    readonly boatError: string | null, readonly lastGoodSnapshotAt: string | null, readonly notResentBefore: string, readonly refusals: number) {
+    super("recovery_incomplete");
+    this.name = "BoatStopRefusedError";
+    this.message = `Boat refused stop ${stopId} of ${providerLeaseId} (status ${boatStatus})${boatError ? `: ${boatError}` : ""}.`
+      + ` Last good snapshot: ${lastGoodSnapshotAt ?? "not reported"}. Boat keeps the sandbox running and retries the save; a resume cancels the stop.`
+      + ` Not forced; no new stop is sent before ${notResentBefore} (refusal ${refusals}).`;
+  }
+}
+// Boat's refusals of our stop, by account-scoped box key: the refused record and
+// when a new POST /stop may be sent. A resume or a confirmed stop forgets it.
+const stopRefusals = new Map<string, { until: number; refusals: number; error: BoatStopRefusedError }>();
 function boxLifecycle(key: string): number { return boxLifecycles.get(key) ?? 0; }
 function endBoxLifecycle(key: string): void { boxLifecycles.set(key, boxLifecycle(key) + 1); }
 function markOurResume(config: Config, id: string): void {
@@ -144,6 +167,9 @@ function markOurResume(config: Config, id: string): void {
   // (an in-flight recovery keeps its own reference to its mark).
   for (const [key, mark] of ourResumes) if (now - mark.at > BOAT_RESUME_RECOVERY_WINDOW_MS) ourResumes.delete(key);
   stoppedBoxes.delete(activityKey(config, id));
+  // A resume ends a pending stop (`superseded`, Boat docs /snapshots/stop), so
+  // an earlier refusal no longer speaks for the box's next stop.
+  stopRefusals.delete(activityKey(config, id));
   ourResumes.set(activityKey(config, id), { at: now });
 }
 function stateTimestamp(value: unknown): number | undefined {
@@ -979,8 +1005,34 @@ async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseI
     return await stopSandboxRequests(config, id);
   } finally { endBoxLifecycle(activityKey(config, id)); }
 }
+/** Boat's words for a refused stop: its `error` text or closed fields, key-redacted and bounded. */
+function boatStopWords(config: Config, error: unknown): string | null {
+  const text = typeof error === "string" ? error
+    : error && typeof error === "object" ? [(error as { code?: unknown }).code, (error as { message?: unknown }).message]
+      .filter((part): part is string => typeof part === "string" && !!part.trim()).join(": ") : "";
+  const words = redactKey(config, text.replace(/\s+/g, " ").trim());
+  return words ? words.slice(0, 500) : null;
+}
+function refuseStop(config: Config, id: string, stopId: string, status: string, error: unknown, snapshotCompletedAt: unknown): BoatStopRefusedError {
+  const key = activityKey(config, id);
+  const refusals = (stopRefusals.get(key)?.refusals ?? 0) + 1;
+  const until = Date.now() + Math.min(BOAT_STOP_REFUSAL_BACKOFF_CAP_MS, BOAT_STOP_REFUSAL_BACKOFF_MS * 2 ** Math.min(refusals - 1, 20));
+  const refused = new BoatStopRefusedError(id, stopId, status, boatStopWords(config, error),
+    typeof snapshotCompletedAt === "string" && snapshotCompletedAt ? snapshotCompletedAt : null, new Date(until).toISOString(), refusals);
+  stopRefusals.delete(key);
+  stopRefusals.set(key, { until, refusals, error: refused });
+  for (const oldest of stopRefusals.keys()) { if (stopRefusals.size <= BOAT_STOP_REFUSAL_MEMORY) break; stopRefusals.delete(oldest); }
+  return refused;
+}
 async function stopSandboxRequests(config: Config, id: string): Promise<{ providerLeaseId: string; state: "stopped" }> {
   idleActivity.resource(activityKey(config, id));
+  // Inside the back-off after Boat refused this box's stop: no new POST /stop
+  // (Boat would return the same pending stop, docs :1855-1856) and no new wait.
+  const refusal = stopRefusals.get(activityKey(config, id));
+  if (refusal && Date.now() < refusal.until) {
+    const last = refusal.error;
+    throw new BoatStopRefusedError(id, last.stopId, last.boatStatus, last.boatError, last.lastGoodSnapshotAt, last.notResentBefore, last.refusals);
+  }
   const proof = idleActivity.proof(activityKey(config, id));
   const stopped = await request(config, `/sandboxes/${encodeURIComponent(id)}/stop`, { method: "POST", body: JSON.stringify({}) }, false, { ownStop: true });
   // Boat documents the operation as `stop`; OpenAPI may expose `operation`.
@@ -988,6 +1040,8 @@ async function stopSandboxRequests(config: Config, id: string): Promise<{ provid
   const operation = stopped?.stop ?? stopped?.operation ?? stopped?.sandbox?.stop;
   const stopId = typeof operation?.id === "string" && operation.id.trim() ? operation.id : undefined;
   const until = Date.now() + 120_000;
+  let readRecord = stopId !== undefined;
+  let lastStatus: string | undefined = typeof operation?.status === "string" ? operation.status : undefined;
   while (Date.now() < until) {
     // Boat's documented poll is GET /sandboxes/{id}; it also confirms a 200
     // already-stopped response before we report success without an operation id.
@@ -998,7 +1052,34 @@ async function stopSandboxRequests(config: Config, id: string): Promise<{ provid
     const stop = seen ?? operation;
     // A completed stop counts only when GET confirms the id returned by POST /stop.
     if (["archived", "stopped"].includes(sandbox.state) || (stopId !== undefined && seen?.id === stopId && seen?.status === "completed")) {
+      stopRefusals.delete(activityKey(config, id));
       idleActivity.confirm(proof); return { providerLeaseId: id, state: "stopped" };
+    }
+    if (typeof stop?.status === "string") lastStatus = stop.status;
+    // Boat's own record of OUR stop: GET /sandboxes/{id}/stops/{stopId}
+    // (https://docs.boat.dev/api/reference/sandboxes/get-stop). `failing` means
+    // Boat refused it (the save failed); it keeps the box running and retries by
+    // itself, so waiting here proves nothing. Return Boat's words at once.
+    if (readRecord && stopId !== undefined) {
+      let record: any;
+      try { record = await request(config, `/sandboxes/${encodeURIComponent(id)}/stops/${encodeURIComponent(stopId)}`); }
+      catch (error) {
+        // 404: Boat does not know the id; keep observing the sandbox as before.
+        if ((error as { status?: unknown })?.status !== 404) throw error;
+        readRecord = false;
+      }
+      const own = record?.stop ?? record?.operation ?? record;
+      if (own && typeof own === "object" && own.id === stopId && typeof own.status === "string") {
+        lastStatus = own.status;
+        if (own.status === "completed") {
+          stopRefusals.delete(activityKey(config, id));
+          idleActivity.confirm(proof); return { providerLeaseId: id, state: "stopped" };
+        }
+        if (own.status === "failing" || own.status === "failed") {
+          throw refuseStop(config, id, stopId, own.status, own.error, own.snapshotCompletedAt ?? sandbox.snapshotCompletedAt);
+        }
+        if (own.status !== "pending") throw new Error(`Boat stop ${stopId} entered ${own.status}`);
+      }
     }
     // A missing id on 202 is not failure: observe the sandbox until its stop
     // appears/completes or it reaches the documented archived state.
@@ -1006,10 +1087,10 @@ async function stopSandboxRequests(config: Config, id: string): Promise<{ provid
     if (observedId && stop?.status && !["pending", "failing", "completed"].includes(stop.status)) {
       throw new Error(`Boat stop ${observedId} entered ${stop.status}`);
     }
-    // Boat retries failing saves; never force a stop or discard unsaved files.
+    // Never force a stop or discard unsaved files.
     await delay(1500);
   }
-  throw new Error(`Boat stop ${stopId ?? id} did not complete`);
+  throw new Error(`Boat stop ${stopId ?? id} did not complete${lastStatus ? ` (Boat status ${lastStatus})` : ""}`);
 }
 // Existing SDK ownership envelope, consumed by core's creation inspection/reaper.
 function cleanupIdentity(config: Config, id: string, owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string): PluginEnvironmentCreationCleanup {
@@ -1053,7 +1134,8 @@ async function cleanupAcquisition(config: Config, ids: string[], owner: { compan
     for (let attempt = 0; attempt < 3; attempt++) {
       try { await stopSandbox(config, id); break; }
       catch (error) {
-        if (attempt === 2) { firstFailed ??= id; failures.push(error); }
+        // Boat refused the stop: a retry inside its back-off sends nothing, so stop retrying.
+        if (attempt === 2 || error instanceof BoatStopRefusedError) { firstFailed ??= id; failures.push(error); break; }
         else await delay(250 * 2 ** attempt);
       }
     }
