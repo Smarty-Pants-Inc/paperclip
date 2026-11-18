@@ -23,7 +23,7 @@ import { hostCleanup, hostDeferredCleanup, hostMutation } from "@paperclipai/ada
 import { canonicalRepositoryRoot, localWorkspaceSourcePaths } from "./execution-workspace-source-roots.js";
 import { withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
 import { loadGitRestorePoint } from "./git-restore-point-storage.js";
-import { nestedWorktreeBranchPrefix, readLinkedNestedCheckout, repairMovedNestedRepositoryWorktree, withNestedRepositoryBaseLock } from "./nested-repository-worktrees.js";
+import { nestedWorktreeBranchPrefix, readLinkedNestedCheckout, withNestedRepositoryBaseLock } from "./nested-repository-worktrees.js";
 import { getStorageService } from "../storage/index.js";
 import { createIssueGitRemoteAuthProvider } from "./git-credentials.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
@@ -240,25 +240,44 @@ export async function historyKey(cwd: string, admin: string, signal?: AbortSigna
   return JSON.stringify([shas(reflog), original.trim()]);
 }
 
-async function repairLinkedCheckout(checkout: string) {
-  const marker = await fs.lstat(path.join(checkout, ".git")).catch(() => null);
-  if (!marker?.isFile()) return;
-  const common = (await git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).trim();
-  await repairMovedNestedRepositoryWorktree(path.dirname(common), checkout);
+/** pl/keepalive8: the combined held-lock signal (the caller's, and the held gate's), checked inside a multi-step helper. */
+function assertStepHeld(signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  currentHostMutationDrain()?.signal.throwIfAborted();
 }
 
-async function retargetNestedBranch(checkout: string, from: string) {
+/** pl/keepalive8: checked before EACH git command and lock/file write inside, not only once around the helper. */
+async function repairLinkedCheckout(checkout: string, signal?: AbortSignal) {
+  assertStepHeld(signal);
   const marker = await fs.lstat(path.join(checkout, ".git")).catch(() => null);
   if (!marker?.isFile()) return;
-  const head = (await git(checkout, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => "")).trim();
+  assertStepHeld(signal);
+  const common = (await git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"], { signal })).trim();
+  assertStepHeld(signal);
+  await withNestedRepositoryBaseLock(path.dirname(common), async () => {
+    assertStepHeld(signal);
+    await git(path.dirname(common), ["worktree", "repair", checkout], { signal });
+  });
+}
+
+async function retargetNestedBranch(checkout: string, from: string, signal?: AbortSignal) {
+  assertStepHeld(signal);
+  const marker = await fs.lstat(path.join(checkout, ".git")).catch(() => null);
+  if (!marker?.isFile()) return;
+  assertStepHeld(signal);
+  const head = (await git(checkout, ["symbolic-ref", "--quiet", "--short", "HEAD"], { signal }).catch(() => "")).trim();
   const previous = await nestedWorktreeBranchPrefix(from);
   if (!head.startsWith(previous)) return;
   const next = `${await nestedWorktreeBranchPrefix(checkout)}${head.slice(previous.length)}`;
   if (next === head) return;
-  const base = path.dirname((await git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).trim());
+  assertStepHeld(signal);
+  const base = path.dirname((await git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"], { signal })).trim());
+  assertStepHeld(signal);
   await withNestedRepositoryBaseLock(base, async () => {
-    if ((await git(base, ["rev-parse", "--verify", "-q", `refs/heads/${next}`]).catch(() => "")).trim()) throw new Error("nested_branch_conflict");
-    await git(checkout, ["branch", "-m", head, next]);
+    assertStepHeld(signal);
+    if ((await git(base, ["rev-parse", "--verify", "-q", `refs/heads/${next}`], { signal }).catch(() => "")).trim()) throw new Error("nested_branch_conflict");
+    assertStepHeld(signal);
+    await git(checkout, ["branch", "-m", head, next], { signal });
   });
 }
 
@@ -367,8 +386,8 @@ export async function returnTransferItems(original: string, moved: string, moves
     if (!await exists(from) || await exists(to)) continue;
     await heldStep(() => fs.mkdir(path.dirname(to), { recursive: true }), signal);
     await heldStep(() => fs.rename(from, to), signal);
-    await heldStep(() => repairLinkedCheckout(to).catch(() => undefined), signal);
-    await heldStep(() => retargetNestedBranch(to, from).catch(() => undefined), signal);
+    await heldStep(() => repairLinkedCheckout(to, signal).catch(() => undefined), signal);
+    await heldStep(() => retargetNestedBranch(to, from, signal).catch(() => undefined), signal);
   }
 }
 
@@ -381,8 +400,8 @@ export async function moveTransferItems(from: string, to: string, moves: string[
     await heldStep(() => fs.mkdir(path.dirname(destination), { recursive: true }), signal);
     await heldStep(() => fs.rename(path.join(from, relative), destination), signal);
     if (linkedBases.has(relative)) {
-      await heldStep(() => repairLinkedCheckout(destination), signal);
-      await heldStep(() => retargetNestedBranch(destination, path.join(from, relative)), signal);
+      await heldStep(() => repairLinkedCheckout(destination, signal), signal);
+      await heldStep(() => retargetNestedBranch(destination, path.join(from, relative), signal), signal);
     }
   }
   // pl/keepalive8: the secret pair (.env files + .claude/settings.local.json) moves last, as ONE unit.
