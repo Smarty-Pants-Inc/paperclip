@@ -7,6 +7,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
+import pino from "pino";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns,
@@ -14,6 +15,9 @@ import {
 } from "@paperclipai/db";
 import type { Environment } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
+import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
+import { logger } from "../middleware/logger.js";
+import { logActivity } from "./activity-log.js";
 import { truncateTablesWithDeadlockRetry } from "../__tests__/helpers/truncate-with-deadlock-retry.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
@@ -49,6 +53,12 @@ vi.mock("./native-runtime/native-workspace-finalization-state.js", async importO
   return { ...original, obsoleteWorkspaceCustodyRefusal: vi.fn(original.obsoleteWorkspaceCustodyRefusal) };
 });
 
+// The activity writer stays real; only the no-secret canary rows make the obsolete decision write fail.
+vi.mock("./activity-log.js", async importOriginal => {
+  const original = await importOriginal<typeof import("./activity-log.js")>();
+  return { ...original, logActivity: vi.fn(original.logActivity) };
+});
+
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
 // A typed fresh-thread refusal (runner-reconciliation-refusal.ts FRESH_THREAD_REFUSAL_CODES).
@@ -80,6 +90,10 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
     vi.mocked(obsoleteWorkspaceCustodyRefusal).mockReset();
     vi.mocked(obsoleteWorkspaceCustodyRefusal).mockImplementation(
       (await vi.importActual<typeof import("./native-runtime/native-workspace-finalization-state.js")>("./native-runtime/native-workspace-finalization-state.js")).obsoleteWorkspaceCustodyRefusal);
+    vi.mocked(logActivity).mockReset();
+    vi.mocked(logActivity).mockImplementation(
+      (await vi.importActual<typeof import("./activity-log.js")>("./activity-log.js")).logActivity);
+    vi.restoreAllMocks();
     custodyPeer.storage = null;
     for (const root of ownedRoots.splice(0)) await rm(root, { recursive: true, force: true });
     resetBacklogContinuationPacingForTests(db);
@@ -375,6 +389,81 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
     expect.soft(oldAfter).toEqual(oldBefore);
     const decisions = await db.select().from(activityLog).where(and(eq(activityLog.entityId, oldLeaseId), eq(activityLog.companyId, companyId)));
     expect.soft(decisions.find(row => row.action === "environment.lease.obsolete_destroy_refused")?.details).toMatchObject({ reason });
+  }, 60_000);
+
+  // ---------------------------------------------------------------- no-secret canary (RFL step 6 F1)
+  // A failed decision-row write (refusal AND destroy) logs a closed errorKind and identifiers only, never the caught
+  // error: it can carry a credential in its message, code, cause or stack. The log is captured through a real Pino
+  // instance with the production redaction config, so the err serializer prints message/stack exactly as production.
+  it.each(["destroy_refused", "destroyed"] as const)("no-secret canary: the %s decision row write fails", async decision => {
+    await company();
+    vi.stubEnv("PAPERCLIP_OBSOLETE_SANDBOX_DESTROY", "destroy");
+    const issueId = randomUUID(), oldRunId = randomUUID(), followUpId = randomUUID();
+    const environmentId = randomUUID(), pluginId = randomUUID(), oldLeaseId = randomUUID();
+    const t0 = new Date(Date.now() - 3600_000);
+    await db.insert(issues).values({ id: issueId, companyId, title: "Answer Paul", status: "in_progress", assigneeAgentId: agentId });
+    const [environment] = await db.insert(environments).values({ id: environmentId, name: `Boat ${environmentId.slice(0, 8)}`, driver: "sandbox",
+      status: "active", config: { provider: "boat", image: "boot-source-before-upgrade", reuseLease: true } }).returning();
+    await db.insert(plugins).values({ id: pluginId, pluginKey: "paperclip.boat", packageName: "@paperclipai/plugin-boat",
+      version: "1.0.0", apiVersion: 1, status: "ready", categories: ["automation"],
+      manifestJson: { id: "paperclip.boat", apiVersion: 1, version: "1.0.0", displayName: "Boat", description: "Boat peer", author: "Paperclip",
+        categories: ["automation"], capabilities: ["environment.drivers.register"], entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{ driverKey: "boat", kind: "sandbox_provider", displayName: "Boat", supportsReusableLeases: true,
+          configSchema: { type: "object" } }] } } as never);
+    await db.insert(heartbeatRuns).values({ id: oldRunId, companyId, agentId, issueId, nativeIssueId: issueId, runtimeMode: "native",
+      status: "succeeded", createdAt: t0, startedAt: t0, finishedAt: new Date(t0.getTime() + 60_000), contextSnapshot: { issueId } });
+    const releasedAt = new Date(t0.getTime() + 61_000), providerLeaseId = `bx-old-${oldLeaseId.slice(0, 8)}`;
+    // Refusal: no custody stamp. Destroy: two verified custody copies and a workspace readback.
+    const backup = decision === "destroyed" ? await custodyFixture({ issueId, runId: oldRunId, providerLeaseId, completedAt: releasedAt }) : null;
+    if (decision === "destroyed") vi.mocked(obsoleteWorkspaceCustodyRefusal).mockResolvedValue(null);
+    await db.insert(environmentLeases).values({ id: oldLeaseId, companyId, environmentId, issueId, heartbeatRunId: oldRunId,
+      provider: "boat", providerLeaseId, leasePolicy: "reuse_by_environment", status: "released", cleanupStatus: "success",
+      acquiredAt: t0, releasedAt, lastUsedAt: releasedAt,
+      metadata: { driver: "sandbox", sandboxProviderPlugin: true, pluginId, pluginKey: "paperclip.boat", agentId, ...environment!.config,
+        reusableSandboxLease: { adapterType: "paperclip_runner" }, pendingCleanupInFlight: false,
+        ...(backup ? { nativeHarnessBackup: backup.stamp } : {}) } });
+    await db.insert(heartbeatRuns).values({ id: followUpId, companyId, agentId, issueId, nativeIssueId: issueId, runtimeMode: "native",
+      status: "running", createdAt: new Date(Date.now() - 60_000), startedAt: new Date(Date.now() - 60_000), contextSnapshot: { issueId } });
+    const drifted = { ...environment!.config, image: "boot-source-after-upgrade" };
+    await db.update(environments).set({ config: drifted }).where(eq(environments.id, environmentId));
+    const call = vi.fn(async (_id: string, method: string, params: Record<string, unknown>) => {
+      if (method === "environmentAcquireLease") return { providerLeaseId: "bx-fresh", metadata: { ...drifted, remoteCwd: "/workspace" } };
+      if (method === "environmentDestroyLease") return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
+      throw new Error(`unexpected provider call ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: { isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentAcquireLease", "environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentStopLease"] }),
+    } as unknown as PluginWorkerManager });
+
+    // An inert FAKE credential in every part of the write error that a serializer can print.
+    const canary = "pcp_live_CANARY_7f3e9a1c5b2d8e4f6a0b";
+    const realLogActivity = (await vi.importActual<typeof import("./activity-log.js")>("./activity-log.js")).logActivity;
+    vi.mocked(logActivity).mockImplementation(async (database, input, publications) => {
+      if (!input.action.startsWith("environment.lease.obsolete_")) return realLogActivity(database, input, publications);
+      throw Object.assign(new Error(`insert failed for postgres://paperclip:${canary}@db.internal:5432/paperclip`), {
+        name: `WriteError_${canary}`, code: `E_${canary}`, detail: `Authorization: Bearer ${canary}`, cause: new Error(`token=${canary}`) });
+    });
+    const lines: string[] = [];
+    const sink = pino({ level: "trace", redact: [...HTTP_LOG_REDACT_PATHS] }, { write: (line: string) => { lines.push(line); } });
+    for (const level of ["info", "warn", "error"] as const) {
+      vi.spyOn(logger, level).mockImplementation(((...args: unknown[]) => (sink[level] as (...a: unknown[]) => void)(...args)) as never);
+    }
+
+    const acquired = await runtime.acquireRunLease({ companyId, environment: { ...environment!, config: drifted, envVars: {} } as unknown as Environment,
+      issueId, agentId, heartbeatRunId: followUpId, adapterType: "paperclip_runner", persistedExecutionWorkspace: null } as never);
+    expect(acquired.lease.providerLeaseId).toBe("bx-fresh");
+    const destroys = call.mock.calls.filter(([, method]) => method === "environmentDestroyLease").map(([, , params]) => params.providerLeaseId);
+    expect(destroys, "the canary hit the intended decision").toEqual(decision === "destroyed" ? [providerLeaseId] : []);
+    expect(vi.mocked(logActivity).mock.calls.map(([, input]) => input.action))
+      .toContain(`environment.lease.obsolete_${decision}`);
+    const written = lines.join("");
+    const rows = lines.map(line => JSON.parse(line) as Record<string, unknown>)
+      .filter(row => row.msg === "obsolete sandbox decision row was not written");
+    expect(rows, "the write-failure path ran and logged once").toHaveLength(1);
+    expect(rows[0]).toMatchObject({ errorKind: "obsolete_sandbox_decision_write_failed", decision: `obsolete_${decision}`,
+      leaseId: oldLeaseId, providerLeaseId, companyId, environmentId });
+    expect(written, "no part of the caught write error reaches the log").not.toContain("CANARY");
+    expect(rows[0]).not.toHaveProperty("err");
   }, 60_000);
 
   // ---------------------------------------------------------------- B-5 + B-2

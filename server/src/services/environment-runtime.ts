@@ -145,6 +145,9 @@ import { crashPoint } from "@paperclipai/shared/crash-points";
 // credential in its name, code, message, cause, or stack. So the log records
 // this constant and the plain provider identifiers only.
 const SANDBOX_ORPHAN_CLEANUP_WRITE_ERROR_KIND = "sandbox_orphan_cleanup_write_failed";
+// Same contract for the obsolete-sandbox decision row: a failed write logs this
+// constant and the identifiers only, never the caught exception.
+const OBSOLETE_SANDBOX_DECISION_WRITE_ERROR_KIND = "obsolete_sandbox_decision_write_failed";
 
 // The fixed non-secret refusal a duplex channel open returns when the lease does
 // not grant the opt-in `duplexCommandStream` capability. The service resolves the
@@ -1755,7 +1758,9 @@ function createSandboxEnvironmentDriver(
         leaseRunId: lease.heartbeatRunId, agentId: lease.metadata?.agentId ?? null,
         custodyManifestSha256: details.manifestSha256 ?? null, rule: details.rule ?? null, reason: details.reason ?? null,
         at: new Date().toISOString(), mode: obsoleteSourceDestroyMode() },
-    }).catch(error => logger.warn({ err: error, leaseId: lease.id }, "obsolete sandbox decision row was not written"));
+    }).catch(() => logger.warn({ errorKind: OBSOLETE_SANDBOX_DECISION_WRITE_ERROR_KIND, decision: `obsolete_${action}`,
+      leaseId: lease.id, providerLeaseId: lease.providerLeaseId, companyId: lease.companyId, environmentId: lease.environmentId },
+      "obsolete sandbox decision row was not written"));
   }
 
   async function cleanupObsoleteReusableSandboxLeases(input: {
