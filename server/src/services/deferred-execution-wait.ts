@@ -1,5 +1,5 @@
 import { HttpError } from "../errors.js";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql, type SQLWrapper } from "drizzle-orm";
 import { agentWakeupRequests, issues, type Db } from "@paperclipai/db";
 import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
@@ -9,6 +9,26 @@ import { persistActivity, publishActivity, type ActivityPublication } from "./ac
  * owning gate producer instead of treating the refusal as infrastructure debt. */
 export class PersistedExecutionWaitRefusal extends HttpError {
   constructor(message: string, details?: unknown) { super(409, message, details); }
+}
+
+/** A saved wait is well formed when it has the shape every writer below
+ * stores: a JSON object with a non-empty string `reason` and a string
+ * `message` (writeDeferredExecutionWait's callers in heartbeat/queue.ts and
+ * deferredWorkIntentWait in work-intent-outbox.ts; the queue route reads the
+ * same two fields, routes/issues.ts). JSON null, false, a string, an array or
+ * an object without those fields is not a wait and grants no Hold50 bypass. */
+export function isWellFormedExecutionWait(value: unknown): value is { reason: string; message: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const wait = value as Record<string, unknown>;
+  return typeof wait.reason === "string" && wait.reason.trim().length > 0 && typeof wait.message === "string";
+}
+
+/** SQL twin of isWellFormedExecutionWait over a wake payload column. */
+export function wellFormedExecutionWaitSql(payload: SQLWrapper) {
+  return sql<boolean>`(jsonb_typeof(${payload}->'executionWait') = 'object'
+    and jsonb_typeof(${payload}->'executionWait'->'reason') = 'string'
+    and btrim(${payload}->'executionWait'->>'reason') <> ''
+    and jsonb_typeof(${payload}->'executionWait'->'message') = 'string')`;
 }
 
 /**
