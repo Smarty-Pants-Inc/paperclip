@@ -793,6 +793,69 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   const resume = (f: { agentId: string }) => db.update(agents).set({ status: "active", lifecycleState: "ready",
     lifecycleHolds: [], pauseReason: null }).where(eq(agents.id, f.agentId));
 
+  // deferred-gap (RFL SUPERSEDE-CAP-ROWS-PERSONVIEW-1118): the message's run was cut off, a recovery RESTORED it, and
+  // the continuation waits as a durable deferred wake with no run. Before: silence, or "sending it again is safe".
+  const RECOVERING_TEXT = "The run answering your message was cut off. Paperclip is recovering it and will continue by itself; your message is saved.";
+  const cutOffAndRestored = async (f: Awaited<ReturnType<typeof fixture>>, wakePayload: Record<string, unknown> = {}) => {
+    const commentId = await f.message();
+    const runId = await f.run({ commentId, status: "failed", errorCode: "native_continuation_requires_reconciliation",
+      error: "native_session_supervisor_busy" });
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "resolved", ownerType: "system", outcome: "restored", returnOwnerAgentId: f.agentId,
+      cause: "native_continuation_requires_reconciliation", fingerprint: `native-workspace:${runId}`, attemptCount: 1,
+      resolutionNote: "continued_fresh_from_last_saved", resolvedAt: new Date(), evidence: { runId, continuationDelivery: "delegated" },
+      nextAction: "The previous run was cut off. Paperclip continues the task in a fresh run from its last saved work." }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+      status: "deferred_issue_execution", reason: "issue_recovery_action_restored", requestedByActorType: "system",
+      payload: { issueId: f.issueId, recoveryActionId: action!.id, ...wakePayload } }).returning();
+    return { commentId, runId, wakeId: wake!.id };
+  };
+
+  it("deferred-gap: a restored continuation waiting as a deferred wake with no run -> no note in the grace, then ONE recovering line (a LATE first sweep says it at once), never resend; its answer supersedes it", async () => {
+    const f = await fixture();
+    const { commentId, wakeId } = await cutOffAndRestored(f);
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    await settleAt(f, 3 * 60_000);
+    await settleAt(f, 10 * 60_000);
+    const notes = await f.visible();
+    expect(notes.map(n => n.body)).toEqual([RECOVERING_TEXT]);
+    expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    expect(rowsOf(notes[0]!).find(row => row.label === "Waiting code")?.value).toBe("recovering");
+    expect(rowsOf(notes[0]!).some(row => row.label === "Failure code")).toBe(false);
+    expect(JSON.stringify(notes[0])).not.toMatch(/send(?:ing)? (?:it|the message|a new message)|safe/i);
+    // A late FIRST sweep (a second task, same shape) says it at once: never silence.
+    const late = await fixture();
+    await cutOffAndRestored(late);
+    await settleAt(late, 11 * 60_000);
+    expect((await late.visible()).map(n => n.body)).toEqual([RECOVERING_TEXT]);
+    // The continuation starts by itself, carries the message and answers it: the line goes.
+    await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, wakeId));
+    const continuation = await f.run({ commentId, status: "succeeded", wakeReason: "issue_recovery_action_restored" });
+    await f.reply(continuation);
+    await settleAt(f, 12 * 60_000);
+    expect(await f.visible()).toHaveLength(0);
+  });
+
+  it("deferred-gap control: the deferred continuation is CANCELLED -> the recovering line does not stay standing; a named execution wait never gets it", async () => {
+    const f = await fixture();
+    const { wakeId } = await cutOffAndRestored(f);
+    await settleAt(f, 3 * 60_000);
+    expect((await f.visible()).map(n => n.body)).toEqual([RECOVERING_TEXT]);
+    await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date() }).where(eq(agentWakeupRequests.id, wakeId));
+    await settleAt(f, 5 * 60_000);
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.body).not.toBe(RECOVERING_TEXT);
+    expect(notes[0]!.body).not.toMatch(/waiting|recovering|still/i);
+    expect(rowsOf(notes[0]!).some(row => row.label === "Waiting code")).toBe(false);
+    // A deferred continuation held by a NAMED wait (here a budget) does not start by itself: not this line.
+    const named = await fixture();
+    await cutOffAndRestored(named, { executionWait: { reason: "budget", message: "Waiting for budget" } });
+    await settleAt(named, 11 * 60_000);
+    expect((await named.visible()).map(n => n.body)).not.toContain(RECOVERING_TEXT);
+  });
+
   it("paused agent: a person's message gets ONE note that says the agent is paused and who can resume it, never 'sending again is safe'", async () => {
     const f = await fixture();
     await pause(f);

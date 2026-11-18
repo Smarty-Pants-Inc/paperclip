@@ -79,7 +79,15 @@ const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] 
 /** The agent that answers the conversation is paused (or held) and will not
  * run until it is resumed. Not a failure: a waiting-kind note. */
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
-const WAITING_KIND_CODES = new Set(["agent_paused"]);
+/** The run that carried the message was cut off and a recovery RESTORED the task: its continuation is saved as a
+ * durable deferred wake (reason issue_recovery_action_restored, no run yet, no named execution wait), which starts by
+ * itself in a fresh run that carries the cut-off run's input (execution-recovery-resolution.ts wake(), its context from
+ * readContinuationCommentInput). Not a failure: a waiting-kind note, never "send it again". */
+export const UNANSWERED_MESSAGE_RECOVERING_CODE = "recovering";
+export const UNANSWERED_MESSAGE_RECOVERING_TEXT =
+  "The run answering your message was cut off. Paperclip is recovering it and will continue by itself; your message is saved.";
+const RECOVERY_CONTINUATION_WAKE_REASON = "issue_recovery_action_restored";
+const WAITING_KIND_CODES = new Set(["agent_paused", UNANSWERED_MESSAGE_RECOVERING_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
@@ -627,7 +635,18 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
-  if (!boardHold && !agentPaused) {
+  // The message's own run was cut off and a recovery restored it: the deferred continuation wake waits to start by
+  // itself and will carry that run's input. The person sees ONE true recovering line after the short grace, anchored
+  // on durable facts (the run's end, the wake's creation), so a first sweep that comes late still says it at once.
+  const recovering = !boardHold && !agentPaused && !liveRuns.length && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
+    ? await recoveringContinuationWake(q, issue, agentId, [...new Set([run.id, messageRun?.id ?? run.id])]) : null;
+  if (recovering && run) {
+    const due = Math.max(recovering.createdAt.getTime(), (run.finishedAt ?? run.updatedAt).getTime()) + PENDING_WAIT_BOUND_MS;
+    if (due > now.getTime()) return { kind: "pending", recheckAt: due };
+    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_RECOVERING_CODE) {
+      return { kind: "pending", recheckAt: now.getTime() + 60_000 };
+    }
+  } else if (!boardHold && !agentPaused) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
       inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
@@ -640,6 +659,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   let code: string;
   if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
+  } else if (recovering) {
+    code = UNANSWERED_MESSAGE_RECOVERING_CODE;
   } else if (waitingToStart) {
     // The turn header says "Waiting to start" until T0 + PENDING_WAIT_START_BOUND_MS;
     // after that the carrying run has not started (a dead claim, a stuck
@@ -746,6 +767,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // as isNativeContinuationRefusal already decides for its own patterns.
   const held = (isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run));
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
+  const recoveringNote = code === UNANSWERED_MESSAGE_RECOVERING_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
   // The ONE bound: the message's automatic lineage used its K=2 fresh
@@ -754,16 +776,18 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
       >= FRESH_CONTINUATION_BOUND);
   const body = paused ? agentPausedText(pausedName)
+    : recoveringNote ? UNANSWERED_MESSAGE_RECOVERING_TEXT
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: paused ? `${pausedName} is paused` : "Your message wasn't answered",
+      title: paused ? `${pausedName} is paused` : recoveringNote ? "Recovering the run for your message" : "Your message wasn't answered",
       body,
       tone: "warning",
       nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+        : recoveringNote ? "Nothing to do: Paperclip continues by itself."
         : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
@@ -777,6 +801,23 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   return { kind: "notice", reason, code, notice, group: messageRun?.id ?? UNANSWERED_MESSAGE_NO_RUN_CODE, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
 
+
+/** The durable deferred continuation wake that a RESTORED recovery of the message's own run saved: reason
+ * issue_recovery_action_restored, no run, no named execution wait (a named wait, such as a budget, does not start by
+ * itself), and its recovery action restored THIS issue from one of the given runs. */
+async function recoveringContinuationWake(q: Db, issue: DecisionIssue, agentId: string, runIds: string[]) {
+  const [wake] = await q.select({ createdAt: agentWakeupRequests.createdAt }).from(agentWakeupRequests)
+    .innerJoin(issueRecoveryActions, and(eq(issueRecoveryActions.companyId, agentWakeupRequests.companyId),
+      sql`${issueRecoveryActions.id}::text = ${agentWakeupRequests.payload}->>'recoveryActionId'`))
+    .where(and(eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.reason, RECOVERY_CONTINUATION_WAKE_REASON),
+      isNull(agentWakeupRequests.runId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+      sql`not coalesce(${agentWakeupRequests.payload} ? 'executionWait', false)`,
+      eq(issueRecoveryActions.sourceIssueId, issue.id), eq(issueRecoveryActions.outcome, "restored"),
+      sql`${issueRecoveryActions.evidence}->>'runId' in (${sql.join(runIds.map(id => sql`${id}`), sql`, `)})`))
+    .orderBy(desc(agentWakeupRequests.createdAt)).limit(1);
+  return wake ?? null;
+}
 
 /** One task the recovery worker already flagged (its batched page query found
  * a person's message to settle): no candidate lookup of its own. */
