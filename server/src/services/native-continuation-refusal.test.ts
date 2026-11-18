@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { isNativeContinuationRefusal, NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
 import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
+import { HELD_PREDECESSOR_SEND_NOTICE } from "./native-runtime/held-predecessor-notice-text.js";
 
 describe("native continuation refusal", () => {
   it.each([
@@ -94,10 +95,15 @@ describe("native continuation refusal", () => {
     expect(isNativeContinuationRefusal(undefined)).toBe(false);
   });
 
-  it("uses the durable notice's one wording: the files are kept, a new task continues, never send a message", () => {
+  it("supersedes(uses the durable notice's one wording: the files are kept, a new task continues, never send a message; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118) uses the durable notice's one wording: the files are kept, a new task continues, never send a message", () => {
+    // Exact pins (toBe on the whole string), never a prefix or a regex: the old unhedged
+    // '...did not finish. Send a new message to try again.' fails both lines.
     expect(HELD_PREDECESSOR_NOTICE)
       .toBe("Your message and saved work are kept, but the previous run of this conversation did not finish. Assign this agent a new task to continue.");
     expect(HELD_PREDECESSOR_NOTICE).not.toMatch(/send a message/i);
+    // The admitted variant (HN1 option b) is the one hedged constant.
+    expect(HELD_PREDECESSOR_SEND_NOTICE)
+      .toBe("Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again; if it doesn't start, assign this agent a new task.");
   });
 
   it("names the refused action with the same one wording, not a second text", () => {

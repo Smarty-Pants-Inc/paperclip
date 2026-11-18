@@ -10,7 +10,8 @@ vi.mock("@/lib/router", () => ({
   Link: ({ children, to, ...props }: AnchorHTMLAttributes<HTMLAnchorElement> & { to: string }) => <a href={to} {...props}>{children}</a>,
 }));
 
-// The held notice's one wording (server native-runtime/held-predecessor-notice-text.ts).
+// The held notice's one wording (server native-runtime/held-predecessor-notice-text.ts): the EXACT
+// default HELD_PREDECESSOR_NOTICE, pinned whole (toBe), never a prefix or a regex.
 const HELD = "Your message and saved work are kept, but the previous run of this conversation did not finish. Assign this agent a new task to continue.";
 const failed: TaskInterruptionPresentation = {
   intentId: "intent", responsibility: "system", state: "failed", nextRetryAt: null,
@@ -30,7 +31,7 @@ describe("chat card with a standing notice (C9 G1)", () => {
   const render = (presentation: TaskInterruptionPresentation) =>
     act(async () => root.render(<ExecutionBlockerNotice presentation={presentation} canRetry onRetry={retry} />));
 
-  it("shows the standing notice instead of the generic text, with no Retry", async () => {
+  it("supersedes(shows the standing notice instead of the generic text, with no Retry; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118) shows the standing notice instead of the generic text, with no Retry", async () => {
     await render({ ...failed, canRetry: false, notice: { code: "native_prior_owner_held", text: HELD } });
     expect(container.querySelector('[data-testid="task-execution-notice"]')?.textContent).toBe(HELD);
     expect(container.textContent).not.toContain("Couldn’t finish this attempt");
@@ -38,10 +39,11 @@ describe("chat card with a standing notice (C9 G1)", () => {
     expect(container.querySelector("button")).toBeNull();
   });
 
-  it("shows the notice over a Retry wait message", async () => {
+  it("supersedes(shows the notice over a Retry wait message; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118) shows the notice over a Retry wait message", async () => {
     await render({ ...failed, canRetry: false, notice: { code: "native_prior_owner_held", text: HELD },
       retryWait: { reason: "workspace_repair_required", message: "Retry is waiting for Paperclip to recover the saved files. Your message is saved." } });
     expect(container.textContent).toContain(HELD);
+    expect(container.querySelector('[data-testid="task-execution-notice"]')?.textContent).toBe(HELD);
     expect(container.querySelector("button")).toBeNull();
   });
 
@@ -52,11 +54,12 @@ describe("chat card with a standing notice (C9 G1)", () => {
     expect(container.querySelector('[data-testid="task-execution-retry"]')?.textContent).toBe("Retry");
   });
 
-  it("shows the notice beside a provider failure, with no Retry", async () => {
+  it("supersedes(shows the notice beside a provider failure, with no Retry; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118) shows the notice beside a provider failure, with no Retry", async () => {
     await render({ ...failed, canRetry: false, notice: { code: "native_prior_owner_held", text: HELD },
       providerFailure: { schema: "paperclip.provider-failure.v1", provider: "openai", phase: "turn", category: "overloaded",
         message: "The provider is overloaded.", retryability: "transient" } });
     expect(container.textContent).toContain(HELD);
+    expect(container.querySelector('[data-testid="task-execution-notice"]')?.textContent).toBe(HELD);
     expect(container.querySelector('[data-testid="task-execution-retry"]')).toBeNull();
   });
 
@@ -70,15 +73,18 @@ describe("chat card with a standing notice (C9 G1)", () => {
   const refused = { ...failed, canRetry: false, notice: { code: "native_prior_owner_held", text: HELD } };
   const renderWith = (props: { error?: Error; takingLonger?: boolean }, presentation: TaskInterruptionPresentation) =>
     act(async () => root.render(<ExecutionBlockerNotice presentation={presentation} canRetry onRetry={retry} {...props} />));
-  it.each([
+  for (const [branch, props] of [
     ["error", { error: new Error("Retry request failed") }],
     ["takingLonger", { takingLonger: true }],
-  ] as const)("(C1) the %s branch shows no Retry over a standing refusal and keeps the notice", async (_branch, props) => {
-    await renderWith(props, refused);
-    expect(container.querySelector('[data-testid="task-execution-retry"]')).toBeNull();
-    expect(container.querySelector("button")).toBeNull();
-    expect(container.querySelector('[data-testid="task-execution-notice"]')?.textContent).toBe(HELD);
-  });
+  ] as const) {
+    const title = `(C1) the ${branch} branch shows no Retry over a standing refusal and keeps the notice`;
+    it(`supersedes(${title}; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118) ${title}`, async () => {
+      await renderWith(props, refused);
+      expect(container.querySelector('[data-testid="task-execution-retry"]')).toBeNull();
+      expect(container.querySelector("button")).toBeNull();
+      expect(container.querySelector('[data-testid="task-execution-notice"]')?.textContent).toBe(HELD);
+    });
+  }
   it.each([
     ["error", { error: new Error("Retry request failed") }],
     ["takingLonger", { takingLonger: true }],

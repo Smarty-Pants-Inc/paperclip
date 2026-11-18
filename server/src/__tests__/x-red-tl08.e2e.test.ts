@@ -229,6 +229,8 @@ function noteWriter(note: typeof issueComments.$inferSelect) {
     const writer = sourceLine("../services/recovery/unanswered-person-message.ts", "const comment = await issueService(tx as unknown as Db).addComment");
     return { writer, caller: sourceLine("../services/heartbeat.ts", "? await settleUnansweredPersonMessagesForTask(db"), authorizationReason: reason };
   }
+  // The executor writes remedy.body: exactly HELD_PREDECESSOR_NOTICE or the admitted hedged
+  // HELD_PREDECESSOR_SEND_NOTICE (whole-string ===, never a prefix or regex; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118).
   if (reason.startsWith("native_prior_owner_held:") || note.body === HELD_PREDECESSOR_NOTICE || note.body === HELD_PREDECESSOR_SEND_NOTICE) {
     const writer = sourceLine("../services/native-runtime/native-session-executor.ts", "await issueService(input.db).addComment(issueId, remedy.body");
     return { writer, caller: writer, authorizationReason: reason };
@@ -1052,7 +1054,7 @@ const runScenario = async (scenario: Scenario) => {
     if (errors.length) throw new AggregateError([...(failure ? [failure] : []), ...errors], "xr-tl08 body/cleanup failed; evidence retained");
   }
 };
-it.skipIf(!enabled).each(scenarios)("xr-tl08: $id / backup=$backup", async scenario => {
+it.skipIf(!enabled).each(scenarios)("supersedes(xr-tl08: $id / backup=$backup; RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118) xr-tl08: $id / backup=$backup", async scenario => {
   console.log(`E2E-PI-PREREQUISITES: ${JSON.stringify({ scenario, runnerd: process.env.PAPERCLIP_RUNNER_BINARY ?? null,
     providerPack: process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH ?? null, PI_TEST_BINARY: process.env.PI_TEST_BINARY ?? null })}`);
   try { await runScenario(scenario); }
