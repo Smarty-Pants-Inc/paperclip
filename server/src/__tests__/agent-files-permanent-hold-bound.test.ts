@@ -61,6 +61,8 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
   // runtime's lifecycle resumeRunLease (B0b).
   const emptyAgentId = randomUUID(), mutedAgentId = randomUUID(), resumedAgentId = randomUUID();
   let resumedGone = false, failMutedNotice = true;
+  // Muted's hold as the failed first notice left it (read before any row runs).
+  let mutedAtSetup: { notices: number; savePending: unknown } | undefined;
   const LEASE_GONE = "Boat sandbox lease is no longer active.";
   // Set by Paused's run after it wrote its files: its stopped source read is refused.
   let leaseGone = false;
@@ -200,6 +202,9 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
       else if (agentId === unchangedAgentId) unchangedRunId = run!.id;
     }
     expect(applyFailures).toContainEqual({ agentId: permanentAgentId, status: 422, message: "The configured instruction entry cannot be deleted" });
+    mutedAtSetup = { notices: (await db.select().from(activityLog).where(and(eq(activityLog.runId, runIdOf.get(mutedAgentId)!),
+      eq(activityLog.action, "agent_files.save_held_permanent")))).length,
+      savePending: (await copies.get(companyId, runIdOf.get(mutedAgentId)!))?.receipt?.savePending };
   }, 120_000);
 
   afterAll(async () => {
@@ -682,12 +687,11 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
     const runId = runIdOf.get(mutedAgentId)!;
     const mutedNotices = async () => db.select().from(activityLog)
       .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "agent_files.save_held_permanent")));
-    const held = (await copies.get(companyId, runId))!;
-    const before = await mutedNotices();
-    console.log("B3_OUTBOX_HELD", JSON.stringify({ runId, failMutedNotice, savePending: held.receipt?.savePending, notices: before.length }));
+    // As the failed first notice transaction left it (read at setup, before any row).
+    console.log("B3_OUTBOX_HELD", JSON.stringify({ runId, failMutedNotice, mutedAtSetup }));
     expect(failMutedNotice).toBe(false);
-    expect(held.receipt?.savePending).toMatchObject({ permanent: true, permanentStatus: 422 });
-    expect(before).toHaveLength(0);
+    expect(mutedAtSetup!.savePending).toMatchObject({ permanent: true, permanentStatus: 422 });
+    expect(mutedAtSetup!.notices).toBe(0);
     // Delivery must come from the RECOVERY WORKER alone (no explicit collection).
     await copies.recoverStopped();
     const recovered = await mutedNotices();
