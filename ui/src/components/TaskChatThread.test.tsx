@@ -2950,7 +2950,7 @@ describe("TaskChatThread runtime transcript selection", () => {
   // SCREEN row 5: a run a PERSON stopped says what happens to its partial
   // reply; any other cancel keeps the neutral detail (control).
   it.each([
-    ["user", "Stopped. The unfinished reply is not sent to the agent; finished steps are kept."],
+    ["user", "Stopped. The unfinished reply isn't sent to the agent with your next message."],
     ["system", "The run was cancelled."],
   ] as const)("SCREEN row 5: the cancelled marker detail for a run cancelled by %s", (actor, expectedDetail) => {
     nativeTranscriptState.transcriptByRun.set(`native-stop-${actor}`, [
