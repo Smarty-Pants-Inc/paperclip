@@ -290,6 +290,27 @@ describe("source-lock wait error text persistence", () => {
     expect((writes[0] as { error: string }).error).toBe(
       "git fetch failed: remote said ***REDACTED*** ***REDACTED*** ***REDACTED*** while locked (last workspace source lock wait ended with SQLSTATE 55P03)");
   });
+
+  // Org's row: an ordinary provider error, with no credential in it, reads the
+  // same in the failure note a person sees as it did before the masking (tB2
+  // wrote error.message unmasked here).
+  it.each([
+    ["rate limit 429", '429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed the rate limit for your organization (3f0c5f0e-8d0b-4c1e-9a43-2f6f1c8e7b21) of 40,000 input tokens per minute. For details, refer to: https://docs.claude.com/en/api/rate-limits. You can see the response headers for current usage. Please reduce the prompt length or the maximum tokens requested, or try again later."},"request_id":"req_011CVBxF6Lr3v9kQ2nT8wYzA"}'],
+    ["overloaded 529", '529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CVBy2mN7pQ4sR8tU1vWxZ"}'],
+    ["context length", "400 This model's maximum context length is 128000 tokens. However, your messages resulted in 131072 tokens. Please reduce the length of the messages. (code: context_length_exceeded, param: messages)"],
+    ["auth failure without a token", '401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_011CVBz9aB3cD5eF7gH9iJkL"}'],
+    ["network ECONNRESET", "request to https://api.openai.com/v1/responses failed, reason: read ECONNRESET (errno -104, code ECONNRESET, syscall read)"],
+  ])("keeps an ordinary provider error byte-equal in the failure note: %s", async (_kind, message) => {
+    const writes: Array<{ error: string }> = [];
+    const db = { update: () => ({ set: (values: { error: string }) => { writes.push(values); return { where: async () => undefined }; } }) } as unknown as Db;
+    const deps = callbacks();
+    const run = unitRun();
+    deps.setRunStatusIfRunning.mockResolvedValue({ updated: true, run: { ...run, status: "cancelled" } });
+    await extracted.createHeartbeatRetries(db, deps).finalizeWorkspaceSourceLockWait(run, new IsolatedRepositorySourceBusy(message), { wasIssueAssignee: true });
+    expect(writes[0].error).toBe(`${message} (last workspace source lock wait ended with SQLSTATE 55P03)`);
+    expect((deps.setRunStatusIfRunning.mock.calls[0][2] as { error: string }).error).toBe(message);
+    expect((deps.setWakeupStatus.mock.calls[0] as unknown[])[2]).toMatchObject({ error: message });
+  });
 });
 
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
