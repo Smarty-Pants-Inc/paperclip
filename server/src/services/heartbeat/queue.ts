@@ -2803,6 +2803,25 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       // so the Retry's final answer answers that message and its one notice retires.
       else if (Array.isArray(answered.wakeCommentIds) && answered.wakeCommentIds.length)
         enrichedContextSnapshot.attributionCommentIds = answered.wakeCommentIds;
+      // Orphan, M2 held: the Retry names the task's LATEST run, which answered only its own
+      // later input, while an earlier FAILED run's own typed message is still not ANSWERED (the
+      // one Retry authority admits this Retry for exactly that message: task-retry-eligibility.ts
+      // readPersonMessageAnswered). The same seam reads each failed run's own pending input, so
+      // this Retry's final answer answers that message once; an ANSWERED message is never read.
+      else {
+        const failedRuns = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, receipt.companyId), ne(heartbeatRuns.id, retry.sourceRunId),
+          or(eq(heartbeatRuns.issueId, issueId!), eq(heartbeatRuns.nativeIssueId, issueId!),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId!}`),
+          inArray(heartbeatRuns.status, ["failed", "timed_out"])))
+          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(50);
+        const owed = new Set<string>();
+        for (const failed of failedRuns) {
+          const own = await readContinuationCommentInput(db, { companyId: receipt.companyId, issueId: issueId!, runId: failed.id });
+          if (!own.interactionIds && Array.isArray(own.wakeCommentIds)) for (const id of own.wakeCommentIds) owed.add(String(id));
+        }
+        if (owed.size) enrichedContextSnapshot.attributionCommentIds = [...owed];
+      }
       if (retry.boardMessageOrigin) enrichedContextSnapshot.boardMessageRetry = true;
     }
 

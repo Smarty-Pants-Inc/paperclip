@@ -161,9 +161,10 @@ describe.skipIf(!support.supported)("tA-min (c): the orphan notice and its Retry
   }
   const CLOCK = [20_000, 150_000, 11 * 60_000, 13 * 60_000, 25 * 60_000];
 
-  // "m2-held" (adopt-lead's shape: a later held message's run succeeded after M1's run failed) is a KNOWN RED
-  // on tA-min: M1 gets its one true notice, but the task's Retry belongs to the latest run. It runs only when asked.
-  const SHAPES = (process.env.TAMIN_ORPHAN_M2_HELD ? ["plain", "m2-held"] : ["plain"]) as ("plain" | "m2-held")[];
+  // "m2-held" (adopt-lead's shape: a later held message's run succeeded after M1's run failed): M1 gets its one
+  // true notice; the task's Retry names the latest run (the one that answered only M2). rf-5 tA-min finding 3:
+  // that Retry is NOT "Already answered above." while M1 is not ANSWERED; it starts ONE run that answers M1.
+  const SHAPES = ["plain", "m2-held"] as ("plain" | "m2-held")[];
   for (const shape of SHAPES) it(`${shape}: M1's only carrying run failed -> answer or ONE true notice; Retry through POST /issues/:id/retry answers M1 once; no second notice`, async () => {
     const c = await chat();
     fixture.calls = []; fixture.failNext = 1;
@@ -184,6 +185,10 @@ describe.skipIf(!support.supported)("tA-min (c): the orphan notice and its Retry
       .send({ idempotencyKey: randomUUID(), observedRunId: interruption?.observedRunId ?? failedRun.id });
     const second = await sweep(c, 8_000);
     const afterRetry = await visible(c, m1);
+    // Control: now that the failed run's own input IS answered, the same Retry is the true no-op.
+    const latestAfter = second.runs.at(-1)!;
+    const again = await request(c.app).post(`/api/issues/${c.issueId}/retry`).send({ idempotencyKey: randomUUID(), observedRunId: latestAfter.id });
+    const third = await sweep(c, 3_000);
     const clockAfter = await sweepAt(c, m1, CLOCK);
     const end = await visible(c, m1);
     const okRuns = new Set(fixture.calls.filter(call => call.ok).map(call => call.runId));
@@ -194,6 +199,7 @@ describe.skipIf(!support.supported)("tA-min (c): the orphan notice and its Retry
         otherNotices: afterNotice.notices.filter(row => !afterNotice.m1Notices.includes(row)).map(noticeView),
         interruption, execution: afterNotice.execution, recoveryActions: afterNotice.recoveryActions },
       retry: { status: retry.status, body: retry.body },
+      again: { status: again.status, body: again.body, runsAfter: third.runs.length, okCallsAfter: fixture.calls.filter(call => call.ok).length },
       afterRetry: { calls: fixture.calls, newOkCalls: fixture.calls.filter(call => call.ok).length - okBefore,
         runs: second.runs.map(run => ({ id: run.id, status: run.status, carried: carried(run.ctx),
           attribution: (run.ctx as any)?.attributionCommentIds ?? null, retryOfRunId: (run.ctx as any)?.retryOfRunId ?? null,
@@ -212,11 +218,24 @@ describe.skipIf(!support.supported)("tA-min (c): the orphan notice and its Retry
     expect.soft(m1AnsweredBeforeRetry || afterNotice.m1Notices.length === 1, "M1 is answered or has exactly one notice").toBe(true);
     if (!m1AnsweredBeforeRetry) {
       expect.soft(afterNotice.m1Notices.map(row => row.body).join("\n"), "the one notice is the true not-answered line").toMatch(/wasn't answered/);
-      expect.soft(interruption?.canRetry, "Retry is offered on the task").toBe(true);
+      // m2-held: the task card belongs to the latest (succeeded) run and shows no Retry button; the Retry is the
+      // API's, with the run that card names (what rf-5 pressed).
+      if (shape === "plain") expect.soft(interruption?.canRetry, "Retry is offered on the task").toBe(true);
       expect.soft(retry.status, `Retry accepted: ${JSON.stringify(retry.body)}`).toBe(202);
       expect.soft(report.afterRetry.newOkCalls, "Retry started exactly one run that reached the provider").toBe(1);
       expect.soft(fixture.calls.filter(call => call.ok).at(-1) as any, "the Retry run was given M1's text").toMatchObject({ hasTypedInput: true });
       expect.soft(report.afterRetry.m1Answered, "M1 is ANSWERED after Retry").toBe(true);
+    }
+    if (!m1AnsweredBeforeRetry) {
+      expect.soft(again.body, "a second Retry, once M1 is ANSWERED, is the no-op line").toMatchObject({ accepted: false, alreadyAnswered: true,
+        refused: { reason: "person_message_already_answered", message: "Already answered above." } });
+      expect.soft(third.runs.length, "the no-op starts no run").toBe(second.runs.length);
+      expect.soft(clockAfter.at(-1)!.notices.filter(n => n.reason === `unanswered_message:${m1}`), "the notice retires once M1 is ANSWERED").toHaveLength(0);
+    }
+    if (shape === "m2-held") {
+      const m2Replies = report.afterRetry.runs.filter(run => run.ok && (run.carried.includes(m2) || (run.attribution ?? []).includes(m2)));
+      expect.soft(m2Replies, "exactly one successful run carried M2").toHaveLength(1);
+      expect.soft(report.afterRetry.m2Answered, "M2 is ANSWERED").toBe(true);
     }
     const m1Replies = report.afterRetry.runs.filter(run => run.ok && (run.carried.includes(m1) || (run.attribution ?? []).includes(m1)));
     expect.soft(m1Replies, "exactly one successful run carried M1").toHaveLength(1);
