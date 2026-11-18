@@ -1343,8 +1343,11 @@ export async function resumeNativeWorkspaceSync(input: {
   // to a separate directory instead, with ONE true line.
   const asideDir = await personStopWithoutFilesAsideDir(input.db, input.runId, existing.descriptor.binding.leaseId);
   if (asideDir) {
-    await fs.rm(asideDir, { recursive: true, force: true });
-    await fs.mkdir(asideDir, { recursive: true });
+    // adopt-stopu-compose8 (drain): the saved-aside directory is a host write
+    // like any other, so it goes through the owner's drain (refused once the
+    // drain closed; awaited before ownership is released).
+    await hostMutation(() => fs.rm(asideDir, { recursive: true, force: true }));
+    await hostMutation(() => fs.mkdir(asideDir, { recursive: true }));
   }
   const runtime = await prepareRuntime({
     runId: input.runId,
