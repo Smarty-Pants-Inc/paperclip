@@ -1874,6 +1874,9 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   // Send's own wait keeps "Sending your messages.".
   // OBSERVED on eee74ebb: while admission holds the Send (process_identity_missing
   // on the wake), the queue GET shows the Send's own handoff wait.
+  // CURRENT BEHAVIOUR, NOT TRUTH: this pin records what the person sees today.
+  // The Send is held, so "Sending your messages." is not true here; gold
+  // smarty-dev#21194 tracks the fix, and this pin changes with it.
   const HELD_SEND_WAIT = { reason: "interrupt_handoff", message: "Sending your messages." };
   const R4 = "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.";
   const RECOVERY_WAITS = {
@@ -1997,6 +2000,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       expect((held?.payload as Record<string, unknown> | null)?.executionWait).toMatchObject({ reason: "process_identity_missing" });
       expect(await successors()).toHaveLength(0);
       // (i) The GET right after the Send shows the exact wait text the person sees.
+      // Current behaviour, not truth: gold smarty-dev#21194 (see HELD_SEND_WAIT).
       const afterSend = (await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
       expect(afterSend.executionWait).toEqual(HELD_SEND_WAIT);
       // (ii) The recovery condition clears the real way: the person confirms the
