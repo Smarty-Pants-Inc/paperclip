@@ -211,6 +211,42 @@ describe("merged #20717 reader+writer: a project-owned connection is never compa
     expect(provider.acquire).not.toHaveBeenCalled();
   });
 
+  // RFL #20717 round 2 item 2 (pair R1 survived): the post-provider admission
+  // (:149) and the post-provider full rechecks (valid() at :122/:151) are the
+  // only guards that see an approval made stale WHILE the provider call runs.
+  it("N1 token post-provider admission (github-app-credentials.ts :149 + :122/:151): approval made stale during the provider call releases no token", async () => {
+    const { f, connection, grant } = await owned({ strayCompanyReach: false });
+    const original = provider.acquire.getMockImplementation()!;
+    provider.acquire.mockImplementationOnce(async () => {
+      await db.update(userCompanyPreferences).set({ primaryAgentId: f.leadB.id })
+        .where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
+      return original();
+    });
+    const outcome = await resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id).then(value => ({ token: value.token }), (error: unknown) => ({ error }));
+    expect(provider.acquire).toHaveBeenCalledTimes(1);
+    expect(outcome).not.toHaveProperty("token");
+    // The provider boundary's value-free failure contract (422) or a 403 refusal; never a token.
+    expect(outcome).toHaveProperty("error");
+    expect([403, 422]).toContain((outcome as { error: { status?: number } }).error.status);
+  });
+
+  // RFL #20717 round 2 item 2 (pair R5 survived): finish entry admission
+  // (:3278) is the only guard that refuses BEFORE the key read and provider
+  // verification; post-provider (:3313) and transaction (:3450) refuse later.
+  it("N1 finish entry admission (tool-access.ts :3278): another project's actor, or A's lead once the approval is stale, is refused before any key read or provider call", async () => {
+    const { f, connection, entry } = await owned({ strayCompanyReach: false });
+    const finish = (actor: ReturnType<typeof f.actor>) => f.service.finishGalleryAppConnection(f.companyId, connection.id,
+      { enabledCatalogEntryIds: [entry.id], askFirstCatalogEntryIds: [], access: { agentIds: [f.leadA.id] } } as never, actor);
+    await expect(finish(f.actor(f.leadB.id))).rejects.toMatchObject({ status: 403, details: { code: OWNED_CODE } });
+    expect(provider.secret).not.toHaveBeenCalled();
+    expect(provider.acquire).not.toHaveBeenCalled();
+    await db.update(userCompanyPreferences).set({ primaryAgentId: f.leadB.id })
+      .where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
+    await expect(finish(f.actor(f.leadA.id))).rejects.toMatchObject({ status: 403 });
+    expect(provider.secret).not.toHaveBeenCalled();
+    expect(provider.acquire).not.toHaveBeenCalled();
+  });
+
   it("N1 policy full admission (tool-access-policy.ts S4): an own-team installed agent with a stale primary approval gets no allowed decision", async () => {
     const { f, connection, entry } = await owned({ strayCompanyReach: false });
     const run = await f.run(f.a, f.leadA.id);

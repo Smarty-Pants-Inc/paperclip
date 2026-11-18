@@ -552,12 +552,17 @@ function connectorEnrollmentPrincipal(req: Request): string {
     projectOwnedConnectionReadView(db, connection, ownedConnectionReader(req));
   router.param("connectionId", async (req, _res, next, connectionId) => {
     try {
-      if (req.actor?.type !== "agent" || typeof connectionId !== "string" || !isUuidLike(connectionId)) return next();
+      if (req.actor?.type !== "agent" || typeof connectionId !== "string") return next();
       if (req.method === "GET" && req.route?.path === "/tool-connections/:connectionId") return next();
-      const [row] = await db.select({ id: toolConnections.id, companyId: toolConnections.companyId, projectId: toolConnections.projectId,
+      // #20717 RFL round 2: decide on the RESOLVED row. A UID alias resolves to
+      // the same row as its UUID (services getConnectionRow), so match either.
+      const identifier = isUuidLike(connectionId)
+        ? or(eq(toolConnections.id, connectionId), eq(toolConnections.uid, connectionId))
+        : eq(toolConnections.uid, connectionId);
+      const rows = await db.select({ id: toolConnections.id, companyId: toolConnections.companyId, projectId: toolConnections.projectId,
         config: toolConnections.config, transportConfig: toolConnections.transportConfig }).from(toolConnections)
-        .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, req.actor.companyId ?? "")));
-      if (row) await assertProjectOwnedConnectionDetailsReadable(db, row, ownedConnectionReader(req));
+        .where(and(identifier, eq(toolConnections.companyId, req.actor.companyId ?? "")));
+      for (const row of rows) await assertProjectOwnedConnectionDetailsReadable(db, row, ownedConnectionReader(req));
       next();
     } catch (error) {
       next(error);
@@ -2490,7 +2495,10 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const connectionIds = [...new Set([...effective.allowedTools.map(tool => tool.connectionId), ...effective.installedConnections.map(connection => connection.id)])];
     const connections = await filterConnectionManagementRows(db, req, "connections:profiles", connectionIds, connectionId => ({ connectionId }));
     if (profiles.length !== effective.profiles.length || connections.length !== connectionIds.length) throw forbidden("Effective profile resources are unavailable to this delegated principal");
-    res.json(effective);
+    // #20717 RFL round 2: the target agent's installed owned rows are projected
+    // through the READER's owned-resource read decision, as the collection and
+    // by-ID reads are; everyone else sees id/name/status/ownership only.
+    res.json({ ...effective, installedConnections: await Promise.all(effective.installedConnections.map(connection => ownedConnectionReadView(req, connection))) });
   });
 
   router.patch("/tool-profiles/:profileId", managementGuard("connections:profiles", "PATCH /tool-profiles/:profileId", { personal: true }), validate(updateToolProfileWithEntriesSchema), async (req, res) => {
