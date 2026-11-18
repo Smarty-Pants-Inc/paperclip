@@ -1767,8 +1767,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(noticesEver.map(n => label(n.metadata?.authorizationReason)), "no notice for M1 or M2").toEqual([]);
     expect(outcomes, "never noticed").not.toContain("noticed");
     expect(await f.visible()).toHaveLength(0);
-    expect(await messageState(f, m1), "M1 answered").toMatchObject({ answered: true });
-    expect(await messageState(f, m2), "M2 answered").toMatchObject({ answered: true });
+    expect(await isAnswered(f, m1), "M1 answered").toBe(true);
+    expect(await isAnswered(f, m2), "M2 answered").toBe(true);
     const [successorRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor));
     const context = successorRow!.contextSnapshot as Record<string, unknown>;
     expect(context).toMatchObject({ conversationReplyBoundaryCommentId: m2, attributionCommentIds: [m1, m2] });
