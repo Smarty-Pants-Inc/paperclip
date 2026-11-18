@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
+import { agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { EXECUTION_RECONCILIATION_CAUSES } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { BACKLOG_CONTINUATION_MAX_AGE_MS, freshContinuationCheckDue, heldExecutionWhere, heldExecutionsAwaitingFreshContinuation,
@@ -11,9 +11,24 @@ import { continuationCauseIsSystemOwnedSql, continuesAutomaticallySql, recoveryR
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
 
-// The predicates as they were before they became index lookups (2026-11-14):
-// `id::text = text` on the run key and cast issue columns, one OR scan per
-// newer-run probe. Kept verbatim as the oracle the rewrite must match.
+// RFL record SUPERSEDE-FCSQ-REFERENCE-1118: keep the pre-index-lookup query
+// shape (`id::text = text`, cast issue links), not superseded behavior.
+// c8fac3284 deliberately stopped treating an earlier live turn as a successor;
+// 1910d6cc8 routes physically stopped predecessors to their refused follow-up.
+// 928c3f802 / merge 9c6b679d6 retain the closed refusal backlog family, beside
+// upstream ca23330c6's permanently lost files. Full per-record and ordered-list
+// equality remain required; the explicit cases below pin these decisions too.
+const referenceRefusalCodes = [
+  "native_controller_recovery_missing_evidence:snapshot_binding",
+  "native_controller_recovery_unsupported:metadata_format",
+  "runner_remote_state_unavailable",
+  "runner_harness_state_mismatch: backup_without_reusable_lease",
+  "runner_harness_state_mismatch: resumed_unavailable",
+  "native_controller_recovery_missing_evidence:retained_sandbox_binding",
+  "native_runner_refresh_required",
+  "native_runner_launch_profile_mismatch",
+] as const;
+const referenceSqlList = (values: readonly string[]) => sql.join(values.map(value => sql`${value}`), sql`, `);
 const previousCancelledAtDispatch = (alias: "newer" | "held") => sql.raw(`coalesce(${alias}.status = 'cancelled' and ${alias}.started_at is null
   and ${alias}.error_code = 'execution_reconciliation_required', false)`);
 const previousRunOfTask = (alias: "newer" | "held", issueId: SQL) => sql`(${sql.raw(alias)}.native_issue_id::text = ${issueId}::text
@@ -35,7 +50,15 @@ function previousRecentInterruptionSourceSql(now: Date) {
   const systemRetriedSource = sql`(${continuationCauseIsSystemOwnedSql("source")}
     and coalesce(source.context_snapshot->>'wakeReason', '') <> 'task_retry' and not coalesce(source.context_snapshot ? 'explicitUserContinuation', false)
     and exists (select 1 from ${heartbeatRuns} held where ${refusedLater} and ${recoveryRunSql("held")}))`;
-  const recent = source(sql`(${continuesAutomaticallySql("source")} or ${systemRetriedSource})
+  const savedFilesLost = sql`exists (select 1 from ${issueRecoveryActions} lost where lost.company_id = source.company_id
+    and lost.source_issue_id::text = ${input.issueId}::text
+    and coalesce(lost.evidence->>'runId', lost.evidence->>'sourceRunId') = source.id::text
+    and lost.evidence#>>'{systemRecovery,state}' = 'exhausted'
+    and lost.evidence#>>'{systemRecovery,failure,code}' in ('allocation_ownership_ambiguous', 'source_binding_invalid', 'source_unavailable', 'historical_source_missing')
+    and lost.evidence#>>'{systemRecovery,failure,retryClass}' in ('service_required', 'use_alternative_strategy'))`;
+  const recent = source(sql`(${continuesAutomaticallySql("source")} or ${systemRetriedSource}
+    or (${continuationCauseIsSystemOwnedSql("source")} and ${savedFilesLost})
+    or source.error_code in (${referenceSqlList(referenceRefusalCodes)}))
     and greatest(source.finished_at, (select max(held.finished_at) from ${heartbeatRuns} held where ${refusedLater})) > ${since}`);
   return sql`(${recent} or ${personAsked})`;
 }
@@ -64,7 +87,19 @@ function previousHeldExecutionWhere(options: { includeActive?: boolean } = {}) {
       and not exists (select 1 from ${heartbeatRuns} newer where newer.company_id = source.company_id and newer.id <> source.id
         and (newer.native_issue_id = ${issues.id} or newer.issue_id = ${issues.id} or newer.context_snapshot->>'issueId' = ${issues.id}::text)
         and not ${previousCancelledAtDispatch("newer")}
-        and (newer.status in ('queued', 'running', 'scheduled_retry') or (newer.created_at, newer.id) > (source.created_at, source.id))))`,
+        and (newer.created_at, newer.id) > (source.created_at, source.id)
+        and not coalesce((newer.runtime_mode = 'native' and newer.agent_id = source.agent_id
+          and newer.native_session_id = source.native_session_id
+          and coalesce(newer.context_snapshot->'conversationSessionGeneration', '0'::jsonb)
+            = coalesce(source.context_snapshot->'conversationSessionGeneration', '0'::jsonb)
+          and newer.status in ('failed', 'timed_out', 'interrupted', 'cancelled') and newer.finished_at is not null
+          and (newer.error_code in (${referenceSqlList(referenceRefusalCodes)})
+            or newer.error in (${referenceSqlList(referenceRefusalCodes)})
+            or newer.result_json#>>'{nativeFreshContinuationRefusal,code}' in (${referenceSqlList(referenceRefusalCodes)}))
+          and exists (select 1 from ${nativeRunFinalizations} stopped where stopped.company_id = source.company_id
+            and stopped.run_id = source.id and stopped.issue_id::text = ${issues.id}::text and stopped.phase = 'terminal_failure'
+            and stopped.lease_owner is null and stopped.result_id is null
+            and stopped.failure_detail#>>'{releasedOwner,reason}' = 'stopped_remote_owner')), false)))`,
   )!;
 }
 
@@ -95,6 +130,7 @@ suite("fresh-continuation schedule queries", () => {
   const now = new Date(Date.UTC(2026, 10, 14, 5, 0, 0));
   const tenants: Array<{ companyId: string; agentIds: string[] }> = [];
   let actions = 0;
+  const referenceCases: Array<{ id: string; name: string; held: boolean; eligible: boolean }> = [];
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-fresh-continuation-schedule-");
@@ -107,6 +143,8 @@ suite("fresh-continuation schedule queries", () => {
       tenants.push({ companyId, agentIds });
     }
     actions = await seedVariedFixture(20261114, 900);
+    await seedReferenceCases();
+    actions += referenceCases.length;
     // Run history that is not linked to any held task, so a scan per candidate shows.
     await db.$client.unsafe(`insert into heartbeat_runs (company_id, agent_id, status, context_snapshot, created_at)
       select $1::uuid, $2::uuid, 'succeeded', jsonb_build_object('issueId', gen_random_uuid()::text, 'prompt', repeat('x', 4000)),
@@ -201,6 +239,68 @@ suite("fresh-continuation schedule queries", () => {
     return actionRows.length;
   }
 
+  // Deterministic witnesses for every superseded rule, with negative neighbors.
+  // No assertion is relaxed to tolerate a difference or to accept a subset.
+  async function seedReferenceCases() {
+    const { companyId, agentIds } = tenants[0]!;
+    const at = (minutesAgo: number) => new Date(now.getTime() - minutesAgo * 60_000);
+    const add = async (name: string, held: boolean, eligible: boolean,
+      sourcePatch: Partial<typeof heartbeatRuns.$inferInsert> = {},
+      newerPatch?: Partial<typeof heartbeatRuns.$inferInsert>, stopped = false,
+      evidencePatch: Record<string, unknown> = {}) => {
+      const issueId = randomUUID(), sourceId = randomUUID(), sessionId = randomUUID(), id = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title: name, status: "in_progress", assigneeAgentId: agentIds[0]! });
+      const source = { id: sourceId, companyId, agentId: agentIds[0]!, scopeKind: "issue" as const,
+        issueId, nativeIssueId: issueId, runtimeMode: "native", nativeSessionId: sessionId,
+        status: "failed", errorCode: "process_lost", createdAt: at(60), startedAt: at(59), finishedAt: at(50),
+        contextSnapshot: { issueId, wakeReason: "issue_assigned", conversationSessionGeneration: 1 }, ...sourcePatch };
+      await db.insert(heartbeatRuns).values(source);
+      if (newerPatch) await db.insert(heartbeatRuns).values({ ...source, id: randomUUID(), createdAt: at(40),
+        startedAt: at(39), finishedAt: at(30), errorCode: "runner_remote_state_unavailable", ...newerPatch });
+      if (stopped) await db.insert(nativeRunFinalizations).values({ runId: sourceId, companyId, issueId,
+        phase: "terminal_failure", failureDetail: { releasedOwner: { reason: "stopped_remote_owner" } } });
+      await db.insert(issueRecoveryActions).values({ id, companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
+        status: "active", ownerType: "board", cause: "native_continuation_requires_reconciliation", fingerprint: `reference:${name}`,
+        nextAction: "Fixture", evidence: { runId: sourceId, automaticRecovery: { replay: "blocked" },
+          freshContinuationCheck: { kind: "backoff", nextCheckAt: now.getTime() - 4 * 60 * 60_000 }, ...evidencePatch } });
+      referenceCases.push({ id, name, held, eligible });
+    };
+    for (const status of ["queued", "running", "scheduled_retry"]) {
+      // c8fac3284: an older live turn is not a successor, a later one still is.
+      await add(`earlier-${status}`, true, true, {}, { status, createdAt: at(80),
+        startedAt: status === "running" ? at(79) : null, finishedAt: null });
+      await add(`later-${status}`, false, true, {}, { status, startedAt: status === "running" ? at(39) : null, finishedAt: null });
+    }
+    // 1910d6cc8: only a stopped, same-agent, same-session, same-generation
+    // predecessor may route past the exact typed refusal of its follow-up.
+    for (const field of ["errorCode", "error", "resultJson"] as const) {
+      await add(`stopped-refusal-${field}`, true, true, {}, { errorCode: field === "errorCode" ? "runner_remote_state_unavailable" : null,
+        ...(field === "error" ? { error: "runner_remote_state_unavailable" } : {}),
+        ...(field === "resultJson" ? { resultJson: { nativeFreshContinuationRefusal: { code: "runner_remote_state_unavailable" } } } : {}) }, true);
+    }
+    await add("refusal-without-stop-proof", false, true, {}, {});
+    await add("refusal-other-session", false, true, {}, { nativeSessionId: randomUUID() }, true);
+    await add("refusal-other-agent", false, true, {}, { agentId: agentIds[1]! }, true);
+    await add("refusal-other-generation", false, true, {}, { contextSnapshot: { conversationSessionGeneration: 2 } }, true);
+    await add("refusal-diagnostic-prose", false, true, {}, { errorCode: null, error: "provider said runner_remote_state_unavailable" }, true);
+    await add("later-success", false, true, {}, { status: "succeeded", errorCode: null }, true);
+    // Cut B's closed refusal family is eligible even on a first attempt that
+    // is not classified as a retry. Old or merely similar codes are not.
+    for (const code of referenceRefusalCodes) await add(`source-${code}`, true, true, { errorCode: code });
+    await add("source-old-refusal", true, false, { errorCode: "runner_remote_state_unavailable",
+      createdAt: at(1_470), startedAt: at(1_469), finishedAt: at(1_450) });
+    await add("source-unknown-refusal", true, false, { errorCode: "runner_remote_state_unavailable_extra" });
+    // ca23330c6: permanent file loss must name this source run; it does not
+    // turn a person's budget stop or a transient restore failure into a retry.
+    const lost = (code = "source_unavailable") => ({ systemRecovery: { state: "exhausted",
+      failure: { code, retryClass: "use_alternative_strategy" } } });
+    await add("source-permanent-files-lost", true, true, { errorCode: "setup_failed", contextSnapshot: { wakeReason: "task_retry" } },
+      undefined, false, lost());
+    await add("source-transient-files-failure", true, false, { errorCode: "setup_failed", contextSnapshot: { wakeReason: "task_retry" } },
+      undefined, false, lost("transport_timeout"));
+    await add("source-person-owned-files-lost", true, false, { errorCode: "budget_exceeded" }, undefined, false, lost());
+  }
+
   const verdicts = (where: { held: SQL; heldWithActive: SQL; eligible: SQL }) => db.select({ id: issueRecoveryActions.id,
     held: sql<boolean>`coalesce(${where.held}, false)`, heldWithActive: sql<boolean>`coalesce(${where.heldWithActive}, false)`,
     eligible: sql<boolean>`coalesce(${where.eligible}, false)` })
@@ -212,6 +312,11 @@ suite("fresh-continuation schedule queries", () => {
       eligible: previousRecentInterruptionSourceSql(now) });
     const after = await verdicts({ held: heldExecutionWhere(), heldWithActive: heldExecutionWhere({ includeActive: true }),
       eligible: recentInterruptionSourceSql(now) });
+    for (const expected of referenceCases) {
+      const verdict = { id: expected.id, held: expected.held, heldWithActive: expected.held, eligible: expected.eligible };
+      expect(before.find(row => row.id === expected.id), `reference: ${expected.name}`).toEqual(verdict);
+      expect(after.find(row => row.id === expected.id), `product: ${expected.name}`).toEqual(verdict);
+    }
     expect(after).toEqual(before);
     expect(before).toHaveLength(actions);
     // The fixture reaches both outcomes of each predicate, so equality is meaningful.
@@ -272,8 +377,8 @@ suite("fresh-continuation schedule queries", () => {
     expect(heartbeatRunRowsRead(plan)).toBeLessThan(2 * runs);
   }, 60_000);
 
-  // Runs last: its candidates reach the saved-files-lost check, which the
-  // previous predicates above do not have.
+  // Runs last: adds enough saved-files-lost candidates and unrelated recovery
+  // records to expose a scan per candidate, beyond the equivalence cases above.
   it("checks for permanently lost saved files by the task's own records, not every recovery record per candidate", async () => {
     const { companyId, agentIds } = tenants[0]!;
     const fillerIssues = Array.from({ length: 100 }, (_, index) => ({ id: randomUUID(), companyId, title: `Filler ${index}`, status: "done" }));
