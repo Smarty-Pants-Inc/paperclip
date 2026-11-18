@@ -160,13 +160,21 @@ provider; restart recovery preserves files until retirement is proven.
 4. Recheck the responsible user's current authorization. Under the same agent
    lock used by editor writes, apply only files changed or deleted relative to
    the last acknowledged baseline. For a competing edit or deletion of the same
-   file, the last synchronization to acquire the lock wins. Unchanged files do
-   not overwrite another run's changes; newly added unrelated files survive.
+   file, another writer's saved version stays canonical; this run's divergent
+   edit is saved as `<name>.conflict-<run8>-<epochms>.<ext>`. A stale deletion is
+   not applied. Unchanged files do not overwrite another run's changes; newly
+   added unrelated files survive.
 5. Record the save receipt and advance the baseline only after application. A
    warm session keeps its directory and hands ownership to the next run using
    a controller-owned marker. Old callbacks cannot collect or remove the next
-   owner's files. On session retirement, collect any later writes and remove
-   the private directory. No per-run file versions or conflict copies accumulate.
+   owner's files. After a local warm conflict, refresh the live tree and its
+   checkpoint baseline from canonical files before reuse; if a concurrent write
+   prevents refresh, retire instead. Remote conflicts invalidate warm reuse and
+   require stopped collection and a fresh restore. The next prepared model input
+   names the retained file and the earlier edit's actual conflict-copy path.
+   On session retirement, collect any later writes and remove the private
+   directory. Named conflict copies remain ordinary persistent files, not a
+   general per-run version history.
 
 These are validated **per-file checkpoints**, not an atomic snapshot of arbitrary
 background writers across an entire directory. Writes after a checkpoint remain
@@ -236,10 +244,13 @@ that digest. Relative supporting files are read from `AGENT_HOME`, not from the
 read-only prompt snapshot.
 
 The editor supplies the hash of the file it read. A stale browser save returns
-409 and retains the user's unsaved draft. Run synchronization itself uses
-per-file last-sync-wins: a later run can overwrite a saved browser edit to the
-same file. There is no text merge or historical copy to recover the overwritten
-version. Ordinary task files continue using their existing workspace contract.
+409 and retains the user's unsaved draft. On a divergent run synchronization,
+another writer's saved version stays canonical, including a saved browser edit;
+this run's edit is saved as `<name>.conflict-<run8>-<epochms>.<ext>`. There is no
+text merge. File/folder topology replacement remains a separate limitation; a
+receipt explicitly records `currentKept: false` if that replacement removed the
+other writer's file, and neither its event nor its next-turn notice claims it
+was kept. Ordinary task files continue using their existing workspace contract.
 
 ## Upgrade and recovery
 
@@ -295,8 +306,10 @@ Re-preparing an existing run uses the same lock as cleanup and rechecks its
 receipt under that lock. Preparing a new run keeps its separate admission path.
 Missing stop proof or lost remote bytes produce a visible diagnostic, never a
 save receipt. An interrupted apply can replay its changed files with the same
-last-sync-wins rule. Cleanup resumes for terminal runs; no copy is retained as
-an archive after cleanup succeeds.
+conflict-copy rule: another writer's saved version stays canonical and this
+run's divergent edit is saved as `<name>.conflict-<run8>-<epochms>.<ext>`.
+Cleanup resumes for terminal runs; named conflict files remain in the canonical
+directory, but the temporary run copy is not retained as an archive.
 
 An unchanged-turn observation is neither a save nor proof that a provider stopped.
 If retirement fails, the controller records unresolved ownership and preserves
@@ -315,7 +328,8 @@ claimed for the pending case, and stale prior-run leases cannot authorize cleanu
 ## Verification
 
 `agent-directory-working-copies.test.ts` exercises nested/binary files, directory
-isolation, last-sync-wins edits and deletions, terminal cleanup, link rejection, old-head
+isolation, canonical-retaining conflict copies and stale deletions, truthful
+topology receipts, still-warm baseline refresh, terminal cleanup, link rejection, old-head
 adoption, stable prompt digests, warm ownership transfer, concurrent stale claims,
 and stop-proved recovery. `agent-directory-probe.test.ts` covers stable snapshots,
 unsafe paths, mutation races and bounded child failures; composed native executor
@@ -327,9 +341,11 @@ The explicit Product E2E `instruction-persistence` suite creates a file through
 the browser editor, runs an agent that changes instructions and supporting files,
 checks exact binary bytes via the public download route, restarts the server,
 and asks a fresh task to prove restored contents using an independent nonce. A
-third task edits its entry while the browser saves that same file; the later
-run sync wins while a separate browser-created file survives, with no conflict
-candidate or manual resolution. Three more tasks save a sparse file at its
+third task edits its entry while the browser saves that same file; the browser's
+saved version stays canonical and the run's divergent edit is saved as
+`<name>.conflict-<run8>-<epochms>.<ext>`, while a separate browser-created file
+survives. The save event names that ordinary file; no legacy conflict candidate
+or manual resolution step is created. Three more tasks save a sparse file at its
 256 MiB boundary, exceed that boundary with a nonfatal save rejection, then
 remove it and save a new small file. All tasks must succeed, with warnings
 visible in run details while full and cleared after cleanup.

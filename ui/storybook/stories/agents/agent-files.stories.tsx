@@ -146,7 +146,7 @@ export const BinaryFile: Story = {
     await expect(await canvas.findByRole("link", { name: "Download cache.bin" })).toBeVisible();
   },
 };
-export const LastSyncWins: Story = { ...AgentEditArrives };
+export const AgentSavedEdit: Story = { ...AgentEditArrives, name: "supersedes: LastSyncWins — Agent saved edit" };
 export const StorageLimit: Story = {
   args: { failedSync: true },
   play: async ({ canvasElement }) => {
