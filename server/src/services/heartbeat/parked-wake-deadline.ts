@@ -89,12 +89,30 @@ export const PARKED_WAKE_NOT_STARTED_WAIT = { reason: "parked_not_started", mess
 export const PARKED_WAKE_STOPPING_TEXT =
   "Your message is saved and will be sent when the previous run has finished stopping, usually within ten minutes.";
 export const PARKED_WAKE_STOPPING_WAIT = { reason: "parked_not_started", message: PARKED_WAKE_STOPPING_TEXT } as const;
+/** RFL C2: a stop that is never confirmed. At this long after the park's FIRST
+ * time the stopping note ("usually within ten minutes") is rewritten ONCE, in
+ * place (still one note), to this true line. Retry would not start it: every
+ * press re-enters admission, which blocks again on the same unconfirmed stop
+ * (explicit-native-continuation.ts:573), so the line names no Retry. */
+export const PARKED_WAKE_UNCONFIRMED_MS = 30 * 60_000;
+export const PARKED_WAKE_UNCONFIRMED_TEXT =
+  "Your message is saved. The previous run has not confirmed it stopped; it will be sent when it does.";
+export const PARKED_WAKE_UNCONFIRMED_WAIT = { reason: "parked_not_started", message: PARKED_WAKE_UNCONFIRMED_TEXT } as const;
 /** "No run can start yet" is admission's own verdict, persisted on the wake as
  * payload.executionWait by admitExplicitNativeContinuation's blocked():
  * remote_cleanup (explicit-native-continuation.ts:573/:576, no remote stop receipt
- * for the previous run's lease), send_predates_stop (:448-449) and
- * execution_settling (:388, the previous run's stop has not settled). */
-export const PARKED_WAKE_STOPPING_REASONS: ReadonlySet<string> = new Set(["remote_cleanup", "send_predates_stop", "execution_settling"]);
+ * for the previous run's lease) and execution_settling (:388, the previous run's
+ * stop has not settled). Both clear by themselves once the stop is confirmed.
+ * NOT send_predates_stop (:448-449, rf-4 Q5): it compares authorizedAt, which for
+ * a queued Send is that press's own queuedCommentInterrupt.requestedAt (:280/:288),
+ * with the previous run's finishedAt. Both are stored values that no receipt
+ * changes, so only a NEW press (a newer requestedAt) clears it: that park keeps
+ * the "did not start ... Press Retry" note, whose Retry works. */
+export const PARKED_WAKE_STOPPING_REASONS: ReadonlySet<string> = new Set(["remote_cleanup", "execution_settling"]);
+/** The queue's line for a noticed stopping park: the 30-min line once written. */
+export function parkedWakeStoppingWait(payload: Payload) {
+  return typeof payload?.parkedUnconfirmedAt === "string" ? PARKED_WAKE_UNCONFIRMED_WAIT : PARKED_WAKE_STOPPING_WAIT;
+}
 export function parkedWakeStopping(payload: Payload) {
   const wait = payload?.executionWait as { reason?: unknown } | null | undefined;
   return typeof wait?.reason === "string" && PARKED_WAKE_STOPPING_REASONS.has(wait.reason);
@@ -132,7 +150,31 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
     const anchor = parkedWakeAnchor(current?.payload);
     if (!current || anchor === null || anchor + parkedWakeDeadlineMs() > now.getTime()) return false;
     const stopping = parkedWakeStopping(current.payload);
-    if (parkedWakeNoticed(current.payload)) return stopping ? PARKED_WAKE_STOPPING : false;
+    if (parkedWakeNoticed(current.payload)) {
+      if (!stopping) return false;
+      // RFL C2: still unconfirmed 30 min after the first park: rewrite the
+      // stopping note ONCE in place (parkedUnconfirmedAt marks it).
+      if (anchor + PARKED_WAKE_UNCONFIRMED_MS <= now.getTime() && typeof current.payload?.parkedUnconfirmedAt !== "string") {
+        await tx.update(agentWakeupRequests).set({
+          payload: sql`${agentWakeupRequests.payload} || ${JSON.stringify({ parkedUnconfirmedAt: now.toISOString() })}::jsonb`,
+        }).where(eq(agentWakeupRequests.id, scope.requestId));
+        const messageId = queuedCommentIdsFromWakePayload(current.payload).at(-1) ?? scope.requestId;
+        const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${messageId}`;
+        const notice = buildStrandedRecoveryEscalationNotice({
+          seed: { title: "Your message is saved", body: PARKED_WAKE_UNCONFIRMED_TEXT, tone: "info",
+            nextAction: "No action is needed; it will be sent when the stop is confirmed." },
+          recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",
+          sourceRun: null, failureCode: UNANSWERED_MESSAGE_NO_RUN_CODE,
+        });
+        // Only this park's stopping note; an answered/retired note stays retired.
+        await tx.update(issueComments).set({ body: notice.body, presentation: notice.presentation,
+          metadata: { ...notice.metadata, authorizationReason: reason }, updatedAt: now })
+          .where(and(eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, issueId),
+            isNull(issueComments.deletedAt), eq(issueComments.body, PARKED_WAKE_STOPPING_TEXT),
+            sql`${issueComments.metadata}->>'authorizationReason' = ${reason}`));
+      }
+      return PARKED_WAKE_STOPPING;
+    }
     // Per held message X, the runs that CARRIED X (directly or through their
     // continuation chain, chainCarriesCommentSql) decide (rf-4 rulings):
     // - a carrying run still queued/running/scheduled_retry: X may yet be
@@ -169,15 +211,18 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
       return false;
     }
     const payload = answered.size > 0 ? withQueuedCommentIdsInWakePayload(current.payload, open) : current.payload;
+    // First note already past the 30-min line (a late pass): write that line.
+    const unconfirmed = stopping && anchor + PARKED_WAKE_UNCONFIRMED_MS <= now.getTime();
     await tx.update(agentWakeupRequests).set({
-      payload: sql`${JSON.stringify(payload)}::jsonb || ${JSON.stringify({ parkedNoticeAt: now.toISOString() })}::jsonb`,
+      payload: sql`${JSON.stringify(payload)}::jsonb || ${JSON.stringify({ parkedNoticeAt: now.toISOString(),
+        ...(unconfirmed ? { parkedUnconfirmedAt: now.toISOString() } : {}) })}::jsonb`,
     }).where(eq(agentWakeupRequests.id, scope.requestId));
     const messageId = open.at(-1) ?? scope.requestId;
     const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${messageId}`;
     const notice = buildStrandedRecoveryEscalationNotice({
       seed: stopping
-        ? { title: "Your message is saved", body: PARKED_WAKE_STOPPING_TEXT, tone: "info",
-          nextAction: "No action is needed; it will be sent by itself." }
+        ? { title: "Your message is saved", body: unconfirmed ? PARKED_WAKE_UNCONFIRMED_TEXT : PARKED_WAKE_STOPPING_TEXT, tone: "info",
+          nextAction: unconfirmed ? "No action is needed; it will be sent when the stop is confirmed." : "No action is needed; it will be sent by itself." }
         : { title: "Your message did not start", body: PARKED_WAKE_NOT_STARTED_TEXT, tone: "warning",
           nextAction: "Press Retry to send it now." },
       recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",

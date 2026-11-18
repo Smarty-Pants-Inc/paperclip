@@ -54,7 +54,7 @@ import { idleWorkSnapshot } from '../services/task-admission.js';
 import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from '../services/deferred-execution-notifications.js';
 import { remoteTerminationReceipt } from '../services/remote-execution-termination.js';
 import { settleUnansweredPersonMessage } from '../services/recovery/unanswered-person-message.js';
-import { PARKED_WAKE_NOT_STARTED_TEXT, PARKED_WAKE_STOPPING_TEXT } from '../services/heartbeat/parked-wake-deadline.js';
+import { PARKED_WAKE_NOT_STARTED_TEXT, PARKED_WAKE_STOPPING_TEXT, PARKED_WAKE_UNCONFIRMED_TEXT } from '../services/heartbeat/parked-wake-deadline.js';
 
 
 // RFL 11:12Z rows. Real Stop and Send routes, real deferred-receipt and dispatch
@@ -104,7 +104,7 @@ describe('S124 fix 4: the parked-Send note while no run can start yet',()=>{
   expect((await readWake()).payload?.executionWait).toMatchObject({reason:'remote_cleanup'});
   expect(await runs()).toHaveLength(0);
   const receipt=async()=>{await db.transaction(async tx=>{await tx.update(environmentLeases).set({status:'released',cleanupStatus:'success',releasedAt:new Date(),metadata:{...lease.metadata,remoteExecutionTermination:remoteTerminationReceipt(lease,{providerLeaseId:lease.providerLeaseId,state:'stopped'})}}).where(eq(environmentLeases.id,lease.id));await notifyDeferredExecutionWork(tx,{companyId,requestId:wakeId});await notifyDeferredWakesForIssue(tx,{companyId,issueId});});};
-  return {companyId,issueId,wakeId,m1,app,get,readWake,runs,replies,notes,receipt,sentAt};
+  return {companyId,issueId,oldId,wakeId,m1,app,get,readWake,runs,replies,notes,receipt,sentAt};
  }
  // Fake ONLY Date/timeouts, advancing with wall time: +2 min past the Send, the real worker writes the note.
  async function toDeadline(r:Awaited<ReturnType<typeof stopAndSend>>){
@@ -196,5 +196,70 @@ describe('S124 fix 4: the parked-Send note while no run can start yet',()=>{
   await hb.drainActiveRunExecutions();
   expect(await r!.replies()).toHaveLength(1);expect(await r!.runs()).toHaveLength(1);
   expect(errors).toEqual([]);
+ });
+ it('row 4 (rf-4 Q5): send_predates_stop does not clear on the receipt, so its park keeps the OLD note with its working Retry',async()=>{
+  vi.useFakeTimers({toFake:['Date','setTimeout','clearTimeout'],shouldAdvanceTime:true});
+  let r:Awaited<ReturnType<typeof stopAndSend>>;
+  try{
+   r=await stopAndSend();
+   // The previous run's terminal time lands after this Send (Send/Stop race), then its receipt.
+   await db.update(heartbeatRuns).set({finishedAt:new Date(r.sentAt+500)}).where(eq(heartbeatRuns.id,r.oldId));
+   await realTimeout(600);await r.receipt();
+   for(let i=0;i<30;i++){await vi.advanceTimersByTimeAsync(5000);await hb.resumeQueuedRuns();await wait(async()=>expect(idleWorkSnapshot().active).toBe(0));}
+   await wait(async()=>expect((await r.readWake()).payload?.parkedNoticeAt).toBeTypeOf('string'),20_000);
+   // More passes with the receipt present: it stays parked (admission keeps answering send_predates_stop).
+   for(let i=0;i<12;i++){await vi.advanceTimersByTimeAsync(5000);await hb.resumeQueuedRuns();}
+  }finally{vi.useRealTimers();}
+  const wake=await r!.readWake(),q=await r!.get(),ns=await r!.notes();
+  console.log('S124FIX5_ROW4',JSON.stringify({wait:wake.payload?.executionWait,queueWait:q.executionWait,notes:ns.map(n=>n.body)}));
+  expect(wake.payload?.executionWait).toMatchObject({reason:'send_predates_stop'});
+  expect(q.executionWait).toEqual({reason:'parked_not_started',message:PARKED_WAKE_NOT_STARTED_TEXT});
+  expect(ns).toHaveLength(1);expect(ns[0]!.body).toBe('Your message is saved, but it did not start. Press Retry to send it now.');
+  expect(await r!.runs()).toHaveLength(0);expect(edge.calls).toHaveLength(0);
+  await startWorkers();
+  const retry=await request(r!.app).post(`/api/issues/${r!.issueId}/queued-comments/interrupt`).send({queueId:r!.wakeId,targetRunId:null,revision:q.revision});
+  expect(retry.status,JSON.stringify(retry.body)).toBe(200);
+  await hb.resumeQueuedRuns();
+  await wait(async()=>expect(edge.calls).toHaveLength(1),40_000);
+  await hb.drainActiveRunExecutions();
+  expect(await r!.replies()).toHaveLength(1);expect(await r!.runs()).toHaveLength(1);
+ });
+ it('row 5 (RFL C2): a stop never confirmed -> at 30 min the ONE note is rewritten once to the true line; then the receipt -> one answer, note retired',async()=>{
+  vi.useFakeTimers({toFake:['Date','setTimeout','clearTimeout'],shouldAdvanceTime:true});
+  let r:Awaited<ReturnType<typeof stopAndSend>>;let noteId='';let firstRewrite:unknown;
+  const step=async(n:number)=>{for(let i=0;i<n;i++){await vi.advanceTimersByTimeAsync(5000);await hb.resumeQueuedRuns();await wait(async()=>expect(idleWorkSnapshot().active).toBe(0));}};
+  try{
+   r=await stopAndSend();
+   await step(30); // +2.5 min
+   await wait(async()=>expect((await r.readWake()).payload?.parkedNoticeAt).toBeTypeOf('string'),20_000);
+   let ns=await r.notes();expect(ns).toHaveLength(1);expect(ns[0]!.body).toBe(NEW_WORDS);noteId=ns[0]!.id;
+   await step(318); // +29 min: no receipt, still the stopping words
+   ns=await r.notes();expect(ns).toHaveLength(1);expect(ns[0]!.body).toBe(NEW_WORDS);
+   expect((await r.readWake()).payload?.parkedUnconfirmedAt).toBeUndefined();
+   await step(24); // +31 min
+   await wait(async()=>expect((await r.readWake()).payload?.parkedUnconfirmedAt).toBeTypeOf('string'),20_000);
+   ns=await r.notes();const q=await r.get();
+   console.log('S124FIX5_ROW5_30MIN',JSON.stringify({elapsedMs:Date.now()-r.sentAt,queueWait:q.executionWait,notes:ns.map(n=>({id:n.id,body:n.body,metadata:n.metadata}))}));
+   expect(ns).toHaveLength(1);expect(ns[0]!.id).toBe(noteId);
+   expect(ns[0]!.body).toBe('Your message is saved. The previous run has not confirmed it stopped; it will be sent when it does.');
+   expect(PARKED_WAKE_UNCONFIRMED_TEXT).toBe(ns[0]!.body);expect(JSON.stringify(ns[0]!.metadata)).not.toMatch(/Retry/);
+   expect(q.executionWait).toEqual({reason:'parked_not_started',message:PARKED_WAKE_UNCONFIRMED_TEXT});
+   firstRewrite={at:(await r.readWake()).payload?.parkedUnconfirmedAt,updatedAt:ns[0]!.updatedAt.toISOString()};
+   await step(60); // +36 min: rewritten ONCE (no further rewrite), still one note, nothing started
+   ns=await r.notes();
+   expect(ns).toHaveLength(1);expect(ns[0]!.body).toBe(PARKED_WAKE_UNCONFIRMED_TEXT);
+   expect({at:(await r.readWake()).payload?.parkedUnconfirmedAt,updatedAt:ns[0]!.updatedAt.toISOString()}).toEqual(firstRewrite);
+   expect(await r.runs()).toHaveLength(0);expect(edge.calls).toHaveLength(0);
+  }finally{vi.useRealTimers();}
+  // Back to wall time: undo only the fake clock's skew on the wake's cadence stamp.
+  await db.update(agentWakeupRequests).set({updatedAt:new Date()}).where(eq(agentWakeupRequests.id,r!.wakeId));
+  await startWorkers();
+  await r!.receipt();
+  await wait(async()=>expect(edge.calls).toHaveLength(1),120_000);
+  await hb.drainActiveRunExecutions();
+  expect(await r!.replies()).toHaveLength(1);expect(await r!.runs()).toHaveLength(1);
+  await settleUnansweredPersonMessage(db,{companyId:r!.companyId,issueId:r!.issueId});
+  expect(await r!.notes()).toHaveLength(0);
+  expect(await r!.replies()).toHaveLength(1);expect(edge.calls).toHaveLength(1);
  });
 });
