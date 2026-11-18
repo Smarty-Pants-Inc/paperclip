@@ -347,6 +347,28 @@ describe("held-save bound: a permanent 4xx hold stops retrying, frees its box, t
     expect((applyCalls.get(unchangedAgentId) ?? 0) - applyBefore).toBe(0);
   }, 60_000);
 
+  it("R0a-REMOTE: Paul's 035deeb8 branch by line, an EXISTING legacy LEASE-GONE hold (no retryOn, no checkpointAt) on a RETAINED remote box whose lease is not active is parked under B0b: no timer", async () => {
+    const stoppedAt = new Date(Date.now() - 13 * HOUR);
+    // PLANTED: Idle's copy bound to a retained (not destroyed) remote box whose lease is no longer active.
+    const [environment] = await db.insert(environments).values({ name: "Planted retained paused sandbox", driver: "sandbox" }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, environmentId: environment!.id,
+      heartbeatRunId: unchangedRunId, status: "expired", leasePolicy: "ephemeral", provider: "daytona",
+      providerLeaseId: randomUUID(), metadata: { driver: "sandbox" } }).returning();
+    await plantUnchangedLeaseGoneHold({ stoppedAt, patch: { location: `remote:${environment!.id}` },
+      receipt: { warm: true, cleanup: { leaseId: lease!.id, remoteCwd: "/planted" } } });
+    const before = (await copies.get(companyId, unchangedRunId))!;
+    await copies.collectStopped({ companyId, runId: unchangedRunId });
+    await sweep([0, 7, 30]);
+    const after = (await copies.get(companyId, unchangedRunId))!;
+    console.log("R0A_REMOTE_PAUL_BRANCH", JSON.stringify({ leaseStatus: lease!.status, checkpointAt: after.receipt?.checkpointAt ?? null,
+      processStoppedAt: after.processStoppedAt, beforeNextAttemptAt: before.nextAttemptAt, state: after.state, held: agentFileSaveHeld(after),
+      nextAttemptAt: after.nextAttemptAt, savePending: after.receipt?.savePending ?? null, nothingToSave: after.receipt?.nothingToSave ?? null }));
+    expect(agentFileSaveHeld(after)).toBe(true);
+    expect(after.receipt?.savePending).toMatchObject({ reason: LEASE_GONE, retryOn: "lease_active" });
+    expect(after.nextAttemptAt).toBeNull();
+    expect(after.receipt?.nothingToSave).toBeUndefined();
+  }, 60_000);
+
   it("R0b: a CHANGED copy refused with LEASE-GONE stays held, stops time-polling, and is retried when its lease is active again", async () => {
     const held = (await copies.get(companyId, leaseGoneRunId))!;
     const pending = held.receipt?.savePending as Record<string, unknown> | undefined;
