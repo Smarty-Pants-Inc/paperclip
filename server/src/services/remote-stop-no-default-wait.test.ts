@@ -471,7 +471,15 @@ const support = await getEmbeddedPostgresTestSupport();
       await new Promise(resolve => setTimeout(resolve, 1_000));
       await evidence(`card6AfterReceipt ${JSON.stringify({ first: first.id, runs: (await successors(f)).map(run => ({ id: run.id, status: run.status,
         wake: run.wakeupRequestId ?? null, context: run.contextSnapshot })), preStopWake: await wakeOf(f.queueId), postWake: await wakeOf(next.wakeId) })}`);
-      expect((await successors(f)).map(run => run.id)).toEqual([first.id]);
+      // No successor takes the pre-Stop messages. The fixture's first successor fails
+      // (its controller lease deadline passed under the 5-min fake clock), so the
+      // ordinary failed-run recovery may retry THAT new message: only it, never the old ones.
+      const afterReceiptRuns = await successors(f);
+      expect(afterReceiptRuns.filter(run => run.wakeupRequestId === f.queueId)).toEqual([]);
+      for (const run of afterReceiptRuns) expect((await admittedOrigins(f, run)).filter(id => f.commentIds.includes(id))).toEqual([]);
+      expect(afterReceiptRuns.filter(run => run.id !== first.id).map(run => ({ retryReason: run.contextSnapshot?.retryReason,
+        wakeCommentIds: run.contextSnapshot?.wakeCommentIds }))).toEqual(afterReceiptRuns.length > 1
+        ? [{ retryReason: "issue_continuation_needed", wakeCommentIds: [next.commentId] }] : []);
       expect((await wakeOf(next.wakeId)).runId).toBe(first.id);
       expect(await wakeOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
       expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(c => c.status))
@@ -482,17 +490,31 @@ const support = await getEmbeddedPostgresTestSupport();
       const sent = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
         .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
       expect(sent.status, JSON.stringify(sent.body)).toBeLessThan(300);
-      await vi.waitFor(async () => expect(await successors(f)).toHaveLength(2), { timeout: 15_000, interval: 200 });
-      const sendRun = (await successors(f)).find(run => run.id !== first.id)!;
+      let sendRun: typeof heartbeatRuns.$inferSelect | undefined;
+      await vi.waitFor(async () => {
+        const runId = (await wakeOf(f.queueId)).runId;
+        sendRun = (await successors(f)).find(run => run.id === runId);
+        expect(sendRun).toBeDefined();
+      }, { timeout: 20_000, interval: 200 });
+      if (!sendRun) throw new Error("no Send run");
       const sendOrigins = await admittedOrigins(f, sendRun);
-      expect(sendOrigins.filter(id => f.commentIds.includes(id))).toEqual(f.commentIds);
+      expect([...sendOrigins.filter(id => f.commentIds.includes(id))].sort()).toEqual([...f.commentIds].sort());
+      const sendEnvelope = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+        runId: sendRun.id, context: sendRun.contextSnapshot!, summary: null, exposeLowTrustRaw: false });
+      expect(sendEnvelope.messages.filter(m => f.commentIds.includes(m.id)).map(m => m.body)).toEqual(["M2", "M3", "M4"]);
       expect(sendOrigins).not.toContain(next.commentId);
       expect((await wakeOf(f.queueId)).runId).toBe(sendRun.id);
       await heartbeatService(db).resumeRemoteStopComments(source);
       await heartbeatService(db).resumeQueuedRuns();
-      expect(await successors(f)).toHaveLength(2);
+      // Admitted once: exactly one run carries the pre-Stop messages.
+      const carriers: string[] = [];
+      for (const run of await successors(f))
+        if ((await admittedOrigins(f, run)).some(id => f.commentIds.includes(id))) carriers.push(run.id);
+      expect(carriers).toEqual([sendRun.id]);
       await evidence(`card6PostCard ${JSON.stringify({ card: card.nextAction, beforeReceipt, afterReceipt: {
         successors: (await successors(f)).map(run => run.id), lease: await boxesOf(f), receiptAttempts: calls.n },
+        afterReceiptRuns: afterReceiptRuns.map(run => ({ id: run.id, status: run.status, wake: run.wakeupRequestId,
+          retryReason: run.contextSnapshot?.retryReason ?? null, wakeCommentIds: run.contextSnapshot?.wakeCommentIds ?? null })),
         send: { runId: sendRun.id, origins: sendOrigins, preStopIds: f.commentIds, newMessageId: next.commentId } })}`);
     } finally { vi.useRealTimers(); }
   }, 60_000);
