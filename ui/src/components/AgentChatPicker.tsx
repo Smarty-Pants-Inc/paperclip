@@ -93,6 +93,10 @@ function AgentChatPickerResults({ agents, onSelect, onComplete, loading, error, 
           <CommandGroup>
             {agents.map((agent) => {
               const unreadCount = unreadMessageCounts?.get(agent.id) ?? 0;
+              const settingUp = agent.status === "paused"
+                && (agent.lifecycleState === "preparing" || agent.lifecycleState === "verifying")
+                && (agent.pauseReason == null || agent.pauseReason === "setup")
+                && (agent.lifecycleHolds ?? []).length === 0 && !agent.lifecycleError;
               return (
                 <CommandItem
                   key={agent.id}
@@ -109,7 +113,9 @@ function AgentChatPickerResults({ agents, onSelect, onComplete, loading, error, 
                   </span>
                   {unreadCount > 0 && <Badge variant="ghost" aria-label={`${unreadCount} unread ${unreadCount === 1 ? "message" : "messages"} from ${agent.name}`} className="shrink-0 bg-primary font-mono tabular-nums text-primary-foreground">{unreadCount}</Badge>}
                   {existingChatAgentIds && <span className="shrink-0 text-xs text-muted-foreground">{existingIds.has(agent.id) ? "Open chat" : "New chat"}</span>}
-                  {agent.status === "paused" && <span className="text-xs text-(--status-agent-paused)">Paused</span>}
+                  {agent.status === "paused" && <span className="text-xs text-(--status-agent-paused)">
+                    {settingUp ? agent.lifecycleState === "preparing" ? "Preparing agent" : "Verifying agent" : "Paused"}
+                  </span>}
                   {agent.status === "terminated" && <span className="text-xs text-muted-foreground">Terminated</span>}
                   {agent.status === "pending_approval" && <span className="text-xs text-muted-foreground">Awaiting approval</span>}
                 </CommandItem>

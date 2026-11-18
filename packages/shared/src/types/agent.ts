@@ -102,6 +102,8 @@ export interface Agent {
   avatarUrl?: string;
   status: AgentStatus;
   lifecycleState?: AgentLifecycleState;
+  /** Existing lifecycle holds returned by the agent API; absent on older servers. */
+  lifecycleHolds?: string[];
   lifecycleVersion?: number;
   lifecycleError?: string | null;
   reportsTo: string | null;
