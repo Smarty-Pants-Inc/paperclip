@@ -12283,17 +12283,33 @@ describe("native warm session supervision", () => {
             if (ending !== "claim-config") expect(retiredReceipt).toMatchObject({ retirementRequired: true });
             expect(retiredReceipt).toMatchObject({ materializationRunId, cleanup: { leaseId: currentLease, remoteCwd } });
             expect((await copies.get(companyId, runId))?.processStoppedAt).toBeInstanceOf(Date);
-            const compact = (await copies.get(companyId, runId))!.receipt;
-            expect(compact).toMatchObject({ materializationRunId, cleanupPending: false });
-            expect(compact?.baseline).toBeUndefined();
-            await expect(access(originalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+            if (ending === "claim-remove-entry") {
+              const held = (await copies.get(companyId, runId))!;
+              expect(held).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_FAILED" });
+              expect(held.receipt).toMatchObject({ materializationRunId, savePending: {
+                code: "AGENT_FILES_SAVE_FAILED", reason: "The configured instruction entry cannot be deleted" } });
+              expect(held.receipt?.baseline).toBeDefined();
+              expect(held.receipt?.cleanupPending).toBeUndefined(); // No compact cleanup receipt while held.
+              expect((await lstat(originalRoot)).isDirectory()).toBe(true);
+              expect(await readFile(join(canonical, "AGENTS.md"), "utf8")).toBe("Retain this exact directory.\n");
+              // docs/api/agents.md:37-58: only an explicit operator discard ends this unsavable hold.
+              const reason = "Discard the stopped copy with its forbidden instruction-entry deletion";
+              const discarded = await copies.discardHeld({ companyId, runId, actorId: userId, reason });
+              expect(discarded).toMatchObject({ state: "resolved", errorCode: "AGENT_FILES_SAVE_DISCARDED",
+                receipt: { materializationRunId, cleanupPending: false, discard: { actorId: userId, reason } } });
+              expect(discarded.receipt?.savePending).toBeUndefined();
+              expect(discarded.receipt?.baseline).toBeUndefined();
+              expect(await readFile(join(canonical, "AGENTS.md"), "utf8")).toBe("Retain this exact directory.\n");
+              await expect(access(originalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+            } else {
+              const compact = (await copies.get(companyId, runId))!.receipt;
+              expect(compact).toMatchObject({ materializationRunId, cleanupPending: false });
+              expect(compact?.baseline).toBeUndefined();
+              await expect(access(originalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+            }
             if (ending === "claim-edit") expect(await readFile(join(canonical, "AGENTS.md"), "utf8")).toBe("Remote edit before next claim\n");
             if (ending === "claim-add") expect(await readFile(join(canonical, "memory.txt"), "utf8")).toBe("Remote addition before next claim\n");
             if (ending === "claim-remove") await expect(access(join(canonical, "optional-memory.txt"))).rejects.toMatchObject({ code: "ENOENT" });
-            if (ending === "claim-remove-entry") {
-              expect((await copies.get(companyId, runId))!).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_FAILED" });
-              expect(await readFile(join(canonical, "AGENTS.md"), "utf8")).toBe("Retain this exact directory.\n");
-            }
             if (ending === "claim-canonical") expect(await readFile(join(canonical, "AGENTS.md"), "utf8")).toBe("Canonical edit before next claim\n");
             // Heartbeat rematerializes only after the successor proved retirement.
             active = await copies.prepare({ companyId, agentId, runId, target, cwd: remoteCwd });
