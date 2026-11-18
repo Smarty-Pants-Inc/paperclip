@@ -284,10 +284,10 @@ describe("the log mask fails closed past its depth bound", () => {
     log.error({ err: Object.assign(new Error("provider failed"), { details }) }, "provider failed");
     const text = output();
     expectNoCanary(text);
-    expect(text).toContain('"[Truncated]"');
+    expect(text).toContain('"[masked: nested deeper than 8]"');
     let node = records(text)[0].err.details;
     while (node && typeof node === "object") node = node.child;
-    expect(node).toBe("[Truncated]");
+    expect(node).toBe("[masked: nested deeper than 8]");
   });
 
   it("replaces a deep stderr / stdout slice the same way", () => {
@@ -297,6 +297,6 @@ describe("the log mask fails closed past its depth bound", () => {
     log.warn({ stderr: deep, stdout: { a: { b: { c: { d: { e: { f: { g: { h: { i: { j: CANARY_LINE } } } } } } } } } } }, "box output");
     const text = output();
     expectNoCanary(text);
-    expect(text).toContain('"[Truncated]"');
+    expect(text).toContain('"[masked: nested deeper than 8]"');
   });
 });

@@ -19,7 +19,7 @@ import {
 import { redactSensitiveText } from "../redaction.js";
 
 const MAX_LOG_REDACTION_DEPTH = 8;
-const TRUNCATED_LOG_VALUE = "[Truncated]";
+const TRUNCATED_LOG_VALUE = `[masked: nested deeper than ${MAX_LOG_REDACTION_DEPTH}]`;
 
 // Mask credential shapes in every string of a serialized log value. Nested
 // objects are copied, never mutated: they can be live application objects.
