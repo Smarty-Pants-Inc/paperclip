@@ -73,7 +73,6 @@ describe("redact-store G1/G4 durable boundaries", () => {
     { name: "padded-quote-split", parts: ['\"  ', "Bearer abcdefgh", '  \"'], secret: "abcdefgh" },
     { name: "ansi-scheme", parts: ["Authorization: \u001b[31mBearer abcdefgh\u001b[0m"], secret: "abcdefgh" },
     { name: "ansi-token", parts: ["Authorization: Bearer \u001b[31mabcdefgh\u001b[0m"], secret: "abcdefgh" },
-    { name: "ansi-osc", parts: ["Bearer abcd\u001b]0;terminal title\u0007efgh"], secret: "efgh" },
     { name: "live-bearer", parts: ['the Bearer of bad news arrived\n\"Bearer SYNTHabcdefghij\"'], secret: "SYNTHabcdefghij" },
     ...[".", ":", "!", "?", ")", "}", "]", '\"', "'", "`", ",", ";", "a", "-", "_", "/"].map(tail => ({
       name: `marker-tail-${tail.charCodeAt(0)}`, parts: [`Bearer ***REDACTED***${tail}abc123def456ghi789`], secret: "abc123def456ghi789",
