@@ -1,12 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { runningProcesses } from "../adapters/index.js";
 import { randomUUID } from "node:crypto";
+import os from "node:os";
 import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
 import { createFullDatabaseResponseCapture, installDatabaseResponseCapture } from "./helpers/full-database-response-capture.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  authUsers,
   agentRuntimeState,
   agentWakeupRequests,
   agents,
@@ -36,6 +38,10 @@ import { hasQueuedInteractionResponse } from "../services/queued-interaction-res
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { initializeRunIdentity, reconcileSteeredIdentity } from "../services/run-identity.js";
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
+import { PROCESS_START_REQUESTED } from "../services/native-local-process-stop.js";
+import { answeredPersonMessageSql } from "../services/person-message-answer.js";
+import type { HeartbeatServiceOptions } from "../services/heartbeat.js";
+import type { NativeRunIdentity, NativeSession, PrpEvent } from "@paperclipai/paperclip-runner";
 import { claimFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerDeferredReceiptWork } from "../services/heartbeat/deferred-receipt-work.js";
@@ -1372,6 +1378,9 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   // after a native person Stop admission holds the Send
   // (nativeStopRequiresReconciliation), so every case keeps its wait text; the
   // Send's own wait keeps "Sending your messages.".
+  // OBSERVED on eee74ebb: while admission holds the Send (process_identity_missing
+  // on the wake), the queue GET shows the Send's own handoff wait.
+  const HELD_SEND_WAIT = { reason: "interrupt_handoff", message: "Sending your messages." };
   const R4 = "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.";
   const RECOVERY_WAITS = {
     execution_recovery: "Waiting for execution recovery. Your message is saved.",
@@ -1464,9 +1473,14 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     });
 
   it.each(Object.keys(RECOVERY_WAITS) as Array<keyof typeof RECOVERY_WAITS>)(
-    "SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with nothing else running keeps the wait; the Send is held (no Option S on eee74ebb)",
+    "supersedes(S7-N held Send without Option S; RFL record SUPERSEDE-SCREENONA-S7N-HELDSEND-1118) SCREEN row 4b S7-N: a %s wait on the chat after an acknowledged owner Stop with nothing else running keeps the wait; the Send is held with its exact wait text, and once the person confirms the stop exactly one run takes the held messages",
     async reason => {
       const { f, wait } = await ackOwnerStopOnChat(reason);
+      // The stopped run's launch was requested on this host (the runner's own
+      // launch record), and no runner for it exists any more.
+      await appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: f.runId, agentId: f.agentId,
+        eventType: PROCESS_START_REQUESTED, stream: "system", level: "info", message: "launch requested",
+        payload: { hostname: os.hostname() } });
       // This agent's run on ANOTHER chat is not "on this chat". It also holds the
       // successor in the ordinary queue (one slot) without launching a provider.
       await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
@@ -1488,7 +1502,111 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       expect(held?.status).toBe("deferred_issue_execution");
       expect((held?.payload as Record<string, unknown> | null)?.executionWait).toMatchObject({ reason: "process_identity_missing" });
       expect(await successors()).toHaveLength(0);
+      // (i) The GET right after the Send shows the exact wait text the person sees.
+      const afterSend = (await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+      expect(afterSend.executionWait).toEqual(HELD_SEND_WAIT);
+      // (ii) The recovery condition clears the real way: the person confirms the
+      // stopped run's runner has stopped (routes/issues.ts confirm-run-stopped),
+      // which records LOCAL_PROCESS_STOPPED; admission's process-identity gate
+      // (explicit-native-continuation.ts hasNativeLocalProcessStop) then passes.
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+      const work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true);
+      try {
+        await work.ready;
+        const confirmedAt = Date.now();
+        // runtime:confirm_owner_stop is a company admin's action.
+        const admin = express();
+        admin.use(express.json());
+        admin.use((req, _res, next) => { (req as any).actor = { type: "board", userId: "stop-admin", source: "session",
+          companyIds: [f.companyId], memberships: [{ companyId: f.companyId, status: "active", membershipRole: "admin" }],
+          isInstanceAdmin: false }; next(); });
+        admin.use("/api", issueRoutes(db, {} as any, {}));
+        admin.use(errorHandler);
+        await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "stop-admin",
+          status: "active", membershipRole: "admin" });
+        await request(admin).post(`/api/issues/${f.issueId}/recovery-actions/confirm-run-stopped`)
+          .send({ runId: f.runId, stopEvidence: "The person checked this host: no runner for this run is running." }).expect(200);
+        // BOUND: the recorded stop's own hint (no further call) starts exactly
+        // one successor within 10 s of the stop being recorded.
+        await vi.waitFor(async () => expect(await successors()).toHaveLength(1), { timeout: 10_000, interval: 50 });
+        const boundMs = Date.now() - confirmedAt;
+        console.log("C2 BOUND ms", boundMs);
+        expect(boundMs).toBeLessThan(10_000);
+        const [successor] = await successors();
+        expect(successor.contextSnapshot?.wakeCommentIds).toEqual(f.commentIds);
+        // More hints never start a second run for the same messages.
+        await db.transaction(tx => notifyDeferredExecutionWork(tx, { companyId: f.companyId, requestId: f.wakeId }));
+        await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, f.wakeId);
+        await new Promise(resolve => setTimeout(resolve, 750));
+        expect(await successors()).toHaveLength(1);
+        // The other chat's run ends, freeing the agent's one slot; the successor
+        // runs with a provider that answers (rf-5's completing peer).
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+          .where(sql`${heartbeatRuns.companyId} = ${f.companyId} and ${heartbeatRuns.contextSnapshot}->>'issueId' <> ${f.issueId}`);
+        // The person the successor acts for (the chat owner) is a real user.
+        await db.insert(authUsers).values({ id: "queue-owner", name: "Queue owner", email: "queue-owner@example.test",
+          createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+        const hb = heartbeatService(db, { nativeSessionBackendFactory: completingPeer() });
+        try {
+          await hb.resumeQueuedRunsForAgent(f.companyId, f.agentId);
+          await vi.waitFor(async () => expect(["succeeded", "failed", "cancelled", "timed_out"])
+            .toContain((await hb.getRun(successor.id))?.status), { timeout: 20_000, interval: 50 });
+          await hb.waitForRunExecutionDrain(successor.id, { timeoutMs: 10_000 });
+        } finally { await hb.drainActiveRunExecutions(); }
+        const ended = (await hb.getRun(successor.id))!;
+        expect(ended.status).toBe("succeeded");
+        // Each held message is answered once: one reply, written by this one run.
+        const replies = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+          .filter(comment => comment.authorType === "agent" && !comment.deletedAt);
+        expect(replies.map(comment => comment.createdByRunId)).toEqual([successor.id]);
+        const answered = await db.select({ id: issueComments.id, answered: answeredPersonMessageSql({ id: sql`${issueComments.id}`,
+          companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) })
+          .from(issueComments).where(sql`${issueComments.id} in (${sql.join(f.commentIds.map(id => sql`${id}`), sql`, `)})`);
+        expect(Object.fromEntries(answered.map(row => [row.id, row.answered])))
+          .toEqual(Object.fromEntries(f.commentIds.map(id => [id, true])));
+        expect(await successors()).toHaveLength(1);
+      } finally { await work.stop(); }
     });
+
+  /** rf-5's completing peer (rf5-completing-peer.ts.txt), the provider-only
+   * boundary: one turn that answers, then completes. */
+  function completingPeer(): NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> {
+    return execution => {
+      let identity: NativeRunIdentity; let sourceInstanceId = ""; const turn = Promise.withResolvers<string>();
+      const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+      const contract = execution.completionContract.contract as { revision: string; criteria: Array<{ id: string }> };
+      const result = { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Answered the held messages.",
+        completionClaim: { contractRevision: contract.revision, objectiveSatisfied: true,
+          criteria: contract.criteria.map(c => ({ criterionId: c.id, status: "satisfied", evidenceRefs: [] })), remainingWork: [] },
+        evidence: [], verification: [], artifacts: [], attentionRequests: [] };
+      const session: NativeSession = { identity: () => identity, capabilities: async () => capabilities,
+        attachRun: async input => { identity = input.identity; },
+        startTurn: async () => { const turnId = randomUUID(); turn.resolve(turnId); return { turnId }; },
+        async *events() {
+          const turnId = await turn.promise;
+          const event = (sourceSeq: number, eventType: PrpEvent["eventType"], payload: Record<string, unknown>): PrpEvent => ({
+            schema: "paperclip.prp.event.v1", sourceKind: "runner", sourceInstanceId,
+            sourceEventId: `${sourceInstanceId}:${identity.runId}:${sourceSeq}`, sourceSeq, runId: identity.runId,
+            normalizedSessionId: identity.sessionId, turnId, schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(),
+            eventType, payload });
+          yield event(1, "turn.started", {});
+          yield event(2, "item.completed", { kind: "agentMessage", channel: "final", text: "Answered the held messages." });
+          yield event(3, "run.result.proposed", result);
+          yield event(4, "turn.completed", { status: "completed" });
+        },
+        result: async () => result as never,
+        snapshot: async () => ({ backendKind: "mock", sessionId: identity.sessionId, identity, providerSessionId: "completing-peer",
+          cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }) as never,
+        close: async () => {} } as NativeSession;
+      return { descriptor: async () => {
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId));
+          sourceInstanceId = run.runnerInstanceId!;
+          return { kind: "mock", name: "completing-peer", version: "1", capabilities,
+            runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } } as never; },
+        openSession: async (input: { identity: NativeRunIdentity }) => { identity = input.identity; return session; },
+        recoverSession: async () => { throw new Error("Only a fresh session is qualified."); } } as never;
+    };
+  }
 
   it("Hold50 starts a message sent after a native Stop as soon as the stopped run's teardown ends", async () => {
     const seeded = await seedQueue();

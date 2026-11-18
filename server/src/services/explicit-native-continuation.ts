@@ -175,61 +175,6 @@ export async function pendingContinuationDecisionWaits(db: Db, companyId: string
   return new Set(rows.map(row => row.id));
 }
 
-/** The admission rule for a Send after the agent's latest native turn ended
- * cancelled or failed (eee74ebb, no Option S): unless a reconciliation source
- * already names that run, the Send gets a synthetic
- * native_continuation_requires_reconciliation source and waits. Admission
- * decides with it; the queued-comment GET's Stop bar reads the same rule so the
- * bar never says "will be sent when you send your next message" while
- * admission would hold the Send. */
-export function nativeStopRequiresReconciliation(
-  latest: { id: string; status: string; runtimeMode: string | null } | null | undefined,
-  sourceChecks: ReadonlyArray<{ evidence: Record<string, unknown> }>,
-): boolean {
-  return latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) &&
-    !sourceChecks.some(source => (source.evidence.runId ?? source.evidence.sourceRunId) === latest.id);
-}
-
-/**
- * The ONE read of what stands between an owner's Send and an ordinary admission
- * (rf-5 SC1): the execution blocker plus the reconciliation sources (the
- * execution-blocker predicate, the Agent Chat boundary and the committed-result
- * exclusion). Admission reads it under lock; the queued-comment GET reads it to
- * decide whether the Stop bar may replace a recovery wait. Both feed
- * `blockedOrReconciling` and nativeStopRequiresReconciliation from here.
- */
-export async function readContinuationReconciliationSources(db: Db, companyId: string, issueId: string,
-  input: { forUpdate: boolean }) {
-  const blocker = await getExecutionBlocker(db, companyId, issueId);
-  const [boundary] = await db.select({ createdAt: issueComments.createdAt }).from(issues).innerJoin(issueComments, and(
-    eq(issueComments.companyId, issues.companyId), eq(issueComments.issueId, issues.id),
-    eq(issueComments.id, issues.conversationBoundaryCommentId),
-  )).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId), sql`${issues.conversationAgentId} is not null`)).limit(1);
-  const query = db.select().from(issueRecoveryActions).where(and(
-    eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
-    boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate(),
-      blocker?.recoveryActionId ? eq(issueRecoveryActions.id, blocker.recoveryActionId) : undefined) : undefined,
-    not(restoreHoldReleasedForCurrentOwnerPredicate()),
-    or(executionBlockerPredicate(), and(
-      inArray(issueRecoveryActions.cause, ["native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_retry_exhausted"]),
-      sql`${issueRecoveryActions.evidence}#>>'{workspaceRecovery,status}' = 'recovered'`,
-      sql`${issueRecoveryActions.evidence}->'executionReconciliation' is null`,
-      sql`${issueRecoveryActions.evidence}->'explicitUserContinuation' is null`,
-      sql`not exists (select 1 from ${heartbeatRuns} completed
-        join ${nativeRunFinalizations} finalized on finalized.run_id = completed.id and finalized.company_id = completed.company_id
-        join ${nativeRunResults} result on result.id = finalized.result_id and result.run_id = completed.id and result.company_id = completed.company_id
-        where completed.company_id = ${companyId} and result.issue_id = ${issueId}
-          and completed.id::text = coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')
-          and completed.runtime_mode = 'native' and completed.status = 'succeeded' and finalized.phase = 'committed'
-          and result.schema_status = 'accepted' and result.result_json#>>'{terminal,runTerminalState}' = 'succeeded')`,
-    )),
-  ));
-  const actions = input.forUpdate ? await query.for("update") : await query;
-  const sourceChecks: Array<{ id?: string; cause: string; evidence: Record<string, unknown> }> =
-    actions.map(action => ({ id: action.id, cause: action.cause, evidence: action.evidence }));
-  return { blocker, actions, sourceChecks, blockedOrReconciling: !!blocker || sourceChecks.length > 0 };
-}
-
 /** Called under the issue lock, in the transaction that creates the new turn.
  * A user request authorizes a new conversation, not replay of the failed run.
  * Unknown action outcomes and all prior records stay intact.
@@ -343,9 +288,32 @@ export async function admitExplicitNativeContinuation(input: {
   const authorizedAt = nativeQueuedSend ? interruptRequestedAt! : savedSend ? new Date(savedSend.requestedAt)
     : response?.comment.createdAt ?? comment?.createdAt ?? retryWake?.requestedAt ?? new Date();
   if (!input.dryRun) await preserveTaskRemoteWorkspaceWriter(db, companyId, issueId);
-  const sourceRead = await readContinuationReconciliationSources(db, companyId, issueId, { forUpdate: true });
-  blocker = sourceRead.blocker;
-  const { actions, sourceChecks } = sourceRead;
+  blocker = await getExecutionBlocker(db, companyId, issueId);
+  const [boundary] = await db.select({ createdAt: issueComments.createdAt }).from(issues).innerJoin(issueComments, and(
+    eq(issueComments.companyId, issues.companyId), eq(issueComments.issueId, issues.id),
+    eq(issueComments.id, issues.conversationBoundaryCommentId),
+  )).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId), sql`${issues.conversationAgentId} is not null`)).limit(1);
+  const actions = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+    boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate(),
+      blocker?.recoveryActionId ? eq(issueRecoveryActions.id, blocker.recoveryActionId) : undefined) : undefined,
+    not(restoreHoldReleasedForCurrentOwnerPredicate()),
+    or(executionBlockerPredicate(), and(
+      inArray(issueRecoveryActions.cause, ["native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_retry_exhausted"]),
+      sql`${issueRecoveryActions.evidence}#>>'{workspaceRecovery,status}' = 'recovered'`,
+      sql`${issueRecoveryActions.evidence}->'executionReconciliation' is null`,
+      sql`${issueRecoveryActions.evidence}->'explicitUserContinuation' is null`,
+      sql`not exists (select 1 from ${heartbeatRuns} completed
+        join ${nativeRunFinalizations} finalized on finalized.run_id = completed.id and finalized.company_id = completed.company_id
+        join ${nativeRunResults} result on result.id = finalized.result_id and result.run_id = completed.id and result.company_id = completed.company_id
+        where completed.company_id = ${companyId} and result.issue_id = ${issueId}
+          and completed.id::text = coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')
+          and completed.runtime_mode = 'native' and completed.status = 'succeeded' and finalized.phase = 'committed'
+          and result.schema_status = 'accepted' and result.result_json#>>'{terminal,runTerminalState}' = 'succeeded')`,
+    )),
+  )).for("update");
+  const sourceChecks: Array<{ id?: string; cause: string; evidence: Record<string, unknown> }> =
+    actions.map(action => ({ id: action.id, cause: action.cause, evidence: action.evidence }));
   if (nativeQueuedSend) {
     const [latest] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
@@ -375,7 +343,8 @@ export async function admitExplicitNativeContinuation(input: {
       if (!result || await hasPendingRunCleanup(db, companyId, latest.id))
         return blocked("cleanup_pending", "Waiting for the previous run to finish cleanup. Your message is saved.");
     }
-    if (latest && nativeStopRequiresReconciliation(latest, sourceChecks)) {
+    if (latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) &&
+        !sourceChecks.some(source => (source.evidence.runId ?? source.evidence.sourceRunId) === latest.id)) {
       sourceChecks.push({ cause: "native_continuation_requires_reconciliation", evidence: { runId: latest.id } });
     }
   }
