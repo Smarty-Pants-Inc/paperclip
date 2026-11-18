@@ -6154,6 +6154,9 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
+    // Section D: Resume is recorded intent; it completes only after the old run is proved stopped.
+    const resumeDisposition = agent.lifecycleState === "pausing" || "pauseStopPending" in agent ? "waiting_for_stop"
+      : agent.lifecycleHolds.length ? "held" : agent.lifecycleState;
 
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -6163,12 +6166,12 @@ export function agentRoutes(
       agentId: actor.agentId,
       runId: actor.runId,
       agentApiKeyId: actor.agentApiKeyId,
-      action: "agent.resumed",
+      action: resumeDisposition === "waiting_for_stop" ? "agent.resume_requested" : "agent.resumed",
       entityType: "agent",
       entityId: agent.id,
     });
 
-    res.json(redactAgentRowForResponse(agent));
+    res.json({ ...redactAgentRowForResponse(agent), resumeDisposition });
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {

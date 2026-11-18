@@ -10,7 +10,7 @@ import { updateAgentConfiguration } from "./adapters/configuration.js";
 import type { AgentConfigurationPatch, UpdateAgentOptions } from "../../lib/agent-records.js";
 import { purgeAgent } from "./adapters/deletion.js";
 import { agentRecords } from "./adapters/records.js";
-import { assertRootDatabase, createLifecycleStore, pendingLifecycleWork, lifecycleEnvironmentWarningPending, lifecycleEnvironmentWarningAt, lifecycleSignalWait, lifecycleStopParkWithoutError, surfaceAgentLifecycleStopParkInTransaction, requestAgentLifecycleRecheckInTransaction } from "./adapters/postgres.js";
+import { assertRootDatabase, createLifecycleStore, settleOverduePauses, pendingLifecycleWork, lifecycleEnvironmentWarningPending, lifecycleEnvironmentWarningAt, lifecycleSignalWait, lifecycleStopParkWithoutError, surfaceAgentLifecycleStopParkInTransaction, requestAgentLifecycleRecheckInTransaction } from "./adapters/postgres.js";
 import { hasCompanyHoldMismatch, projectCompanyHolds } from "./adapters/company-policy.js";
 import { createLifecycleWorker } from "./application/worker.js";
 import type { LifecycleDriver } from "./application/ports.js";
@@ -175,6 +175,8 @@ export function startAgentLifecycle(db: Db, effects: LifecycleEffects, driver: L
         coalesce(extract(epoch from (${agents.lifecycleOperation}->>'leaseUntil')::timestamptz) * 1000, 0),
         coalesce(extract(epoch from (${agents.lifecycleOperation}->>'retryAt')::timestamptz) * 1000, 0)),
         case when ${lifecycleEnvironmentWarningPending} then ${lifecycleEnvironmentWarningAt}
+          else 'Infinity'::double precision end,
+        case when ${agents.lifecycleState} = 'pausing' then extract(epoch from (${agents.lifecycleOperation}->>'pauseDeadlineAt')::timestamptz) * 1000
           else 'Infinity'::double precision end))::double precision` })
         .from(agents).where(pendingLifecycleWork);
       const due = pending?.due == null ? null : Number(pending.due);
@@ -186,13 +188,15 @@ export function startAgentLifecycle(db: Db, effects: LifecycleEffects, driver: L
     },
     sweep() {
       if (stopped || !canRun()) return Promise.resolve();
-      return running ??= (async () => {
+      // The pause bound is one cheap update, never queued behind an active sweep's provider I/O.
+      const bound = settleOverduePauses(db, new Date()).catch(error => { effects.reportFailure({ stage: "scan" }, error); });
+      return running ??= bound.then(async () => {
         try { await projectCompanyHolds(db, effects); }
         catch (error) { effects.reportFailure({ stage: "policy_scan" }, error); throw error; }
         try { await recoverPage(); }
         catch (error) { effects.reportFailure({ stage: "scan" }, error); throw error; }
         await worker.sweep();
-      })().finally(() => { running = undefined; });
+      }).finally(() => { running = undefined; });
     },
     async stop() {
       stopped = true;

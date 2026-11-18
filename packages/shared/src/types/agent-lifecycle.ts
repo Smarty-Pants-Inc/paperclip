@@ -34,6 +34,15 @@ export interface AgentLifecycleOperation {
   /** Why a pause started: its holds and the company's pause reason at that moment. Runs the
    * pause stops record it, so a budget resume continues only work its own budget stopped. */
   pauseCause?: { holds: string[]; companyPauseReason: string | null };
+  /** Immutable pause request time and its visible bound; nothing moves them. Past the bound the pause is a
+   * stable `paused` with `pauseOutcome`, and `stopPending` keeps this operation's Stop owner working. */
+  pauseRequestedAt?: string;
+  pauseDeadlineAt?: string;
+  pauseOutcome?: "pause_stop_unconfirmed";
+  stopPending?: boolean;
+  resumeRequested?: boolean;
+  /** A legacy repaired pause: only a fresh authorized Resume may resume it. */
+  repairNeedsFreshResume?: boolean;
   /** Who asked for a termination. The terminal step's `agent.terminated` audit row names this caller. */
   requestedBy?: AgentLifecycleRequester;
   /** Written with the terminal state in the same transaction. The hand-over recovery worker clears it

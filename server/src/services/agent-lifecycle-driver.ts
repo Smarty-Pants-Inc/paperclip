@@ -58,7 +58,8 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager,
       const environment = await resolveAgentEnvironment(agent);
       const environmentDriverKey = pluginServesAgentEnvironment(plugin, environment) && typeof environment?.config?.driverKey === "string"
         ? environment.config.driverKey : undefined;
-      const request = { companyId: agent.companyId, agentId: agent.id, operationId, version: agent.lifecycleVersion, phase: agent.lifecycleState,
+      const request = { companyId: agent.companyId, agentId: agent.id, operationId, version: agent.lifecycleVersion,
+        phase: agent.lifecycleOperation?.stopPending ? "pausing" as const : agent.lifecycleState,
         ...(environmentDriverKey ? { environmentDriverKey } : {}), instanceSecrets };
       const result = await manager.call(plugin.id, "agentLifecycle", request, 30_000);
       if (!result || result.operationId !== operationId || result.version !== agent.lifecycleVersion || !["complete", "pending"].includes(result.status)) {
@@ -69,15 +70,17 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager,
     },
     async runHost(agent) {
       if (agent.lifecycleState === "verifying") return verify(agent);
-      if (["pausing", "terminating", "cleaning_up"].includes(agent.lifecycleState)) {
-        const ids = agent.lifecycleState === "pausing" ? [agent.id]
+      // Past the pause bound the residual Stop runs the original pausing effect on stable 'paused'.
+      const pausing = agent.lifecycleState === "pausing" || agent.lifecycleOperation?.stopPending === true;
+      if (pausing || ["terminating", "cleaning_up"].includes(agent.lifecycleState)) {
+        const ids = pausing ? [agent.id]
           : [agent.id, ...listInvalidOrgChainDescendantIds(agent.id,
             await db.select().from(agents).where(eq(agents.companyId, agent.companyId)))];
         const reason = agent.lifecycleHolds?.includes("company_archived")
           ? COMPANY_ARCHIVED_STOP_REASON : AGENT_LIFECYCLE_STOP_REASON;
         // Record what this pause stopped the runs for, so a budget resume
         // continues only the work its own budget stopped, never a manual pause.
-        if (agent.lifecycleState === "pausing") {
+        if (pausing) {
           // The cause recorded when the pause started survives a resume that
           // already removed the holds before this Stop ran.
           const cause = agent.lifecycleOperation?.pauseCause;
@@ -92,7 +95,7 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager,
             sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'pauseStop')`));
         }
         const blocker = await heartbeat.agentInvocationStopBlocker(ids, reason,
-          { preservePauseDeferred: agent.lifecycleState === "pausing",
+          { preservePauseDeferred: pausing,
             ...(agent.lifecycleOperation?.id ? { trigger: `lifecycle:${agent.lifecycleOperation.id}` } : {}) });
         if (blocker) return { pending: blocker };
       }

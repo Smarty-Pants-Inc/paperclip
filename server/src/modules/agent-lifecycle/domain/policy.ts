@@ -1,5 +1,7 @@
 import type { AgentLifecycleState } from "@paperclipai/shared";
 
+/** PAUSING-DESIGN-R2 C: a visibility bound from the immutable request time, never readiness. */
+export const PAUSE_SETTLEMENT_TIMEOUT_MS = 120_000;
 export type LifecycleCommand = "reconcile" | "approve" | "reject" | "pause" | "resume" | "terminate" | "complete" | "retry";
 export class AgentLifecycleConflict extends Error {
   constructor(message: string) { super(message); this.name = "AgentLifecycleConflict"; }

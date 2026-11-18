@@ -153,7 +153,8 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
  * Reads with the task-scoped (write-free) proof mode; it never writes. */
 export async function pausingAgentsReport(db: Db, companyId: string) {
   const rows = await db.select({ id: agents.id }).from(agents)
-    .where(and(eq(agents.companyId, companyId), eq(agents.lifecycleState, "pausing"))).limit(100);
+    .where(and(eq(agents.companyId, companyId), or(eq(agents.lifecycleState, "pausing"),
+      and(eq(agents.lifecycleState, "paused"), sql`${agents.lifecycleOperation}->>'stopPending' = 'true'`)))).limit(100);
   return Promise.all(rows.map(async ({ id }) => {
     const condition = and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, id))!;
     const runIds = (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition)).map(run => run.id);

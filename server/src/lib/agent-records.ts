@@ -349,6 +349,8 @@ export function agentRecordQueries(db: Db) {
       ...publicRow,
       // A retired agent shows its named pending code until its work and reports are handed over.
       ...(lifecycleOperation?.handover ? { handover: lifecycleOperation.handover } : {}),
+      // Past the pause bound: the old run's Stop is still unproved (PAUSING-DESIGN-R2 C/D).
+      ...(lifecycleOperation?.stopPending ? { pauseStopPending: true } : {}),
       permissions: normalizeAgentPermissions(row.permissions, { role: row.role }),
     });
   }

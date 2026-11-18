@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm";
 import { agents, type Db } from "@paperclipai/db";
 import { agentRecordQueries, AGENT_CONFIGURATION_FIELDS, jsonEqual, type AgentConfigurationPatch, type UpdateAgentOptions } from "../../../lib/agent-records.js";
 import type { ActivityPublication } from "../../../types/activity-publication.js";
-import { AgentLifecycleConflict, canConfigureAgentConnection } from "../domain/policy.js";
+import { AgentLifecycleConflict, canConfigureAgentConnection, PAUSE_SETTLEMENT_TIMEOUT_MS } from "../domain/policy.js";
 import type { LifecycleEffects } from "./effects.js";
 
 export async function updateAgentConfiguration(tx: Db, effects: LifecycleEffects, id: string, data: AgentConfigurationPatch, options?: UpdateAgentOptions, publications: ActivityPublication[] = []) {
@@ -54,7 +54,8 @@ export async function updateAgentConfiguration(tx: Db, effects: LifecycleEffects
       waitingForSignal: undefined, recheckRequested: undefined,
       // With no new hold, completed pause work resumes automatically, then verifies the new environment.
       ...(pauseForEnvironment ? { resumeState: "verifying" as const,
-        pauseCause: { holds: current.lifecycleHolds, companyPauseReason: null } } : {}) },
+        pauseCause: { holds: current.lifecycleHolds, companyPauseReason: null },
+        pauseRequestedAt: new Date().toISOString(), pauseDeadlineAt: new Date(Date.now() + PAUSE_SETTLEMENT_TIMEOUT_MS).toISOString() } : {}) },
   } : {}) }).where(eq(agents.id, id)).returning();
   if (pauseForEnvironment) await effects.recordStatus(tx, current.companyId, id, "idle", "paused");
   await effects.completeConfiguration(tx, current, updated, patch, options, publications);

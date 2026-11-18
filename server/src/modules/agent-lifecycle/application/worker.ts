@@ -18,7 +18,8 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
     phase: for (let step = 0; !stopped && canRun() && step < 8; step++) {
       const owner = randomUUID();
       const agent = await attempt({ stage: "claim", agentId: id }, () => store.claim(id, owner, new Date()));
-      if (!agent || !isLifecycleWorkPending(agent.lifecycleState)) return;
+      // A stable 'paused' with stopPending keeps this same owner working on its residual Stop.
+      if (!agent || !isLifecycleWorkPending(agent.lifecycleState) && !agent.lifecycleOperation?.stopPending) return;
       const context = { agentId: agent.id, companyId: agent.companyId, phase: agent.lifecycleState,
         operationId: agent.lifecycleOperation?.id, version: agent.lifecycleVersion,
         attempts: agent.lifecycleOperation?.attempts };

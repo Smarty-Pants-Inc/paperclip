@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import { agents, agentApiKeys, agentIdentityKeys, companies, budgetPolicies, type Db } from "@paperclipai/db";
 import { persistActivity } from "../../../services/activity-log.js";
 import type { AgentLifecycleOperation } from "@paperclipai/shared";
-import { AgentLifecycleConflict, canConfigureAgentConnection, compatibilityStatus, isLifecycleWorkPending, transition, type LifecycleCommand } from "../domain/policy.js";
+import { AgentLifecycleConflict, canConfigureAgentConnection, compatibilityStatus, isLifecycleWorkPending, PAUSE_SETTLEMENT_TIMEOUT_MS, transition, type LifecycleCommand } from "../domain/policy.js";
 import type { LifecycleEffects } from "./effects.js";
 import type { LifecycleStore } from "../application/ports.js";
 import type { ActivityPublication } from "../../../types/activity-publication.js";
@@ -31,9 +31,25 @@ const lifecycleStartupAllowed = sql`(${agents.lifecycleState} not in ('preparing
   and not (coalesce(${agents.lifecycleOperation}->'pauseCause'->'holds', '[]'::jsonb) ?| array['manual', 'budget', 'company_paused', 'company_archived'])
 ))`;
 
+const pauseStopLine = (resumeRequested: SQL) => sql`'pause_stop_unconfirmed: ' || case when ${resumeRequested}
+  then 'Resume was requested for ' || ${agents.name} || '. New work is waiting for its previous run to stop.'
+  else ${agents.name} || ' is paused for new work. We could not confirm that its previous run stopped.' end`;
+/** At the bound an unresolved pause becomes stable `paused` with its outcome. The operation, its claim,
+ * version and Stop targets stay, so the same lifecycle Stop owner keeps working (`stopPending`).
+ * `legacy` settles a pre-fix row (no request time) only on an authorized Retry, never on deploy. */
+export async function settleOverduePauses(db: Pick<Db, "update">, now: Date, id?: string, legacy = false) {
+  return db.update(agents).set({ lifecycleState: "paused", lifecycleError: pauseStopLine(sql`${agents.lifecycleHolds} = '[]'::jsonb`),
+    lifecycleOperation: sql`${agents.lifecycleOperation} || ${JSON.stringify({ stopPending: true, pauseOutcome: "pause_stop_unconfirmed",
+      ...(legacy ? { repairNeedsFreshResume: true } : {}) })}::jsonb`, updatedAt: now,
+  }).where(and(id ? eq(agents.id, id) : undefined, eq(agents.lifecycleState, "pausing"), legacy
+    ? sql`${agents.lifecycleOperation} ? 'pauseCause' and not (${agents.lifecycleOperation} ? 'pauseDeadlineAt')`
+    : sql`(${agents.lifecycleOperation}->>'pauseDeadlineAt')::timestamptz <= ${now.toISOString()}::timestamptz`)).returning();
+}
+
 // Prepared drafts wait for the wizard; they have no background verification obligation.
 export const pendingLifecycleWork = and(
-  inArray(agents.lifecycleState, ["preparing", "verifying", "pausing", "resuming", "terminating", "cleaning_up"]),
+  or(inArray(agents.lifecycleState, ["preparing", "verifying", "pausing", "resuming", "terminating", "cleaning_up"]),
+    and(eq(agents.lifecycleState, "paused"), sql`${agents.lifecycleOperation}->>'stopPending' = 'true'`)),
   lifecycleStartupAllowed,
   sql`not (${agents.lifecycleState} = 'verifying' and ${agents.lifecycleHolds} @> '["setup"]'::jsonb)`,
   sql`coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') <> 'true'`,
@@ -165,8 +181,14 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     Date.parse(agent.lifecycleOperation?.leaseUntil ?? "") <= Date.now() ||
     !agent.lifecycleOperation.hostComplete || agent.lifecycleRequiredPluginIds === null ||
     agent.lifecycleRequiredPluginIds.some(id => !agent.lifecycleOperation!.completedPluginIds.includes(id)))) return null;
+  const residual = agent.lifecycleOperation?.stopPending === true;
   if (command === "retry") {
-    transition(agent.lifecycleState, command);
+    // Section F: an authorized Retry settles a pre-fix Pause (its cause, no request time) through the bound's
+    // path, then un-parks as usual. Other pausing producers (migration, setup) keep their plain Retry.
+    if (agent.lifecycleState === "pausing" && agent.lifecycleOperation?.pauseCause && !agent.lifecycleOperation.pauseDeadlineAt) {
+      await settleOverduePauses(tx, new Date(), agent.id, true);
+    }
+    if (!residual) transition(agent.lifecycleState, command);
     if (agent.lifecycleOperation?.leaseUntil && Date.parse(agent.lifecycleOperation.leaseUntil) > Date.now()) {
       await effects.notifyWork(tx);
       const [requested] = await tx.update(agents).set({ lifecycleOperation:
@@ -199,17 +221,28 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   const blockingHolds = holds.filter(hold => hold !== "setup" || !["preparing", "verifying"].includes(agent.lifecycleState));
   let next = command === "reconcile"
     ? blockingHolds.length && !["pausing", "paused"].includes(agent.lifecycleState) ? "pausing" as const
-      : !holds.length && agent.lifecycleState === "paused" ? "resuming" as const : agent.lifecycleState
-    : command === "resume" && (holds.length || agent.lifecycleState === "pausing") ? agent.lifecycleState
+      : !holds.length && agent.lifecycleState === "paused" && !residual && !agent.lifecycleOperation?.repairNeedsFreshResume
+        ? "resuming" as const : agent.lifecycleState
+    : command === "resume" && (holds.length || agent.lifecycleState === "pausing" || residual) ? agent.lifecycleState
+    : command === "complete" && residual ? "paused"
     : transition(agent.lifecycleState, command, agent.lifecycleOperation?.resumeState);
   if (restartPause && next === "paused") next = "pausing";
   if (command === "complete" && next === "ready" && holds.length) next = "pausing";
-  if (command === "complete" && next === "paused" && !holds.length) next = "resuming";
+  if (command === "complete" && next === "paused" && !holds.length && !agent.lifecycleOperation?.repairNeedsFreshResume) next = "resuming";
   if (["complete", "reconcile"].includes(command) && next === "paused" && holds.length === 1 && holds[0] === "setup"
     && await effects.setupRequiresPreparation(tx, agent.companyId, agent.defaultEnvironmentId, agent)) next = "preparing";
   if (next === agent.lifecycleState) {
-    if (JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null)) {
-      const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null }).where(eq(agents.id, agent.id)).returning();
+    // A residual Stop proved: clear it. A Resume while Stop is unproved is remembered and wakes its owner now.
+    const resumed = command === "resume" && (residual || agent.lifecycleState === "pausing");
+    if (resumed) await effects.notifyWork(tx);
+    if (command === "complete" && residual || resumed
+      || JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null)) {
+      const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null,
+        ...(command === "complete" && residual ? { lifecycleError: null, lifecycleOperation:
+          sql`${agents.lifecycleOperation} - 'stopPending' - 'pauseOutcome' - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt'` }
+          : resumed ? { lifecycleOperation: sql`(${agents.lifecycleOperation} - 'repairNeedsFreshResume' - 'retryAt') || '{"resumeRequested":true}'::jsonb`,
+            ...(residual ? { lifecycleError: pauseStopLine(sql`${holds.length === 0}::boolean`) } : {}) } : {}),
+      }).where(eq(agents.id, agent.id)).returning();
       return updated;
     }
     return agent;
@@ -232,6 +265,9 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     const [company] = await tx.select({ pauseReason: companies.pauseReason }).from(companies)
       .where(eq(companies.id, agent.companyId));
     operation.pauseCause = { holds, companyPauseReason: company?.pauseReason ?? null };
+    const requestedAt = Date.now();
+    operation.pauseRequestedAt = new Date(requestedAt).toISOString();
+    operation.pauseDeadlineAt = new Date(requestedAt + PAUSE_SETTLEMENT_TIMEOUT_MS).toISOString();
   }
   const status = compatibilityStatus(next, agent.status);
   if(!canConfigureAgentConnection(agent)&&canConfigureAgentConnection({lifecycleState:next,status}))await effects.beforeConnectionEligibilityRestore?.(tx,agent.companyId,agent.id);
@@ -312,6 +348,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     },
     async claim(id, owner, now) {
       await surfaceEnvironmentWarning(now, id);
+      await settleOverduePauses(db, now, id);
       // leaseHolder names the claiming process, so restart recovery settles a dead holder's lease at once.
       const leaseHolder = effects.leaseHolder?.() ?? null;
       const [agent] = await db.update(agents).set({
@@ -320,7 +357,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
             'attempts', coalesce((${agents.lifecycleOperation}->>'attempts')::integer, 0) + 1)
           || ${JSON.stringify(leaseHolder ? { leaseHolder } : {})}::jsonb`,
       }).where(and(eq(agents.id, id), pendingLifecycleWork,
-        sql`(${agents.lifecycleState} in ('pausing', 'terminating', 'cleaning_up') or exists (
+        sql`(${agents.lifecycleState} in ('pausing', 'paused', 'terminating', 'cleaning_up') or exists (
           select 1 from ${companies} where ${companies.id} = ${agents.companyId} and ${companies.status} = 'active'))`,
         sql`coalesce((${agents.lifecycleOperation}->>'leaseUntil')::timestamptz, '-infinity') <= ${now.toISOString()}::timestamptz`,
         sql`coalesce((${agents.lifecycleOperation}->>'retryAt')::timestamptz, '-infinity') <= ${now.toISOString()}::timestamptz`,
@@ -391,7 +428,8 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
         retry.verificationFailures = options.verificationFailures;
       }
       const rows = await db.update(agents).set({
-        lifecycleError: sql`case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true' then null else ${visibleError}::text end`,
+        lifecycleError: sql`case when ${agents.lifecycleOperation}->>'stopPending' = 'true' then coalesce(${visibleError}::text, ${agents.lifecycleError})
+          when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true' then null else ${visibleError}::text end`,
         lifecycleOperation: sql`((case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true'
             then ${agents.lifecycleOperation} - 'verificationFailures' - 'stopFailures' else ${agents.lifecycleOperation} end)
           - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'retryRequired' - 'waitingForSignal' - 'recheckRequested' - 'transientFailureSince' - 'transientFailures')
@@ -404,6 +442,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     },
     async pending(limit, now) {
       await surfaceEnvironmentWarning(now);
+      await settleOverduePauses(db, now);
       return db.select({ id: agents.id }).from(agents).where(and(
         pendingLifecycleWork,
         sql`coalesce((${agents.lifecycleOperation}->>'leaseUntil')::timestamptz, '-infinity') <= ${now.toISOString()}::timestamptz`,
