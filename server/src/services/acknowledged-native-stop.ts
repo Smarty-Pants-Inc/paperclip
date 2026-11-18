@@ -120,8 +120,13 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: Pic
   ));
   // Provider PIDs are meaningful only on their own host. A recovered sandbox
   // queued for destroy keeps its verified stop; the destroy is only cleanup.
+  // Each lease proves its own stop (same rule as explicit-native-continuation's
+  // remote_cleanup gate): a sandbox lease by its stop receipt, a released local
+  // lease (the run's host-side environment) by its release without failed cleanup.
   if (leases.some(lease => lease.provider !== "local"))
-    return leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease));
+    return leases.every(lease => lease.provider === "local"
+      ? !!lease.releasedAt && lease.cleanupStatus !== "failed"
+      : hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease));
   if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return false;
   if (!run.processPid && !run.processGroupId) return hasNativeLocalProcessStop(db, run.companyId, run.id);
   const absent = (pid: number) => {
