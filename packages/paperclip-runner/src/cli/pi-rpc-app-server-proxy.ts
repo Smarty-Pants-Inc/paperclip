@@ -521,6 +521,10 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         send({ method: "warning", params: { threadId: opened.ids().driverSessionId,
           ...(event.turnId ?? activeTurnId ? { turnId: event.turnId ?? activeTurnId } : {}),
           message: payload.summary, severity: payload.severity, category: payload.category, noticeKey: payload.noticeId, details: payload.details } });
+        // A no-op has no context.compacted receipt. Deliver its info notice
+        // before releasing the administrative turn's progress gate instead.
+        if (compactionProgress?.runId === event.runId && payload.category === "context_compaction" && payload.severity === "info" &&
+            Array.isArray(payload.details) && payload.details.some(detail => record(detail).name === "Outcome" && record(detail).value === "noop")) compactionProgress.observed();
       } else if (event.eventType === "harness.diagnostic") {
         if (payload.code === PROVIDER_PERFORMANCE_DIAGNOSTIC) {
           const spans = parseProviderPerformanceSpans(payload, Date.now());
@@ -736,7 +740,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
             const timeout = setTimeout(() => rejectObserved(new Error("Pi compaction progress receipt missing")), 5000);
             try { await observed; } finally { clearTimeout(timeout); }
             send({ method: "turn/completed", params: { threadId: opened.ids().driverSessionId, turnId,
-              turn: { id: turnId, status: "completed" }, compaction: { tokensBefore: receipt.tokensBefore,
+              turn: { id: turnId, status: "completed" }, compaction: receipt.noop === true ? { noop: true } : { tokensBefore: receipt.tokensBefore,
                 estimatedTokensAfter: receipt.estimatedTokensAfter, firstKeptEntryId: receipt.firstKeptEntryId } } });
           }).catch(error => {
             send({ method: "turn/failed", params: { threadId: opened.ids().driverSessionId, turnId,
