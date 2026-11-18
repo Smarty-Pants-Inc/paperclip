@@ -155,7 +155,7 @@ const support = await getEmbeddedPostgresTestSupport();
         if (error instanceof NativeEnvironmentProbeCleanupError && retain) retain(database, runtime, input, error);
         else if (error instanceof NativeEnvironmentProbeCleanupError) {
           const { retainAiCredentialCleanup } = await import("../services/retained-ai-credential-cleanup.js");
-          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, cleanup, retired: error.retired, agentId,
+          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, cleanup: cleanup as () => Promise<void>, retired: error.retired, agentId,
             retryRetirement: () => error.retryCleanup!.call(error) });
           const { unprocessable } = await import("../errors.js");
           throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
@@ -240,9 +240,9 @@ const support = await getEmbeddedPostgresTestSupport();
     const [probeRow] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, probe.lease.id));
     expect(probeRow!.metadata?.remoteExecutionTermination, "the probe holder's exact id binds it")
       .toMatchObject({ runId: null, leaseId: probe.lease.id, state: "destroyed" });
-    expect((termination.hasRemoteTerminationReceipt as Function)(probeRow!, probe.lease.id), "read by its exact id").toBe(true);
+    expect((termination as unknown as { hasProbeLeaseTerminationReceipt: Function }).hasProbeLeaseTerminationReceipt(probeRow!, probe.lease.id), "read by its exact id").toBe(true);
     expect(termination.hasRemoteTerminationReceipt(probeRow!), "the shared reader without the exact id refuses it").toBe(false);
-    expect((termination.hasRemoteTerminationReceipt as Function)(probeRow!, plain.lease.id), "another lease's id never reads it").toBe(false);
+    expect((termination as unknown as { hasProbeLeaseTerminationReceipt: Function }).hasProbeLeaseTerminationReceipt(probeRow!, plain.lease.id), "another lease's id never reads it").toBe(false);
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agent.id, invocationSource: "manual", status: "running" } as never);
     const [runLease] = await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: f.environment.id, heartbeatRunId: runId,
