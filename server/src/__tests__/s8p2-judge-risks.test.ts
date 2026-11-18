@@ -18,6 +18,7 @@ import { deliverConversationComments } from "../services/agent-conversations.js"
 import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { stopStartedTurn } from "./helpers/stopped-started-turn.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = support.supported ? describe : describe.skip;
@@ -132,10 +133,14 @@ describeEmbeddedPostgres("RF4 independent named risk and failure probes", () => 
 
   async function oldAnswer(f: Awaited<ReturnType<typeof seedBusyChat>>, indices: number[], status: 'succeeded' | 'cancelled', stopper = 'queue-owner') {
     await db.update(heartbeatRuns).set({createdAt:new Date(Date.now()-100_000),startedAt:new Date(Date.now()-90_000)}).where(eq(heartbeatRuns.id,f.runId));
-    const id = randomUUID();
-    await db.insert(heartbeatRuns).values({id,companyId:f.companyId,agentId:f.agentId,status,runtimeMode:'native',nativeIssueId:f.issueId,
+    // A stopped turn: it started answering, then `stopper` pressed the real Stop route (no stop field hand-seeded).
+    const id = status === 'cancelled'
+      ? await stopStartedTurn(db,{companyId:f.companyId,agentId:f.agentId,issueId:f.issueId,own:indices.map(i=>f.commentIds[i]),
+        createdAt:new Date(Date.now()-250_000),startedAt:new Date(Date.now()-230_000),stopper:{type:'user',userId:stopper}})
+      : randomUUID();
+    if (status === 'succeeded') await db.insert(heartbeatRuns).values({id,companyId:f.companyId,agentId:f.agentId,status,runtimeMode:'native',nativeIssueId:f.issueId,
       createdAt:new Date(Date.now()-250_000),startedAt:new Date(Date.now()-230_000),finishedAt:new Date(Date.now()-150_000),
-      resultJson:status === 'cancelled' ? {cancelledByActorType:'user',cancelledByActorId:stopper,cancelledByUserId:stopper} : {},
+      resultJson:{},
       contextSnapshot:{issueId:f.issueId,wakeCommentIds:indices.map(i=>f.commentIds[i])}});
     await db.insert(issueComments).values({companyId:f.companyId,issueId:f.issueId,authorType:'agent',authorAgentId:f.agentId,
       createdByRunId:id,body:status === 'succeeded' ? 'Final reply' : 'Partial progress, not a final answer',createdAt:new Date(Date.now()-180_000)});

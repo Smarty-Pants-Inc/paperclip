@@ -15,6 +15,7 @@ import { deliverConversationComments } from "../services/agent-conversations.js"
 import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { stopStartedTurn } from "./helpers/stopped-started-turn.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = support.supported ? describe : describe.skip;
@@ -228,8 +229,8 @@ describeEmbeddedPostgres("queued-comment Interrupt keeps the person's order", ()
     // M2 was written at -270s, then carried/answered on an older turn at -250s.
     // The current busy turn starts at -90s, after that older turn was stopped.
     await db.update(heartbeatRuns).set({createdAt:new Date(Date.now()-100_000),startedAt:new Date(Date.now()-90_000)}).where(eq(heartbeatRuns.id,f.runId));
-    const oldRunId=randomUUID();
-    await db.insert(heartbeatRuns).values({id:oldRunId,companyId:f.companyId,agentId:f.agentId,status:"cancelled",runtimeMode:"native",createdAt:new Date(Date.now()-250_000),startedAt:new Date(Date.now()-240_000),finishedAt:new Date(Date.now()-150_000),resultJson:{cancelledByActorType:"user",cancelledByActorId:"queue-owner"},contextSnapshot:{issueId:f.issueId,wakeCommentId:f.commentIds[1],wakeCommentIds:[f.commentIds[1]]}});
+    // The sender stops that older turn through the real Stop route after it started answering M2.
+    const oldRunId=await stopStartedTurn(db,{companyId:f.companyId,agentId:f.agentId,issueId:f.issueId,wakeCommentId:f.commentIds[1],own:[f.commentIds[1]]});
     await db.insert(issueComments).values({companyId:f.companyId,issueId:f.issueId,authorType:"agent",authorAgentId:f.agentId,createdByRunId:oldRunId,body:"M2 answered before its sender stopped this turn",createdAt:new Date(Date.now()-180_000)});
     await press(f); await finishTeardown(f);
     await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId,f.wakeIds[0]);
