@@ -959,7 +959,22 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     if (!presentation || (presentation.state === "resolved" && !mayOweMessage.has(issueId))) continue;
     const automaticRecovery = presentation.state === "working" && !presentation.canRetry
       && continuingIssues.has(issueId) && !presentation.notice && !presentation.retryWait;
-    if (presentation.state === "working" && !presentation.canRetry && !automaticRecovery) continue;
+    if (presentation.state === "working" && !presentation.canRetry && !automaticRecovery) {
+      // fam-retry-c3fix item 1 (rf-3 #1): a Retry accepted and HELD behind a
+      // restore hold is a deferred intent, not work: after the click the card
+      // keeps the authority's accept-held state and the hold's words (no Retry
+      // button), the same state it showed before the click, never an empty 'working'.
+      if (presentation.intentId && !presentation.retryWait && !presentation.notice) {
+        const hold = await readRestoreHoldEvidence(db, { companyId, issueId });
+        const heldAuthority = hold ? decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId, issueId }),
+          restoreHold: hold, retrySource: true }) : null;
+        if (heldAuthority?.admission === "held" && heldAuthority.cardText) {
+          presentation.retryAdmission = "held";
+          presentation.retryWait = { reason: heldAuthority.reason, message: heldAuthority.cardText };
+        }
+      }
+      continue;
+    }
     const run = runMap.get(issueId);
     const stopGate = run?.runtimeMode === "native" && run.finishedAt
       ? (await readRetryStopGate(db, { companyId, issueId, sourceRunId: run.id, now }))?.state ?? null : null;
