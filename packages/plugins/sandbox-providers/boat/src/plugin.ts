@@ -1412,7 +1412,10 @@ function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSecond
   if (shuttingDown) return;
   if (desired <= 0) {
     for (const pool of knownSparePools.values()) {
-      if (pool.key.companyId !== key.companyId || pool.key.environmentId !== key.environmentId || pool.desired <= 0) continue;
+      if (pool.key.companyId !== key.companyId || pool.key.environmentId !== key.environmentId) continue;
+      // Off stays off: wakes and maintenance recompute desired from baseDesired.
+      pool.baseDesired = 0;
+      if (pool.desired <= 0) continue;
       pool.desired = 0;
       void readySpares.reconcile(pool.key, 0, pool.operations).catch(() => undefined);
     }
