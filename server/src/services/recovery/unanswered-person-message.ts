@@ -269,7 +269,7 @@ function noticeCoversAnsweredCardSql(n: string): SQL {
       createdAt: sql.raw("ca.resolved_at") })})`;
 }
 /** SQL over issue_thread_interactions rows (the outer table): an owed card answer with no notice yet. The recovery
- * worker reads it in the SAME batched statement as unansweredPersonMessageCommentCondition (work.ts). */
+ * worker reads it with one batched query per page, beside unansweredPersonMessageCommentCondition's (work.ts). */
 export function owedCardAnswerInteractionCondition(now: Date = new Date()): SQL {
   return unnoticedOwedCardAnswerSql("issue_thread_interactions", now);
 }
