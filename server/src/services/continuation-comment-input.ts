@@ -27,8 +27,6 @@ function carriesInputSql(id: SQL): SQL {
 }
 
 type CarryInput = { companyId: string; issueId: string; agentId: string; contextSnapshot: unknown;
-  /** The source run, when the caller knows it (H3 carry-once): it never blocks its own typed input. */
-  runId?: string | null;
   /** The source run's agent and id: another LIVE run of that agent owning a card answer blocks a second carry. */
   liveOwner?: { agentId: string; runId: string } };
 
@@ -69,7 +67,6 @@ async function pendingPersonCommentInput(db: Pick<Db, "select">, input: CarryInp
   if (candidates.length === 0) return {};
   const responded = interactionIds(input.contextSnapshot);
   const senderStopped = senderStoppedCheck(db, input);
-  const sourceRunId = [input.runId, input.liveOwner?.runId].find(id => typeof id === "string" && UUID.test(id));
   const rows = await db.select({ id: issueComments.id, authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     inArray(issueComments.id, candidates), isNull(issueComments.deletedAt),
@@ -88,10 +85,11 @@ async function pendingPersonCommentInput(db: Pick<Db, "select">, input: CarryInp
     // A failed run's progress reply is DELIVERED only: the message is still carried (RFL F1, 21:28Z).
     sql`not ${completedPersonMessageAnswerSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}`,
-    // The ONE policy's live-owner leg for typed input (H3 carry-once 7ad76a83): another LIVE run of this agent
-    // already carrying the message blocks a second carry; it is not an answer. The source run never blocks itself.
-    ...(sourceRunId ? [sql`not ${carriedInLiveRunSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
-      issueId: sql`${issueComments.issueId}`, agentId: sql`${input.agentId}::uuid`, excludeRunId: sql`${sourceRunId}::uuid` })}`] : []),
+    // The ONE policy's live-owner leg for typed input, as for a card answer below: another LIVE run of this
+    // agent already carrying the message blocks a second carry; it is not an answer. The source run never blocks itself.
+    ...(input.liveOwner ? [sql`not ${carriedInLiveRunSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, agentId: sql`${input.liveOwner.agentId}::uuid`,
+      excludeRunId: sql`${input.liveOwner.runId}::uuid` })}`] : []),
   )).orderBy(asc(issueComments.createdAt), asc(issueComments.id));
   const commentIds: string[] = [];
   for (const row of rows) if (!await senderStopped(row)) commentIds.push(row.id);
