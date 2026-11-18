@@ -3,7 +3,7 @@ import { withAccountingTransaction } from "../accounting-transaction.js";
 import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 export { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { isWellFormedExecutionWait, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
+import { isWellFormedExecutionWait, UNNAMED_EXECUTION_WAIT, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import { anchorParkedWakePayloadSql, personSendSql } from "./parked-wake-anchor.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
@@ -763,7 +763,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         ));
         if (!comment?.body.trim()) continue;
       } else {
-        let wait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+        let wait: { reason: string; message: string } = { ...UNNAMED_EXECUTION_WAIT };
         const admitted = await admitExplicitNativeContinuation({ db, companyId: run.companyId, issueId,
           agentId: run.agentId, actorType: wake.requestedByActorType, actorId: requestedByActorId,
           reason, commentId, successorRunId: randomUUID(), dryRun: true,
@@ -832,7 +832,15 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const source = latest ? await getRunExecutionWait(companyId, latest.id) : null;
     if (!source || source.runtimeMode !== "native" || source.status !== "cancelled" || !source.finishedAt) return null;
     const stoppedAt = userStopBoundaryAt(source);
-    if (!stoppedAt || wake.requestedAt.getTime() <= stoppedAt.getTime()) return null;
+    // A chat-queue reorder permutes requestedAt (routes/issues.ts
+    // reorderChatQueue), so it cannot tell old input from new. The message's
+    // own createdAt, which no reorder moves, decides the side of the Stop.
+    const commentIds = queuedCommentIdsFromWakePayload(wake.payload).filter(isUuidLike);
+    const [message] = commentIds.length ? await db.select({ createdAt: sql<Date>`max(${issueComments.createdAt})`.mapWith(issueComments.createdAt) })
+      .from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+        inArray(issueComments.id, commentIds))) : [];
+    const sentAt = message?.createdAt ?? wake.requestedAt;
+    if (!stoppedAt || sentAt.getTime() <= stoppedAt.getTime()) return null;
     return await nativeStopExecutionProven(companyId, source.id) ? source : null;
   }
 

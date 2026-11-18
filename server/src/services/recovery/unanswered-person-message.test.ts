@@ -1343,6 +1343,18 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.reply(success);
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
+    // rf-5 F3: the read path redacts a deleted comment, but the superseded
+    // notice keeps its reason code (and nothing else) so the chat can drop
+    // only that placeholder; a deleted person message keeps no metadata.
+    await db.update(issueComments).set({ deletedAt: new Date(), metadata: { version: 1, sections: [], authorizationReason: "person_note" } })
+      .where(eq(issueComments.id, commentId));
+    const { issueService } = await import("../issues.js");
+    const read = await issueService(db).listComments(f.issueId);
+    const deleted = read.filter(comment => comment.deletedAt);
+    expect(deleted.map(comment => [comment.authorType, comment.body, comment.presentation, comment.metadata])).toEqual(expect.arrayContaining([
+      ["system", "", null, { version: 1, sections: [], authorizationReason: expect.stringMatching(/^unanswered_message:/) }],
+      ["user", "", null, null]]));
+    expect(deleted).toHaveLength(2);
   });
 
   // RFL 20:42Z (b): a BLOCKED task the person is legitimately waiting on after

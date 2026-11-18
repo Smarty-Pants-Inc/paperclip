@@ -28,7 +28,12 @@ import {
   runIdentityContexts,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
+import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { issueRoutes } from "../routes/issues.js";
+import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
+import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -225,6 +230,114 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     return { ...f, commentIds, wakeIds };
   }
 
+  // RFL SUPERSEDE-QUEUEFIX-WAKE-REORDER-1118 amendment: the queue must
+  // answer in SEND order without a drag, and in exactly the displayed order
+  // after a drag. Exercise HTTP mutation AND the production Postgres release
+  // drain; do not simulate promotion by inserting the desired successor.
+  describe.each(["ordinary", "card response", "Interrupt", "Stop", "capacity retry"] as const)("chosen order across %s", kind => {
+    let chatWasEnabled: boolean;
+    beforeAll(async () => {
+      chatWasEnabled = (await instanceSettingsService(db).getExperimental()).enableAgentChat;
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    });
+    afterAll(async () => {
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: chatWasEnabled });
+      expect((await instanceSettingsService(db).getExperimental()).enableAgentChat).toBe(chatWasEnabled);
+    });
+    it.each([false, true])("honours displayed order (drag=%s), including sub-millisecond send slots", async drag => {
+      const f = await seedChatTail(["First sent", "Second sent", "Third sent"]);
+      const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+      // Postgres preserves microseconds; its JS Date reader does not. These
+      // are three distinct SEND slots, not a timestamp-tie invented by a drag.
+      for (let i = 0; i < f.wakeIds.length; i++) {
+        await db.update(agentWakeupRequests).set({
+          requestedAt: sql`'2026-08-22T15:01:00Z'::timestamptz + ${i + 1} * interval '1 microsecond'`,
+        }).where(eq(agentWakeupRequests.id, f.wakeIds[i]));
+      }
+      if (kind === "card response") {
+        const interactionId = randomUUID();
+        await db.insert(issueThreadInteractions).values({ id: interactionId, companyId: f.companyId, issueId: f.issueId,
+          kind: "request_confirmation", status: "accepted", createdByAgentId: f.agentId,
+          resolvedByUserId: "queue-owner", resolvedAt: new Date(), continuationPolicy: "wake_assignee",
+          requestedResolverPolicy: "human_only", effectiveResolverPolicy: "human_only", resolverPolicyProvenance: "explicit",
+          payload: { version: 1, prompt: "Continue?" }, result: { version: 1, outcome: "accepted" } });
+        // The current turn is answering this saved card. The plain messages
+        // behind it still keep their own wakes and their chosen order.
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, interactionId,
+          interactionKind: "request_confirmation", interactionStatus: "accepted" } }).where(eq(heartbeatRuns.id, f.runId));
+      }
+      if (kind === "capacity retry") {
+        await db.update(heartbeatRuns).set({ status: "scheduled_retry", scheduledRetryAt: new Date(0),
+          scheduledRetryAttempt: 1, startedAt: null }).where(eq(heartbeatRuns.id, f.runId));
+        const retried = await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: f.companyId,
+          runId: f.runId, now: new Date() });
+        expect(retried.outcome).toBe("promoted");
+      }
+      if (kind === "Stop" || kind === "Interrupt") {
+        // Occupy the adapter slot, so real admission can queue a successor but
+        // cannot start a provider. The release use case below never applies
+        // provider-start post-commit effects either.
+        await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+        await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+          status: "running", contextSnapshot: { issueId: randomUUID() } });
+        await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId, responsibleUserId: "queue-owner" }).where(eq(heartbeatRuns.id, f.runId));
+        await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "observed" });
+        if (kind === "Stop") {
+          await heartbeatService(db).cancelRun(f.runId, "Cancelled by a board operator", {
+            cancellationRequestId: randomUUID(), cancellationRequestedByUserId: "queue-owner",
+            resultJson: { cancelledByActorType: "user", cancelledByUserId: "queue-owner" } });
+        }
+      }
+      const initial = (await request(client).get(path).expect(200)).body;
+      expect(initial.entries.map((entry: any) => entry.comment.id)).toEqual(f.commentIds);
+      const chosen = drag ? [f.commentIds[2], f.commentIds[0], f.commentIds[1]] : f.commentIds;
+      if (drag) {
+        const reordered = await request(client).put(`${path}/order`).send({ queueId: initial.queueId,
+          revision: initial.revision, orderedCommentIds: chosen }).expect(200);
+        expect(reordered.body.entries.map((entry: any) => entry.comment.id)).toEqual(chosen);
+      }
+      const visible = (await request(client).get(path).expect(200)).body;
+      expect(visible.entries.map((entry: any) => entry.comment.id)).toEqual(chosen);
+      let finishingRunId: string = f.runId;
+      const answered: string[] = [];
+      if (kind === "Stop" || kind === "Interrupt") {
+        await request(client).post(`${path}/interrupt`).send({ queueId: visible.queueId, revision: visible.revision,
+          targetRunId: kind === "Interrupt" ? f.runId : null }).expect(200);
+        const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+        await db.update(heartbeatRuns).set({ processPid: 999999999, resultJson: { ...source.resultJson,
+          nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId,
+            issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
+            dispatched: true, intentAuditId: "order-intent", acknowledgementAuditId: "order-ack" } } }).where(eq(heartbeatRuns.id, f.runId));
+        await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+        await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, visible.queueId);
+        const [firstWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, visible.queueId));
+        expect(firstWake.runId).not.toBeNull();
+        const [firstRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, firstWake.runId!));
+        answered.push(...(firstRun.contextSnapshot?.wakeCommentIds as string[] ?? []));
+        expect(answered).toEqual(chosen.slice(0, 1));
+        finishingRunId = firstRun.id;
+      }
+      const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => "queue-owner",
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      }), recovery: { escalateStrandedAssignedIssue: async () => undefined,
+        escalateStrandedRecoveryIssueInPlace: async () => undefined } });
+      while (answered.length < chosen.length) {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, finishingRunId));
+        const result = await release({ companyId: f.companyId, runId: finishingRunId, now: new Date(), suppressImmediateRecovery: true });
+        expect(result.outcome.kind).toBe("promoted");
+        const [next] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.executionRunId!));
+        answered.push(...(run.contextSnapshot?.wakeCommentIds as string[] ?? []));
+        expect(answered).toEqual(chosen.slice(0, answered.length));
+        finishingRunId = run.id;
+      }
+      expect(answered).toEqual(chosen);
+      console.log("CHOSEN-ORDER", JSON.stringify({ kind, drag, send: f.commentIds, shown: chosen, answered }));
+    });
+  });
+
   it("lists the chat tail across /new and marks the reset and every message behind it", async () => {
     const f = await seedChatTail(["A", "/new", "B"]);
     const response = await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
@@ -232,6 +345,29 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(response.body.entries.map((entry: any) => entry.behindReset)).toEqual([false, true, true]);
     expect(response.body.entries.slice(1).map((entry: any) => entry.queueId)).toEqual(f.wakeIds.slice(1));
     expect(response.body.entries.slice(1).every((entry: any) => typeof entry.queueRevision === "string" && entry.queueRevision.length > 0)).toBe(true);
+  });
+
+  it("reorders an Agent Chat queue across its per-message wakes while a turn runs, and refuses a stale revision", async () => {
+    // S9 (c1, 18:09:08Z): PUT /queued-comments/order with the GET's own
+    // queueId and revision was refused (409) for a chat of three messages.
+    const f = await seedChatTail(["A", "B", "C"]);
+    const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+    const before = (await request(client).get(path).expect(200)).body;
+    expect(before).toMatchObject({ state: "deferred", targetRunId: f.runId, queueId: f.wakeIds[0] });
+    const ids = before.entries.map((entry: any) => entry.comment.id);
+    const reordered = await request(client).put(`${path}/order`)
+      .send({ queueId: before.queueId, revision: before.revision, orderedCommentIds: [ids[2], ids[0], ids[1]] });
+    expect(reordered.status, JSON.stringify(reordered.body)).toBe(200);
+    expect(reordered.body.entries.map((entry: any) => entry.comment.body)).toEqual(["C", "A", "B"]);
+    const after = (await request(client).get(path).expect(200)).body;
+    expect(after.entries.map((entry: any) => entry.comment.body)).toEqual(["C", "A", "B"]);
+    expect(after.queueId).toBe(f.wakeIds[2]);
+    const stale = await request(client).put(`${path}/order`)
+      .send({ queueId: after.queueId, revision: before.revision, orderedCommentIds: ids });
+    expect(stale.status).toBe(409);
+    expect(stale.body.details?.code).toBe("queued_comment_revision_conflict");
+    expect((await request(client).get(path).expect(200)).body.entries.map((entry: any) => entry.comment.body))
+      .toEqual(["C", "A", "B"]);
   });
 
   it("deletes only B using the later chat entry's own queue identity and revision", async () => {
@@ -1365,6 +1501,93 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     });
   }
 
+  it.each([false, true])("AUDIT third writer after ordinary Stop: resolved no-replay hold=%s", async (keepResolvedHold) => {
+    const f = await seedQueue();
+    const { service } = await stopNativeMidTurn(f);
+    await endTeardown(f, "both");
+    if (!keepResolvedHold) await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId));
+    else {
+      await db.delete(issueRecoveryActions).where(sql`${issueRecoveryActions.companyId} = ${f.companyId} and ${issueRecoveryActions.fingerprint} <> ${f.runId}`);
+      await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "blocked" }).where(eq(issueRecoveryActions.companyId, f.companyId));
+    }
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const stop = new Date(String((source.resultJson?.cancellation as any).recordedAt));
+    const messageId = randomUUID(), wakeId = randomUUID(), queuedId = randomUUID();
+    await db.insert(issueComments).values({ id: messageId, companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "queue-owner", body: "New direction after ordinary Stop", createdAt: new Date(stop.getTime() + 100) });
+    const context = { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: messageId, wakeCommentIds: [messageId] };
+    await db.insert(agentWakeupRequests).values({ id: wakeId, companyId: f.companyId, agentId: f.agentId,
+      source: "on_demand", reason: "issue_commented", status: "claimed", runId: queuedId,
+      requestedByActorType: "user", requestedByActorId: "queue-owner", payload: { issueId: f.issueId, commentId: messageId } });
+    await db.insert(heartbeatRuns).values({ id: queuedId, companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "on_demand", status: "queued", runtimeMode: "legacy", wakeupRequestId: wakeId,
+      responsibleUserId: "queue-owner", contextSnapshot: context });
+    await db.update(issues).set({ executionRunId: queuedId }).where(eq(issues.id, f.issueId));
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId));
+    expect(actions.filter(a => ["active", "escalated"].includes(a.status))).toHaveLength(0);
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId: f.companyId,
+      runId: queuedId, expectedStatus: "queued", now: new Date() });
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.id, f.wakeId));
+    const visibleQueue = (await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+    console.log("AUDIT THIRD WRITER", JSON.stringify({ keepResolvedHold, actions: actions.map(a => ({ status: a.status, cause: a.cause, evidence: a.evidence })), blocker, result, wakeStatus: saved.status, executionWait: saved.payload?.executionWait, visibleExecutionWait: visibleQueue.executionWait }));
+    if (keepResolvedHold) {
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "execution_reconciliation_required" });
+      expect(saved.status).toBe("deferred_issue_execution");
+      expect((saved.payload?.executionWait as { message?: unknown } | undefined)?.message).not.toBe("Waiting for execution recovery. Your message is saved.");
+    } else {
+      expect(result).toMatchObject({ outcome: "not_stale" });
+      expect(saved.payload?.executionWait).toBeUndefined();
+    }
+  });
+
+  it.each(["control-no-reorder", "pre-after-post", "post-before-pre"])("AUDIT Stop boundary reorder %s", async (direction) => {
+    const f = await seedChatTail(["M2 pre-Stop", "M3 post-Stop", "M4 post-Stop"]);
+    const { service } = await stopNativeMidTurn(f);
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const stop = new Date(String((source.resultJson?.cancellation as any).recordedAt));
+    for (let i = 0; i < 3; ++i) {
+      const at = new Date(stop.getTime() + [-1000, 100, 200][i]);
+      await db.update(issueComments).set({ createdAt: at }).where(eq(issueComments.id, f.commentIds[i]));
+      await db.update(agentWakeupRequests).set({ requestedAt: at, reason: "issue_commented",
+        payload: { issueId: f.issueId, commentId: f.commentIds[i], executionWait: { reason: "controller_settling", message: "Waiting for stopped controller" },
+          _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented", commentId: f.commentIds[i], wakeCommentId: f.commentIds[i], wakeCommentIds: [f.commentIds[i]] } }
+      }).where(eq(agentWakeupRequests.id, f.wakeIds[i]));
+    }
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
+    const client = app(f.companyId), path = `/api/issues/${f.issueId}/queued-comments`;
+    const before = (await request(client).get(path).expect(200)).body;
+    const order = direction === "control-no-reorder" ? f.commentIds : direction === "pre-after-post" ? [f.commentIds[1], f.commentIds[2], f.commentIds[0]] : [f.commentIds[1], f.commentIds[0], f.commentIds[2]];
+    const result = await request(client).put(`${path}/order`).send({ queueId: before.queueId, revision: before.revision, orderedCommentIds: order });
+    expect(result.status, JSON.stringify(result.body)).toBe(200);
+    const reordered = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    console.log("AUDIT REORDER", JSON.stringify({ direction, stop, status: result.status, order: result.body.entries.map((e:any) => e.comment.body), timestamps: reordered.map(w => ({ id: w.id, comments: w.payload?.commentId, requestedAt: w.requestedAt })) }));
+    await endTeardown(f, "both");
+    const target = direction === "pre-after-post" ? f.wakeIds[0] : f.wakeIds[1];
+    await service.resumeExecutionWaitComments({ companyId: f.companyId, requestId: target });
+    const successors = await hold50Successors(f);
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, target));
+    console.log("AUDIT STOP RESULT", JSON.stringify({ direction, target, savedStatus: saved.status, executionWait: saved.payload?.executionWait,
+      updatedBeforeHint: reordered.find(w => w.id === target)?.updatedAt, updatedAfterHint: saved.updatedAt,
+      successors: successors.map(r => ({ id: r.id, status: r.status, context: r.contextSnapshot })) }));
+    if (direction === "pre-after-post") {
+      expect(successors.flatMap(r => (r.contextSnapshot?.wakeCommentIds as string[]) ?? [])).not.toContain(f.commentIds[0]);
+      expect(saved.status).toBe("deferred_issue_execution");
+      // Reordering must not reclassify old intent even when admission later refuses it.
+      expect.soft(saved.updatedAt.getTime()).toBe(reordered.find(w => w.id === target)!.updatedAt.getTime());
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 31_000) }).where(eq(agentWakeupRequests.id, target));
+      await service.resumeExecutionWaitComments({ companyId: f.companyId, requestId: target });
+      expect((await hold50Successors(f)).flatMap(r => (r.contextSnapshot?.wakeCommentIds as string[]) ?? [])).not.toContain(f.commentIds[0]);
+      await service.resumeExecutionWaitComments({ companyId: f.companyId, requestId: f.wakeIds[1] });
+      const afterNewHint = await hold50Successors(f);
+      console.log("AUDIT POST AFTER PRE REORDER", JSON.stringify({ successors: afterNewHint.map(r => r.contextSnapshot) }));
+      expect.soft(afterNewHint.flatMap(r => (r.contextSnapshot?.wakeCommentIds as string[]) ?? [])).toContain(f.commentIds[1]);
+    } else {
+      expect(successors.flatMap(r => (r.contextSnapshot?.wakeCommentIds as string[]) ?? [])).toContain(f.commentIds[1]);
+    }
+  });
+
   it("Hold50 starts a message sent after a native Stop as soon as the stopped run's teardown ends", async () => {
     const seeded = await seedQueue();
     const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
@@ -1933,6 +2156,24 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const admitted = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
     expect(admitted.status).toBe(200);
     expect(admitted.body.executionWait).toBeUndefined();
+  });
+
+  it("shows messages behind an ordinary busy turn as queued, not waiting for an unnamed recovery", async () => {
+    // S9 (c1, 18:09:07Z): a running turn, three mid-turn messages, and the
+    // admission default wait no gate named.
+    const seeded = await seedQueue();
+    const executionWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+    await db.update(agentWakeupRequests).set({
+      payload: sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) || ${JSON.stringify({ executionWait })}::jsonb`,
+    }).where(eq(agentWakeupRequests.id, seeded.wakeId));
+    const busy = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+    expect(busy.body).toMatchObject({ state: "deferred", targetRunId: seeded.runId });
+    expect(busy.body.executionWait).toBeUndefined();
+    // Once no turn runs, the saved hold is what the messages wait on.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, seeded.runId));
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, seeded.issueId));
+    const held = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+    expect(held.body.executionWait).toEqual(executionWait);
   });
 
   it("returns the authoritative order, preserves full Markdown edits, and rejects stale revisions", async () => {
