@@ -69,7 +69,7 @@ export {
   recoverToolCallback,
   toolCallbackOwnedByThisProcess,
 } from "./control-plane/orphaned-tool-callback.js";
-export type { DurableRecoveryIdentity } from "./control-plane/prp-transport-types.js";
+export type { DurableRecoveryIdentity, DurablePrpEffectRefusal, DurablePrpEffectRefusalReason } from "./control-plane/prp-transport-types.js";
 export * from "./drivers/codex/app-server-transport.js";
 export * from "./drivers/codex/codex-app-server-driver.js";
 export { codexUsageBaselineForNextRun } from "./drivers/codex/codex-usage-baseline.js";

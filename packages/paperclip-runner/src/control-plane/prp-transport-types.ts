@@ -51,4 +51,21 @@ export interface DurableRecoveryCommittedEvent {
   envelope: Record<string, unknown>;
   deliveryCount: number;
   logicalEffectCount: number;
+  /** Present when the frame was stored as trace only: its run was finalized
+   * or superseded, so its effects were refused (RFL rf-3 fence (c)). */
+  effectRefusal?: DurablePrpEffectRefusal;
+}
+
+/** Why a frame's effects were refused while the frame itself was kept as trace. */
+export type DurablePrpEffectRefusalReason = "run_finalized" | "run_superseded";
+
+/** The persisted post-terminal marker stored with a refused frame or bootstrap. */
+export interface DurablePrpEffectRefusal {
+  readonly code: "run_effect_refused";
+  readonly reason: DurablePrpEffectRefusalReason;
+  readonly frame: "event" | "bootstrap";
+  readonly runId: string;
+  readonly sourceSeq?: number;
+  readonly sourceEventId?: string;
+  readonly observedAt: string;
 }

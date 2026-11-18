@@ -1,22 +1,27 @@
 import { resolve } from "node:path";
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
 import {
   agents,
   completionContracts,
+  heartbeatRunEvents,
   heartbeatRuns,
   issues,
 } from "@paperclipai/db";
 import {
   DurablePrpControlPlane,
+  type DurablePrpEffectRefusal,
+  type DurablePrpEffectRefusalReason,
   type PaperclipSemanticToolDefinition,
   type PrpStructuredRunResult,
+  type PrpEvent,
   type PrpTerminalState,
 } from "../../vendor/paperclip-runner/index.js";
 
-import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
+import { registerRunnerPrpAuthority, runnerPrpRunSuperseded } from "../../realtime/runner-prp-ws.js";
+import { agentRunSuperseded, agentRunWritesRevoked } from "../../agent-run-cancellation.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
 import {
   flushNativeQuestionResponses,
@@ -74,6 +79,15 @@ export interface PreparedRunnerPrpSession {
   }>;
   waitForCommand(commandId: string, timeoutMs?: number): Promise<Record<string, unknown> | null>;
   waitForGoalEvent(requestId: string, timeoutMs?: number): Promise<void>;
+  /**
+   * RFL rf-3 fence (c): the effect fence this run's PRP authority applies to
+   * every frame and bootstrap redemption. `refusal()` is null while the run
+   * is live and the current authority; `storeTrace` stores a refused frame.
+   */
+  readonly effectFence: {
+    refusal(): Promise<DurablePrpEffectRefusalReason | null>;
+    storeTrace(event: PrpEvent, refusal: DurablePrpEffectRefusal): Promise<void>;
+  };
   release(): Promise<void>;
 }
 
@@ -267,6 +281,46 @@ export function runnerPrpCoordinator(
           resolveTerminal = resolveTerminalPromise;
         },
       );
+      // RFL rf-3 fence (c): "the run is live and is the current authority".
+      // Superseded: a successor's real registration holds the task's live
+      // slot, the issue's execution moved to another run, or the run row
+      // carries a supersession marker (agentRunSuperseded, as auth.ts uses).
+      // Finalized: the run's own run.terminal was stored as a live event, or
+      // the run row is no longer queued/running or its writes are revoked
+      // (agentRunWritesRevoked, the predicate auth.ts :389-403 uses for 403).
+      // SCOPE: a SERVER fence on server-side effects only (results, commands,
+      // projections, saves into canonical). A revived P writing files ON ITS
+      // OWN BOX is not stoppable here; that is fences (a)/(b).
+      const effectFence: PreparedRunnerPrpSession["effectFence"] = {
+        refusal: async () => {
+          if (runnerPrpRunSuperseded(input)) return "run_superseded";
+          const [state] = await db
+            .select({
+              status: heartbeatRuns.status,
+              resultJson: heartbeatRuns.resultJson,
+              executionRunId: issues.executionRunId,
+              terminalStored: sql<boolean>`exists (select 1 from ${heartbeatRunEvents}
+                where ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+                  and ${heartbeatRunEvents.eventType} = 'run.terminal'
+                  and (${heartbeatRunEvents.payload} -> 'effectRefusal') is null)`,
+            })
+            .from(heartbeatRuns)
+            .leftJoin(issues, and(eq(issues.id, heartbeatRuns.nativeIssueId), eq(issues.companyId, heartbeatRuns.companyId)))
+            .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
+            .limit(1);
+          if (!state) return "run_finalized";
+          if (agentRunSuperseded(state) || (state.executionRunId !== null && state.executionRunId !== input.runId)) {
+            return "run_superseded";
+          }
+          if (!["queued", "running"].includes(state.status) || agentRunWritesRevoked(state) || state.terminalStored) {
+            return "run_finalized";
+          }
+          return null;
+        },
+        storeTrace: async (event, refusal) => {
+          await nativeStore.appendEvent(event, { effectRefusal: refusal });
+        },
+      };
       const authority = new DurablePrpControlPlane({
         stateDirectory: resolve(stateRoot, input.runId),
         identity: {
@@ -280,6 +334,8 @@ export function runnerPrpCoordinator(
         expectedRunnerVersion: input.runnerVersion,
         expectedRunnerDigest: input.runnerDigest,
         connectionLeaseTtlMs,
+        runEffectAuthority: () => effectFence.refusal(),
+        onPostTerminalEvent: (event, refusal) => effectFence.storeTrace(event, refusal),
         onCommittedEvent: async (event) => {
           await nativeStore.appendEvent(event);
           if (event.eventType === "runtime_request.created") {
@@ -347,6 +403,7 @@ export function runnerPrpCoordinator(
         connectUrl: registration.connectUrl,
         bootstrapTicket,
         semanticTools,
+        effectFence,
         queueCommand: (type, payload = {}, commandId) => {
           if (released) throw new Error("runner_prp_session_released");
           const command = authority.queueCommand(

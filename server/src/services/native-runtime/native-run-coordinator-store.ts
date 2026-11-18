@@ -19,6 +19,7 @@ import {
 } from "@paperclipai/db";
 import {
   NativeSessionProtocolIntegrityError,
+  type DurablePrpEffectRefusal,
   type PrpEvent,
   type PrpStructuredRunResult,
   type PrpTerminalState,
@@ -203,7 +204,10 @@ export class NativeRunCoordinatorStore {
     return null;
   }
 
-  async appendEvent(value: PrpEvent): Promise<{
+  async appendEvent(value: PrpEvent, options?: {
+    /** RFL rf-3 fence (c): store this frame as trace only, with its refusal persisted on the row. */
+    readonly effectRefusal?: DurablePrpEffectRefusal;
+  }): Promise<{
     readonly disposition: "committed" | "duplicate";
     readonly cursor: number;
     readonly highestContiguousSourceSeq: number;
@@ -297,10 +301,12 @@ export class NativeRunCoordinatorStore {
         throw new Error("native_event_source_gap");
       }
 
-      if (isSafeNativeChatProgressEventType(event.eventType)) {
+      // A refused (post-terminal) frame is trace only: no chat progress or
+      // response presentation notifications (RFL rf-3 fence (c)).
+      if (!options?.effectRefusal && isSafeNativeChatProgressEventType(event.eventType)) {
         await notifyChatNativeProgress(tx, { companyId: this.#binding.companyId, issueId: this.#binding.issueId });
       }
-      if (isNativeResponseEvidence(event.eventType, canonicalPayload)) {
+      if (!options?.effectRefusal && isNativeResponseEvidence(event.eventType, canonicalPayload)) {
         await notifyNativeResponsePresentation(tx, this.#binding);
       }
       const cursor = run.nextEventSeq;
@@ -314,7 +320,11 @@ export class NativeRunCoordinatorStore {
           eventType: event.eventType,
           stream: "system",
           level: event.eventType.includes("failed") ? "error" : "info",
-          payload: { prpEvent: canonicalPayload },
+          // The refusal is stored beside the canonical event (never inside
+          // it), so the source digest and replay identity are unchanged.
+          payload: options?.effectRefusal
+            ? { prpEvent: canonicalPayload, effectRefusal: { ...options.effectRefusal } as unknown as Record<string, unknown> }
+            : { prpEvent: canonicalPayload },
           sourceInstanceId: event.sourceInstanceId,
           sourceEventId: event.sourceEventId,
           sourceSeq: event.sourceSeq,

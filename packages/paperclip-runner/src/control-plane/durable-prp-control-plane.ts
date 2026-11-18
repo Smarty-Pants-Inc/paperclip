@@ -42,6 +42,8 @@ import {
   type PrpEvent,
 } from "../protocol/replay-contract.js";
 import {
+  type DurablePrpEffectRefusal,
+  type DurablePrpEffectRefusalReason,
   type DurableRecoveryCommittedEvent,
   type DurableRecoveryCoreCommand,
   type DurableRecoveryIdentity,
@@ -216,6 +218,8 @@ interface StoredCoreState {
   leases: Record<string, ConnectionLeaseRecord>;
   commands: DurableRecoveryCoreCommand[];
   committedEvents: DurableRecoveryCommittedEvent[];
+  /** Bounded, persisted refusals of bootstrap redemptions (RFL rf-3 fence (c)). */
+  effectRefusals?: DurablePrpEffectRefusal[];
   ackedSourceSeq: number;
   connectionCount: number;
   commandDeliveryCounts: Record<string, number>;
@@ -329,6 +333,18 @@ export interface DurablePrpControlPlaneOptions {
   }) => Promise<{ readonly result: unknown; readonly isError?: boolean }>;
   /** Persist the canonical event before the runner receives its cumulative ACK. */
   onCommittedEvent?: (event: PrpEvent) => Promise<void>;
+  /**
+   * RFL rf-3 fence (c): is `runId` still live and the current authority for
+   * its task? Return null while it is; otherwise the reason its EFFECTS are
+   * refused. The fence never refuses what a run RECORDS: a refused frame is
+   * stored through `onPostTerminalEvent` and acknowledged, so no trace is
+   * lost. It gates the committed-event business callback, semantic dispatch
+   * and bootstrap-ticket redemption. Requires `onPostTerminalEvent`.
+   */
+  runEffectAuthority?: (input: { readonly runId: string }) =>
+    DurablePrpEffectRefusalReason | null | Promise<DurablePrpEffectRefusalReason | null>;
+  /** Store a refused (post-terminal) frame as trace only, with its persisted refusal. */
+  onPostTerminalEvent?: (event: PrpEvent, refusal: DurablePrpEffectRefusal) => Promise<void>;
   /**
    * Resolve a saved input that has no durable result. Return null to keep it
    * pending. `admission` says whether this controller instance dispatched the
@@ -2245,6 +2261,8 @@ export class DurablePrpControlPlane {
   readonly #authorityRunId: () => string | undefined;
   #onSemanticToolInput?: DurablePrpControlPlaneOptions["onSemanticToolInput"];
   #onCommittedEvent?: DurablePrpControlPlaneOptions["onCommittedEvent"];
+  #runEffectAuthority?: DurablePrpControlPlaneOptions["runEffectAuthority"];
+  #onPostTerminalEvent?: DurablePrpControlPlaneOptions["onPostTerminalEvent"];
   #recoverSemanticToolInput?: DurablePrpControlPlaneOptions["recoverSemanticToolInput"];
   #beforeAuthenticatedConnection?: DurablePrpControlPlaneOptions["beforeAuthenticatedConnection"];
   #onProtocolIntegrityError?: DurablePrpControlPlaneOptions["onProtocolIntegrityError"];
@@ -2316,6 +2334,13 @@ export class DurablePrpControlPlane {
     this.#semanticInputSourceRunId = this.#semanticInputMode === "retain_only" ? options.identity.runId : null;
     this.#onSemanticToolInput = options.onSemanticToolInput;
     this.#onCommittedEvent = options.onCommittedEvent;
+    if ((options.runEffectAuthority === undefined) !== (options.onPostTerminalEvent === undefined)) {
+      // A fence without a trace store would drop refused frames; a trace store
+      // without a fence is meaningless. Never-OK: refuse the configuration.
+      throw new Error("runner_prp_effect_fence_requires_trace_store");
+    }
+    this.#runEffectAuthority = options.runEffectAuthority;
+    this.#onPostTerminalEvent = options.onPostTerminalEvent;
     this.#recoverSemanticToolInput = options.recoverSemanticToolInput;
     this.#beforeAuthenticatedConnection = options.beforeAuthenticatedConnection;
     this.#onProtocolIntegrityError = options.onProtocolIntegrityError;
@@ -2661,6 +2686,25 @@ export class DurablePrpControlPlane {
   }
 
   /** Forces a resumable re-authentication after an immutable run attachment rotates. */
+  /** RFL rf-3 fence (c): the refusal for `runId`'s effects, or null while it is live and current. */
+  async #effectRefusal(
+    runId: string,
+    frame: { readonly frame: "event" | "bootstrap"; readonly sourceSeq?: number; readonly sourceEventId?: string },
+  ): Promise<DurablePrpEffectRefusal | null> {
+    if (this.#runEffectAuthority === undefined) return null;
+    const reason = await this.#runEffectAuthority({ runId });
+    if (reason === null) return null;
+    if (reason !== "run_finalized" && reason !== "run_superseded") throw new Error("runner_prp_effect_reason_invalid");
+    return { code: "run_effect_refused", reason, runId, ...frame, observedAt: new Date().toISOString() };
+  }
+
+  /** Persist a refusal that has no stored frame of its own (a refused bootstrap). */
+  #persistEffectRefusal(refusal: DurablePrpEffectRefusal): void {
+    const candidate = structuredClone(this.#store.state);
+    candidate.effectRefusals = [...(candidate.effectRefusals ?? []), refusal].slice(-32);
+    this.#store.commit(candidate);
+  }
+
   disconnectActiveRunner(): void {
     const connections = [...this.#connections];
     this.#connections.clear();
@@ -4008,6 +4052,31 @@ export class DurablePrpControlPlane {
       connection.close();
       return;
     }
+    // RFL rf-3 fence (c), bootstrap: a ticket issued before its run was
+    // finalized or superseded must not mint a new lease afterwards. Same
+    // predicate as the frame fence; a resumable lease (same-run reconnect)
+    // is not a mint and stays admitted so its unsent trace can still drain.
+    if (authorization.kind === "bootstrap" && this.#runEffectAuthority !== undefined) {
+      const bootstrapRunId = (pending.requestedIdentity ?? pending.authorization.identity).runId;
+      let refusal: DurablePrpEffectRefusal | null;
+      try {
+        refusal = await this.#effectRefusal(bootstrapRunId, { frame: "bootstrap" });
+      } catch {
+        connection.close();
+        return;
+      }
+      if (refusal !== null) {
+        this.#persistEffectRefusal(refusal);
+        connection.close();
+        return;
+      }
+      if (!this.#connections.has(connection) || connection.pendingChallenge !== pending) return;
+      authorization = this.#reauthorizePendingChallenge(pending, Date.now());
+      if (authorization === null) {
+        connection.close();
+        return;
+      }
+    }
     if (this.#beforeAuthenticatedConnection) {
       await this.#beforeAuthenticatedConnection({
         identity: structuredClone(
@@ -4758,8 +4827,30 @@ export class DurablePrpControlPlane {
     // the runner replays the event, the caller observes a duplicate, and only
     // then do we advance the cumulative cursor. Reversing this order can make
     // an uncommitted event disappear from the runner outbox permanently.
+    // RFL rf-3 fence (c): decide, per frame, whether this run may still CHANGE
+    // anything. A finalized or superseded run's frame is still stored (trace,
+    // marked post-terminal, refusal persisted with it) and acknowledged, but
+    // its effects are refused: the business callback (result acceptance,
+    // request projection, accounting) and semantic dispatch below.
+    // SCOPE: this is a SERVER fence. It refuses only the server-side effects
+    // of P's work (results, commands, saves into canonical, comments). A
+    // revived P writing files ON ITS OWN BOX cannot be stopped here; that is
+    // fences (a)/(b).
+    let effectRefusal: DurablePrpEffectRefusal | null = null;
     try {
-      await this.#onCommittedEvent?.(event);
+      effectRefusal = await this.#effectRefusal(identity.runId, { frame: "event", sourceSeq, sourceEventId });
+    } catch (error) {
+      // An unanswerable fence keeps the frame unacknowledged (the runner
+      // retains and resends it) rather than guess either way.
+      if (this.#eventOwner === connection && this.#identity === identity) {
+        this.#eventCommitFailed(connection, `effect_authority_failed:${safeErrorCauseCode(error)}`, sourceSeq);
+      }
+      return;
+    }
+    if (this.#eventOwner !== connection || this.#identity !== identity) return;
+    try {
+      if (effectRefusal !== null) await this.#onPostTerminalEvent!(event, effectRefusal);
+      else await this.#onCommittedEvent?.(event);
     } catch (error) {
       if (this.#eventOwner !== connection || this.#identity !== identity) return;
       if (error instanceof NativeSessionProtocolIntegrityError) {
@@ -4802,6 +4893,7 @@ export class DurablePrpControlPlane {
       committedEvents.push({
         sourceSeq, sourceEventId, eventType, priority,
         envelope: structuredClone(envelope), deliveryCount: 1, logicalEffectCount: 1,
+        ...(effectRefusal === null ? {} : { effectRefusal }),
       });
       return { ...state, committedEvents, ackedSourceSeq: sourceSeq };
     };
@@ -4844,7 +4936,9 @@ export class DurablePrpControlPlane {
     }
     connection.unacknowledgedEvents = 0;
 
-    const liveCall = !this.#retainsSourceInputs() && isSemanticInput && this.#onSemanticToolInput && semantic !== undefined
+    // A refused (post-terminal) frame never dispatches: no server-side tool
+    // effect, including a save into canonical (RFL rf-3 fence (c)).
+    const liveCall = effectRefusal === null && !this.#retainsSourceInputs() && isSemanticInput && this.#onSemanticToolInput && semantic !== undefined
       && typeof semantic.callId === "string" && typeof semantic.operationId === "string"
       ? { callId: semantic.callId, operationId: semantic.operationId, input: semantic.input,
           sourceEventId, sourceEventType: eventType,

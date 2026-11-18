@@ -106,6 +106,22 @@ export function setupRunnerPrpWebSocketServer(
   );
 }
 
+/**
+ * RFL rf-3 fence (c): true when a successor run's registration holds this
+ * run's live company/issue/agent slot. The predecessor's route stays
+ * registered, so its frames are still received and stored as trace; only
+ * their effects are refused by the authority's effect fence.
+ */
+export function runnerPrpRunSuperseded(input: {
+  readonly companyId: string;
+  readonly issueId: string;
+  readonly agentId: string;
+  readonly runId: string;
+}): boolean {
+  const current = currentLiveAuthorities.get(liveAuthorityKey(input));
+  return current !== undefined && current.runId !== input.runId;
+}
+
 export async function registerRunnerPrpAuthority(input: {
   readonly companyId: string;
   readonly issueId?: string;
