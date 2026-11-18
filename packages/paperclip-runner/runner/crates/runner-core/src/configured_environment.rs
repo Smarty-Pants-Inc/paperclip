@@ -141,7 +141,16 @@ const RESERVED: &[&str] = &[
     "XAI_API_KEY",
 ];
 
+/// Operator Pi extension authority (gold #21121): the only configured
+/// `PAPERCLIP_PI_` names that cross. Exact and case-sensitive; every other
+/// `PAPERCLIP_PI_` name stays excluded.
+const CONFIGURED_PI_AUTHORITY: &[&str] =
+    &["PAPERCLIP_PI_EXTENSIONS", "PAPERCLIP_PI_EXTENSIONS_MODE"];
+
 fn eligible_key(key: &str) -> bool {
+    if CONFIGURED_PI_AUTHORITY.contains(&key) {
+        return true;
+    }
     let upper = key.to_ascii_uppercase();
     !key.is_empty()
         && key.len() <= 128
@@ -262,6 +271,60 @@ mod tests {
                 );
                 assert_eq!(command.get_envs().count(), 0);
             }
+        }
+    }
+
+    // Keep: gold #21121. Operator Pi extension authority crosses the configured
+    // projection by exact name only; every other PAPERCLIP_PI_ name stays out.
+    #[test]
+    fn only_exact_pi_extension_authority_crosses_the_configured_projection() {
+        let raw = r#"["PAPERCLIP_PI_EXTENSIONS","PAPERCLIP_PI_EXTENSIONS_MODE"]"#;
+        let mut command = Command::new("unused");
+        apply_configured_environment(&mut command, |key| match key {
+            MARKER => Some(raw.into()),
+            "PAPERCLIP_PI_EXTENSIONS" => Some("[\"/opt/pi/cap.ts\"]".into()),
+            "PAPERCLIP_PI_EXTENSIONS_MODE" => Some("native".into()),
+            _ => None,
+        })
+        .expect("exact Pi extension authority is a configured name");
+        let envs = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            envs.get("PAPERCLIP_PI_EXTENSIONS"),
+            Some(&Some("[\"/opt/pi/cap.ts\"]".to_owned()))
+        );
+        assert_eq!(
+            envs.get("PAPERCLIP_PI_EXTENSIONS_MODE"),
+            Some(&Some("native".to_owned()))
+        );
+        for excluded in [
+            "PAPERCLIP_PI_PROVIDER_KEY",
+            "PAPERCLIP_PI_EXTENSIONS_EXTRA",
+            "PAPERCLIP_PI_EXTENSION",
+            "paperclip_pi_extensions",
+            "Paperclip_Pi_Extensions_Mode",
+        ] {
+            let raw = serde_json::to_string(&[excluded]).unwrap();
+            let mut command = Command::new("unused");
+            assert!(
+                apply_configured_environment(&mut command, |key| if key == MARKER {
+                    Some(raw.clone())
+                } else if key == excluded {
+                    Some("value".into())
+                } else {
+                    None
+                })
+                .is_err(),
+                "{excluded} must stay excluded"
+            );
+            assert_eq!(command.get_envs().count(), 0);
         }
     }
 
