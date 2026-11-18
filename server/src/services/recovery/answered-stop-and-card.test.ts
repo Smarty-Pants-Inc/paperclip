@@ -166,7 +166,7 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
     /** The sweeps' clock: `minutes` after the fixture started. */
     const at = (minutes: number) => new Date(startedAt + minutes * 60_000);
     return { companyId, agentId, issueId, sender, other, send, startRun, readRun, stop, end, card, cardStatus, sweep, answered, notices,
-      answer, resumeRun, at };
+      answer, resumeRun, at, app };
   }
   const key = (id: string) => ({ authorizationReason: `unanswered_message:${id}` });
   const PASSES = [1, 3, 11, 30];
@@ -367,6 +367,54 @@ describe.skipIf(!support.supported)("the sender's own Stop and an answerable car
     const counts = [];
     for (const minutes of [5, 11, 30]) counts.push((await f.sweep(minutes)).noticed);
     expect(counts, "one notice, on the first pass after the expiry").toEqual([1, 0, 0]);
+    const all = await f.notices();
+    expect(all, "exactly one notice, ever").toHaveLength(1);
+    expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_NO_REPLY_TEXT, metadata: { ...key(m), sourceRunId: run } });
+  }, 60_000);
+
+  // Ruling (b): a card CANCELLED by the PERSON's own skip or withdrawal (resolved_by_user_id is that person's actor
+  // id) counts as answered: no notice. A cancel with no person behind it (system / agent) does not: M is owed.
+  // The person's rows go through the REAL board routes (routes/issues.ts POST /issues/:id/interactions/:id/skip,
+  // /withdraw and /cancel -> skipInteraction / withdrawInteraction / cancelQuestions); the system row calls the REAL
+  // withdrawInteraction service with a non-person actor, as tool-gateway.ts expireElicitationRound does (agent id,
+  // no user). The message, the run and the card row are inserted, as in the rows above.
+  it.each([["skip", "skipped"], ["withdraw", "withdrawn"], ["cancel", null]] as const)(
+    "ruling (b): the PERSON's own %s of the card (real route, by the person's actor id) counts as answered -> 0 notices", async (route, outcome) => {
+      const f = await fixture();
+      const m = await f.send("M: deploy it.");
+      const run = await f.startRun(m);
+      const cardId = await f.card(run);
+      await f.end(run, "succeeded");
+      const response = await request(f.app(f.sender)).post(`/api/issues/${f.issueId}/interactions/${cardId}/${route}`).send({});
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const [row] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, cardId));
+      expect(row, "the route cancelled the card BY THE PERSON").toMatchObject({ status: "cancelled", resolvedByUserId: f.sender,
+        resolvedByAgentId: null });
+      if (outcome) expect((row!.result as unknown as Record<string, unknown>).outcome).toBe(outcome);
+      else expect((row!.result as unknown as Record<string, unknown>).cancelled).toBe(true);
+      expect(await f.answered(m), "the person's own skip / withdrawal is their answer to the card").toBe(true);
+      const counts = [];
+      for (const minutes of PASSES) counts.push((await f.sweep(minutes)).noticed);
+      expect(counts).toEqual([0, 0, 0, 0]);
+      expect(await f.notices(), "no notice, ever").toHaveLength(0);
+    }, 60_000);
+
+  it("ruling (b): a SYSTEM cancel of the card (the real withdrawInteraction service, no person actor) does not count -> M is owed: exactly 1 notice", async () => {
+    const f = await fixture();
+    const m = await f.send("M: deploy it.");
+    const run = await f.startRun(m);
+    const cardId = await f.card(run);
+    await f.end(run, "succeeded");
+    expect(await f.answered(m), "while the card is pending it answers M").toBe(true);
+    await issueThreadInteractionService(db).withdrawInteraction({ id: f.issueId, companyId: f.companyId }, cardId,
+      { reason: "The app's question expired before it was answered." }, { agentId: f.agentId });
+    const [row] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, cardId));
+    expect(row, "the SAME cancelled shape as the person's withdrawal, but no person resolved it").toMatchObject({ status: "cancelled",
+      resolvedByUserId: null, result: { outcome: "withdrawn" } });
+    expect(await f.answered(m), "a card nobody can answer and no person closed: M is owed again").toBe(false);
+    const counts = [];
+    for (const minutes of [5, 11, 30]) counts.push((await f.sweep(minutes)).noticed);
+    expect(counts, "one notice on the first pass after the cancel, never another").toEqual([1, 0, 0]);
     const all = await f.notices();
     expect(all, "exactly one notice, ever").toHaveLength(1);
     expect(all[0]).toMatchObject({ deletedAt: null, body: UNANSWERED_MESSAGE_NO_REPLY_TEXT, metadata: { ...key(m), sourceRunId: run } });
