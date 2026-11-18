@@ -164,6 +164,11 @@ export async function preserveNativeFailedWorkspace(db: Db, selected: Pick<typeo
     if (!run || run.runtimeMode !== "native" || (!options.allowPreterminal && run.status !== "failed")) return;
     if (options.requireCancelledStop && (run.status !== "cancelled" || !hasAcknowledgedNativeRunStopRequest(run)
       || run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt.getTime() > Date.now())) return;
+    // C3 (product decision): a person's Stop does not carry the stopped turn's
+    // unsaved files into the next message. The sandbox keeps its disk
+    // (stop_and_retain) and the next message runs fresh, so no restore is owed.
+    // An accepted result (stopped copy-back) or any real failure still is.
+    if (run.status === "cancelled" && !coordinator.resultId && hasAcknowledgedNativeRunStopRequest(run)) return;
     const currentReference = workspaceRecoveryReference(run.runnerProfileJson);
     if (!currentReference || currentReference.state !== "prepared"
       || (claim?.kind === "reattach_remote_runner" && (claim.remote.kind === "plugin_task" || claim.remote.providerLeaseId !== currentReference.providerLeaseId
