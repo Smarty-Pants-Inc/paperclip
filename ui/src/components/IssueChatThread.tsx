@@ -299,7 +299,7 @@ interface IssueChatMessageContext {
   stoppingRunLabel?: string;
   stopRunVariant?: "stop" | "pause";
   runFinalizationActions?: readonly IssueChatRunFinalizationAction[];
-  onInterruptQueued?: (runId: string | null) => Promise<IssueQueuedCommentQueue | void>;
+  onInterruptQueued?: (runId: string | null, commentId?: string) => Promise<IssueQueuedCommentQueue | void>;
   onCancelQueued?: (commentId: string) => void;
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   onImageClick?: (src: string) => void;
@@ -643,6 +643,7 @@ interface IssueChatThreadProps {
     attachmentIds?: string[],
     clientRequestId?: string,
     runSettings?: ComposerRunSettings,
+    sendMode?: "steer" | "queue" | "interrupt",
   ) => Promise<void>;
   onCancelRun?: () => Promise<void>;
   stopPending?: boolean;
@@ -689,7 +690,7 @@ interface IssueChatThreadProps {
   transcriptsByRunId?: ReadonlyMap<string, readonly IssueChatTranscriptEntry[]>;
   hasOutputForRun?: (runId: string) => boolean;
   includeSucceededRunsWithoutOutput?: boolean;
-  onInterruptQueued?: (runId: string | null) => Promise<IssueQueuedCommentQueue | void>;
+  onInterruptQueued?: (runId: string | null, commentId?: string) => Promise<IssueQueuedCommentQueue | void>;
   onCancelQueued?: (commentId: string) => void;
   /** Authoritative PRP queue. The classic thread intentionally ignores it. */
   queuedCommentQueue?: IssueQueuedCommentQueue | null;
@@ -697,6 +698,8 @@ interface IssueChatThreadProps {
     commentId: string,
     body: string,
     revision: string,
+    /** Capture the row's owning wake when editing begins, like discard. */
+    queueId?: string,
   ) => Promise<void>;
   onReorderQueuedComments?: (
     orderedCommentIds: string[],
@@ -708,7 +711,11 @@ interface IssueChatThreadProps {
   onDiscardQueuedComment?: (
     commentId: string,
     revision: string,
+    /** A message behind a /new waits in its own wake. */
+    queueId?: string,
   ) => Promise<void>;
+  /** A waiting message's mode (Steer or Queue), stored on the server. */
+  onSetQueuedCommentIntent?: (commentId: string, intent: "steer" | "queue") => Promise<void>;
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   interruptingQueuedRunId?: string | null;
   stoppingRunId?: string | null;

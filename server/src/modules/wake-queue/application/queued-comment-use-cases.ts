@@ -18,7 +18,8 @@ export type QueuedCommentMutationErrorCode =
   | "queued_comment_already_dispatching"
   | "queued_comment_stale_queue"
   | "queued_comment_revision_conflict"
-  | "queued_comment_order_mismatch";
+  | "queued_comment_order_mismatch"
+  | "queued_comment_stop_line_crossing";
 
 /** The route maps this 1:1 onto the `conflict(...)` HTTP error it threw before this move, using `code` and `message` unchanged. */
 export class QueuedCommentMutationError extends Error {
@@ -173,6 +174,11 @@ export function createReorderQueuedComments(deps: { issueLock: QueuedCommentIssu
             "The queued message order does not match the current queue",
           );
         }
+
+        await tx.assertReorderPreservesStopLine({
+          comments: locked.queue.entries.map((entry) => entry.comment),
+          orderedIds: input.orderedCommentIds,
+        });
 
         const updatedWake = await tx.updateWakeQueuedCommentIds({
           wakeId: locked.wake.id,

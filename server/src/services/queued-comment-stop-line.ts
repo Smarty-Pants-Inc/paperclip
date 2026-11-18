@@ -1,0 +1,65 @@
+import { and, desc, eq, or, sql } from "drizzle-orm";
+import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { QueuedCommentMutationError } from "../modules/wake-queue/application/queued-comment-use-cases.js";
+import { recordedUserStop, userStopBoundaryAt } from "./run-cancellation.js";
+
+/** Both reorder writers call this under the issue lock, before any writes.
+ * The latest person-Stop remains the boundary while any older message is held,
+ * even after newer runs start or finish. Use the Stop clock and immutable
+ * createdAt, never requestedAt: chat reorders permute those mutable send slots.
+ */
+export async function assertQueuedCommentStopLinePreserved(db: Db, input: {
+  companyId: string;
+  issueId: string;
+  agentId: string | null;
+  comments: ReadonlyArray<{ id: string; createdAt: Date | string }>;
+  orderedIds: string[];
+}): Promise<void> {
+  if (!input.agentId) return;
+  const sources = await db.select({ status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt,
+    resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+    or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`, eq(heartbeatRuns.nativeIssueId, input.issueId)),
+    // Skip typed/provider runs in SQL so they cannot age the Stop out of this
+    // bounded scan. Validate the full person-Stop evidence below as well.
+    sql`${heartbeatRuns.resultJson}->'cancellation'->'initiator'->>'type' = 'user'`,
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(50);
+  let boundary: Date | null = null;
+  for (const source of sources) {
+    // userStopBoundaryAt also falls back to finishedAt for non-person stops;
+    // those must neither establish nor replace this person's Stop line.
+    if (!recordedUserStop(source)) continue;
+    const candidate = userStopBoundaryAt(source);
+    // Run creation and Stop order can disagree. Keep the latest Stop clock;
+    // the query's createdAt/id order breaks ties within the same bounded set.
+    if (candidate && (!boundary || candidate > boundary)) boundary = candidate;
+  }
+  if (!boundary) return;
+  const stopTime = boundary.getTime();
+  const postStop = new Map(input.comments.map(comment =>
+    [comment.id, new Date(comment.createdAt).getTime() > stopTime]));
+  // Once every pre-Stop message was answered/removed, no held list remains.
+  if ([...postStop.values()].every(after => after)) return;
+  // Each id must keep every opposite-side id on the same side of itself.
+  // Counting opposite-side predecessors also handles a queue that was already
+  // interleaved before this guard shipped; equal label sequences alone would
+  // let two pre-Stop ids swap across a post-Stop id in such a saved queue.
+  const oppositeBefore = new Map<string, number>();
+  let pre = 0, post = 0;
+  for (const comment of input.comments) {
+    const after = postStop.get(comment.id)!;
+    oppositeBefore.set(comment.id, after ? pre : post);
+    if (after) post++; else pre++;
+  }
+  pre = 0; post = 0;
+  const crossing = input.orderedIds.some(id => {
+    const after = postStop.get(id)!;
+    const before = after ? pre : post;
+    if (after) post++; else pre++;
+    return oppositeBefore.get(id) !== before;
+  });
+  if (crossing) {
+    throw new QueuedCommentMutationError("queued_comment_stop_line_crossing",
+      "Queued messages cannot be moved across the Stop line");
+  }
+}

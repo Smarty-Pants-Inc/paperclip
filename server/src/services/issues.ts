@@ -7347,6 +7347,13 @@ export function issueService(db: Db) {
     }
   }
 
+  function supersededUnansweredNoticeMarker(comment: { authorType?: string | null; authorAgentId?: string | null;
+    authorUserId?: string | null; metadata?: unknown }): IssueCommentMetadata | null {
+    const reason = issueCommentMetadataSchema.nullable().catch(null).parse(comment.metadata ?? null)?.authorizationReason;
+    return deriveIssueCommentAuthorType(comment) === "system" && reason?.startsWith("unanswered_message:")
+      ? { version: 1, sections: [], authorizationReason: reason } : null;
+  }
+
   function redactIssueComment<
     T extends {
       body: string;
@@ -7376,7 +7383,9 @@ export function issueService(db: Db) {
         authorType: deriveIssueCommentAuthorType(comment),
         body: "",
         presentation: null,
-        metadata: null,
+        // A superseded unanswered-message notice keeps only its reason code:
+        // the chat tells that withdrawn notice from a comment someone deleted.
+        metadata: supersededUnansweredNoticeMarker(comment),
         deletedAt,
         deletedByType: comment.deletedByType ?? null,
         deletedByAgentId: comment.deletedByAgentId ?? null,

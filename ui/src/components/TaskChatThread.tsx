@@ -542,6 +542,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     onResumeAssignee: undefined, onResumeFromBacklog: undefined, onInterruptQueued: undefined,
     onCancelQueued: undefined, onEditQueuedComment: undefined, onReorderQueuedComments: undefined,
     onSteerQueuedComment: undefined, onDiscardQueuedComment: undefined, runFinalizationActions: undefined,
+    onSetQueuedCommentIntent: undefined,
     onResolveRecoveryAction: undefined, onReissueIsolatedRecoveryAction: undefined,
     onReconcileForwardRecoveryAction: undefined, onBreakGlassOverrideRecoveryAction: undefined,
     onQuarantineRestoreRecoveryAction: undefined,
@@ -625,6 +626,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     onSteerQueuedComment,
     queuedMessageAutoSteerDelayMs = QUEUED_MESSAGE_AUTO_STEER_DELAY_MS,
     onDiscardQueuedComment,
+    onSetQueuedCommentIntent,
     blockedBy = [],
     blockerAttention,
     liveIssueIds,
@@ -771,6 +773,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     commentId: string;
     body: string;
     revision: string;
+    queueId?: string;
     stale?: boolean;
   } | null>(null);
 
@@ -783,7 +786,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       setQueuedEdit({
         commentId,
         body: entry.comment.body,
-        revision: queuedMessageQueue.revision,
+        revision: entry.queueRevision ?? queuedMessageQueue.revision,
+        queueId: entry.queueId ?? queuedMessageQueue.queueId ?? undefined,
       });
     },
     [queuedMessageQueue],
@@ -801,7 +805,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       if (!onEditQueuedComment)
         throw new Error("This queued message is no longer editable.");
       try {
-        await onEditQueuedComment(commentId, body, queuedEdit.revision);
+        await onEditQueuedComment(commentId, body, queuedEdit.revision, queuedEdit.queueId);
       } catch (error) {
         const payload =
           typeof error === "object" && error !== null
@@ -825,7 +829,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         const stale =
           payload?.status === 409 &&
           (code === "queued_comment_stale_target" ||
-            code === "queued_comment_not_pending");
+            code === "queued_comment_not_pending" ||
+            code === "queued_comment_already_dispatching");
         if (stale) {
           setQueuedEdit((current) =>
             current?.commentId === commentId
@@ -3761,6 +3766,9 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                           onEdit={beginQueuedEdit}
                           editingCommentId={queuedEdit?.commentId ?? null}
                           autoSteerDelayMs={queuedMessageAutoSteerDelayMs}
+                          steerHeadOnly={conversationMode === true}
+                          readOnly={readOnlyConversation}
+                          onSetIntent={onSetQueuedCommentIntent}
                           onReorder={async (orderedCommentIds, revision) => {
                             if (!onReorderQueuedComments)
                               throw new Error("Queue reordering is unavailable.");
@@ -3776,14 +3784,14 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                           }}
                           onInterrupt={
                             onInterruptQueued && queuedMessageQueue?.queueId
-                              ? async () => {
-                                  return onInterruptQueued(
-                                    queuedMessageQueue.targetRunId,
-                                  );
+                              ? async (commentId?: string) => {
+                                  return commentId
+                                    ? onInterruptQueued(queuedMessageQueue.targetRunId, commentId)
+                                    : onInterruptQueued(queuedMessageQueue.targetRunId);
                                 }
                               : undefined
                           }
-                          onDiscard={async (commentId, revision) => {
+                          onDiscard={async (commentId, revision, queueId) => {
                             if (commentId.startsWith("optimistic-")) {
                               if (!onCancelQueued)
                                 throw new Error("Discard is unavailable.");
@@ -3792,7 +3800,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                             }
                             if (!onDiscardQueuedComment)
                               throw new Error("Discard is unavailable.");
-                            await onDiscardQueuedComment(commentId, revision);
+                            if (queueId) await onDiscardQueuedComment(commentId, revision, queueId);
+                            else await onDiscardQueuedComment(commentId, revision);
                             if (queuedEdit?.commentId === commentId)
                               setQueuedEdit(null);
                           }}
@@ -3801,6 +3810,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                       <div className="relative z-10">
                         <TaskChatComposer
                           onAdd={handleThreadAdd}
+                          steeringDisposition={queuedMessageQueue?.entries.length && !queuedMessageQueue.entries[0]!.behindReset
+                            ? queuedMessageQueue.steeringDisposition : null}
                           confirmedSubmissionIds={new Set(comments.filter((comment) =>
                             comment.authorUserId === currentUserId && comment.clientRequestId &&
                             !("clientStatus" in comment && comment.clientStatus)
