@@ -446,7 +446,7 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     expect(classifyNativeMidStreamCutRecovery(failed({ code: "pi_provider_error", message: "429 rate_limit_error: This request triggered rate limit restrictions." }))).toBeNull();
     expect(classifyNativeMidStreamCutRecovery(failed({ code: "pi_provider_error", message: "unexpected EOF" }))).toBe("provider_error");
     expect(classifyNativeMidStreamCutRecovery(failed({ code: "pi_rpc_transport_failed", message: "upstream connect error: stream reset" }))).toBe("provider_error");
-    expect(classifyNativeMidStreamCutRecovery(failed({ code: "pi_output_truncated" }))).toBe("output_cap");
+    expect(classifyNativeMidStreamCutRecovery(failed({ code: "pi_output_truncated" }))).toBe("output_cap_no_text");
     // compose: an account or key rejection that names the Terms of Service is an
     // ordinary provider error; a request the provider says violates them is a refusal.
     expect(isNativeProviderRefusal({ code: "pi_provider_error", message: "400 invalid_request_error: Account blocked until Terms of Service are accepted. See https://www.anthropic.com/legal/commercial-terms." })).toBe(false);
