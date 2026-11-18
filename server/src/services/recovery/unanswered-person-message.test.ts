@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { appendFileSync } from "node:fs";
 import {
   activityLog,
   agentWakeupRequests,
   agents,
   approvals,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issueApprovals,
@@ -21,7 +23,7 @@ import {
   statusDecisionEffects,
   environmentLeases,
 } from "@paperclipai/db";
-import { and, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { executionProjectionsForRuns } from "../execution-projection.js";
@@ -33,7 +35,8 @@ import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "../continuation-comment-input.js";
 import { taskInterruptionPresentation } from "../task-interruption-presentation.js";
 import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION } from "../native-runtime/remote-runner-recovery-diagnostics.js";
-import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
+import { accessService } from "../access.js";
+import { deliverReconciledExecutions, markExecutionReconciliation, settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
@@ -81,7 +84,21 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       if (r.commentId) contextSnapshot.wakeCommentId = r.commentId;
       const created = at();
       const finishedAt = r.finishedAgoMs === undefined ? created : new Date(Date.now() - r.finishedAgoMs);
-      const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: r.status, runtimeMode: "native",
+      // The responsible user, as the REAL run insert sets it (heartbeat/queue.ts:5341 `responsibleUserId: await
+      // resolveQueuedResponsibleUserId()` -> run-preparation.ts resolveResponsibleUserIdForRunSeed), in its order:
+      // the author of the run's own wake message (not for a retry); a retry inherits its origin run's; last the
+      // company's oldest active owner. With none of them the real insert REFUSES the run; this helper then leaves
+      // NULL, and such a run is a planted one (no row of this file reads a NULL responsible user).
+      let responsibleUserId: string | null = null;
+      if (r.commentId && !r.retryOfRunId) responsibleUserId = (await db.select({ authorUserId: issueComments.authorUserId }).from(issueComments)
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.id, r.commentId))))[0]?.authorUserId ?? null;
+      if (!responsibleUserId && r.retryOfRunId) responsibleUserId = (await db.select({ responsibleUserId: heartbeatRuns.responsibleUserId })
+        .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, r.retryOfRunId))))[0]?.responsibleUserId ?? null;
+      if (!responsibleUserId) responsibleUserId = (await db.select({ userId: companyMemberships.principalId }).from(companyMemberships)
+        .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.status, "active"), eq(companyMemberships.membershipRole, "owner")))
+        .orderBy(asc(companyMemberships.createdAt), asc(companyMemberships.id)))[0]?.userId ?? null;
+      const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: r.status, runtimeMode: "native", responsibleUserId,
         nativeIssueId: issueId, contextSnapshot, error: r.error ?? null, errorCode: r.errorCode ?? null,
         retryOfRunId: r.retryOfRunId ?? null, createdAt: created,
         finishedAt: ["running", "queued", "scheduled_retry"].includes(r.status) ? null : finishedAt }).returning();
@@ -1778,4 +1795,144 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notices).toHaveLength(1);
       expect(notices[0]!.body).toBe(NO_REPLY);
     });
+  // am7 item 5, the REAL-PRODUCER DRAIN ROW (replaces D1). No wake and no continuation run is written by hand.
+  // The producers, in order (each is the real function):
+  // 1. markExecutionReconciliation (routes/issues.ts calls it for a restore) records continuationDelivery 'pending'
+  //    on the restored action A of the cut-off run that carried M.
+  // 2. The worker deliverReconciledExecutions calls the real heartbeat wakeup (execution-recovery-resolution.ts
+  //    :569-590). While a LIVE RUN holds the task that wake defers with NO wake row (heartbeat/queue.ts: "The
+  //    resolved action is already a durable retry outbox"); A stays 'pending'.
+  // 3. The live run ends through the real cancelRun, which leaves its own board hold B
+  //    (legacy_execution_requires_reconciliation). The worker's next wake() for A now DEFERS behind B as a
+  //    deferred_issue_execution wake whose context is saved as _paperclipWakeContext and names M.
+  // 4. B is restored: markExecutionReconciliation 'pending' -> deliverReconciledExecutions starts B's own
+  //    continuation; real dispatch (drainActiveRunExecutions; no runner here, so it ends) promotes the deferred
+  //    wake into a RUN carrying M; the worker's next pass records A 'delivered' with that run.
+  // PLANTED, and named so: the cut-off run, the live run and its execution lock (no runner starts a run in this
+  // harness), A's and B's restored row state (the operator's decision), and the successor's final reply.
+  const RECOVERING_TEXT = "The run answering your message was cut off. Paperclip is recovering it and will continue by itself; your message is saved.";
+  const carriesM = (snapshot: unknown, messageId: string) => {
+    const context = (snapshot ?? {}) as { wakeCommentId?: unknown; wakeCommentIds?: unknown };
+    return context.wakeCommentId === messageId || (Array.isArray(context.wakeCommentIds) && context.wakeCommentIds.includes(messageId));
+  };
+  it.each([{ owner: false, name: "no company owner: the successor's responsible user comes from the cut-off run, as the real insert reads it" },
+    { owner: true, name: "companion: the company has a real owner membership (accessService.ensureMembership)" }])(
+    "drain REAL PRODUCER ($name): a restored action whose wake() defers behind the task's execution (context saved as _paperclipWakeContext) -> "
+    + "markExecutionReconciliation 'pending' -> deliverReconciledExecutions -> exactly one successor carrying M starts, no deferred wake left, "
+    + "no recovering note at END+11, no notice at +12",
+    async ({ owner }) => {
+      const f = await fixture();
+      // The real company-creation producer of the owner (routes/companies.ts calls accessService.ensureMembership).
+      if (owner) await accessService(db).ensureMembership(f.companyId, "user", f.userId, "owner", "active");
+      const commentId = await f.message();
+      const runId = await f.run({ commentId, status: "failed", errorCode: "native_continuation_requires_reconciliation",
+        error: "native_session_supervisor_busy" });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]!.responsibleUserId,
+        "the helper set the cut-off run's responsible user as the real insert does: M's author").toBe(f.userId);
+      // PLANTED: a live execution holds the task (another run of the same agent, running, owning the execution lock).
+      // A legacy run, inserted here and not by f.run: the real cancelRun below needs no native coordinator for it.
+      const liveRunId = (await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running",
+        runtimeMode: "legacy", responsibleUserId: f.userId, startedAt: new Date(), createdAt: f.at(),
+        contextSnapshot: { issueId: f.issueId, wakeReason: "heartbeat_timer" } }).returning())[0]!.id;
+      await db.update(issues).set({ executionRunId: liveRunId, executionLockedAt: new Date(), executionAgentNameKey: "managed pi" })
+        .where(eq(issues.id, f.issueId));
+      const [action] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "active_run_watchdog", status: "resolved", ownerType: "system", outcome: "restored", returnOwnerAgentId: f.agentId,
+        cause: "native_continuation_requires_reconciliation", fingerprint: `native-workspace:${runId}`, attemptCount: 1,
+        resolvedAt: new Date(), evidence: { runId },
+        nextAction: "The previous run was cut off. Paperclip continues the task in a fresh run from its last saved work." }).returning();
+      await markExecutionReconciliation(db, action!, { runId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "The cut-off run made no external change; continue from its saved input." }, "operator");
+      const read = async () => (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]!;
+      expect((await read()).evidence.continuationDelivery).toBe("pending");
+      const hb = heartbeatService(db);
+      // The observed states go to the test log, or to the file DRAIN_TRACE names.
+      const emit = (line: string) => process.env.DRAIN_TRACE ? appendFileSync(process.env.DRAIN_TRACE, `${line}\n`) : console.log("DRAIN_REAL_PRODUCER", line);
+      const wakesOf = async () => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      const successorsOf = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+        .filter(r => r.id !== runId && r.id !== liveRunId);
+      const trace = async (step: string) => emit(JSON.stringify({ owner, step, evidence: (await read()).evidence,
+        successors: (await successorsOf()).map(r => ({ id: r.id, status: r.status, responsibleUserId: r.responsibleUserId, retryOfRunId: r.retryOfRunId,
+          context: r.contextSnapshot })),
+        holds: (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(h => ({ id: h.id,
+          kind: h.kind, status: h.status, ownerType: h.ownerType, cause: h.cause, outcome: h.outcome, evidence: h.evidence })),
+        wakes: (await wakesOf()).map(w => ({ id: w.id, status: w.status, reason: w.reason, runId: w.runId, payload: w.payload })) }));
+      // Pass 1 of the real worker: its wake() defers on the live execution.
+      const wakeResults: unknown[] = [];
+      const wakeup = (async (...args: Parameters<typeof hb.wakeup>) => {
+        const result = await hb.wakeup(...args); // the real wakeup, observed; the worker is global, so keep this action's calls only
+        if ((args[1]?.payload as Record<string, unknown> | undefined)?.recoveryActionId === action!.id) wakeResults.push(result);
+        return result; }) as typeof hb.wakeup;
+      await deliverReconciledExecutions(db, wakeup);
+      await trace("after pass 1 (live execution holds the task)");
+      // What the real wake() does on a live execution for a reconciled continuation (heartbeat/queue.ts, "The
+      // resolved action is already a durable retry outbox ... or create a second deferred wake"): it DEFERS by
+      // returning no run and writes NO deferred wake row; the action itself stays 'pending' and is tried again.
+      expect(wakeResults, "the worker called the real wake() once and it deferred: no run").toEqual([null]);
+      expect(await wakesOf(), "no wake row at all: no sparse deferred wake can be left behind").toEqual([]);
+      const waiting = await read();
+      expect(waiting.evidence.continuationDelivery, "the continuation stays owed on the action").toBe("pending");
+      expect(typeof waiting.evidence.continuationDeliveryAttemptedAt, "the deferred attempt is recorded").toBe("string");
+      expect(await successorsOf(), "nothing started while the live run holds the task").toHaveLength(0);
+      // The live run ends through the real cancelRun (the system's, no user). It leaves its own board hold B.
+      await hb.cancelRun(liveRunId, "Cancelled by system", { errorCode: "cancelled" });
+      const holdsOf = async () => (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)))
+        .filter(h => h.id !== action!.id && h.kind === "active_run_watchdog");
+      const [hold] = await holdsOf();
+      expect(hold, "the real cancelRun left a board hold on the stopped run").toMatchObject({ kind: "active_run_watchdog", status: "active",
+        ownerType: "board", cause: "legacy_execution_requires_reconciliation", evidence: { runId: liveRunId } });
+      // Pass 2 of the real worker: A's wake() now defers behind hold B, as a deferred wake with its saved context.
+      await deliverReconciledExecutions(db, wakeup);
+      await trace("after pass 2 (hold B blocks the task)");
+      const deferred = (await wakesOf()).filter(w => w.status === "deferred_issue_execution");
+      expect(deferred, "the real wake() deferred A's continuation behind the hold").toHaveLength(1);
+      expect(deferred[0]!.runId).toBeNull();
+      const deferredPayload = deferred[0]!.payload as Record<string, unknown>;
+      expect(deferredPayload.executionWait, "it waits on hold B").toMatchObject({ reason: "execution_recovery", recoveryActionId: hold!.id });
+      const saved = deferredPayload._paperclipWakeContext;
+      expect(saved, "the deferred wake saved the continuation's context").toMatchObject({ recoveryActionId: action!.id,
+        wakeReason: "issue_recovery_action_restored", retryOfRunId: runId });
+      expect(carriesM(saved, commentId), "the saved context names M: not a sparse deferred wake").toBe(true);
+      expect(await successorsOf(), "nothing started behind the hold").toHaveLength(0);
+      expect((await read()).evidence.continuationDelivery).toBe("pending");
+      // B is restored. PLANTED: the operator's decision state on B; the continuation record is the real producer's.
+      await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "restored", ownerType: "system", returnOwnerAgentId: f.agentId,
+        resolvedAt: new Date() }).where(eq(issueRecoveryActions.id, hold!.id));
+      const [restoredHold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold!.id));
+      await markExecutionReconciliation(db, restoredHold!, { runId: liveRunId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "The stopped run made no external change; continue from its saved input." }, "operator");
+      expect((await holdsOf())[0]!.evidence.continuationDelivery).toBe("pending");
+      // Pass 3 delivers B (its own continuation, which never carried M); real dispatch then ends that run (no
+      // runner here) and PROMOTES the deferred wake into a run; pass 4 records A as delivered by that run.
+      await deliverReconciledExecutions(db, wakeup);
+      await trace("after pass 3 (B delivered)");
+      await hb.drainActiveRunExecutions();
+      await trace("after real dispatch drained");
+      await deliverReconciledExecutions(db, wakeup);
+      await trace("after pass 4");
+      const delivered = await read();
+      const successors = (await successorsOf()).filter(r => carriesM(r.contextSnapshot, commentId));
+      expect(successors, "exactly ONE successor carrying M").toHaveLength(1);
+      expect(successors[0]!.contextSnapshot, "it is A's continuation of the cut-off run").toMatchObject({ recoveryActionId: action!.id,
+        wakeReason: "issue_recovery_action_restored" });
+      expect(successors[0]!.retryOfRunId).toBe(runId);
+      expect(successors[0]!.startedAt, "it STARTED").not.toBeNull();
+      expect(successors[0]!.responsibleUserId, "the real insert resolved the successor's responsible user").toBe(f.userId);
+      expect((await successorsOf()).filter(r => !carriesM(r.contextSnapshot, commentId)).map(r => r.contextSnapshot?.recoveryActionId),
+        "the only other run is B's own continuation").toEqual([hold!.id]);
+      expect(delivered.evidence.continuationDelivery).toBe("delivered");
+      expect(delivered.evidence.continuationRunId).toBe(successors[0]!.id);
+      expect((await wakesOf()).filter(w => w.status === "deferred_issue_execution"), "no deferred wake is left").toEqual([]);
+      expect((await wakesOf()).filter(w => w.runId === successors[0]!.id).map(w => w.reason), "the deferred wake BECAME the successor")
+        .toEqual(["issue_execution_promoted"]);
+      await settleAt(f, 11 * 60_000);
+      expect((await f.visible()).map(n => n.body), "no recovering promise at END+11 min").not.toContain(RECOVERING_TEXT);
+      // PLANTED: the successor's answer (no model runs here; real dispatch ended it without a runner).
+      await db.update(heartbeatRuns).set({ status: "succeeded", error: null, errorCode: null, finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, successors[0]!.id));
+      await f.reply(successors[0]!.id);
+      await settleAt(f, 12 * 60_000);
+      emit(JSON.stringify({ owner, step: "visible at +12 min", visible: (await f.visible()).map(n => ({ body: n.body, metadata: n.metadata })) }));
+      expect(await f.visible(), "no notice at +12 min").toHaveLength(0);
+    }, 120_000);
 });
