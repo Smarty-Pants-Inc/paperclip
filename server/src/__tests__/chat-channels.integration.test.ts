@@ -18,6 +18,7 @@ import { environmentService } from "../services/environments.js";
 import { reconcilePersistedRuntimeServicesOnStartup, readWorkspaceRuntimeIdleWork } from "../services/workspace-runtime.js";
 import { createAdmissionTransactionScope, createWakeAdmissionWriter } from "../modules/wake-queue/adapters/postgres.js";
 import { chatFailedRetryNoticeWork } from "../services/chat-failed-retry-notice-work.js";
+import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { chatInboundWakeNoticeWork } from "../services/chat-inbound-wake-notice-work.js";
 import { nativeChatProgressWork } from "../services/chat-native-progress-work.js";
@@ -70667,6 +70668,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await db.insert(agentWakeupRequests).values(copiedIds.map(id => ({
         ...receipt, id, idempotencyKey: `retry-discovery-budget:${id}`,
       })));
+      // Fixture setup queues debounced secret-resolution writes (secret-resolution-writes.ts:114/187);
+      // flush them so they cannot land inside the whole-db capture window below.
+      await flushSecretResolutionWrites();
       const scope = { companyId: context.fixture.companyId, issueId: context.issue.id };
       const events: Array<Record<string, unknown>> = [], now = Date.now();
       const capture = createFullDatabaseResponseCapture({ start: now - 1, end: now + 59_000 }, event => events.push(event));
