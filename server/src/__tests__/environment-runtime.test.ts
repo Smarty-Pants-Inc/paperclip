@@ -952,6 +952,113 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     },
   );
 
+  // Keep: never-OK trace loss. The failed close marks the OLD owner's row; a
+  // successor's unmarked lease on the same box must not destroy past it.
+  describe("destroy-guard: nativeHarnessBackupMissing is allocation-wide in the final destroy claim", () => {
+    async function seedSuccessorWithPredecessor(predecessorBox: string) {
+      const f = await seedReusablePluginSandboxLease("paperclip_runner");
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+      const [predecessor] = await db.insert(environmentLeases).values({
+        companyId: f.companyId, environmentId: f.environment.id, executionWorkspaceId: f.executionWorkspaceId,
+        heartbeatRunId: f.runId, status: "expired", leasePolicy: "reuse_by_environment", provider: "fake-plugin",
+        providerLeaseId: predecessorBox, releasedAt: new Date(), cleanupStatus: "success",
+        metadata: { ...f.reusableLease.metadata, reusableLeaseSuccessor: { leaseId: f.reusableLease.id } },
+      }).returning();
+      await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, f.reusableLease.id));
+      const successor = (await environmentService(db).getLeaseById(f.reusableLease.id))!;
+      expect(successor.metadata).not.toHaveProperty("nativeHarnessBackupMissing");
+      const call = vi.fn(async (_pluginId: string, method: string) => {
+        if (method !== "environmentDestroyLease") throw new Error(`Unexpected method: ${method}`);
+        return { providerLeaseId: successor.providerLeaseId, state: "destroyed" };
+      });
+      const service = environmentRuntimeService(db, { pluginWorkerManager: {
+        isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentDestroyLease"] }),
+      } as unknown as PluginWorkerManager });
+      const destroy = async (destroyPath: "run" | "reusable" | "retry") => {
+        if (destroyPath === "run") return await service.destroyRunLease({ environment: f.environment, lease: successor });
+        if (destroyPath === "reusable") {
+          const result = await service.destroyReusableSandboxLeases({ companyId: f.companyId, executionWorkspaceId: f.executionWorkspaceId });
+          return result.length ? result : null;
+        }
+        return await service.retryPendingSandboxTeardown({ environment: f.environment, lease: successor }).catch((error: Error) => {
+          expect(error.message).toBe("Native harness backup is missing; destructive cleanup is forbidden.");
+          return null;
+        });
+      };
+      return { f, predecessor: predecessor!, successor, call, destroy };
+    }
+    async function markPredecessor(f: { companyId: string; environment: Environment; runId: string }, leaseId: string, box: string) {
+      const { markNativeHarnessBackupMissing } = await import("../services/native-runtime/native-harness-backup-missing.ts");
+      await markNativeHarnessBackupMissing(db, { companyId: f.companyId, environmentId: f.environment.id, providerLeaseId: box,
+        runId: f.runId, leaseId, sessionId: "pi-predecessor-session", reason: "retries_exhausted" });
+    }
+
+    it.each(["run", "reusable", "retry"] as const)(
+      "an expired predecessor's marker on the same box refuses the successor's %s destroy", async destroyPath => {
+        const { f, predecessor, successor, call, destroy } = await seedSuccessorWithPredecessor("reusable-plugin-lease");
+        await markPredecessor(f, predecessor.id, "reusable-plugin-lease");
+        const result = await destroy(destroyPath);
+        expect(call).not.toHaveBeenCalled();
+        const kept = (await environmentService(db).getLeaseById(successor.id))!;
+        if (destroyPath === "reusable") {
+          // Archive pre-claims the row for the sweep (ER destroyClaimedSandboxLease); the final claim keeps the box.
+          expect(result).toMatchObject([{ lease: { id: successor.id, status: "pending_cleanup" } }]);
+          expect(kept).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+        } else {
+          expect(result).toBeNull();
+          expect(kept).toMatchObject({ status: "retained" });
+        }
+        expect((await environmentService(db).getLeaseById(successor.id))!.metadata).not.toHaveProperty("agentFileDestroyClaim");
+        expect((await environmentService(db).getLeaseById(predecessor.id))!).toMatchObject({ status: "expired",
+          metadata: { nativeHarnessBackupMissing: { sessionId: "pi-predecessor-session", reason: "retries_exhausted" } } });
+      });
+
+    it("a marker committed while the claim waits is seen by the claim (serialized with the marker write)", async () => {
+      const { f, predecessor, successor, call, destroy } = await seedSuccessorWithPredecessor("reusable-plugin-lease");
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let written!: () => void;
+      const markerWritten = new Promise<void>(resolve => { written = resolve; });
+      const marker = { runId: f.runId, sessionId: "pi-race-session", sessionRootDigest: "c".repeat(64), reason: "close_failed", at: new Date().toISOString() };
+      const markerTx = db.transaction(async tx => {
+        await tx.update(environmentLeases).set({
+          metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ nativeHarnessBackupMissing: marker })}::jsonb`,
+        }).where(eq(environmentLeases.id, predecessor.id));
+        written();
+        await gate;
+      });
+      await markerWritten;
+      const destroying = destroy("run");
+      await new Promise(resolve => setTimeout(resolve, 400));
+      release();
+      await markerTx;
+      expect(await destroying).toBeNull();
+      expect(call).not.toHaveBeenCalled();
+      expect((await environmentService(db).getLeaseById(successor.id))!).toMatchObject({ status: "retained" });
+      expect((await environmentService(db).getLeaseById(predecessor.id))!.metadata?.nativeHarnessBackupMissing).toEqual(marker);
+    });
+
+    it("no marker anywhere on the allocation destroys as today", async () => {
+      const { successor, call, destroy } = await seedSuccessorWithPredecessor("reusable-plugin-lease");
+      expect(await destroy("run")).toMatchObject({ id: successor.id, status: "expired", cleanupStatus: "success" });
+      expect(call).toHaveBeenCalledOnce();
+    });
+
+    it("a marker on a DIFFERENT box has no effect on this box's destroy", async () => {
+      const { f, predecessor, successor, call, destroy } = await seedSuccessorWithPredecessor("other-box");
+      await markPredecessor(f, predecessor.id, "other-box");
+      expect(await destroy("run")).toMatchObject({ id: successor.id, status: "expired", cleanupStatus: "success" });
+      expect(call).toHaveBeenCalledOnce();
+      expect((await environmentService(db).getLeaseById(predecessor.id))!.metadata).toHaveProperty("nativeHarnessBackupMissing");
+    });
+
+    it("the marker write confirms its row: a write that matches no row throws instead of silently passing", async () => {
+      const { f, predecessor } = await seedSuccessorWithPredecessor("reusable-plugin-lease");
+      await expect(markPredecessor(f, predecessor.id, "not-this-box")).rejects.toThrow("native_harness_backup_missing_not_recorded");
+      expect((await environmentService(db).getLeaseById(predecessor.id))!.metadata).not.toHaveProperty("nativeHarnessBackupMissing");
+    });
+  });
+
   it.each([true, false])("nativeHarnessBackupMissing guards the reusable driver's expiry destroy (flagged=%s)", async flagged => {
     // Expiry delegates straight to destroyReusableSandboxLease, not the public
     // destroy or scoped cleanup guards exercised above.
