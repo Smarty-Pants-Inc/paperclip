@@ -204,6 +204,7 @@ describe("automatic retained workspace recovery", () => {
         // A held intake may have attempted admission more than once, but must deliver one turn.
         explicitResume = heartbeat.resumeTaskRetry(f.companyId, receipt.requestId);
       }
+      await explicitResume;
       const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
         mode === "automatic_lost" ? eq(heartbeatRuns.scheduledRetryReason, "interrupted_preparation")
           : sql`${heartbeatRuns.contextSnapshot}->>'taskRetryRequestId' = ${receipt.requestId}`));
@@ -217,6 +218,11 @@ describe("automatic retained workspace recovery", () => {
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(and(
         eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "running")));
       releaseStart!(); await Promise.all([heldStart, explicitResume]);
+      await new Promise(resolve => setTimeout(resolve, 3_000));
+      const successorsLater = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+        mode === "automatic_lost" ? eq(heartbeatRuns.scheduledRetryReason, "interrupted_preparation")
+          : sql`${heartbeatRuns.contextSnapshot}->>'taskRetryRequestId' = ${receipt.requestId}`));
+      expect(successorsLater).toHaveLength(1);
       await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
       const completed = await run(successors[0].id);
       if (mode === "invalid_published_root") {
