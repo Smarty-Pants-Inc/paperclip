@@ -7,7 +7,7 @@ export const LIFECYCLE_PROBE_CLEANUP_BOUND_MS = 30 * 60_000;
 /** The one true line for native_probe_cleanup_pending, while a retryAt exists. */
 export const LIFECYCLE_PROBE_CLEANUP_PENDING_MESSAGE = "The last account test has not confirmed its test computer stopped; Paperclip will retry automatically.";
 /** The same line at the park (no retryAt): no "will retry". */
-export const LIFECYCLE_PROBE_CLEANUP_PARKED_MESSAGE = "The last account test has not confirmed its test computer stopped. Press Retry after a few minutes; if it stays stuck, tell your operator.";
+export const LIFECYCLE_PROBE_CLEANUP_PARKED_MESSAGE = "The last account test has not confirmed its test computer stopped. Choose Retry after a few minutes; if it stays stuck, tell your operator.";
 
 /** Saved retries use the shared lifecycle deadline, never a separate timer. */
 export function lifecycleRetryDelay(failures: number, capMs = 300_000): number {
