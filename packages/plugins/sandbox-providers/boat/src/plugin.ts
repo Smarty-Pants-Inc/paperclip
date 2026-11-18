@@ -28,12 +28,29 @@ import type {
   PluginEnvironmentRunnerIngressEndpointParams, PluginEnvironmentRunnerIngressEndpoint, PluginContext,
 } from "@paperclipai/plugin-sdk";
 
-type Config = RunnerConfig & { provider: string; setupTimeoutSeconds: number; runLeaseRenewCapSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
+type Config = RunnerConfig & { apiBaseUrl?: string; provider: string; setupTimeoutSeconds: number; runLeaseRenewCapSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
 const DEFAULT_RUN_LEASE_RENEW_CAP_SECONDS = 86400;
 function validRunLeaseRenewCap(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 2_592_000;
 }
 const API = "https://boat.dev/api/v1";
+let apiBaseUrlWarned = false;
+/** Test-only, server-env authority; validate again even for callers bypassing config validation. */
+function apiBase(config: Record<string, unknown>): string {
+  if (config.apiBaseUrl === undefined) return API;
+  if (process.env.PAPERCLIP_BOAT_FAULT_PROXY_ALLOWED !== "1") throw new Error("Boat apiBaseUrl requires PAPERCLIP_BOAT_FAULT_PROXY_ALLOWED=1 in the server process environment.");
+  let url: URL;
+  try {
+    if (typeof config.apiBaseUrl !== "string") throw new Error();
+    url = new URL(config.apiBaseUrl);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || /[?#]/.test(url.href) || /^[^:]+:\/+[^/]*@/.test(config.apiBaseUrl.trim().replace(/\\/g, "/"))) throw new Error();
+  } catch { throw new Error("Boat apiBaseUrl must be an http: or https: URL without userinfo, query or fragment."); }
+  if (!apiBaseUrlWarned && duplexLogger) {
+    duplexLogger.warn("Boat apiBaseUrl fault-proxy override enabled", { host: typeof config.apiKey === "string" && config.apiKey.trim() ? url.host.split(config.apiKey.trim()).join("[REDACTED]") : url.host });
+    apiBaseUrlWarned = true;
+  }
+  return url.href.replace(/\/+$/, "");
+}
 const SPARE_ACTIVITY_EVENTS = ["agent.run.started", "agent.run.finished", "agent.run.failed", "agent.run.cancelled",
   "issue.comment.created", "issue.created", "issue.updated"] as const;
 const idleActivity = new BoatIdleActivity();
@@ -99,7 +116,7 @@ function subscribeCompanyActivity(companyId: string): void {
 }
 const BOAT_CALL_BUDGET_MS = 30_000;
 const BOAT_MAX_ATTEMPTS = 3;
-function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${API}\0${config.apiKey}\0${id}`).digest("hex"); }
+function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${apiBase(config)}\0${config.apiKey}\0${id}`).digest("hex"); }
 // smarty-dev#20974: Boat's documented 409 answers (troubleshooting 'Error
 // messages'; readiness.md:9-31). Only these closed values reach an error.
 // snapshot_data_expired is Boat's troubleshooting.md, 'Error messages',
@@ -601,6 +618,7 @@ async function resumeOwedSpareStops(config: Config, companyId: string, environme
 function parse(raw: Record<string, unknown>): Config {
   return {
     apiKey: typeof raw.apiKey === "string" ? raw.apiKey.trim() : "",
+    ...(raw.apiBaseUrl === undefined ? {} : { apiBaseUrl: apiBase(raw) }),
     provider: typeof raw.provider === "string" ? raw.provider : "boat",
     duplexCarrier: raw.duplexCarrier === "ssh" ? "ssh" : "off",
     ...(typeof raw.snapshot === "string" ? { snapshot: raw.snapshot } : {}),
@@ -818,7 +836,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         sendBody = JSON.stringify({ ...responseOptions.command, command: attemptCommand });
       }
       commandInFlight = commandSend;
-      response = await fetch(`${API}${path}`, { ...init, body: sendBody, headers, redirect: "error", signal: callSignal });
+      response = await fetch(`${apiBase(config)}${path}`, { ...init, body: sendBody, headers, redirect: "error", signal: callSignal });
       commandInFlight = false;
       httpStatus = response.status;
       if ((commandSend || filesCall) && response.status >= 500) {
@@ -1440,7 +1458,7 @@ async function stopSandboxRequests(config: Config, id: string): Promise<{ provid
 function cleanupIdentity(config: Config, id: string, owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string): PluginEnvironmentCreationCleanup {
   return { providerLeaseId: id, observedProviderLeaseId: id, companyId: owner.companyId,
     environmentId: owner.environmentId, runId: owner.runId, attemptId,
-    accountFingerprint: createHash("sha256").update(`${API}\n${config.apiKey}`).digest("hex"),
+    accountFingerprint: createHash("sha256").update(`${apiBase(config)}\n${config.apiKey}`).digest("hex"),
     labels: { "paperclip-acquire": attemptId } };
 }
 async function acquisitionMatches(config: Config, attemptId: string, owner: { companyId: string; environmentId: string; runId?: string }, deadline?: number): Promise<string[]> {
@@ -1613,7 +1631,7 @@ function readySpareHash(config: Config, ttlSeconds: number, from: string | undef
     configuredSnapshot: config.snapshot ?? null,
     resolvedSnapshot: snapshot ? { id: snapshot.id, name: snapshot.name, createdAt: snapshot.createdAt } : null,
     pinnedSnapshotId: config.pinnedSnapshotId ?? null,
-    accountFingerprint: createHash("sha256").update(`${API}\n${config.apiKey}`).digest("hex"),
+    accountFingerprint: createHash("sha256").update(`${apiBase(config)}\n${config.apiKey}`).digest("hex"),
   });
 }
 async function listBoatSandboxes(config: Config, labels: Array<[string, string]>): Promise<any[]> {
@@ -2132,6 +2150,7 @@ function startRunLeaseTtlRefresh(params: PluginEnvironmentAcquireLeaseParams | P
 const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async setup(ctx) {
     shuttingDown = false;
+    apiBaseUrlWarned = false;
     boatRateLimitPauseUntil = 0;
     preparedEnvDirectories.clear();
     readySpares.start();
@@ -2273,6 +2292,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   },
   async onIdleDrain() { return idleActivity.present() || duplexChannels.present() || readySpares.present() ? "present" : "none"; },
   async onEnvironmentValidateConfig(params: PluginEnvironmentValidateConfigParams): Promise<PluginEnvironmentValidationResult> {
+    try { apiBase(params.config); }
+    catch (error) { return { ok: false, errors: [(error as Error).message] }; }
     const c = parse(params.config); const errors: string[] = [];
     if (!c.apiKey) errors.push("Boat apiKey is required.");
     if (params.config.duplexCarrier !== undefined && !["off", "ssh"].includes(String(params.config.duplexCarrier))) errors.push("duplexCarrier must be off or ssh.");
