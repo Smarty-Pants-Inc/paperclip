@@ -86,9 +86,23 @@ export async function ownLeaseTerminated(db: Db, owner: RemoteLeaseOwner,
   const runLeases = leases.filter(ownRun);
   const earlierOwn = (lease: Lease) => runLeases.length > 1 && runLeases.some(other => other.id !== lease.id &&
     other.acquiredAt.getTime() > lease.acquiredAt.getTime());
+  // B1: a receipt says the box stopped at confirmedAt, not that it stayed
+  // stopped. Another holder's lease on this box acquired at or after then, or
+  // still open, may have resumed it (and the owner's runner with it). Boat's
+  // driver is not in this tree, so nothing shows a destroyed allocation id is
+  // never reused: the same rule holds for "destroyed".
+  const otherHolder = (lease: Lease) => !ownRun(lease) && !(owner.leaseId !== undefined && lease.id === owner.leaseId);
+  // The receipt's own lease is the one that stopped, never a resume of it.
+  const resumedSince = (receiptLease: Lease, confirmedAt: unknown) => {
+    const confirmed = typeof confirmedAt === "string" ? Date.parse(confirmedAt) : NaN;
+    return leases.some(other => other.id !== receiptLease.id && otherHolder(other) && (!other.releasedAt
+      || !Number.isFinite(confirmed) || other.acquiredAt.getTime() >= confirmed));
+  };
   return resolved.some(lease => {
     if (!terminationReceipt(lease, owner.leaseId)) return false;
-    const state = (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state;
+    const receipt = lease.metadata?.remoteExecutionTermination as { state?: unknown; confirmedAt?: unknown } | undefined;
+    if (resumedSince(lease, receipt?.confirmedAt)) return false;
+    const state = receipt?.state;
     const ownLease = (ownRun(lease) && !(scope.ownLeaseOnly === true && earlierOwn(lease)))
       || (owner.leaseId !== undefined && lease.id === owner.leaseId);
     return (state === "destroyed" && (ownLease || scope.ownLeaseOnly !== true))
