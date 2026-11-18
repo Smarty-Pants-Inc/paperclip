@@ -8188,6 +8188,7 @@ export function issueRoutes(
   function operatorInterruptCancelOptions(input: { issueId: string; actor: ReturnType<typeof getActorInfo> }) {
     return {
       errorCode: "operator_interrupted",
+      stopAcceptance: "interrupt" as const,
       resultJson: {
         operatorInterrupted: true,
         interruptionSource: "issue_comment_interrupt",
