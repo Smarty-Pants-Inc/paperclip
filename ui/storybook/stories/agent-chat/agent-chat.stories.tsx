@@ -50,6 +50,27 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
+// Production AgentChat chooses the owner from the same primary-directory read
+// as the app; the production TaskDetailSurface owns the composer boundary.
+export const OwnSmarty: Story = {
+  name: "Own Smarty · interactive",
+  args: { primaryView: "own", coordinator: true, contextInitiallyOpen: false },
+  parameters: { paperclip: { capabilities: ["agent-chat/history"], status: "current", implementation: "production", boundary: "fixtures",
+    notes: "Kate opens her own primary agent. Production page and task surface; HTTP responses, message saves and identities are fixture data, not live company acceptance." } },
+};
+export const OtherMemberSmarty: Story = {
+  name: "Other member's Smarty · read-only",
+  args: { primaryView: "other", coordinator: true, contextInitiallyOpen: false },
+  parameters: { paperclip: { capabilities: ["agent-chat/history"], status: "current", implementation: "production", boundary: "fixtures",
+    notes: "Kate opens Paul's primary agent. Production owner selection and read-only thread, with no composer or member toggle. HTTP data is simulated; server authorization is covered separately." } },
+};
+export const OtherMemberNoChat: Story = {
+  name: "Other member's Smarty · no chat yet",
+  args: { primaryView: "other-empty", coordinator: true, contextInitiallyOpen: false },
+  parameters: { paperclip: { capabilities: ["agent-chat/history"], status: "current", implementation: "production", boundary: "fixtures",
+    notes: "Production page's plain one-line state when no shared owner conversation exists. Does not create a chat; fixture HTTP responses only." } },
+};
+
 export const Returning: Story = {
   name: "01 · Pick up the conversation",
   args: { scenario: "returning" },

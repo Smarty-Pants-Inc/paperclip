@@ -7,6 +7,12 @@ export interface PrimaryAgentPreference {
   initialized: boolean;
 }
 
+/** Company-visible primary assignments for active human members. */
+export interface MemberPrimaryAgent {
+  userId: string;
+  agentId: string;
+}
+
 export const updatePrimaryAgentSchema = z.object({
   primaryAgentId: z.string().uuid(),
 }).strict();

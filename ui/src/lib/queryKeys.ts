@@ -679,6 +679,7 @@ export const queryKeys = {
       ["sidebar-preferences", "project-order", companyId, userId] as const,
   },
   primaryAgent: {
+    members: (companyId: string, userId: string) => ["primary-agent", companyId, "members", userId] as const,
     mine: (companyId: string, userId: string) => ["primary-agent", companyId, userId] as const,
   },
   resourceMemberships: {

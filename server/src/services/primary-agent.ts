@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
-import { agents, userCompanyPreferences, type Db } from "@paperclipai/db";
-import type { PrimaryAgentPreference } from "@paperclipai/shared";
+import { agents, companyMemberships, userCompanyPreferences, type Db } from "@paperclipai/db";
+import type { MemberPrimaryAgent, PrimaryAgentPreference } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { resourceMembershipService } from "./resource-memberships.js";
@@ -57,6 +57,18 @@ export function primaryAgentService(db: Db) {
   }
   return {
     get,
+    async list(companyId: string): Promise<MemberPrimaryAgent[]> {
+      return db.select({ userId: userCompanyPreferences.userId, agentId: agents.id })
+        .from(userCompanyPreferences)
+        .innerJoin(companyMemberships, and(
+          eq(companyMemberships.companyId, userCompanyPreferences.companyId),
+          eq(companyMemberships.principalId, userCompanyPreferences.userId),
+          eq(companyMemberships.principalType, "user"), eq(companyMemberships.status, "active"),
+        ))
+        .innerJoin(agents, and(eq(agents.companyId, companyId), eq(agents.id, userCompanyPreferences.primaryAgentId)))
+        .where(eq(userCompanyPreferences.companyId, companyId))
+        .orderBy(userCompanyPreferences.userId);
+    },
     async set(companyId: string, userId: string, agentId: string, actor: Express.Request["actor"]) {
       const result = await db.transaction(async tx => {
         const txDb = tx as unknown as Db;
