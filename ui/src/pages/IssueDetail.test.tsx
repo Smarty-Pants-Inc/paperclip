@@ -2185,7 +2185,7 @@ describe("IssueDetail", () => {
 
   });
 
-  it.each(["message", "attachment", "plain HTTP message"])("creates an unused conversation only for the first %s and updates its canonical cache", async (kind) => {
+  it.each(["message", "attachment", "plain HTTP message"])("supersedes(creates an unused conversation only for the first %s and updates its canonical cache; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — fixture signature, idle intent stays undefined", async (kind) => {
     if (kind === "plain HTTP message") vi.stubGlobal("crypto", { getRandomValues: crypto.getRandomValues.bind(crypto) });
     mockIssuesApi.markRead.mockClear();
     const agent = createAgent();
@@ -2242,7 +2242,7 @@ describe("IssueDetail", () => {
     expect(mockIssuesApi.addComment).toHaveBeenCalledOnce();
   });
 
-  it.each([false, true])("saves chat model preferences before the ordered message (existing conversation: %s)", async (existing) => {
+  it.each([false, true])("supersedes(saves chat model preferences before the ordered message (existing conversation: %s); RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — fixture signature, ids and settings unchanged", async (existing) => {
     const agent = createAgent();
     const canonical = createIssue({ assigneeAgentId: agent.id, conversationAgentId: agent.id, conversationUserId: "user-1", status: "in_review" });
     const ensureIssue = vi.fn().mockResolvedValue(canonical);
@@ -3037,7 +3037,7 @@ describe("IssueDetail", () => {
   });
 
   it.each([false, true])(
-    "preserves explicit upload receipt IDs through the page mutation (reassign=%s)",
+    "supersedes(preserves explicit upload receipt IDs through the page mutation (reassign=%s); RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — fixture signature, upload ids unchanged",
     async (reassign) => {
       const issue = createIssue();
       const id = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
@@ -7293,7 +7293,7 @@ describe("IssueDetail", () => {
       return response;
     }
 
-    it("allows a message while tree control is pending and remains enabled after success", async () => {
+    it("supersedes(allows a message while tree control is pending and remains enabled after success; RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — fixture signature, body and receipt unchanged", async () => {
       mockIssuesApi.addComment.mockClear().mockResolvedValue(createIssueComment({ body: "Keep working" }));
       const response = await renderWithPendingTreeControl();
       expect(composerProps().composerDisabledReason).toBeNull();

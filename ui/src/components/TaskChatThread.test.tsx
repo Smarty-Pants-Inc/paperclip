@@ -5685,7 +5685,7 @@ describe("TaskChatThread Paperclip Runner queue", () => {
     { targetRunId: null, protocol: "legacy", steeringDisposition: "unsupported" },
     { targetRunId: "run-1", protocol: "paperclip_runner_v1", steeringDisposition: "temporarily_unavailable" },
     { targetRunId: "run-1", protocol: "paperclip_runner_v1", steeringDisposition: "unsupported" },
-  ] as const)("offers Interrupt for a live $protocol queue with $steeringDisposition steering and Send for a stopped queue ($targetRunId)", ({ targetRunId, protocol, steeringDisposition }) => {
+  ] as const)("supersedes(offers Interrupt for a live $protocol queue with $steeringDisposition steering and Send for a stopped queue ($targetRunId); RFL record SUPERSEDE-QUEUEUX-NOTE6-DESIGN-1118) — selected-message Interrupt now", ({ targetRunId, protocol, steeringDisposition }) => {
     const onInterruptQueued = vi.fn(async () => {});
     renderThread({
       comments: [
