@@ -635,6 +635,306 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       } finally { checkpointReadHook.callback = null; spy.mockRestore(); await Promise.allSettled(pending); await warmResult; }
     }, 60_000);
 
+  it.each([
+    ...[
+      { code: "40P01", failures: 1 }, { code: "40P01", failures: 3 },
+      { code: "40001", failures: 1 }, { code: "40001", failures: 3 },
+      { code: "55P03", failures: 1 },
+    ].map(row => ({ ...row, afterApply: false })),
+    { code: "40P01", failures: 1, afterApply: true },
+  ])("projection transaction retry: $code after $failures failures (afterApply=$afterApply)", async ({ code, failures, afterApply }) => {
+    const fixture = await staleProjection("codex", true);
+    const { prior, latest, followUp, root, path } = fixture;
+    const transaction = db.transaction.bind(db);
+    const attempts: { xid: string; checkpointReads: number }[] = [];
+    let checkpointReads = 0;
+    checkpointReadHook.callback = async () => { checkpointReads++; };
+    const spy = vi.spyOn(db, "transaction").mockImplementation((callback, config) => transaction(async tx => {
+      let refresh = false, injected = false;
+      const select = tx.select.bind(tx);
+      const wrap = (query: any): any => new Proxy(query, { get(target, key) {
+        if (key === "then") return (yes: any, no: any) => (async () => {
+          const text = target.toSQL().sql;
+          if (text.includes('to_jsonb("environment_leases")')) refresh = true;
+          if (refresh && !injected && text.includes('from "heartbeat_runs"') && /for update/i.test(text)) {
+            injected = true;
+            const [row] = await tx.execute(sql`select txid_current()::text as xid`);
+            attempts.push({ xid: String(row!.xid), checkpointReads });
+            if (!afterApply && attempts.length <= failures) {
+              // Real PostgreSQL abort/rollback, before the filesystem apply.
+              await tx.execute(sql.raw(`do $$ begin raise exception 'forced projection conflict' using errcode = '${code}'; end $$`));
+            }
+          }
+          return await target;
+        })().then(yes, no);
+        const value = Reflect.get(target, key, target);
+        if (typeof value !== "function" || typeof key === "symbol" || key === "constructor") return value;
+        return (...args: any[]) => {
+          const result = value.apply(target, args);
+          return result && typeof result === "object" && (result === target || typeof result.then === "function") ? wrap(result) : result;
+        };
+      } });
+      (tx as any).select = (...args: any[]) => {
+        const builder = (select as any)(...args);
+        return new Proxy(builder, { get(target, key) {
+          const value = Reflect.get(target, key, target);
+          return key === "from" ? (...args: any[]) => wrap(value.apply(target, args)) : value;
+        } });
+      };
+      const result = await callback(tx);
+      if (refresh && afterApply) {
+        await tx.execute(sql`do $$ begin raise exception 'forced projection commit conflict' using errcode = '40P01'; end $$`);
+      }
+      return result;
+    }, config));
+    try {
+      const outcome = await followUp.start();
+      const retryable = code === "40P01" || code === "40001";
+      expect(attempts).toHaveLength(retryable && !afterApply ? Math.min(failures + 1, 3) : 1);
+      expect(new Set(attempts.map(attempt => attempt.xid)).size).toBe(attempts.length);
+      for (let index = 1; index < attempts.length; index++) expect(attempts[index]!.checkpointReads).toBeGreaterThan(attempts[index - 1]!.checkpointReads);
+      if (retryable && failures === 1 && !afterApply) {
+        expect(outcome).toBe(ADMITTED);
+        expect(JSON.parse(await readFile(path, "utf8")).identity).toEqual(latest.identity);
+        expect(await archivedOwners(root)).toEqual([prior.runId]);
+      } else {
+        if (retryable) {
+          expect(outcome).toBe("native_runner_checkpoint_projection_held:transaction_conflict");
+          expect(followUp.failures.at(-1)).toHaveProperty("code", outcome);
+        }
+        if (afterApply) {
+          expect(JSON.parse(await readFile(path, "utf8")).identity).toEqual(latest.identity);
+          expect(await archivedOwners(root)).toEqual([prior.runId]);
+        } else {
+          expect(await readFile(path, "utf8")).toBe(fixture.originalBytes);
+          expect(await archivedOwners(root)).toEqual([]);
+        }
+      }
+      await fixture.assertBackup();
+      if (process.env.S099E_OUT) await writeFile(join(process.env.S099E_OUT, `retry-${code}-${failures}-${afterApply}.json`),
+        JSON.stringify({ code, failures, afterApply, attempts, outcome, backupReadableUnchanged: true }, null, 2));
+    } finally { checkpointReadHook.callback = null; spy.mockRestore(); }
+  }, 60_000);
+
+  // Independent RFL-S099D experiments. Only fixture construction/provider boundary
+  // are shared with the product test; SQL interleavings and acceptance are judge-owned.
+  it.each(["retire-order"])(
+    "independent S099D %s", async mode => {
+      const fixture = await staleProjection("codex", true);
+      const { prior, latest, followUp, root, path } = fixture;
+      await recordPriorLeaseOnSameSandbox(prior, followUp);
+      const [lease] = await db.insert(environmentLeases).values({ companyId,
+        environmentId: followUp.environmentId, issueId: prior.issueId, heartbeatRunId: latest.runId,
+        provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: mode === "warm-order" ? "active" : "released",
+        leasePolicy: mode === "warm-order" ? "reuse_by_environment" : "ephemeral",
+        releasedAt: mode === "warm-order" ? null : new Date(), metadata: { remoteCwd: "/workspace" }
+      }).returning();
+      const manifestBytes = await readFile(join(fixture.backupRoot, "manifest.json"), "utf8");
+      const actualManifest = JSON.parse(manifestBytes);
+      const retireProviderLeaseId = actualManifest.sourceProviderLeaseId;
+      const manifestSha256 = `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`;
+      const [retireLease] = await db.insert(environmentLeases).values({ companyId,
+        environmentId: followUp.environmentId, issueId: prior.issueId, heartbeatRunId: latest.runId,
+        provider: "daytona", providerLeaseId: retireProviderLeaseId, status: "released",
+        leasePolicy: "reuse_by_environment", releasedAt: new Date(), metadata: {
+          remoteCwd: "/workspace", sandboxState: "started", reusableSandboxLease: { version: 1, provider: "daytona" },
+          nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2",
+            normalizedSessionId: latest.identity.normalizedSessionId,
+            runnerInstanceId: latest.identity.runnerInstanceId, sessionScopeSha256: root.split("/").at(-1),
+            sourceProviderLeaseId: retireProviderLeaseId, authorizedProviderLeaseId: retireProviderLeaseId,
+            manifestSha256, completedAt: actualManifest.completedAt }
+        } }).returning();
+      type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+      const transaction = db.transaction.bind(db);
+      const evidence: any = { mode, events: [], locks: [], writes: [] };
+      let active: Tx | undefined, checks = 0, refreshPid = 0, didTrigger = false;
+      let refreshEnded = false, warmStarted = false, releaseWarm = () => {};
+      let warmResult: Promise<any> | undefined;
+      const pending: Promise<any>[] = [];
+      const activity = async (pid: number) => {
+        const rows: any = await db.execute(sql`select pid, state, wait_event_type, wait_event,
+          pg_blocking_pids(pid) as blockers, query from pg_stat_activity where pid = ${pid}`);
+        return rows[0];
+      };
+      const waitFor = async (fn: () => Promise<boolean>, ms = 2000) => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) { if (await fn()) return true; await new Promise(r => setTimeout(r, 20)); }
+        return false;
+      };
+      const startWrite = async (name: string, write: (tx: Tx) => PromiseLike<unknown>, requireBlock: boolean) => {
+        const entry: any = { name }; evidence.writes.push(entry);
+        let ready!: () => void; const pidReady = new Promise<void>(r => { ready = r; });
+        let settled = false;
+        const done = transaction(async tx => {
+          await tx.execute(sql`set local lock_timeout = '6s'`);
+          entry.pid = Number((await tx.execute(sql`select pg_backend_pid() as pid`))[0]!.pid);
+          ready(); await write(tx);
+        }).then(() => { settled = true; entry.committed = true; entry.afterRefresh = refreshEnded; },
+          (err: any) => { settled = true; entry.error = err.cause?.code ?? err.code ?? String(err); ready(); });
+        pending.push(done); await pidReady;
+        if (requireBlock) {
+          entry.blocked = await waitFor(async () => {
+            if (settled) return false;
+            const row = await activity(entry.pid);
+            if (row?.wait_event_type === "Lock" && row.blockers?.includes(refreshPid)) {
+              entry.activity = row; return true;
+            }
+            return false;
+          }, 1000);
+          entry.settledInGap = settled;
+        } else await done;
+      };
+      const hook = async (state: any, text: string, phase: string) => {
+        if (text.includes('to_jsonb("environment_leases")')) state.refresh = true;
+        if (!state.refresh) return;
+        evidence.events.push({ phase, text });
+        const update = /for update/i.test(text);
+        const run = update && text.includes('from "heartbeat_runs"');
+        const leases = update && text.includes('from "environment_leases"');
+        const parts = update && text.includes('from "native_runner_checkpoints"');
+        if (phase === "after" && run) state.runLocked = true;
+        if (phase === "after" && parts) state.partsLocked = true;
+        if (didTrigger) return;
+        if (mode === "retire-order" && phase === "before" && run) {
+          didTrigger = true; evidence.trigger = "before refresh run lock";
+          // With R -> L retirement already owns R. Observe refresh waiting there
+          // before releasing it; with the old order it reaches L and deadlocks.
+          pending.push((async () => {
+            evidence.refreshBlocked = await waitFor(async () => {
+              const row = await activity(refreshPid);
+              if (row?.wait_event_type === "Lock") { evidence.locks.push(row); return true; }
+              return false;
+            });
+            releaseWarm();
+          })());
+        } else if (mode === "retire-order" && phase === "before" && leases) {
+          didTrigger = true; evidence.trigger = "before refresh lease lock";
+          const watcher = (async () => {
+            evidence.refreshLeaseBlocked = await waitFor(async () => {
+              const row = await activity(refreshPid);
+              if (row?.wait_event_type === "Lock") { evidence.locks.push(row); return true; }
+              return false;
+            }); releaseWarm();
+          })(); pending.push(watcher);
+        } else if (mode === "phantom-block" && phase === "after" && leases) {
+          didTrigger = true;
+          await startWrite("insert", tx => tx.insert(environmentLeases).values({ companyId,
+            environmentId: followUp.environmentId, issueId: prior.issueId, heartbeatRunId: latest.runId,
+            provider: "daytona", providerLeaseId: followUp.providerLeaseId, status: "released",
+            releasedAt: new Date(), metadata: { remoteCwd: "/workspace", independentPhantom: true } }), true);
+        } else if (mode === "phantom-before" && phase === "before" && run) {
+          didTrigger = true;
+          await startWrite("insert", tx => tx.insert(environmentLeases).values({ companyId,
+            environmentId: followUp.environmentId, issueId: prior.issueId, heartbeatRunId: latest.runId,
+            provider: "daytona", providerLeaseId: followUp.providerLeaseId, status: "released",
+            releasedAt: new Date(), metadata: { remoteCwd: "/workspace", independentPhantom: true } }), false);
+        } else if (mode === "late-lease-write" && phase === "after" && state.partsLocked
+          && text.includes('to_jsonb("environment_leases")')) {
+          didTrigger = true;
+          await startWrite("update", tx => tx.update(environmentLeases)
+            .set({ metadata: sql`${environmentLeases.metadata} || '{"independentLate":true}'::jsonb` })
+            .where(eq(environmentLeases.id, lease!.id)), true);
+        }
+      };
+      const spy = vi.spyOn(db, "transaction").mockImplementation((callback, config) => {
+        const state: any = { refresh: false };
+        return transaction(async tx => {
+          active = tx;
+          const select = tx.select.bind(tx);
+          const wrap = (q: any): any => new Proxy(q, { get(target, key) {
+            if (key === "then") return (yes: any, no: any) => {
+              let text = ""; try { text = target.toSQL().sql; } catch {}
+              return (async () => { await hook(state, text, "before");
+                const rows = await target; await hook(state, text, "after"); return rows; })().then(yes, no);
+            };
+            const val = Reflect.get(target, key, target);
+            if (typeof val !== "function" || typeof key === "symbol" || key === "constructor") return val;
+            return (...args: any[]) => { const r = val.apply(target, args);
+              return r && typeof r === "object" && (r === target || typeof r.then === "function") ? wrap(r) : r; };
+          } });
+          (tx as any).select = (...args: any[]) => {
+            const builder = (select as any)(...args);
+            return new Proxy(builder, { get(t, k) { const v = Reflect.get(t, k, t);
+              return k === "from" ? (...a: any[]) => wrap(v.apply(t, a)) : v; } });
+          };
+          refreshPid = Number((await tx.execute(sql`select pg_backend_pid() as pid`))[0]!.pid);
+          try { return await callback(tx); }
+          catch (err: any) { if (state.refresh) evidence.refreshError = { code: err.cause?.code ?? err.code,
+            message: err.cause?.message ?? err.message }; throw err; }
+          finally { active = undefined; }
+        }, config).finally(() => { if (state.refresh) refreshEnded = true; });
+      });
+      checkpointReadHook.callback = async () => {
+        if (mode !== "retire-order" || !active || checks < 2 || warmStarted) return;
+        warmStarted = true;
+        let ready!: () => void; const locked = new Promise<void>(r => { ready = r; });
+        const release = new Promise<void>(r => { releaseWarm = r; });
+        const { retiredSourceAuthorizesNativeBackupRestore } = await import("./native-retired-backup-source.js");
+        const restoreDb = new Proxy(db, { get(target, key) {
+          if (key === "transaction") return (callback: any, config: any) => transaction(async tx => {
+            await tx.execute(sql`set local lock_timeout = '8s'`);
+            evidence.retirePid = Number((await tx.execute(sql`select pg_backend_pid() as pid`))[0]!.pid);
+            const update = tx.update.bind(tx);
+            const wrapWrite = (q: any): any => new Proxy(q, { get(t, k) {
+              if (k === "then") return (yes: any, no: any) => (async () => {
+                const text = t.toSQL().sql; const rows = await t;
+                if (text.startsWith('update "environment_leases"')) {
+                  evidence.realLeaseUpdate = text; evidence.claimedRows = rows;
+                  ready(); await release;
+                }
+                return rows;
+              })().then(yes, no);
+              const v = Reflect.get(t, k, t);
+              if (typeof v !== "function" || typeof k === "symbol" || k === "constructor") return v;
+              return (...args: any[]) => { const r = v.apply(t, args);
+                return r && typeof r === "object" && (r === t || typeof r.then === "function") ? wrapWrite(r) : r; };
+            } });
+            (tx as any).update = (...args: any[]) => wrapWrite((update as any)(...args));
+            return callback(tx);
+          }, config);
+          const v = Reflect.get(target, key, target); return typeof v === "function" ? v.bind(target) : v;
+        } });
+        warmResult = retiredSourceAuthorizesNativeBackupRestore(restoreDb, { companyId,
+          currentRunId: followUp.runId, normalizedSessionId: latest.identity.normalizedSessionId,
+          manifest: { sourceProviderLeaseId: retireProviderLeaseId, runnerInstanceId: latest.identity.runnerInstanceId,
+            normalizedSessionId: latest.identity.normalizedSessionId }, manifestSha256,
+          targetProviderLeaseId: followUp.providerLeaseId,
+        }).then(authorized => ({ status: "committed", authorized }), (err: any) => ({ status: "rejected",
+          code: err.cause?.code ?? err.code, message: err.cause?.message ?? err.message }));
+        // A refusal before supersede has no row lock: fail rather than hang.
+        await Promise.race([locked, warmResult.then(result => { throw new Error(`restore never held lease: ${JSON.stringify(result)}`); })]);
+      };
+      const execute = followUp.remoteExecute.getMockImplementation()!;
+      followUp.remoteExecute.mockImplementation(async request => {
+        const text = JSON.stringify(request);
+        if (text.includes("runner-state.json")) return { exitCode: 0, timedOut: false, stderr: "",
+          stdout: Buffer.from(JSON.stringify({ schema: "paperclip.runner.durable.state.v1", ...latest.identity,
+            lifecycle: "suspended", outbox: [], pendingTerminalDelivery: null,
+            pendingProviderCleanup: null, warmTransition: null })).toString("base64") };
+        const result = await execute(request);
+        if (text.includes("paperclip-runner-generation-check")) checks++;
+        return result;
+      });
+      try {
+        evidence.outcome = await followUp.start("resumed");
+        releaseWarm(); await Promise.all(pending); evidence.warm = await warmResult;
+        evidence.triggered = didTrigger; evidence.originalPreserved = await readFile(path, "utf8") === fixture.originalBytes;
+        evidence.archives = await archivedOwners(root);
+        await fixture.assertBackup(); evidence.backupReadableUnchanged = true;
+        if (process.env.S099D_OUT) await writeFile(join(process.env.S099D_OUT, `independent-${mode}.json`), JSON.stringify(evidence, null, 2));
+        expect(didTrigger).toBe(true);
+        expect(evidence.claimedRows).toHaveLength(1);
+        expect(evidence.refreshError?.code, "refresh must not deadlock with real backup-source retirement").not.toBe("40P01");
+        expect(evidence.warm?.code, "real backup-source retirement must not deadlock with refresh").not.toBe("40P01");
+        expect(evidence.warm?.status).toBe("committed");
+        expect(evidence.warm?.authorized).toBe(true);
+        expect(evidence.outcome).toBe("native_runner_checkpoint_projection_held:source_changed");
+        expect(evidence.originalPreserved).toBe(true); expect(evidence.archives).toEqual([]);
+      } finally { releaseWarm(); checkpointReadHook.callback = null; spy.mockRestore();
+        await Promise.allSettled(pending); await warmResult; }
+    }, 60_000);
+
   it("starts an unclaimed remote follow-up from the previous owner's external marker under a bootstrap claim", async () => {
     const fixture = await staleProjection("codex", true);
     expect(await fixture.followUp.start("created", { kind: "bootstrap_incomplete", runId: fixture.followUp.runId,
