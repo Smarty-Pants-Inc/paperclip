@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import { issueComments, issues, type Db } from "@paperclipai/db";
 import {
   HELD_PREDECESSOR_NEW_TASK_ACTION, HELD_PREDECESSOR_NOTICE, HELD_PREDECESSOR_SEND_ACTION, HELD_PREDECESSOR_SEND_NOTICE,
@@ -24,8 +24,8 @@ class ProbeRollback extends Error {
  * only when the comment route's own explicit native continuation admission
  * (admitExplicitNativeContinuation, the gate a new composer message meets on
  * this conversation) admits a new message from the conversation's person now.
- * The predicate is CALLED, never copied: a new person message is written in a
- * savepoint, the admission runs as its dry run, and the savepoint is rolled
+ * The predicate is CALLED, never copied: its dry run weighs a message sent
+ * now without writing one, inside a read-only transaction that is rolled
  * back. Any doubt (no person, no assignee, an error) keeps the default.
  */
 export async function heldConversationRemedy(db: Db, input: { companyId: string; issueId: string }): Promise<HeldConversationRemedy> {
@@ -42,13 +42,14 @@ export async function heldConversationRemedy(db: Db, input: { companyId: string;
     const { admitExplicitNativeContinuation } = await import("./explicit-native-continuation.js");
     const agentId = issue.assigneeAgentId; const actorId = person.userId;
     try {
+      // A pure read: no message is written; the admission weighs one sent now.
+      // Read-only (also as a savepoint in a writer's transaction), Postgres
+      // refuses any write, and it is always rolled back.
       await db.transaction(async tx => {
-        const [probe] = await tx.insert(issueComments).values({ companyId: input.companyId, issueId: input.issueId,
-          authorType: "user", authorUserId: actorId, body: "held-conversation remedy probe", createdAt: new Date() })
-          .returning({ id: issueComments.id });
+        await tx.execute(sql`set transaction read only`);
         const admitted = await admitExplicitNativeContinuation({ db: tx as unknown as Db, companyId: input.companyId,
           issueId: input.issueId, agentId, actorType: "user", actorId, reason: "issue_commented",
-          commentId: probe!.id, successorRunId: randomUUID(), dryRun: true });
+          commentId: randomUUID(), prospectiveMessageAt: new Date(), successorRunId: randomUUID(), dryRun: true });
         throw new ProbeRollback(Boolean(admitted));
       });
     } catch (outcome) {

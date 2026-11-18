@@ -89,6 +89,13 @@ function workspaceRecoveryReference(profile: Record<string, unknown> | null | un
   return readNativeWorkspaceSyncReference(profile?.nativeWorkspaceSync) ?? (remote.success ? remote.data : null);
 }
 
+/** The read preserveNativeFailedWorkspace starts from: false means it writes nothing. */
+export function nativeFailedWorkspacePreservable(selected: Pick<typeof heartbeatRuns.$inferSelect,
+  "nativeIssueId" | "issueId" | "contextSnapshot" | "runnerProfileJson">): boolean {
+  return workspaceRecoveryReference(selected.runnerProfileJson)?.state === "prepared"
+    && typeof (selected.nativeIssueId ?? selected.issueId ?? selected.contextSnapshot?.issueId) === "string";
+}
+
 export async function preserveTaskRemoteWorkspaceWriter(db: Db, companyId: string, issueId: string) {
   const [bound] = await db.select({ id: executionWorkspaces.id, metadata: executionWorkspaces.metadata }).from(issues)
     .innerJoin(executionWorkspaces, and(eq(executionWorkspaces.id, issues.executionWorkspaceId),
