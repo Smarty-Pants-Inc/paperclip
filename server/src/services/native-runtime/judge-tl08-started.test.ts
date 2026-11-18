@@ -23751,6 +23751,11 @@ describe("runnerd provider runtime wiring", () => {
         ? { proof: "session_opened_without_turn", runnerInstanceId: "runner-new-in-retained-workspace" } : null);
     onTestFinished(() => controllerProof.mockRestore());
     const runtimeContext = nativeRuntimeContextFixture();
+    // Launch staging archives the real instruction bundle tree (49abb9f86), so
+    // the fixture needs one on disk; rootPath is outside the aggregate digest.
+    runtimeContext.instructions.bundle.rootPath = join(isolatedStateDirectory, "instructions-fixture");
+    await mkdir(runtimeContext.instructions.bundle.rootPath, { recursive: true });
+    await writeFile(join(runtimeContext.instructions.bundle.rootPath, "AGENTS.md"), "fixture");
     const executionWithContext = homeMode === "preconfigured"
       ? { ...execution, schema: "paperclip.native-execution-input.v7" as const,
         homeMode: "preconfigured" as const, executionMode: "default" as const, planningContext: null,
@@ -23916,11 +23921,16 @@ describe("runnerd provider runtime wiring", () => {
           expect(files.some(file => file.sourcePath === join(home, name))).toBe(false);
         }
       }
+      // SUPERSEDED (49abb9f86): the instruction bundle and runtime-context.json no longer
+      // upload one by one; they stage as ONE archive upload plus ONE install exec.
       expect(syncIn.mock.calls.flat(2).flatMap((entry: { files: Array<{ sourcePath: string }> }) => entry.files)
-        .filter((file: { sourcePath: string }) => file.sourcePath === runtimeContext.instructions.bundle.rootPath)).toHaveLength(1);
-      expect(syncIn).toHaveBeenCalledWith([expect.objectContaining({
-        files: [expect.objectContaining({ sourcePath: join(options.stateDirectory!, "runtime-context.json"), kind: "file" })],
-      })]);
+        .filter((file: { sourcePath: string }) => /paperclip-runtime-assets-[^/]*\.tar\.gz$/.test(file.sourcePath))).toHaveLength(1);
+      const assetInstalls = remoteExecute.mock.calls.filter(([command]) => command.args?.[2] === "paperclip-runtime-assets");
+      expect(assetInstalls).toHaveLength(1);
+      expect(JSON.parse(assetInstalls[0]![0].args![4]!)).toEqual([
+        expect.objectContaining({ index: 0, kind: "directory", mode: 0o555 }),
+        expect.objectContaining({ index: 1, kind: "file", mode: 0o600, targetPath: expect.stringMatching(/\/runtime-context\.json$/) }),
+      ]);
       expect(remoteExecute.mock.calls.filter(([command]) => command.args?.[2] === "paperclip-runner-claim-unstarted-session")).toHaveLength(1);
     } else {
       await expect(options.prepareExternalRunnerState()).rejects.toThrow(
