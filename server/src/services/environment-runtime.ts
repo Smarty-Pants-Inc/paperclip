@@ -605,6 +605,9 @@ export interface EnvironmentDriverReleaseInput {
   environment: Environment;
   lease: EnvironmentLease;
   status: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed">;
+  /** A setup probe's holder names its exact (run-less) lease, so the release
+   * binds the provider's stop/destroy receipt to it (remoteTerminationReceipt). */
+  probeLeaseId?: string;
 }
 
 function resolvePluginSandboxRpcTimeoutMs(
@@ -3695,7 +3698,7 @@ function createSandboxEnvironmentDriver(
         const receipt = releaseErasesSandbox(input.lease)
           ? await withLeaseDestroyClaim(db, input.lease, releaseCall)
           : await releaseCall();
-        termination = remoteTerminationReceipt(input.lease, receipt);
+        termination = remoteTerminationReceipt(input.lease, receipt, input.probeLeaseId);
         if (input.cancelActiveWork && !termination) cleanupStatus = "failed";
       } catch {
         logger.warn({ event: "sandbox_release_failed", leaseId: input.lease.id, reasonClass: "release_error" }, "sandbox lease release did not complete");
@@ -4045,7 +4048,7 @@ function createPluginEnvironmentDriver(
     };
   }
 
-  async function cleanupPluginRunLease(input: { environment: Environment | null; lease: EnvironmentLease },
+  async function cleanupPluginRunLease(input: { environment: Environment | null; lease: EnvironmentLease; probeLeaseId?: string },
     executionStopObserved = false, claimDestroy = false) {
     const settled = await settleDispatchedEnvironmentTask(db, workerManager, input.lease, { executionStopObserved });
     const [current] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.id, input.lease.id),
@@ -4068,7 +4071,7 @@ function createPluginEnvironmentDriver(
       ? await withLeaseDestroyClaim(db, lease, call) : await call();
     const taskStopped = settled !== false ||
       (lease.metadata?.runnerTaskLease === true && lease.metadata?.runnerTaskDispatched !== true && !lease.metadata?.runnerTaskStartup && !lease.metadata?.runnerTaskStartupCleanup);
-    return remoteTerminationReceipt(lease, receipt) ? receipt
+    return remoteTerminationReceipt(lease, receipt, input.probeLeaseId) ? receipt
       : taskStopped ? { providerLeaseId: lease.providerLeaseId, state: "stopped" } : undefined;
   }
 
@@ -4088,7 +4091,7 @@ function createPluginEnvironmentDriver(
     }
     return await environmentsSvc.releaseLease(input.lease.id, input.status, {
       cleanupStatus: "success",
-      remoteExecutionTermination: remoteTerminationReceipt(input.lease, receipt),
+      remoteExecutionTermination: remoteTerminationReceipt(input.lease, receipt, input.probeLeaseId),
     });
   }
 

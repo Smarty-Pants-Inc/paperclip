@@ -350,6 +350,8 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
             environment: testEnvironment,
             lease: leaseRecord.lease,
             status,
+            // This setup test holds the exact probe lease: bind its receipt (H).
+            probeLeaseId: leaseRecord.lease.id,
           });
         } else {
           await environmentsSvc.releaseLease(leaseRecord.lease.id, status);
