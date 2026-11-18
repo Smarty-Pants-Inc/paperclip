@@ -523,8 +523,45 @@ export function readPiBindInitial(environment: NodeJS.ProcessEnv): PiBindInitial
   try { return JSON.parse(json) as PiBindInitial; } catch { throw new Error(PI_BIND_ERROR); }
 }
 
+/** Pi custom-message type carrying a run's start time. Hidden (display: false); the pi_rpc
+ * projector drops every non user/assistant/toolResult message, so it never reaches the chat. */
+export const PI_CURRENT_TIME_MESSAGE = "paperclip.current-time";
+
+/** One line for the model: the environment's TZ (process.env.TZ, named as configured)
+ * when it names an IANA zone, otherwise UTC said explicitly. The image's /etc/localtime is
+ * never consulted, so an unconfigured box can never present a silent wrong zone. */
+export function piCurrentTimeLine(now: Date = new Date(), environment: NodeJS.ProcessEnv = process.env): string {
+  const utc = (why: string) => `Current time: ${now.toISOString().replace(/\.\d{3}Z$/, "Z")} (UTC; ${why})`;
+  const configured = environment.TZ?.trim().replace(/^:/, "");
+  if (!configured) return utc("no TZ configured");
+  let format: Intl.DateTimeFormat;
+  try {
+    format = new Intl.DateTimeFormat("en-US", { timeZone: configured, hourCycle: "h23",
+      year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch { return utc("TZ is not a valid IANA zone"); }
+  const part = Object.fromEntries(format.formatToParts(now).map(({ type, value }) => [type, value]));
+  const seconds = Math.floor(now.getTime() / 1000) * 1000;
+  const offset = Math.round((Date.UTC(+part.year!, +part.month! - 1, +part.day!, +part.hour!, +part.minute!, +part.second!) - seconds) / 60000);
+  const sign = offset < 0 ? "-" : "+", abs = Math.abs(offset);
+  const zone = `${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}`;
+  return `Current time: ${part.year}-${part.month}-${part.day}T${part.hour}:${part.minute}:${part.second}${zone} (${configured})`;
+}
+
+/** Pi has no date setting. Its documented per-run hook returns a `message` added to the run
+ * (docs/extensions.md, before_agent_start): a persisted custom message the model receives
+ * after the run's prompt. NOT a prompt section: the host-instructions handlers force the
+ * whole system prompt each run, so a per-run section would change those bytes and miss the
+ * provider prompt cache on every run's first request. Fires per run, so a warm session that
+ * outlives a day still gets this run's time. */
+export function installPiCurrentTime(pi: PiBindApi, now: () => Date = () => new Date()): void {
+  pi.on("before_agent_start", () => ({
+    message: { customType: PI_CURRENT_TIME_MESSAGE, content: piCurrentTimeLine(now()), display: false },
+  }));
+}
+
 export default function paperclipPiBindExtension(pi: PiBindApi): void {
   installPiPerformanceDiagnostics(pi);
+  installPiCurrentTime(pi);
   const socketPath = process.env.PAPERCLIP_PI_BIND_SOCKET;
   const initial = readPiBindInitial(process.env);
   if (!socketPath && initial === undefined) {
