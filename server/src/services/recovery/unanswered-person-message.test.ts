@@ -136,6 +136,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     };
     return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, at, nativeSuccessor };
   }
+  // The run's OWN pending input, as the continuation carry writes it (readContinuationCommentInput; a card answer as
+  // interactionIds/interactionId). RFL F2 (22:41Z) attributes an answer only through it.
+  const carryInto = async (runId: string, input: Record<string, unknown>) => {
+    const [row] = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...(row!.context as Record<string, unknown> ?? {}), ...input } })
+      .where(eq(heartbeatRuns.id, runId));
+  };
 
   const codeOf = (comment: { metadata: unknown }) => {
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
@@ -608,7 +615,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
-  it.each(["retry", "native-status"])("supersedes(D10 row 12): ordered chain rule: PV2b chain: a comment-less %s continuation supersedes its ancestor's notice", async kind => {
+  it.each(["retry", "native-status"])("supersedes(RFL F2 pending-only attribution, 22:41Z): supersedes(D10 row 12): ordered chain rule: PV2b chain: a comment-less %s continuation does not; one carrying the message supersedes its ancestor's notice", async kind => {
+    // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
+    // Was: the comment-less continuation's reply answered the ancestor's message through retry/native-status ancestry.
     const f = await fixture();
     const commentId = await f.message("What about my follow-up?");
     const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_workspace_required" });
@@ -619,6 +628,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const continuation = kind === "native-status" ? await f.nativeSuccessor(failed)
       : await f.run({ commentId: null, status: "succeeded", retryOfRunId: failed, wakeReason: "issue_continuation_needed" });
     await f.reply(continuation);
+    expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId }), "ancestry is not attribution")
+      .toEqual({ kind: "noticed_before" });
+    expect(await f.visible()).toHaveLength(1);
+    await carryInto(continuation, { wakeCommentIds: [commentId] });
     const outcome = await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
     expect(outcome).toEqual({ kind: "answered" });
     expect(await f.visible()).toHaveLength(0);
@@ -1368,12 +1381,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   it.each([
     ["carrying", "context"], ["continuation", "context"], ["carrying", "delivery"], ["continuation", "delivery"],
   ] as const)(
-    "PV2b chain: message -> %s card -> answer-resume (%s) fails -> successor final never gets a resend notice", async (cardSource, answerLink) => {
+    "supersedes(RFL F2 pending-only attribution, 22:41Z): PV2b chain: message -> %s card -> answer-resume (%s) fails -> successor final never gets a resend notice", async (cardSource, answerLink) => {
+    // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
+      // Was: the continuation run that presented the card answered M through ancestry alone; it now carries M as its own
+      // pending input, as the retry continuation's carry writes it (recovery/service.ts readContinuationCommentInput).
       const f = await fixture({ status: "in_review" });
       const messageId = await f.message("Build Sol; ask me for the name first.");
       const carryingRunId = await f.run({ commentId: messageId, status: "succeeded" });
       const sourceRunId = cardSource === "carrying" ? carryingRunId
-        : await f.run({ status: "succeeded", retryOfRunId: carryingRunId });
+        : await f.run({ commentId: messageId, status: "succeeded", retryOfRunId: carryingRunId });
       const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
         kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId,
         addresseeUserId: f.userId, continuationPolicy: "wake_assignee", createdAt: f.at(),
@@ -1411,7 +1427,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect((await db.select().from(issueComments).where(eq(issueComments.id, stale!.id)))[0]!.deletedAt).not.toBeNull();
     });
 
-  it("PV2b chain: a final after multiple failed ancestors answers without copied input ids or a card", async () => {
+  it("supersedes(RFL F2 pending-only attribution, 22:41Z): PV2b chain: a final after multiple failed ancestors answers only with the input in its own pending input", async () => {
+    // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
+    // Was: the final answered with no copied input ids, through previousRunId/retryOfRunId ancestry.
     const f = await fixture();
     const messageId = await f.message();
     const root = await f.run({ commentId: messageId, status: "failed", errorCode: "native_run_failed" });
@@ -1420,6 +1438,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, previousRunId: resume,
       wakeReason: "native_status_decision" } }).where(eq(heartbeatRuns.id, final));
     await f.reply(final);
+    expect(await settleUnansweredPersonMessage(db, f), "no copied input: ancestry is not attribution").toMatchObject({ kind: "noticed" });
+    expect(await readContinuationCommentInput(db, { ...f, runId: root })).toMatchObject({ wakeCommentIds: [messageId] });
+    await carryInto(final, { wakeCommentIds: [messageId] });
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
@@ -1467,9 +1488,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
     });
 
-  it("PV2b chain: a pending output-cap continuation never asks for a resend; its final answers the chain", async () => {
+  it("supersedes(RFL F2 pending-only attribution, 22:41Z): PV2b chain: a pending output-cap continuation never asks for a resend; its final answers M only with M in its own pending input", async () => {
+    // RFL F2 (22:41Z): an answer is attributed only through the answering run's OWN pending input; ancestry collects, never attributes.
+    // Was: the comment-less native-status successor's final answered M through ancestry.
     const f = await fixture();
-    const root = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_run_failed" });
+    const messageId = await f.message();
+    const root = await f.run({ commentId: messageId, status: "failed", errorCode: "native_run_failed" });
     // The sweep observes the durable continuation, not a provider-specific
     // output-cap string. No input ids need to be copied into its context.
     const successor = await f.nativeSuccessor(root, "queued");
@@ -1489,6 +1513,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect((await f.visible()).every(note => !note.body.includes("Sending it again"))).toBe(true);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, successor));
     await f.reply(successor);
+    expect((await settleUnansweredPersonMessage(db, f)).kind, "no own input: not answered").not.toBe("answered");
+    expect(await readContinuationCommentInput(db, { ...f, runId: root })).toMatchObject({ wakeCommentIds: [messageId] });
+    await carryInto(successor, { wakeCommentIds: [messageId] });
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     expect(await f.visible()).toHaveLength(0);
   });
