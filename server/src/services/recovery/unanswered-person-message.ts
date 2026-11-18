@@ -722,7 +722,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun, ownInput))
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
   const startedMessageRun = carriers.find(candidate => candidate.startedAt !== null || candidate.status === "running") ?? null;
-  const messageRun = startedMessageRun ?? carriers[0] ?? null;
+  // The stack's carrier choice is unchanged (the newest carrying run in the window decides the wait and the
+  // descendant proof); the own-input carriers only back it up outside the window and prove an own start.
+  const messageRun = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? startedMessageRun ?? carriers[0] ?? null;
   // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
   // native-governance.ts conversationTurnAnswered): only a pending question or
   // confirmation card that the message's OWN run created stands in for its
@@ -844,11 +846,13 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     inArray(heartbeatRuns.status, LIVE))).limit(1);
   const liveRuns = otherLive ? [...live, otherLive] : live;
-  // Once this input started, a further carrying attempt is not NO_RUN or a
-  // resend remedy, however long it queues. Its terminal state reopens the
-  // existing once-only notice decision; silence cannot settle the obligation.
-  if ((startedMessageRun && carriers.some(candidate => LIVE.includes(candidate.status)))
-    || liveRuns.some(candidate => candidate.status === "running")) {
+  // Once this input started, a further carrying attempt is not NO_RUN, a
+  // failure or a resend remedy, however long it queues: it is waiting work.
+  // Its terminal state reopens the existing once-only notice decision. Past
+  // the ordinary grace the true waiting line stands, never silence (RFL
+  // (A)(ii): the still-trying line at the bound); see carrierPending below.
+  let carrierPending = Boolean(startedMessageRun && carriers.some(candidate => LIVE.includes(candidate.status)));
+  if (liveRuns.some(candidate => candidate.status === "running")) {
     return { kind: "pending", recheckAt: now.getTime() + 30_000 };
   }
   // The agent is paused (Paperclip's lifecycle: status paused, lifecycle state
@@ -955,7 +959,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     if (startedMessageRun && wakes.some(wake => wakeCarriesIssue(wake.payload, issue.id)
       && (wakeCarriesMessage(wake.payload, message.id)
         || runCarriesMessage((wake.payload as Record<string, unknown> | null)?._paperclipWakeContext, message.id)))) {
-      return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+      carrierPending = true;
     }
     // Admission has saved a real further attempt for THIS message, not a
     // failed start. Coalesced receipts alone are not live; missing/malformed
@@ -974,6 +978,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       if (pendingExecutionWait || (!run && wakes.some(wake => wake.status === "queued"
         && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id)
         && (!latestWake || wake.createdAt > latestWake.updatedAt)))) waitingToStart = true;
+    }
+    // norun-sweep on the stack's sweep: after an own start, a live or saved further carrier is waiting work.
+    // Nothing is posted within the ordinary pending grace; after it only the existing waiting line may stand,
+    // until that carrier starts or terminates (never NO_RUN, a failure note or resend advice while it is pending).
+    if (carrierPending) {
+      // Behind a board-owned recovery hold the saved attempt stays silent: the hold has its own notice.
+      if (boardHold) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+      if (!waitingToStart) { const wait = await bounded(now.getTime() + 30_000); if (wait) return wait; }
+      waitingToStart = true; continuationWaiting = true;
     }
   }
 
@@ -998,7 +1011,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       }
       code = UNANSWERED_MESSAGE_WAITING_CODE;
     } else {
-      code = startedMessageRun ? runCode! : UNANSWERED_MESSAGE_NO_RUN_CODE;
+      code = UNANSWERED_MESSAGE_NO_RUN_CODE;
     }
   } else if (!run) {
     // Paperclip records a deferred or coalesced wake that could not start as
@@ -1143,6 +1156,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     sql`not starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), ${UNANSWERED_MESSAGE_REASON_PREFIX})`)).limit(1);
   if (explained) return { kind: "explained" };
 
+  // norun-sweep: after an own start the message is never "no run started". The started carrier's own failure
+  // decides the ONE true note (not answered; the run may have taken actions).
+  if (code === UNANSWERED_MESSAGE_NO_RUN_CODE && startedMessageRun) code = unansweredMessageCode(startedMessageRun);
   const policyRefused = code === PROVIDER_POLICY_REFUSAL_CODE;
   const supervisionUnconfirmed = code === REMOTE_RUNNER_SUPERVISION_EXHAUSTED && !held;
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
