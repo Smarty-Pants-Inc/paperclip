@@ -589,8 +589,15 @@ export async function undeliveredConversationComments(
         isNull(issueComments.authorAgentId),
         eq(issueComments.origin, "comment"),
         sql`${issueComments.clientRequestId} is not null`,
+        // A wake whose run FAILED with no reply or refusal, and no other live run, did not answer it: re-deliver once.
         sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${companyId}
-      and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text)`,
+      and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text
+      and (${agentWakeupRequests.status} <> 'failed' or exists (select 1 from issue_comments reply where reply.created_by_run_id = ${agentWakeupRequests.runId})
+        or exists (select 1 from heartbeat_runs refused where refused.id = ${agentWakeupRequests.runId} and refused.error_code = 'provider_policy_refusal')
+        or exists (select 1 from heartbeat_runs carrier where carrier.company_id = ${companyId} and carrier.status <> 'failed'
+          and carrier.context_snapshot->'wakeCommentIds' @> jsonb_build_array(${issueComments.id}::text))))
+      and (select count(*) from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${companyId}
+      and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text) < 2`,
       ),
     )
     .orderBy(issueComments.createdAt, issueComments.id)
