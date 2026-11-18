@@ -2989,6 +2989,44 @@ describe("TaskChatThread runtime transcript selection", () => {
     if (actor !== "user") expect(detail).not.toContain("unfinished reply");
   });
 
+  // SCREEN ROW 6: the exact-run Retry route refuses a person-stopped STARTED
+  // turn with 409 (issue-chat-bootstrap-routes "SCREEN ROW 6", the same
+  // bootstrap row). The chat must not offer that Retry, on a chat or a task.
+  // Control: the same turn settled as failed offers it (the route accepts a
+  // failed run), so the absence is not a missing handler.
+  it.each([
+    ["cancelled", true, false],
+    ["cancelled", false, false],
+    ["failed", true, true],
+    ["failed", false, true],
+  ] as const)("SCREEN ROW 6: a person-stopped started turn %s (conversationMode=%s) offers Retry: %s", async (status, conversationMode, offered) => {
+    const runId = `row6-${status}-${conversationMode}`;
+    nativeTranscriptState.transcriptByRun.set(runId, [
+      assistantEntry("2026-08-25T18:00:01.000Z", "Half a reply", "progress"),
+    ]);
+    const retried: string[] = [];
+    renderThread({
+      comments: [],
+      onAdd: async () => {},
+      conversationMode,
+      issueStatus: "in_progress",
+      onRetryFailedRun: async (id) => { retried.push(id); },
+      linkedRuns: [{
+        runId, runtimeMode: "native", status, agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z", finishedAt: "2026-08-25T18:00:02.000Z",
+        resultJson: { cancelledByActorType: "user" },
+      }],
+    });
+    const button = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-run-failed-try-again"]');
+    expect(Boolean(button)).toBe(offered);
+    if (button) {
+      flushSync(() => button.click());
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(retried).toEqual([runId]);
+    }
+  });
+
   it.each([
     ["failed", "Run failed"],
     ["timed_out", "Run timed out"],
