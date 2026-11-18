@@ -5935,7 +5935,7 @@ describe("IssueDetail", () => {
     });
   });
 
-  it("does not rebind a queued message when another run becomes live before its request settles, supersedes(does not rebind a queued message when another run becomes live before its request settles; RFL record SUPERSEDE-QUEUEUX-CONFLICT-WORDING-1118 (R1 /srv/scratch/paul/rfl-verdicts/SUPERSEDE-QUEUEUX-CONFLICT-WORDING-1118.md, in inputs/), spec ui/src/lib/issue-queued-comment-queue.ts:10-13 requires a neutral stale-queue update; every other assertion of the old row kept)", async () => {
+  it("supersedes(does not rebind a queued message when another run becomes live before its request settles; RFL record SUPERSEDE-QUEUEUX-CONFLICT-WORDING-1118) — neutral stale-queue update; every other assertion kept", async () => {
     const postedComment = createDeferred<IssueComment>();
     mockIssuesApi.get.mockResolvedValue(
       createIssue({
