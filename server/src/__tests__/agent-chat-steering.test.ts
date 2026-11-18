@@ -244,11 +244,20 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
         .send({ queueId: queue.queueId, revision: queue.revision,
           targetRunId: selectedId ? chat.runId : null, ...(selectedId ? { commentId: selectedId } : {}) }).expect(200);
+      // supersedes(fixture: the run and wake SELECTs are two moments and can straddle the last
+      // promotion commit, so the helper could stop before the final run answered; it now also
+      // waits until every sent non-/new message was carried. Same deadline, no assertion change.
+      // RFL record SUPERSEDE-QUEUEUX-WAKE-SHAPE-1118, C3 addendum)
+      const sentBodies = new Map((await db.select().from(issueComments)
+        .where(eq(issueComments.issueId, chat.issue.id))).map(comment => [comment.id, comment.body]));
+      const expectedMessageIds = expected.filter(id => !/^\s*\/new\s*$/.test(sentBodies.get(id) ?? ""));
       const deadline = Date.now() + 20_000;
       while (true) {
         const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, chat.agentId));
         const waiting = await deferredWakes(chat);
-        if (!waiting.length && !runs.some(run => ["running", "queued"].includes(run.status))) break;
+        const carried = new Set(seen.flatMap(turn => turn.ids));
+        const sawEveryMessage = expectedMessageIds.every(id => carried.has(id));
+        if (!waiting.length && !runs.some(run => ["running", "queued"].includes(run.status)) && sawEveryMessage) break;
         if (Date.now() > deadline) throw Error(JSON.stringify({ seen, waiting, runs }));
         await new Promise(resolve => setTimeout(resolve, 25));
       }
