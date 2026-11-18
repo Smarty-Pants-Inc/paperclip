@@ -527,6 +527,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   const [runs, waits, agentRows, projectRows, pauseRows, approvalRows, companyRows, admissionWaits] = await Promise.all([
     db.select({ issueId: requestedIssueId, id: heartbeatRuns.id, status: heartbeatRuns.status,
       createdAt: heartbeatRuns.createdAt, finishedAt: heartbeatRuns.finishedAt, agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId,
+      startableSince: heartbeatRuns.startableSince,
       // When the person wrote the LATEST message this failed attempt carried: its
       // wakeCommentId/commentId, any wakeCommentIds entry (queued-batch coalescing
       // keeps the older scalar and appends the newer id there) or its first-turn
@@ -878,7 +879,9 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     const clearedAt = new Map(clearRows);
     for (const run of personQueued) {
       if (busy.has(run.agentId)) continue;
-      queuedRunStartableSince.set(run.id, Math.max(run.createdAt!.getTime(), endedAt.get(run.id) ?? 0, clearedAt.get(run.id) ?? 0));
+      // RFL 01:00Z (a): heartbeat_runs.startable_since, stamped where each hold clears.
+      queuedRunStartableSince.set(run.id, Math.max(run.createdAt!.getTime(), endedAt.get(run.id) ?? 0, clearedAt.get(run.id) ?? 0,
+        run.startableSince?.getTime() ?? 0));
     }
   }
   // Task-level start holds for those person runs, read from the same rows the

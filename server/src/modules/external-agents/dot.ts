@@ -1,4 +1,5 @@
 import { budgetServiceInTransaction } from "../../services/budgets.js";
+import { stampQueuedRunsStartable } from "../../services/heartbeat/startable-since.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../services/delivery-work-notifications.js";
 import { withExternalAdmissionGuard, withExternalExecutionAdmission } from "./admission.js";
 import { createNativeExternalBroker } from "./native-broker.js";
@@ -494,6 +495,8 @@ function createBroker(db: Db) {
       const [updated] = await db.update(bindings).set({ status: "ready", readyAt: new Date(), challengeHash: null, challengeExpiresAt: null, updatedAt: new Date() })
         .where(and(eq(bindings.id, b.id), eq(bindings.generation, b.generation), isNull(bindings.revokedAt), eq(bindings.grantId, principal.grant.id), eq(bindings.challengeHash, hash(nonce)), gt(bindings.challengeExpiresAt, new Date()))).returning();
       if (!updated) throw fail("Event test expired or does not match.");
+      // RFL 01:00Z (a): the external-agent setup hold clears; its queued runs are startable from now.
+      await stampQueuedRunsStartable(db, { companyId: b.companyId, agentId: b.agentId });
       await logActivity(db, { companyId: b.companyId, actorType: "agent", actorId: b.agentId,
         action: "dot.event_test_completed", entityType: "agent", entityId: b.agentId, details: { bindingId: b.id } });
       return { status: "ready" };
