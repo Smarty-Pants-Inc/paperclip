@@ -71,15 +71,6 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-// The saved remote execution identity is what the resume gate compares with
-// the next run's target. Dropping it here made every remote session look like
-// it came from another target, so no remote run could ever resume.
-function readRecord(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? { ...(value as Record<string, unknown>) }
-    : null;
-}
-
 function remoteSessionMetadata(record: Record<string, unknown>): Record<string, unknown> {
   const remoteExecution = normalizeAdapterExecutionTargetSessionIdentity(record.remoteExecution);
   const conversationId = readNonEmptyString(record.sshClaudeConversationId);
@@ -108,7 +99,6 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
     const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
-    const remoteExecution = readRecord(record.remoteExecution);
     return {
       sessionId,
       ...remoteSessionMetadata(record),
@@ -118,7 +108,6 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
-      ...(remoteExecution ? { remoteExecution } : {}),
     };
   },
   serialize(params: Record<string, unknown> | null) {
@@ -136,7 +125,6 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(params.workspaceId) ?? readNonEmptyString(params.workspace_id);
     const repoUrl = readNonEmptyString(params.repoUrl) ?? readNonEmptyString(params.repo_url);
     const repoRef = readNonEmptyString(params.repoRef) ?? readNonEmptyString(params.repo_ref);
-    const remoteExecution = readRecord(params.remoteExecution);
     return {
       sessionId,
       ...remoteSessionMetadata(params),
@@ -146,7 +134,6 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
-      ...(remoteExecution ? { remoteExecution } : {}),
     };
   },
   getDisplayId(params: Record<string, unknown> | null) {
