@@ -221,6 +221,7 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
     failureReason?: string | null;
     providerResourceDisposition?: ProviderResourceDisposition;
     respectCleanupDeadlines?: boolean;
+    personStopNote?: false;
   }) => Promise<void>;
   acknowledgeRemoteStop: (runId: string, companyId: string) => Promise<void>;
   resumeRemoteStopComments: (run: HeartbeatRun) => Promise<void>;
@@ -1704,7 +1705,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     }
     await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId, agentId: run.agentId,
       status: run.status, failureReason: run.error ?? undefined,
-      providerResourceDisposition: deferral ? deferral.providerResourceDisposition ?? undefined : "destroy" });
+      providerResourceDisposition: deferral ? deferral.providerResourceDisposition ?? undefined : "destroy", personStopNote: false });
     const [after] = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata })
       .from(environmentLeases).where(eq(environmentLeases.id, lease.id));
     if (after?.status !== "active") return true;
