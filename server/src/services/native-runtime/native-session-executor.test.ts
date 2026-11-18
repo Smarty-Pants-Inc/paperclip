@@ -15109,6 +15109,24 @@ describe("native warm session supervision", () => {
       const answerBoundMs = 60_000; // warm+60: the first answer lands inside 60 s of the Send / typed message.
       afterEach(async () => { await closeIdleWarmNativeSessionsForRestart(); });
       const unproven = /^native_predecessor_retirement_unproven/;
+      // The refusal rows: with the owner's lease row present the successor waits
+      // up to warmSessionReleaseWait (30 s) for a typed receipt that never comes.
+      // Fake timers let that bound elapse without real waiting, and prove the
+      // refusal came only AFTER it (still pending 1 s before the bound).
+      const refusedAfterBound = async (s: Awaited<ReturnType<typeof scenario>>, runId: string, box: string) => {
+        vi.useFakeTimers();
+        try {
+          const bound = warmSessionReleaseWait.timeoutMs, started = Date.now();
+          let outcome: string | undefined, settledAt = 0;
+          const pending = s.run(runId, box).then(value => { outcome = value; settledAt = Date.now(); return value; });
+          await vi.advanceTimersByTimeAsync(bound - 1_000);
+          expect(outcome, "still waiting inside the bound").toBeUndefined();
+          for (let step = 0; outcome === undefined && step < 60; step++) await vi.advanceTimersByTimeAsync(1_000);
+          await pending;
+          expect(settledAt - started, "refused only after the bound").toBeGreaterThanOrEqual(bound);
+          return outcome;
+        } finally { vi.useRealTimers(); }
+      };
 
       it("row 1 (abd1cb54): three held, Stop with its receipt, Send => ONE successor on a NEW box, succeeded, the held messages answered once, zero unproven", async () => {
         const s = await scenario("row1-send-three-held");
@@ -15155,21 +15173,21 @@ describe("native warm session supervision", () => {
 
       it("control: the owner's lease released WITHOUT a stop receipt => still refused", async () => {
         const s = await scenario("control-no-receipt", { receipt: "none" });
-        expect(await s.run(`${s.base.binding.runId}-b`, "bx_box_b")).toMatch(unproven);
+        expect(await refusedAfterBound(s, `${s.base.binding.runId}-b`, "bx_box_b")).toMatch(unproven);
         s.record();
         expect(s.turns).toEqual([s.base.binding.runId]);
       });
 
       it("control: a stop receipt on ANOTHER run's lease of that box (not the owner's own) => still refused", async () => {
         const s = await scenario("control-foreign-receipt", { receipt: "foreign-stopped" });
-        expect(await s.run(`${s.base.binding.runId}-b`, "bx_box_b")).toMatch(unproven);
+        expect(await refusedAfterBound(s, `${s.base.binding.runId}-b`, "bx_box_b")).toMatch(unproven);
         s.record();
         expect(s.turns).toEqual([s.base.binding.runId]);
       });
 
       it("control: the successor on the SAME lease (box) as the stopped owner => 'stopped' does NOT prove the owner gone", async () => {
         const s = await scenario("control-same-lease");
-        expect(await s.run(`${s.base.binding.runId}-same`, s.stoppedBox)).toMatch(unproven);
+        expect(await refusedAfterBound(s, `${s.base.binding.runId}-same`, s.stoppedBox)).toMatch(unproven);
         s.record();
         expect(s.turns).toEqual([s.base.binding.runId]);
       });
@@ -15183,7 +15201,7 @@ describe("native warm session supervision", () => {
         { label: "timeout", closeError: () => Object.assign(new Error("warm Runner close timed out"), { name: "TimeoutError", code: "ETIMEDOUT" }) },
       ])("rf-3 (i): close fails with only $label and NO typed receipt on the owner's lease => NOT proven gone", async ({ label, closeError }) => {
         const s = await scenario(`rf3-i-${label}`, { receipt: "none", closeError });
-        expect(await s.run(`${s.base.binding.runId}-b`, "bx_box_b")).toMatch(unproven);
+        expect(await refusedAfterBound(s, `${s.base.binding.runId}-b`, "bx_box_b")).toMatch(unproven);
         s.record();
         expect(s.runs[0]!.closeAttempts).toBe(1);
         expect(s.turns).toEqual([s.base.binding.runId]);
