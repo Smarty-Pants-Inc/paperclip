@@ -642,14 +642,18 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       // A person's Send (queuedCommentInterrupt) is delivering it: still waiting.
       const sendRequested = wakes.some(wake => wakeCarriesMessage(wake.payload, message.id)
         && wake.payload?.queuedCommentInterrupt != null);
-      if (pendingExecutionWait && !sendRequested) {
+      // S2: a message held by a person's Stop with NO execution wait (its own
+      // deferred_issue_execution wake) is held the same way: R3, never N.
+      const heldWithoutWait = !pendingExecutionWait && wakes.some(wake => wake.status === "deferred_issue_execution"
+        && wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+      if ((pendingExecutionWait || heldWithoutWait) && !sendRequested) {
         const [lastTurn] = await q.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
           .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun))
           .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
         const stop = (lastTurn?.resultJson ?? {}) as Record<string, unknown>;
         heldByPersonStop = lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user"
           && !stop.queuedCommentInterruptQueueId;
-        if (!heldByPersonStop) waitingToStart = true;
+        if (!heldByPersonStop && pendingExecutionWait) waitingToStart = true;
       } else if (pendingExecutionWait) waitingToStart = true;
     }
   }
