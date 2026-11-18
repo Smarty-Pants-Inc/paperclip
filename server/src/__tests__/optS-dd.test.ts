@@ -394,16 +394,14 @@ describe.skipIf(!support.supported)("optS-dd: default-DENY stop-acceptance row",
   // D3 FORGERY: the most permissive writer (legacy adapter events, run-output.ts onAdapterEvent) can write a
   // lifecycle row with a caller-chosen message and payload but always adds its receipt stamp. After a non-person
   // cancel, a forged row (stamped, or another user's) must not admit S.
-  it.each(["adapter_stamped", "other_user", "after_finish"] as const)("D3 forged %s row after a system cancel does not admit S", async mode => {
-    const s = await heldThenStop("system");
+  it.each(["adapter_stamped", "other_user", "after_finish"] as const)("D3 forged %s row after an attributed non-route cancel does not admit S", async mode => {
+    // The R10 control (acknowledged, user-attributed Stop that is not the Stop route): every term but the row holds.
+    const s = await heldThenStop("direct");
     try {
       const { row } = await sameShapeRow(s.f, "person_stop", mode === "adapter_stamped"
         ? { receivedAt: new Date().toISOString(), adapterEventIndex: 1 } : mode === "other_user" ? { userId: "someone-else" } : {});
       // A forging writer runs during the run: only after_finish is left outside the window.
       if (mode !== "after_finish") await duringRun(s.f.runId, row.id);
-      // Even a payload-exact row written after the run finished is out of the cancel's window.
-      await db.update(heartbeatRuns).set({ resultJson: sql`${heartbeatRuns.resultJson} || ${JSON.stringify({ cancelledByActorType: "user", cancelledByUserId: userId })}::jsonb` })
-        .where(eq(heartbeatRuns.id, s.f.runId));
       const out = await sendOutcome(s);
       await evidence(`D3-forged-${mode}`, out);
       expect(out.turns).toEqual([]);
