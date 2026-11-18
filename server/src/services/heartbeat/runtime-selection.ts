@@ -29,6 +29,7 @@ import type { agentInstructionWorkingCopyService } from "../agent-instruction-wo
 import { createHash, randomUUID } from "node:crypto";
 import { nativeSha256 } from "../native-runtime/canonical.js";
 import { selectFreshContinuationThread, selectPiConversation } from "../native-runtime/pi-conversation-record.js";
+import type { HandoffEntry } from "../native-runtime/native-session-handoff.js";
 import type { FailedNativePredecessorProbe } from "../native-runtime/native-provider-work-proof.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -124,7 +125,7 @@ export interface HeartbeatRuntimeSelectionInput {
     persistedRunnerProfile: Record<string, unknown>;
     taskResumeSessionId: string | null;
     isFailedChatRunRetry: boolean;
-    getFreshSessionHandoff: (() => Promise<string | null>) | undefined;
+    getFreshSessionHandoff: ((unfinishedTurn?: HandoffEntry) => Promise<string | null>) | undefined;
   };
   workspace: {
     persistedExecutionWorkspace: { id: string; metadata?: Record<string, unknown> | null } | null;
@@ -806,6 +807,14 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         instructionWorkingCopy: instructionCopy ? { rootPath: instructionCopy.executionRoot, entryPath: instructionCopy.entryFile, ...(isAgentDirectoryCopy(instructionCopy) ? { kind: "agent_files" as const } : {}) } : undefined,
       }));
       getNativeFreshSessionHandoff = nativeReviewRequest ? undefined : getFreshSessionHandoff;
+      // The unfinished-turn boundary's packet is materialized now into S's persisted task prompt
+      // (the actual startTurn input), not the late fresh-session callback, which it replaces.
+      const unfinishedTurnEntry = piConversation?.runId === run.id && piConversation.reason.startsWith("fresh_continuation:")
+        ? await (await import("../fresh-continuation-fallback.js")).readUnfinishedTurnEntry(db, { companyId: agent.companyId, runId: run.id,
+          actionId: piConversation.reason.slice("fresh_continuation:".length) }) : null;
+      const unfinishedTurnHandoff = unfinishedTurnEntry ? await getFreshSessionHandoff?.(unfinishedTurnEntry) : null;
+      if (unfinishedTurnEntry && !unfinishedTurnHandoff) throw new Error("native_handoff_unfinished_turn_missing");
+      if (unfinishedTurnHandoff) getNativeFreshSessionHandoff = undefined;
       const nativeProviderConfig = nativeRuntimeResolution.profile.backend === "cursor_cloud_api"
         || nativeRuntimeResolution.profile.backend === "pi_rpc"
         || nativeRuntimeResolution.profile.backend === "codex_app_server"
@@ -861,6 +870,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                   }),
                 ) ??
                 `# ${issueRef.identifier ?? issueRef.id}: ${issueRef.title}`,
+                unfinishedTurnHandoff,
                 !["openai_dot_mcp", "grok_bot_mcp", "muse_external", "cursor_cloud_api"].includes(nativeRuntimeResolution.profile.backend) && projectRepositoryPaths.length > 0
                   ? `## Project repositories\nThe task workspace also contains these editable Git repositories:\n${projectRepositoryPaths.map((repo) => `- ${repo}`).join("\n")}`
                   : null,

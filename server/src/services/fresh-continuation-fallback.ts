@@ -1,7 +1,7 @@
-import { and, asc, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, ne, or, sql, type SQL } from "drizzle-orm";
 import {
-  agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRuns, issueApprovals,
-  issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolInvocations, type Db,
+  agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, environmentLeases, executionWorkspaces, heartbeatRuns, issueApprovals,
+  issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, nativeRunResults, toolInvocations, type Db,
 } from "@paperclipai/db";
 import {
   EXECUTION_RECONCILIATION_CAUSES, remoteWorkspaceRunReferenceSchema, type ExecutionReconciliation,
@@ -30,7 +30,8 @@ import { PERMANENT_SOURCE_RETRY_CLASSES, UNVERIFIABLE_SOURCE_CODES, readSystemRe
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
 export { freshContinuationChain } from "./fresh-continuation-chain.js";
 import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
-import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.js";
+import { FRESH_THREAD_UNFINISHED_NOTE, UNFINISHED_TURN_FACT, freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.js";
+import { ownLeaseTerminated } from "./remote-execution-termination.js";
 import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuationCauseIsSystemOwnedSql, continuesAutomaticallySql,
   isPersonOwnedFailureCode } from "./continuation-cause.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
@@ -407,8 +408,9 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
   // unanswered boundary. This includes turns admitted before recordedAt but
   // answered afterwards. Caller holds the issue lock used by turn admission.
   if (await hasAnswerSinceSettlement(db, source, issueId, fresh.recordedAt, run.id)) return null;
-  return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId,
-    startedNote: await freshThreadStartedNote(db, source) };
+  const unfinished = fresh.trigger === UNFINISHED_TURN_TRIGGER && object(action.evidence.unfinishedTurn).successorRunId === run.id;
+  return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId, unfinished,
+    startedNote: unfinished ? FRESH_THREAD_UNFINISHED_NOTE : await freshThreadStartedNote(db, source) };
 }
 
 /** The Retry's own record (recordRetryFreshProviderThread): bound at admission
@@ -453,7 +455,9 @@ export function retryFreshThreadTrigger(intent: { initiatedBy?: "restart_recover
  */
 export async function recordRetryFreshProviderThread(db: Db, input: {
   companyId: string; issueId: string; agentId: string; sourceRunId: string; successorRunId: string;
-  trigger: RetryFreshThreadTrigger;
+  trigger: RetryFreshThreadTrigger | typeof UNFINISHED_TURN_TRIGGER;
+  /** admitUnfinishedTurnFreshThread's receipt-qualified variant: every predecessor's writer ended. */
+  qualified?: { predecessorRunIds: string[]; unfinishedTurn: Record<string, unknown> };
 }): Promise<string | null> {
   const [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.agentId, input.agentId))).for("update");
@@ -462,27 +466,111 @@ export async function recordRetryFreshProviderThread(db: Db, input: {
   // The admitting transaction's clock: never later than its successor's created_at.
   const [clock] = await db.execute<{ ms: string }>(sql`select (extract(epoch from date_trunc('milliseconds', now())) * 1000)::bigint::text as ms`);
   const recordedAt = new Date(Number(clock!.ms)).toISOString();
-  const isolation: FreshContinuationIsolation = "fresh_isolated_workspace";
+  const q = input.qualified;
+  const isolation: FreshContinuationIsolation = q ? "writer_ended" : "fresh_isolated_workspace";
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: source.id, trigger: input.trigger,
-    failureCode: source.errorCode ?? null, delivery: "caller_owns", recordedAt, isolation, stopProof: "unproven_isolated" };
-  const reconciliation = { runId: source.id, providerStopped: true, providerStopProof: "isolated",
-    workspaceRepairEvidence: `The Retry of run ${source.id} starts in a new isolated workspace; no unverified files are applied.`,
+    failureCode: source.errorCode ?? null, delivery: "caller_owns", recordedAt, isolation, stopProof: q ? "writer_ended" : "unproven_isolated" };
+  const reconciliation = { runId: source.id, providerStopped: true, providerStopProof: q ? "remote_termination_receipt" : "isolated",
+    workspaceRepairEvidence: q ? `Every predecessor of run ${input.successorRunId} has a typed stop receipt; no unverified files are applied.`
+      : `The Retry of run ${source.id} starts in a new isolated workspace; no unverified files are applied.`,
     actorId: FRESH_CONTINUATION_ACTOR, recordedAt };
   const settlement = { schema: FRESH_CONTINUATION_SCHEMA, actorType: "system", actorId: FRESH_CONTINUATION_ACTOR,
     decision: "continue_in_fresh_run", replay: "none", sourceRunId: source.id, failureCode: source.errorCode ?? null,
-    reason: "retry_fresh_isolated_workspace", isolation, requestedBy: input.trigger === RETRY_FRESH_THREAD_TRIGGER ? RETRY_FRESH_THREAD_TRIGGER : "system", recordedAt };
+    reason: q ? "unfinished_turn_writer_ended" : "retry_fresh_isolated_workspace", isolation,
+    requestedBy: q ? "person" : input.trigger === RETRY_FRESH_THREAD_TRIGGER ? RETRY_FRESH_THREAD_TRIGGER : "system", recordedAt };
   const [created] = await db.insert(issueRecoveryActions).values({ companyId: input.companyId, sourceIssueId: input.issueId,
     kind: "active_run_watchdog", status: "resolved", outcome: "restored", ownerType: "system",
-    returnOwnerAgentId: input.agentId, cause: FRESH_CONTINUATION_CAUSE, fingerprint: `fresh-continuation:retry:${input.successorRunId}`,
-    nextAction: USER_TEXT, resolutionNote: "retry_fresh_provider_thread", resolvedAt: new Date(recordedAt), attemptCount: 1,
+    returnOwnerAgentId: input.agentId, cause: FRESH_CONTINUATION_CAUSE,
+    fingerprint: `fresh-continuation:${q ? "unfinished-turn" : "retry"}:${input.successorRunId}`,
+    nextAction: USER_TEXT, resolutionNote: q ? "unfinished_turn_fresh_provider_thread" : "retry_fresh_provider_thread",
+    resolvedAt: new Date(recordedAt), attemptCount: 1,
     evidence: { runId: source.id, originalFailureCode: source.errorCode ?? null, executionReconciliation: reconciliation,
       freshContinuationSettlement: settlement, freshContinuation, continuationDelivery: "delivered",
-      continuationRunId: input.successorRunId } }).returning({ id: issueRecoveryActions.id });
-  // As the follow-up does: the replaced run loses its write authority.
+      continuationRunId: input.successorRunId, ...(q ? { unfinishedTurn: q.unfinishedTurn } : {}) } }).returning({ id: issueRecoveryActions.id });
+  // As the follow-up does: the replaced run (and, qualified, every predecessor) loses its write authority.
   await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
     || ${JSON.stringify({ [FRESH_CONTINUATION_SUPERSEDED_KEY]: recordedAt })}::jsonb` }).where(and(
-    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, source.id)));
+    eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, q?.predecessorRunIds ?? [source.id])));
   return created!.id;
+}
+
+export const UNFINISHED_TURN_TRIGGER = "successor_admission" as const;
+const UNFINISHED_TURN_PREDECESSORS_MAX = 4;
+
+/**
+ * A person's next authorized message after a turn that never finished (no
+ * terminal event, no accepted result) on a box that was only STOPPED. Called
+ * by selectPiConversation at the running-S cut, under its issue -> run(S) ->
+ * task-session locks; it adds run(D) -> coordinator(D), the coordinator
+ * store's issue -> run -> coordinator order. D is the run owning the thread
+ * (P, whose nativeSessionId is the pointer :113 compares) and every native run
+ * on this task between P and S (S0). EACH must independently be failed,
+ * terminal_failure, resultless, without live authority, with a nonempty OWN
+ * physical-lease set each proven by the one shared ownLeaseTerminated reader
+ * (ownLeaseOnly) and S on none of those boxes. Anything missing: null (the
+ * existing route holds). No remote I/O; the copies and pending controls are
+ * not read or touched.
+ */
+export async function admitUnfinishedTurnFreshThread(db: Db, input: {
+  run: typeof heartbeatRuns.$inferSelect; issueId: string; sourceSessionId: string | null | undefined;
+  /** The run the conversation record names as the thread's owner (Pi record runId, else task-session lastRunId). */
+  sourceRunId: string | null | undefined;
+}): Promise<string | null> {
+  const { run, issueId } = input;
+  const authorization = object(object(run.contextSnapshot).explicitUserContinuation);
+  if (!input.sourceSessionId || !input.sourceRunId || typeof authorization.commentId !== "string" || run.status !== "running"
+    || run.runtimeMode !== "native" || run.nativeSessionId || run.runnerProfileJson?.nativeExecutionInput !== undefined) return null;
+  const [existing] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+    eq(issueRecoveryActions.fingerprint, `fresh-continuation:unfinished-turn:${run.id}`))).limit(1);
+  if (existing) return existing.id; // same S: the same boundary, never a second one
+  const scope = and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
+    eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.runtimeMode, "native"), ne(heartbeatRuns.id, run.id),
+    lt(heartbeatRuns.createdAt, run.createdAt));
+  const [source] = await db.select().from(heartbeatRuns).where(and(scope, eq(heartbeatRuns.id, input.sourceRunId),
+    eq(heartbeatRuns.nativeSessionId, input.sourceSessionId))).limit(1);
+  if (!source) return null;
+  const ids = (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(scope,
+    gte(heartbeatRuns.createdAt, source.createdAt))).limit(UNFINISHED_TURN_PREDECESSORS_MAX + 1)).map(row => row.id).sort();
+  if (!ids.includes(source.id) || ids.length > UNFINISHED_TURN_PREDECESSORS_MAX) return null;
+  const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, ids)).orderBy(asc(heartbeatRuns.id)).for("update");
+  const finals = await db.select().from(nativeRunFinalizations).where(inArray(nativeRunFinalizations.runId, ids))
+    .orderBy(asc(nativeRunFinalizations.runId)).for("update");
+  const [accepted] = await db.select({ id: nativeRunResults.id }).from(nativeRunResults).where(inArray(nativeRunResults.runId, ids)).limit(1);
+  if (accepted || runs.length !== ids.length) return null;
+  const successorBoxes = (await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
+    eq(environmentLeases.heartbeatRunId, run.id)))).map(lease => `${lease.provider}\u0000${lease.providerLeaseId}`);
+  for (const predecessor of runs) {
+    const final = finals.find(row => row.runId === predecessor.id);
+    if (!["failed", "timed_out"].includes(predecessor.status) || !predecessor.finishedAt || predecessor.resultJson?.[FRESH_CONTINUATION_SUPERSEDED_KEY]
+      || !final || final.phase !== "terminal_failure" || final.resultId || final.leaseOwner || final.nextAttemptAt || final.controlDeadlineAt) return null;
+    const own = await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
+      eq(environmentLeases.heartbeatRunId, predecessor.id)));
+    if (!own.length) return null;
+    for (const lease of own) {
+      if (!lease.provider || !lease.providerLeaseId || successorBoxes.includes(`${lease.provider}\u0000${lease.providerLeaseId}`)) return null;
+      if (!await ownLeaseTerminated(db, { companyId: run.companyId, environmentId: lease.environmentId,
+        providerLeaseId: lease.providerLeaseId, runId: predecessor.id }, { ownLeaseOnly: true, successorOnOwnerSandbox: false })) return null;
+    }
+  }
+  const unfinishedTurn = { kind: "unfinished_turn", body: UNFINISHED_TURN_FACT, sourceRunId: source.id,
+    sourceSessionId: source.nativeSessionId, sourceRunnerInstanceId: source.runnerInstanceId ?? null, predecessorRunIds: ids,
+    controllerGenerations: Object.fromEntries(finals.map(row => [row.runId, row.controllerGeneration])),
+    companyId: run.companyId, agentId: run.agentId, issueId, successorRunId: run.id,
+    conversationSessionGeneration: run.contextSnapshot?.conversationSessionGeneration ?? null,
+    authorizationCommentId: authorization.commentId, checkedAt: new Date().toISOString() };
+  return recordRetryFreshProviderThread(db, { companyId: run.companyId, issueId, agentId: run.agentId, sourceRunId: source.id,
+    successorRunId: run.id, trigger: UNFINISHED_TURN_TRIGGER, qualified: { predecessorRunIds: ids, unfinishedTurn } });
+}
+
+/** The non-droppable handoff entry for S, read back from its own boundary action only. */
+export async function readUnfinishedTurnEntry(db: Pick<Db, "select">, input: { companyId: string; actionId: string; runId: string }) {
+  const [action] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, input.companyId),
+    eq(issueRecoveryActions.id, input.actionId))).limit(1);
+  const entry = object(action?.evidence.unfinishedTurn);
+  if (!action || action.evidence.continuationRunId !== input.runId || entry.successorRunId !== input.runId
+    || entry.kind !== "unfinished_turn" || entry.body !== UNFINISHED_TURN_FACT) return null;
+  return { ...entry, kind: "unfinished_turn", id: action.id, body: UNFINISHED_TURN_FACT };
 }
 
 /**

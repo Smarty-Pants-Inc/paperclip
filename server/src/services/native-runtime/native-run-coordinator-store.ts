@@ -1,3 +1,4 @@
+import { agentRunSuperseded } from "../../agent-run-cancellation.js";
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
 import { isNativeResponseEvidence, notifyNativeResponsePresentation } from "../native-response-presentation-notifications.js";
@@ -375,6 +376,8 @@ export class NativeRunCoordinatorStore {
       ) {
         throw new Error("native_result_run_not_authorized");
       }
+      // A fenced predecessor (fresh-thread boundary won first) cannot land a stale result.
+      if (agentRunSuperseded(run)) throw new Error("native_result_run_superseded");
 
       const [existing] = await tx
         .select()

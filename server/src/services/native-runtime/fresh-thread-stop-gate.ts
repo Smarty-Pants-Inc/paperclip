@@ -13,6 +13,9 @@ import { hostname } from "node:os";
 import { isInstructionRefreshPrepareCode } from "../../vendor/paperclip-runner/index.js";
 
 export const FRESH_THREAD_STARTED_NOTE = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
+/** The receipt-qualified unfinished-turn boundary only: never says no actions were taken. */
+export const UNFINISHED_TURN_FACT = "The previous turn did not finish and produced no accepted result.";
+export const FRESH_THREAD_UNFINISHED_NOTE = `${UNFINISHED_TURN_FACT} ${FRESH_THREAD_STARTED_NOTE}`;
 
 /** Only the typed instruction/skill refresh may claim the change took effect.
  * Environment loss and launch mismatch retain the generic truthful notice. */

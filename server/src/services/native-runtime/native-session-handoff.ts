@@ -11,9 +11,11 @@ const LIMIT = 10;
 
 export type HandoffEntry = { kind: string; id: string; body: string; truncated?: boolean; [key: string]: unknown };
 
-export function createNativeSessionHandoffLoader(input: Parameters<typeof buildNativeSessionHandoff>[0]): () => Promise<string | null> {
+export function createNativeSessionHandoffLoader(input: Parameters<typeof buildNativeSessionHandoff>[0]): (unfinishedTurn?: HandoffEntry) => Promise<string | null> {
   let packet: Promise<string | null> | undefined;
-  return () => packet ??= buildNativeSessionHandoff(input);
+  // The qualified packet is never the cached generic one (nor cached as it).
+  return unfinishedTurn => unfinishedTurn ? buildNativeSessionHandoff({ ...input, unfinishedTurn })
+    : packet ??= buildNativeSessionHandoff(input);
 }
 
 /** Deterministic background, never a substitute for the current authorized wake. */
@@ -50,6 +52,8 @@ export function renderNativeSessionHandoff(input: {
 export async function buildNativeSessionHandoff(input: {
   db: Db; companyId: string; issueId: string; agentId: string; before: Date;
   throughCommentId?: string | null;
+  /** Server-owned, typed by admission (readUnfinishedTurnEntry): first, never dropped. */
+  unfinishedTurn?: HandoffEntry;
 }): Promise<string | null> {
   const { db, companyId, issueId, agentId } = input;
   const [issue] = await db.select({
@@ -173,15 +177,22 @@ export async function buildNativeSessionHandoff(input: {
     const sourceTrust = historicalTrust(row.id, executionPolicy);
     entries.push({ ...sanitizeQuarantinedCommentForHigherTrust({ ...entry, sourceTrust }), kind: "run_summary" });
   }
+  const required = input.unfinishedTurn;
+  if (required && (required.kind !== "unfinished_turn" || required.issueId !== issueId || required.agentId !== agentId
+    || required.companyId !== companyId)) throw new Error("native_handoff_unfinished_turn_invalid");
+  if (required) entries.unshift(required);
   if (!entries.length) return null;
   const omittedEntriesAtLeast = Number(recent.length > LIMIT) + Number(decisions.length > 8) + Number(replies.length > 4) + Number(savedDocuments.length > 3) + Number(runSummaries.length > 2);
   // Give each indispensable category an early slot before filling the budget
   // with older messages. A long recent exchange cannot crowd out every answer
   // or the current plan.
-  const priority = [entries.find(entry => entry.kind === "original_request"), entries.find(entry => entry.kind === "message"),
+  const priority = [required, entries.find(entry => entry.kind === "original_request"), entries.find(entry => entry.kind === "message"),
     entries.find(entry => entry.kind === "resolved_interaction"), entries.find(entry => entry.kind === "document"), entries.find(entry => entry.kind === "run_summary"), entries.find(entry => entry.kind === "agent_reply")]
     .filter((entry): entry is HandoffEntry => entry !== undefined);
   const prioritized = [...new Set([...priority, ...entries])];
   const redacted = await createRunSecretRedactionRegistry(db).redactForIssue(companyId, issueId, prioritized);
-  return renderNativeSessionHandoff({ issueId, generation: issue.conversationAgentId ? issue.generation : null, entries: redacted, omittedEntriesAtLeast });
+  const packet = renderNativeSessionHandoff({ issueId, generation: issue.conversationAgentId ? issue.generation : null, entries: redacted, omittedEntriesAtLeast });
+  // HOLD before model submission rather than silently clip/redact the required fact away.
+  if (required && !packet.includes(JSON.stringify(required.body).slice(1, -1))) throw new Error("native_handoff_unfinished_turn_dropped");
+  return packet;
 }
