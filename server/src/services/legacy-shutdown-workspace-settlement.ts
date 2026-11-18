@@ -244,9 +244,12 @@ export async function allowLegacyShutdownWorkspaceCleanup(db: Db, lease: Lease, 
       }
     }
     if (current.status === "active") await notifyEnvironmentCleanup(tx, { companyId: run.companyId, runId: run.id });
-    const { terminalizeLegacyExecution } = await import("./legacy-execution-recovery.js");
-    const preserved = await terminalizeLegacyExecution({ db: tx as unknown as Db, run, status: run.status,
-      recordRestoreFailureOnly: true, patch: { resultJson: { workspaceRestoreFailure: "restore_failed" } } });
+    // The export deadline passed without a copy-back: the files are owed. Route
+    // through the one restore-hold authority; a failure the adapter already
+    // recorded on the run keeps the Retry words.
+    const { recordRequiredWorkspaceRestoreFailure, workspaceRestoreOnlyOwed } = await import("./legacy-execution-recovery.js");
+    const preserved = await recordRequiredWorkspaceRestoreFailure(tx as unknown as Db, run,
+      { workspaceRestoreFailure: "restore_failed" }, undefined, { restorePending: workspaceRestoreOnlyOwed(run) });
     if (!preserved) return false;
     await tx.update(environmentLeases).set({ metadata: sql`jsonb_set(${environmentLeases.metadata},
       '{legacyShutdownWorkspaceSettlement,state}', '"expired"'::jsonb)` }).where(and(
