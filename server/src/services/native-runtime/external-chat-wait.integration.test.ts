@@ -3629,6 +3629,28 @@ describe("native external-chat response wait", () => {
     } finally { await coordinator.stop(); vi.useRealTimers(); }
   });
 
+  // KEEP: accepted summaries and stored agent replies must compare in the
+  // same masked form without weakening the native review authorization proof.
+  it.each(["equality", "12000-prefix"])("redact-store ii: key-bearing %s still presents the accepted summary", async mode => {
+    const { redactSensitiveText } = await import("../../redaction.js");
+    const keys = ["sk-proj-" + "aB3-_".repeat(8), "sk-ant-api03-" + "cD4-_".repeat(8), "sk-or-v1-" + "a1".repeat(32), "sk-" + "eF5g".repeat(8)];
+    const summary = mode === "equality" ? keys.join("\n") : (keys.join("\n") + " " + "s".repeat(12_000)).slice(0, 12_000);
+    const answer = summary + (mode === "12000-prefix" ? " WHOLE_ANSWER_TAIL" : "");
+    const fixture = await seedWaitTurn("telegram", [], { summary });
+    await seedPriorCompletionReview(fixture);
+    const resultJson = await finishReviewResponse(fixture);
+    expect(resultJson.finalizationReasonCode).toBe("governed_response_waiting");
+    expect(await authorizeNativeChatReviewPresentation(db, { ...fixture, resultJson })).toBe(true);
+    const posted = await issueService(db).addComment(fixture.issueId, redactSensitiveText(answer),
+      { agentId: fixture.agentId, runId: fixture.runId }, { authorizationReason: "allow_chat_run_presentation" });
+    expect(posted.body).toBe(redactSensitiveText(answer));
+    expect(posted.createdByRunId).toBe(fixture.runId);
+    expect((await db.select().from(chatPublications).where(eq(chatPublications.commentId, posted.id))).length).toBe(1);
+    await expect(issueService(db).addComment(fixture.issueId, "Not the accepted summary",
+      { agentId: fixture.agentId, runId: fixture.runId }, { authorizationReason: "allow_chat_run_presentation" }))
+      .rejects.toMatchObject({ status: 409, details: { code: "chat_review_response_presentation_denied" } });
+  });
+
   it.each([
     ["telegram", "agent"],
     ["discord", "agent"],
