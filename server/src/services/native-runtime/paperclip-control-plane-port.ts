@@ -1,3 +1,4 @@
+import { redactSensitiveText } from "../../redaction.js";
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
@@ -71,6 +72,16 @@ function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+}
+
+/** Text leaves only: do not apply field-name masking to protocol objects. */
+function redactNativeText<T>(value: T): T {
+  if (typeof value === "string") return redactSensitiveText(value) as T;
+  if (Array.isArray(value)) return value.map(redactNativeText) as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, redactNativeText(child)])) as T;
+  }
+  return value;
 }
 
 function assertTerminal(value: unknown): asserts value is PrpTerminalState {
@@ -249,7 +260,7 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
   }
 
   normalizeReplayPayload(payload: PrpEvent["payload"]): PrpEvent["payload"] {
-    return redactRunnerApiPayloads(this.#identityRedactor.redact(payload));
+    return redactNativeText(redactRunnerApiPayloads(this.#identityRedactor.redact(payload)));
   }
 
   async checkpointSession(snapshot: PersistedNativeSession, options?: { signal: AbortSignal }): Promise<void> {
@@ -444,6 +455,12 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       }
     }
     event = redactRunnerApiEvent(event);
+    // Commit and hash the SAME masked event. Replays, observers, transcript
+    // reads and source-log integrity checks must all see this canonical form.
+    if (/^(?:item|tool|message|semantic_tool)\./.test(event.eventType)) {
+      event = { ...event, payload: redactNativeText(event.payload),
+        ...(event.debug === undefined ? {} : { debug: redactNativeText(event.debug) }) };
+    }
     const observerKey = JSON.stringify([event.sourceInstanceId, event.sourceEventId]);
     const pendingObservation = this.#deferredEventObservers.get(observerKey);
     const persisted = await measureNativeControllerStep("event_write", () => appendHeartbeatRunEvent(this.#db, {

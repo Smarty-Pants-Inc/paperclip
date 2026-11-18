@@ -1,0 +1,874 @@
+[
+  {
+    "input": "bearer of good news",
+    "expected": "bearer ***REDACTED*** good news"
+  },
+  {
+    "input": "bearer of this letter",
+    "expected": "bearer ***REDACTED*** this letter"
+  },
+  {
+    "input": "bearer marks every room",
+    "expected": "bearer ***REDACTED*** every room"
+  },
+  {
+    "input": "bearer bonds were common",
+    "expected": "bearer ***REDACTED*** were common"
+  },
+  {
+    "input": "bearer Johnson led us",
+    "expected": "bearer ***REDACTED*** led us"
+  },
+  {
+    "input": "bearer authentication and bearer tokens.",
+    "expected": "bearer authentication and bearer tokens."
+  },
+  {
+    "input": "bearer tokens are used",
+    "expected": "bearer tokens are used"
+  },
+  {
+    "input": "bearer credentials are private",
+    "expected": "bearer credentials are private"
+  },
+  {
+    "input": "bearer lanterns glow",
+    "expected": "bearer ***REDACTED*** glow"
+  },
+  {
+    "input": "bearer responsibilities continue",
+    "expected": "bearer ***REDACTED*** continue"
+  },
+  {
+    "input": "bearer internationalization matters",
+    "expected": "bearer ***REDACTED*** matters"
+  },
+  {
+    "input": "bearer room12number34 is a sign",
+    "expected": "bearer ***REDACTED*** is a sign"
+  },
+  {
+    "input": "bearer chapter2026edition continues",
+    "expected": "bearer ***REDACTED*** continues"
+  },
+  {
+    "input": "bearer abcdefABCDEF is text",
+    "expected": "bearer ***REDACTED*** is text"
+  },
+  {
+    "input": "bearer abc123def",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer abcdefghijkl",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer 0123456789abcdef",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer abc123def456",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer 123456789012",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer 1234567890123456789",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer a1b2c3d4e5f6g7h8i9",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer xxxxxxxxxxxxxxxxxxx",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer xxxxxxxxxxxxxxxxxxxx",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer xxxxxxxxxxxxxxxxxxxxx",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer abcDEF12345678901234!",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "bearer abcDEF1234567890123456:",
+    "expected": "bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer of good news",
+    "expected": "the bearer ***REDACTED*** good news"
+  },
+  {
+    "input": "the bearer of this letter",
+    "expected": "the bearer ***REDACTED*** this letter"
+  },
+  {
+    "input": "the bearer marks every room",
+    "expected": "the bearer ***REDACTED*** every room"
+  },
+  {
+    "input": "the bearer bonds were common",
+    "expected": "the bearer ***REDACTED*** were common"
+  },
+  {
+    "input": "the bearer Johnson led us",
+    "expected": "the bearer ***REDACTED*** led us"
+  },
+  {
+    "input": "the bearer authentication and bearer tokens.",
+    "expected": "the bearer authentication and bearer tokens."
+  },
+  {
+    "input": "the bearer tokens are used",
+    "expected": "the bearer tokens are used"
+  },
+  {
+    "input": "the bearer credentials are private",
+    "expected": "the bearer credentials are private"
+  },
+  {
+    "input": "the bearer lanterns glow",
+    "expected": "the bearer ***REDACTED*** glow"
+  },
+  {
+    "input": "the bearer responsibilities continue",
+    "expected": "the bearer ***REDACTED*** continue"
+  },
+  {
+    "input": "the bearer internationalization matters",
+    "expected": "the bearer ***REDACTED*** matters"
+  },
+  {
+    "input": "the bearer room12number34 is a sign",
+    "expected": "the bearer ***REDACTED*** is a sign"
+  },
+  {
+    "input": "the bearer chapter2026edition continues",
+    "expected": "the bearer ***REDACTED*** continues"
+  },
+  {
+    "input": "the bearer abcdefABCDEF is text",
+    "expected": "the bearer ***REDACTED*** is text"
+  },
+  {
+    "input": "the bearer abc123def",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer abcdefghijkl",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer 0123456789abcdef",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer abc123def456",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer 123456789012",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer 1234567890123456789",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer a1b2c3d4e5f6g7h8i9",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer xxxxxxxxxxxxxxxxxxx",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer xxxxxxxxxxxxxxxxxxxx",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer xxxxxxxxxxxxxxxxxxxxx",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer abcDEF12345678901234!",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "the bearer abcDEF1234567890123456:",
+    "expected": "the bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer of good news",
+    "expected": "lantern bearer ***REDACTED*** good news"
+  },
+  {
+    "input": "lantern bearer of this letter",
+    "expected": "lantern bearer ***REDACTED*** this letter"
+  },
+  {
+    "input": "lantern bearer marks every room",
+    "expected": "lantern bearer ***REDACTED*** every room"
+  },
+  {
+    "input": "lantern bearer bonds were common",
+    "expected": "lantern bearer ***REDACTED*** were common"
+  },
+  {
+    "input": "lantern bearer Johnson led us",
+    "expected": "lantern bearer ***REDACTED*** led us"
+  },
+  {
+    "input": "lantern bearer authentication and bearer tokens.",
+    "expected": "lantern bearer authentication and bearer tokens."
+  },
+  {
+    "input": "lantern bearer tokens are used",
+    "expected": "lantern bearer tokens are used"
+  },
+  {
+    "input": "lantern bearer credentials are private",
+    "expected": "lantern bearer credentials are private"
+  },
+  {
+    "input": "lantern bearer lanterns glow",
+    "expected": "lantern bearer ***REDACTED*** glow"
+  },
+  {
+    "input": "lantern bearer responsibilities continue",
+    "expected": "lantern bearer ***REDACTED*** continue"
+  },
+  {
+    "input": "lantern bearer internationalization matters",
+    "expected": "lantern bearer ***REDACTED*** matters"
+  },
+  {
+    "input": "lantern bearer room12number34 is a sign",
+    "expected": "lantern bearer ***REDACTED*** is a sign"
+  },
+  {
+    "input": "lantern bearer chapter2026edition continues",
+    "expected": "lantern bearer ***REDACTED*** continues"
+  },
+  {
+    "input": "lantern bearer abcdefABCDEF is text",
+    "expected": "lantern bearer ***REDACTED*** is text"
+  },
+  {
+    "input": "lantern bearer abc123def",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer abcdefghijkl",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer 0123456789abcdef",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer abc123def456",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer 123456789012",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer 1234567890123456789",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer a1b2c3d4e5f6g7h8i9",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer xxxxxxxxxxxxxxxxxxx",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer xxxxxxxxxxxxxxxxxxxx",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer xxxxxxxxxxxxxxxxxxxxx",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer abcDEF12345678901234!",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "lantern bearer abcDEF1234567890123456:",
+    "expected": "lantern bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer of good news",
+    "expected": "standard bearer ***REDACTED*** good news"
+  },
+  {
+    "input": "standard bearer of this letter",
+    "expected": "standard bearer ***REDACTED*** this letter"
+  },
+  {
+    "input": "standard bearer marks every room",
+    "expected": "standard bearer ***REDACTED*** every room"
+  },
+  {
+    "input": "standard bearer bonds were common",
+    "expected": "standard bearer ***REDACTED*** were common"
+  },
+  {
+    "input": "standard bearer Johnson led us",
+    "expected": "standard bearer ***REDACTED*** led us"
+  },
+  {
+    "input": "standard bearer authentication and bearer tokens.",
+    "expected": "standard bearer authentication and bearer tokens."
+  },
+  {
+    "input": "standard bearer tokens are used",
+    "expected": "standard bearer tokens are used"
+  },
+  {
+    "input": "standard bearer credentials are private",
+    "expected": "standard bearer credentials are private"
+  },
+  {
+    "input": "standard bearer lanterns glow",
+    "expected": "standard bearer ***REDACTED*** glow"
+  },
+  {
+    "input": "standard bearer responsibilities continue",
+    "expected": "standard bearer ***REDACTED*** continue"
+  },
+  {
+    "input": "standard bearer internationalization matters",
+    "expected": "standard bearer ***REDACTED*** matters"
+  },
+  {
+    "input": "standard bearer room12number34 is a sign",
+    "expected": "standard bearer ***REDACTED*** is a sign"
+  },
+  {
+    "input": "standard bearer chapter2026edition continues",
+    "expected": "standard bearer ***REDACTED*** continues"
+  },
+  {
+    "input": "standard bearer abcdefABCDEF is text",
+    "expected": "standard bearer ***REDACTED*** is text"
+  },
+  {
+    "input": "standard bearer abc123def",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer abcdefghijkl",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer 0123456789abcdef",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer abc123def456",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer 123456789012",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer 1234567890123456789",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer a1b2c3d4e5f6g7h8i9",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer xxxxxxxxxxxxxxxxxxx",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer xxxxxxxxxxxxxxxxxxxx",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer xxxxxxxxxxxxxxxxxxxxx",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer abcDEF12345678901234!",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "standard bearer abcDEF1234567890123456:",
+    "expected": "standard bearer ***REDACTED***"
+  },
+  {
+    "input": "Bearer x",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer x",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"x\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'x'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer x\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=x",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer abc",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer abc",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"abc\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'abc'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer abc\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=abc",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer abc123def",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer abc123def",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"abc123def\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'abc123def'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer abc123def\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=abc123def",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer abcdefghijkl",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer abcdefghijkl",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"abcdefghijkl\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'abcdefghijkl'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer abcdefghijkl\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=abcdefghijkl",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer abc123def456",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer abc123def456",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"abc123def456\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'abc123def456'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer abc123def456\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=abc123def456",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer 0123456789abcdef",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer 0123456789abcdef",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"0123456789abcdef\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer '0123456789abcdef'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer 0123456789abcdef\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=0123456789abcdef",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer 1234567890123456",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer 1234567890123456",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"1234567890123456\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer '1234567890123456'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer 1234567890123456\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=1234567890123456",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer a1b2c3d4e5f6g7h8i9",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer a1b2c3d4e5f6g7h8i9",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"a1b2c3d4e5f6g7h8i9\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'a1b2c3d4e5f6g7h8i9'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer a1b2c3d4e5f6g7h8i9\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=a1b2c3d4e5f6g7h8i9",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer abcdefghijklmno",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer abcdefghijklmno",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"abcdefghijklmno\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'abcdefghijklmno'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer abcdefghijklmno\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=abcdefghijklmno",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer abc-123-def-456",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer abc-123-def-456",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"abc-123-def-456\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'abc-123-def-456'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer abc-123-def-456\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=abc-123-def-456",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer xxxxxxxxxxxxxxxxxxx",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer xxxxxxxxxxxxxxxxxxx",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"xxxxxxxxxxxxxxxxxxx\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'xxxxxxxxxxxxxxxxxxx'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer xxxxxxxxxxxxxxxxxxx\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=xxxxxxxxxxxxxxxxxxx",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer xxxxxxxxxxxxxxxxxxxx",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer xxxxxxxxxxxxxxxxxxxx",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"xxxxxxxxxxxxxxxxxxxx\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'xxxxxxxxxxxxxxxxxxxx'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer xxxxxxxxxxxxxxxxxxxx\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=xxxxxxxxxxxxxxxxxxxx",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer 0123456789abcdef0123456789abcdef",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer 0123456789abcdef0123456789abcdef",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"0123456789abcdef0123456789abcdef\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer '0123456789abcdef0123456789abcdef'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer 0123456789abcdef0123456789abcdef\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=0123456789abcdef0123456789abcdef",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer abcDEF12345678901234!",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer abcDEF12345678901234!",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"abcDEF12345678901234!\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'abcDEF12345678901234!'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer abcDEF12345678901234!\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=abcDEF12345678901234!",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer secret!123456789012345",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer secret!123456789012345",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"secret!123456789012345\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'secret!123456789012345'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer secret!123456789012345\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=secret!123456789012345",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer token:1234567890123456",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer token:1234567890123456",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"token:1234567890123456\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'token:1234567890123456'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer token:1234567890123456\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=token:1234567890123456",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer café123456789012345678",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer café123456789012345678",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"café123456789012345678\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'café123456789012345678'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer café123456789012345678\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=café123456789012345678",
+    "expected": "bearer=***REDACTED***"
+  },
+  {
+    "input": "Bearer abcdefghijk1234567890",
+    "expected": "Bearer ***REDACTED***"
+  },
+  {
+    "input": "Authorization: Bearer abcdefghijk1234567890",
+    "expected": "Authorization: ***REDACTED***"
+  },
+  {
+    "input": "bearer \"abcdefghijk1234567890\"",
+    "expected": "bearer \"***REDACTED***\""
+  },
+  {
+    "input": "bearer 'abcdefghijk1234567890'",
+    "expected": "bearer '***REDACTED***'"
+  },
+  {
+    "input": "\"authorization\": \"Bearer abcdefghijk1234567890\"",
+    "expected": "\"authorization\": \"***REDACTED***\""
+  },
+  {
+    "input": "bearer=abcdefghijk1234567890",
+    "expected": "bearer=***REDACTED***"
+  }
+]
