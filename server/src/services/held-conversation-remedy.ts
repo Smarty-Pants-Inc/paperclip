@@ -91,3 +91,56 @@ export async function newMessageWouldRun(db: Db, input: { companyId: string; iss
   const decision = await decideNewMessage(db, input);
   return Boolean(decision && (!decision.blocked || decision.admitted));
 }
+
+class SendProbeRollback extends Error {
+  constructor(readonly decision: HeldSendDecision) { super("held-list Send probe rollback"); }
+}
+
+/** What the held list's Send would do now: admitted, or held with the wait dispatch would write. */
+export type HeldSendDecision = { admitted: true } | { admitted: false; wait: { reason: string; message: string } };
+
+/**
+ * The ONE pure read of the held list's Send (the queued-comments GET's Stop
+ * bar). The Send route writes an interrupt intent { actorId, requestedAt } onto
+ * the held wake and dispatch then calls the admission with that wake
+ * (heartbeat/queue.ts:4209 preview, :5104 commit). Here the intent is never
+ * written: prospectiveSendAt stands in for it inside the admission, as
+ * prospectiveMessageAt stands in for a typed comment. The same read-only,
+ * always-rolled-back transaction as decideNewMessage. Dispatch holds the Send
+ * when the admission does not admit it and there is a blocker or a named
+ * refusal (queue.ts:4209-4218, :5115-5116); the wait it then writes is the
+ * named refusal, else the unnamed wait (queue.ts:4109, :4116). A verified
+ * /new reset is not held by a named refusal alone (queue.ts:4218). An error
+ * returns null (doubt).
+ */
+export async function heldListSendDecision(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; queueId: string; actorId: string; commentId: string;
+  conversationReset: boolean;
+}): Promise<HeldSendDecision | null> {
+  try {
+    const { admitExplicitNativeContinuation } = await import("./explicit-native-continuation.js");
+    const { getExecutionBlocker } = await import("./execution-blocker.js");
+    const { UNNAMED_EXECUTION_WAIT } = await import("./deferred-execution-wait.js");
+    try {
+      await db.transaction(async tx => {
+        await tx.execute(sql`set transaction read only`);
+        const blocker = await getExecutionBlocker(tx as unknown as Db, input.companyId, input.issueId);
+        let refusal: { reason: string; message: string } | null = null;
+        const admitted = await admitExplicitNativeContinuation({ db: tx as unknown as Db,
+          companyId: input.companyId, issueId: input.issueId, agentId: input.agentId, actorType: "user", actorId: input.actorId,
+          reason: "issue_commented", commentId: input.commentId, successorRunId: randomUUID(),
+          queuedCommentInterruptId: input.queueId, prospectiveSendAt: new Date(), dryRun: true,
+          onBlocked: (reason, message) => { refusal = { reason, message }; } });
+        const named = refusal as { reason: string; message: string } | null;
+        const held = !admitted && (Boolean(blocker) || (named !== null && !input.conversationReset));
+        throw new SendProbeRollback(held ? { admitted: false, wait: named ?? { ...UNNAMED_EXECUTION_WAIT } } : { admitted: true });
+      });
+    } catch (outcome) {
+      if (outcome instanceof SendProbeRollback) return outcome.decision;
+      throw outcome;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}

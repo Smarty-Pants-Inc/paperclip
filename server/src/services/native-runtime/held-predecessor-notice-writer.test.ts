@@ -70,7 +70,7 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
   // S6 (rf5 round 2): after a PERSON's Stop the held writer wrote H, whose
   // "Send a new message to try again" invites a retype answered twice. It writes
   // R3 then. Controls: a non-person cancel and the Send's interrupt stop keep H.
-  it.each(["person stop", "system cancel", "interrupt stop"] as const)("SCREEN S6: the held writer after a %s", async cause => {
+  const screenS6 = async (cause: "person stop" | "system cancel" | "interrupt stop") => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Held stop", issuePrefix: companyId.slice(0, 8) });
     await db.insert(agents).values({ id: agentId, companyId, name: "Held agent", adapterType: "paperclip_runner", status: "active" });
@@ -88,11 +88,26 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
     const notices = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
       .filter(comment => String((comment.metadata as Record<string, unknown> | null)?.authorizationReason ?? "")
         === `native_prior_owner_held:${sessionId}`);
+    return { companyId, agentId, issueId, notices };
+  };
+  it.each(["person stop"] as const)("SCREEN S6: the held writer after a %s", async cause => {
+    const { notices } = await screenS6(cause);
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(cause === "person stop"
-      ? "Stopped. This message is waiting and will be sent when you send your next message. Send it now, or delete it."
-      : HELD_PREDECESSOR_NOTICE);
-    expect(notices[0]!.body.toLowerCase().includes("send a new message")).toBe(cause !== "person stop");
+    expect(notices[0]!.body).toBe("Stopped. This message is waiting and will be sent when you send your next message. Send it now, or delete it.");
+    expect(notices[0]!.body.toLowerCase().includes("send a new message")).toBe(false);
+  });
+  // SUPERSEDE-C4-SCREEN-CONTROLS-HELDTEXT-1118 (rf-5's four points): a NON-Stop held state takes the held
+  // banner's ONE remedy rule. Here it is EXACTLY the default new-task text; the person-Stop half stays R3.
+  // The old unhedged "Send a new message to try again." turns it red.
+  it.each(["system cancel", "interrupt stop"] as const)("SUPERSEDE-C4-SCREEN-CONTROLS-HELDTEXT-1118 SCREEN S6: the held writer after a %s writes exactly the new-task text", async cause => {
+    const f = await screenS6(cause);
+    expect(f.notices).toHaveLength(1);
+    expect(f.notices[0]!.body).toBe("Your message and saved work are kept, but the previous run of this conversation did not finish. Assign this agent a new task to continue.");
+    expect(f.notices[0]!.body).toBe(HELD_PREDECESSOR_NOTICE);
+    expect(f.notices[0]!.body.toLowerCase().includes("send a new message")).toBe(false);
+    // rf-5 point 2 (a real POST is deferred) is NOT met here: observed, not asserted (c4-bar-i finding).
+    const posted = await postDeferred(await routeApp("owner", f.companyId), f);
+    console.log("C4CTRL", JSON.stringify({ row: "S6", cause, wakes: posted.wakes.map(wake => wake.status), runs: posted.runs.length }));
   });
 
 

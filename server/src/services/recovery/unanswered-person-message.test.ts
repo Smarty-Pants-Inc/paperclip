@@ -933,17 +933,29 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   // SCREEN row 3 control: a NON-Stop held case (a pre-turn refusal, G4's shape)
   // keeps HELD_PREDECESSOR_NOTICE, its title and its "Send a new message" action.
-  it.each([true, false])("SCREEN row 3 control: a non-Stop held message keeps HELD_PREDECESSOR_NOTICE (chat=%s)", async chat => {
-    expect(HELD).toBe("Your message and saved work are kept, but the previous run of this conversation did not finish. Send a new message to try again.");
+  // SUPERSEDE-C4-SCREEN-CONTROLS-HELDTEXT-1118 (rf-5's four points): the non-Stop held text is EXACTLY the
+  // held banner's default new-task text and Next action (the helper's own decision); the old unhedged
+  // "Send a new message to try again." turns it red.
+  it.each([true, false])("SUPERSEDE-C4-SCREEN-CONTROLS-HELDTEXT-1118 SCREEN row 3 control: a non-Stop held message keeps HELD_PREDECESSOR_NOTICE (chat=%s)", async chat => {
+    expect(HELD).toBe("Your message and saved work are kept, but the previous run of this conversation did not finish. Assign this agent a new task to continue.");
     const f = await fixture({ chat });
     await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
       error: "runner_state_identity_mismatch: legacy_owner_unverified" });
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(HELD);
+    // c4: a non-Stop held state takes the held banner's ONE remedy rule (not R3), here the new task.
+    const remedy = await heldConversationRemedy(db, f);
+    expect(remedy.newMessageAdmitted).toBe(false);
+    expect(notices[0]!.body).toBe("Your message and saved work are kept, but the previous run of this conversation did not finish. Assign this agent a new task to continue.");
+    expect(notices[0]!.body).toBe(remedy.body);
     expect(notices[0]!.presentation).toMatchObject({ title: "Your message wasn't answered" });
-    expect(nextActionOf(notices[0]!)).toBe("Send a new message to try again.");
+    expect(nextActionOf(notices[0]!)).toBe("Assign this agent a new task to continue.");
+    expect(nextActionOf(notices[0]!)).toBe(remedy.nextAction);
+    expect(`${notices[0]!.body}\n${nextActionOf(notices[0]!)}`).not.toContain("Send a new message to try again.");
+    // rf-5 point 2 (a new message is deferred) is NOT met here: observed, not asserted (c4-bar-i finding).
+    console.log("C4CTRL", JSON.stringify({ row: "row 3", chat, blocker: Boolean(await getExecutionBlocker(db, f.companyId, f.issueId)),
+      admitted: remedy.newMessageAdmitted }));
   });
 
   it("waitnote: execution_recovery uses the existing start bound and upgrades the SAME waiting note after it", async () => {

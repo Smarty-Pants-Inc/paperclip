@@ -62,6 +62,7 @@ import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from ".
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse, type QueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
+import { heldListSendDecision } from "../services/held-conversation-remedy.js";
 import {
   assertStoredIntentAllowsSteer, changeQueuedCommentDeliveryIntent, chatQueueTail, DELIVERY_INTENTS,
   sendQueuedCommentFirst, storeDeliveryIntent,
@@ -7905,7 +7906,7 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
-    if (wake && queueState?.state === "deferred" && !input.activeRun && !queue.executionWait && comments.length > 0 &&
+    if (wake && queueState?.state === "deferred" && !input.activeRun && !interruptHandoff && comments.length > 0 &&
         input.issue.assigneeAgentId && !queuedInteractionId(wake.payload)) {
       // Stop means stop (org 11-17): after a person's Stop the waiting messages
       // of every task (Agent Chat or not) are not sent. The person sends them,
@@ -7917,7 +7918,24 @@ export function issueRoutes(
         .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
       const stop = readObject(lastTurn?.resultJson);
       if (lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId) {
-        queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+        // The Stop bar says what the held list's Send does NOW: its own pure
+        // read through the admission (heldListSendDecision). R4 only when that
+        // Send is admitted; otherwise the refusal's own wait. A stored wait is
+        // what an earlier dispatch said, never read as the current truth.
+        const sender = input.issue.conversationAgentId ? input.issue.conversationUserId
+          : input.actor.actorType === "user" ? input.actor.actorId : null;
+        const heldIds = queuedCommentIdsFromWakePayload(wake.payload);
+        const last = heldIds.at(-1);
+        const lastBody = comments.find((comment) => comment.id === last)?.body ?? "";
+        const send = sender && last ? await heldListSendDecision(input.executor as Db, {
+          companyId: input.issue.companyId, issueId: input.issue.id, agentId: input.issue.assigneeAgentId,
+          queueId: wake.id, actorId: sender, commentId: last,
+          conversationReset: Boolean(input.issue.conversationAgentId) && isConversationReset(lastBody),
+        }) : null;
+        // Doubt (no person who could Send, or the read failed) claims nothing.
+        if (send?.admitted) queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
+        else if (send) queue.executionWait = send.wait;
+        else delete queue.executionWait;
       }
     }
     if (wake && queuedInteractionId(wake.payload)) {

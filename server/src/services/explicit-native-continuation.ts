@@ -195,10 +195,17 @@ export async function admitExplicitNativeContinuation(input: {
    * that is never written: only its time is read, as the saved comment's would
    * be. It takes no row lock and runs no preservation, so it writes nothing. */
   prospectiveMessageAt?: Date;
+  /** A pure-read dry run of the held list's Send (the queued-comments GET's
+   * Stop bar) with queuedCommentInterruptId naming the held wake: the
+   * interrupt intent the Send route would write onto it ({ actorId,
+   * requestedAt }) is never written; this time stands in for it, as
+   * prospectiveMessageAt stands in for the comment. */
+  prospectiveSendAt?: Date;
   onBlocked?: (reason: string, message: string) => void;
 }): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; taskRetryRequestId?: string; queuedCommentInterruptId?: string; readiness?: ContinuationReadiness } | null> {
   const { db, companyId, issueId, agentId, actorId, commentId } = input;
-  const pureRead = input.dryRun === true && input.prospectiveMessageAt !== undefined;
+  const pureRead = input.dryRun === true && (input.prospectiveMessageAt !== undefined || input.prospectiveSendAt !== undefined);
+  const prospectiveSendAt = pureRead ? input.prospectiveSendAt ?? null : null;
   // A pure read takes no row lock, so a read-only transaction can run it.
   const lockRows = <Q>(query: Q): Q => pureRead ? query : (query as unknown as { for(strength: "update"): Q }).for("update");
   const blocked = (reason: string, message: string) => { input.onBlocked?.(reason, message); return null; };
@@ -227,13 +234,16 @@ export async function admitExplicitNativeContinuation(input: {
   )) : [];
   const taskRetry = readTaskRetryIntent(retryWake?.payload);
   if (input.taskRetryRequestId && (!taskRetry || taskRetry.generationId !== retryWake?.id || taskRetry.actorId !== actorId)) return null;
-  const [interruptQueue] = input.queuedCommentInterruptId ? await db.select().from(agentWakeupRequests).where(and(
+  const [heldQueue] = input.queuedCommentInterruptId ? await db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.id, input.queuedCommentInterruptId),
     eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
     eq(agentWakeupRequests.status, "deferred_issue_execution"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
-    sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${actorId}`,
+    prospectiveSendAt ? undefined : sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${actorId}`,
   )) : [];
+  // The prospective Send's intent stands in for the one the Send route writes.
+  const interruptQueue = heldQueue && prospectiveSendAt ? { ...heldQueue, payload: { ...(heldQueue.payload ?? {}),
+    queuedCommentInterrupt: { actorId, requestedAt: prospectiveSendAt.toISOString() } } } : heldQueue;
   const response = interruptQueue
     ? await readQueuedInteractionResponse(db, companyId, issueId, interruptQueue.payload) : decided;
   const queuedInterrupt = Boolean(interruptQueue && (response || (commentId &&
@@ -273,7 +283,7 @@ export async function admitExplicitNativeContinuation(input: {
     if (undelivered.at(-1) !== commentId) return null;
     partiallyDeliveredQueue = undelivered.length !== ids.length;
   }
-  const prospective = pureRead
+  const prospective = pureRead && input.prospectiveMessageAt
     ? { body: "prospective message", createdAt: input.prospectiveMessageAt } as typeof issueComments.$inferSelect : null;
   const [comment] = retry || taskRetry || response ? [] : prospective ? [prospective] : await db.select().from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
