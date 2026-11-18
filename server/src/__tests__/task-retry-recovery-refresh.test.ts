@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import express from "express";
@@ -29,6 +31,11 @@ import { startTaskDrain, stopTaskDrain } from "../services/task-admission.js";
 import { decideStrandedRetryAdmission } from "../services/recovery/stranded-retry-admission.js";
 import { buildStrandedRecoveryEscalationNotice } from "../services/recovery/stranded-notice.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
+import type { NativeRunIdentity, NativeSession, PrpEvent } from "@paperclipai/paperclip-runner";
+import type { HeartbeatServiceOptions } from "../services/heartbeat.js";
+import { registerLocalRuntimeApiServer, runtimeApiInternals } from "../runtime-api.js";
+import { answeredPersonMessageSql } from "../services/person-message-answer.js";
+import { closeIdleWarmNativeSessionsForRestart } from "../services/native-runtime/native-session-executor.js";
 
 // Keep: RFL round-4 findings F1/F5. Real HTTP, durable Task Retry and the real
 // native workspace hold writer. No provider call or executor is started.
@@ -532,6 +539,102 @@ describe("Task Retry recovery-card refresh", () => {
       if (opts.adapterType !== "paperclip_runner") expect(probe.runStarted).toBe(true);
     }, 60_000);
   }
+
+  // G2 (rf-5 2g §3): the answering peer is rf-5's rf5-completing-peer.ts pattern
+  // (provider-only boundary of heartbeat-provider-trace.test.ts; no admission,
+  // stop-proof, selection, event persistence or publication mocks). It answers
+  // the new message once and writes its own marker naming the run.
+  function answeringPeer(markerFile: string): NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> {
+    return execution => {
+      let identity: NativeRunIdentity; let sourceInstanceId = ""; const turn = Promise.withResolvers<string>();
+      const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+      const contract = execution.completionContract.contract as { revision: string; criteria: Array<{ id: string }> };
+      const result = { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "G2 controlled provider answered the new message.",
+        completionClaim: { contractRevision: contract.revision, objectiveSatisfied: true,
+          criteria: contract.criteria.map(c => ({ criterionId: c.id, status: "satisfied", evidenceRefs: [] })), remainingWork: [] },
+        evidence: [], verification: [], artifacts: [], attentionRequests: [] };
+      const session: NativeSession = { identity: () => identity, capabilities: async () => capabilities, attachRun: async input => { identity = input.identity; },
+        startTurn: async input => { const turnId = randomUUID();
+          await appendFile(markerFile, `${JSON.stringify({ at: new Date().toISOString(), runId: identity.runId, marker: "provider.startTurn", input })}\n`);
+          turn.resolve(turnId); return { turnId }; },
+        async *events() { const turnId = await turn.promise;
+          const event = (sourceSeq: number, eventType: PrpEvent["eventType"], payload: Record<string, unknown>): PrpEvent => ({ schema: "paperclip.prp.event.v1",
+            sourceKind: "runner", sourceInstanceId, sourceEventId: `${sourceInstanceId}:${identity.runId}:${sourceSeq}`, sourceSeq, runId: identity.runId,
+            normalizedSessionId: identity.sessionId, turnId, schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), eventType, payload });
+          yield event(1, "turn.started", {});
+          yield event(2, "item.completed", { kind: "agentMessage", channel: "final", text: "G2 controlled provider answered the new message." });
+          yield event(3, "run.result.proposed", result); yield event(4, "turn.completed", { status: "completed" }); },
+        result: async () => result as never, snapshot: async () => ({ backendKind: "mock", sessionId: identity.sessionId, identity,
+          providerSessionId: "g2-controlled-provider", cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }), close: async () => {} } as NativeSession;
+      return { descriptor: async () => { const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId));
+          sourceInstanceId = run!.runnerInstanceId!;
+          await appendFile(markerFile, `${JSON.stringify({ at: new Date().toISOString(), runId: run!.id, startedAt: run!.startedAt, marker: "executor.backend.descriptor" })}\n`);
+          return { kind: "mock", name: "g2-controlled-provider-only", version: "1", capabilities, runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } } as never; },
+        openSession: async (input: { identity: NativeRunIdentity }) => { identity = input.identity; return session; },
+        recoverSession: async () => { throw new Error("G2 harness refuses to recover an old held provider session; only fresh OPEN is qualified."); } } as never;
+    };
+  }
+
+  // G2: 'To continue now, create a new task for <agent>' (the U text) is proved to
+  // ANSWER, not only to start: the legacy-unproved (paperclip_runner) row with the
+  // native runtime API listener registered as production does (http/server.ts) and
+  // an answering executor. The new task's message is answered (answeredPersonMessageSql)
+  // with exactly one run-attributed reply.
+  it("JUDGE G2 (u) legacy row: the new task for the same agent ANSWERS its message once", async () => {
+    const f = await judgeFixture({ adapterType: "paperclip_runner" });
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "paperclip/faux", lifecycleMode: "cold" } }).where(eq(agents.id, f.agentId));
+    await legacyHold(f);
+    const held = await agentSurfaces(f);
+    expect(held.canRetry).toBe(false);
+    expect(held.screenBlocker).toContain("To continue now, create a new task for Judge agent");
+    const markerFile = path.join(markerDir, `g2-${f.agentId}.jsonl`);
+    const settings = instanceSettingsService(db);
+    await settings.updateExperimental({ enableNativeRunner: true });
+    const app = appForBoard();
+    const listener = createServer(app);
+    registerLocalRuntimeApiServer(listener);
+    await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
+    let hb: ReturnType<typeof heartbeatService> | null = null;
+    try {
+      closeProcessRunAdmission();
+      const created = await request(app).post(`/api/companies/${f.companyId}/issues`)
+        .send({ title: "Same question, new task", description: "Please continue the stranded work.", assigneeAgentId: f.agentId, status: "todo" });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+      const newIssueId = created.body.id as string;
+      const sent = await request(app).post(`/api/issues/${newIssueId}/comments`).send({ body: "Answer this NEW TASK message once.", clientRequestId: randomUUID() });
+      expect(sent.status, JSON.stringify(sent.body)).toBe(201);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      resetProcessRunAdmissionForTests();
+      hb = heartbeatService(db, { nativeSessionBackendFactory: answeringPeer(markerFile) });
+      await hb.resumeQueuedRunsForAgent(f.companyId, f.agentId);
+      for (let i = 0; i < 400; i++) { if (hb.getTaskDrainStatus().quiescent) break; await new Promise(resolve => setTimeout(resolve, 50)); }
+      await hb.drainActiveRunExecutions();
+      const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId)))
+        .filter(run => run.issueId === newIssueId || run.nativeIssueId === newIssueId);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, newIssueId));
+      const [answer] = await db.select({ answered: answeredPersonMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) }).from(issueComments).where(eq(issueComments.id, sent.body.id));
+      const markers = existsSync(markerFile) ? readFileSync(markerFile, "utf8").trim().split("\n").map(line => JSON.parse(line) as { runId: string; marker: string }) : [];
+      const replies = comments.filter(c => c.authorType === "agent" && c.createdByRunId && !c.deletedAt && runs.some(run => run.id === c.createdByRunId));
+      const row = { newIssueId, messageId: sent.body.id, answered: answer?.answered ?? false, replyCount: replies.length,
+        replies: replies.map(c => ({ id: c.id, runId: c.createdByRunId, body: c.body.slice(0, 200) })),
+        runs: runs.map(run => ({ id: run.id, status: run.status, startedAt: run.startedAt?.toISOString() ?? null, error: `${run.errorCode ?? ""}:${run.error ?? ""}`.slice(0, 300) })),
+        executorMarkers: markers.map(m => `${m.marker}:${m.runId}`) };
+      console.info("JUDGE_G2_ANSWERED", JSON.stringify(row));
+      if (process.env.JUDGE_ROWS_FILE) appendFileSync(process.env.JUDGE_ROWS_FILE, `${JSON.stringify({ test: expect.getState().currentTestName, g2: row })}\n`);
+      expect(row.runs.map(run => run.error).join(" ")).not.toMatch(/local_runtime_api_listener_unavailable|previous_execution_unverified/);
+      expect(row.answered).toBe(true);
+      expect(row.replyCount).toBe(1);
+      expect(markers.some(m => m.marker === "provider.startTurn" && m.runId === replies[0]!.createdByRunId)).toBe(true);
+    } finally {
+      if (hb) await hb.drainActiveRunExecutions();
+      await closeIdleWarmNativeSessionsForRestart();
+      closeProcessRunAdmission();
+      await new Promise<void>(resolve => listener.close(() => resolve()));
+      runtimeApiInternals.resetForTests();
+      await settings.updateExperimental({ enableNativeRunner: false });
+    }
+  }, 90_000);
 
   // r2d ST5: the agent is busy (its one concurrency slot is occupied by a
   // running run on another task). Record what Retry does at press time.
