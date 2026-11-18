@@ -6,9 +6,9 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 const seam = vi.hoisted(() => ({ failSupersede: 0 }));
 vi.mock("../services/recovery/stop-pending.js", async importOriginal => {
   const real = await importOriginal<typeof import("../services/recovery/stop-pending.js")>();
-  return { ...real, supersedePersonStopCardByBoundDecision: async (...args: Parameters<typeof real.supersedePersonStopCardByBoundDecision>) => {
-    if (seam.failSupersede > 0) { seam.failSupersede--; throw new Error("forced supersede failure (twoclock3 b)"); }
-    return real.supersedePersonStopCardByBoundDecision(...args);
+  return { ...real, supersedePersonStopCardLocked: async (...args: Parameters<typeof real.supersedePersonStopCardLocked>) => {
+    if (seam.failSupersede > 0) { seam.failSupersede--; throw new Error("forced supersede failure (twoclock4)"); }
+    return real.supersedePersonStopCardLocked(...args);
   } };
 });
 import { recoveryService } from "../services/recovery/service.js";
@@ -34,7 +34,7 @@ describe("adopt-stopu-twoclock: the person-Stop card and the export hold share o
     db = createDb(database.connectionString, { maxConnections: 4 });
     db.$client.options.onnotice = () => {};
   }, 90_000);
-  beforeEach(async () => { await db.execute(sql`truncate companies cascade`); });
+  beforeEach(async () => { seam.failSupersede = 0; await db.execute(sql`truncate companies cascade`); });
   afterEach(() => { vi.useRealTimers(); });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); });
 
@@ -152,7 +152,17 @@ describe("adopt-stopu-twoclock: the person-Stop card and the export hold share o
     expect(await openCards(f.issueId)).toEqual([]);
   });
 
-  it("twoclock3 (b): a failed supersede is logged as a run event and the next sweep closes the card", async () => {
+  async function decisionOf(f: { leaseId: string }) {
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    return readPersonStopBoundDecision(lease!.metadata);
+  }
+  async function pointers(f: { issueId: string }) {
+    const [task] = await db.select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues).where(eq(issues.id, f.issueId));
+    return task!;
+  }
+
+  it("twoclock4 RED: a card close that throws inside the decision rolls the whole decision back, then the retry closes it", async () => {
     const f = await fixture();
     at(STOP_AT + 5 * 60_000 + 1_000);
     await db.transaction(async tx => recordTaskStopPending(tx as unknown as Db, { companyId: f.companyId, issueId: f.issueId,
@@ -160,17 +170,67 @@ describe("adopt-stopu-twoclock: the person-Stop card and the export hold share o
     expect(await openCards(f.issueId)).toHaveLength(1);
     at(FAILING_SINCE + PERSON_STOP_EXPORT_BOUND_MS);
     seam.failSupersede = 1;
-    expect(await decide(f)).toMatchObject({ decision: "without_files" });
+    // No decision now: nothing committed.
+    expect(await decide(f)).toBeNull();
     expect(seam.failSupersede).toBe(0);
+    expect(await decisionOf(f)).toBeNull();
+    expect(await pointers(f)).toEqual({ checkoutRunId: f.runId, executionRunId: f.runId });
+    expect(await openCards(f.issueId)).toHaveLength(1);
     const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
     const failed = events.filter(event => event.eventType === "person_stop.card_supersede_failed");
     expect(failed).toHaveLength(1);
     expect(failed[0]!.message).toMatch(/forced supersede failure/);
+    // No without_files line was posted for a decision that did not commit.
+    expect(events.filter(event => event.eventType === "workspace_export_bound_reached")).toEqual([]);
+    // The next retry decides, and decision + pointer clear + card close commit together.
+    at(FAILING_SINCE + PERSON_STOP_EXPORT_BOUND_MS + 30_000);
+    expect(await decide(f)).toMatchObject({ decision: "without_files", decidedNow: true });
+    expect(await decisionOf(f)).toMatchObject({ decision: "without_files" });
+    expect(await pointers(f)).toEqual({ checkoutRunId: null, executionRunId: null });
+    expect(await openCards(f.issueId)).toEqual([]);
+    const rows = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(rows.map(row => [row.status, row.outcome])).toEqual([["cancelled", "cancelled"]]);
+  });
+
+  it("twoclock4: a committed without_files decision never leaves an open card for that run (every attempt)", async () => {
+    const f = await fixture();
+    at(STOP_AT + 5 * 60_000 + 1_000);
+    await db.transaction(async tx => recordTaskStopPending(tx as unknown as Db, { companyId: f.companyId, issueId: f.issueId,
+      runIds: [f.runId], source: "recovery.sweep_stale_issue_locks" }, []));
+    seam.failSupersede = 2;
+    let committed = false;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      at(FAILING_SINCE + PERSON_STOP_EXPORT_BOUND_MS + attempt * 30_000);
+      await decide(f);
+      const decided = await decisionOf(f);
+      const open = await openCards(f.issueId);
+      // The invariant: decision committed => no open card; no decision => the card is still there.
+      if (decided?.decision === "without_files") { committed = true; expect(open).toEqual([]); }
+      else expect(open).toHaveLength(1);
+      // The sweep (no pointer names the run after a commit) never reopens it.
+      await sweep(f);
+      if (committed) expect(await openCards(f.issueId)).toEqual([]);
+    }
+    expect(committed).toBe(true);
+    expect(seam.failSupersede).toBe(0);
+  });
+
+  it("twoclock3 heal kept: a card left open by an older code path's committed decision is closed by the sweep", async () => {
+    const f = await fixture();
+    at(STOP_AT + 5 * 60_000 + 1_000);
+    await db.transaction(async tx => recordTaskStopPending(tx as unknown as Db, { companyId: f.companyId, issueId: f.issueId,
+      runIds: [f.runId], source: "recovery.sweep_stale_issue_locks" }, []));
     expect(await openCards(f.issueId)).toHaveLength(1);
-    // twoclock2 cleared the task's pointers with the decision, so the sweep no
-    // longer visits this task. Put the execution pointer back on the stopped run
-    // (a pointer that still names it) so the sweep's deferral is what runs next.
-    await db.update(issues).set({ executionRunId: f.runId, checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    // The older path: the decision committed on its own and its separate supersede failed.
+    at(FAILING_SINCE + PERSON_STOP_EXPORT_BOUND_MS);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(environmentLeases).set({ metadata: { ...(lease!.metadata as Record<string, unknown>),
+      personStopExportBound: { schema: "paperclip.person-stop-export-bound.v1", decision: "without_files",
+        reason: "tools_not_proven_stopped", runId: run!.id, providerLeaseId: lease!.providerLeaseId,
+        decidedAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.leaseId));
+    expect(await decisionOf(f)).toMatchObject({ decision: "without_files" });
+    expect(await openCards(f.issueId)).toHaveLength(1);
     at(FAILING_SINCE + PERSON_STOP_EXPORT_BOUND_MS + 30_000);
     await sweep(f);
     expect(await openCards(f.issueId)).toEqual([]);

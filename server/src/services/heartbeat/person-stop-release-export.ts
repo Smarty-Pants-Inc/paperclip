@@ -14,7 +14,8 @@ import { PERSON_STOP_BOUND_KEY, PERSON_STOP_PROBE_TIMEOUT_MS, PERSON_STOP_WITHOU
 export { PERSON_STOP_EXPORT_BOUND_MS, PERSON_STOP_WITHOUT_FILES_LINE, personStopExportBoundAt, personStopKeptBoxForSuccessor,
   readPersonStopBoundDecision } from "./person-stop-export-bound.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
-import { supersedePersonStopCardByBoundDecision } from "../recovery/stop-pending.js";
+import { isPersonStop, supersedePersonStopCardLocked } from "../recovery/stop-pending.js";
+import { publishActivity, type ActivityPublication } from "../activity-log.js";
 import { proveStoppedTurnGoneOnBox, recordStoppedTurnCloseProof, stoppedTurnCloseOwedAfterCrash } from "./stopped-turn-box-proof.js";
 
 async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T | "timed_out"> {
@@ -108,8 +109,28 @@ export async function decidePersonStopExportAtBound(input: {
   // export reads this decision under the same lock and, for without_files,
   // saves the old files aside instead of over the successor's host workspace
   // (native-workspace-sync.ts resumeNativeWorkspaceSync).
-  const recorded = await db.transaction(async tx => {
+  // adopt-stopu-twoclock4 (never-OK card left open for good): the without_files
+  // decision, the task pointer clear AND the close of this run's Stop-pending
+  // card commit in ONE transaction, under the task + run row locks every card
+  // writer holds from its read to its write (taken in the same order: task,
+  // then run), so either all three commit or none does. A failed card close
+  // rolls the decision back: no decision now, the pointer still held, the card
+  // still open, and the next retry decides again.
+  const issueId: string | null = run.nativeIssueId ?? run.issueId ?? null;
+  const cardIssueId: string | null = issueId
+    ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
+  const closesCard = decision.decision === "without_files" && cardIssueId !== null && isPersonStop(run);
+  const publications: ActivityPublication[] = [];
+  let recorded: { id: string }[] | null;
+  try {
+  recorded = await db.transaction(async tx => {
     if (!await tryLockNativeWorkspaceFinalization(tx as unknown as Db, { companyId: run.companyId, runId: run.id })) return null;
+    if (closesCard) {
+      await tx.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.companyId, run.companyId), eq(issues.id, cardIssueId!))).for("update");
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).for("update");
+    }
     const written = await tx.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
       || ${JSON.stringify({ [PERSON_STOP_BOUND_KEY]: decision })}::jsonb` })
       .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "active"),
@@ -121,7 +142,6 @@ export async function decidePersonStopExportAtBound(input: {
     // destination fence (resumeNativeWorkspaceSync reads this decision under the
     // same finalization lock), and the kept box/lease is owned by the lease, not
     // the task's claims. Only pointers that still name THIS run are cleared.
-    const issueId: string | null = run.nativeIssueId ?? run.issueId ?? null;
     if (written.length && decision.decision === "without_files" && issueId) {
       const released = await tx.update(issues).set({
         checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
@@ -134,8 +154,21 @@ export async function decidePersonStopExportAtBound(input: {
       // A lock release is a hold-release event: saved messages are promoted.
       if (released.length) await promoteDeferredWorkIntents(tx, { companyId: run.companyId, trigger: "lock_released", issueId });
     }
+    // adopt-stopu-twoclock4: the card close is part of the decision. A throw
+    // here aborts the whole transaction (decision + pointer clear included).
+    if (written.length && closesCard) await supersedePersonStopCardLocked(tx as unknown as Db, run, cardIssueId!, publications);
     return written;
   });
+  } catch (error) {
+    // Nothing committed. Record why (never silent) and keep holding: the caller
+    // treats null as "no decision yet" and the next retry decides again.
+    await appendHeartbeatRunEvent(db, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
+      eventType: "person_stop.card_supersede_failed", stream: "system", level: "error",
+      message: error instanceof Error ? error.message : String(error),
+      payload: { decision: decision.decision, reason, rolledBack: true } }).catch(() => undefined);
+    return null;
+  }
+  for (const publication of publications) publishActivity(publication);
   if (recorded === null) return null;
   if (recorded.length === 0) {
     const [again] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(eq(environmentLeases.id, lease.id));
@@ -143,15 +176,9 @@ export async function decidePersonStopExportAtBound(input: {
   }
   if (decision.decision === "without_files") {
     // adopt-stopu-twoclock: the decision owns the person's line from now on; a
-    // Stop-pending card no receipt can close (the box is kept) is superseded.
-    // adopt-stopu-twoclock3: a failure is recorded, never silent; the sweep's
-    // deferral heals the card on its next pass (recovery/service.ts).
-    await supersedePersonStopCardByBoundDecision(db, run).catch(async (error: unknown) => {
-      await appendHeartbeatRunEvent(db, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
-        eventType: "person_stop.card_supersede_failed", stream: "system", level: "error",
-        message: error instanceof Error ? error.message : String(error),
-        payload: { decision: decision.decision, reason } }).catch(() => undefined);
-    });
+    // Stop-pending card no receipt can close (the box is kept) was superseded
+    // INSIDE the decision's transaction above (adopt-stopu-twoclock4). A card
+    // written by an older code path is still healed by the sweep's deferral.
     // ONE true line in the chat (rf-4 22:30Z + RFL 22:31Z): no 'restored'
     // claim, the box/lease unchanged (kept, not destroyed).
     const line = PERSON_STOP_WITHOUT_FILES_LINE;

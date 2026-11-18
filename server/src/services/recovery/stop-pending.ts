@@ -291,26 +291,17 @@ export async function recheckPersonStopCleanupPending(db: Db, run: StoppedRun & 
   });
   for (const publication of publications) publishActivity(publication);
 }
-/** adopt-stopu-twoclock: the person-Stop export bound DECIDED for this run and
- * kept the box (no stop request, so no stop receipt will ever close a card).
- * Its one true line supersedes this run's Stop-pending card: a standalone card
- * is cancelled (never 'Stop proved'), an annotation on a stronger obligation is
- * removed (the obligation and its budget stay). Under the task and run locks. */
-export async function supersedePersonStopCardByBoundDecision(db: Db, run: StoppedRun & { contextSnapshot?: Record<string, unknown> | null }) {
-  const issueId = runIssueId(run);
-  if (!issueId || !isPersonStop(run)) return;
-  const publications: ActivityPublication[] = [];
-  await db.transaction(async tx => {
-    await tx.select({ id: issues.id }).from(issues).where(and(
-      eq(issues.companyId, run.companyId), eq(issues.id, issueId))).for("update");
-    await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).for("update");
-    await supersedePersonStopCardLocked(tx as unknown as Db, run, issueId, publications);
-  });
-  for (const publication of publications) publishActivity(publication);
-}
+/** adopt-stopu-twoclock: the person-Stop export bound DECIDED without_files for
+ * this run and kept the box (no stop request, so no stop receipt will ever close
+ * a card). Its one true line supersedes this run's Stop-pending card: a
+ * standalone card is cancelled (never 'Stop proved'), an annotation on a
+ * stronger obligation is removed (the obligation and its budget stay).
+ * adopt-stopu-twoclock4: there is no separate, failable supersede step; the
+ * decision's own transaction calls the body below under the task and run locks
+ * (person-stop-release-export.ts decidePersonStopExportAtBound). */
 /** adopt-stopu-twoclock3: the supersede body. Caller holds the task and run
- * locks (the decision's own transaction above, or the sweep's deferral heal).
+ * locks (the without_files decision's own transaction, or the sweep's deferral
+ * heal for a card written by an older code path).
  * Idempotent: no open card for exactly this run -> nothing. */
 export async function supersedePersonStopCardLocked(tx: Db, run: StoppedRun & { contextSnapshot?: Record<string, unknown> | null },
   issueId: string, publications: ActivityPublication[]) {
