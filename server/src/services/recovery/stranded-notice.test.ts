@@ -436,7 +436,8 @@ describe("stranded notice offers Retry only where Retry admits", () => {
       sourceRun: { id: "run-1", status: "failed" } });
   it.each([
     [{ admits: false, refusal: "agent_paused", agentName: "Ada" } as const, "Ask a board user or Ada's manager to resume Ada.", "Ada is paused"],
-    [{ admits: false, refusal: "previous_execution_unverified" } as const, "Press Confirm it stopped once the previous attempt has stopped.", "can't confirm that the previous attempt stopped"],
+    [{ admits: false, refusal: "confirm_run_stopped" } as const, "Press Confirm it stopped once the previous attempt has stopped.", "can't confirm that the previous attempt stopped"],
+    [{ admits: false, refusal: "previous_execution_unverified" } as const, "a board user records that the previous attempt stopped", "can't confirm that the previous attempt stopped"],
     [{ admits: false, refusal: "workspace_repair_required" } as const, "Press Recover saved files to recover the workspace.", "saved files must be recovered first"],
   ])("RED %o: no Retry instruction; the true action instead", (retry, action, cause) => {
     const notice = build(retry);
@@ -452,6 +453,19 @@ describe("stranded notice offers Retry only where Retry admits", () => {
     expect(notice.body).not.toMatch(/retry/i);
     expect(notice.body).toContain("Your message is saved.");
     expect(JSON.stringify(nextActionOf(notice))).toContain("a new message or a change to the task starts it again");
+  });
+  // r2d ST2: with no confirm_run_stopped userAction the screen has no Confirm button.
+  it("previous_execution_unverified without the screen's Confirm names no button", () => {
+    const notice = build({ admits: false, refusal: "previous_execution_unverified" });
+    expect(JSON.stringify(notice)).not.toMatch(/Press Confirm|Confirm it stopped/);
+  });
+  // r2d ST1: a cause-specific seed keeps its cause; only its Retry sentence goes.
+  it("a refused cause-specific seed keeps its cause sentence and drops only the Retry sentence", () => {
+    const notice = buildStrandedRecoveryEscalationNotice({ retry: { admits: false, refusal: "none" }, recoveryActionId: "action-1",
+      recoveryOwner: null, sourceRun: { id: "run-1", status: "succeeded" },
+      seed: { title: "Review recovery stalled", tone: "danger", body: "The reviewer for this task did not finish the review, even after Paperclip asked again. Choose a reviewer, or press Retry to ask the same reviewer again." } });
+    expect(notice.body).toBe("The reviewer for this task did not finish the review, even after Paperclip asked again.");
+    expect(notice.body).not.toMatch(/retry/i);
   });
   it("CONTROL: an admissible failure keeps Press Retry", () => {
     const notice = build({ admits: true });
