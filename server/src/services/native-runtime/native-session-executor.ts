@@ -112,7 +112,7 @@ import { nativeRetryCancellationEligible, rethrowNativeCancellationLockConflict,
 import { readNativePlanWait } from "./native-plan-wait.js";
 import { nativeProviderLifecycle } from "./provider-lifecycle.js";
 import { NativePermissionDeclinedError, readCompletedNativePermissionDecline } from "./native-permission-decline.js";
-import { activeIssueInteractionCondition } from "../issue-question-context.js";
+import { activeIssueInteractionCondition, personCommentAfterInteractionCondition } from "../issue-question-context.js";
 import { resolveAcpxQualification, resolveAntigravityCandidateAdmission, resolveKimiCandidateAdmission } from "./acpx-qualification.js";
 import { readLocalAiCredentialFile } from "../local-ai-credential-file.js";
 import { prepareGrokRunnerCredentials } from "./grok-runner-credentials.js";
@@ -2317,6 +2317,32 @@ export function nativeToolsRefreshWaitResult(input: {
  * closed native envelope, so that exact interaction may park the continuation
  * run without requiring the model to recreate a second request.
  */
+/** The pending card that parks this run's turn (resolvePendingGovernedWait). */
+export function pendingGovernedWaitCondition(execution: NativeExecutionInput) {
+  const continuingInteractionIds = continuingPendingInteractionIds(execution);
+  return and(
+    eq(issueThreadInteractions.companyId, execution.binding.companyId),
+    eq(issueThreadInteractions.issueId, execution.binding.issueId),
+    or(
+      eq(issueThreadInteractions.sourceRunId, execution.binding.runId),
+      and(
+        eq(issueThreadInteractions.kind, "connection_intent"),
+        eq(issueThreadInteractions.createdByAgentId, execution.binding.agentId),
+        // A person's newer message in this wake releases an earlier run's card, as it does a question.
+        sql`not ${personCommentAfterInteractionCondition(sql`(select jsonb_array_elements_text(${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds') from ${heartbeatRuns} where ${heartbeatRuns.id} = ${execution.binding.runId})`)}`,
+      ),
+      ...(continuingInteractionIds.length > 0
+        ? [inArray(issueThreadInteractions.id, continuingInteractionIds)]
+        : []),
+    ),
+    eq(issueThreadInteractions.status, "pending"),
+    activeIssueInteractionCondition({ runId: execution.binding.runId }),
+    // Live provider questions resume their current turn; only durable
+    // wake-based cards park it. A timeout creates a separate fallback.
+    sql`not (${issueThreadInteractions.kind} = 'ask_user_questions' and ${issueThreadInteractions.continuationPolicy} = 'none' and coalesce(${issueThreadInteractions.idempotencyKey}, '') like 'paperclip-runner-question:%')`,
+  );
+}
+
 export function continuingPendingInteractionIds(
   execution: NativeExecutionInput,
 ): string[] {
@@ -13239,9 +13265,6 @@ async function executePaperclipNativeSessionAttempt(
     const handoff = await nativeCaseHandoffResult(input.db, { ...input.execution.binding,
       completionContract: input.execution.completionContract.contract });
     if (handoff) return handoff;
-    const continuingInteractionIds = continuingPendingInteractionIds(
-      input.execution,
-    );
     const interaction = await input.db
       .select({
         id: issueThreadInteractions.id,
@@ -13249,36 +13272,7 @@ async function executePaperclipNativeSessionAttempt(
         summary: issueThreadInteractions.summary,
       })
       .from(issueThreadInteractions)
-      .where(
-        and(
-          eq(
-            issueThreadInteractions.companyId,
-            input.execution.binding.companyId,
-          ),
-          eq(issueThreadInteractions.issueId, input.execution.binding.issueId),
-          or(
-            eq(
-              issueThreadInteractions.sourceRunId,
-              input.execution.binding.runId,
-            ),
-            and(
-              eq(issueThreadInteractions.kind, "connection_intent"),
-              eq(
-                issueThreadInteractions.createdByAgentId,
-                input.execution.binding.agentId,
-              ),
-            ),
-            ...(continuingInteractionIds.length > 0
-              ? [inArray(issueThreadInteractions.id, continuingInteractionIds)]
-              : []),
-          ),
-          eq(issueThreadInteractions.status, "pending"),
-          activeIssueInteractionCondition({ runId: input.execution.binding.runId }),
-          // Live provider questions resume their current turn; only durable
-          // wake-based cards park it. A timeout creates a separate fallback.
-          sql`not (${issueThreadInteractions.kind} = 'ask_user_questions' and ${issueThreadInteractions.continuationPolicy} = 'none' and coalesce(${issueThreadInteractions.idempotencyKey}, '') like 'paperclip-runner-question:%')`,
-        ),
-      )
+      .where(pendingGovernedWaitCondition(input.execution))
       .orderBy(
         desc(issueThreadInteractions.createdAt),
         desc(issueThreadInteractions.id),
