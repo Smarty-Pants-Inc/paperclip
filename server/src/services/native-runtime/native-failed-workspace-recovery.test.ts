@@ -228,6 +228,48 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         expect(reads).not.toHaveBeenCalled(); expect(worker.nextWakeAt()).toBeNull();
       } finally { await worker.stop(); }
     });
+    // C3 hunk 28 (rf-4 accepted): pendingCancelledWorkspace() excludes an
+    // acknowledged person Stop whose finalization is terminal_failure, unowned
+    // and without a result. So the sweep's load() returns no entry for it, and
+    // check() on an entry loaded earlier returns null; it is never rescheduled
+    // at +30 s. (Hunk 29, the duplicate `if (!finalization.resultId) return null`
+    // in check(), is cut: this row holds with hunk 28 alone.)
+    it("C3 hunk 28: after an acknowledged person Stop the sweep's load() returns no entry and check() returns null (never rescheduled at +30 s)", async () => {
+      const finalization = async (runId: string) =>
+        (await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)))[0];
+      // load(): stopped before the sweep starts.
+      // Both runs launched their Runner (a process pid), as a person's Stop of a live turn has:
+      // otherwise check() settles a never-launched workspace and returns null without hunk 28.
+      const launched = (runId: string) => db.update(heartbeatRuns).set({ processPid: 4242 }).where(eq(heartbeatRuns.id, runId));
+      const stopped = await prepared(); await cancel(stopped); await launched(stopped.runId);
+      expect(await finalization(stopped.runId)).toMatchObject({ phase: "terminal_failure", leaseOwner: null, resultId: null });
+      // check(): loaded while its finalization was still observed (+30 s), then it settles.
+      const settling = await prepared();
+      await db.update(nativeRunFinalizations).set({ phase: "observed" }).where(eq(nativeRunFinalizations.runId, settling.runId));
+      await cancel(settling); await launched(settling.runId);
+      clock(); const worker = coordinator();
+      try {
+        const loadedAt = Date.now();
+        await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true).ready;
+        await vi.advanceTimersByTimeAsync(1000);
+        // Only the settling run is watched, and only because its finalization is not terminal yet.
+        const wake = worker.nextWakeAt();
+        expect(wake).not.toBeNull();
+        expect(wake! - loadedAt).toBeGreaterThanOrEqual(29_000);
+        await db.update(nativeRunFinalizations).set({ phase: "terminal_failure" }).where(eq(nativeRunFinalizations.runId, settling.runId));
+        expect(await finalization(settling.runId)).toMatchObject({ phase: "terminal_failure", leaseOwner: null, resultId: null });
+        const settle = async (ms: number) => {
+          for (let tick = 0; tick < ms / 1000; tick++) await vi.advanceTimersByTimeAsync(1000);
+          await expect.poll(() => idleWorkSnapshot().active).toBe(0);
+        };
+        await settle(31_000);
+        // check() returned null: nothing is rescheduled, and the sweep reads nothing more.
+        expect(worker.nextWakeAt()).toBeNull();
+        const reads = vi.spyOn(db, "select"); await settle(120_000);
+        expect(reads).not.toHaveBeenCalled(); reads.mockRestore(); expect(worker.nextWakeAt()).toBeNull();
+        await pinned(stopped); await pinned(settling);
+      } finally { await worker.stop(); }
+    });
     it.each(["restart", "drain", "standby"] as const)("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) retains preservation across %s", async mode => {
       const f = await prepared(); if (mode === "restart") await cancel(f);
       let admitted = mode === "restart";
