@@ -4744,7 +4744,22 @@ export function environmentRuntimeService(
           }
           if (!environment) {
             if (leaseSnapshot.metadata?.driver === "plugin" && options.pluginWorkerManager) {
-              const receipt = await requireDriverKey("plugin").retryPendingSandboxTeardown!({ environment: null, lease: leaseSnapshot });
+              // custody-gaps (c): a destroy-method cleanup deletes the box, so it
+              // takes the same final destroy claim (allocation-wide custody veto)
+              // as every other destroy. Refused: no provider call, left for retry.
+              const claim = leaseSnapshot.metadata?.pluginLeaseCleanupMethod === "destroy"
+                ? await claimLeaseForDestroyUnlessHeld(db, leaseSnapshot) ?? false : null;
+              if (claim === false) {
+                throw new Error(await nativeHarnessBackupMissingOnAllocation(db, leaseSnapshot)
+                  ? "Native harness backup is missing; destructive cleanup is forbidden."
+                  : "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.");
+              }
+              let receipt: unknown;
+              try {
+                receipt = await requireDriverKey("plugin").retryPendingSandboxTeardown!({ environment: null, lease: leaseSnapshot });
+              } finally {
+                if (claim) await releaseLeaseDestroyClaim(db, leaseSnapshot.id, claim).catch(() => undefined);
+              }
               await environmentsSvc.releaseLease(leaseSnapshot.id, status, { cleanupStatus: "success",
                 remoteExecutionTermination: remoteTerminationReceipt(leaseSnapshot, receipt),
               });
