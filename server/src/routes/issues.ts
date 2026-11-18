@@ -72,7 +72,6 @@ import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { assertQueuedCommentStopLinePreserved } from "../services/queued-comment-stop-line.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
-import { nativeStopRequiresReconciliation, readContinuationReconciliationSources } from "../services/explicit-native-continuation.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -459,7 +458,6 @@ function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comme
 }
 
 const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
-const STOP_BAR_RECOVERY_WAIT_REASONS = new Set(["execution_recovery", "remote_cleanup", "execution_settling"]);
 const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.";
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -7907,39 +7905,18 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
-    // A well-formed recovery wait (execution_recovery from the run-dispatch
-    // fallback, remote_cleanup, execution_settling) may give way to the Stop
-    // bar ONLY when admission on this base would admit the owner's Send (RFL S7
-    // 14:32Z): then "will be sent when you send your next message" is true.
-    // Without Option S, admission holds a Send after a native turn that ended
-    // cancelled (nativeStopRequiresReconciliation), so the wait keeps its own
-    // true line, as every other wait (the Send's interrupt_handoff, a running
-    // process, a pause) does.
-    const recoveryWait = !!queue.executionWait && STOP_BAR_RECOVERY_WAIT_REASONS.has(queue.executionWait.reason);
-    const stopBarMayReplace = !queue.executionWait || recoveryWait;
-    if (wake && queueState?.state === "deferred" && !input.activeRun && stopBarMayReplace && comments.length > 0 &&
+    if (wake && queueState?.state === "deferred" && !input.activeRun && !queue.executionWait && comments.length > 0 &&
         input.issue.assigneeAgentId && !queuedInteractionId(wake.payload)) {
       // Stop means stop (org 11-17): after a person's Stop the waiting messages
       // of every task (Agent Chat or not) are not sent. The person sends them,
       // or deletes some first.
-      const [lastTurn] = await input.executor.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
-        status: heartbeatRuns.status, nativeIssueId: heartbeatRuns.nativeIssueId, runtimeMode: heartbeatRuns.runtimeMode,
-        resultJson: heartbeatRuns.resultJson, finishedAt: heartbeatRuns.finishedAt })
+      const [lastTurn] = await input.executor.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
         .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.issue.companyId),
           eq(heartbeatRuns.agentId, input.issue.assigneeAgentId),
           sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issue.id}`))
         .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
       const stop = readObject(lastTurn?.resultJson);
-      const personStop = lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId;
-      const sendAdmitted = async () => {
-        if (!lastTurn || lastTurn.runtimeMode !== "native" || input.actor.actorType !== "user") return false;
-        // rf-5 SC1: the SAME read admission takes (blocker + reconciliation
-        // sources), then admission's own stopped-run rule on this base.
-        const { blockedOrReconciling, sourceChecks } = await readContinuationReconciliationSources(input.executor as Db,
-          input.issue.companyId, input.issue.id, { forUpdate: false });
-        return !blockedOrReconciling && !nativeStopRequiresReconciliation(lastTurn, sourceChecks);
-      };
-      if (personStop && (!recoveryWait || await sendAdmitted())) {
+      if (lastTurn?.status === "cancelled" && stop.cancelledByActorType === "user" && !stop.queuedCommentInterruptQueueId) {
         queue.executionWait = { reason: CHAT_STOPPED_BY_PERSON_REASON, message: CHAT_STOPPED_BY_PERSON_MESSAGE };
       }
     }
