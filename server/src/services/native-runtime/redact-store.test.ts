@@ -214,6 +214,7 @@ describe("redact-store G1/G4 durable boundaries", () => {
   });
 });
 
+// supersedes(d29fcfe4 bearer-prose expectations; RFL record SUPERSEDE-BEARER-PROSE-1117)
 it("r4/r6 all 218 corpus inputs stay byte-equal to base and redaction is idempotent", () => {
   expect(corpus).toHaveLength(218);
   for (const { input, expected } of corpus) {
