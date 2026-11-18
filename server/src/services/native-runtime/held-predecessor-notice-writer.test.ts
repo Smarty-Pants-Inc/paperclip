@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { agents, authUsers, companies, completionContracts, createDb, environmentLeases, heartbeatRuns, issueComments,
-  issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
+import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases,
+  heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
+import express from "express";
+import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -11,6 +13,18 @@ import { settleUnansweredPersonMessagesForTask } from "../recovery/unanswered-pe
 import { heldConversationRemedy } from "../held-conversation-remedy.js";
 import { subscribeAllCompanyLiveEvents, subscribeCompanyLiveEvents, subscribeGlobalLiveEvents } from "../live-events.js";
 import { sql } from "drizzle-orm";
+import { HELD_PREDECESSOR_SEND_ACTION } from "./held-predecessor-notice-text.js";
+import { UNANSWERED_MESSAGE_NEW_TASK_TEXT, UNANSWERED_MESSAGE_TEXT } from "../recovery/unanswered-person-message.js";
+import { getExecutionBlocker } from "../execution-blocker.js";
+import { readStandingRunNotice } from "../standing-run-notice.js";
+import { taskInterruptionPresentation } from "../task-interruption-presentation.js";
+import { answeredPersonMessageSql } from "../person-message-answer.js";
+import { instanceSettingsService } from "../instance-settings.js";
+import { heartbeatService, type HeartbeatServiceOptions } from "../heartbeat.js";
+import { closeProcessRunAdmission, resetProcessRunAdmissionForTests } from "../heartbeat/run-admission.js";
+import { closeIdleWarmNativeSessionsForRestart } from "./native-session-executor.js";
+import { issueRoutes } from "../../routes/issues.js";
+import { errorHandler } from "../../middleware/index.js";
 
 it.each([
   "runner_harness_state_mismatch: backup_without_reusable_lease",
@@ -163,7 +177,7 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
       expect(notes, `${writer} wrote the held notice`).toHaveLength(1);
       if (admits) {
         expect(notes[0]!.body).toBe(HELD_PREDECESSOR_SEND_NOTICE);
-        if (writer === "sweep") expect(nextActionOf(notes[0]!)).toContain("Send a new message to try again.");
+        if (writer === "sweep") expect(nextActionOf(notes[0]!)).toContain(HELD_PREDECESSOR_SEND_ACTION);
       } else {
         expect(notes[0]!.body).toBe(HELD_PREDECESSOR_NOTICE);
         expect(notes[0]!.body).toContain(HELD_PREDECESSOR_NEW_TASK_ACTION);
@@ -286,4 +300,194 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
     await refuse(await run("running"));
     expect(await notices()).toHaveLength(2);
   });
+  // ---- heldnote r2b: the posted remedy stays TRUE in every later state, through the real comment route ----
+  // A provider-only peer: the real heartbeat runs the new task's native run; this backend answers its one turn.
+  const answeringPeer = (): NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> => execution => {
+    type Backend = ReturnType<NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]>>;
+    type Session = Awaited<ReturnType<Backend["openSession"]>>;
+    let identity: { runId: string; sessionId: string }; let sourceInstanceId = "";
+    let resolveTurn!: (turnId: string) => void;
+    const turn = { promise: new Promise<string>(resolve => { resolveTurn = resolve; }), resolve: (id: string) => resolveTurn(id) };
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+    const contract = execution.completionContract.contract as { revision: string; criteria: Array<{ id: string }> };
+    const result = { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "The new task answered.",
+      completionClaim: { contractRevision: contract.revision, objectiveSatisfied: true,
+        criteria: contract.criteria.map(c => ({ criterionId: c.id, status: "satisfied", evidenceRefs: [] })), remainingWork: [] },
+      evidence: [], verification: [], artifacts: [], attentionRequests: [] };
+    const session = { identity: () => identity, capabilities: async () => capabilities,
+      attachRun: async (input: { identity: typeof identity }) => { identity = input.identity; },
+      startTurn: async () => { const turnId = randomUUID(); turn.resolve(turnId); return { turnId }; },
+      async *events() {
+        const turnId = await turn.promise;
+        const event = (sourceSeq: number, eventType: string, payload: Record<string, unknown>) => ({ schema: "paperclip.prp.event.v1",
+          sourceKind: "runner", sourceInstanceId, sourceEventId: `${sourceInstanceId}:${identity.runId}:${sourceSeq}`, sourceSeq,
+          runId: identity.runId, normalizedSessionId: identity.sessionId, turnId, schemaVersion: 1, priority: 0,
+          emittedAt: new Date().toISOString(), eventType, payload });
+        yield event(1, "turn.started", {});
+        yield event(2, "item.completed", { kind: "agentMessage", channel: "final", text: "The new task answered." });
+        yield event(3, "run.result.proposed", result);
+        yield event(4, "turn.completed", { status: "completed" });
+      },
+      result: async () => result,
+      snapshot: async () => ({ backendKind: "mock", sessionId: identity.sessionId, identity, providerSessionId: "r2b-answering-peer",
+        cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }),
+      close: async () => {} } as unknown as Session;
+    return { descriptor: async () => {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId));
+      sourceInstanceId = run!.runnerInstanceId!;
+      return { kind: "mock", name: "r2b-answering-peer", version: "1", capabilities,
+        runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } };
+    }, openSession: async (input: { identity: typeof identity }) => { identity = input.identity; return session; },
+    recoverSession: async () => { throw new Error("only a fresh session is qualified"); } } as unknown as Backend;
+  };
+  const routeApp = async (userId: string, companyId: string) => {
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, membershipRole: "owner" });
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true, enableNativeRunner: true });
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { (req as unknown as { actor: unknown }).actor = { type: "board", source: "local_implicit", userId }; next(); });
+    app.use("/api", issueRoutes(db, {} as never)); app.use(errorHandler);
+    return app;
+  };
+  const answered = async (commentId: string) => (await db.select({ answered: answeredPersonMessageSql({ id: sql`${issueComments.id}`,
+    companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) })
+    .from(issueComments).where(eq(issueComments.id, commentId)))[0]?.answered;
+  // A real POST of a new message on the held issue: 201, and its wake is deferred (no run admitted for it).
+  const postDeferred = async (app: express.Express, f: { companyId: string; issueId: string }) => {
+    const response = await request(app).post(`/api/issues/${f.issueId}/comments`)
+      .send({ body: "A NEW message after the notice.", clientRequestId: randomUUID() });
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    let wakes: Array<typeof agentWakeupRequests.$inferSelect> = [];
+    for (let i = 0; i < 200 && !wakes.length; i++) {
+      wakes = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+        .filter(w => JSON.stringify(w.payload ?? {}).includes(response.body.id));
+      if (!wakes.length) await new Promise(r => setTimeout(r, 25));
+    }
+    const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => JSON.stringify(r.contextSnapshot ?? {}).includes(response.body.id));
+    return { id: response.body.id as string, wakes, runs };
+  };
+  // The new task remedy, through the real routes and the real heartbeat: create, message, run, answered.
+  const newTaskAnswers = async (app: express.Express, f: { companyId: string; agentId: string }) => {
+    const created = await request(app).post(`/api/companies/${f.companyId}/issues`)
+      .send({ title: "New task remedy", description: "Answer the new message once.", status: "todo", assigneeAgentId: f.agentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const sent = await request(app).post(`/api/issues/${created.body.id}/comments`)
+      .send({ body: "Answer this NEW TASK message once.", clientRequestId: randomUUID() });
+    expect(sent.status, JSON.stringify(sent.body)).toBe(201);
+    await new Promise(r => setTimeout(r, 150));
+    resetProcessRunAdmissionForTests();
+    const hb = heartbeatService(db, { nativeSessionBackendFactory: answeringPeer() });
+    try {
+      await hb.resumeQueuedRunsForAgent(f.companyId, f.agentId);
+      for (let i = 0; i < 400 && !hb.getTaskDrainStatus().quiescent; i++) await new Promise(r => setTimeout(r, 50));
+      for (let i = 0; i < 200 && !(await answered(sent.body.id)); i++) await new Promise(r => setTimeout(r, 50));
+      await hb.drainActiveRunExecutions();
+    } finally { await hb.drainActiveRunExecutions(); await closeIdleWarmNativeSessionsForRestart(); closeProcessRunAdmission(); }
+    return { issueId: created.body.id as string, messageId: sent.body.id as string, answered: await answered(sent.body.id) };
+  };
+  // A Send remedy standing without its hedge: the false remedy once a later hold defers new messages.
+  const UNHEDGED_SEND = /send a new message to try again(?!; if it doesn't start, assign this agent a new task\.)/i;
+
+  it("HN1: a posted Send note stays TRUE after a restore_unsafe hold: GET, card, standing reader and thread show no unhedged Send; a real POST is deferred and a new task answers (both writers)", async () => {
+    closeProcessRunAdmission();
+    try {
+      for (const writer of ["executor", "sweep"] as const) for (const kind of ["task", "chat"] as const) {
+        const label = `${writer} ${kind}`;
+        const f = await seedHeld(kind, "dead_pid");
+        await db.update(agents).set({ runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } }).where(eq(agents.id, f.agentId));
+        const app = await routeApp(f.userId, f.companyId);
+        const notes = await writeHeld(f, writer);
+        expect(notes.map(n => n.body), label).toEqual(["Your message and saved work are kept, but the previous run of this conversation "
+          + "did not finish. Send a new message to try again; if it doesn't start, assign this agent a new task."]);
+        // The state deteriorates after the note was posted: an unsafe-restore hold.
+        await db.update(heartbeatRuns).set({ resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } }).where(eq(heartbeatRuns.id, f.sourceId));
+        const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+        await db.update(issueRecoveryActions).set({ evidence: { ...hold!.evidence, workspaceRestoreFailure: "restore_unsafe_archive" } })
+          .where(eq(issueRecoveryActions.id, hold!.id));
+        expect((await heldConversationRemedy(db, f)).newMessageAdmitted, `${label}: the helper now refuses Send`).toBe(false);
+        const get = await request(app).get(`/api/issues/${f.issueId}/comments`);
+        expect(get.status, label).toBe(200);
+        const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+        const card = await taskInterruptionPresentation(db, issue!);
+        const standing = await readStandingRunNotice(db, f);
+        const thread = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).filter(c => c.authorType === "system");
+        for (const [where, text] of [["GET", JSON.stringify(get.body)], ["card", JSON.stringify(card)],
+          ["standing", JSON.stringify(standing)], ["thread", JSON.stringify(thread)]] as const) {
+          expect(text, `${label} ${where}: no unhedged 'Send a new message to try again.'`).not.toMatch(UNHEDGED_SEND);
+        }
+        if (writer === "executor") expect(standing?.text, `${label}: the standing note names the new task`).toContain("assign this agent a new task");
+        // The hedge is honest: the new message is saved (201) and deferred, and the new task answers.
+        const post = await postDeferred(app, f);
+        expect(post.runs, `${label}: no run admitted for the new message`).toEqual([]);
+        expect(post.wakes.map(w => w.status), `${label}: deferred`).toEqual(["deferred_issue_execution"]);
+        expect(JSON.stringify(post.wakes[0]!.payload), `${label}: workspace_repair_required`).toContain("workspace_repair_required");
+        const remedy = await newTaskAnswers(app, f);
+        expect(remedy.answered, `${label}: the new task answered`).toBe(true);
+      }
+    } finally { resetProcessRunAdmissionForTests(); }
+  }, 240_000);
+
+  // RF2 (RFL 14:57Z): on the LEGACY runtime a successor that failed adapter_failed leaves an execution blocker
+  // (active_run_watchdog, legacy_execution_requires_reconciliation); dispatch defers every new message. The sweep's
+  // "Sending it again is safe" notice takes its remedy from the ONE helper, which asks that blocker.
+  it("RF2: legacy (process) successor failed adapter_failed -> the sweep's notice and Next action say 'assign a new task', never 'safe'; a real POST is deferred; CONTROL native ordinary failure keeps its text", async () => {
+    closeProcessRunAdmission();
+    try {
+      for (const runtime of ["legacy", "native"] as const) {
+        const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = `rf2-${randomUUID()}`;
+        await db.insert(authUsers).values({ id: userId, name: "RF2 person", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+        await db.insert(companies).values({ id: companyId, name: "RF2 legacy", issuePrefix: `L${companyId.slice(0, 7)}` });
+        await db.insert(agents).values({ id: agentId, companyId, name: `RF2 ${runtime} agent`, role: "engineer", status: "idle",
+          ...(runtime === "legacy" ? { adapterType: "process", adapterConfig: { command: "true" } }
+            : { adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/faux", lifecycleMode: "cold" } }),
+          runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } });
+        await db.insert(issues).values({ id: issueId, companyId, title: "RF2 task", status: "in_progress", assigneeAgentId: agentId });
+        const app = await routeApp(userId, companyId);
+        const t = Date.now() - 3_600_000;
+        const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+          body: "M: a message delivered to the successor", createdAt: new Date(t) }).returning();
+        // M delivered to a successor that actually started and failed adapter_failed.
+        const [successor] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, runtimeMode: runtime,
+          ...(runtime === "native" ? { nativeIssueId: issueId, nativeSessionId: randomUUID() } : {}),
+          status: "failed", invocationSource: "on_demand", triggerDetail: "manual",
+          startedAt: new Date(t + 1000), finishedAt: new Date(t + 2000), createdAt: new Date(t + 500),
+          errorCode: "adapter_failed", error: "RF2 synthetic provider threw: adapter_failed",
+          contextSnapshot: { issueId, wakeCommentId: message!.id } }).returning();
+        const [hold] = runtime !== "legacy" ? [] : await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
+          kind: "active_run_watchdog", status: "active", ownerType: "board", cause: "legacy_execution_requires_reconciliation",
+          fingerprint: `rf2:${successor!.id}`, nextAction: "The run stopped before it finished, and Paperclip cannot tell which of its "
+            + "last actions took effect. Press Retry to continue the task in a fresh run; the agent checks those actions before repeating any.",
+          evidence: { runId: successor!.id, adapterRecovery: "unsupported_or_unknown", originalFailure: "adapter_failed" } }).returning();
+        const blocker = await getExecutionBlocker(db, companyId, issueId);
+        expect(Boolean(blocker), `${runtime}: dispatch's execution blocker`).toBe(runtime === "legacy");
+        await settleUnansweredPersonMessagesForTask(db, { companyId, issueId, now: new Date() });
+        const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+          .filter(c => c.authorType === "system" && String((c.metadata as Record<string, unknown> | null)?.authorizationReason ?? "")
+            .startsWith("unanswered_message:"));
+        expect(notes, `${runtime}: one notice`).toHaveLength(1);
+        const shown = `${notes[0]!.body}\n${nextActionOf(notes[0]!)}`;
+        if (runtime === "legacy") {
+          expect(notes[0]!.body).toBe(UNANSWERED_MESSAGE_NEW_TASK_TEXT);
+          expect(nextActionOf(notes[0]!)).toContain(`"Next action","value":"${HELD_PREDECESSOR_NEW_TASK_ACTION}"`);
+          expect(shown).not.toMatch(/\bsafe\b/i);
+          expect(shown).not.toMatch(/send the message again/i);
+          // The new-task text is honest: a real POST of a new message is deferred behind the same blocker.
+          const post = await postDeferred(app, { companyId, issueId });
+          expect(post.runs, "legacy: no run admitted for the new message").toEqual([]);
+          expect(post.wakes.map(w => w.status), "legacy: deferred").toEqual(["deferred_issue_execution"]);
+          expect(post.wakes[0]!.payload?.executionWait, "legacy: deferred behind the legacy hold")
+            .toMatchObject({ reason: "execution_recovery", recoveryActionId: hold!.id });
+          // A new task for the agent is not behind this issue's blocker: its message is admitted, not deferred.
+          const created = await request(app).post(`/api/companies/${companyId}/issues`)
+            .send({ title: "RF2 new task", description: "Answer the new message.", status: "todo", assigneeAgentId: agentId });
+          expect(created.status, JSON.stringify(created.body)).toBe(201);
+          expect(await getExecutionBlocker(db, companyId, created.body.id), "legacy: the new task has no blocker").toBeNull();
+        } else {
+          // CONTROL: a native agent's ordinary failure (no blocker) keeps today's text.
+          expect(notes[0]!.body).toBe(UNANSWERED_MESSAGE_TEXT);
+          expect(nextActionOf(notes[0]!)).toContain("Send the message again; if it fails again, assign this agent a new task.");
+        }
+      }
+    } finally { resetProcessRunAdmissionForTests(); }
+  }, 120_000);
 });
