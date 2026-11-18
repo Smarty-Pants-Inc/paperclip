@@ -30,6 +30,8 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { admitExplicitNativeContinuation } from "../services/explicit-native-continuation.js";
+import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.js";
 import { issueRoutes } from "../routes/issues.js";
 import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
@@ -1501,6 +1503,101 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     });
   }
 
+  // rf-5 F4 / RFL ruling (a): real HTTP routes, immutable message times,
+  // and the production cancelled-native admission on a coalesced task wake.
+  describe.each(["chat", "task"] as const)("Stop-line partition %s", kind => {
+    async function fixture(stop: boolean) {
+      const f = await seedChatTail(["A before Stop", "B after Stop", "C after Stop"]);
+      if (kind === "task") {
+        await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null })
+          .where(eq(issues.id, f.issueId));
+        await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeIds[1]));
+        await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeIds[2]));
+        await db.update(agentWakeupRequests).set({ reason: "issue_commented",
+          payload: withQueuedCommentIdsInWakePayload({ issueId: f.issueId }, f.commentIds) })
+          .where(eq(agentWakeupRequests.id, f.wakeId));
+      }
+      if (stop) {
+        await stopNativeMidTurn(f);
+        await endTeardown(f, "both");
+        await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
+        const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+        const boundary = new Date(String((source.resultJson?.cancellation as any).recordedAt));
+        for (const [i, id] of f.commentIds.entries()) {
+          await db.update(issueComments).set({ createdAt: new Date(boundary.getTime() + [-1000, 100, 200][i]) })
+            .where(eq(issueComments.id, id));
+        }
+      }
+      return { ...f, client: app(f.companyId), path: `/api/issues/${f.issueId}/queued-comments` };
+    }
+    async function saved(companyId: string) {
+      return {
+        wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)).orderBy(agentWakeupRequests.id),
+        runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)).orderBy(heartbeatRuns.id),
+        comments: await db.select().from(issueComments).where(eq(issueComments.companyId, companyId)).orderBy(issueComments.id),
+        issues: await db.select().from(issues).where(eq(issues.companyId, companyId)),
+        activity: await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)).orderBy(activityLog.id),
+      };
+    }
+    it.each(["B above A", "A below C"])("refuses %s with a distinct 409 and no writes", async direction => {
+      const f = await fixture(true), [a, b, c] = f.commentIds;
+      const before = (await request(f.client).get(f.path).expect(200)).body;
+      const stored = await saved(f.companyId);
+      const result = await request(f.client).put(`${f.path}/order`).send({ queueId: before.queueId, revision: before.revision,
+        orderedCommentIds: direction === "B above A" ? [b, a, c] : [b, c, a] });
+      expect(result.status, JSON.stringify(result.body)).toBe(409);
+      expect(result.body.details?.code).toBe("queued_comment_stop_line_crossing");
+      expect(await saved(f.companyId)).toEqual(stored);
+      expect((await request(f.client).get(f.path).expect(200)).body.entries.map((e: any) => e.comment.id)).toEqual(f.commentIds);
+      console.log("STOP-LINE REFUSED", JSON.stringify({ kind, direction, status: result.status, code: result.body.details.code, unchanged: true }));
+    });
+    it("refuses a crossing in an already interleaved saved queue even when partition labels match", async () => {
+      const f = await fixture(true), [a, b, c] = f.commentIds;
+      const [first] = await db.select().from(issueComments).where(eq(issueComments.id, a));
+      await db.update(issueComments).set({ createdAt: first.createdAt }).where(eq(issueComments.id, c));
+      const before = (await request(f.client).get(f.path).expect(200)).body, stored = await saved(f.companyId);
+      const result = await request(f.client).put(`${f.path}/order`).send({ queueId: before.queueId, revision: before.revision,
+        orderedCommentIds: [c, b, a] }).expect(409);
+      expect(result.body.details?.code).toBe("queued_comment_stop_line_crossing");
+      expect(await saved(f.companyId)).toEqual(stored);
+    });
+    it.each([true, false])("honours permitted reorder (Stop=%s)", async stop => {
+      const f = await fixture(stop), [a, b, c] = f.commentIds;
+      const before = (await request(f.client).get(f.path).expect(200)).body;
+      const chosen = stop ? [a, c, b] : [c, b, a];
+      const result = await request(f.client).put(`${f.path}/order`).send({ queueId: before.queueId, revision: before.revision,
+        orderedCommentIds: chosen }).expect(200);
+      expect(result.body.entries.map((e: any) => e.comment.id)).toEqual(chosen);
+      expect((await request(f.client).get(f.path).expect(200)).body.entries.map((e: any) => e.comment.id)).toEqual(chosen);
+    });
+    if (kind === "task") it("keeps C, not A, as cancelled-native authorizing message after refused A below C", async () => {
+      const f = await fixture(true), [a, b, c] = f.commentIds;
+      const before = (await request(f.client).get(f.path).expect(200)).body;
+      const response = await request(f.client).put(`${f.path}/order`).send({ queueId: before.queueId, revision: before.revision,
+        orderedCommentIds: [b, c, a] });
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      // The persisted tail is what run-control supplies to admission. Do not
+      // hard-code C as the candidate: that would miss the base/mutant failure.
+      const candidate = queuedCommentIdsFromWakePayload(wake.payload).at(-1)!;
+      const admitted = await db.transaction(tx => admitExplicitNativeContinuation({ db: tx as unknown as typeof db,
+        companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, actorType: "user", actorId: "queue-owner",
+        reason: "issue_commented", commentId: candidate, successorRunId: randomUUID(), queuedCommentRequestId: f.wakeId, dryRun: true }));
+      console.log("STOP-LINE AUTHORIZATION", JSON.stringify({ status: response.status, candidate, C: c, A: a, admitted }));
+      expect(admitted).toMatchObject({ previousRunId: f.runId, commentId: c });
+      expect(candidate).toBe(c);
+      expect(response.status).toBe(409);
+      // Exercise the caller too: run-control.ts:740-761 selects the last
+      // undelivered id and checks its immutable time, then ordinary admission
+      // persists that authorizing comment on the successor.
+      const service = heartbeatService(db);
+      await service.resumeRemoteStopComments((await service.getRun(f.runId))!);
+      const successors = await hold50Successors(f);
+      expect(successors).toHaveLength(1);
+      expect(successors[0].contextSnapshot).toMatchObject({ commentId: c, wakeCommentIds: f.commentIds });
+      console.log("STOP-LINE PRODUCTION SELECTION", JSON.stringify({ C: c, A: a, context: successors[0].contextSnapshot }));
+    });
+  });
+
   it.each([false, true])("AUDIT third writer after ordinary Stop: resolved no-replay hold=%s", async (keepResolvedHold) => {
     const f = await seedQueue();
     const { service } = await stopNativeMidTurn(f);
@@ -1560,9 +1657,10 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const before = (await request(client).get(path).expect(200)).body;
     const order = direction === "control-no-reorder" ? f.commentIds : direction === "pre-after-post" ? [f.commentIds[1], f.commentIds[2], f.commentIds[0]] : [f.commentIds[1], f.commentIds[0], f.commentIds[2]];
     const result = await request(client).put(`${path}/order`).send({ queueId: before.queueId, revision: before.revision, orderedCommentIds: order });
-    expect(result.status, JSON.stringify(result.body)).toBe(200);
+    expect(result.status, JSON.stringify(result.body)).toBe(direction === "control-no-reorder" ? 200 : 409);
+    if (direction !== "control-no-reorder") expect(result.body.details?.code).toBe("queued_comment_stop_line_crossing");
     const reordered = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
-    console.log("AUDIT REORDER", JSON.stringify({ direction, stop, status: result.status, order: result.body.entries.map((e:any) => e.comment.body), timestamps: reordered.map(w => ({ id: w.id, comments: w.payload?.commentId, requestedAt: w.requestedAt })) }));
+    console.log("AUDIT REORDER", JSON.stringify({ direction, stop, status: result.status, order: (await request(client).get(path).expect(200)).body.entries.map((e:any) => e.comment.body), timestamps: reordered.map(w => ({ id: w.id, comments: w.payload?.commentId, requestedAt: w.requestedAt })) }));
     await endTeardown(f, "both");
     const target = direction === "pre-after-post" ? f.wakeIds[0] : f.wakeIds[1];
     await service.resumeExecutionWaitComments({ companyId: f.companyId, requestId: target });
