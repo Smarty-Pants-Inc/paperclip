@@ -468,7 +468,7 @@ async function setup() {
   if (!address || typeof address === "string") throw new Error("No full server listener");
   apiUrl = `http://127.0.0.1:${address.port}`;
   vi.stubEnv("PAPERCLIP_API_URL", apiUrl);
-  setupRunnerPrpWebSocketServer(http, { apiUrl });
+  setupRunnerPrpWebSocketServer(http);
   stage("full Paperclip server up");
 
   const company = await api("POST", "/companies", { name: "Rung 4 agent communication proof" }, 201);

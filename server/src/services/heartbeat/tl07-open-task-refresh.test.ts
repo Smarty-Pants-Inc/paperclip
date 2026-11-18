@@ -141,7 +141,7 @@ it.skipIf(!support.supported)("TL07 open task: refreshed instructions and saved 
         resolveAddress(address);
       });
     });
-    setupRunnerPrpWebSocketServer(runtimeApi, { apiUrl: `http://127.0.0.1:${apiAddress.port}` });
+    setupRunnerPrpWebSocketServer(runtimeApi);
     const priorAt = new Date(run.createdAt.getTime() - 10_000);
     const [priorRun] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
       issueId: issue.id, nativeIssueId: issue.id, scopeKind: "issue", runtimeMode: "native", status: "succeeded",

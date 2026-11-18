@@ -540,7 +540,7 @@ it.skipIf(!enabled)("F3: separate legitimate KA creator turns yield A/B; real la
     await new Promise<void>(resolve => http!.listen(0, "127.0.0.1", resolve));
     apiUrl = `http://127.0.0.1:${(http.address() as { port: number }).port}`;
     vi.stubEnv("PAPERCLIP_API_URL", apiUrl);
-    setupRunnerPrpWebSocketServer(http, { apiUrl });
+    setupRunnerPrpWebSocketServer(http);
     companyId = (await api("POST", "/companies", { name: "F3 disposable real Pi addressed-card qualification" }, 201)).id;
     await api("PATCH", `/companies/${companyId}`, { requireBoardApprovalForNewAgents: false });
     await db.insert(authUsers).values({ id: "local-board", name: "F3 fixture operator", email: "f3@example.invalid", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();

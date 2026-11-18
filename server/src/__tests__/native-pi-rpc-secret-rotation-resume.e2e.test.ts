@@ -216,7 +216,7 @@ it.skipIf(!enabled)("latest secret rotation refreshes the Pi process without los
     const address = http.address(); if (!address || typeof address === "string") throw new Error("No full server listener");
     const apiUrl = `http://127.0.0.1:${address.port}`;
     vi.stubEnv("PAPERCLIP_API_URL", apiUrl);
-    setupRunnerPrpWebSocketServer(http, { apiUrl });
+    setupRunnerPrpWebSocketServer(http);
     const api = async (method: string, path: string, body?: unknown, expected = 200) => {
       const response = await fetch(`${apiUrl}/api${path}`, { method, headers: { "content-type": "application/json", origin: apiUrl },
         signal: AbortSignal.timeout(30_000), ...(body === undefined ? {} : { body: JSON.stringify(body) }) });

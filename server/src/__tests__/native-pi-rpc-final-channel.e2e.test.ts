@@ -223,7 +223,7 @@ it.skipIf(!enabled)(`labels every final answer through the real Pi server path (
     const address = http.address(); if (!address || typeof address === "string") throw new Error("No full server listener");
     const apiUrl = `http://127.0.0.1:${address.port}`;
     vi.stubEnv("PAPERCLIP_API_URL", apiUrl);
-    setupRunnerPrpWebSocketServer(http, { apiUrl });
+    setupRunnerPrpWebSocketServer(http);
     stage("full Paperclip server up", { apiUrl });
     const api = async (method: string, path: string, body?: unknown, expected = 200) => {
       const response = await fetch(`${apiUrl}/api${path}`, { method, headers: { "content-type": "application/json", origin: apiUrl }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
