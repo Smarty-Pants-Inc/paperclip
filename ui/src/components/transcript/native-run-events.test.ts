@@ -73,6 +73,28 @@ function runResult(summary: string): Record<string, unknown> {
   };
 }
 
+describe("cut native text snapshots", () => {
+  it.each(["reasoning", "agentMessage"] as const)("preserves streamed %s instead of preferring a cut completion", kind => {
+    const whole = "é" + "r".repeat(4352);
+    const cut = Buffer.from(whole).subarray(0, 4096).toString() + "…[truncated]";
+    const payload = { kind, channel: kind === "reasoning" ? "detail" : "final" };
+    const completion = itemEvent(3, "item.completed", "whole-1", { ...payload, text: cut });
+    const entries = nativeRunEventsToTranscript([
+      itemEvent(1, "item.delta", "whole-1", { ...payload, text: whole.slice(0, 2000) }),
+      itemEvent(2, "item.delta", "whole-1", { ...payload, text: whole.slice(2000) }), completion,
+    ]);
+    const items = transcriptToTaskChatItems(entries, { runId: RUN_ID, running: false });
+    const rendered = items.map(item => item.kind === "thinking" ? item.lines.join("\n") : item.kind === "message" ? item.text : "").join("");
+    expect(rendered).toBe(whole);
+    expect(Buffer.byteLength(rendered)).toBe(4354);
+    expect(JSON.stringify(entries)).not.toContain("[truncated]");
+    const reloaded = nativeRunEventsToTranscript([completion]);
+    expect(reloaded[0]).toMatchObject({ text: cut.slice(0, -"…[truncated]".length) +
+      `\n\nThe full ${kind === "reasoning" ? "thinking" : "response"} is kept in the run log.` });
+    expect(JSON.stringify(reloaded)).not.toContain("[truncated]");
+  });
+});
+
 describe("provider notice presentation", () => {
   it("omits unrelated information from saved chat without removing warnings or responses", () => {
     const legacyNotice = {
@@ -252,7 +274,8 @@ describe("native proposed-plan presentation", () => {
         markdown: "# Other", source: "codex_plan_item",
       }),
     ]);
-    expect(fencedTranscript[0]).toMatchObject({ kind: "assistant", text: fenced });
+    expect(fencedTranscript[0]).toMatchObject({ kind: "assistant", text: "Format:\n```\n<proposed_plan>\n# Plan\n\nThe full response is kept in the run log." });
+    expect(JSON.stringify(fencedTranscript)).not.toContain("[truncated]");
   });
 
   it("shows a completed proposal's example tags unchanged on its card", () => {

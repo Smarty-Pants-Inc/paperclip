@@ -1558,6 +1558,23 @@ describe("buildIssueChatMessages", () => {
     });
   });
 
+  it.each([
+    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "viewer" }, label: "Stopped by you", detail: "You stopped this run before it finished." },
+    { resultJson: { interruptedByActorType: "user", interruptedByActorId: "viewer", operatorInterrupted: true }, label: "Interrupted by you", detail: "You interrupted this run." },
+    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "other" }, label: "Stopped by Alex" },
+    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "unknown" }, label: "Stopped by a board member" },
+    { resultJson: { cancelledByActorType: "system", cancelledByUserId: "viewer" }, label: "Cancelled after 1 minute" },
+    { resultJson: { cancelledByActorType: "agent", cancelledByUserId: "viewer" }, label: "Cancelled after 1 minute" },
+  ])("attributes a cancelled run to its recorded actor ($label)", ({ resultJson, label, detail }) => {
+    const messages = buildIssueChatMessages({ comments: [], timelineEvents: [], liveRuns: [],
+      currentUserId: "viewer", userLabelMap: new Map([["other", "Alex"]]),
+      linkedRuns: [{ runId: "stop", status: "cancelled", agentId: "agent", resultJson,
+        createdAt: "2026-04-06T12:01:00Z", startedAt: "2026-04-06T12:01:00Z", finishedAt: "2026-04-06T12:02:00Z" }],
+    });
+    expect(messages[0]?.metadata.custom).toMatchObject({ chainOfThoughtLabel: label });
+    if (detail) expect(messages[0]?.metadata.custom).toMatchObject({ notices: [detail] });
+  });
+
   it("labels pause-caused cancelled runs as paused by board", () => {
     const messages = buildIssueChatMessages({
       comments: [],

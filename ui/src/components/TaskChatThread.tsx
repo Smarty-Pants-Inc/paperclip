@@ -138,6 +138,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useIssuePlanDocument } from "@/hooks/useIssuePlanDocument";
 import { isRedundantAiRecoveryNotice, latestSameRunHandoffTimestamp } from "@/lib/issue-chat-messages";
+import { userRunStopPresentation } from "@/lib/interrupt-handoff";
 import { isLiveIssueRun, isTerminalIssueStatus } from "@/lib/liveIssueIds";
 import {
   resolveTaskChatBlockers,
@@ -1748,6 +1749,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         agentName: meta.agentName || agentMap?.get(meta.agentId)?.name,
       } : undefined, currentUserId, userLabelMap);
       const historical = statusRelevance.isHistoricalRun(source.id);
+      const userStop = userRunStopPresentation({ ...meta, status: source.status }, currentUserId, userLabelMap);
       // A workspace admission attempt never started provider work. Its live
       // successor owns the waiting indicator; retain this attempt in the run log.
       if (source.status === "cancelled" && (meta?.errorCode === "workspace_busy" || meta?.errorCode === "agent_directory_busy")) {
@@ -1901,7 +1903,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
           (source.status === "timed_out"
             ? "native_runner_timed_out"
             : "native_runner_process_exited");
-        const label =
+        const label = userStop?.label ?? (
           code === "native_provider_runtime_missing" && source.status === "failed"
             ? "Runtime missing"
             : code === "native_provider_model_rejected" && source.status === "failed"
@@ -1916,11 +1918,11 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                 ? "Run interrupted"
                 : source.status === "timed_out"
                   ? "Run timed out"
-                  : "Run failed";
+                  : "Run failed");
         const responseBoundary = sourceHasNativeResponse
           ? " after returning a final response"
           : "";
-        const detail =
+        const detail = userStop?.detail ?? (
           source.status === "cancelled"
             ? `The run was cancelled${responseBoundary}.`
             : source.status === "interrupted"
@@ -1940,14 +1942,14 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                     ? "Provider output exceeded the safe limit."
                     : source.status === "timed_out"
                       ? `The runner timed out${responseBoundary} (${code}).`
-                      : `The runner stopped${responseBoundary} (${code}).`;
+                      : `The runner stopped${responseBoundary} (${code}).`);
         const id = `${source.id}:failure`;
         const runAgent = meta?.agentId
           ? agentMap?.get(meta.agentId)
           : undefined;
         const finishedAt =
           meta?.finishedAt ?? meta?.startedAt ?? meta?.createdAt;
-        if (!historical && (!props.interruption || credentialAccess ||
+        if (!historical && (userStop || !props.interruption || credentialAccess ||
             (props.interruption.responsibility === "user" &&
               ["native_provider_model_rejected", "native_provider_approval_required"].includes(code)))) entriesWithFailures.push({
           ms: toMs(finishedAt),
@@ -1979,7 +1981,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       // or a final comment. Otherwise the thread keeps retrying an older run.
       const sourceHasLegacyStop = !sourceIsPaperclipRunner && (
         source.status === "failed" || source.status === "timed_out" ||
-        (source.status === "cancelled" && entries.length === 0)
+        (source.status === "cancelled" && (entries.length === 0 || userStop))
       );
       if (sourceHasLegacyStop) {
         settledRunIds.add(source.id);
@@ -1995,7 +1997,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
           interaction.sourceRunId === source.id && interactionTargetsPlanRevision(interaction, planDocument),
         )));
         const aiRequest = interactions?.find((interaction) => interaction.kind === "connection_intent" && interaction.payload.purpose === "ai" && interaction.sourceRunId === source.id);
-        const detail = branchUnavailable
+        const detail = userStop?.detail ?? (branchUnavailable
           ? "Repair the starting branch below before retrying."
           : restoreFailed
           ? workspaceRestoreMarkerDetail({ result: meta?.resultJson, savedPlan, hasResponse: sourceHasPresentationComment || Boolean(acceptedSummary) })
@@ -2011,9 +2013,9 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
             ? `Provider output exceeded the safe limit. ${retryDetail}`
             : code.startsWith("workspace_git_scan_")
             ? `Workspace setup failed before the agent started. ${retryDetail}`
-            : `The run failed (${code}). ${retryDetail}`;
+            : `The run failed (${code}). ${retryDetail}`);
         const id = `${source.id}:failure`;
-        if (!historical && (!props.interruption || credentialAccess)) entriesWithFailures.push({
+        if (!historical && (userStop || !props.interruption || credentialAccess)) entriesWithFailures.push({
           ms: toMs(meta?.finishedAt ?? meta?.startedAt ?? meta?.createdAt),
           order: 3,
           id,
@@ -2021,7 +2023,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
             id,
             kind: "marker",
             variant: "interrupted",
-            label: branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : source.status === "cancelled" ? (meta?.startedAt ? "Stopped" : "Couldn't start") : "Run failed",
+            label: userStop?.label ?? (branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : source.status === "cancelled" ? (meta?.startedAt ? "Stopped" : "Couldn't start") : "Run failed"),
             runId: source.status === "cancelled" ? undefined : source.id,
             ...(branchUnavailable || aiRequest?.status === "pending" ? { retryable: false } : {}),
             ...(restoreFailed ? {
@@ -2098,7 +2100,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         } else if (!sourceHasNativeStop && !sourceHasLegacyStop && !lastCommentIdByRun.has(source.id)) {
           settledRunIds.add(source.id);
           const id = `${source.id}:terminal-notice`;
-          if (!historical && (!props.interruption || credentialAccess)) entriesWithFailures.push({
+          if (!historical && (userStop || !props.interruption || credentialAccess)) entriesWithFailures.push({
             ms: toMs(meta?.finishedAt ?? meta?.startedAt ?? meta?.createdAt),
             order: 3,
             id,
@@ -2106,8 +2108,8 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
               id,
               kind: "marker",
               variant: "turn_boundary",
-              label: source.status === "cancelled" ? "Stopped" : "Run completed",
-              detail: source.status === "cancelled" ? "This turn was cancelled before it returned a response." : "The runner returned no user-facing response.",
+              label: userStop?.label ?? (source.status === "cancelled" ? "Stopped" : "Run completed"),
+              detail: userStop?.detail ?? (source.status === "cancelled" ? "This turn was cancelled before it returned a response." : "The runner returned no user-facing response."),
             },
           });
         }
