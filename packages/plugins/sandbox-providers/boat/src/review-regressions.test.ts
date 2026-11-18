@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { findReusableSandboxProviderLeaseId } from "../../../../../server/src/services/sandbox-provider-runtime.js";
+import { PluginEnvironmentStopError } from "@paperclipai/plugin-sdk";
 import plugin from "./plugin.js";
 
 // Keep: data safety and the provider/core trust boundary (review 0.1.3 F1–F3).
@@ -38,14 +39,22 @@ describe("0.1.3 review regressions", () => {
     expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toEqual({}); // never force away unsaved data
   });
 
-  it("F2: a retrying failing stop is not a receipt; only completed settles", async () => {
-    const stop = { id: "stop_123", status: "failing" };
+  it("F2: a failing stop is not a receipt; Boat's failing stop record returns its refusal at once (PARITY rows 1+2)", async () => {
+    // Boat's documented shapes: the 202 carries the stop {id, status}; GET /sandboxes/{id}/stops/{stopId}
+    // reads it; a failed save shows `failing` with its `error` (staged boat-llms-full.txt :1785-1789, :1850-1856).
+    // Superseded contract: this test used to wait through `failing` until `completed`; a refused stop now
+    // returns at once, typed and non-terminal, and is not resent inside a back-off. Own box id: the back-off is per box.
+    const id = "bx_f2refuse";
+    const stop = { id: "stop_123", status: "failing", error: "Refusing archive/stop: no successful snapshot in the last 30 minutes" };
     const fetch = vi.fn().mockResolvedValueOnce(response({ operation: stop }, 202))
-      .mockResolvedValueOnce(response({ sandbox: { id: base.providerLeaseId, state: "archiving", stop } }))
-      .mockResolvedValueOnce(response({ sandbox: { id: base.providerLeaseId, state: "archiving", stop: { ...stop, status: "completed" } } }));
+      .mockResolvedValueOnce(response({ sandbox: { id, state: "archiving", stop } }))
+      .mockResolvedValueOnce(response({ stop }));
     vi.stubGlobal("fetch", fetch);
-    expect(await plugin.definition.onEnvironmentReleaseLease!(base)).toEqual({ providerLeaseId: base.providerLeaseId, state: "stopped" });
-    expect(fetch).toHaveBeenCalledTimes(3);
+    const error = await plugin.definition.onEnvironmentReleaseLease!({ ...base, providerLeaseId: id }).catch(e => e);
+    expect(error).toBeInstanceOf(PluginEnvironmentStopError);
+    expect(error.message).toContain(stop.error);
+    expect(fetch.mock.calls.map(call => `${call[1]?.method ?? "GET"} ${new URL(String(call[0])).pathname}`)).toEqual([
+      `POST /api/v1/sandboxes/${id}/stop`, `GET /api/v1/sandboxes/${id}`, `GET /api/v1/sandboxes/${id}/stops/stop_123`]);
   });
 
   it("F3: dedicated stop retains the exact allocation even when reuse is disabled", async () => {
