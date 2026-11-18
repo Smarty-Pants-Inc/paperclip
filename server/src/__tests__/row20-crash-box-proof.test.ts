@@ -192,7 +192,8 @@ describe.skipIf(!support.supported)("row 20 crash path: the clean-close proof is
       expect(hasCleanStoppedSessionClose(r.run)).toBe(true);
       expect(proof).toMatchObject({ clean: true, via: "box_stopped_turn_kill_after_crash", remaining: [] });
       expect(proof.found).toContain(stray.pid);
-      expect(proof.killedGroups).toContain(stray.pid);
+      // adopt-stopu-round: the crash path runs the ONE check (ugate2's noStoppedTurnProcessRemains), which kills per process.
+      expect(proof.killedPids).toContain(stray.pid);
       expect(evidence.strayAlive).toBe(false);
       // Branch A (same box) was available; the bounded export ran first.
       expect(r.decision).toMatchObject({ decision: "same_box", reason: "box_reachable_tools_stopped" });
@@ -249,9 +250,9 @@ describe.skipIf(!support.supported)("row 20 crash path: the clean-close proof is
     // The box answers every command; the kill-and-verify command reports a
     // process that survived (exit 3, remaining nonempty).
     const unprovenRunner: CommandManagedRuntimeRunner = { execute: async input =>
-      (input.args ?? []).includes("paperclip-stopped-turn-kill")
-        ? { exitCode: 3, signal: null, timedOut: false, pid: null, startedAt: null, stderr: "",
-          stdout: JSON.stringify({ procfs: true, found: [424242], killedGroups: [], killedPids: [], remaining: [424242], unreadable: 0 }) }
+      // adopt-stopu-round: the ONE check (stopped-turn-process-gone.ts) reports a survivor.
+      input.command === "sh" && String(input.args?.[1] ?? "").includes("/proc/stat")
+        ? { exitCode: 3, signal: null, timedOut: false, pid: null, startedAt: null, stderr: "", stdout: "REMAIN 424242\n" }
         : boxRunner.execute(input) };
     boxTargets.set(f.leaseId, { ...(boxTargets.get(f.leaseId) as object), runner: unprovenRunner });
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never });
