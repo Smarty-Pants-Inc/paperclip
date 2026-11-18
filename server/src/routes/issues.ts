@@ -13089,7 +13089,7 @@ export function issueRoutes(
       if (!issue.conversationAgentId || issue.conversationUserId !== req.actor.userId) throw forbidden("Only the chat owner can mark a conversation message read");
       const [comment] = await db.select({ createdAt: sql<string>`${issueComments.createdAt}::text` }).from(issueComments).where(and(
         eq(issueComments.id, input.throughCommentId), eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-        isNull(issueComments.deletedAt),
+        isNull(issueComments.deletedAt), sql`${issueComments.origin} <> 'fast_response'`,
       ));
       if (!comment) throw notFound("Chat message not found");
       readAt = sql`${comment.createdAt}::timestamptz`;

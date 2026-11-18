@@ -6,6 +6,24 @@ import {
 } from "./task-chat-adapter";
 
 describe("commentsToTaskChatItems", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605
+  it("fast-response R2: renders acknowledgements, never session markers, at every generation", () => {
+    for (const conversationSessionGeneration of [null, 0, 1, 42]) {
+      const receipt = {
+        id: "receipt", authorType: "agent", authorAgentId: "agent", authorUserId: null,
+        body: "I'll check that now.", origin: "fast_response", conversationSessionGeneration,
+        createdAt: new Date("2026-08-25T18:00:01.000Z"),
+      } as IssueChatComment;
+      expect(commentsToTaskChatItems([receipt])).toMatchObject([
+        { id: "receipt", kind: "message", author: "agent", origin: "fast_response", text: receipt.body },
+      ]);
+      if (conversationSessionGeneration != null) {
+        expect(commentsToTaskChatItems([{ ...receipt, origin: "comment", body: "/new" }]))
+          .toMatchObject([{ kind: "marker", variant: "session_start", label: "New session" }]);
+      }
+    }
+  });
+
   it("preserves distinct human IDs, photos and viewer ownership, including after a profile refresh", () => {
     const comments = ["alex", "sam"].map(authorUserId => ({
       id: `comment-${authorUserId}`, authorType: "user", authorUserId,

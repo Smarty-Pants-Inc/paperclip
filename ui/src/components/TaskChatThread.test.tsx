@@ -1878,6 +1878,27 @@ describe("TaskChatThread draft pass-through", () => {
 });
 
 describe("TaskChatThread runtime transcript selection", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605
+  it("fast-response R1: preserves an acknowledgement matching the runner final text", () => {
+    const run = nativeRunningRun();
+    const body = "I'll check that now.";
+    nativeTranscriptState.transcriptByRun.set(run.id, [
+      assistantEntry("2026-08-25T18:00:02.000Z", body, "final"),
+    ]);
+    const comment = {
+      id: "acknowledgement", companyId: "company", issueId: "issue",
+      authorType: "agent" as const, authorAgentId: run.agentId, authorUserId: null,
+      body, presentation: null, metadata: null, createdByRunId: null,
+      createdAt: new Date("2026-08-25T18:00:01.000Z"), updatedAt: new Date("2026-08-25T18:00:01.000Z"),
+    };
+    const props = { onAdd: async () => {}, activeRun: run, issueStatus: "in_progress" };
+    renderThread({ ...props, comments: [{ ...comment, origin: "comment" }] });
+    expect(container.querySelector("#comment-acknowledgement")).toBeNull();
+    renderThread({ ...props, comments: [{ ...comment, origin: "fast_response" }] });
+    expect(container.querySelector("#comment-acknowledgement")?.textContent).toContain(body);
+    expect(container.querySelector('[data-testid="task-chat-runner-turn"]')?.textContent).toContain(body);
+  });
+
   // Keep: real production catch, Agent Chat work disappearing after reload (2026-11-12).
   it("rebuilds Agent Chat tool activity after a cold remount with compact message history", () => {
     const run = nativeRunningRun();
@@ -5930,7 +5951,7 @@ describe("TaskChatThread live transcript", () => {
     ).toBeNull();
   });
 
-  it.each(["running", "queued", "failed", "queued-message", "unfocused", "scrolled-up", "unseen-saved-reply"])("marks a seen persisted chat reply read while its runner bubble owns the response (%s)", async scenario => {
+  it.each(["running", "queued", "failed", "queued-message", "unfocused", "scrolled-up", "unseen-saved-reply", "fast-response"])("marks a seen persisted chat reply read while its runner bubble owns the response (%s)", async scenario => {
     const commentId = "11111111-1111-4111-8111-111111111111";
     const body = "Completed the requested streaming test.";
     const markRead = vi.spyOn(issuesApi, "markRead").mockResolvedValue({} as never);
@@ -5946,10 +5967,11 @@ describe("TaskChatThread live transcript", () => {
     render(<AgentChatReadProvider issueId="issue-1" companyId="company-1" userId="owner-a">
       <TaskChatThread issueId="issue-1" conversationMode conversationOwnerId="owner-a" currentUserId="owner-a"
         comments={[{ id: commentId, companyId: "company-1", issueId: "issue-1", authorType: "agent", authorAgentId: "agent-1", authorUserId: null,
-          body: scenario === "unseen-saved-reply" ? "A different saved reply not yet shown." : body,
+          body: scenario === "fast-response" ? "Acknowledged." : scenario === "unseen-saved-reply" ? "A different saved reply not yet shown." : body,
+          origin: scenario === "fast-response" ? "fast_response" : "comment",
           // Saved native replies carry stored run provenance even before the
           // activity-derived runId arrives. Text alone must not clear unread.
-          presentation: null, metadata: null, createdByRunId: "run-runner",
+          presentation: null, metadata: null, createdByRunId: scenario === "fast-response" ? null : "run-runner",
           runId: scenario === "unseen-saved-reply" ? "run-runner" : null,
           createdAt: new Date("2026-08-21T15:44:22.000Z"), updatedAt: new Date("2026-08-21T15:44:22.000Z") },
           ...(scenario === "queued-message" ? [{ id: "22222222-2222-4222-8222-222222222222", companyId: "company-1", issueId: "issue-1",
@@ -5968,7 +5990,7 @@ describe("TaskChatThread live transcript", () => {
       expect(container.textContent?.match(/Completed the requested streaming test\./g)).toHaveLength(1);
       expect(container.querySelector('[data-testid="task-chat-live-transcript"]')).not.toBeNull();
     }
-    if (scenario === "unfocused" || scenario === "scrolled-up" || scenario === "unseen-saved-reply") expect(markRead).not.toHaveBeenCalled();
+    if (scenario === "unfocused" || scenario === "scrolled-up" || scenario === "unseen-saved-reply" || scenario === "fast-response") expect(markRead).not.toHaveBeenCalled();
     else expect(markRead).toHaveBeenCalledWith("issue-1", commentId);
     expect(markRead.mock.calls.every(([, id]) => id === commentId)).toBe(true);
   });

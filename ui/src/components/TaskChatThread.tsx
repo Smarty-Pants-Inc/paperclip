@@ -257,7 +257,7 @@ function isRunnerResponseComment(params: {
   finalText: string | null;
 }): boolean {
   const { comment, runId, runStartedAtMs, finalText } = params;
-  if (comment.deletedAt || comment.authorType === "user") return false;
+  if (comment.deletedAt || comment.authorType === "user" || comment.origin === "fast_response") return false;
   if (comment.runId === runId) return true;
   if (comment.runId || !finalText) return false;
   const commentAtMs = toMs(comment.createdAt);

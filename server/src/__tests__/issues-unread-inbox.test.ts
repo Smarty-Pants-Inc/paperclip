@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import { eq, inArray, sql, type SQL } from "drizzle-orm";
 import request from "supertest";
 import { expect, it } from "vitest";
-import { activityLog, issueComments, issueInboxArchives, issueReadStates, issues, issueThreadInteractions, issueAccessGrants, projectAccessMembers, projects } from "@paperclipai/db";
+import { activityLog, agents, issueComments, issueInboxArchives, issueReadStates, issues, issueThreadInteractions, issueAccessGrants, projectAccessMembers, projects } from "@paperclipai/db";
 import { sidebarBadgeRoutes } from "../routes/sidebar-badges.js";
+import { issueRoutes } from "../routes/issues.js";
+import { withConversationReadState } from "../services/agent-chat-read-state.js";
 import { issueReadSqlCondition } from "../services/authorization.js";
 import { issueService } from "../services/issues.js";
 import { describeEmbeddedPostgres, routeApp, seedCompanyWithBoardAccess, useEmbeddedPostgres } from "./helpers/route-test-harness.js";
@@ -15,6 +17,52 @@ const readable = sql<boolean>`true`;
 
 describeEmbeddedPostgres("Mine unread badge", () => {
   const ctx = useEmbeddedPostgres("paperclip-mine-unread-");
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605
+  it("fast-response R4: receipts never affect unread, external activity, ranking or chat read cutoffs", async () => {
+    const { companyId, userId, actor } = await seedCompanyWithBoardAccess(ctx.db, "Receipt read boundaries");
+    const svc = issueService(ctx.db);
+    const target = randomUUID(), receiptTask = randomUUID();
+    const filler = Array.from({ length: 99 }, () => randomUUID());
+    const replyAt = new Date("2026-01-01T12:00:00Z");
+    await ctx.db.insert(issues).values([target, receiptTask, ...filler].map(id => ({ id, companyId, title: id,
+      status: "todo", createdByUserId: userId, createdAt: old, updatedAt: filler.includes(id) ? commentAt : old })));
+    await ctx.db.insert(issueComments).values({ companyId, issueId: target, authorType: "agent", body: "Actual reply", createdAt: replyAt });
+    const [receipt] = await ctx.db.insert(issueComments).values({ companyId, issueId: receiptTask, authorType: "agent",
+      body: "I'll check that now.", origin: "fast_response", createdAt: newer }).returning();
+    const check = async () => {
+      expect.soft(await svc.countUnreadTouchedByUser(companyId, userId)).toBe(1);
+      expect.soft(await svc.unreadInboxIssueIds(companyId, userId, readable)).toEqual([target]);
+      const row = (await svc.list(companyId, { touchedByUserId: userId })).find(issue => issue.id === receiptTask);
+      expect.soft(row).toMatchObject({ isUnreadForMe: false, lastExternalCommentAt: null, lastActivityAt: old });
+    };
+    await check(); // The comment itself is neither unread nor last activity.
+    await ctx.db.delete(issueComments).where(eq(issueComments.id, receipt!.id));
+    await ctx.db.insert(activityLog).values({ companyId, entityType: "issue", entityId: receiptTask, actorType: "system",
+      actorId: "paperclip-fast-response", action: "issue.comment_added", createdAt: newer, details: { origin: "fast_response" } });
+    await check(); // Its publication log must not move the task either.
+    await ctx.db.insert(issueComments).values({ companyId, issueId: receiptTask, origin: "import", body: "Imported reply", createdAt: newer });
+    expect.soft(await svc.countUnreadTouchedByUser(companyId, userId)).toBe(2);
+    expect.soft((await svc.list(companyId, { touchedByUserId: userId })).find(issue => issue.id === receiptTask))
+      .toMatchObject({ isUnreadForMe: true, lastExternalCommentAt: newer, lastActivityAt: newer });
+
+    const [agent] = await ctx.db.insert(agents).values({ companyId, name: "Chat agent", adapterType: "process" }).returning();
+    const [chat] = await ctx.db.insert(issues).values({ companyId, title: "Chat", conversationAgentId: agent!.id,
+      conversationUserId: userId, conversationState: "waiting", assigneeAgentId: agent!.id, createdByUserId: userId, createdAt: old, updatedAt: old }).returning();
+    const [reply, ack] = await ctx.db.insert(issueComments).values([
+      { companyId, issueId: chat!.id, authorAgentId: agent!.id, authorType: "agent", body: "Real answer", createdAt: commentAt },
+      { companyId, issueId: chat!.id, authorAgentId: agent!.id, authorType: "agent", body: "Acknowledged", origin: "fast_response", createdAt: newer },
+    ]).returning();
+    const unread = () => withConversationReadState(ctx.db, companyId, userId, [{ id: chat!.id }]);
+    expect.soft(await unread()).toMatchObject([{ unreadMessageCount: 1 }]);
+    const app = routeApp(ctx.db, actor, issueRoutes);
+    const mark = (throughCommentId: string) => request(app).post(`/api/issues/${chat!.id}/read`).send({ throughCommentId });
+    expect.soft((await mark(ack!.id)).status).toBe(404);
+    expect.soft(await ctx.db.select().from(issueReadStates).where(eq(issueReadStates.issueId, chat!.id))).toEqual([]);
+    expect.soft(await unread()).toMatchObject([{ unreadMessageCount: 1 }]);
+    expect.soft((await mark(reply!.id)).status).toBe(200);
+    expect.soft(await unread()).toMatchObject([{ unreadMessageCount: 0 }]);
+  });
 
   it("ranks all visible Mine tasks before unread with canonical activity and exact ID ties", async () => {
     const { companyId, userId } = await seedCompanyWithBoardAccess(ctx.db, "Mine top100");
