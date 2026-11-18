@@ -6,7 +6,7 @@ import { idleWorkSnapshot } from "../services/task-admission.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -62,6 +62,9 @@ import { environmentService } from "../services/environments.ts";
 import { resumePluginEnvironmentLease } from "../services/plugin-environment-driver.js";
 import { remoteExecutionHasStopped } from "../services/remote-execution-termination.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { agentExecutionStopBlocker } from "../services/agent-execution-stop.ts";
+import { configureAgentLifecycle } from "../services/agent-lifecycle.ts";
+import { createLifecycleDriver } from "../services/agent-lifecycle-driver.ts";
 import { secretService } from "../services/secrets.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 import type { Environment, EnvironmentDriver, EnvironmentStatus } from "@paperclipai/shared";
@@ -956,6 +959,78 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       } else expect(call).toHaveBeenCalledOnce();
     },
   );
+
+  // Pausing stage 1, park key (RFL 14:34Z ruling 2) through the real runtime,
+  // the real pending-destroy sweep and the real lifecycle worker. Live
+  // 0eb2069c: pending_cleanup / failed / retained_orphan_sandbox_released with
+  // its own carried 'stopped' receipt (proved), retainOnDestroy true.
+  async function parkedPendingDestroy(answer: "stopped" | "destroyed", held: boolean) {
+    const f = await seedReusablePluginSandboxLease("paperclip_runner");
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    const lease = (await environmentService(db).getLeaseById(f.reusableLease.id))!;
+    const stopReceipt = remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "stopped" });
+    await db.update(environmentLeases).set({ status: "pending_cleanup", cleanupStatus: "failed", releasedAt: new Date(),
+      failureReason: "retained_orphan_sandbox_released", metadata: { ...lease.metadata, retainOnDestroy: true,
+        workspaceRecoveryCleanup: { runId: f.runId, stopReceipt, reason: "retained_orphan_sandbox_released" } } })
+      .where(eq(environmentLeases.id, lease.id));
+    const localRoot = await mkdtemp(path.join(os.tmpdir(), "gate4-0eb2069c-"));
+    await writeFile(path.join(localRoot, "unsaved-note.txt"), "unsaved note");
+    if (held) {
+      const since = new Date(Date.now() - 4 * 3600_000);
+      await db.insert(agentInstructionWorkingCopies).values({ runId: f.runId, companyId: f.companyId, agentId: f.agentId, responsibleUserId: "user-1",
+        entryFile: "AGENTS.md", baseHash: "base", localRoot, executionRoot: "/workspace/.paperclip-runtime/agent-files/gate4",
+        location: `remote:${f.environment.id}`, state: "unavailable", processStoppedAt: since, errorCode: "AGENT_FILES_SAVE_FAILED",
+        receipt: { schema: "paperclip.agent-files.v1", warm: true, cleanup: { leaseId: lease.id, remoteCwd: "/workspace" },
+          savePending: { code: "AGENT_FILES_SAVE_FAILED", since: since.toISOString(), reason: "Boat sandbox lease is no longer active.", failures: 15 } } });
+    }
+    const copyBefore = await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, f.runId));
+    await db.update(agents).set({ status: "paused", lifecycleState: "pausing", lifecycleHolds: ["manual"], lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).where(eq(agents.id, f.agentId));
+    const call = vi.fn(async (_pluginId: string, method: string, input: any) => {
+      if (method !== "environmentDestroyLease") throw new Error(`Unexpected method: ${method}`);
+      return { providerLeaseId: input.providerLeaseId, state: answer };
+    });
+    const workerManager = { isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentDestroyLease"] }) } as unknown as PluginWorkerManager;
+    await heartbeatService(db, { environmentRuntime: environmentRuntimeService(db, { pluginWorkerManager: workerManager }), pluginWorkerManager: workerManager })
+      .sweepPendingCleanupLeases({ backoffMs: 0 });
+    const settled = (await environmentService(db).getLeaseById(lease.id))!;
+    const blocker = await agentExecutionStopBlocker(db, [f.agentId]);
+    const work = configureAgentLifecycle(db, createLifecycleDriver(db, workerManager));
+    try { await work.process(f.agentId); } finally { await work.stop(); }
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    return { f, call, settled, blocker, agent, localRoot, copyBefore };
+  }
+
+  it("gate 4 (0eb2069c shape): a proved stop held by an unsaved copy is parked held_for_unsaved_files with its debt, never destroyed, files untouched, and the pause completes", async () => {
+    const { f, call, settled, blocker, agent, localRoot, copyBefore } = await parkedPendingDestroy("destroyed", true);
+    expect(call).not.toHaveBeenCalled();
+    expect(settled.status).toBe("pending_cleanup");
+    expect(settled.metadata?.cleanupDisposition).toMatchObject({ state: "parked", code: "held_for_unsaved_files",
+      debt: "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox." });
+    expect(blocker).toBeNull();
+    expect(agent).toMatchObject({ lifecycleState: "paused", status: "paused", lifecycleError: null });
+    expect(call).not.toHaveBeenCalled();
+    expect(await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, f.runId))).toEqual(copyBefore);
+    expect(await readFile(path.join(localRoot, "unsaved-note.txt"), "utf8")).toBe("unsaved note");
+  });
+
+  it("Boat proved stop: the destroy answers 'stopped' (stop-and-retain), so the computer is parked provider_retains_resource and the pause completes", async () => {
+    const { call, settled, blocker, agent } = await parkedPendingDestroy("stopped", false);
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(settled.status).toBe("pending_cleanup");
+    expect(settled.metadata?.cleanupDisposition).toMatchObject({ state: "parked", code: "provider_retains_resource" });
+    expect(blocker).toBeNull();
+    expect(agent).toMatchObject({ lifecycleState: "paused", status: "paused", lifecycleError: null });
+  });
+
+  it("real-destroy provider, proved stop, nothing held: the sweep destroys as before (no park)", async () => {
+    const { call, settled } = await parkedPendingDestroy("destroyed", false);
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(settled.status).not.toBe("pending_cleanup");
+    expect(settled.cleanupStatus).toBe("success");
+    expect(settled.metadata?.cleanupDisposition).toBeUndefined();
+  });
 
   it.each([true, false])("nativeHarnessBackupMissing guards the reusable driver's expiry destroy (flagged=%s)", async flagged => {
     // Expiry delegates straight to destroyReusableSandboxLease, not the public
