@@ -1,5 +1,6 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
-import { environmentLeases, environments, heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
+import { environmentLeases, environments, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { promoteDeferredWorkIntents } from "../work-intent-outbox.js";
 import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
 import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
 import type { environmentRuntimeService } from "../environment-runtime.js";
@@ -109,10 +110,31 @@ export async function decidePersonStopExportAtBound(input: {
   // (native-workspace-sync.ts resumeNativeWorkspaceSync).
   const recorded = await db.transaction(async tx => {
     if (!await tryLockNativeWorkspaceFinalization(tx as unknown as Db, { companyId: run.companyId, runId: run.id })) return null;
-    return tx.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
+    const written = await tx.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
       || ${JSON.stringify({ [PERSON_STOP_BOUND_KEY]: decision })}::jsonb` })
       .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "active"),
         sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? ${PERSON_STOP_BOUND_KEY})`)).returning({ id: environmentLeases.id });
+    // adopt-stopu-twoclock2 (RFL 02:38Z, never-OK dead chat): without_files ENDS
+    // the stopped run's claim hold, atomically with the decision. No box stop was
+    // requested, so no stop receipt will ever release it; and it guards nothing
+    // the decision does not: late old host writes are saved aside by the
+    // destination fence (resumeNativeWorkspaceSync reads this decision under the
+    // same finalization lock), and the kept box/lease is owned by the lease, not
+    // the task's claims. Only pointers that still name THIS run are cleared.
+    const issueId: string | null = run.nativeIssueId ?? run.issueId ?? null;
+    if (written.length && decision.decision === "without_files" && issueId) {
+      const released = await tx.update(issues).set({
+        checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
+        executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
+        executionAgentNameKey: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
+        executionLockedAt: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
+        updatedAt: new Date(),
+      }).where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId),
+        or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)))).returning({ id: issues.id });
+      // A lock release is a hold-release event: saved messages are promoted.
+      if (released.length) await promoteDeferredWorkIntents(tx, { companyId: run.companyId, trigger: "lock_released", issueId });
+    }
+    return written;
   });
   if (recorded === null) return null;
   if (recorded.length === 0) {
