@@ -89,6 +89,11 @@ export type LockedQueuedCommentState = {
  * authorization boundary by itself.
  */
 export interface QueuedCommentQueueTransaction {
+  /** Reads the run-control Stop boundary on this transaction; rejects before any reorder write. */
+  assertReorderPreservesStopLine(input: {
+    comments: ReadonlyArray<{ id: string; createdAt: Date | string }>;
+    orderedIds: string[];
+  }): Promise<void>;
   updateCommentBody(input: {
     issueId: string;
     commentId: string;

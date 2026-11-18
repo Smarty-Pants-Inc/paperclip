@@ -4,6 +4,7 @@ import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteraction
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
 import { notifyDeferredExecutionWork } from "../services/deferred-execution-notifications.js";
+import { STOPPED_EXECUTION_WAIT, UNNAMED_EXECUTION_WAIT } from "../services/deferred-execution-wait.js";
 import { notifyNativeRecoveryNotices } from "../services/native-recovery-notice-notifications.js";
 import { notifyNativeStatusReassessment } from "../services/native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../services/unsafe-workspace-export-notifications.js";
@@ -61,10 +62,15 @@ import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from ".
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse, type QueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
+import {
+  assertStoredIntentAllowsSteer, changeQueuedCommentDeliveryIntent, chatQueueTail, DELIVERY_INTENTS,
+  sendQueuedCommentFirst, storeDeliveryIntent,
+} from "../services/queued-comment-delivery-intent.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
+import { assertQueuedCommentStopLinePreserved } from "../services/queued-comment-stop-line.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
@@ -463,7 +469,10 @@ const queuedCommentSteeringTargetSchema =
   });
 const queuedCommentInterruptTargetSchema = queuedCommentMutationTargetSchema.extend({
   targetRunId: z.string().min(1).nullable(),
+  /** Interrupt now for ONE message: it goes first; the rest stay queued, in order. */
+  commentId: z.string().uuid().optional(),
 });
+const queuedCommentIntentSchema = z.object({ intent: z.enum(DELIVERY_INTENTS) }).strict();
 const editQueuedCommentSchema = queuedCommentMutationTargetSchema.extend({
   body: z
     .string()
@@ -7812,7 +7821,10 @@ export function issueRoutes(
 
   async function buildQueuedCommentQueue(input: {
     executor: IssueQueueDb;
-    issue: { id: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null };
+    issue: {
+      id: string; companyId: string; assigneeAgentId: string | null;
+      conversationAgentId?: string | null; conversationUserId?: string | null;
+    };
     activeRun: Awaited<ReturnType<typeof resolveActiveIssueRun>>;
     actor: ReturnType<typeof getActorInfo>;
     queueState?: IssueQueueState | null;
@@ -7857,14 +7869,24 @@ export function issueRoutes(
       assignedAgentAdapterType: assignedAgent?.adapterType ?? null,
       queuedCommentCount: comments.length,
     });
+    // A chat steers only its owner's head message, never a /new reset (which
+    // runs at a turn boundary). Otherwise the live native probe decides.
+    const chatHead = input.issue.conversationAgentId ? comments[0] ?? null : null;
     const steeringDisposition: IssueQueuedCommentQueue["steeringDisposition"] =
-      input.issue.conversationAgentId ? "unsupported" : steering.kind !== "probe"
+      input.issue.conversationAgentId && (input.actor.actorType !== "user" ||
+        input.actor.actorId !== input.issue.conversationUserId || !chatHead || isConversationReset(chatHead.body))
+        ? "unsupported" : steering.kind !== "probe"
         ? steering.kind
         : input.steeringDisposition
           ?? (await getNativeSessionSteeringState(steering.steeringRunId)
             .then((state) => state.disposition)
             .catch(() => "temporarily_unavailable" as const));
-    const wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    const savedWait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    // Behind a running turn, a wait no gate named is the ordinary busy turn:
+    // the queue shows its normal queued state. Every named wait still shows.
+    const unnamed = savedWait.reason === UNNAMED_EXECUTION_WAIT.reason || savedWait.reason === STOPPED_EXECUTION_WAIT.reason;
+    const wait = unnamed && input.activeRun?.status === "running"
+      ? {} : savedWait;
     // The user's Interrupt click is delivering these messages. Its stopped run
     // settling is not something to read about under the composer; the task
     // notice owns any wait that needs the user.
@@ -7911,61 +7933,96 @@ export function issueRoutes(
     }
     // Agent Chat lists every waiting message, also behind a /new (its own wake).
     if (input.issue.conversationAgentId && wake && !queuedInteractionId(wake.payload)) {
-      queue.entries = await chatQueueTail(input.executor, { issue: input.issue, headQueueId: wake.id,
+      queue.entries = await chatQueueTail(input.executor as Db, { issue: input.issue, headQueueId: wake.id,
         headEntries: queue.entries, actorType: input.actor.actorType, actorId: input.actor.actorId });
     }
     return queue;
   }
 
   /**
-   * Agent Chat: every waiting message, in order, from the queue's head wake to
-   * the last one. A `/new` keeps its own wake, so the head wake alone would stop
-   * the list at the first reset while the backlog still runs on through it
-   * (S10 C2). Mirrors al/queue-ux `chatQueueTail` without its delivery intent.
+   * Agent Chat keeps one wake per waiting message, and requestedAt owns their
+   * order: the read view (chatQueueTail) and the release drain both take the
+   * earliest first. A person's reorder of the whole chat queue, also while a
+   * turn runs, therefore permutes those wakes' saved requestedAt values. A
+   * stale head revision is still refused; the ids must be exactly the chat
+   * queue's, each wake's messages kept together. Returns null when the order
+   * is not a chat-queue order; the ordinary single-wake reorder then decides.
    */
-  async function chatQueueTail(executor: IssueQueueDb, input: {
-    issue: { id: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null };
-    headQueueId: string; headEntries: IssueQueuedCommentQueue["entries"]; actorType: string; actorId: string;
-  }): Promise<IssueQueuedCommentQueue["entries"]> {
-    if (!input.issue.assigneeAgentId) return input.headEntries;
-    const wakes = (await executor.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, input.issue.companyId),
-      eq(agentWakeupRequests.agentId, input.issue.assigneeAgentId),
-      sql`${agentWakeupRequests.payload}->'issueId' = to_jsonb(${input.issue.id}::text)`,
-      inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
-    )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.createdAt)))
-      .flatMap((wake) => {
-        const ids = queuedCommentIdsFromWakePayload(wake.payload);
-        return ids.length && !readObject(wake.payload).interactionId ? [{ wake, ids }] : [];
-      });
-    const headIndex = wakes.findIndex((candidate) => candidate.wake.id === input.headQueueId);
-    if (headIndex < 0) return input.headEntries;
-    const later = wakes.slice(headIndex + 1);
-    const laterIds = later.flatMap((wake) => wake.ids);
-    const rows = laterIds.length ? await executor.select().from(issueComments).where(and(
-      eq(issueComments.companyId, input.issue.companyId), eq(issueComments.issueId, input.issue.id),
-      inArray(issueComments.id, laterIds))) : [];
-    const comments = new Map(rows.filter((row) => !row.deletedAt).map((row) => [row.id, row]));
-    let behindReset = false;
-    const entries = input.headEntries.map((entry) => {
-      behindReset ||= isConversationReset(entry.comment.body);
-      return { ...entry, behindReset };
-    });
-    for (const { wake, ids } of later) {
-      const wakeComments = ids.flatMap((id) => comments.get(id) ?? []);
-      const revision = queuedCommentQueueRevision({ queueId: wake.id, comments: wakeComments });
-      for (const comment of wakeComments) {
-        behindReset ||= isConversationReset(comment.body);
-        entries.push({
-          comment: { ...comment, authorType: comment.authorType ?? (comment.authorAgentId ? "agent" : "user") } as never,
-          position: entries.length,
-          canEdit: input.actorType === "user" && comment.authorUserId === input.actorId,
-          canDiscard: input.actorType === "user" && (comment.authorUserId === input.actorId || Boolean(comment.authorAgentId)),
-          behindReset, queueId: wake.id, queueRevision: revision,
-        });
+  async function reorderChatQueue(input: {
+    issue: { id: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null; executionRunId?: string | null };
+    actor: ReturnType<typeof getActorInfo>; queueId: string; revision: string; orderedCommentIds: string[];
+  }) {
+    const { issue } = input;
+    if (!issue.conversationAgentId || !issue.assigneeAgentId) return null;
+    const activeRun = await resolveActiveIssueRun(issue, { queueStateOnly: true });
+    const publications: ActivityPublication[] = [];
+    const queue = await db.transaction(async (tx) => {
+      await tx.select({ id: issueRows.id }).from(issueRows)
+        .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId))).for("update");
+      const current = await buildQueuedCommentQueue({ executor: tx, issue, activeRun, actor: input.actor });
+      const wakeIdOf = (entry: IssueQueuedCommentQueue["entries"][number]) => entry.queueId ?? current.queueId!;
+      const currentIds = current.entries.map((entry) => entry.comment.id);
+      // Older callers submit the complete side before /new rather than the
+      // complete displayed list. Keep that contract without moving the reset.
+      const resetIndex = current.entries.findIndex((entry) => isConversationReset(entry.comment.body));
+      if (resetIndex > 0 && input.orderedCommentIds.length === resetIndex &&
+          [...currentIds.slice(0, resetIndex)].sort().join() === [...input.orderedCommentIds].sort().join()) {
+        input.orderedCommentIds = [...input.orderedCommentIds, ...currentIds.slice(resetIndex)];
       }
-    }
-    return entries;
+      if (current.queueId !== input.queueId || current.state !== "deferred" ||
+          !current.entries.some((entry) => entry.queueId && entry.queueId !== current.queueId) ||
+          currentIds.length !== input.orderedCommentIds.length ||
+          [...currentIds].sort().join() !== [...input.orderedCommentIds].sort().join()) return null;
+      if (current.revision !== input.revision)
+        throw new QueuedCommentMutationError("queued_comment_revision_conflict", "The queued messages changed in another session");
+      const wakeOf = new Map(current.entries.map((entry) => [entry.comment.id, wakeIdOf(entry)]));
+      const order: string[] = [];
+      for (const id of input.orderedCommentIds) {
+        const wakeId = wakeOf.get(id)!;
+        if (order.at(-1) === wakeId) continue;
+        if (order.includes(wakeId)) throw new QueuedCommentMutationError("queued_comment_order_mismatch",
+          "The queued message order does not match the current queue");
+        order.push(wakeId);
+      }
+      const wakes = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId), inArray(agentWakeupRequests.id, order),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+      )).for("update");
+      if (wakes.length !== order.length) throw new QueuedCommentMutationError("queued_comment_already_dispatching",
+        "The queued message is already being dispatched");
+      await assertQueuedCommentStopLinePreserved(tx as unknown as Db, {
+        companyId: issue.companyId, issueId: issue.id, agentId: issue.assigneeAgentId,
+        comments: current.entries.map((entry) => entry.comment), orderedIds: input.orderedCommentIds,
+      });
+      const slots = wakes.map((wake) => wake.requestedAt).sort((a, b) => a.getTime() - b.getTime());
+      // Postgres send slots can differ only in microseconds, which Date drops.
+      // Writing those back as ties would silently answer a different order.
+      // Keep the chosen order strict at the precision our writer can preserve.
+      for (let index = 1; index < slots.length; index++) {
+        if (slots[index]!.getTime() <= slots[index - 1]!.getTime())
+          slots[index] = new Date(slots[index - 1]!.getTime() + 1);
+      }
+      const now = new Date();
+      for (const [index, wakeId] of order.entries()) {
+        const wake = wakes.find((candidate) => candidate.id === wakeId)!;
+        const ids = input.orderedCommentIds.filter((id) => wakeOf.get(id) === wakeId);
+        const hidden = queuedCommentIdsFromWakePayload(wake.payload).filter((id) => !ids.includes(id));
+        await tx.update(agentWakeupRequests).set({ requestedAt: slots[index]!, updatedAt: now,
+          payload: withQueuedCommentIdsInWakePayload(wake.payload, [...hidden, ...ids]) })
+          .where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, issue.companyId)));
+      }
+      const next = await buildQueuedCommentQueue({ executor: tx, issue, activeRun, actor: input.actor });
+      await logActivity(tx as unknown as Db, {
+        companyId: issue.companyId, actorType: input.actor.actorType, actorId: input.actor.actorId,
+        agentId: input.actor.agentId, runId: input.actor.runId, action: "issue.queued_comments_reordered",
+        entityType: "issue", entityId: issue.id,
+        details: { queueId: next.queueId, revision: next.revision, orderedCommentIds: input.orderedCommentIds },
+      }, publications);
+      return next;
+    });
+    if (!queue) return null;
+    for (const publication of publications) publishActivity(publication);
+    return queue;
   }
 
   function assertQueueMutationTarget(input: {
@@ -17962,6 +18019,21 @@ export function issueRoutes(
     }
   }
 
+  /**
+   * Agent Chat: after an edit, reorder or delete, answer with the whole chat
+   * queue (every waiting message, also behind a /new), not only the mutated
+   * wake, so the list never shrinks to one wake until the next poll.
+   */
+  async function chatQueueAfterMutation(
+    issue: Parameters<typeof buildQueuedCommentQueue>[0]["issue"],
+    queue: IssueQueuedCommentQueue,
+    actor: ReturnType<typeof getActorInfo>,
+  ) {
+    if (!issue.conversationAgentId) return queue;
+    return buildQueuedCommentQueue({ executor: db, issue, actor,
+      activeRun: await resolveActiveIssueRun(issue as Parameters<typeof resolveActiveIssueRun>[0], { queueStateOnly: true }) });
+  }
+
   router.get("/issues/:id/queued-comments", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(
@@ -18037,6 +18109,29 @@ export function issueRoutes(
         }),
       );
       publishActivity(activityPublication as ActivityPublication);
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, await chatQueueAfterMutation(issue, queue, actor)));
+    },
+  );
+
+  // A waiting message's mode (Steer or Queue), stored on the comment so a
+  // reload and a second tab agree. Owner only; the message must still wait.
+  router.patch(
+    "/issues/:id/queued-comments/:commentId/intent",
+    validate(queuedCommentIntentSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+      if (!issue) return;
+      if (issue.conversationAgentId && !(await instanceSettings.getExperimental()).enableAgentChat) {
+        throw notFound("Agent Chat is disabled");
+      }
+      const decision = await decideIssueAccess(req, issue, "issue:comment");
+      if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+      await changeQueuedCommentDeliveryIntent(db, { issue, actorUserId: req.actor.userId,
+        commentId: req.params.commentId as string, intent: req.body.intent });
+      const queue = await buildQueuedCommentQueue({ executor: db, issue,
+        activeRun: await resolveActiveIssueRun(issue, { queueStateOnly: true }), actor: getActorInfo(req) });
       res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
     },
   );
@@ -18056,6 +18151,12 @@ export function issueRoutes(
       );
       if (!issue) return;
       const actor = getActorInfo(req);
+      const chatQueue = await runQueuedCommentMutation(() => reorderChatQueue({ issue, actor,
+        queueId: req.body.queueId, revision: req.body.revision, orderedCommentIds: req.body.orderedCommentIds as string[] }));
+      if (chatQueue) {
+        res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, chatQueue));
+        return;
+      }
       const { queue, activityPublication } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.reorderQueuedComments({
           issue: buildQueuedCommentIssueContext(issue),
@@ -18067,7 +18168,7 @@ export function issueRoutes(
         }),
       );
       publishActivity(activityPublication as ActivityPublication);
-      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, await chatQueueAfterMutation(issue, queue, actor)));
     },
   );
 
@@ -18103,8 +18204,9 @@ export function issueRoutes(
       const untargeted = !req.body.targetRunId;
       const nothingWaiting = () => conflict("Nothing is waiting.", {
         code: "queued_comment_not_pending", reason: "nothing_waiting" });
+      let interruptQueueId = req.body.queueId as string;
       const interruptPlan = await db.transaction(async (tx): Promise<{ firstTurnRunId: string } | { runToInterrupt: string | null }> => {
-        const locked = await lockQueuedCommentState({
+        let locked = await lockQueuedCommentState({
           tx, issue, actor, queueId: req.body.queueId, targetRunId: req.body.targetRunId ?? undefined,
           allowStoppedTarget: true,
         }).catch((error: unknown) => {
@@ -18123,6 +18225,21 @@ export function issueRoutes(
         }
         if (locked.activeRun?.status === "running" && locked.activeRun.id !== req.body.targetRunId) {
           throw conflict("The queued message targets a stale run", { code: "queued_comment_stale_target" });
+        }
+        if (issue.conversationAgentId && req.body.commentId) {
+          // The composer targets the displayed list's head revision. A row in
+          // another per-message wake still owns its own input and interrupt.
+          const selected = locked.queue.entries.find((entry) => entry.comment.id === req.body.commentId);
+          if (selected?.queueId && selected.queueId !== locked.wake.id) {
+            locked = await lockQueuedCommentState({ tx, issue, actor, queueId: selected.queueId,
+              targetRunId: req.body.targetRunId ?? undefined, allowStoppedTarget: true });
+          }
+          interruptQueueId = locked.wake.id;
+        }
+        if (req.body.commentId) {
+          locked.wake.payload = await sendQueuedCommentFirst(tx as unknown as Db, {
+            issue, wake: locked.wake, commentId: req.body.commentId,
+          });
         }
         // A run that has not started its first provider turn takes these
         // messages into that turn. Stopping it would only discard its setup.
@@ -18155,14 +18272,14 @@ export function issueRoutes(
       if (runToInterrupt) await heartbeat.cancelRun(runToInterrupt, "Interrupted to send queued messages", {
         ...options,
         suppressImmediateRecovery: true,
-        resultJson: { ...options.resultJson, queuedCommentInterruptQueueId: req.body.queueId },
+        resultJson: { ...options.resultJson, queuedCommentInterruptQueueId: interruptQueueId },
       });
-      if (!firstTurnRunId) await heartbeat.resumeQueuedCommentInterrupt(issue.companyId, req.body.queueId, { retryCleanup: true });
+      if (!firstTurnRunId) await heartbeat.resumeQueuedCommentInterrupt(issue.companyId, interruptQueueId, { retryCleanup: true });
       await logActivity(db, {
         companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
         agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
         action: "issue.queued_comments_interrupted", entityType: "issue", entityId: issue.id,
-        details: { queueId: req.body.queueId, targetRunId: req.body.targetRunId,
+        details: { queueId: interruptQueueId, targetRunId: req.body.targetRunId,
           ...(firstTurnRunId ? { deliveredWithFirstTurnOfRunId: firstTurnRunId } : {}) },
       });
       const currentIssue = await svc.getById(issue.id);
@@ -18217,7 +18334,14 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      if (issue.conversationAgentId) throw conflict("Conversation messages are processed in order at turn boundaries");
+      // A chat is personal: only its owner steers, as for Interrupt. Order and
+      // the /new boundary are checked against the locked queue below.
+      if (issue.conversationAgentId) {
+        if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
+        if (req.actor.type !== "board" || req.actor.userId !== issue.conversationUserId) {
+          throw forbidden("Only the conversation owner can steer a chat message into the current turn");
+        }
+      }
       const decision = await decideIssueAccess(req, issue, "issue:comment");
       if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
       const actor = getActorInfo(req);
@@ -18352,6 +18476,32 @@ export function issueRoutes(
               queueState: locked.queueState,
             });
           }
+          const chatTarget = issue.conversationAgentId
+            ? locked.queue.entries.find((candidate) => candidate.comment.id === commentId) : null;
+          if (chatTarget) {
+            if (isConversationReset(chatTarget.comment.body)) {
+              throw conflict("/new starts a new session at a turn boundary. It cannot be steered into the current turn.", {
+                code: "conversation_reset_requires_turn_boundary",
+              });
+            }
+            // Only the chat's first queued message joins the running turn, so
+            // steered messages keep the order they were sent in and nothing
+            // behind a /new reaches the old session.
+            const head = await findQueuedCommentWake(tx, issue);
+            if (head?.wake.id !== locked.wake.id || locked.queue.entries[0]?.comment.id !== commentId) {
+              throw conflict("Only the first queued message can be steered into the current turn.", {
+                code: "conversation_steer_out_of_order",
+              });
+            }
+            const [chat] = await tx.select({ generation: issueRows.conversationSessionGeneration })
+              .from(issueRows).where(eq(issueRows.id, issue.id));
+            if (readObject(locked.activeRun.contextSnapshot).conversationSessionGeneration !== chat?.generation) {
+              throw conflict("The current turn belongs to an earlier chat session. Your message is still queued.", {
+                code: "conversation_steer_stale_session",
+              });
+            }
+          }
+          await assertStoredIntentAllowsSteer(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id, commentId });
           assertQueueMutationTarget({
             queue: locked.queue,
             queueId: req.body.queueId,
@@ -18407,8 +18557,9 @@ export function issueRoutes(
           if (steeringIdentity)
             await acceptSteeredIdentity(tx, steeringIdentity);
           acknowledgedTurnId = acknowledgement.turnId;
-          const remainingIds = locked.queue.entries
-            .map((candidate) => candidate.comment.id)
+          // The visible chat list spans wakes; remove only from the owning
+          // wake, never copy later messages into it as additional input.
+          const remainingIds = queuedCommentIdsFromWakePayload(locked.wake.payload)
             .filter((candidateId) => candidateId !== commentId);
           const now = new Date();
           const nextWake =
@@ -18431,9 +18582,22 @@ export function issueRoutes(
                   .where(eq(agentWakeupRequests.id, locked.wake.id))
                   .returning()
                   .then((rows) => rows[0] ?? locked.wake);
+          // The turn now carries this message: record it where settlement and
+          // the answered-message check read the comments a run carries.
+          const acknowledgedContext = readObject(acknowledgedRun.contextSnapshot);
+          const carriedCommentIds = (Array.isArray(acknowledgedContext.wakeCommentIds)
+            ? acknowledgedContext.wakeCommentIds
+            : [acknowledgedContext.wakeCommentId ?? acknowledgedContext.commentId]
+          ).filter((id): id is string => typeof id === "string" && id.length > 0);
           await tx
             .update(heartbeatRuns)
             .set({
+              contextSnapshot: {
+                ...acknowledgedContext,
+                wakeCommentIds: carriedCommentIds.includes(commentId)
+                  ? carriedCommentIds : [...carriedCommentIds, commentId],
+                ...(issue.conversationAgentId ? { conversationReplyBoundaryCommentId: commentId } : {}),
+              },
               resultJson: {
                 ...acknowledgedResult,
                 queuedSteeringAcknowledgements: {
@@ -18454,9 +18618,9 @@ export function issueRoutes(
             issue,
             activeRun: locked.activeRun,
             actor,
-            queueState: nextWake
-              ? { wake: nextWake, state: "deferred", queueRun: null }
-              : null,
+            ...(nextWake
+              ? { queueState: { wake: nextWake, state: "deferred" as const, queueRun: null } }
+              : issue.conversationAgentId ? {} : { queueState: null }),
           });
         });
       } catch (error) {
@@ -18548,7 +18712,7 @@ export function issueRoutes(
       if (result.cancelledRun) {
         void emitAgentTaskRunById(db, { runId: result.cancelledRun.id, companyId: issue.companyId });
       }
-      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, result.queue));
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, await chatQueueAfterMutation(issue, result.queue, actor)));
     },
   );
 
@@ -20148,6 +20312,8 @@ export function issueRoutes(
           const saved = await svc.addComment(issue.id, req.body.body, { userId }, {
             clientRequestId: req.body.clientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
           }, tx);
+          if (!existing && req.body.deliveryIntent) await storeDeliveryIntent(tx as unknown as Db, {
+            companyId: issue.companyId, issueId: issue.id, commentId: saved.id, intent: req.body.deliveryIntent });
           if (!existing) await logActivity(tx as unknown as Db, {
             companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
             action: "issue.comment_added", entityType: "issue", entityId: issue.id,
@@ -20716,6 +20882,8 @@ export function issueRoutes(
         }) : await add();
       }
 
+      if (req.body.deliveryIntent && actor.actorType === "user") await storeDeliveryIntent(db, {
+        companyId: currentIssue.companyId, issueId: currentIssue.id, commentId: comment.id, intent: req.body.deliveryIntent });
       if (!fastResponseEnqueued && actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status)) {
         await db.transaction(tx => enqueueFastResponse(tx as unknown as Db, { companyId: currentIssue.companyId, issueId: currentIssue.id, agentId: currentIssue.assigneeAgentId,
           responsibleUserId: actor.actorId, sourceCommentId: comment.id, sourceKey: `comment:${comment.id}`, acceptedAt: new Date(comment.createdAt) }))
