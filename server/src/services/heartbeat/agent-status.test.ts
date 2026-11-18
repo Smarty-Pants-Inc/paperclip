@@ -281,6 +281,41 @@ describePostgres("heartbeat agent status", () => {
     expect(await reconcile()).toEqual([agentId]);
   });
 
+  // rf-3 (smarty-dev#20787 C1, required 2): a permanent held agent-file save is
+  // an operator's decision, not agent execution. After a crash leaves the agent
+  // flagged running with no live run, the hold alone must not keep it 'running'
+  // (UI 'working'); the hold row itself stays exactly as it was.
+  it.each([
+    { shape: "legacy failed save", state: "unavailable", code: "AGENT_FILES_SAVE_FAILED", native: false },
+    { shape: "native failed save", state: "unavailable", code: "AGENT_FILES_SAVE_FAILED", native: true },
+    { shape: "unsurfaced aside copies", state: "pending_collection", code: "AGENT_FILES_ASIDE_UNSURFACED", native: false },
+  ])("never keeps a stale running agent working for a held save alone: $shape", async ({ state, code, native }) => {
+    const { companyId, agentId, runId } = native ? await seedNativeLease("interrupted") : await seed("interrupted");
+    const savePending = { since: old().toISOString(), code, reason: "The configured instruction entry cannot be deleted", failures: 3 };
+    const nextAttemptAt = new Date(Date.now() + 6 * 60 * 60_000);
+    await db.insert(agentInstructionWorkingCopies).values({ companyId, agentId, runId,
+      responsibleUserId: "test-user", entryFile: "AGENTS.md", baseHash: "test-hash",
+      localRoot: "/tmp/held-root", executionRoot: "/tmp/held-root", location: "local",
+      state, errorCode: code, processStoppedAt: old(), nextAttemptAt,
+      receipt: { schema: "paperclip.agent-files.v1", baseline: {}, savePending } });
+    expect(await reconcile()).toEqual([agentId]);
+    expect((await agent(agentId)).status).toBe("idle");
+    expect(await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, runId)))
+      .toEqual([expect.objectContaining({ state, errorCode: code, nextAttemptAt,
+        receipt: { schema: "paperclip.agent-files.v1", baseline: {}, savePending } })]);
+  });
+
+  it("keeps a held save whose process is not recorded stopped as work", async () => {
+    const { companyId, agentId, runId } = await seed("interrupted");
+    await db.insert(agentInstructionWorkingCopies).values({ companyId, agentId, runId,
+      responsibleUserId: "test-user", entryFile: "AGENTS.md", baseHash: "test-hash",
+      localRoot: "/tmp/held-root", executionRoot: "/tmp/held-root", location: "local",
+      state: "unavailable", processStoppedAt: null, nextAttemptAt: new Date(Date.now() + 60_000),
+      receipt: { schema: "paperclip.agent-files.v1", baseline: {}, savePending: { code: "AGENT_FILES_SAVE_FAILED" } } });
+    expect(await reconcile()).toEqual([]);
+    expect((await agent(agentId)).status).toBe("running");
+  });
+
   it.each([false, true])("settles a handed-off superseded alias, including historical retry metadata (%s)", async staleRetry => {
     const { companyId, agentId, runId } = await seed("succeeded");
     const successorRunId = randomUUID();
