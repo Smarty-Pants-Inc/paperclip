@@ -1,3 +1,4 @@
+import { agentRunSuperseded } from "../../agent-run-cancellation.js";
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
@@ -742,6 +743,7 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       if (!run || !this.#matchesPersistedBinding(run)) {
         throw new Error("native_result_binding_mismatch");
       }
+      if (agentRunSuperseded(run)) throw new Error("native_result_run_superseded");
       if (recovery && owner) {
         const [clock] = await tx.execute<{ now: Date }>(sql`select clock_timestamp() as now`);
         await validateNativeRunnerCheckpointOwner(tx, recovery.owner, { ...owner, now: clock.now }, false,

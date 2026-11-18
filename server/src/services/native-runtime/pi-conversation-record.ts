@@ -105,12 +105,18 @@ export async function selectPiConversation(db: Db, input: {
     let legacyId = session?.sessionParamsJson?.sessionId;
     if (legacyId != null && !uuid(legacyId)) throw new Error("pi_conversation_record_invalid");
     const legacyProvenanceId = legacyId;
-    const { readFreshContinuationSessionBoundary } = await import("../fresh-continuation-fallback.js");
+    const { admitUnfinishedTurnFreshThread, readFreshContinuationSessionBoundary } = await import("../fresh-continuation-fallback.js");
+    // The running-S cut: S is running and locked; final rechecks and the one boundary commit here.
+    const unfinishedTurnAction = previous?.runId === run.id ? null
+      : await admitUnfinishedTurnFreshThread(tx, { run, issueId: input.issueId, sourceSessionId: previous?.id ?? legacyId ?? run.nativeSessionId,
+        sourceRunId: previous?.runId ?? session?.lastRunId });
     const fresh = await readFreshContinuationSessionBoundary(tx, run, input.issueId);
     // Consume only the recorded, fenced fallback for the thread we still own.
     // Once rotated, sourceSessionId no longer matches, including later turns
     // and same-run replays. Generic freshness/config flags never authorize it.
     const freshBoundary = fresh && (previous?.id ?? legacyId ?? run.nativeSessionId) === fresh.sourceSessionId ? fresh : null;
+    // A committed unfinished-turn boundary is consumed by exactly this equality, or the turn HOLDS.
+    if (unfinishedTurnAction && freshBoundary?.recoveryActionId !== unfinishedTurnAction) throw new Error("pi_conversation_fresh_source_mismatch");
     let legacyUnverified = false;
     if (previous && legacyId && legacyId !== previous.id) throw new Error("pi_conversation_identity_conflict");
     if (!previous && uuid(legacyId) && !freshBoundary) {
