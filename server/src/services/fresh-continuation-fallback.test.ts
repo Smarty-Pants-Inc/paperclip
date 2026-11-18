@@ -1378,7 +1378,11 @@ suite("fresh-continuation fallback", () => {
   // writer. The card counts its 10-min bound from the LATER of enqueue and heartbeat_runs.startable_since:
   // working inside the bound, a Retry press then starts nothing, failed + Retry only at stamp + 10 min,
   // and the dispatcher taking it starts exactly one run.
-  it.each(["sandbox_cleanup", "agent_setup", "ordinary_pause", "budget_pause"] as const)("FIX15 %s clears: no failed flash inside the bound, one run, failed + Retry at stamp + 10 min", async hold => {
+  // FIX16: each other field of hasPendingRunCleanup (execution-blocker.ts:93-114) holds the run ALONE
+  // (cleanup_status already 'success', so 0496 never fires) and the clear goes ONLY through that field.
+  it.each(["sandbox_cleanup", "agent_setup", "ordinary_pause", "budget_pause",
+    "lease_released_at", "lease_status", "lease_pending_cleanup_in_flight", "lease_leaves_run",
+    "run_finalization_owner", "native_finalization_row"] as const)("FIX15 %s clears: no failed flash inside the bound, one run, failed + Retry at stamp + 10 min", async hold => {
     const f = await judgeQueued(), heartbeat = heartbeatService(db);
     const { createLifecycleStore } = await import("../modules/agent-lifecycle/adapters/postgres.js");
     const { createAgentLifecycleEffects } = await import("./agent-lifecycle.js");
@@ -1387,8 +1391,35 @@ suite("fresh-continuation fallback", () => {
     const [companyBefore] = await db.select().from(companies).where(eq(companies.id, companyId));
     const { budgetPolicies } = await import("@paperclipai/db");
     const enqueued = f.queued.createdAt; // 11 min ago: already past the bound from enqueue
+    const fieldHolds: Record<string, () => Promise<unknown>> = {
+      lease_released_at: () => db.update(environmentLeases).set({ cleanupStatus: "success", releasedAt: null }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_status: () => db.update(environmentLeases).set({ cleanupStatus: "success", status: "active" }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_pending_cleanup_in_flight: () => db.update(environmentLeases).set({ cleanupStatus: "success", metadata: { pendingCleanupInFlight: true } }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_leaves_run: () => db.update(environmentLeases).set({ cleanupStatus: "success", status: "active" }).where(eq(environmentLeases.id, f.lease.id)),
+      run_finalization_owner: async () => {
+        await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeWorkspaceFinalizationOwner: "fix16" } }).where(eq(heartbeatRuns.id, f.source.id));
+      },
+      native_finalization_row: async () => {
+        await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+        await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.source.id));
+        await db.insert(nativeRunFinalizations).values({ runId: f.source.id, companyId, issueId: f.issueId, phase: "committed", leaseOwner: "native-finalizer:fix16" });
+      },
+    };
+    const fieldClears: Record<string, () => Promise<unknown>> = {
+      lease_released_at: () => db.update(environmentLeases).set({ releasedAt: new Date() }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_status: () => db.update(environmentLeases).set({ status: "released" }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_pending_cleanup_in_flight: () => db.update(environmentLeases).set({ metadata: { pendingCleanupInFlight: false } }).where(eq(environmentLeases.id, f.lease.id)),
+      lease_leaves_run: () => db.update(environmentLeases).set({ heartbeatRunId: null }).where(eq(environmentLeases.id, f.lease.id)),
+      run_finalization_owner: () => db.update(heartbeatRuns).set({ runnerProfileJson: {} }).where(eq(heartbeatRuns.id, f.source.id)),
+      native_finalization_row: () => db.update(nativeRunFinalizations).set({ leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.source.id)),
+    };
     if (hold === "sandbox_cleanup") await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
-    else if (hold === "budget_pause") {
+    else if (fieldHolds[hold]) {
+      await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
+      await fieldHolds[hold]!();
+      await db.update(heartbeatRuns).set({ startableSince: null }).where(eq(heartbeatRuns.id, f.queued.id));
+    } else if (hold === "budget_pause") {
       await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
       await db.update(heartbeatRuns).set({ startableSince: null }).where(eq(heartbeatRuns.id, f.queued.id));
       // A company budget hard stop; the policy's spend is now under its limit, so the budget writer lifts it.
@@ -1411,6 +1442,7 @@ suite("fresh-continuation fallback", () => {
         leaseUntil: new Date(Date.now() + 3_600_000).toISOString(), resumeState: "ready" as const };
       const before = Date.now();
       if (hold === "sandbox_cleanup") await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+      else if (fieldClears[hold]) await fieldClears[hold]!();
       else if (hold === "budget_pause") {
         const { budgetServiceInTransaction } = await import("./budgets.js");
         await db.transaction(async tx => { await budgetServiceInTransaction(tx as unknown as typeof db).reconcileScope(companyId, "company", companyId); });
