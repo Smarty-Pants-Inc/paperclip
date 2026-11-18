@@ -74,10 +74,30 @@ type BoxState = { fail: boolean; calls: number; inflight?: number; held?: number
   /** A command matching `match` is held until `until` resolves, then runs (a held command that joins late). */
   gate?: { match: (script: string) => boolean; until: Promise<void> } | null };
 
+/** adopt-stopu-ugate: the box's process-gone check (stopped-turn-process-gone.ts). */
+function isStoppedTurnProcessCheck(input: Parameters<CommandManagedRuntimeRunner["execute"]>[0]): boolean {
+  return input.command === "sh" && String(input.args?.[1] ?? "").includes("/proc/stat");
+}
+function runStoppedTurnProcessCheck(input: Parameters<CommandManagedRuntimeRunner["execute"]>[0]) {
+  return new Promise<Awaited<ReturnType<CommandManagedRuntimeRunner["execute"]>>>(resolve => {
+    const child = execFile(input.command, input.args ?? [], { cwd: input.cwd, timeout: input.timeoutMs }, (error, stdout, stderr) =>
+      resolve({ exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0, signal: error?.signal ?? null,
+        timedOut: error?.killed ?? false, stdout, stderr, pid: null, startedAt: null }));
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end();
+  });
+}
+/** The proven-gone box for a direct call of the export boundary. */
+const provenStoppedTurnBox = (remoteCwd: string) => async () => ({ runner: boxRunner({ fail: false, calls: 0 }), remoteCwd });
+
 /** The "box": commands run locally against its directory. */
 function boxRunner(state: BoxState): CommandManagedRuntimeRunner {
   return {
     execute: async (input) => {
+      // adopt-stopu-ugate: the process-gone check (noStoppedTurnProcessRemains)
+      // runs on the box as itself: outside this fixture's copyback accounting
+      // (calls / fail / gate), which models the EXPORT's box commands.
+      if (isStoppedTurnProcessCheck(input)) return await runStoppedTurnProcessCheck(input);
       state.inflight = (state.inflight ?? 0) + 1;
       try {
         const gate = state.gate;
@@ -358,6 +378,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const timeoutMs = 3_000;
     const startedAt = Date.now();
     const outcome = await finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+      stoppedTurnBox: provenStoppedTurnBox(f.box),
       nativeWorkspaceSync: f.sync, timeoutMs });
     const waitedMs = Date.now() - startedAt;
     expect(outcome).toEqual({ outcome: "unproven", reason: "timed_out" });
@@ -447,6 +468,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const original = f.sync.restoreWorkspace.bind(f.sync);
     vi.spyOn(f.sync, "restoreWorkspace").mockImplementation((...args) => (exportPromise = original(...args)));
     const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+      stoppedTurnBox: provenStoppedTurnBox(f.box),
       nativeWorkspaceSync: f.sync, timeoutMs: 3_000 });
     try {
       await waitFor(() => f.runnerState.held === 1);
@@ -524,6 +546,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const original = f.sync.restoreWorkspace.bind(f.sync);
     vi.spyOn(f.sync, "restoreWorkspace").mockImplementation((...args) => (exportPromise = original(...args)));
     const work = finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+      stoppedTurnBox: provenStoppedTurnBox(f.box),
       nativeWorkspaceSync: f.sync, timeoutMs: 3_000 });
     try {
       expect(await work).toEqual({ outcome: "unproven", reason: "timed_out" });
@@ -557,6 +580,7 @@ const support = await getEmbeddedPostgresTestSupport();
     // Hold the copyback's first remote command (the box export) past the deadline.
     f.runnerState.gate = { match: () => true, until: new Promise<void>(resolve => { release = resolve; }) };
     const outcome = await finishCancelledWarmWorkspaceExport({ db, runId: f.runId, companyId: f.companyId,
+      stoppedTurnBox: provenStoppedTurnBox(f.box),
       nativeWorkspaceSync: f.sync, timeoutMs: 2_000 });
     expect(outcome).toEqual({ outcome: "unproven", reason: "timed_out" });
     expect(f.runnerState.held).toBeGreaterThanOrEqual(1);
