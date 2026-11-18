@@ -1,5 +1,5 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
-import { anchorParkedWakePayloadSql, parkedWakeExpiredSql, parkedWakeNoticedSql, personControlledWait, personSend,
+import { anchorParkedWakePayloadSql, parkedWakeExpiredSql, parkedWakeHeldForRetrySql, personControlledWait, personSend,
   personSendSql } from "./parked-wake-deadline.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
@@ -2216,7 +2216,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         // deadline a parked Send is never released automatically: its one
         // note told the person it did not start, and their Retry owns it.
         sql`not ${parkedWakeExpiredSql(agentWakeupRequests.payload)}`,
-        sql`not ${parkedWakeNoticedSql(agentWakeupRequests.payload)}`,
+        sql`not ${parkedWakeHeldForRetrySql(agentWakeupRequests.payload)}`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
             AND (live_issue_run.context_snapshot->>'issueId' = ${issues.id}::text
@@ -2309,7 +2309,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         // S124e: the same bound for a Stop-named legacy receipt; after its
         // deadline (and note) only the person's Retry sends it.
         sql`not ${parkedWakeExpiredSql(agentWakeupRequests.payload)}`,
-        sql`not ${parkedWakeNoticedSql(agentWakeupRequests.payload)}`,
+        sql`not ${parkedWakeHeldForRetrySql(agentWakeupRequests.payload)}`,
         cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
       ));
     for (const run of interruptedQueues) {

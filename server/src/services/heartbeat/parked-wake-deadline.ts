@@ -52,11 +52,24 @@ export function parkedWakeNoticedSql(payload: SQLWrapper) {
     and coalesce(${payload}->'queuedCommentInterrupt'->>'requestedAt', '') <= ${payload}->>'firstParkedAt')`;
 }
 
+/** SQL twin of parkedWakeStopping (admission's persisted stop wait). */
+export function parkedWakeStoppingSql(payload: SQLWrapper) {
+  return sql<boolean>`(coalesce(${payload}->'executionWait'->>'reason', '') in (${sql.join(
+    [...PARKED_WAKE_STOPPING_REASONS].map(reason => sql`${reason}`), sql`, `)}))`;
+}
+
+/** Noticed and not a stopping park: only the person's Retry sends it. A
+ * stopping park's note says it will be sent, so its re-dispatch continues. */
+export function parkedWakeHeldForRetrySql(payload: SQLWrapper) {
+  return sql<boolean>`(${parkedWakeNoticedSql(payload)} and not ${parkedWakeStoppingSql(payload)})`;
+}
+
 /** Past this park's deadline (any wake whose current park's anchor is older
  * than the bound). The periodic re-dispatch scan skips it: the receipt worker
- * writes the one note instead of another silent retry. */
+ * writes the one note instead of another silent retry. A stopping park
+ * (RFL 11:12Z) is not skipped: it is sent once its stop is confirmed. */
 export function parkedWakeExpiredSql(payload: SQLWrapper, now = Date.now()) {
-  return sql<boolean>`(${parkedWakeSql(payload)}
+  return sql<boolean>`(${parkedWakeSql(payload)} and not ${parkedWakeStoppingSql(payload)}
     and ${payload}->>'firstParkedAt' is not null
     and coalesce(${payload}->'queuedCommentInterrupt'->>'requestedAt', '') <= ${payload}->>'firstParkedAt'
     and ${payload}->>'firstParkedAt' <= ${new Date(now - parkedWakeDeadlineMs()).toISOString()})`;
@@ -69,6 +82,26 @@ export const PARKED_WAKE_NOT_STARTED_TEXT =
 /** S124e: the queue's line once the one note is written. It says what the note
  * says (nothing started; Send/Retry sends it), never "Sending your messages.". */
 export const PARKED_WAKE_NOT_STARTED_WAIT = { reason: "parked_not_started", message: PARKED_WAKE_NOT_STARTED_TEXT } as const;
+
+/** RFL 11:12Z: the note while NO run can start yet (the Send is parked behind
+ * an unconfirmed stop of the previous run). No Retry: the receipt worker keeps
+ * the park's cadence and sends it when the stop is confirmed. */
+export const PARKED_WAKE_STOPPING_TEXT =
+  "Your message is saved and will be sent when the previous run has finished stopping, usually within ten minutes.";
+export const PARKED_WAKE_STOPPING_WAIT = { reason: "parked_not_started", message: PARKED_WAKE_STOPPING_TEXT } as const;
+/** "No run can start yet" is admission's own verdict, persisted on the wake as
+ * payload.executionWait by admitExplicitNativeContinuation's blocked():
+ * remote_cleanup (explicit-native-continuation.ts:573/:576, no remote stop receipt
+ * for the previous run's lease), send_predates_stop (:448-449) and
+ * execution_settling (:388, the previous run's stop has not settled). */
+export const PARKED_WAKE_STOPPING_REASONS: ReadonlySet<string> = new Set(["remote_cleanup", "send_predates_stop", "execution_settling"]);
+export function parkedWakeStopping(payload: Payload) {
+  const wait = payload?.executionWait as { reason?: unknown } | null | undefined;
+  return typeof wait?.reason === "string" && PARKED_WAKE_STOPPING_REASONS.has(wait.reason);
+}
+/** noticeParkedWakeDeadline's answer for a park whose note is (or now is) the
+ * stopping note: the caller keeps retrying on the park's cadence. */
+export const PARKED_WAKE_STOPPING = "stopping" as const;
 
 /** noticeParkedWakeDeadline's answer when a run carrying a held message is
  * still queued/running/scheduled_retry: no note yet; check again next pass. */
@@ -83,7 +116,7 @@ export const PARKED_WAKE_CARRIER_ACTIVE = "carrier_active" as const;
  * same transaction, so the note is never repeated per retry. DB writes only.
  */
 export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: string; requestId: string }, now = new Date()):
-  Promise<boolean | typeof PARKED_WAKE_CARRIER_ACTIVE> {
+  Promise<boolean | typeof PARKED_WAKE_CARRIER_ACTIVE | typeof PARKED_WAKE_STOPPING> {
   const [wake] = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests)
     .where(and(eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.id, scope.requestId),
       eq(agentWakeupRequests.status, "deferred_issue_execution")));
@@ -97,7 +130,9 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
       .where(and(eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.id, scope.requestId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"))).for("update");
     const anchor = parkedWakeAnchor(current?.payload);
-    if (!current || anchor === null || anchor + parkedWakeDeadlineMs() > now.getTime() || parkedWakeNoticed(current.payload)) return false;
+    if (!current || anchor === null || anchor + parkedWakeDeadlineMs() > now.getTime()) return false;
+    const stopping = parkedWakeStopping(current.payload);
+    if (parkedWakeNoticed(current.payload)) return stopping ? PARKED_WAKE_STOPPING : false;
     // Per held message X, the runs that CARRIED X (directly or through their
     // continuation chain, chainCarriesCommentSql) decide (rf-4 rulings):
     // - a carrying run still queued/running/scheduled_retry: X may yet be
@@ -140,8 +175,11 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
     const messageId = open.at(-1) ?? scope.requestId;
     const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${messageId}`;
     const notice = buildStrandedRecoveryEscalationNotice({
-      seed: { title: "Your message did not start", body: PARKED_WAKE_NOT_STARTED_TEXT, tone: "warning",
-        nextAction: "Press Retry to send it now." },
+      seed: stopping
+        ? { title: "Your message is saved", body: PARKED_WAKE_STOPPING_TEXT, tone: "info",
+          nextAction: "No action is needed; it will be sent by itself." }
+        : { title: "Your message did not start", body: PARKED_WAKE_NOT_STARTED_TEXT, tone: "warning",
+          nextAction: "Press Retry to send it now." },
       recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",
       sourceRun: null, failureCode: UNANSWERED_MESSAGE_NO_RUN_CODE,
     });
@@ -149,18 +187,18 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
       waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${UNANSWERED_WAITING_ROW_JSON}::jsonb, false)` })
       .from(issueComments).where(and(eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, issueId),
         isNull(issueComments.deletedAt), sql`${issueComments.metadata}->>'authorizationReason' = ${reason}`)).limit(1);
-    if (standing && !standing.waiting) return false;
+    if (standing && !standing.waiting) return stopping ? PARKED_WAKE_STOPPING : false;
     if (standing) {
       await tx.update(issueComments).set({ body: notice.body, presentation: notice.presentation,
         metadata: { ...notice.metadata, authorizationReason: reason }, updatedAt: now })
         .where(eq(issueComments.id, standing.id));
-      return true;
+      return stopping ? PARKED_WAKE_STOPPING : true;
     }
     await issueService(tx as unknown as Db).addComment(issueId, notice.body, {}, {
       authorType: "system", presentation: notice.presentation,
       metadata: { ...notice.metadata, authorizationReason: reason },
     }, tx);
-    return true;
+    return stopping ? PARKED_WAKE_STOPPING : true;
   });
 }
 
