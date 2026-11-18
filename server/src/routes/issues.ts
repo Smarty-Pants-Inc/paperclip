@@ -452,7 +452,7 @@ function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comme
 }
 
 const CHAT_STOPPED_BY_PERSON_REASON = "stopped_by_person";
-const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting and will be sent when you send your next message. Send them now, or delete any first.";
+const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting: Send them, or delete any first.";
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),

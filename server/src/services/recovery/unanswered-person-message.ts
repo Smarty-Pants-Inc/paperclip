@@ -100,9 +100,9 @@ export const UNANSWERED_MESSAGE_WAITING_TEXT =
  * failed run, and "send a new message to try again" would invite a retype that
  * gets answered twice (the held one is sent right after the next message). */
 export const PERSON_STOP_HELD_MESSAGE_TEXT =
-  "Stopped. This message is waiting and will be sent when you send your next message. Send it now, or delete it.";
+  "Stopped. This message is waiting: Send it, or delete it.";
 export const PERSON_STOP_HELD_MESSAGE_TITLE = "Stopped: your message is waiting";
-export const PERSON_STOP_HELD_MESSAGE_NEXT_ACTION = "Send it now, or delete it.";
+export const PERSON_STOP_HELD_MESSAGE_NEXT_ACTION = "Send it, or delete it.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
 /** The ONE bound (follow-Paperclip B-2, RFL 05:51Z): the fork's K=2 fresh-continuation chain cap. */
