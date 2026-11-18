@@ -14,6 +14,7 @@ import {
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
 } from "../services/heartbeat-run-summary.js";
+import * as runSummary from "../services/heartbeat-run-summary.js";
 
 describe("model-facing run errors", () => {
   it("excludes provider instructions from the session-handoff fallback", () => {
@@ -1266,5 +1267,91 @@ describe("mergeHeartbeatRunResultJson", () => {
       summary: "adapter result",
       stdout: "raw stdout",
     });
+  });
+});
+
+// dl-n5-66k (Paul NOTE 5, H5; run 5184ca23, gate 1): the final answer's
+// item.completed (seq 2667, `...:pi-message:2:block:0`) was stored as
+// {byteSize: 66220, truncated: true} with no text; its text survived only in
+// the item's 2,460 deltas, and the 238-character result summary was posted.
+describe("dl-n5-66k a final answer stored without text is never replaced by the summary", () => {
+  // Read through the module so the base build (which has no rebuild) fails on
+  // the presented text, the incident's behaviour, not on a missing import.
+  const module = runSummary as Record<string, unknown>;
+  const readTruncatedCompletedAssistantMessageCandidate = (module.readTruncatedCompletedAssistantMessageCandidate
+    ?? (() => null)) as (input: { seq: number; prpEvent: unknown; deltaRows: { seq: number; payload: unknown }[] }) => ReturnType<typeof readCompletedAssistantMessageCandidate>;
+  const reassembleAgentMessageFromDeltas = (module.reassembleAgentMessageFromDeltas
+    ?? (() => null)) as (rows: { seq: number; payload: unknown }[], itemId: string) => string | null;
+  const itemId = "runner-1:run-1:turn-1:pi-message:2:block:0";
+  const summary = "S".repeat(238);
+  const resultJson = { nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary } };
+  const answerOf = (bytes: number) => "Line \"quoted\" 🦀 naïve\n".repeat(Math.ceil(bytes / 27)).slice(0, bytes);
+  const rowsFor = (answer: string) => {
+    const rows: { seq: number; payload: unknown }[] = [];
+    let seq = 100;
+    for (let offset = 0; offset < answer.length; offset += 27) {
+      rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta", itemId, sourceEventId: `delta-${seq}`,
+        payload: { kind: "agentMessage", channel: "progress", providerMethod: "item/agentMessage/delta", text: answer.slice(offset, offset + 27) } } } });
+    }
+    // Exactly the stored incident shape: no kind, no channel, no text.
+    const completed = { seq: seq++, payload: { prpEvent: { eventType: "item.completed", itemId, sourceEventId: "completed-2667",
+      payload: { byteSize: 66220, truncated: true } } } };
+    return { deltas: rows, completed };
+  };
+  const resolve = (answer: string, existingComment: { id: string; body: string } | null = null) => {
+    const { deltas, completed } = rowsFor(answer);
+    const prpEvent = (completed.payload as { prpEvent: unknown }).prpEvent;
+    expect(readCompletedAssistantMessageCandidate({ seq: completed.seq, prpEvent })).toBeNull();
+    const candidate = readTruncatedCompletedAssistantMessageCandidate({ seq: completed.seq, prpEvent, deltaRows: deltas });
+    const finalAgentMessage = selectHeartbeatRunFinalAgentMessage({ candidates: candidate ? [candidate] : [] });
+    return resolveHeartbeatRunResponse({ resultJson, nativeConversationFinalResponse: true, conversationTurnFinished: true,
+      existingComment, finalAgentMessage });
+  };
+
+  it.each([66_220, 100_000])("posts a %i-character final answer whole, once, not the 238-character summary", bytes => {
+    const answer = answerOf(bytes);
+    const resolved = resolve(answer);
+    expect(resolved.text).toBe(answer);
+    expect(resolved.decision.chosenSource).toBe("final_agent_message");
+    expect(resolved.decision.commentAction).toBe("create");
+    expect(resolved.decision.reasonCodes).not.toContain("accepted_semantic_result_summary");
+  });
+
+  it("gives a 300 KiB final answer n5e's plain line and a labelled excerpt; the full text is retrievable server-side", () => {
+    const answer = answerOf(300 * 1024);
+    const resolved = resolve(answer);
+    expect(resolved.decision.chosenSource).toBe("final_agent_message");
+    expect(resolved.text).toMatch(/^This answer is longer than one message \(\d+ KB\)\. The full text is kept; ask me to show any part\.\n\nExcerpt \(the start of the answer, not the whole answer\):\n\n/u);
+    const excerpt = resolved.text!.slice(resolved.text!.indexOf(":\n\n") + 3);
+    expect(excerpt.length).toBeGreaterThan(1000);
+    expect(answer.startsWith(excerpt)).toBe(true);
+    expect(resolved.text).not.toMatch(/truncated/iu);
+    // The whole text stays in the server's own run events.
+    expect(reassembleAgentMessageFromDeltas(rowsFor(answer).deltas, itemId)).toBe(answer);
+  });
+
+  it("NEGATIVE: an answer already posted as the agent's comment with identical final text is reused, not posted twice", () => {
+    const answer = answerOf(66_220);
+    const resolved = resolve(answer, { id: "comment-1", body: answer });
+    expect(resolved.decision.commentAction).toBe("reuse");
+    expect(resolved.decision.commentId).toBe("comment-1");
+    expect(resolved.text).toBe(answer);
+  });
+
+  it("NEGATIVE: a whole 66,220-character completed answer identical to the agent's posted comment is reused (one comment)", () => {
+    const answer = answerOf(66_220);
+    const candidate = readCompletedAssistantMessageCandidate({ seq: 9, prpEvent: { eventType: "item.completed", itemId, sourceEventId: "c",
+      payload: { kind: "agentMessage", channel: "final", text: answer } } });
+    const resolved = resolveHeartbeatRunResponse({ resultJson, nativeConversationFinalResponse: true, conversationTurnFinished: true,
+      existingComment: { id: "comment-1", body: answer }, finalAgentMessage: selectHeartbeatRunFinalAgentMessage({ candidates: [candidate!] }) });
+    expect(resolved.decision).toMatchObject({ chosenSource: "final_agent_message", commentAction: "reuse", commentId: "comment-1" });
+  });
+
+  it("NEGATIVE: a cut delta never yields a partial answer", () => {
+    const { deltas } = rowsFor(answerOf(1000));
+    const cut = structuredClone(deltas);
+    (cut[3]!.payload as { prpEvent: { payload: Record<string, unknown> } }).prpEvent.payload = { truncated: true, byteSize: 70000 };
+    expect(reassembleAgentMessageFromDeltas(cut, itemId)).toBeNull();
+    expect(reassembleAgentMessageFromDeltas(deltas, itemId)).toBe(answerOf(1000));
   });
 });
