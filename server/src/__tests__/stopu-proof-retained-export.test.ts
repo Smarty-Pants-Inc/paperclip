@@ -119,9 +119,12 @@ describe.skipIf(!support.supported)("adopt-stopu-proof: a retained person's Stop
     // by the check, its children respawn): the tools are NOT provably gone.
     let respawner: ChildProcess | null = null;
     if (shape.respawner) {
-      await db.update(heartbeatRuns).set({ startedAt: new Date(Date.now() + 1_500) }).where(eq(heartbeatRuns.id, runId));
+      // adopt-stopu-round: the ONE check (ugate2's) counts processes up to
+      // NO_STOPPED_TURN_PROCESS_CLOCK_SLACK_MS (2 s) before the turn start, so the
+      // parent predates the turn by more than that.
+      await db.update(heartbeatRuns).set({ startedAt: new Date(Date.now() + 3_500) }).where(eq(heartbeatRuns.id, runId));
       respawner = onBox(remoteCwd, "while :; do (sleep 30) & sleep 0.05; done");
-      await new Promise(resolve => setTimeout(resolve, 2_500));
+      await new Promise(resolve => setTimeout(resolve, 4_500));
     }
     await new Promise(resolve => setTimeout(resolve, 200));
     expect(alive(foreground.pid)).toBe(true);
