@@ -150,7 +150,13 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.textContent).toContain("Second queued message");
   });
 
-  it("renders every later-wake message but disables its row controls with a reason", () => {
+  // Paul's queue spec, NOTE 6 (message queueing):
+  // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20994
+  // "when i add new messages while you're working, it adds them to a list and that list LOOKS like i should be able to reorder it but the reordering controls don't work at all???"
+  // "what i ACTUALLY want for this UX is: ... 4. the list should have two sections: steering items and then queued items below that. dragging between the two lists should also work"
+  // RFL record SUPERSEDE-QUEUEFIX-WAKE-REORDER-1118: cross-wake drag is
+  // allowed; edit/delete/Interrupt restrictions and saved-card immutability stay.
+  it("supersedes(renders every later-wake message but disables its row controls with a reason; RFL record SUPERSEDE-QUEUEFIX-WAKE-REORDER-1118)", () => {
     const entries = [queue.entries[0],
       { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" },
       { ...queue.entries[1], comment: { ...queue.entries[1].comment, id: "comment-3", body: "Third queued message" },
@@ -170,21 +176,16 @@ describe("TaskChatQueuedMessages", () => {
     }
     expect(props.onDiscard).not.toHaveBeenCalled();
     expect(container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.disabled).toBe(false);
-    expect([...container.querySelectorAll<HTMLButtonElement>('[aria-label^="Reorder queued message:"]')].every(button => button.disabled)).toBe(true);
+    expect([...container.querySelectorAll<HTMLButtonElement>('[aria-label^="Reorder queued message:"]')].map(button => button.disabled)).toEqual([false, false, false]);
   });
 
-  it("does not offer a reorder across distinct chat wakes", () => {
-    const entries = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2" }];
-    expect(reorderQueuedMessageEntries(entries, "comment-1", "comment-2")).toBeNull();
-  });
-
-  it("offers no reorder for a queue holding a saved card response", () => {
+  it("supersedes(does not offer a reorder across distinct chat wakes; RFL record SUPERSEDE-QUEUEFIX-WAKE-REORDER-1118)", () => {
     const entries = [queue.entries[0], { ...queue.entries[1], queueId: "wake-2", queueRevision: "rev-2",
       source: { kind: "interaction" } as never }];
     render({ queue: { ...queue, entries } });
     expect(reorderQueuedMessageEntries(entries, "comment-1", "comment-2")).toBeNull();
     expect([...container.querySelectorAll<HTMLButtonElement>('[aria-label^="Reorder queued message:"]')]
-      .every(button => button.disabled)).toBe(true);
+      .map(button => button.disabled)).toEqual([true, true]);
   });
 
   describe.each(["ordinary", "card response", "Interrupt", "Stop", "capacity retry"] as const)("shown order across %s", kind => {
