@@ -1,5 +1,8 @@
 // @vitest-environment jsdom
 
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import producerThreads from "./__fixtures__/silent-wait-threads.json";
 import { act } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
@@ -109,6 +112,52 @@ const baseTimestamps = {
 };
 
 describe("IssueChatThread system notice routing", () => {
+  // RULING-FIXTURES-FROM-REAL-PRODUCER-1118: these are the unchanged GET
+  // /issues/:id/comments responses captured by c3A-rf4-c3-person-stop.test.ts
+  // after the real HTTP Stop + ack. Never fabricate system notice fixtures.
+  describe.each([390, 1440])("silent Stop wait in the rendered thread at %i px", width => {
+    const waitLine = "The previous session is still shutting down. Your work is saved, and Paperclip finishes the cleanup automatically. This turn starts when the old Runner is confirmed stopped. Paperclip is stopping it and keeps its files.";
+    const operatorLine = "This message hasn't started: Paperclip couldn't confirm the previous session stopped, and has stopped trying. Your message is saved; tell us and we'll start it.";
+    const threads = process.env.SW_THREAD_FIXTURES
+      ? Object.fromEntries(["settling", "pending", "confirmed"].map(mode => [mode,
+        JSON.parse(readFileSync(join(process.env.SW_THREAD_FIXTURES!, `sw-${mode}-thread.json`), "utf8"))])) as typeof producerThreads
+      : producerThreads;
+    function show(mode: keyof typeof producerThreads, phase: string) {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+      container.style.width = `${width}px`;
+      const row = threads[mode];
+      const comments = (row.snapshots as Record<string, unknown>)[phase] as IssueChatComment[];
+      renderThread(comments);
+      if (process.env.TASK_OUT) writeFileSync(join(process.env.TASK_OUT,
+        `sw-dom-${mode}-${phase}-${width}.html`), container.outerHTML);
+      const typed = container.querySelector('[data-message-role="user"]');
+      expect(typed?.textContent, "the saved typed message remains beside the notice").toContain("Please answer next.");
+      return { text: container.textContent ?? "", comments };
+    }
+    it("R1 shows ONE wait line immediately and after later polls", () => {
+      for (const phase of ["settling", "settlingPoll"]) {
+        const { text } = show("settling", phase);
+        expect(text.split(waitLine).length - 1, phase).toBe(1);
+        expect(container.querySelectorAll('[data-message-role="system"]')).toHaveLength(1);
+      }
+    });
+    it("R2 shows its own true exhausted line once, not a second copy on polls", () => {
+      for (const phase of ["operatorRequired", "operatorRequiredPoll"]) {
+        const { text } = show("settling", phase);
+        expect(text.split(operatorLine).length - 1, phase).toBe(1);
+        expect(text.split(waitLine).length - 1, "no duplicate pending notice on escalation").toBe(1);
+        expect(container.querySelectorAll('[data-message-role="system"]')).toHaveLength(2);
+      }
+    });
+    it("R3 keeps the existing pending line once", () => {
+      expect(show("pending", "pending").text.split(waitLine).length - 1).toBe(1);
+    });
+    it("R4 a confirmed stop has no exhausted line or duplicate wait", () => {
+      const { text } = show("confirmed", "pending");
+      expect(text.split(operatorLine).length - 1).toBe(0);
+      expect(text.split(waitLine).length - 1).toBeLessThanOrEqual(1);
+    });
+  });
   it("renders the typed disposition notice in the classic thread without reading its prose", () => {
     const comment: IssueChatComment = {
       id: "typed-recovery", companyId: "company-1", issueId: "issue-1", authorType: "system", authorAgentId: null, authorUserId: null,
