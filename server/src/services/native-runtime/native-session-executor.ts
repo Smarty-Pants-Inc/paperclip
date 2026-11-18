@@ -1,3 +1,4 @@
+import { isRetryableTransactionError, withTransactionRetry } from "../transaction-retry.js";
 import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal, type FreshThreadRefusalCode,
   RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE, RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON, restoreUnavailableOnNewBoxCode,
   LAUNCH_PROFILE_MISMATCH_CODE, LAUNCH_PROFILE_CHANGED_REASON } from "./runner-reconciliation-refusal.js";
@@ -8026,6 +8027,37 @@ async function restorePerTurnRunnerdController(input: {
 async function refreshFinishedPerTurnRunnerdProjection(
   input: Parameters<typeof restorePerTurnRunnerdController>[0], root: string, reference: RunnerdDurableIdentity, sourceRunId: string, external: boolean, referenceBytes: string,
 ): Promise<void> {
+  // PostgreSQL: "It is important to retry the complete transaction, including all
+  // logic that decides which SQL to issue and/or which values to use."
+  // https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html
+  // Deadlocks: "deadlocks can be handled on-the-fly by retrying transactions that abort due to deadlocks."
+  // https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS
+  // Retry the complete CAS, including fresh DB snapshots and read-only provider
+  // probes. Only private scratch is written before apply; referenceBytes and the
+  // final fenced re-read guard replacement. Active filesystem effects cannot be
+  // rolled back, so a failure after apply begins must be held, never replayed.
+  let applying = false;
+  const held = () => nativeReconciliationError("native_runner_checkpoint_projection_held:transaction_conflict");
+  try {
+    await withTransactionRetry(input.db, async () => {
+      try {
+        await refreshFinishedPerTurnRunnerdProjectionOnce(input, root, reference, sourceRunId, external, referenceBytes,
+          () => { applying = true; });
+      } catch (error) {
+        if (applying && isRetryableTransactionError(error)) throw held();
+        throw error;
+      }
+    });
+  } catch (error) {
+    if (isRetryableTransactionError(error)) throw held();
+    throw error;
+  }
+}
+
+async function refreshFinishedPerTurnRunnerdProjectionOnce(
+  input: Parameters<typeof restorePerTurnRunnerdController>[0], root: string, reference: RunnerdDurableIdentity, sourceRunId: string, external: boolean, referenceBytes: string,
+  onApply: () => void,
+): Promise<void> {
   const refuse = (reason: string): never => { throw new Error(`native_runner_checkpoint_projection_held:${reason}`); };
   const { companyId } = input.execution.binding;
   const runIds = [...new Set([reference.runId, sourceRunId, input.execution.binding.runId])];
@@ -8122,6 +8154,7 @@ async function refreshFinishedPerTurnRunnerdProjection(
           if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8") !== referenceBytes) {
             return refuse("journal_changed");
           }
+          onApply();
           recovered.checkpoint.restoreSessionDirectory(root);
         });
         return;
@@ -8155,6 +8188,7 @@ async function refreshFinishedPerTurnRunnerdProjection(
       if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8") !== referenceBytes) {
         return refuse("journal_changed");
       }
+      onApply();
       const archiveParent = resolve(root, "continuity-breaks");
       mkdirSync(archiveParent, { recursive: true, mode: 0o700 });
       if (!isSafeNativeStateDirectory(archiveParent)) return refuse("archive_unsafe");

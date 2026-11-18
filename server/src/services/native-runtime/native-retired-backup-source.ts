@@ -267,6 +267,8 @@ async function supersedeIdleWarmSource(db: Db, lease: typeof environmentLeases.$
   const { reusableSandboxLease: scope, ...metadata } = lease.metadata ?? {};
   const prior = metadata[SUPERSEDED_REUSABLE_SANDBOX_KEY] as { reusableSandboxLease?: unknown } | undefined;
   return db.transaction(async tx => {
+  await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId!))).for("update");
   const [claimed] = await tx.update(environmentLeases).set({
     metadata: { ...metadata, [SUPERSEDED_REUSABLE_SANDBOX_KEY]: {
       schema: "paperclip.reusable-sandbox-lease-superseded.v1", reason: "harness_backup_restored_elsewhere",
