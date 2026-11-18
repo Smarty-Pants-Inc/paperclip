@@ -58,7 +58,7 @@ const support = await getEmbeddedPostgresTestSupport();
   /** The Boat sandbox-provider worker shape (driverKey "boat"). Release answers
    * per gate; inspect answers Boat's typed state; anything else after the
    * release is refused by lease-gates.ts:41 with -32002. Every call is recorded. */
-  function boatWorker(pluginId: string, mode: { release: Release; inspect: Inspect }) {
+  function boatWorker(pluginId: string, mode: { release: Release; inspect: Inspect; inspectBy?: Record<string, Inspect> }) {
     let boxes = 0;
     const calls: Array<{ method: string; providerLeaseId?: string }> = [];
     const methods = ["environmentAcquireLease", "environmentReleaseLease", "environmentDestroyLease", "environmentRealizeWorkspace", "environmentExecute", "environmentInspectLease"];
@@ -75,8 +75,9 @@ const support = await getEmbeddedPostgresTestSupport();
           return mode.release === "void" ? undefined : { providerLeaseId, state: "stopped" };
         }
         if (method === "environmentInspectLease") {
-          if (mode.inspect === "throws") throw new JsonRpcCallError({ code: -32603, message: "Boat API timed out" } as never);
-          return { providerLeaseId, state: mode.inspect, stoppedAt: mode.inspect === "stopped" ? "2026-11-18T09:59:00.000Z" : null, lastRebootAt: null, observedAt: null };
+          const answer = mode.inspectBy?.[providerLeaseId ?? ""] ?? mode.inspect;
+          if (answer === "throws") throw new JsonRpcCallError({ code: -32603, message: "Boat API timed out" } as never);
+          return { providerLeaseId, state: answer, stoppedAt: answer === "stopped" ? "2026-11-18T09:59:00.000Z" : null, lastRebootAt: null, observedAt: null };
         }
         throw new JsonRpcCallError({ code: -32002, message: BOAT_REFUSAL } as never);
       }),
@@ -96,7 +97,7 @@ const support = await getEmbeddedPostgresTestSupport();
       updatedAt: new Date() } as never);
     const [environment] = await db.insert(environments).values({ name: `boat-${pluginId.slice(0, 8)}`, driver: "sandbox",
       config: { provider: "boat", reuseLease: input.reuseLease ?? false, timeoutMs: 1234 } }).returning();
-    const mode = { release: input.release, inspect: input.inspect };
+    const mode: { release: Release; inspect: Inspect; inspectBy?: Record<string, Inspect> } = { release: input.release, inspect: input.inspect };
     const boat = boatWorker(pluginId, mode);
     const accountKey = randomUUID();
     const [agent] = await db.insert(agents).values({ companyId, name: "Pi hire", adapterType: "paperclip_runner",
@@ -338,6 +339,8 @@ const support = await getEmbeddedPostgresTestSupport();
     const sibling = await runtime.acquireRunLease({ companyId: f.companyId, agentId: f.agent.id, adapterType: "paperclip_runner",
       environment: f.environment as never, configuredEnvironment: f.environment as never, issueId: null, heartbeatRunId: null, persistedExecutionWorkspace: null } as never);
     await runtime.getDriver("sandbox")!.releaseRunLease({ environment: f.environment as never, lease: sibling.lease, status: "failed" });
+    // Boat reads the SIBLING's box stopped; the probe's own box is still active.
+    f.mode.inspectBy = { [sibling.lease.providerLeaseId!]: "stopped" };
     const inspectSpy = f.boat.worker.call as ReturnType<typeof vi.fn>;
     inspectSpy.mockClear();
     await untilRetryAt(f.agent.id);
