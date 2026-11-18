@@ -374,6 +374,15 @@ function wakeCarriesMessage(payload: unknown, messageId: string): boolean {
     ...(Array.isArray(nested.wakeCommentIds) ? nested.wakeCommentIds : [])].includes(messageId);
 }
 
+/** The wake the real answer route leaves for a person's card answer (routes/issues.ts respond ->
+ * question-response delivery's wake fallback): its payload and wake context name the card as interactionId. */
+function wakeCarriesCardAnswer(payload: unknown, cardId: string): boolean {
+  const value = (payload ?? {}) as Record<string, unknown>;
+  const nested = (value._paperclipWakeContext ?? {}) as Record<string, unknown>;
+  return [value.interactionId, nested.interactionId,
+    ...(Array.isArray(nested.interactionIds) ? nested.interactionIds : [])].includes(cardId);
+}
+
 function wakeCarriesIssue(payload: unknown, issueId: string): boolean {
   const value = (payload ?? {}) as Record<string, unknown>;
   const nested = (value._paperclipWakeContext ?? {}) as Record<string, unknown>;
@@ -503,7 +512,8 @@ async function recordPendingDecision(db: Db, issue: DecisionIssue, decision: Exc
     if (decision.noticeId) await db.transaction(async tx => {
       await tx.select({ id: issues.id }).from(issues)
         .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-      const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies, decision.messageId);
+      const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, nativeBlockedRepairApplies,
+        decision.cardAnswerId ? undefined : decision.messageId, decision.cardAnswerId);
       if (fenced.kind !== "person_stopped" || fenced.noticeId !== decision.noticeId) return;
       const [notice] = await tx.select({ metadata: issueComments.metadata }).from(issueComments).where(and(
         eq(issueComments.id, decision.noticeId!), eq(issueComments.companyId, issue.companyId),
@@ -564,7 +574,7 @@ type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: 
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type Decision = { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" }
   /** The sender stopped the run that was answering this message; noticeId is its standing notice, if any. */
-  | { kind: "person_stopped"; messageId: string; noticeId: string | null }
+  | { kind: "person_stopped"; messageId: string; noticeId: string | null; cardAnswerId?: string }
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: { messageId: string; runId: string | null } }
   | NoticeDecision;
@@ -649,9 +659,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // message is not owed a notice, and a standing one stops covering it. A stop by anyone else (another user, an
   // agent, the system, a pause, a timeout) or of a run that had not read the message keeps the message owed. The
   // ONE rule (person-stopped-message.ts senderStoppedWhileAnswering), read by this decision and the carry.
-  if (!cardAnswer && await senderStoppedWhileAnswering(q, issue.companyId, messageRun, message)) {
-    return { kind: "person_stopped", messageId: message.id, noticeId: noticed?.id ?? null };
-  }
+  // A person's CARD ANSWER is their input the same way (RFL 22:22Z, am6 gap 19): its sender is the person who
+  // answered the card, and the carry already reads the rule for it (continuation-comment-input.ts).
+  const personStopped = { kind: "person_stopped" as const, messageId: message.id, noticeId: noticed?.id ?? null,
+    ...(cardAnswerId ? { cardAnswerId } : {}) };
+  if (await senderStoppedWhileAnswering(q, issue.companyId, messageRun, message)) return personStopped;
   // A standing WAITING note is still an open obligation: it must stay true.
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
   const upgrading = noticed?.waiting ? noticed.id : null;
@@ -751,7 +763,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // That hold must not turn the sender's own Stop into a "no run started" line: a message of the SAME sender whose
   // own wake still waits in line behind the run they stopped is kept for their Send, by their own Stop. The Stop
   // line is the one note (ruling 8). A hold from any other stop, or a message with no waiting wake, decides below.
-  if (boardHold && !cardAnswer && !agentPaused && !messageRun && message.authorUserId) {
+  // A card answer held the same way (the person answered the card, and its own wake waits in line behind the run
+  // they stopped) is kept for them by their own Stop too: never "Your answer is saved, but no run started for it".
+  if (boardHold && !agentPaused && !messageRun && message.authorUserId) {
     const heldRunId = (boardHold.evidence as Record<string, unknown> | null)?.runId;
     const [heldRun] = typeof heldRunId === "string" ? await q.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
       resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
@@ -760,9 +774,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       const waiting = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
         inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
-      if (waiting.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id))) {
-        return { kind: "person_stopped", messageId: message.id, noticeId: noticed?.id ?? null };
-      }
+      if (waiting.some(wake => wakeCarriesIssue(wake.payload, issue.id)
+        && (cardAnswer ? wakeCarriesCardAnswer(wake.payload, message.id) : wakeCarriesMessage(wake.payload, message.id)))) return personStopped;
     }
   }
   if (!boardHold && !agentPaused) {

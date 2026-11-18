@@ -4,7 +4,7 @@ import request from "supertest";
 import { and, eq, isNull } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, agentWakeupRequests, companies, companyMemberships, createDb, heartbeatRuns, issueRecoveryActions,
-  heartbeatRunEvents, issues, issueComments, nativeRunFinalizations } from "@paperclipai/db";
+  heartbeatRunEvents, issues, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, nativeRunFinalizations } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentRoutes } from "../routes/agents.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -118,10 +118,24 @@ describe.skipIf(!support.supported)("the sender's own Stop wins over the board h
       await db.update(heartbeatRuns).set({ finishedAt: new Date(t + 30000) }).where(eq(heartbeatRuns.id, runId));
       return wakeId;
     };
-    return { companyId, agentId, issueId, runId, messageId, sender, other, t, event, notes, readRun, settle, settleFromStop, sweep, message, stop, queue, interrupt };
+    /** A question card the running run posted for the sender (the card row is inserted, as in rf-5's seeds). */
+    const card = async () => (await db.insert(issueThreadInteractions).values({ companyId, issueId, sourceRunId: runId,
+      kind: "ask_user_questions", status: "pending", createdByAgentId: agentId, addresseeUserId: sender, continuationPolicy: "wake_assignee",
+      payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?", required: true, selectionMode: "single",
+        options: [{ id: "first", label: "First" }] }] } as never }).returning())[0]!.id;
+    /** The person answers the card through the REAL route (POST /issues/:id/interactions/:id/respond) and its real
+     * delivery: the answer's delivery row and its own wake are the route's, not inserted. */
+    const answer = async (cardId: string, by = sender) => {
+      const response = await request(app(companyId, by)).post(`/api/issues/${issueId}/interactions/${cardId}/respond`)
+        .send({ answers: [{ questionId: "scope", optionIds: ["first"] }] });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body).toMatchObject({ status: "answered", resolvedByUserId: by });
+    };
+    return { companyId, agentId, issueId, runId, messageId, sender, other, t, event, notes, readRun, settle, settleFromStop, sweep, message, stop, queue, interrupt,
+      card, answer };
   }
 
-  const lines = (notes: Array<{ body: string }>) => notes.filter(n => /wasn't answered|no run started|wasn't acted on/i.test(n.body));
+  const lines = <T extends { body: string }>(notes: T[]) => notes.filter(n => /wasn't answered|no run started|wasn't acted on/i.test(n.body));
   it.each([["CHAT", "native", true], ["TASK", "native", false], ["CHAT", "legacy", true], ["TASK", "legacy", false]] as const)(
     "%s (%s run): the sender's real Stop with a message waiting behind it -> no 'wasn't answered' or no-run line at +1/+3/+11 min",
     async (_shape, mode, chat) => {
@@ -158,4 +172,84 @@ describe.skipIf(!support.supported)("the sender's own Stop wins over the board h
     const notes = await f.notes(); expect(notes).toHaveLength(1);
     expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${m2}`);
   }, 60000);
+
+  // RFL 22:22Z (am6 gap 19): the sender-Stop exemption applies to a person's CARD ANSWER too. What the real routes
+  // leave (logs/probe/item3-card-answer-stop-footprint.txt): the answer route marks the card answered by the person,
+  // writes its delivery (fallback_queued, wake_fallback) and ONE wake that waits in line (deferred_issue_execution,
+  // payload.interactionId = the card); the Stop leaves the cancelled run and the board hold. Before this fix the
+  // sweep wrote "Your answer is saved, but no run started for it" at +3 min, beside the person's own Stop.
+  const cardFootprint = async (f: Awaited<ReturnType<typeof seed>>, cardId: string) => {
+    const [delivery] = await db.select().from(issueQuestionResponseDeliveries).where(eq(issueQuestionResponseDeliveries.interactionId, cardId));
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    return { delivery: delivery?.status, wakes: wakes.map(w => [w.status, (w.payload as Record<string, unknown>).interactionId === cardId]),
+      holds: holds.map(h => [h.kind, h.status, h.ownerType, (h.evidence as Record<string, unknown>).runId === f.runId]) };
+  };
+  it.each([["CHAT", "answer, then Stop", true], ["TASK", "answer, then Stop", false], ["CHAT", "Stop, then answer", true]] as const)(
+    "%s card answer (real answer route + the answerer's real Stop; %s): no 'no run started' line for the answer at +1/+3/+11/+30 min",
+    async (_shape, order, chat) => {
+      const f = await seed("native", chat); const cardId = await f.card();
+      if (order === "answer, then Stop") { await f.answer(cardId); await f.stop(); } else { await f.stop(); await f.answer(cardId); }
+      expect(await cardFootprint(f, cardId), "the real routes' footprint: the answer's own wake waits behind the Stop's hold").toEqual({
+        delivery: "fallback_queued", wakes: [["deferred_issue_execution", true]], holds: [["active_run_watchdog", "active", "board", true]] });
+      for (const min of [1, 3, 11, 30]) {
+        const decision = await f.settle(min * 60000);
+        expect(decision.kind, `+${min} min`).not.toBe("noticed");
+        expect(lines(await f.notes()), `+${min} min`).toHaveLength(0);
+      }
+      await f.sweep(); await f.sweep();
+      expect(await f.notes(), "the real sweep writes nothing either").toHaveLength(0);
+    }, 60000);
+
+  it("negative: ANOTHER board user's real Stop -> the person's card answer keeps its ONE line, never silence", async () => {
+    const f = await seed(); const cardId = await f.card(); await f.answer(cardId); await f.stop(f.other);
+    expect((await cardFootprint(f, cardId)).wakes).toEqual([["deferred_issue_execution", true]]);
+    await f.settle(60000); await f.settle(3 * 60000); await f.settle(11 * 60000); await f.settle(30 * 60000);
+    const notes = lines(await f.notes());
+    expect(notes, "exactly one line").toHaveLength(1);
+    expect(notes[0]!.body).toBe("Your answer is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.");
+    expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${cardId}`);
+  }, 60000);
+
+  it("negative: the answerer's own Stop, but the answer's wake no longer waits in line (PLANTED: the wake row ended 'failed') -> one line, never silence", async () => {
+    const f = await seed(); const cardId = await f.card(); await f.answer(cardId); await f.stop();
+    // PLANTED: the real routes left the wake waiting (row above); here it ended without a run.
+    await db.update(agentWakeupRequests).set({ status: "failed", error: "planted: the wake ended without a run", finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.companyId, f.companyId));
+    await f.settle(3 * 60000); await f.settle(11 * 60000);
+    const notes = lines(await f.notes());
+    expect(notes, "exactly one line").toHaveLength(1);
+    expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${cardId}`);
+  }, 60000);
+
+  it.each([["the answerer", true, 0], ["ANOTHER board user", false, 1]] as const)(
+    "the run that took the card answer and had started answering it is stopped by %s (real Stop route; own Stop %s) -> %s line(s) for the answer",
+    async (_who, own, expected) => {
+      const f = await seed(); const cardId = await f.card(); await f.answer(cardId);
+      // The first run ends (PLANTED status), and the answer's resume run is PLANTED as the real wake's context names it
+      // (interactionId = the card), with the model's read and first reply item (as rf-5's seeds plant them).
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(f.t + 25000) }).where(eq(heartbeatRuns.id, f.runId));
+      const resumeId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: resumeId, companyId: f.companyId, agentId: f.agentId, runtimeMode: "native",
+        nativeIssueId: f.issueId, scopeKind: "issue", issueId: f.issueId, responsibleUserId: f.sender, status: "running",
+        startedAt: new Date(f.t + 26000), createdAt: new Date(f.t + 26000),
+        contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented", source: "issue.interaction.respond",
+          interactionId: cardId, interactionStatus: "answered" } });
+      await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: resumeId, phase: "observed" });
+      await db.update(issues).set({ executionRunId: resumeId }).where(eq(issues.id, f.issueId));
+      await db.update(agentWakeupRequests).set({ status: "completed", runId: resumeId, finishedAt: new Date() }).where(eq(agentWakeupRequests.companyId, f.companyId));
+      await db.update(issueQuestionResponseDeliveries).set({ targetRunId: resumeId }).where(eq(issueQuestionResponseDeliveries.interactionId, cardId));
+      for (const [index, kind] of ["userMessage", "agentMessage"].entries()) await db.insert(heartbeatRunEvents).values({ companyId: f.companyId,
+        agentId: f.agentId, runId: resumeId, seq: index + 1, eventType: "item.started", sourceEventId: `source-${randomUUID()}`,
+        payload: { prpEvent: { eventType: "item.started", turnId: `turn-${resumeId}`, itemId: `item-${index}`, payload: { kind, item: { type: kind } } } } });
+      const response = await request(app(f.companyId, own ? f.sender : f.other)).post(`/api/heartbeat-runs/${resumeId}/cancel`).send({});
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, resumeId));
+      expect(stopped).toMatchObject({ status: "cancelled", resultJson: { cancelledByActorType: "user", cancelledByUserId: own ? f.sender : f.other } });
+      await db.update(heartbeatRuns).set({ finishedAt: new Date(f.t + 30000) }).where(eq(heartbeatRuns.id, resumeId));
+      for (const min of [1, 3, 11, 30]) await f.settle(min * 60000);
+      const notes = (await f.notes()).filter(n => String(n.metadata?.authorizationReason).startsWith("unanswered_message:"));
+      expect(notes, own ? "the answerer's own Stop line is the one note" : "someone else's Stop: the answer keeps its one line").toHaveLength(expected);
+      if (!own) expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${cardId}`);
+    }, 60000);
 });
