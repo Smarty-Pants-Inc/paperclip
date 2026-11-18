@@ -1,6 +1,8 @@
 import { connectionIntentService } from "./connection-intents.js";
 import { readAiConnectionConfigurationFailure } from "./ai-connection-configuration-failure.js";
 import { logger } from "../middleware/logger.js";
+import { HttpError, unprocessable } from "../errors.js";
+import { reconcileRetainedAiCleanup } from "./retained-ai-credential-cleanup.js";
 import { createHmac } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import { agents, companies, companySecrets, type Db } from "@paperclipai/db";
@@ -158,6 +160,18 @@ export function agentHarnessVerificationService(db: Db, manager: PluginWorkerMan
     if (runner?.kind === "local" && !binding) runner = null;
     const digest = harnessVerificationDigest({ adapterType: agent.adapterType, config, account: accountWith(credentialVersions), environmentId, runner });
     if (digest && agent.harnessVerifiedDigest === digest) return "complete";
+    // A lifecycle retry must settle the previous probe's physical retirement
+    // and credential handoff BEFORE resolveAdapterTestExecutionContext can acquire
+    // another box/lease. withManagedAiProbe's cleanup 422 occurs after acquisition.
+    if (selected) {
+      try { await reconcileRetainedAiCleanup({ companyId: agent.companyId, accountKey: selected.grant.id }); }
+      catch (error) {
+        if (error instanceof HttpError && (error.details as { code?: unknown } | null)?.code === "ai_credential_cleanup_pending") {
+          throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
+        }
+        throw error;
+      }
+    }
     const target = providerApi
       ? { executionTarget: null, environmentName: null, fallbackChecks: [], release: async (_status?: "released" | "failed") => {} }
       : await tests.resolveAdapterTestExecutionContext({ agentId: agent.id, companyId: agent.companyId, adapterType: agent.adapterType, environmentId });
