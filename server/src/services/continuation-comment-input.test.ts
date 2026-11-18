@@ -214,6 +214,42 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
       unrelatedMessageId: next.id, input }));
   });
 
+  // KEEP: rf5 A3-card (03:20Z): the same sender's Stop after answering started excluded typed input but still carried
+  // the CARD answer the stopped run carried. The card is excluded the same way; an unrelated typed input still rides.
+  it.each([true, false])("A3-card: a sender-stopped CARD answer is excluded only after answering started (%s)", async (started) => {
+    const f = await fixture();
+    const [asker] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      status: "succeeded", contextSnapshot: { issueId: f.issueId } }).returning();
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, sourceRunId: asker.id,
+      resolvedByUserId: "board", resolvedAt: new Date(), idempotencyKey: randomUUID(),
+      payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", selectionMode: "single", options: [{ id: "yes", label: "YES" }] }] },
+      result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }] } } as never).returning();
+    const [next] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "board", body: "Unrelated next message" }).returning();
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled",
+      contextSnapshot: { issueId: f.issueId, interactionIds: [card.id] }, resultJson: {
+      cancelledByActorType: "user", cancelledByUserId: "board", stopReason: "cancelled",
+      executionCancellation: { state: "requested", requestedAt: new Date().toISOString() },
+      cancellation: { source: "operator", expected: true, initiator: { id: "board", type: "user" },
+        recordedAt: new Date().toISOString() },
+    } }).where(eq(heartbeatRuns.id, f.run.id));
+    if (started) await db.insert(heartbeatRunEvents).values(["userMessage", "agentMessage"].map((kind, index) => ({
+      companyId: f.companyId, agentId: f.agentId, runId: f.run.id, seq: index + 1,
+      eventType: "item.started", sourceEventId: randomUUID(), payload: { prpEvent: {
+        eventType: "item.started", turnId: `turn-${f.run.id}`, itemId: `item-${index}`,
+        payload: { kind, item: { type: kind } },
+      } },
+    })));
+    const input = await pendingContinuationCommentInput(db, { ...f,
+      contextSnapshot: { interactionIds: [card.id], wakeCommentIds: [next.id] },
+      liveOwner: { agentId: f.agentId, runId: f.run.id } });
+    console.log("A3_CARD_EVIDENCE", JSON.stringify({ started, sourceRunId: f.run.id, stoppedCardId: card.id,
+      unrelatedMessageId: next.id, input }));
+    expect(input.wakeCommentIds, "the unrelated typed input still rides").toEqual([next.id]);
+    expect(input.interactionIds ?? []).toEqual(started ? [] : [card.id]);
+  });
+
   // KEEP: rf5 A2 caught lost card input and false safe-to-retry advice on a failed resume.
   it.each(["interactionId", "interactionIds", "respondWake", "respondWakeContext"])("A2: failed card resume carries %s into its successor's OWN input and suppresses a false notice", async (field) => {
     const f = await fixture();

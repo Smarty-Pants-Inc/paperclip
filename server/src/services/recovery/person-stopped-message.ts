@@ -24,14 +24,16 @@ export function stoppedBySender(run: StoppedRun, senderUserId: string | null): b
     && hasRecordedUserStopRequest(run) && run.resultJson?.cancelledByUserId === senderUserId;
 }
 
-/** The run's OWN first-turn input: its wake comment(s) and the comments it took
- * into its first turn. A steer, a message queued behind it or one delivered
- * after the stop is not here. */
+/** The run's OWN first-turn input: its wake comment(s), the comments it took
+ * into its first turn and the card answers it carried (interactionId(s), rf5
+ * A3-card). A steer, a message queued behind it or one delivered after the
+ * stop is not here. */
 export function runOwnInputIds(contextSnapshot: unknown): string[] {
   const context = (contextSnapshot ?? {}) as Record<string, unknown>;
   const firstTurn = (context.firstTurnQueuedInput ?? {}) as Record<string, unknown>;
   return [context.wakeCommentId, ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
-    ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : [])]
+    ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : []),
+    context.interactionId, ...(Array.isArray(context.interactionIds) ? context.interactionIds : [])]
     .filter((id): id is string => typeof id === "string" && id.length > 0);
 }
 
