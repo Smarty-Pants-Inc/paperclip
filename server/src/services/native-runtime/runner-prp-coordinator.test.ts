@@ -499,4 +499,88 @@ describeEmbeddedPostgres("hidden runner PRP coordinator", () => {
       nativeStore.claimFinalization({ leaseOwner: "server-2" }),
     ).resolves.toMatchObject({ attempt: 2, resultId: firstResult.resultId });
   });
+
+  // b1-prp-effects (RFL rf-3 fence (c), redo), server half. The coordinator's
+  // effect fence is decided by the REAL producers: the run's own stored
+  // run.terminal (finalize), a Stop, and the REAL successor registration
+  // through registerRunnerPrpAuthority. A refused frame is still stored, and
+  // its refusal is persisted with it in heartbeat_run_events.
+  async function prepareRun(coordinator: ReturnType<typeof runnerPrpCoordinator>, seed: SeededNativeRun) {
+    return coordinator.prepare({
+      ...seed, normalizedSessionId: seed.sessionId, environmentLeaseId: "environment-lease-1",
+      turnId: "turn-1", itemId: "item-1", runnerVersion: "0.3.0", runnerDigest: `sha256:${"a".repeat(64)}`,
+    });
+  }
+  async function successorOf(seed: SeededNativeRun): Promise<SeededNativeRun> {
+    const successor = { ...seed, runId: randomUUID(), runnerInstanceId: randomUUID(), sessionId: randomUUID() };
+    await db.insert(heartbeatRuns).values({
+      id: successor.runId, companyId: seed.companyId, agentId: seed.agentId, status: "running", runtimeMode: "native",
+      nativeIssueId: seed.issueId, runnerInstanceId: successor.runnerInstanceId, nativeSessionId: successor.sessionId,
+      driverKind: "codex", driverVersion: "0.3.0", completionContractId: seed.completionContractId,
+      completionContractSha256: seed.completionContractSha256, nativePhase: "observed",
+    });
+    await db.update(issues).set({ executionRunId: successor.runId }).where(eq(issues.id, seed.issueId));
+    return successor;
+  }
+  async function boundServer() {
+    const server = createServer();
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    setupRunnerPrpWebSocketServer(server, { apiUrl: "http://127.0.0.1:3213" });
+    return server;
+  }
+
+  it("b1-prp-effects R2+R4 (server): the real successor registration refuses P's effects; P's frame is stored with its refusal, read back from the DB", async () => {
+    const server = await boundServer();
+    const stateRoot = mkdtempSync(resolve(tmpdir(), "paperclip-runner-effects-"));
+    scratchDirectories.push(stateRoot);
+    const coordinator = runnerPrpCoordinator(db, { stateRoot });
+    const seedP = await seedNativeRun();
+    const p = await prepareRun(coordinator, seedP);
+    expect(await p.effectFence.refusal()).toBeNull();
+    await store(seedP).appendEvent(runnerEvent(seedP, 1));
+    const seedS = await successorOf(seedP);
+    const s = await prepareRun(coordinator, seedS);
+    expect(await p.effectFence.refusal()).toBe("run_superseded");
+    expect(await s.effectFence.refusal()).toBeNull();
+    // P's unsent seq-2 frame arrives after supersession: stored as trace.
+    const late = { ...runnerEvent(seedP, 2), eventType: "run.result.proposed", payload: result } as PrpEvent;
+    await p.effectFence.storeTrace(late, { code: "run_effect_refused", reason: "run_superseded", frame: "event",
+      runId: seedP.runId, sourceSeq: 2, sourceEventId: late.sourceEventId, observedAt: new Date().toISOString() });
+    const rows = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, seedP.runId))
+      .orderBy(heartbeatRunEvents.sourceSeq);
+    // Server count = runner journal (seq 1..2); the refusal is durable.
+    expect(rows.map(row => row.sourceSeq)).toEqual([1, 2]);
+    expect((rows[0]!.payload as Record<string, unknown>).effectRefusal).toBeUndefined();
+    expect((rows[1]!.payload as Record<string, unknown>).effectRefusal)
+      .toMatchObject({ code: "run_effect_refused", reason: "run_superseded", sourceSeq: 2 });
+    // Its effect (result acceptance) was not applied.
+    expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, seedP.runId))).toHaveLength(0);
+    await s.release();
+    await p.release();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+
+  it("b1-prp-effects R1 (server): P's own stored run.terminal, or a Stop, finalizes it for the effect fence", async () => {
+    const server = await boundServer();
+    const stateRoot = mkdtempSync(resolve(tmpdir(), "paperclip-runner-effects-"));
+    scratchDirectories.push(stateRoot);
+    const coordinator = runnerPrpCoordinator(db, { stateRoot });
+    const seedP = await seedNativeRun();
+    const p = await prepareRun(coordinator, seedP);
+    const nativeStore = store(seedP);
+    await nativeStore.appendEvent({ ...runnerEvent(seedP, 1), eventType: "run.result.proposed", payload: result } as PrpEvent);
+    expect(await p.effectFence.refusal()).toBeNull();
+    const terminalEvent = { ...runnerEvent(seedP, 2), eventType: "run.terminal", payload: terminal } as PrpEvent;
+    await nativeStore.appendEvent(terminalEvent);
+    await nativeStore.reconcileTerminalEvent(terminalEvent);
+    expect(await p.effectFence.refusal()).toBe("run_finalized");
+    await p.release();
+    const seedQ = await seedNativeRun();
+    const q = await prepareRun(coordinator, seedQ);
+    expect(await q.effectFence.refusal()).toBeNull();
+    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, seedQ.runId));
+    expect(await q.effectFence.refusal()).toBe("run_finalized");
+    await q.release();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
 });
