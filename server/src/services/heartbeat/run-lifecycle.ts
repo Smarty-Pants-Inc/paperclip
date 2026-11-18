@@ -1,3 +1,5 @@
+import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
+import { writeRuntimeRunPointer } from "./runtime-run-pointer.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { notifyTerminalWorkspaceWork } from "../terminal-workspace-work.js";
 import { settleReattachRun } from "./run-admission.js";
@@ -88,7 +90,6 @@ import {
 } from "@paperclipai/shared";
 import {
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   activityLog,
   approvals,
@@ -2633,6 +2634,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         )
         .then((rows) => rows[0] ?? null);
       if (!issue) return null;
+      await lockAgentForRunAdmission(tx, { companyId: run.companyId, agentId: run.agentId });
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -3243,17 +3245,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     normalizedUsage?: UsageTotals | null,
   ) {
     await ensureRuntimeState(agent);
-    await db
-      .update(agentRuntimeState)
-      .set({
-        adapterType: agent.adapterType,
-        sessionId: session.legacySessionId,
-        lastRunId: run.id,
-        lastRunStatus: run.status,
-        lastError: run.error ?? null,
-        updatedAt: new Date(),
-      })
-      .where(eq(agentRuntimeState.agentId, agent.id));
+    await writeRuntimeRunPointer(db, agent, run, { sessionId: session.legacySessionId });
 
   }
 
