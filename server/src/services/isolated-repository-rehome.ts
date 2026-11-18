@@ -19,7 +19,7 @@ import { applyRestorePoint, captureRestorePoint, currentRestorePointSnapshot, im
 import { findRegenerableWorkspaceDirs, REGENERABLE_WORKSPACE_DIR_NAMES, WORKSPACE_COMPACTION_TRASH_DIR } from "./workspace-compaction.js";
 import { ensureManagedRepositoriesIgnored } from "./managed-repository-checkout.js";
 import { currentHostMutationDrain, withHeldLockHostDrain } from "./native-runtime/held-lock-host-drain.js";
-import { hostCleanup, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
+import { hostCleanup, hostDeferredCleanup, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { canonicalRepositoryRoot, localWorkspaceSourcePaths } from "./execution-workspace-source-roots.js";
 import { withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
 import { loadGitRestorePoint } from "./git-restore-point-storage.js";
@@ -309,11 +309,60 @@ async function heldStep<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<
   return hostMutation(fn);
 }
 
+/** The secret pair: a workspace's .env files and its .claude/settings.local.json. They move as ONE unit. */
+function secretTransferItem(relative: string) {
+  return relative === ".claude/settings.local.json" || /^\.env(\..*)?$/.test(path.posix.basename(relative));
+}
+
+/**
+ * pl/keepalive8: move the secret pair as ONE unit, never split between source and target. Each rename is a
+ * checked, gated host step; the unit commits only if the held lock (combined signal) is still held after the
+ * last rename. On a loss (or any failure) before the commit, BOTH go back to their original paths: the rollback
+ * is registered with the held drain before the first rename, so a closing drain runs it after the in-flight
+ * rename returns, before ownership is released. The rollback only renames back; it never deletes a secret file
+ * and never overwrites one.
+ */
+async function moveSecretUnit(fromRoot: string, toRoot: string, items: string[], signal?: AbortSignal) {
+  if (!items.length) return;
+  for (const relative of items) if (await exists(path.join(toRoot, relative))) throw new Error("transfer_conflict");
+  const moved: string[] = [];
+  let committed = false;
+  const rollback = hostDeferredCleanup(async () => {
+    if (committed) return;
+    for (const relative of [...moved].reverse()) {
+      const original = path.join(fromRoot, relative), staged = path.join(toRoot, relative);
+      if (await exists(original) || !await exists(staged)) continue;
+      await fs.mkdir(path.dirname(original), { recursive: true });
+      await fs.rename(staged, original);
+    }
+    moved.length = 0;
+  });
+  try {
+    for (const relative of items) {
+      const source = path.join(fromRoot, relative), destination = path.join(toRoot, relative);
+      await heldStep(() => fs.mkdir(path.dirname(destination), { recursive: true }), signal);
+      await heldStep(async () => { await fs.rename(source, destination); moved.push(relative); }, signal);
+    }
+    // Commit both only while the lock is still held; otherwise the finally rolls BOTH back.
+    signal?.throwIfAborted();
+    currentHostMutationDrain()?.signal.throwIfAborted();
+    committed = true;
+  } finally {
+    await rollback();
+  }
+}
+
 export async function returnTransferItems(original: string, moved: string, moves: string[], conflict: string, signal?: AbortSignal) {
   for (const relative of moves) {
     if (await exists(path.join(moved, relative)) && await exists(path.join(original, relative))) throw new Error(conflict);
   }
-  for (const relative of [...moves].reverse()) {
+  // pl/keepalive8: the secret pair returns as one unit (both or neither).
+  const secrets: string[] = [];
+  for (const relative of moves.filter(secretTransferItem)) {
+    if (await exists(path.join(moved, relative)) && !await exists(path.join(original, relative))) secrets.push(relative);
+  }
+  await moveSecretUnit(moved, original, secrets, signal);
+  for (const relative of [...moves].reverse().filter(item => !secretTransferItem(item))) {
     const from = path.join(moved, relative), to = path.join(original, relative);
     if (!await exists(from) || await exists(to)) continue;
     await heldStep(() => fs.mkdir(path.dirname(to), { recursive: true }), signal);
@@ -326,7 +375,7 @@ export async function returnTransferItems(original: string, moved: string, moves
 /** pl/keepalive7: every move (and its mkdir / linked-checkout repair) is its own checked, gated host step. */
 export async function moveTransferItems(from: string, to: string, moves: string[], linkedBases: Map<string, string>, signal?: AbortSignal) {
   if (moves.some(item => item.startsWith(`${PROJECT_REPOSITORIES_DIR}/`))) await heldStep(() => ensureManagedRepositoriesIgnored(to), signal);
-  for (const relative of moves) {
+  for (const relative of moves.filter(item => !secretTransferItem(item))) {
     const destination = path.join(to, relative);
     if (await exists(destination)) throw new Error("transfer_conflict");
     await heldStep(() => fs.mkdir(path.dirname(destination), { recursive: true }), signal);
@@ -336,6 +385,8 @@ export async function moveTransferItems(from: string, to: string, moves: string[
       await heldStep(() => retargetNestedBranch(destination, path.join(from, relative)), signal);
     }
   }
+  // pl/keepalive8: the secret pair (.env files + .claude/settings.local.json) moves last, as ONE unit.
+  await moveSecretUnit(from, to, moves.filter(secretTransferItem), signal);
 }
 
 export async function assertTransferredItems(from: string, to: string, moves: string[], linkedBases: Map<string, string>) {
