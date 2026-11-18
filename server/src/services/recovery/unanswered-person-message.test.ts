@@ -39,6 +39,7 @@ import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
 import { enqueueNativeContinuationWake } from "../native-runtime/status-decision-committer.js";
 import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
 import { claimFirstTurnQueuedInput } from "../native-runtime/first-turn-queued-input.js";
+import { completedPersonMessageAnswerSql, unansweredCardAnswerSql } from "../person-message-answer.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -162,6 +163,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const [row] = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     await db.update(heartbeatRuns).set({ contextSnapshot: { ...(row!.context as Record<string, unknown> ?? {}),
       wakeCommentIds: [messageId], wakeCommentId: messageId } }).where(eq(heartbeatRuns.id, runId));
+  };
+
+  // The run's OWN pending input, as the continuation carry writes it (readContinuationCommentInput; a card answer as
+  // interactionIds/interactionId). RFL F2 (22:41Z) attributes an answer only through it.
+  const carryInto = async (runId: string, input: Record<string, unknown>) => {
+    const [row] = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...(row!.context as Record<string, unknown> ?? {}), ...input } })
+      .where(eq(heartbeatRuns.id, runId));
   };
 
   // RFL F1 (21:28Z), ANSWERED: a cut run's progress reply is DELIVERED only. The sweep owes ONE true notice
@@ -1494,6 +1503,68 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await f.visible()).toHaveLength(0);
       expect((await db.select().from(issueComments).where(eq(issueComments.id, stale!.id)))[0]!.deletedAt).not.toBeNull();
     });
+
+  // SUPERSEDE-F2-PENDING-ONLY-1117 (rf5 A6, ported from 32b02f11d): pair each of the four superseded PV2b
+  // positives above for BOTH inputs: the card's source must own the typed message, and the final-answer
+  // successor must own the pending card answer. c1x port: c1x's sweep has no card-answer duty
+  // (unansweredCardAnswerSql has no sweep caller), so the card half is pinned on the ONE shared ANSWERED
+  // predicate (answered/owed) and not on a card notice.
+  it.each([
+    ["carrying", "context"], ["continuation", "context"], ["carrying", "delivery"], ["continuation", "delivery"],
+  ] as const)("PV2b paired no-own-input control: %s card / %s resume: successor final does not answer inherited input", async (cardSource, answerLink) => {
+    const f = await fixture({ status: "in_progress" });
+    const messageId = await f.message("Build Sol; ask me for the name first.");
+    const carryingRunId = await f.run({ commentId: messageId, status: "succeeded" });
+    const sourceRunId = cardSource === "carrying" ? carryingRunId
+      : await f.run({ commentId: messageId, status: "succeeded", retryOfRunId: carryingRunId });
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId,
+      addresseeUserId: f.userId, continuationPolicy: "none", createdAt: f.at(),
+      payload: { version: 1, questions: [{ id: "name", prompt: "What is the product called?", required: true,
+        selectionMode: "single", options: [{ id: "sol", label: "Sol" }] }] } }).returning();
+    // The superseded fixture added M to the card-producing run's own input.
+    // Remove ONLY that field: neither a card's timing nor continuation ancestry
+    // may answer M. Restore it to exercise the paired positive unchanged.
+    const messageAnswerState = () => db.select({ answered: completedPersonMessageAnswerSql({
+      id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) })
+      .from(issueComments).where(eq(issueComments.id, messageId));
+    await carryInto(sourceRunId, { wakeCommentId: null });
+    expect(await messageAnswerState()).toMatchObject([{ answered: false }]);
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed" });
+    const messageNotes = await f.visible();
+    expect(messageNotes).toHaveLength(1);
+    expect(messageNotes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
+    await carryInto(sourceRunId, { wakeCommentId: messageId });
+    expect(await messageAnswerState()).toMatchObject([{ answered: true }]);
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    expect(await f.visible()).toHaveLength(0);
+    await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId }, card!.id,
+      { answers: [{ questionId: "name", optionIds: ["sol"] }] }, { userId: f.userId });
+    // Keep the resolved input and its delivery on the fixture clock: a pending
+    // delivery's grace must not mask the owed answer in either paired variant.
+    await db.update(issueThreadInteractions).set({ resolvedAt: f.at() }).where(eq(issueThreadInteractions.id, card!.id));
+    const resume = await f.run({ status: "failed", errorCode: "adapter_failed" });
+    await carryInto(resume, { interactionId: card!.id, interactionStatus: "answered", source: "issue.interaction.respond" });
+    await db.update(issueQuestionResponseDeliveries).set({ targetRunId: resume,
+      status: answerLink === "context" ? "delivered" : "fallback_queued",
+      deliveryMode: answerLink === "context" ? "steered" : "wake_fallback" })
+      .where(eq(issueQuestionResponseDeliveries.interactionId, card!.id));
+    const successor = await f.nativeSuccessor(resume);
+    await f.reply(successor);
+    const cardAnswerState = () => db.select({ answered: completedPersonMessageAnswerSql({
+      id: sql`${issueThreadInteractions.id}`, companyId: sql`${issueThreadInteractions.companyId}`,
+      issueId: sql`${issueThreadInteractions.issueId}`, createdAt: sql`${issueThreadInteractions.resolvedAt}` }),
+      owed: unansweredCardAnswerSql("issue_thread_interactions") }).from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, card!.id));
+    expect(await cardAnswerState(), "ancestry-only final leaves the card answer owed").toMatchObject([{ answered: false, owed: true }]);
+    // Paired positive: change ONLY the successor's own pending input. The same final now answers it.
+    await carryInto(successor, { interactionIds: [card!.id] });
+    expect(await cardAnswerState()).toMatchObject([{ answered: true, owed: false }]);
+    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+  });
 
   it("supersedes(ANSWERED blob, RFL 21:28Z/22:41Z): PV2b chain: a final after multiple failed ancestors answers only with the message as its own input", async () => {
     // Reason: ANSWERED never attributes through continuation ancestry (RFL F2 22:41Z). Ancestry alone: not answered,
