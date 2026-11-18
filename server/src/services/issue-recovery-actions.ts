@@ -24,9 +24,6 @@ const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfi
 const MAX_UPSERT_RETRIES = 3;
 // Recheck at every ordinary write: the guarded Stop owner may have annotated
 // the action after this writer's read. A stale snapshot cannot hide that hold.
-// Built per query, never at module load: stop-pending.ts sits in an import
-// cycle with this module, and a load-time read of STOP_PENDING_SCHEMA can see
-// it before it is initialized (an empty right-hand side, a SQL syntax error).
 const noTaskStopPending = () => sql`coalesce(${issueRecoveryActions.evidence}->'stopPending'->>'schema', '') <> ${STOP_PENDING_SCHEMA}`;
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
