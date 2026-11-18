@@ -6798,7 +6798,7 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
     // answered only another message; the server has not retired the notice because "person-message" is not
     // ANSWERED). The old row pinned the notice hidden; the server's true notice must stay visible until the
     // server retires it (the row above: deletedAt -> hidden).
-    it("supersedes((c) before the sweep supersedes it, the answering run already makes the notice historical (statusRelevance.isHistoricalNotice); RFL record PENDING: an unanswered-message notice is never historical)", () => {
+    it("supersedes((c) before the sweep supersedes it, the answering run already makes the notice historical (statusRelevance.isHistoricalNotice); RFL record SUPERSEDE-HISTORICAL-NOTICE-FILTER-1118)", () => {
       paint({
         comments: [personMessage("person-message", "Please continue.", 0), bPrimeNotice(5),
           personMessage("resend", "Please continue (again).", 10), agentAnswer("answer", "Here is my answer.", 15, "answer-run")],
