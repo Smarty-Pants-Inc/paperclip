@@ -1,26 +1,34 @@
 import { randomUUID } from "node:crypto";
-import { afterDatabaseCommit, type heartbeatRuns } from "@paperclipai/db";
+import { and, eq, isNull } from "drizzle-orm";
+import { afterDatabaseCommit, heartbeatRuns, type Db } from "@paperclipai/db";
 import { parseObject } from "../../adapters/utils.js";
 import { publishPluginDomainEvent } from "../activity-log.js";
 
 /**
  * Called inside the status owner's transaction with its locked pre-write row.
- * Terminal-to-terminal repair is not a second lifecycle end (even if its status
- * changes). The row lock / conditional write arbitrates concurrent owners; the
- * database context, not the caller, owns the actual publication boundary.
+ * A run has only one lifecycle end, including after recovery reopens it. Claim
+ * its durable marker in the status transaction, not from a stale caller row.
+ * Rollback discards both the claim and its post-commit effect. This retains the
+ * bus's best-effort delivery contract; it is not a durable publication outbox.
  */
-export function publishTerminalRunLifecyclePluginEventAfterCommit(
-  tx: object,
+export async function publishTerminalRunLifecyclePluginEventAfterCommit(
+  tx: Pick<Db, "update">,
   before: { status: string },
   after: typeof heartbeatRuns.$inferSelect,
-): void {
+): Promise<void> {
   if (after.runtimeMode !== "native" || !["queued", "scheduled_retry", "running"].includes(before.status)
     || !["succeeded", "failed", "timed_out", "cancelled", "interrupted"].includes(after.status)) return;
-  afterDatabaseCommit(tx, () => publishRunLifecyclePluginEvent(after));
+  const eventId = randomUUID();
+  const [claimed] = await tx.update(heartbeatRuns)
+    .set({ terminalPluginEventId: eventId })
+    .where(and(eq(heartbeatRuns.id, after.id), eq(heartbeatRuns.companyId, after.companyId),
+      isNull(heartbeatRuns.terminalPluginEventId)))
+    .returning({ id: heartbeatRuns.id });
+  if (claimed) afterDatabaseCommit(tx, () => publishRunLifecyclePluginEvent(after, eventId));
 }
 
 /** Publish after the owning status transaction commits, only for its winning transition. */
-export function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect) {
+export function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect, eventId?: string) {
   const issueId = parseObject(run.contextSnapshot).issueId;
   publishRunLifecyclePluginEventData({
     companyId: run.companyId,
@@ -35,7 +43,7 @@ export function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferS
     issueId: typeof issueId === "string" && issueId.trim().length > 0 ? issueId.trim() : null,
     startedAt: run.startedAt,
     finishedAt: run.finishedAt,
-  });
+  }, eventId);
 }
 
 export function publishRunLifecyclePluginEventData(run: {
@@ -51,7 +59,7 @@ export function publishRunLifecyclePluginEventData(run: {
   issueId: string | null;
   startedAt: Date | null;
   finishedAt: Date | null;
-}) {
+}, eventId: string = randomUUID()) {
   const eventType =
     run.status === "running"
       ? "agent.run.started"
@@ -64,7 +72,7 @@ export function publishRunLifecyclePluginEventData(run: {
             : null;
   if (!eventType) return;
   publishPluginDomainEvent({
-    eventId: randomUUID(),
+    eventId,
     eventType,
     occurredAt: new Date().toISOString(),
     actorId: run.agentId,

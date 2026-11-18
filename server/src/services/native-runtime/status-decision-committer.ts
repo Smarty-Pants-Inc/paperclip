@@ -1197,7 +1197,7 @@ async function materializeDecisionEffect(input: {
       )
       .returning();
     if (!run) throw new Error("native_continuation_cancellation_run_missing");
-    if (before) publishTerminalRunLifecyclePluginEventAfterCommit(input.tx, before, run);
+    if (before) await publishTerminalRunLifecyclePluginEventAfterCommit(input.tx, before, run);
     input.terminalRunsToEmit?.push(run);
     return {
       effectKind: effect.kind,

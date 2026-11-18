@@ -208,7 +208,7 @@ export async function projectCommittedRun(input: {
       .where(needsRepair)
       .returning();
     if (after) {
-      publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, after);
+      await publishTerminalRunLifecyclePluginEventAfterCommit(tx, before, after);
       await settleNativeTerminalWake(tx, after);
       await promoteDeferredWorkIntents(tx, { companyId: input.run.companyId, trigger: "lock_released", issueId: input.coordinator.issueId });
     }

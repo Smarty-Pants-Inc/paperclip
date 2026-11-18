@@ -853,7 +853,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           )
           .returning();
         if (!terminal) return null;
-        publishTerminalRunLifecyclePluginEventAfterCommit(tx, current, terminal);
+        await publishTerminalRunLifecyclePluginEventAfterCommit(tx, current, terminal);
         if (current.wakeupRequestId)
           await tx
             .update(agentWakeupRequests)
@@ -1133,7 +1133,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const [row] = await tx.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(),
             errorCode: "case_handoff_superseded", error: "This case handoff was cancelled or superseded.", updatedAt: new Date() })
             .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.status, "queued"))).returning();
-          if (row) publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "queued" }, row);
+          if (row) await publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "queued" }, row);
           return row;
         });
         if (cancelled) await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: new Date(), error: cancelled.error });
@@ -1610,7 +1610,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     )
                     .returning();
                   if (!cancelled) return { kind: "stale" as const, run: null };
-                  publishTerminalRunLifecyclePluginEventAfterCommit(tx, lockedRun, cancelled);
+                  await publishTerminalRunLifecyclePluginEventAfterCommit(tx, lockedRun, cancelled);
                   await tx
                     .update(agentWakeupRequests)
                     .set({
@@ -1730,7 +1730,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     ),
                   )
                   .returning();
-                if (cancelled) publishTerminalRunLifecyclePluginEventAfterCommit(tx, lockedRun, cancelled);
+                if (cancelled) await publishTerminalRunLifecyclePluginEventAfterCommit(tx, lockedRun, cancelled);
                 await tx
                   .update(agentWakeupRequests)
                   .set({
@@ -4418,7 +4418,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               .then((rows) => rows[0] ?? null);
 
             if (!cancelled) return false;
-            publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "scheduled_retry" }, cancelled);
+            await publishTerminalRunLifecyclePluginEventAfterCommit(tx, { status: "scheduled_retry" }, cancelled);
 
             if (scheduledRun.wakeupRequestId) {
               await tx
@@ -4561,7 +4561,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               )
               .returning();
             if (cancelled.length > 0) {
-              publishTerminalRunLifecyclePluginEventAfterCommit(tx, activeExecutionRun, cancelled[0]);
+              await publishTerminalRunLifecyclePluginEventAfterCommit(tx, activeExecutionRun, cancelled[0]);
               cancelledRunsToEmit.push(cancelled[0]);
               if (activeExecutionRun.wakeupRequestId) {
                 await tx

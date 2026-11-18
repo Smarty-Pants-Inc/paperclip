@@ -291,7 +291,7 @@ export async function reconcileAbandonedExecutionControl(
             })
             .where(eq(heartbeatRuns.id, run.id))
             .returning();
-          if (updatedRun) publishTerminalRunLifecyclePluginEventAfterCommit(tx, run, updatedRun);
+          if (updatedRun) await publishTerminalRunLifecyclePluginEventAfterCommit(tx, run, updatedRun);
           if (updatedRun && updatedRun.status !== run.status) {
             terminalRunToReport = updatedRun;
           }

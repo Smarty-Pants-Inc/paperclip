@@ -51,6 +51,8 @@ export const heartbeatRuns = pgTable(
     executionControlDeadlineAt: timestamp("execution_control_deadline_at", { withTimezone: true }),
     // Transactional delivery marker. Null on historical rows; publication never replays provider work.
     executionStatusDeliveryId: uuid("execution_status_delivery_id"),
+    // First native terminal plugin-event reservation; recovery must never reset it.
+    terminalPluginEventId: uuid("terminal_plugin_event_id"),
     error: text("error"),
     wakeupRequestId: uuid("wakeup_request_id").references(() => agentWakeupRequests.id),
     exitCode: integer("exit_code"),

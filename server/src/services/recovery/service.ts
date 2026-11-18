@@ -6892,7 +6892,7 @@ export function recoveryService(
         })
         .where(eligible)
         .returning();
-      if (terminalRun) publishTerminalRunLifecyclePluginEventAfterCommit(tx, candidate, terminalRun);
+      if (terminalRun) await publishTerminalRunLifecyclePluginEventAfterCommit(tx, candidate, terminalRun);
       return terminalRun ?? null;
     });
     if (!updated) {
