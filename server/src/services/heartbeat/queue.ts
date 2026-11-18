@@ -1217,6 +1217,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         logger.info({ runId: run.id, agentId: run.agentId, companyId: run.companyId, issueId,
           reason: "predecessor_settling_in_process", predecessorRunId: settlingOwner.id },
         "claimQueuedRun: queued run declined at the issue execution claim");
+        // This is the same saved turn waiting for cleanup as the gate below.
+        // Reuse its transactional notice/dedupe; do not change admission.
+        await recordNativeCleanupHold(db, { run, issueId, cleanupBlock: "pending" }).catch((err: unknown) =>
+          logger.warn({ err, runId: run.id, issueId }, "could not record the native session cleanup hold on its run"));
         return null;
       }
     }

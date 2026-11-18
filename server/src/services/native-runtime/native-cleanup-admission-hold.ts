@@ -18,6 +18,9 @@ export const NATIVE_CLEANUP_HOLD_CAUSE = "native_session_cleanup_settling";
 /** The held run's next action. Only a confirmed stop releases the hold. */
 export const NATIVE_CLEANUP_HOLD_NEXT_ACTION =
   "This turn starts when the old Runner is confirmed stopped. Paperclip is stopping it and keeps its files.";
+export const NATIVE_CLEANUP_OPERATOR_REQUIRED_CAUSE = "native_session_cleanup_operator_required";
+export const NATIVE_CLEANUP_OPERATOR_REQUIRED_MESSAGE =
+  "This message hasn't started: Paperclip couldn't confirm the previous session stopped, and has stopped trying. Your message is saved; tell us and we'll start it.";
 
 /**
  * The first time admission holds this queued run behind its task's cleanup
@@ -26,7 +29,8 @@ export const NATIVE_CLEANUP_HOLD_NEXT_ACTION =
  * task's comments. Both are written once, together. The comment goes through
  * the issue service directly, not the comment route, so it wakes nobody
  * (only the route wakes the assignee); it creates no run. The run stays
- * queued and admission still decides when it starts. Later holds add nothing.
+ * queued and admission still decides when it starts. Repeated holds add nothing;
+ * exhausting automatic close retries records its own notice once.
  */
 export async function recordNativeCleanupHold(db: Db, input: {
   run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">;
@@ -34,6 +38,10 @@ export async function recordNativeCleanupHold(db: Db, input: {
   cleanupBlock: "pending" | "operator_required";
 }): Promise<boolean> {
   const { run, issueId, cleanupBlock } = input;
+  const operatorRequired = cleanupBlock === "operator_required";
+  const eventType = operatorRequired ? NATIVE_CLEANUP_OPERATOR_REQUIRED_CAUSE : NATIVE_CLEANUP_HOLD_CAUSE;
+  const nextAction = operatorRequired ? NATIVE_CLEANUP_OPERATOR_REQUIRED_MESSAGE : NATIVE_CLEANUP_HOLD_NEXT_ACTION;
+  const message = operatorRequired ? nextAction : `${NATIVE_CLEANUP_SETTLING_MESSAGE} ${nextAction}`;
   return db.transaction(async tx => {
     const [current] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.status, "queued"),
@@ -41,18 +49,18 @@ export async function recordNativeCleanupHold(db: Db, input: {
     if (!current) return false;
     const [recorded] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
-      eq(heartbeatRunEvents.eventType, NATIVE_CLEANUP_HOLD_CAUSE),
+      eq(heartbeatRunEvents.eventType, eventType),
     )).limit(1);
     if (recorded) return false;
     await appendHeartbeatRunEvent(tx as unknown as Db, {
       companyId: run.companyId, runId: run.id, agentId: run.agentId,
-      eventType: NATIVE_CLEANUP_HOLD_CAUSE, stream: "system", level: "warn",
-      message: NATIVE_CLEANUP_HOLD_NEXT_ACTION,
+      eventType, stream: "system", level: "warn",
+      message: nextAction,
       payload: { reason: NATIVE_CLEANUP_HOLD_CAUSE, cleanupBlock, issueId },
     });
-    await issueService(db).addComment(issueId, `${NATIVE_CLEANUP_SETTLING_MESSAGE} ${NATIVE_CLEANUP_HOLD_NEXT_ACTION}`, {},
+    await issueService(db).addComment(issueId, message, {},
       { authorType: "system", metadata: { version: 1, sourceRunId: run.id,
-        authorizationReason: `${NATIVE_CLEANUP_HOLD_CAUSE}:${run.id}`,
+        authorizationReason: `${eventType}:${run.id}`,
         sections: [{ rows: [{ type: "run_link", runId: run.id, agentId: run.agentId, title: "Held turn" }] }] } }, tx);
     return true;
   });

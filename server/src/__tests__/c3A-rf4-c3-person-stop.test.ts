@@ -143,7 +143,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
       expect(result.status).toBe(200); expect(result.body.status).toBe("cancelled");
       await waitFor(async () => ((await heartbeat.getRun(runId))?.resultJson?.nativeCancellation as { dispatchState?: string } | undefined)?.dispatchState === "acknowledged");
       await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "native_retry_cancelled", leaseOwner: null, leaseExpiresAt: null }).where(eq(nativeRunFinalizations.runId, runId));
-      if (mode === "mid_turn" && opts.silentWait !== "pending") waitingWakes = await message();
+      if (mode === "mid_turn" && opts.silentWait !== "pending" && opts.silentWait !== "confirmed") waitingWakes = await message();
     };
     const provider = getSandboxProvider("fake")!;
     let stop = vi.spyOn(provider, "stopLease");
@@ -157,24 +157,24 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     const realSetTimeout = globalThis.setTimeout;
     // Timing-only injection: spend the real nine-attempt retry budget without
     // waiting six minutes. No gate/attempt counter is assigned by the fixture.
-    const retryTimer = opts.silentWait ? vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback, delay, ...args) =>
+    const retryTimer = opts.silentWait ? vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) =>
       realSetTimeout(callback, delay === 60_000 && new Error().stack?.includes("native-session-runtime") ? 5 : delay, ...args)
     ) as typeof setTimeout) : undefined;
     if (opts.silentWait) {
       // NAMED injection: only the provider stop RPC refuses to confirm. The real
       // Stop route/ack, active executor, close retries, gate and comments are product-written.
       stop.mockRestore();
-      const originalStop = getSandboxProvider("fake")!.stopLease.bind(provider);
+      const originalStop = getSandboxProvider("fake")!.stopLease!.bind(provider);
       stop = vi.spyOn(provider, "stopLease").mockImplementation(async input => {
         if (failStop) throw new Error("SILENT_WAIT_PROVIDER_STOP_NEVER_CONFIRMS");
         return originalStop(input);
       });
       fixture.remoteCleanupScope = JSON.stringify(["fake", providerLeaseId]);
-      fixture.closeSession = () => provider.stopLease({ config: { driver: "sandbox", provider: "fake", image: "fixture:test", reuseLease: true }, providerLeaseId }).then(() => undefined);
+      fixture.closeSession = () => provider.stopLease!({ config: { driver: "sandbox", provider: "fake", image: "fixture:test", reuseLease: true }, providerLeaseId }).then(() => undefined);
       const originalOnFirst = fixture.onFirst;
       fixture.onFirst = async () => {
         await originalOnFirst!();
-        if (opts.silentWait !== "pending") {
+        if (opts.silentWait === "settling") {
           await heartbeat.resumeQueuedRuns();
           snapshots.settling = await readThread();
           // A second claim is a later dispatch/poll, not a second notification.
@@ -186,7 +186,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     try {
       await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
       if (opts.silentWait) {
-        if (opts.silentWait === "pending") waitingWakes = await message();
+        if (opts.silentWait !== "settling") waitingWakes = await message();
         await heartbeat.resumeQueuedRuns();
         snapshots.pending = await readThread();
         if (opts.silentWait !== "confirmed") {
@@ -239,7 +239,7 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     expect(r.runs).toHaveLength(1);
     expect(r.calls).toEqual([r.runId, r.runs[0]!.id]);
     expect(bodies(r.snapshots.pending).filter(body => body === operatorLine)).toHaveLength(0);
-    expect(bodies(r.snapshots.pending).filter(body => body === waitLine).length).toBeLessThanOrEqual(1);
+    expect(bodies(r.snapshots.pending).filter(body => body === waitLine)).toHaveLength(0);
   }, 60_000);
   // RFL 05:07Z: a message waiting BEFORE the person's Stop is not run by itself
   // after that Stop. It stays HELD (the deferred wake the queued list shows with
