@@ -10,9 +10,6 @@ const UUID = /^[0-9a-f-]{36}$/i;
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 
-export const NATIVE_FAILED_TURN_CONTINUATION_EXHAUSTED_NOTE =
-  "The run stopped before the answer finished, and one automatic retry stopped too. Press Retry to try again.";
-
 /**
  * The arbiter spent the generic failed turn's one continuation. Use its applied
  * decision, not an error string or copied retry context, as publication authority.
@@ -37,7 +34,12 @@ export async function readExhaustedNativeFailedTurnCandidate(
   )).limit(1);
   if (!decision) return null;
   const prefix = readFailedTurnStreamedAnswer(rows)?.text;
-  const note = NATIVE_FAILED_TURN_CONTINUATION_EXHAUSTED_NOTE;
+  const errorCode = record(record(event.payload).error).code;
+  const note = errorCode === "native_runner_process_exited"
+    ? "The agent's runner stopped unexpectedly before the answer finished. Press Retry to try once more."
+    : errorCode === "pi_turn_idle_timeout"
+      ? "The model stopped responding before the answer finished. Press Retry to try once more."
+      : "The run stopped before the answer finished. Press Retry to try once more.";
   return { seq: terminal.seq, sourceEventId: typeof event.sourceEventId === "string" ? event.sourceEventId : null,
     channel: "final", text: prefix ? `${prefix}${prefix.endsWith("\n") ? "" : "\n"}\n— ${note}` : note,
     reasonCode: decision.reasonCode };

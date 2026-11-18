@@ -37,7 +37,7 @@ import { issueService } from "../issues.js";
 import * as usageReceipts from "../usage-receipts.js";
 import { settleUnansweredPersonMessagesForTask, unansweredPersonMessageCondition } from "../recovery/unanswered-person-message.js";
 
-// fam-long u1j (review-fleet-2). judge-generic-busy/free.test.ts beside this file are rf-2's c2a-form CONTROLS:
+// fam-long u1m (review-fleet-2). The removed judge-generic-busy/free.test.ts remain rf-2's c2a-form R1 artefacts:
 // on this tree every provider failure in them takes the mid-stream CUT lane (u1h), so they do not exercise the
 // generic retry. This file is the real RED: same harness, same dispatcher sequence (dispatch ->
 // deliverReconciledExecutions x2 -> promote), same +1m/+1h sweeps, with failures that still take the GENERIC
@@ -56,6 +56,12 @@ const matrixErrors: Record<string, Record<string, unknown>> = {
   pi_turn_idle_timeout: { code: "pi_turn_idle_timeout" },
   pi_abort_escalated: { code: "pi_abort_escalated" },
 };
+const expectedNotes: Record<string, string> = {
+  runner_process_exited: "The agent's runner stopped unexpectedly before the answer finished. Press Retry to try once more.",
+  pi_turn_idle_timeout: "The model stopped responding before the answer finished. Press Retry to try once more.",
+  pi_abort_escalated: "The run stopped before the answer finished. Press Retry to try once more.",
+};
+const STREAMED_PREFIX = "Step 1: snapshot the invoices table. Step 2: ";
 const SWEEP_SAFE_LINE = /no run started|wasn't answered|Sending it again is safe/i;
 const ASK = "Write the full migration plan for the billing tables, every step, nothing left out.";
 const STORED = { provider: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "xhigh" };
@@ -90,13 +96,13 @@ describe("generic native_run_failed retry: one successor, busy or free slot (fam
   }
 
   /** The runner events of one cut turn, as the Pi driver emits them (pi-rpc-driver.ts :1705-1710). */
-  function cutEvents(shape: CutShape, base: Omit<PrpEvent, "sourceEventId" | "sourceSeq" | "eventType" | "payload">): PrpEvent[] {
+  function cutEvents(shape: CutShape, base: Omit<PrpEvent, "sourceEventId" | "sourceSeq" | "eventType" | "payload">, streamedPrefix = false): PrpEvent[] {
     const item = (seq: number, kind: "reasoning" | "agentMessage", text: string): PrpEvent => ({ ...base, sourceEventId: `item-${seq}`,
       sourceSeq: seq, eventType: "item.delta", itemId: `${base.turnId}:${kind === "reasoning" ? "pi-thinking" : "pi-message"}:1`,
       payload: { kind, text } } as PrpEvent);
     const failed = (seq: number, error: Record<string, unknown>): PrpEvent => ({ ...base, sourceEventId: "turn-terminal", sourceSeq: seq,
       eventType: "turn.failed", payload: { status: "failed", error } } as PrpEvent);
-    if (matrixErrors[shape]) return [...(shape.startsWith("h_") ? [item(1, "agentMessage", "Step 1: snapshot the invoices table. Step 2: ")] : []), failed(shape.startsWith("h_") ? 2 : 1, matrixErrors[shape])];
+    if (matrixErrors[shape]) return [...(streamedPrefix ? [item(1, "agentMessage", STREAMED_PREFIX)] : []), failed(streamedPrefix ? 2 : 1, matrixErrors[shape])];
     const extra: Record<string, Record<string, unknown>> = {
       auth401: {code:"pi_provider_error",httpStatus:401,message:"401 invalid_api_key: invalid API key"},
       permission403: {code:"pi_provider_error",httpStatus:403,message:"403 permission_error: access denied"},
@@ -119,7 +125,7 @@ describe("generic native_run_failed retry: one successor, busy or free slot (fam
   }
 
   /** One cut turn through the real executor and finalizer. `existingRunId` is an already-materialized successor. */
-  async function cutTurn(issueId: string, shape: CutShape, existingRunId?: string) {
+  async function cutTurn(issueId: string, shape: CutShape, existingRunId?: string, streamedPrefix = false) {
     const runId = existingRunId ?? randomUUID();
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     const [message] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "user")));
@@ -147,7 +153,7 @@ describe("generic native_run_failed retry: one successor, busy or free slot (fam
     await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: execution } }).where(eq(heartbeatRuns.id, runId));
     const events = cutEvents(shape, { schema: "paperclip.prp.event.v1", runId, normalizedSessionId: native.normalizedSessionId,
       turnId: native.turnId, sourceInstanceId: native.runnerInstanceId, sourceKind: "runner", schemaVersion: 1, priority: 0,
-      emittedAt: new Date().toISOString() } as Omit<PrpEvent, "sourceEventId" | "sourceSeq" | "eventType" | "payload">);
+      emittedAt: new Date().toISOString() } as Omit<PrpEvent, "sourceEventId" | "sourceSeq" | "eventType" | "payload">, streamedPrefix);
     const terminal: PrpTerminalState = { schema: "paperclip.prp.terminal.v1", turnTerminalState: "failed", runTerminalState: "failed", reportedWorkDisposition: "needs_review" };
     const result = { ...CONTROL_PLANE_CONFORMANCE_RESULT, reportedWorkDisposition: "needs_review" as const,
       completionClaim: { ...CONTROL_PLANE_CONFORMANCE_RESULT.completionClaim, contractRevision: completionInput.revision } };
@@ -267,9 +273,10 @@ describe("generic native_run_failed retry: one successor, busy or free slot (fam
   }
 
   const SLOTS = ["BUSY", "FREE"] as const;
-  const ROWS = SLOTS.flatMap(slot => Object.keys(matrixErrors).map(shape => [slot, shape] as const));
+  const ROWS = SLOTS.flatMap(slot => Object.keys(matrixErrors).flatMap(firstShape =>
+    Object.keys(matrixErrors).map(shape => [slot, firstShape, shape] as const)));
   const published = new Map<string, Awaited<ReturnType<typeof assertOnePublishedNoteAfterSweep>>>();
-  it.each(ROWS)("BOUND %s %s", async (slot, shape) => {
+  it.each(ROWS)("BOUND %s %s -> %s", async (slot, firstShape, shape) => {
     // BUSY: the agent's only slot is held by another task's run, as in rf-2's busy file.
     const [blocker] = slot === "BUSY" ? await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running",
       contextSnapshot: { issueId: randomUUID() } }).returning() : [null];
@@ -277,18 +284,18 @@ describe("generic native_run_failed retry: one successor, busy or free slot (fam
     let issueId: string | null = null;
     try {
       issueId = await task();
-      const first = await cutTurn(issueId, shape);
+      const first = await cutTurn(issueId, firstShape);
       const afterFirst = await dispatchEverything(issueId, first.runId);
       const claimed = afterFirst.successors.length === 1 ? await claimSuccessor(afterFirst) : null;
       const publicationFirst = await assertOnePublishedNoteAfterSweep(issueId, first.runId, afterFirst.successors.length === 0);
       let second = null, afterSecond = null, publicationFinal = publicationFirst;
       if (claimed?.claimedByFixture === 1) {
-        second = await cutTurn(issueId, shape, claimed.id);
+        second = await cutTurn(issueId, shape, claimed.id, true);
         afterSecond = await dispatchEverything(issueId, first.runId);
         publicationFinal = await assertOnePublishedNoteAfterSweep(issueId, second.runId);
       }
       const successorsFinal = afterSecond?.successors ?? afterFirst.successors;
-      const row = { slot, shape, error: matrixErrors[shape], first, successorsFirst: afterFirst.successors, claimed,
+      const row = { slot, firstShape, shape, error: matrixErrors[shape], first, successorsFirst: afterFirst.successors, claimed,
         dispatchFirst: afterFirst.generic, wakesFirst: afterFirst.wakes, publicationFirst, second, successorsFinal, publicationFinal };
       appendFileSync(process.env.EVIDENCE_OUT + "/matrix-rows.jsonl", JSON.stringify(row) + "\n");
       // Not vacuous: the first failure took the GENERIC lane (status-arbiter.ts :506-519), not the cut lane.
@@ -307,8 +314,22 @@ describe("generic native_run_failed retry: one successor, busy or free slot (fam
       expect.soft(second?.decision.reasonCode).toBe("native_run_failed_continuation_exhausted");
       expect.soft(second?.effects.map(effect => effect.effectKind)).not.toContain("schedule_retry");
       expect.soft(successorsFinal).toHaveLength(1);
-      published.set(`${slot} ${shape}`, publicationFinal);
+      published.set(`${slot} ${firstShape} ${shape}`, publicationFinal);
+      // The person's Retry is a new manual request, not another automatic continuation.
+      const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: "board-user", actorSource: "session",
+        idempotencyKey: randomUUID(), observedRunId: second!.runId });
+      expect.soft(receipt).toMatchObject({ accepted: true, stale: false });
+      const [manualBlocker] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running",
+        contextSnapshot: { issueId: randomUUID() } }).returning();
+      stopTaskDrain(); // Admit Retry with a real busy slot, so its one manual run queues without executing.
+      await afterFirst.heartbeat.resumeTaskRetry(companyId, receipt.requestId!);
+      await afterFirst.heartbeat.resumeTaskRetry(companyId, receipt.requestId!); // replay must not create a second manual successor
+      const manual = (await successorsOf(issueId, first.runId)).filter(run => run.contextSnapshot?.taskRetryRequestId === receipt.requestId);
+      expect.soft(manual).toHaveLength(1);
+      expect.soft(manual[0]?.status).toBe("queued");
+      appendFileSync(process.env.EVIDENCE_OUT + "/manual-retry-rows.jsonl", JSON.stringify({ slot, firstShape, shape, receipt, manual }) + "\n");
       await afterFirst.heartbeat.drainActiveRunExecutions();
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, manualBlocker.id));
       // The slot really was what the row says while the successor was dispatched.
       expect.soft(afterFirst.slotHolders).toBe(slot === "BUSY" ? 1 : 0);
     } finally {
@@ -323,14 +344,16 @@ describe("generic native_run_failed retry: one successor, busy or free slot (fam
   // What the person reads after the GENERIC row above (same task, read-only): ONE true final note, also after the
   // +1m and +1h sweeps, and never a "safe to send again" line once a carrying run started. Kept apart from the
   // bound so each is judged on its own: the sweep text belongs to recovery/unanswered-person-message.ts.
-  it.each(ROWS)("NOTE %s %s", (slot, shape) => {
-    const publication = published.get(`${slot} ${shape}`);
+  it.each(ROWS)("NOTE %s %s -> %s", (slot, firstShape, shape) => {
+    const publication = published.get(`${slot} ${firstShape} ${shape}`);
     expect(publication, "the BOUND row for this task did not finish").toBeDefined();
     const finals = (comments: Array<{ body: string }>) => comments.filter(c => !c.body.includes("Paperclip is continuing"));
-    expect.soft(finals(publication!.before)).toHaveLength(1);
+    const exactBody = `${STREAMED_PREFIX}\n\n— ${expectedNotes[shape]}`;
+    expect.soft(finals(publication!.before).map(c => c.body)).toEqual([exactBody]);
     expect.soft(publication!.sweeps).toHaveLength(2);
     for (const sweep of publication!.sweeps) {
-      expect.soft(finals(sweep.comments)).toHaveLength(1);
+      expect.soft(sweep.comments).toEqual(publication!.before); // +1m/+1h must add NOTHING
+      expect.soft(finals(sweep.comments).map(c => c.body)).toEqual([exactBody]);
       expect.soft(sweep.comments.map(c => c.body).join("\n")).not.toMatch(SWEEP_SAFE_LINE);
     }
   });
