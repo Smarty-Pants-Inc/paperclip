@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
@@ -666,6 +666,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
    * (the one retainCancelledSession requires to keep a warm Pi owner). */
   async function stopSettledOwner(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, options: {
     ack?: "own" | "none" | "other-run"; failureCode?: string; leaseOwner?: string;
+    /** C1: the person's Stop is recorded even when it was never acknowledged. */
+    personStop?: boolean;
     /** The owner's own committed provider events (PRP payloads). */
     events?: Array<{ eventType: string; payload: Record<string, unknown> }> } = {}) {
     const ack = options.ack ?? "own";
@@ -677,7 +679,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const nativeCancellation = { schema: "paperclip.native-cancellation.v1", runId: ack === "other-run" ? randomUUID() : prior.runId,
       companyId, issueId: prior.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
       dispatched: true, intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID() };
-    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", resultJson: ack === "none" ? {}
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", resultJson: ack === "none"
+      ? (options.personStop ? { cancelledByActorType: "user", cancelledByUserId: "board-user" } : {})
       : { cancelledByActorType: "user", cancelledByUserId: "board-user", nativeCancellation } })
       .where(eq(heartbeatRuns.id, prior.runId));
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: options.failureCode ?? "native_retry_cancelled",
@@ -742,7 +745,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
 
   /** H6 (recovery/service.ts): a warm Stop whose release was skipped raises
    * the Stop-pending card through its real writer, never a hand-made row. */
+  /** C1: no Stop-pending card within 60 s of a Stopped run's finish. */
+  async function finishedSettleWindowAgo(runIds: string[]) {
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 61_000) })
+      .where(and(inArray(heartbeatRuns.id, runIds), isNotNull(heartbeatRuns.finishedAt)));
+  }
   async function raiseStopPendingCard(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, runIds = [prior.runId]) {
+    await finishedSettleWindowAgo([prior.runId]);
     await db.transaction(async tx => recordTaskStopPending(tx as unknown as typeof db, { companyId, issueId: prior.issueId,
       runIds, source: "recovery.sweep_stale_issue_locks" }, []));
     const [card] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, prior.issueId),
@@ -788,6 +797,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     ] });
     await db.update(issues).set({ checkoutRunId: prior.runId, executionRunId: prior.runId })
       .where(eq(issues.id, prior.issueId));
+    await finishedSettleWindowAgo([prior.runId]);
     const enqueueWakeup = vi.fn();
     const swept = await recoveryService(db, { enqueueWakeup }).sweepStaleIssueLocks({ companyId, issueId: prior.issueId });
     expect(swept).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
@@ -832,6 +842,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     if (missingCheckpoint) await db.delete(nativeRunnerCheckpoints).where(eq(nativeRunnerCheckpoints.runId, second.runId));
     await db.update(issues).set({ checkoutRunId: first.runId, executionRunId: second.runId })
       .where(eq(issues.id, first.issueId));
+    await finishedSettleWindowAgo([first.runId, second.runId]);
     expect((await recoveryService(db, { enqueueWakeup: vi.fn() })
       .sweepStaleIssueLocks({ companyId, issueId: first.issueId })).cleared).toBe(0);
     const [card] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, first.issueId));
@@ -890,19 +901,23 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   // card; the warm-adoption path (native-controller-recovery) reads both. The
   // card itself must therefore hold for every unproven or stronger case.
   const SETTLED_JOURNAL = JSON.stringify({ commands: [{ type: "turn.interrupt", status: "completed" }], committedEvents: [] });
-  it.each([
+  const heldCases = [
     { label: "a proven Stop", held: false },
     { label: "no caller journal", held: true, journal: null },
     { label: "an undelivered tool answer", held: true, journal: JSON.stringify({ commands: [],
       committedEvents: [{ eventType: "semantic_tool.input", sourceEventId: "unanswered" }] }) },
     { label: "an escalated Pi abort", held: true, stop: { events: [{ eventType: "harness.diagnostic",
       payload: { code: "pi_abort_escalated", message: "abort did not settle" } }] } },
-    { label: "an unacknowledged Stop", held: true, stop: { ack: "none" as const } },
+    { label: "an unacknowledged Stop", held: true, stop: { ack: "none" as const, personStop: true } },
     { label: "another failure code", held: true, stop: { failureCode: "native_session_interrupted" } },
     { label: "a live finalization lease", held: true, stop: { leaseOwner: "still-running-controller" } },
     { label: "a card naming another run", held: true, otherRun: true },
     { label: "a stronger obligation", held: true, stronger: true },
-  ])("nativeUserStopRecoveryHeld on a Stop-pending card with $label: held=$held", async ({ held, journal, stop, otherRun, stronger }) => {
+  ];
+  it.each(heldCases.filter(c => c.label !== "an unacknowledged Stop"))("nativeUserStopRecoveryHeld on a Stop-pending card with $label: held=$held", stopRecoveryHeld, 60_000);
+  // C1: a card needs a recorded Stop; this fixture now records the person's Stop.
+  it.each(heldCases.filter(c => c.label === "an unacknowledged Stop"))("supersedes(C1 no-Stop card): nativeUserStopRecoveryHeld on a Stop-pending card with $label: held=$held", stopRecoveryHeld, 60_000);
+  async function stopRecoveryHeld({ held, journal, stop, otherRun, stronger }: (typeof heldCases)[number]) {
     const prior = await seedRecoveredPriorRun();
     await stopSettledOwner(prior, stop ?? {});
     if (stronger) {
@@ -915,7 +930,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const binding = { companyId, issueId: prior.issueId, runId: prior.runId };
     expect(await nativeUserStopRecoveryHeld(db, binding,
       journal === null ? undefined : { controlBytes: journal ?? SETTLED_JOURNAL })).toBe(held);
-  }, 60_000);
+  }
 
   it("keeps a Stop-settled owner held while its controller is still running", async () => {
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { stdio: "ignore" });

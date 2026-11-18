@@ -124,8 +124,9 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   const stoppedRuns = boundRuns.filter(hasRecordedStopRequest);
   if (!stoppedRuns.length) return;
   // C1 guard 2: give the stop receipt time to land after the run finishes.
+  // A Stopped run that never finishes is the true Stop-pending case: it may card.
   const settledBefore = Date.now() - TASK_STOP_PENDING_SETTLE_MS;
-  if (!stoppedRuns.some(run => run.finishedAt && run.finishedAt.getTime() <= settledBefore)) return;
+  if (!stoppedRuns.some(run => !run.finishedAt || run.finishedAt.getTime() <= settledBefore)) return;
   // A provider refusal is not a Stop request. Suppress only that diagnostic,
   // never the underlying execution claims or any genuinely requested Stop.
   const noStopRefusals = new Set(boundRuns.filter(run => run.status === "failed"
