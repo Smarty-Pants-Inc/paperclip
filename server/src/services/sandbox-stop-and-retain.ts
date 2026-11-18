@@ -473,7 +473,3 @@ export async function settleAbsentSandbox(db: Db, lease: typeof environmentLease
   });
   return changed.length === 1;
 }
-
-/** The one note a person sees after their acknowledged Stop, and only when the
- * provider confirmed stop_and_retain for the stopped run's sandbox. */
-export const PERSON_STOP_RETAINED_NOTE = "The stopped turn's unsaved changes stay on the previous sandbox and can be recovered.";

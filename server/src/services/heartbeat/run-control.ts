@@ -105,7 +105,8 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { hasConfirmedSandboxStopAndRetain, PERSON_STOP_RETAINED_NOTE } from "../sandbox-stop-and-retain.js";
+import { hasConfirmedSandboxStopAndRetain } from "../sandbox-stop-and-retain.js";
+import { PERSON_STOP_NOTE } from "../system-recovery-state.js";
 import {
   type EnvironmentLeaseStatus,
 } from "@paperclipai/shared";
@@ -569,7 +570,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       await tx.insert(issueRecoveryActions).values({
         companyId: run.companyId, sourceIssueId: run.issueId!, kind: "active_run_watchdog", ownerType: "system",
         cause: "person_stop_retained_sandbox", fingerprint, status: "resolved", outcome: "cancelled", resolvedAt: now,
-        nextAction: PERSON_STOP_RETAINED_NOTE,
+        nextAction: PERSON_STOP_NOTE,
         evidence: { runId: run.id, personStopRetainedSandbox: { leaseIds: leases.filter(lease => hasConfirmedSandboxStopAndRetain(lease)).map(lease => lease.id), recordedAt: now.toISOString() } },
       });
     });
