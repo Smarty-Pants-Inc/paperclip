@@ -402,6 +402,8 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
   // RF2 (RFL 14:57Z): on the LEGACY runtime a successor that failed adapter_failed leaves an execution blocker
   // (active_run_watchdog, legacy_execution_requires_reconciliation); dispatch defers every new message. The sweep's
   // "Sending it again is safe" notice takes its remedy from the ONE helper, which asks that blocker.
+  // Named limit (RFL record SUPERSEDE-HELDNOTE-RF2-NEWTASK-1118): the legacy new task is shown unblocked, not
+  // answered: this file has no process provider, so no run answers it here. Tracked with gold smarty-dev#21183.
   it("RF2: legacy (process) successor failed adapter_failed -> the sweep's notice and Next action say 'assign a new task', never 'safe'; a real POST is deferred; CONTROL native ordinary failure keeps its text", async () => {
     closeProcessRunAdmission();
     try {
@@ -457,6 +459,8 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
         } else {
           // CONTROL: a native agent's ordinary failure (no blocker) keeps today's text.
           expect(notes[0]!.body).toBe(UNANSWERED_MESSAGE_TEXT);
+          expect(notes[0]!.body, "CONTROL: the exact 'safe' text, pinned literally")
+            .toBe("Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.");
           expect(nextActionOf(notes[0]!)).toContain("Send the message again; if it fails again, assign this agent a new task.");
         }
       }
