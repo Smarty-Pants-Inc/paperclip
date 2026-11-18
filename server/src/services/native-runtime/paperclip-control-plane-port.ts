@@ -94,10 +94,35 @@ function record(value: unknown): Record<string, unknown> {
 
 /** Text leaves only: do not apply field-name masking to protocol objects. */
 function redactNativeText<T>(value: T): T {
-  if (typeof value === "string") return redactSensitiveText(value) as T;
-  if (Array.isArray(value)) return value.map(redactNativeText) as T;
+  if (typeof value === "string") {
+    // Pi tool inputs can themselves be serialized JSON. Decode before masking:
+    // an escaped newline's `n` otherwise hides the following key's word boundary.
+    if (/^[\[{]/.test(value.trimStart())) {
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(value);
+      } catch {
+        // JSON-looking plain text still takes the ordinary redaction path.
+        return redactSensitiveText(value) as T;
+      }
+      const masked = redactNativeText(decoded);
+      // Preserve formatting/escapes byte-for-byte unless a leaf changed.
+      return (masked === decoded ? value : JSON.stringify(masked)) as T;
+    }
+    return redactSensitiveText(value) as T;
+  }
+  if (Array.isArray(value)) {
+    const masked = value.map(redactNativeText);
+    return (masked.some((child, index) => child !== value[index]) ? masked : value) as T;
+  }
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, redactNativeText(child)])) as T;
+    let changed = false;
+    const entries = Object.entries(value).map(([key, child]) => {
+      const masked = redactNativeText(child);
+      if (masked !== child) changed = true;
+      return [key, masked];
+    });
+    return changed ? Object.fromEntries(entries) as T : value;
   }
   return value;
 }
@@ -505,7 +530,9 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     event = redactRunnerApiEvent(event);
     // Commit and hash the SAME masked event. Replays, observers, transcript
     // reads and source-log integrity checks must all see this canonical form.
-    if (/^(?:item|tool|message|semantic_tool)\./.test(event.eventType)) {
+    // PRP v1-v3 content families include diagnostics, plans, requests and
+    // terminal summaries, not just transcript items and tool results.
+    if (/^(?:item|tool|message|semantic_tool|turn|session|runner|runtime|workspace|harness|plan|research|delegation|model|context|artifact|review|hook|memory|safety|terminal|wait|provider|mcp_app|runtime_request|interaction|run|attention|work|issue|external_provider)\./.test(event.eventType)) {
       event = { ...event, payload: redactNativeText(event.payload),
         ...(event.debug === undefined ? {} : { debug: redactNativeText(event.debug) }) };
     }
