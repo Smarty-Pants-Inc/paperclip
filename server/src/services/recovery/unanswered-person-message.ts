@@ -25,6 +25,7 @@ import { conversationTurnAnswered } from "../native-runtime/native-governance.js
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { noticeMetadataReferencesRecoveryAction } from "./successful-run-handoff.js";
 import { keyValueRow } from "./notice-format.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
@@ -655,9 +656,11 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   if (agentPaused) {
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
-    // Re-checked every 30 s (was 5 min) so the sweep after a Resume finds it.
+    // The standing recheck stays 5 min: a Resume does not wait for it. The
+    // resume transition's own effect (notifyPausedNoteResume) hands each of
+    // the agent's tasks with this note to the sweep's per-issue entry now.
     if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
-      return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+      return { kind: "pending", recheckAt: now.getTime() + 5 * 60_000 };
     }
   }
   let waitingToStart = false;
@@ -899,6 +902,25 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
 
+
+/** Resume (paused -> resuming) is an event: every open task of this agent whose
+ * person's message carries a standing '<agent> is paused' note is handed to the
+ * stranded sweep's per-issue entry (settleUnansweredPersonMessagesForTask) at
+ * commit, so the SAME note is upgraded now, not at the 5-min recheck. Called
+ * in the lifecycle transaction (services/agent-lifecycle.ts recordStatus). */
+export async function notifyPausedNoteResume(tx: Db, scope: { companyId: string; agentId: string }): Promise<void> {
+  const pausedRow = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL, value: UNANSWERED_MESSAGE_AGENT_PAUSED_CODE }] }]);
+  const rows = await tx.selectDistinct({ id: issues.id }).from(issues)
+    .innerJoin(issueComments, and(eq(issueComments.companyId, issues.companyId), eq(issueComments.issueId, issues.id)))
+    .where(and(eq(issues.companyId, scope.companyId), eq(issues.assigneeAgentId, scope.agentId), isNull(issues.hiddenAt),
+      inArray(issues.status, ["todo", "in_progress", "in_review", "blocked"]),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+      sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
+      sql`coalesce(${issueComments.metadata}->'sections' @> ${pausedRow}::jsonb, false)`)).limit(200);
+  for (const row of rows) {
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.strandedAssignments, JSON.stringify({ companyId: scope.companyId, issueId: row.id }));
+  }
+}
 
 /** One task the recovery worker already flagged (its batched page query found
  * a person's message to settle): no candidate lookup of its own. */
