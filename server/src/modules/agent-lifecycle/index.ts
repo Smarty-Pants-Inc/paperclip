@@ -10,7 +10,7 @@ import { updateAgentConfiguration } from "./adapters/configuration.js";
 import type { AgentConfigurationPatch, UpdateAgentOptions } from "../../lib/agent-records.js";
 import { purgeAgent } from "./adapters/deletion.js";
 import { agentRecords } from "./adapters/records.js";
-import { assertRootDatabase, createLifecycleStore, pendingLifecycleWork, lifecycleSignalWait, lifecycleStopParkWithoutError, surfaceAgentLifecycleStopParkInTransaction, requestAgentLifecycleRecheckInTransaction } from "./adapters/postgres.js";
+import { assertRootDatabase, createLifecycleStore, pendingLifecycleWork, lifecycleEnvironmentWarningPending, lifecycleEnvironmentWarningAt, lifecycleSignalWait, lifecycleStopParkWithoutError, surfaceAgentLifecycleStopParkInTransaction, requestAgentLifecycleRecheckInTransaction } from "./adapters/postgres.js";
 import { hasCompanyHoldMismatch, projectCompanyHolds } from "./adapters/company-policy.js";
 import { createLifecycleWorker } from "./application/worker.js";
 import type { LifecycleDriver } from "./application/ports.js";
@@ -171,9 +171,11 @@ export function startAgentLifecycle(db: Db, effects: LifecycleEffects, driver: L
         await initializeRecovery();
         if (!recoveryDone) return true;
       }
-      const [pending] = await db.select({ due: sql<number | null>`min(greatest(
+      const [pending] = await db.select({ due: sql<number | null>`min(least(greatest(
         coalesce(extract(epoch from (${agents.lifecycleOperation}->>'leaseUntil')::timestamptz) * 1000, 0),
-        coalesce(extract(epoch from (${agents.lifecycleOperation}->>'retryAt')::timestamptz) * 1000, 0)))::double precision` })
+        coalesce(extract(epoch from (${agents.lifecycleOperation}->>'retryAt')::timestamptz) * 1000, 0)),
+        case when ${lifecycleEnvironmentWarningPending} then ${lifecycleEnvironmentWarningAt}
+          else 'Infinity'::double precision end))::double precision` })
         .from(agents).where(pendingLifecycleWork);
       const due = pending?.due == null ? null : Number(pending.due);
       const now = Date.now();
