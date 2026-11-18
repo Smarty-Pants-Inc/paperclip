@@ -3,7 +3,8 @@ import { activityLog, agents, companies, createDb, environmentLeases, environmen
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { runExecutionsHaveStopped } from "../services/agent-execution-stop.js";
+import { agentExecutionStopBlocker, runExecutionsHaveStopped } from "../services/agent-execution-stop.js";
+import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { claimCancellationRequest } from "../services/native-runtime/native-cancellation-request.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
@@ -164,6 +165,46 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     expect(await stopActions(f.issueId)).toMatchObject([{ cause: "execution_stop_pending", status: "escalated", ownerType: "board" }]);
   });
 
+  // RF3 case (h): the shared guard reports lease cleanup first, so recovery
+  // must independently preserve the missing remote termination proof.
+  it.each(["sweep", "stranded"] as const)("%s remote_stop_unconfirmed is an independent blocker, not just unreleased lease", async path => {
+    const f = await warmFixture(path === "stranded");
+    await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    expect(await agentExecutionStopBlocker(db, [f.agentId])).toBe("remote_stop_unconfirmed");
+    await db.update(environmentLeases).set({ status: "active", releasedAt: null, cleanupStatus: null })
+      .where(eq(environmentLeases.id, f.lease.id));
+    const before = await task(f.issueId);
+    await inspect(f, path);
+    expect(await stopActions(f.issueId)).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+    expect(await task(f.issueId)).toEqual(before);
+  });
+
+  it.each(["sweep", "stranded"] as const)("%s still defers ordinary cleanup with a receipt-proven cancelled remote co-owner", async path => {
+    const f = await warmFixture(path === "stranded"), checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: checkoutRunId, companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "on_demand", status: "cancelled", runtimeMode: "native", executionStage: "settled",
+      issueId: f.issueId, nativeIssueId: f.issueId, contextSnapshot: { issueId: f.issueId },
+      startedAt: new Date(Date.now() - 120_000), finishedAt: new Date(Date.now() - 60_000), resultJson: {},
+      createdAt: new Date(0) });
+    const [released] = await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId,
+      heartbeatRunId: checkoutRunId, provider: "plugin:boat:computer", providerLeaseId: `boat-${checkoutRunId}`,
+      status: "released", cleanupStatus: "success", releasedAt: new Date() }).returning();
+    // The shared helper requires successful release as well as the bound receipt.
+    // The other owner retains the ordinary unreleased lease receiving grace.
+    await db.update(environmentLeases).set({ metadata: { remoteExecutionTermination: remoteTerminationReceipt(released!, {
+      providerLeaseId: released!.providerLeaseId, state: "stopped" }) } }).where(eq(environmentLeases.id, released!.id));
+    await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, f.issueId));
+    expect(await runExecutionsHaveStopped(db, f.companyId, [checkoutRunId])).toBe(true);
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    const before = await task(f.issueId);
+    await inspect(f, path);
+    expect(await stopActions(f.issueId)).toEqual([]);
+    expect(await task(f.issueId)).toEqual(before);
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0]).toEqual(f.lease);
+  });
+
   it("does not hide task cancellation behind a succeeded warm run", async () => {
     const f = await warmFixture();
     // A conversation is open-only; task cancellation retires its identity too.
@@ -217,7 +258,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     }
   });
 
-  it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted"] as const)("does not infer a Stop request from terminal status %s", async status => {
+  it.each(["succeeded", "failed", "timed_out", "interrupted"] as const)("does not infer a Stop request from terminal status %s", async status => {
     const f = await warmFixture();
     await db.update(heartbeatRuns).set({ status, resultJson: { stopReason: "cancelled" } }).where(eq(heartbeatRuns.id, f.runId));
     await db.update(environmentLeases).set({ metadata: { releaseDeferral: { reason: "release_failed", attempts: 1,
