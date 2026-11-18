@@ -44,9 +44,12 @@ import { redactSensitiveText } from "../redaction.js";
  *   included) and ArrayBuffer.
  * - A credential split across two fields, or across two log lines, is in no
  *   single string either layer scans.
- * - Both layers also mask by key name: a value of any type under a key in
- *   SENSITIVE_LOG_KEY_NAMES (http-log-redaction.ts; whole key, any case, "-"
- *   and "_" alike) becomes "[masked: sensitive key]". The walker does it at
+ * - Both layers also mask by key name: under a key in SENSITIVE_LOG_KEY_NAMES
+ *   (http-log-redaction.ts; whole key, any case, "-" and "_" alike) a string
+ *   or byte value (Buffer, typed array, ArrayBuffer) becomes
+ *   "[masked: sensitive key]"; in an object or array there every string and
+ *   byte leaf does, and the shape is kept. Booleans, numbers and null carry no
+ *   credential and stay as written (`secret: false`). The walker does it at
  *   any depth of err, stderr, stdout, msg and errorContext; the backstop does
  *   it in every field of the line, so it also covers fields no serializer
  *   visits ({"ctx":{"x-api-key":"abc"}}), child bindings, and pino-http's req
@@ -99,15 +102,18 @@ function setLogField(target: Record<string, unknown>, key: string, value: unknow
 // toJSON that throws becomes a fixed marker. Past the depth bound a subtree is
 // replaced, never passed through unread. `ancestors` holds the current path
 // only, so a true cycle is "[Circular]" and a shared reference is written twice.
-function redactLogValue(value: unknown, depth = 0, ancestors = new Set<object>()): unknown {
-  if (typeof value === "string") return redactSensitiveText(value);
+// `sensitive`: the value is under a sensitive key name, at any depth. Then
+// every string and byte value in it is the marker; booleans, numbers and null
+// are kept, and so is the shape of an object or array.
+function redactLogValue(value: unknown, depth = 0, ancestors = new Set<object>(), sensitive = false): unknown {
+  if (typeof value === "string") return sensitive ? SENSITIVE_KEY_LOG_VALUE : redactSensitiveText(value);
   if (typeof value === "function") return undefined;
   if (!value || typeof value !== "object") return value;
   if (depth > MAX_LOG_REDACTION_DEPTH) return TRUNCATED_LOG_VALUE;
   if (ancestors.has(value)) return "[Circular]";
   ancestors.add(value);
   try {
-    return redactLogObject(value, depth, ancestors);
+    return redactLogObject(value, depth, ancestors, sensitive);
   } catch {
     return UNREADABLE_LOG_VALUE;
   } finally {
@@ -115,35 +121,33 @@ function redactLogValue(value: unknown, depth = 0, ancestors = new Set<object>()
   }
 }
 
-function redactLogObject(value: object, depth: number, ancestors: Set<object>): unknown {
+function redactLogObject(value: object, depth: number, ancestors: Set<object>, sensitive: boolean): unknown {
   const bytes = binaryLogBytes(value);
-  if (bytes) return binaryLogText(bytes);
+  if (bytes) return sensitive ? SENSITIVE_KEY_LOG_VALUE : binaryLogText(bytes);
   // A URL's userinfo and query are credentials the text scan cannot know; the
   // request-URL policy drops both.
-  if (value instanceof URL) return redactSensitiveText(stripSecretBearingUrlParts(value.href));
+  if (value instanceof URL) {
+    return sensitive ? SENSITIVE_KEY_LOG_VALUE : redactSensitiveText(stripSecretBearingUrlParts(value.href));
+  }
   const toJSON = (value as { toJSON?: unknown }).toJSON;
   if (typeof toJSON === "function") {
     // JSON.stringify would call this after masking; call it now, once, and
     // mask what it returns (a Date's ISO text, an HTTP client error's config).
-    return redactLogValue(toJSON.call(value, ""), depth + 1, ancestors);
+    return redactLogValue(toJSON.call(value, ""), depth + 1, ancestors, sensitive);
   }
-  if (Array.isArray(value)) return value.map((item) => redactLogValue(item, depth + 1, ancestors));
+  if (Array.isArray(value)) return value.map((item) => redactLogValue(item, depth + 1, ancestors, sensitive));
   const copy: Record<string, unknown> = {};
   for (const key of Object.keys(value)) {
-    // A value under a sensitive key name is a credential whatever its shape
-    // or type (an `x-api-key` header of 32 random characters): a fixed marker,
-    // never read.
-    if (sensitiveLogKey(key)) {
-      setLogField(copy, key, SENSITIVE_KEY_LOG_VALUE);
-      continue;
-    }
     let item: unknown;
     try {
       item = (value as Record<string, unknown>)[key];
     } catch {
       item = UNREADABLE_LOG_VALUE;
     }
-    const masked = redactLogValue(item, depth + 1, ancestors);
+    // Under a sensitive key name (an `x-api-key` header of 32 random
+    // characters has no credential shape) a string or byte value is the
+    // marker, whatever it holds; a boolean, number or null is kept.
+    const masked = redactLogValue(item, depth + 1, ancestors, sensitive || sensitiveLogKey(key));
     if (masked !== undefined) setLogField(copy, redactSensitiveText(key), masked);
   }
   return copy;
@@ -159,11 +163,13 @@ function redactLogObject(value: object, depth: number, ancestors: Set<object>): 
 // A line with nothing to mask is returned as the same string, byte for byte;
 // on a masked line only the masked tokens change, so Pino's key order and
 // duplicate keys are kept (a whole-line JSON.parse/stringify would reorder
-// integer-like keys and collapse duplicates). A key token whose decoded name
-// is in SENSITIVE_LOG_KEY_NAMES has its whole value (a string, number or
-// literal, or a balanced object or array) replaced with
-// "[masked: sensitive key]", whatever field it is in. The scan is a loop, not
-// a recursion: there is no depth limit to fall past.
+// integer-like keys and collapse duplicates). Under a key token whose decoded
+// name is in SENSITIVE_LOG_KEY_NAMES, whatever field it is in, a string token
+// or a byte shape (a Buffer's {"type":"Buffer","data":[...]}, a typed array's
+// {"0":n,...}) becomes "[masked: sensitive key]"; in an object or array there,
+// every string token and byte shape does and the brackets stay. true, false,
+// null and numbers stay as written. The scan is a loop, not a recursion: there
+// is no depth limit to fall past.
 export function maskSerializedLogLine(line: string): string {
   return maskSerializedLogStrings(maskSerializedLogBytes(line));
 }
@@ -216,15 +222,22 @@ function maskedSerializedBuffer(match: string, values: number[]): string {
   return masked === text ? match : JSON.stringify(masked);
 }
 
+// The elements of a {"0":n,"1":n,...} match, or null when its keys are not
+// the indexes 0, 1, 2, ... in order (then it is not a view's shape).
+function serializedIndexElements(match: string): number[] | null {
+  const entries = Object.entries(JSON.parse(match) as Record<string, number>);
+  if (entries.some(([key], index) => key !== String(index))) return null;
+  return entries.map(([, byte]) => byte);
+}
+
 function maskSerializedLogBytes(line: string): string {
   if (!line.includes('"data":[') && !line.includes('{"0":')) return line;
   return line
     .replace(SERIALIZED_BUFFER_RE, (match, data: string) =>
       data ? maskedSerializedBuffer(match, data.split(",").map(Number)) : match)
     .replace(SERIALIZED_INDEX_OBJECT_RE, (match) => {
-      const entries = Object.entries(JSON.parse(match) as Record<string, number>);
-      if (entries.some(([key], index) => key !== String(index))) return match;
-      return maskedSerializedBytes(match, entries.map(([, byte]) => byte));
+      const elements = serializedIndexElements(match);
+      return elements ? maskedSerializedBytes(match, elements) : match;
     });
 }
 
@@ -299,13 +312,16 @@ function maskSerializedLogStrings(line: string): string {
     // A string followed by ":" is a key (JSON has no other place for one).
     const colon = jsonSpaceEnd(line, end + 1);
     if (line.charCodeAt(colon) === 0x3a && sensitiveLogKey(text)) {
-      // A key with a sensitive name: its whole value becomes the marker.
+      // A key with a sensitive name: the string and byte values in its value.
       const valueStart = jsonSpaceEnd(line, colon + 1);
       const valueEnd = jsonValueEnd(line, valueStart);
       if (valueEnd === -1) return unparsableLogLine(line);
-      if (!MASKED_KEY_LOG_JSON.has(line.slice(valueStart, valueEnd))) {
+      const value = line.slice(valueStart, valueEnd);
+      const maskedValue = maskSensitiveKeyJson(value);
+      if (maskedValue === null) return unparsableLogLine(line);
+      if (maskedValue !== value) {
         parts ??= [];
-        parts.push(line.slice(copied, valueStart), SENSITIVE_KEY_LOG_JSON);
+        parts.push(line.slice(copied, valueStart), maskedValue);
         copied = valueEnd;
       }
       index = line.indexOf('"', valueEnd);
@@ -320,6 +336,52 @@ function maskSerializedLogStrings(line: string): string {
   }
   if (!parts) return line;
   parts.push(line.slice(copied));
+  return parts.join("");
+}
+
+// The JSON value under a sensitive key name, with every string token and byte
+// shape in it replaced with the marker (a value already written as "[Redacted]"
+// or as the marker is left as it is), and true, false, null, numbers, keys and
+// brackets kept: `false` stays `false`, `{"hash":"x","n":1}` becomes
+// `{"hash":"[masked: sensitive key]","n":1}`. null if a token does not parse.
+function maskSensitiveKeyJson(value: string): string | null {
+  const first = value.charCodeAt(0);
+  if (first === 0x22) return MASKED_KEY_LOG_JSON.has(value) ? value : SENSITIVE_KEY_LOG_JSON;
+  if (first !== 0x7b && first !== 0x5b) return value;
+  // Byte shapes first (structural: never inside a string), each to the marker.
+  const json = value
+    .replace(SERIALIZED_BUFFER_RE, () => SENSITIVE_KEY_LOG_JSON)
+    .replace(SERIALIZED_INDEX_OBJECT_RE, (match) => (serializedIndexElements(match) ? SENSITIVE_KEY_LOG_JSON : match));
+  let parts: string[] | null = null;
+  let copied = 0;
+  let index = json.indexOf('"');
+  while (index !== -1) {
+    const end = jsonStringEnd(json, index);
+    if (end === -1) return null;
+    const token = json.slice(index, end + 1);
+    let replacement: string | null = null;
+    if (json.charCodeAt(jsonSpaceEnd(json, end + 1)) === 0x3a) {
+      // A key: kept, its text masked by shape like every other key.
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(token);
+      } catch {
+        return null;
+      }
+      const masked = redactSensitiveText(decoded as string);
+      if (masked !== decoded) replacement = JSON.stringify(masked);
+    } else if (!MASKED_KEY_LOG_JSON.has(token)) {
+      replacement = SENSITIVE_KEY_LOG_JSON;
+    }
+    if (replacement !== null) {
+      parts ??= [];
+      parts.push(json.slice(copied, index), replacement);
+      copied = end + 1;
+    }
+    index = json.indexOf('"', end + 1);
+  }
+  if (!parts) return json;
+  parts.push(json.slice(copied));
   return parts.join("");
 }
 
@@ -354,7 +416,7 @@ export function redactedErrSerializer(err: unknown): unknown {
   // The standard serializer returns a fresh object whose prototype carries the
   // non-enumerable `raw` reference; redact its own fields in place.
   for (const key of Object.keys(record)) {
-    record[key] = sensitiveLogKey(key) ? SENSITIVE_KEY_LOG_VALUE : redactLogValue(record[key]);
+    record[key] = redactLogValue(record[key], 0, new Set<object>(), sensitiveLogKey(key));
   }
   return record;
 }

@@ -726,23 +726,23 @@ describe.each<Layer>(["production", "walker"])("values under sensitive key names
     for (const record of fiveHundreds) expect(record.err.config.headers["x-api-key"]).toBe(SENSITIVE_KEY_MARKER);
   });
 
-  it("masks `password` nested 6 deep, a Set-Cookie array, and values of any type", () => {
+  it("masks `password` nested 6 deep, a Set-Cookie array, and the strings inside any value; numbers, booleans and null stay", () => {
     const { log, output } = captureLayer(layer);
     const details = { a: { b: { c: { d: { e: { password: "plain-words-no-shape", user: "app" } } } } } };
     log.error({ err: Object.assign(new Error("db login failed"), { details }) }, "db");
     log.warn({ stderr: { headers: { "Set-Cookie": ["sid=f00dfeed1234; Path=/; HttpOnly", "csrf=abcd"], "Content-Type": "text/html" } } }, "cookie");
     log.warn({ stdout: { X_API_KEY: 1234567890, "Client-Secret": { nested: "shapeless-client-secret" }, ACCESS_TOKEN: ["a", "b"], Passwd: true, private_key: null } }, "types");
     const text = output();
-    for (const raw of ["plain-words-no-shape", "f00dfeed1234", "csrf=abcd", "1234567890", "shapeless-client-secret"]) expect(text).not.toContain(raw);
+    for (const raw of ["plain-words-no-shape", "f00dfeed1234", "csrf=abcd", "shapeless-client-secret"]) expect(text).not.toContain(raw);
     const [db, cookie, types] = records(text);
     expect(db.err.details.a.b.c.d.e).toEqual({ password: SENSITIVE_KEY_MARKER, user: "app" });
-    expect(cookie.stderr.headers).toEqual({ "Set-Cookie": SENSITIVE_KEY_MARKER, "Content-Type": "text/html" });
+    expect(cookie.stderr.headers).toEqual({ "Set-Cookie": [SENSITIVE_KEY_MARKER, SENSITIVE_KEY_MARKER], "Content-Type": "text/html" });
     expect(types.stdout).toEqual({
-      X_API_KEY: SENSITIVE_KEY_MARKER,
-      "Client-Secret": SENSITIVE_KEY_MARKER,
-      ACCESS_TOKEN: SENSITIVE_KEY_MARKER,
-      Passwd: SENSITIVE_KEY_MARKER,
-      private_key: SENSITIVE_KEY_MARKER,
+      X_API_KEY: 1234567890,
+      "Client-Secret": { nested: SENSITIVE_KEY_MARKER },
+      ACCESS_TOKEN: [SENSITIVE_KEY_MARKER, SENSITIVE_KEY_MARKER],
+      Passwd: true,
+      private_key: null,
     });
   });
 
@@ -910,7 +910,7 @@ describe.each<Layer>(["production", "backstop"])("sensitive key names are masked
     expect(done.res.statusCode).toBe(200);
   });
 
-  it("masks an object or array under `password` whole, and values of any type", () => {
+  it("masks every string inside an object or array under `password`, keeping its shape; numbers, booleans and null stay", () => {
     const { log, output } = captureLayer(layer);
     log.info({
       ctx: {
@@ -923,17 +923,17 @@ describe.each<Layer>(["production", "backstop"])("sensitive key names are masked
       after: "kept",
     }, "values");
     const text = output();
-    for (const raw of ["plain-words-no-shape", "p1-shapeless", "p2-shapeless", "p3-shapeless", "p4-shapeless", "1234567890"]) {
+    for (const raw of ["plain-words-no-shape", "p1-shapeless", "p2-shapeless", "p3-shapeless", "p4-shapeless"]) {
       expect(text).not.toContain(raw);
     }
     expectCleanLines(text);
     const [record] = records(text);
     expect(record.ctx).toEqual({
-      password: SENSITIVE_KEY_MARKER,
-      login: { user: "app", Password: SENSITIVE_KEY_MARKER },
-      SECRET: SENSITIVE_KEY_MARKER,
-      client_secret: SENSITIVE_KEY_MARKER,
-      private_key: SENSITIVE_KEY_MARKER,
+      password: { primary: SENSITIVE_KEY_MARKER, list: [SENSITIVE_KEY_MARKER, { deep: SENSITIVE_KEY_MARKER }] },
+      login: { user: "app", Password: [SENSITIVE_KEY_MARKER, SENSITIVE_KEY_MARKER] },
+      SECRET: 1234567890,
+      client_secret: true,
+      private_key: null,
     });
     expect(record.after).toBe("kept");
   });
@@ -949,10 +949,10 @@ describe.each<Layer>(["production", "backstop"])("sensitive key names are masked
 });
 
 describe("the backstop's key-name masking, given the line directly", () => {
-  it("masks the whole value after a sensitive key token, even with an escaped key or braces inside strings", () => {
+  it("masks the string values after a sensitive key token, even with an escaped key or braces inside strings", () => {
     const line = '{"level":30,"ctx":{"x\\u002dapi-key":"abc","password":{"a":"}{]\\"[","b":[1,{"c":2}]},"n":1},"msg":"x"}\n';
     expect(maskSerializedLogLine(line)).toBe(
-      '{"level":30,"ctx":{"x\\u002dapi-key":"[masked: sensitive key]","password":"[masked: sensitive key]","n":1},"msg":"x"}\n',
+      '{"level":30,"ctx":{"x\\u002dapi-key":"[masked: sensitive key]","password":{"a":"[masked: sensitive key]","b":[1,{"c":2}]},"n":1},"msg":"x"}\n',
     );
   });
 
@@ -964,6 +964,100 @@ describe("the backstop's key-name masking, given the line directly", () => {
     ]) {
       expect(maskSerializedLogLine(line)).toBe(line);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The sensitive-key rule masks only STRING and BYTE values (review-fleet-2):
+// `stderr: { secret: false }` is a diagnostic flag, not a credential, and a
+// number or null carries none either. Strings, Buffers and typed arrays under
+// a sensitive key are masked; inside an object or array under one, every
+// string leaf is masked and the shape kept. Walker path (stderr, stdout, err)
+// and backstop path (a field no serializer visits) alike.
+// ---------------------------------------------------------------------------
+
+const SHAPELESS_SECRET = "Qz82mT4vLp0sN7xRb5Wc";
+
+describe.each<Layer>(["production", "walker", "backstop"])("the sensitive-key rule masks only string and byte values (%s)", (layer) => {
+  it("keeps secret: false, secret: 0 and secret: null as written", () => {
+    const { log, output } = captureLayer(layer);
+    log.warn({ stderr: { secret: false, verbose: true }, stdout: { secret: 0, Client_Secret: null } }, "flags");
+    log.error({ err: Object.assign(new Error("x"), { secret: false, details: { password: 0, access_token: null } }) }, "err flags");
+    log.info({ ctx: { secret: false, SECRET: 0, "api-key": null, list: [{ secret: true }] } }, "ctx flags");
+    const text = output();
+    expectCleanLines(text);
+    expect(text).not.toContain(SENSITIVE_KEY_MARKER);
+    const [flags, errFlags, ctxFlags] = records(text);
+    expect(flags.stderr).toEqual({ secret: false, verbose: true });
+    expect(flags.stdout).toEqual({ secret: 0, Client_Secret: null });
+    expect(errFlags.err.secret).toBe(false);
+    expect(errFlags.err.details).toEqual({ password: 0, access_token: null });
+    expect(ctxFlags.ctx).toEqual({ secret: false, SECRET: 0, "api-key": null, list: [{ secret: true }] });
+  });
+
+  it("masks secret: 'Qz82…', a Client-Secret header string, and a Buffer or typed array under a sensitive key", () => {
+    const { log, output } = captureLayer(layer);
+    const bytes = Buffer.from("shapeless-byte-secret", "utf8");
+    log.warn({
+      stderr: { secret: SHAPELESS_SECRET, headers: { "Client-Secret": SHAPELESS_SECRET, Accept: "text/plain" } },
+      stdout: { password: bytes, access_token: new Uint8Array(bytes) },
+    }, "strings and bytes");
+    const text = output();
+    expect(text).not.toContain(SHAPELESS_SECRET);
+    expectCleanLines(text);
+    const [record] = records(text);
+    expect(record.stderr).toEqual({ secret: SENSITIVE_KEY_MARKER, headers: { "Client-Secret": SENSITIVE_KEY_MARKER, Accept: "text/plain" } });
+    expect(record.stdout).toEqual({ password: SENSITIVE_KEY_MARKER, access_token: SENSITIVE_KEY_MARKER });
+  });
+
+  it("masks the strings under password: { hash, algo } and keeps the shape and the number", () => {
+    const { log, output } = captureLayer(layer);
+    log.warn({ stderr: { password: { hash: "x-hash-shapeless", algo: "y-algo", rounds: 10 } } }, "shape");
+    const text = output();
+    expect(text).not.toContain("x-hash-shapeless");
+    expect(text).not.toContain("y-algo");
+    expect(records(text)[0].stderr).toEqual({ password: { hash: SENSITIVE_KEY_MARKER, algo: SENSITIVE_KEY_MARKER, rounds: 10 } });
+  });
+});
+
+describe.each<Layer>(["production", "backstop"])("the backstop's key rule masks only string and byte values (%s)", (layer) => {
+  it("in a field no serializer visits: strings and bytes masked, false / 0 / null kept", () => {
+    const { log, output } = captureLayer(layer);
+    const bytes = Buffer.from("shapeless-byte-secret", "utf8");
+    log.info({
+      ctx: {
+        secret: SHAPELESS_SECRET,
+        headers: { "Client-Secret": SHAPELESS_SECRET },
+        password: bytes,
+        access_token: new Uint16Array(new Uint8Array(Buffer.from("shapeless-u16-secret", "utf8")).buffer),
+        flags: { secret: false, cookie: 0, authorization: null },
+      },
+    }, "ctx");
+    const text = output();
+    expect(text).not.toContain(SHAPELESS_SECRET);
+    expectCleanLines(text);
+    expect(records(text)[0].ctx).toEqual({
+      secret: SENSITIVE_KEY_MARKER,
+      headers: { "Client-Secret": SENSITIVE_KEY_MARKER },
+      password: SENSITIVE_KEY_MARKER,
+      access_token: SENSITIVE_KEY_MARKER,
+      flags: { secret: false, cookie: 0, authorization: null },
+    });
+  });
+});
+
+describe("the backstop's key rule, given the line directly: string and byte tokens only", () => {
+  it("returns a line with false, 0, null and number arrays under sensitive keys byte for byte", () => {
+    const line = '{"level":30,"stderr":{"secret":false},"ctx":{"secret":0,"password":null,"access_token":-1.5e3,"cookie":[1,2,3],"x-api-key":{"on":true}},"msg":"x"}\n';
+    expect(maskSerializedLogLine(line)).toBe(line);
+  });
+
+  it("masks a string token, a Buffer shape and a typed-array index object under a sensitive key", () => {
+    const line = '{"ctx":{"secret":"Qz82mT4vLp0sN7xRb5Wc","password":{"type":"Buffer","data":[112,119]},"access_token":{"0":112,"1":119},"private_key":{"type":"Buffer","data":[]}},"n":[{"secret":{"inner":{"type":"Buffer","data":[1]},"n":2}}]}\n';
+    const marker = JSON.stringify(SENSITIVE_KEY_MARKER);
+    expect(maskSerializedLogLine(line)).toBe(
+      `{"ctx":{"secret":${marker},"password":${marker},"access_token":${marker},"private_key":${marker}},"n":[{"secret":{"inner":${marker},"n":2}}]}\n`,
+    );
   });
 });
 
