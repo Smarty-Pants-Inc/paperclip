@@ -436,4 +436,33 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
     expect(await stopCards(f.issueId)).toEqual([]);
     expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_environment_unreleased"))).toEqual([]);
   });
+
+  // C1 r5 (RFL F3): the no-card helper's 'delivered_answer' is the shared ANSWERED
+  // predicate (answeredPersonMessageSql), never a run's status.
+  async function succeededRunOnly() {
+    const f = await fixture({});
+    await db.update(heartbeatRuns).set({ status: "succeeded", issueId: f.issueId, contextSnapshot: { issueId: f.issueId } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ assigneeAgentId: f.agentId }).where(eq(issues.id, f.issueId));
+    return f;
+  }
+  it("C1 r5 F3: succeeded status alone is not a delivered answer, and cannot pass the helper (empty result, zero comments: silence fails)", async () => {
+    const f = await succeededRunOnly();
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toMatchObject({ status: "succeeded", resultJson: {} });
+    await expect(expectPersonSeesInsteadOfCard(db, f.issueId)).rejects.toThrow(/expected 'silent' not to be 'silent'/);
+  });
+  it("C1 r5 F3: the helper's delivered answer is the shared predicate: a carried person message stays silent until the run's reply answers it", async () => {
+    const f = await succeededRunOnly();
+    const messageId = randomUUID();
+    await db.insert(issueComments).values({ id: messageId, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: "board-user", body: "Please send me the final report.", createdAt: new Date(Date.now() - 120_000) });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: messageId } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    // The carried person message is unanswered and the run succeeded: not a delivered answer.
+    expect(await expectPersonSeesInsteadOfCard(db, f.issueId)).not.toBe("delivered_answer");
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: f.runId, body: "Here is the final report." });
+    expect(await expectPersonSeesInsteadOfCard(db, f.issueId)).toBe("delivered_answer");
+  });
 });
