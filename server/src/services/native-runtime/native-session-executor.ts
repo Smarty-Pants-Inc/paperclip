@@ -337,6 +337,7 @@ import {
   REMOTE_RECOVERY_MARKER_READ_SCRIPT, REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT,
   REMOTE_RUNNER_EXIT_EVIDENCE_SCRIPT, RemoteRunnerRecoveryError, attachRemoteRunnerRecoveryDiagnostic, boundRemoteRunnerExitEvidence,
   describeExitedRemoteRunner, describeExitedRemoteRunnerReason, describeExitedRemoteRunnerRunLog, exitedRunnerRequestedFreshBootstrap, readRemoteRunnerRecoveryError,
+  isRemoteRunnerSupervisionExhausted, REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION,
   remoteRecoveryProbeReason, runnerStateRequestsFreshBootstrap,
 } from "./remote-runner-recovery-diagnostics.js";
 import { createNativeStateStaging, fenceNativeStateStagingQuietly, removeNativeStateStaging, sweepNativeStateStaging } from "./native-state-staging.js";
@@ -9800,6 +9801,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "native_session_cleanup_quarantined" ||
     sourceFailureCode === "native_adopted_runner_authentication_timeout" ||
     sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED ||
+    sourceFailureCode === REMOTE_RUNNER_SUPERVISION_EXHAUSTED ||
     sourceFailureCode === "native_provider_usage_limit" ||
     sourceFailureCode === NATIVE_PROVIDER_SESSION_CLOSED ||
     sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED ||
@@ -10000,6 +10002,7 @@ export function nativeSessionFailureSourceCode(
   | "native_session_cleanup_quarantined"
   | "native_adopted_runner_authentication_timeout"
   | typeof REMOTE_RUNNER_OBSERVATION_EXHAUSTED
+  | typeof REMOTE_RUNNER_SUPERVISION_EXHAUSTED
   | "runner_remote_provider_artifact_incompatible"
   | "runner_remote_provider_verification_unavailable"
   | "provider_process_exited"
@@ -10032,6 +10035,7 @@ export function nativeSessionFailureSourceCode(
   | FreshThreadRefusalCode {
   if (error instanceof Error && /^(?:Notification transport failed closed: )?runner_process_observation_budget_exhausted:/.test(error.message))
     return REMOTE_RUNNER_OBSERVATION_EXHAUSTED;
+  if (isRemoteRunnerSupervisionExhausted(error)) return REMOTE_RUNNER_SUPERVISION_EXHAUSTED;
   const freshRefusal = freshThreadRefusalCode(error);
   if (freshRefusal) return freshRefusal;
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
@@ -14624,6 +14628,8 @@ async function executePaperclipNativeSessionAttempt(
                   ? startupRejectedAction
                   : sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED
                   ? REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION
+                  : sourceFailureCode === REMOTE_RUNNER_SUPERVISION_EXHAUSTED
+                  ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
                   : sourceFailureCode === NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER
                   ? NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER_ACTION
                   : sourceFailureCode === "native_session_cleanup_quarantined"
@@ -14915,6 +14921,8 @@ async function executePaperclipNativeSessionAttempt(
               ? startupRejectedAction
               : sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED
               ? REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION
+              : sourceFailureCode === REMOTE_RUNNER_SUPERVISION_EXHAUSTED
+              ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
               : sourceFailureCode === NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER
               ? NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER_ACTION
               : sourceFailureCode === "native_session_cleanup_quarantined"
