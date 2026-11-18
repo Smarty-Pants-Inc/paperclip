@@ -222,7 +222,28 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
   // The ONE shared definition (person-message-answer.ts), so B's notice and the continuation carry never
   // disagree on a message (RFL 20:22Z: run-less agent comments never answer; org 20:29Z: imported history).
   // No run-status rule of its own here: ANSWERED already requires the completed final answer.
-  return completedPersonMessageAnswerSql(m);
+  // Legacy card origin (rf-5 tA-min, C3-2 'direct'): see legacyCardOriginSql.
+  return sql`(${completedPersonMessageAnswerSql(m)} or ${legacyCardOriginSql(m)})`;
+}
+/**
+ * SQL: message m is the recorded asking origin (source_comment_id or
+ * origin_comment_ids) of a LEGACY card: one that recorded no source run
+ * (source_run_id null), so the shared ANSWERED rule cannot attribute the card
+ * to the run that carried m. The agent's card is its reply to m, as a card
+ * with a source run is; the person's card answer is new input with its own
+ * duty (owedCardAnswerSql). Without this the sweep posts a false notice for m
+ * after the card answer was acted on. The card statuses are ANSWERED's own.
+ */
+function legacyCardOriginSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
+  return sql`exists (select 1 from ${issueThreadInteractions} legacy_card
+    where legacy_card.company_id = ${m.companyId} and legacy_card.issue_id = ${m.issueId}
+      and legacy_card.source_run_id is null and legacy_card.created_by_agent_id is not null
+      and legacy_card.created_at > ${m.createdAt}
+      and (legacy_card.status in ('pending', 'answered', 'accepted', 'rejected')
+        or (legacy_card.status = 'cancelled' and legacy_card.resolved_by_user_id is not null
+          and (legacy_card.result->>'outcome' in ('skipped', 'withdrawn') or legacy_card.result->>'cancelled' = 'true')))
+      and (legacy_card.source_comment_id::text = ${m.id}::text
+        or coalesce(legacy_card.origin_comment_ids, '[]'::jsonb) ? ${m.id}::text))`;
 }
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
