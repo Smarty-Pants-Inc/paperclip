@@ -110,7 +110,9 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     const [next] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
       authorType: "user", authorUserId: "board", body: "Next message", createdAt: new Date(f.message.createdAt.getTime() + 100) }).returning();
     await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled",
-      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } }).where(eq(heartbeatRuns.id, f.run.id));
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board",
+        // RFL F5 (22:41Z): the carry reads the WHOLE stop helper, so the fixture records a real Stop request.
+        executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, f.run.id));
     await db.insert(heartbeatRunEvents).values(["userMessage", "agentMessage"].map((kind, i) => ({
       companyId: f.companyId, agentId: f.agentId, runId: f.run.id, seq: i + 1, eventType: "item.started",
       sourceEventId: randomUUID(), payload: { prpEvent: { turnId: "first", itemId: `item-${i}`, payload: { kind } } },
@@ -131,7 +133,14 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
   it("a held list plus Send carries once into its own live first turn, then blocks a second wake", async () => {
     const f = await fixture();
     await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled",
-      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } }).where(eq(heartbeatRuns.id, f.run.id));
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board",
+        // RFL F5 (22:41Z): the carry reads the WHOLE stop helper, so the fixture records a real Stop request.
+        executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, f.run.id));
+    // The stopped run had STARTED answering M (read it, began an assistant item): the whole exclusion applies.
+    await db.insert(heartbeatRunEvents).values(["userMessage", "agentMessage"].map((kind, i) => ({
+      companyId: f.companyId, agentId: f.agentId, runId: f.run.id, seq: i + 1, eventType: "item.started",
+      sourceEventId: randomUUID(), payload: { prpEvent: { turnId: "first", itemId: `item-${i}`, payload: { kind } } },
+    })));
     const held = await db.insert(issueComments).values(["A", "B", "C"].map((body, i) => ({ companyId: f.companyId,
       issueId: f.issueId, authorType: "user" as const, authorUserId: "board", body,
       createdAt: new Date(f.message.createdAt.getTime() + 100 + i * 100),
@@ -361,7 +370,9 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     const at = (n: number) => new Date(t0 + n * 100);
     const generation = { conversationSessionGeneration: 1 };
     await db.update(issueComments).set({ body: "M12", createdAt: at(0) }).where(eq(issueComments.id, f.message.id));
-    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId, createdAt: at(1), finishedAt: at(2),
+    // supersedes(RFL F1, 22:41Z): a FAILED run's ACK is DELIVERED, not ANSWERED, so M12 is answered here by a
+    // COMPLETED run's final reply; the row still proves an answered M12 is never restored.
+    await db.update(heartbeatRuns).set({ status: "succeeded", nativeSessionId: sessionId, createdAt: at(1), finishedAt: at(2),
       contextSnapshot: { ...f.run.contextSnapshot, ...generation } }).where(eq(heartbeatRuns.id, f.run.id));
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
       authorAgentId: f.agentId, createdByRunId: f.run.id, body: "ACK M12", createdAt: at(3) });
@@ -418,6 +429,9 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     console.log("H3_CARRY_SEALED", JSON.stringify({ runId: successor.id, receipt: sealed.contextSnapshot?.firstTurnQueuedInput }));
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
       authorAgentId: f.agentId, createdByRunId: successor.id, body: "ACK M13, M14, M15" });
+    // supersedes(RFL F1): a RUNNING run's reply is DELIVERED only; the reply answers once that run COMPLETES.
+    expect((await readContinuationCommentInput(db, { ...f, runId: successor.id })).wakeCommentIds).toEqual(expected);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, successor.id));
     expect(await readContinuationCommentInput(db, { ...f, runId: successor.id })).toEqual({});
   });
 
