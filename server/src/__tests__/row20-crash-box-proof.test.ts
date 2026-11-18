@@ -42,7 +42,8 @@ import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/e
 import { prepareNativeWorkspaceSync } from "../services/native-runtime/native-workspace-sync.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.js";
-import { PERSON_STOP_WITHOUT_FILES_LINE, readPersonStopBoundDecision } from "../services/heartbeat/person-stop-export-bound.js";
+import { PERSON_STOP_EXPORT_BOUND_MS, PERSON_STOP_WITHOUT_FILES_LINE, readPersonStopBoundDecision } from "../services/heartbeat/person-stop-export-bound.js";
+import { readLeaseReleaseDeferral } from "../services/environment-lease-release-deferral.js";
 import { hasCleanStoppedSessionClose } from "../services/heartbeat/cancelled-warm-workspace-export.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -240,6 +241,70 @@ describe.skipIf(!support.supported)("row 20 crash path: the clean-close proof is
     } finally {
       await heartbeat.drainActiveRunExecutions();
       destroy.mockRestore(); stop.mockRestore();
+    }
+  }, 90_000);
+
+  it("the box answers but the stopped turn's processes are NOT proven gone: no proof, held, and the existing bound decides (without_files, tools_not_proven_stopped)", async () => {
+    const f = await crashFixture("Row 20 box answers unproven");
+    // The box answers every command; the kill-and-verify command reports a
+    // process that survived (exit 3, remaining nonempty).
+    const unprovenRunner: CommandManagedRuntimeRunner = { execute: async input =>
+      (input.args ?? []).includes("paperclip-stopped-turn-kill")
+        ? { exitCode: 3, signal: null, timedOut: false, pid: null, startedAt: null, stderr: "",
+          stdout: JSON.stringify({ procfs: true, found: [424242], killedGroups: [], killedPids: [], remaining: [424242], unreadable: 0 }) }
+        : boxRunner.execute(input) };
+    boxTargets.set(f.leaseId, { ...(boxTargets.get(f.leaseId) as object), runner: unprovenRunner });
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => ({}) as never });
+    try {
+      const sweep = await heartbeat.sweepOrphanedActiveLeases({ companyId: f.companyId, leaseId: f.leaseId, backoffMs: 0 });
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "user",
+        authorUserId: "row20-person", body: "Please answer using my kept notes.md." }).returning();
+      await heartbeat.wakeup(f.agentId, { source: "automation", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: "row20-person", payload: { issueId: f.issueId, commentId: comment.id },
+        contextSnapshot: { issueId: f.issueId, commentId: comment.id, wakeReason: "issue_commented" } });
+      for (let i = 0; i < 20; i++) {
+        await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      const [held] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+      const [heldRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const deferral = readLeaseReleaseDeferral(held.metadata);
+      const heldEvidence = { case: "answers_unproven/held", sweep, decision: readPersonStopBoundDecision(held.metadata),
+        proof: (heldRun.runnerProfileJson as Record<string, unknown>).nativeStoppedSessionClose ?? null,
+        deferral, providerTurns: [...providerTurns], leaseStatus: held.status };
+      console.log("ROW20_PROOF_EVIDENCE", JSON.stringify(heldEvidence));
+      if (process.env.ROW20_PROOF_EVIDENCE_FILE) await fs.appendFile(process.env.ROW20_PROOF_EVIDENCE_FILE, `${JSON.stringify(heldEvidence)}\n`);
+      expect(heldEvidence.proof).toBeNull();
+      expect(heldEvidence.decision).toBeNull();
+      expect(heldEvidence.providerTurns).toEqual([]);
+      expect(deferral).toMatchObject({ reason: "person_stop_export_unproven" });
+      // At the bound: the existing by-line decision, never a hold past it.
+      const boundAt = Date.parse(deferral!.failingSince) + PERSON_STOP_EXPORT_BOUND_MS;
+      vi.useFakeTimers({ toFake: ["Date"], now: boundAt });
+      try {
+        await heartbeat.releaseEnvironmentLeasesForRun({ runId: f.runId, companyId: f.companyId, agentId: f.agentId,
+          status: "cancelled", providerResourceDisposition: "keep_running", trigger: "release_retry" }).catch(() => undefined);
+      } finally { vi.useRealTimers(); }
+      const deadline = Date.now() + 15_000;
+      while (providerTurns.length === 0 && Date.now() < deadline) {
+        await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      const [atBound] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+      const boundEvidence = { case: "answers_unproven/bound", decision: readPersonStopBoundDecision(atBound.metadata),
+        providerTurns: [...providerTurns], leaseStatus: atBound.status,
+        withoutFilesLines: events.filter(e => e.message === PERSON_STOP_WITHOUT_FILES_LINE).map(e => e.eventType).sort(),
+        boxSha: await fs.readFile(f.owedFile).then(sha, () => null), expectedSha: f.expectedSha };
+      console.log("ROW20_PROOF_EVIDENCE", JSON.stringify(boundEvidence));
+      if (process.env.ROW20_PROOF_EVIDENCE_FILE) await fs.appendFile(process.env.ROW20_PROOF_EVIDENCE_FILE, `${JSON.stringify(boundEvidence)}\n`);
+      expect(boundEvidence.decision).toMatchObject({ decision: "without_files", reason: "tools_not_proven_stopped" });
+      expect(boundEvidence.providerTurns).toHaveLength(1);
+      expect(boundEvidence.withoutFilesLines).toEqual(["provider.notice.recorded", "workspace_export_bound_reached"]);
+      expect(boundEvidence.leaseStatus).toBe("active");
+      expect(boundEvidence.boxSha).toBe(f.expectedSha);
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
     }
   }, 90_000);
 });
