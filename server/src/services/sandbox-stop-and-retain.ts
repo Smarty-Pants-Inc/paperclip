@@ -184,22 +184,6 @@ export async function prepareSupersededWarmSandboxStop(db: Db, lease: typeof env
   return prepareStopAndRetain(db, lease, "retained", recovery);
 }
 
-/** Intent marker of a stop requested for a previous boot's closed ACTIVE tip
- * after its boot source changed (J3-26). */
-export const PREVIOUS_BOOT_CLOSED_TIP_STOP_KEY = "previousBootClosedTip";
-
-/** A previous boot's warm owner closed (its checkpoint is stamped on the lease
- * chain) but its run never settled the lease, so the tip is still `active`.
- * The recall's obsolete cleanup has proven the run ended, that no holder in
- * this process remains and that nothing holds the files; this stops and keeps
- * the sandbox exactly as `prepareSupersededWarmSandboxStop` does for a
- * retained tip. It is not an orphan to destroy. */
-export async function preparePreviousBootClosedTipStop(db: Db, lease: typeof environmentLeases.$inferSelect, recovery: Record<string, unknown>) {
-  if (lease.status !== "active" || lease.leasePolicy !== "reuse_by_environment" || !lease.heartbeatRunId
-    || !lease.providerLeaseId || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease)) return null;
-  return prepareStopAndRetain(db, lease, "active", { ...recovery, [PREVIOUS_BOOT_CLOSED_TIP_STOP_KEY]: true });
-}
-
 /** An ended run still owes unsaved files from this sandbox, and no stop-and-retain
  * receipt ever arrived for it. Stop and keep it through the stop-only contract,
  * whatever cleanup it was waiting on: its pending-cleanup sweep then dispatches
@@ -236,22 +220,6 @@ export async function prepareCleanupGateOwnerStop(db: Db, lease: typeof environm
     || (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed"
     || lease.metadata?.pluginLeaseCleanupMethod !== undefined || lease.metadata?.runnerTaskRetiring === true) return null;
   return prepareStopAndRetain(db, lease, lease.status, { [NATIVE_CLEANUP_GATE_OWNER_STOP_KEY]: true });
-}
-
-/** Only an exact positive RUNNING provider GET can authorize a stop request.
- * Error, absent, unknown and foreign observations leave ended rows unchanged.
- * The existing cleanup owner dispatches only from pending_cleanup; preserve
- * the COMPLETE ended row durably as well as in its intent before re-arming.
- * Settlement restores that exact row plus its fresh physical stop receipt.
- * Never called from the preparation gate or for an active turn. */
-export async function prepareInspectedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect, observation: unknown) {
-  if (!observation || typeof observation !== "object" || Array.isArray(observation)) return null;
-  const resource = observation as { providerLeaseId?: unknown; state?: unknown };
-  if (resource.providerLeaseId !== lease.providerLeaseId || !["active", "running"].includes(String(resource.state))) return null;
-  if (!["released", "expired"].includes(lease.status)) return prepareUnconfirmedSourceSandboxStop(db, lease);
-  if (!lease.heartbeatRunId || !lease.provider || lease.provider === "local" || !lease.providerLeaseId
-    || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease) || hasBoundRemoteStopReceipt(lease)) return null;
-  return prepareStopAndRetain(db, lease, lease.status, { endedLeaseEvidence: lease });
 }
 
 /** A deliberate user Retry re-arms only the existing, validated stop owner.
@@ -292,7 +260,6 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
       ...(preserveEndedEvidence ? { endedLeaseEvidence: recovery.endedLeaseEvidence } : {}),
       // A cleanup-gate owner's stop keeps its sandbox: it is not an orphan to destroy.
       ...(fromStatus === "active" && Object.keys(recovery).length && recovery[NATIVE_CLEANUP_GATE_OWNER_STOP_KEY] !== true
-        && recovery[PREVIOUS_BOOT_CLOSED_TIP_STOP_KEY] !== true
         ? { [ORPHANED_SANDBOX_RECOVERY_KEY]: { ...recovery, runId: lease.heartbeatRunId, recoveredAt: now.toISOString() } } : {}),
       pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,
       pendingCleanupRetryAfterMs: 0, pendingCleanupRetryAttempts: 0, pendingCleanupRetryCapWarned: false,
