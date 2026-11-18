@@ -63,6 +63,27 @@ const credentials = [
 ];
 
 describe("standalone bearer prose allowlist", () => {
+  // Never-OK: marker-shaped credential prefixes must not bypass masking.
+  it.each(["[REDACTED]", "***REDACTED***", "[redacted]"])("keeps only a complete bearer marker: %s", marker => {
+    for (const boundary of ["", " ", "\n", '"', "'", "`", ")", "]", "}", '\"]}']) {
+      const input = `Bearer ${marker}${boundary}`;
+      expect(redactSensitiveText(input)).toBe(input);
+      expect(redactEventPayload({ text: input })).toEqual({ text: input });
+      expect(redactSensitiveText(redactSensitiveText(input))).toBe(input);
+    }
+    for (const tail of ["abc123def456ghi789", ".abc123def456ghi789", ":abc123def456ghi789", "!abc123def456ghi789", "?abc123def456ghi789", ")abc123def456ghi789", "}abc123def456ghi789", "]abc123def456ghi789", '\"abc123def456ghi789', "'abc123def456ghi789", "`abc123def456ghi789", ",abc123def456ghi789", ";abc123def456ghi789", "-abc123def456ghi789", "_abc123def456ghi789", "/abc123def456ghi789", "sk-proj-" + "aB3".repeat(12)]) {
+      for (const prefix of ["Bearer ", "Authorization: Bearer "]) {
+        const masked = redactSensitiveText(prefix + marker + tail);
+        expect(masked).not.toContain("abc123def456ghi789");
+        expect(masked).not.toContain("aB3".repeat(12));
+        expect(masked).toBe(prefix === "Bearer " ? "Bearer ***REDACTED***" : "Authorization: ***REDACTED***");
+        expect(redactSensitiveText(masked)).toBe(masked);
+      }
+    }
+  });
+  it.each(["[REDACTED", "***REDACTED**", "[redacted"])("masks an unclosed marker and its tail: %s", marker => {
+    expect(redactSensitiveText(`Bearer ${marker}abc123def456ghi789`)).toBe("Bearer ***REDACTED***");
+  });
   it.each(prose)("preserves prose: %s", input => {
     expect(redactSensitiveText(input)).toBe(input);
     expect(redactEventPayload({ text: input })).toEqual({ text: input });

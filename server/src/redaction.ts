@@ -579,6 +579,16 @@ function credentialEndAfterQuotedDelimiter(input: string, quotedEnd: number) {
   return input.length;
 }
 
+function unquotedCredentialEnd(input: string, start: number): number {
+  // A marker-shaped prefix is not itself a boundary. If more token bytes
+  // follow it, consume the entire whitespace-delimited value, including any
+  // embedded bracket/quote/punctuation (e.g. [REDACTED]sk-proj-...).
+  const markerPrefix = /^(?:\[redacted|\*+redacted)/i.test(input.slice(start));
+  let end = start;
+  while (end < input.length && !(markerPrefix ? /\s/ : /[\s,;}\]]/).test(input[end])) end += 1;
+  return end;
+}
+
 interface AuthorizationCredentialRange {
   start: number;
   end: number;
@@ -669,10 +679,8 @@ function authorizationCredentialRange(
         escapedQuotedValueEnd(input, credentialStart, escapedCredentialQuote),
       );
     } else {
-      end = credentialStart;
-      // Embedded quote/backtick bytes do not make an unquoted credential safe;
-      // consume them through the next structural or whitespace boundary.
-      while (end < input.length && !/[\s,;}\]]/.test(input[end])) end += 1;
+      // Embedded quote/backtick bytes do not make an unquoted credential safe.
+      end = unquotedCredentialEnd(input, credentialStart);
     }
   }
   return { start: valueStart, end, replacement: REDACTED_EVENT_VALUE };
@@ -719,6 +727,13 @@ function redactStandaloneBearerCredentials(input: string): string {
       continue;
     }
 
+    // Keep an exact prior mask byte-for-byte. Closing delimiters count only
+    // when they really close the value: a token continuation after a quote or
+    // bracket (or any other punctuation) must still be masked in full.
+    if (/^(?:\[REDACTED\]|\*\*\*REDACTED\*\*\*|\[redacted\])(?=$|\s|["'`)\]}]+(?=$|\s))/.test(input.slice(credentialStart))) {
+      continue;
+    }
+
     let end: number;
     let replacement = REDACTED_EVENT_VALUE;
     const rawQuote = input[credentialStart];
@@ -738,8 +753,13 @@ function redactStandaloneBearerCredentials(input: string): string {
         const delimiter = `\\${escapedQuote}`;
         replacement = `${delimiter}${REDACTED_EVENT_VALUE}${delimiter}`;
       } else {
-        end = credentialStart;
-        while (end < input.length && !/[\s,;}\]]/.test(input[end])) end += 1;
+        end = unquotedCredentialEnd(input, credentialStart);
+        // Do not create a marker with an attached credential tail ourselves.
+        // A structural stop is safe only if the rest of this word consists
+        // entirely of closing delimiters; otherwise mask the whole word now.
+        let tokenEnd = end;
+        while (tokenEnd < input.length && !/\s/.test(input[tokenEnd])) tokenEnd += 1;
+        if (end < tokenEnd && !/^["'`)\]}]+$/.test(input.slice(end, tokenEnd))) end = tokenEnd;
       }
     }
 
