@@ -2947,6 +2947,41 @@ describe("TaskChatThread runtime transcript selection", () => {
     ).toBeNull();
   });
 
+  // SCREEN row 5: a run a PERSON stopped says what happens to its partial
+  // reply; any other cancel keeps the neutral detail (control).
+  it.each([
+    ["user", "Stopped. The unfinished reply is not sent to the agent; finished steps are kept."],
+    ["system", "The run was cancelled."],
+  ] as const)("SCREEN row 5: the cancelled marker detail for a run cancelled by %s", (actor, expectedDetail) => {
+    nativeTranscriptState.transcriptByRun.set(`native-stop-${actor}`, [
+      assistantEntry("2026-08-25T18:00:01.000Z", "Half a reply", "progress"),
+    ]);
+    renderThread({
+      comments: [],
+      onAdd: async () => {},
+      linkedRuns: [
+        {
+          runId: `native-stop-${actor}`,
+          runtimeMode: "native",
+          status: "cancelled",
+          agentId: "agent-1",
+          agentName: "Runner",
+          adapterType: "paperclip_runner",
+          createdAt: "2026-08-25T18:00:00.000Z",
+          startedAt: "2026-08-25T18:00:00.000Z",
+          finishedAt: "2026-08-25T18:00:02.000Z",
+          resultJson: actor === "user" ? { cancelledByActorType: "user", cancelledByUserId: "user-1" } : null,
+        },
+      ],
+    });
+    const marker = container.querySelector('[data-testid="task-chat-collapsible-marker"]');
+    expect(marker?.textContent).toContain("Run cancelled");
+    flushSync(() => marker!.querySelector<HTMLButtonElement>('button[aria-expanded="false"]')!.click());
+    const detail = container.querySelector('[data-testid="task-chat-collapsible-marker-details"]')?.textContent ?? "";
+    expect(detail).toContain(expectedDetail);
+    if (actor !== "user") expect(detail).not.toContain("unfinished reply");
+  });
+
   it.each([
     ["failed", "Run failed"],
     ["timed_out", "Run timed out"],
