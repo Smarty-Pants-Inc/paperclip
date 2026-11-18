@@ -850,7 +850,7 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     }), wake.id);
   });
 
-  it.each(["ephemeral", "reuse_by_environment"] as const)("keeps %s cancellation eligible for retention when teardown loses the task lock", async leasePolicy => {
+  it.each(["ephemeral", "reuse_by_environment"] as const)("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) keeps %s cancellation eligible for retention when teardown loses the task lock", async leasePolicy => {
     const { company, agent } = await fixture();
     const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Retain cancelled work",
       status: "in_progress", assigneeAgentId: agent.id }).returning();
@@ -891,8 +891,11 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
           reason: "workspace_retention_busy", attempts: 1, providerResourceDisposition: "stop_and_retain" }) }) });
     } finally { release(); await holding; }
     await preserveCancelledNativeWorkspaces(db);
+    // C3: a person's acknowledged Stop owes no restore, so the sweep pins nothing
+    // and records no hold; the release below still stops and retains the disk.
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0])
-      .toMatchObject({ status: "pending_cleanup", leasePolicy: "retain_on_failure" });
+      .toMatchObject({ status: "active", leasePolicy });
+    expect((await deps.getRun(runId))?.resultJson).not.toHaveProperty("workspaceRestoreRecovery");
     await control.releaseEnvironmentLeasesForRun({ runId, companyId: company.id, agentId: agent.id,
       status: "cancelled", providerResourceDisposition: "destroy" });
     expect(deps.envOrchestrator.releaseForRun).toHaveBeenCalledWith(expect.objectContaining({
@@ -903,7 +906,7 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].status).toBe("in_progress");
   }, 15_000);
 
-  it("keeps a warm sandbox running when a board cancel leaves prepared native files", async () => {
+  it("supersedes(fork warm-after-Stop handoff 7fa6b895f; RFL record SUPERSEDE-C3-STOP-HANDOFF-TESTS-1118) keeps a warm sandbox running when a board cancel leaves prepared native files", async () => {
     const { company, agent } = await fixture();
     const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Cancel keeps warm",
       status: "in_progress", assigneeAgentId: agent.id }).returning();
@@ -922,11 +925,12 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     const deps = callbacks(db), control = createHeartbeatRunControl(db, deps);
     await control.releaseEnvironmentLeasesForRun({ runId, companyId: company.id, agentId: agent.id,
       status: "cancelled", providerResourceDisposition: "keep_running" });
+    // C3 (upstream run-control): a person's cancel stops and retains the box; it is not kept warm.
     expect(deps.envOrchestrator.releaseForRun).toHaveBeenCalledWith(expect.objectContaining({
-      heartbeatRunId: runId, providerResourceDisposition: "keep_running",
+      heartbeatRunId: runId, providerResourceDisposition: "stop_and_retain",
     }));
     expect(deps.envOrchestrator.releaseForRun).not.toHaveBeenCalledWith(expect.objectContaining({
-      providerResourceDisposition: "stop_and_retain",
+      providerResourceDisposition: "keep_running",
     }));
   }, 15_000);
 
