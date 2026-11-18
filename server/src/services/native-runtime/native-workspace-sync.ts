@@ -12,7 +12,8 @@ import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { personStopKeptBoxForSuccessor } from "../heartbeat/person-stop-export-bound.js";
+import { personStopKeptBoxForSuccessor, readPersonStopBoundDecision } from "../heartbeat/person-stop-export-bound.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import type { Db } from "@paperclipai/db";
 import { environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import { retryUnlessTransactionBound } from "../transaction-retry.js";
@@ -906,6 +907,9 @@ async function finalizePreparedRuntime(input: {
   signal?: AbortSignal;
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
+  /** adopt-stopu-compose6 (c): the directory the copyback was merged into, when
+   * it is not the descriptor's host workspace (the person-Stop aside directory). */
+  localDir?: string;
 }): Promise<NativeWorkspaceSyncReference> {
   // Ownership (and the caller's deadline) is re-checked AFTER every remote or
   // long step, immediately before the next write: a held command that joins
@@ -927,7 +931,7 @@ async function finalizePreparedRuntime(input: {
     const finalSnapshot =
       await import("@paperclipai/adapter-utils/workspace-restore-merge").then(
         ({ captureDirectorySnapshotOffThread: captureDirectorySnapshot }) =>
-          captureDirectorySnapshot(input.descriptor.binding.localCwd, {
+          captureDirectorySnapshot(input.localDir ?? input.descriptor.binding.localCwd, {
             exclude: input.runtime.workspaceSyncSnapshot?.baseline.exclude ?? [],
             ignoredPaths: input.runtime.workspaceSyncSnapshot?.baseline.ignoredPaths,
             diskBacked: true,
@@ -1281,7 +1285,7 @@ export async function resumeNativeWorkspaceSync(input: {
   }
   const target = abandonableTarget(input.target, () => input.signal);
   const run = await input.db
-    .select({ companyId: heartbeatRuns.companyId, runnerProfileJson: heartbeatRuns.runnerProfileJson })
+    .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, runnerProfileJson: heartbeatRuns.runnerProfileJson })
     .from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, input.runId))
     .limit(1)
@@ -1324,16 +1328,30 @@ export async function resumeNativeWorkspaceSync(input: {
     return true;
   }
   input.signal?.throwIfAborted();
+  // adopt-stopu-compose6 (c), never-OK: once a person's Stop was decided
+  // `without_files` at the bound, a successor has run WITHOUT these files and
+  // owns the host workspace. A late export of the stopped box must never merge
+  // over it (the baseline merge copies every path the box changed, including a
+  // path the successor changed since). The decision is written only under this
+  // run's finalization lock (person-stop-release-export.ts), and every caller
+  // here holds that lock, so the read below cannot race it. The old files go
+  // to a separate directory instead, with ONE true line.
+  const asideDir = await personStopWithoutFilesAsideDir(input.db, input.runId, existing.descriptor.binding.leaseId);
+  if (asideDir) {
+    await fs.rm(asideDir, { recursive: true, force: true });
+    await fs.mkdir(asideDir, { recursive: true });
+  }
   const runtime = await prepareRuntime({
     runId: input.runId,
     target,
     onPhase: input.onPhase,
     onCheckpoint: input.onCheckpoint,
-    workspaceLocalDir: existing.descriptor.binding.localCwd,
+    workspaceLocalDir: asideDir ?? existing.descriptor.binding.localCwd,
     mode: "adopt_remote",
     baseline: existing.baseline,
-    gitSnapshot: existing.descriptor.gitSnapshot,
-    repositories: existing.descriptor.repositories,
+    // Aside is a plain directory: no host repository to integrate into.
+    gitSnapshot: asideDir ? null : existing.descriptor.gitSnapshot,
+    repositories: asideDir ? [] : existing.descriptor.repositories,
   });
   await finalizePreparedRuntime({
     db: input.db,
@@ -1345,8 +1363,40 @@ export async function resumeNativeWorkspaceSync(input: {
     signal: input.signal,
     onPhase: input.onPhase,
     onCheckpoint: input.onCheckpoint,
+    ...(asideDir ? { localDir: asideDir } : {}),
   });
+  if (asideDir && run) {
+    const line = PERSON_STOP_SAVED_ASIDE_LINE;
+    const payload = { asideDir, hostCwd: existing.descriptor.binding.localCwd };
+    await appendHeartbeatRunEvent(input.db, { companyId: run.companyId, agentId: run.agentId, runId: input.runId,
+      eventType: "workspace_export_saved_aside", stream: "system", level: "info", message: line, payload })
+      .catch(() => undefined);
+    await appendHeartbeatRunEvent(input.db, { companyId: run.companyId, agentId: run.agentId, runId: input.runId,
+      eventType: "provider.notice.recorded", stream: "system", level: "info", message: line,
+      payload: { ...payload, prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "control_plane",
+        runId: input.runId, eventType: "provider.notice.recorded", emittedAt: new Date().toISOString(),
+        payload: { schema: "paperclip.provider.notice.v1", severity: "info", category: "person_stop_files_saved_aside",
+          summary: line, message: line } } } }).catch(() => undefined);
+  }
   return true;
+}
+
+/** adopt-stopu-compose6 (c): the person reads this when the stopped turn's files
+ * become available after its successor ran without them. */
+export const PERSON_STOP_SAVED_ASIDE_LINE =
+  "The files from the stopped turn are now saved separately; your newer changes were kept.";
+
+/** Where a late person-Stop export lands instead of the host workspace: outside
+ * every workspace, under the instance's own state root, one directory per run. */
+export function personStopAsideDirectory(runId: string): string {
+  return path.join(resolvePaperclipInstanceRoot(), "stopped-turn-files", requireSafeSegment(runId, "run_id"));
+}
+
+async function personStopWithoutFilesAsideDir(db: Db, runId: string, leaseId: string): Promise<string | null> {
+  const [lease] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
+    .where(eq(environmentLeases.id, leaseId)).limit(1);
+  const decision = readPersonStopBoundDecision(lease?.metadata);
+  return decision?.decision === "without_files" && decision.runId === runId ? personStopAsideDirectory(runId) : null;
 }
 
 export async function cleanupNativeWorkspaceSync(runId: string): Promise<void> {

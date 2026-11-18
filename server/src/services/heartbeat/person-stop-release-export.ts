@@ -6,6 +6,7 @@ import type { environmentRuntimeService } from "../environment-runtime.js";
 import { admittedNativeResourceDisposition } from "../native-runtime/native-failed-workspace-recovery.js";
 import { readNativeWorkspaceSyncReference, resumeNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
 import { nativeWorkspaceExportPendingForLease } from "../native-runtime/native-workspace-finalization-state.js";
+import { tryLockNativeWorkspaceFinalization } from "../native-runtime/native-workspace-finalization-ownership.js";
 import { finishCancelledWarmWorkspaceExport, hasCleanStoppedSessionClose, type CancelledWarmExportOutcome } from "./cancelled-warm-workspace-export.js";
 import { PERSON_STOP_BOUND_KEY, PERSON_STOP_PROBE_TIMEOUT_MS, PERSON_STOP_WITHOUT_FILES_LINE, readPersonStopBoundDecision, personStopExportBoundAt,
   type PersonStopBoundDecision } from "./person-stop-export-bound.js";
@@ -39,7 +40,7 @@ export async function decidePersonStopExportAtBound(input: {
   run: typeof heartbeatRuns.$inferSelect;
   now?: number;
   probeTimeoutMs?: number;
-}): Promise<PersonStopBoundDecision | null> {
+}): Promise<(PersonStopBoundDecision & { decidedNow?: true }) | null> {
   const { db, environmentRuntime, run } = input;
   const prepared = readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync);
   if (run.runtimeMode !== "native" || run.status !== "cancelled" || !hasAcknowledgedNativeRunStopRequest(run)
@@ -73,10 +74,22 @@ export async function decidePersonStopExportAtBound(input: {
   const decision: PersonStopBoundDecision = { schema: "paperclip.person-stop-export-bound.v1",
     decision: reason === "box_reachable_tools_stopped" ? "same_box" : "without_files", reason,
     runId: run.id, providerLeaseId: lease.providerLeaseId!, decidedAt: new Date(input.now ?? Date.now()).toISOString() };
-  const recorded = await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
-    || ${JSON.stringify({ [PERSON_STOP_BOUND_KEY]: decision })}::jsonb` })
-    .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "active"),
-      sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? ${PERSON_STOP_BOUND_KEY})`)).returning({ id: environmentLeases.id });
+  // adopt-stopu-compose6 (c), never-OK: the decision is recorded ONLY under the
+  // run's workspace-finalization lock (the same advisory key every export of
+  // this run holds for its whole copyback: withNativeWorkspaceFinalizationOwnership).
+  // An export still in flight -> no decision now (keep holding; it finalizes or
+  // times out within its own bound, and the next retry decides). Every LATER
+  // export reads this decision under the same lock and, for without_files,
+  // saves the old files aside instead of over the successor's host workspace
+  // (native-workspace-sync.ts resumeNativeWorkspaceSync).
+  const recorded = await db.transaction(async tx => {
+    if (!await tryLockNativeWorkspaceFinalization(tx as unknown as Db, { companyId: run.companyId, runId: run.id })) return null;
+    return tx.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
+      || ${JSON.stringify({ [PERSON_STOP_BOUND_KEY]: decision })}::jsonb` })
+      .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "active"),
+        sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? ${PERSON_STOP_BOUND_KEY})`)).returning({ id: environmentLeases.id });
+  });
+  if (recorded === null) return null;
   if (recorded.length === 0) {
     const [again] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(eq(environmentLeases.id, lease.id));
     return readPersonStopBoundDecision(again?.metadata);
@@ -95,7 +108,7 @@ export async function decidePersonStopExportAtBound(input: {
         payload: { schema: "paperclip.provider.notice.v1", severity: "warning", category: "person_stop_runs_without_files",
           summary: line, message: line } } } }).catch(() => undefined);
   }
-  return decision;
+  return { ...decision, decidedNow: true };
 }
 
 /**

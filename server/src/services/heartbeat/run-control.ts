@@ -205,7 +205,7 @@ export interface HeartbeatRunControlDependencies extends Pick<ReturnType<typeof 
   exportPersonStoppedWarmWorkspace?: (run: typeof heartbeatRuns.$inferSelect) => Promise<{ outcome: string }>;
   /** adopt-stopu-compose4: the bounded decision at PERSON_STOP_EXPORT_BOUND_MS
    * (person-stop-release-export.ts decidePersonStopExportAtBound). Wired by heartbeat.ts. */
-  decidePersonStopExportAtBound?: (run: typeof heartbeatRuns.$inferSelect) => Promise<{ decision: "same_box" | "without_files"; reason: string } | null>;
+  decidePersonStopExportAtBound?: (run: typeof heartbeatRuns.$inferSelect) => Promise<{ decision: "same_box" | "without_files"; reason: string; decidedNow?: true } | null>;
   personStopExportBoundAt?: (runId: string, companyId: string) => Promise<number | null>;
   options: {
     closeWarmNativeSessionsForRun?: (input: {
@@ -437,7 +437,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       // At the bound: probe first (an unreachable box is not exported again),
       // then one more export; still unproven -> the by-line decision.
       const atBound = decidePersonStopExportAtBound ? await decidePersonStopExportAtBound(cancelledRun).catch(() => null) : null;
-      const exported = atBound?.decision === "without_files" ? { outcome: "unproven" as const }
+      // adopt-stopu-compose6 (c): the call that DECIDES without_files does not
+      // export again (its probe just failed). A later retry does export: the
+      // decision is durable, so that export saves the old files ASIDE and
+      // never over the successor's host workspace (resumeNativeWorkspaceSync).
+      const exported = atBound?.decision === "without_files" && atBound.decidedNow ? { outcome: "unproven" as const }
         : await exportPersonStoppedWarmWorkspace(cancelledRun).catch(() => ({ outcome: "unproven" as const }));
       if ((exported.outcome === "unproven" || exported.outcome === "not_settled") && atBound?.decision === "same_box") {
         // FIRST choice: the box is reachable and its stopped tools are proven
