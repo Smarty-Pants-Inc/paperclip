@@ -7,6 +7,8 @@ import { queueGitExclusionNextTry } from "./helpers/git-exclusion-next-try.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createHeartbeatInstructionWorkingCopy } from "../services/heartbeat/instruction-working-copy.js";
 import * as fileStoreModule from "../services/agent-file-store.js";
+import * as storeModule from "../services/agent-file-store.js";
+import { withDedicatedDbConnection } from "@paperclipai/db";
 import * as fileCheckpoints from "../services/agent-file-checkpoints.js";
 import * as instructionAuthorization from "../services/agent-instruction-authorization.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -666,6 +668,39 @@ describe("persistent agent directories", () => {
         };
         return { executionTarget, prepare, siblingSavesRemote, backgroundChild };
       }
+      // C3: rf-3's original remote/existing-file probe, unchanged from
+      // rf3-port-collector/artifacts/critical-probes.ts (smarty-dev#20787).
+      // Keep the remote source, existing canonical file, apply completion wait,
+      // and final byte assertions: the local/new-file rows below do not cover them.
+      describe("rf3 original remote abort boundary", () => {
+        const get = () => ({ db, copies, companyId, root, paulBundle, sandbox });
+        async function proof(name: string, value: unknown) { await writeJudgeEvidence(name + '.json', value); }
+        async function unlock(db: any) { await withDedicatedDbConnection(db, async d => { await d.execute(sql`select pg_advisory_unlock_all()`); }); }
+  it('RF3 ABORT DURING APPLY: an aborted collector cannot commit canonical bytes after its lock session ended',async()=>{
+    const {db,copies,companyId,root,paulBundle,sandbox}=get();
+    vi.stubEnv('PAPERCLIP_EPHEMERAL_SERVER','true');let factory:any;let applyDone:Promise<void>|undefined;
+    try {
+      await paulBundle();const f='memory/rf3-abort-apply.md';await fs.writeFile(path.join(root,f),'CANONICAL BEFORE ABORT\n');
+      const boat=await sandbox();const row=await boat.prepare({warm:true});await fs.writeFile(path.join(row.executionRoot,f),'RUN UNSAVED BYTES\n');
+      const controller=new AbortController();const original=storeModule.agentFileStore;
+      factory=vi.spyOn(storeModule,'agentFileStore').mockImplementation((...args:any[])=>{
+        const store=(original as any)(...args);
+        return {...store,apply:async(...params:any[])=>{
+          controller.abort(new Error('RF3 deadline during canonical save'));
+          let finished!:()=>void;applyDone=new Promise<void>(r=>{finished=r;});
+          try {return await (store.apply as any)(...params);}finally{finished();}
+        }};
+      });
+      const directory=agentDirectoryWorkingCopyService(db,(c:string,r:string)=>copies.get(c,r));
+      let error:string|null=null;await directory.collectStopped((await copies.get(companyId,row.runId))!,boat.executionTarget,controller.signal).catch((e:any)=>{error=String(e);});
+      await applyDone;await new Promise(r=>setTimeout(r,10));
+      const canonical=await fs.readFile(path.join(root,f),'utf8');const source=await fs.readFile(path.join(row.executionRoot,f),'utf8').catch((e:any)=>'MISSING:'+e.code);
+      await proof('rf3-abort-during-apply',{aborted:controller.signal.aborted,error,canonical,source,copy:await copies.get(companyId,row.runId)});
+      expect(controller.signal.aborted).toBe(true);expect(error).toContain('RF3 deadline during canonical save');expect(source).toBe('RUN UNSAVED BYTES\n');
+      expect(canonical,'canonical folder must remain unchanged after collector abort').toBe('CANONICAL BEFORE ABORT\n');
+    }finally{await applyDone;factory?.mockRestore();await unlock(db).catch(()=>{});vi.unstubAllEnvs();}
+  },90000);
+      });
       const contextFor = async (copy: { runId: string; executionRoot: string }) => buildNativeRuntimeContext({ db, agent: { id: agentId, companyId, name: "Target",
         adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } },
         runId: copy.runId, runtimeConfig: {}, runtimeSkillEntries: [], instructionWorkingCopy: { rootPath: copy.executionRoot, entryPath: "AGENTS.md", kind: "agent_files" } });
