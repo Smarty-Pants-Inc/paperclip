@@ -11301,6 +11301,106 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(runtime.endpoints.get(endpoint.id)!.posts.map(post => post.text)).toContain("**Owner User (via Paperclip)**\n\nHanging Slack check");
   }, 60_000);
 
+  it("keeps a 10-connection pool serving concurrent inbound deliveries while a Board publication waits on a slow Slack check", async () => {
+    // Incident 11-17 class: one publication waited on Slack inside its
+    // authorization transaction, holding the channel's chat row locks. Every
+    // inbound delivery for that channel then waited on those locks while
+    // holding a pool connection, so the whole pool (max 10: the driver default
+    // when DATABASE_POOL_MAX is unset) was stuck until Slack answered.
+    const SLACK_DELAY_MS = 15_000; // per Slack call; the Board check makes two
+    const DELIVERY_BOUND_MS = 25_000;
+    const DELIVERIES = 12;
+    expect(Number(db.$client.options.max)).toBe(10);
+    // Only the publication's Board check is slow: its channel lookup and the
+    // Board user's lookup. Inbound deliveries come from another Slack user.
+    const slack = fakeSlackFetch() as typeof fetch;
+    let armed = false;
+    let channelChecks = 0;
+    let slowCalls = 0;
+    let markSlackStarted!: () => void;
+    const slackStarted = new Promise<void>(resolve => { markSlackStarted = resolve; });
+    const slowFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const body = String(init?.body ?? "");
+      const boardCheck = armed && ((url.endsWith("/conversations.info") && body.includes("channel=CPOOL") && ++channelChecks === 1) ||
+        (url.endsWith("/users.info") && body.includes("user=UBOARD")));
+      if (boardCheck) {
+        slowCalls += 1;
+        markSlackStarted();
+        await new Promise(resolve => setTimeout(resolve, SLACK_DELAY_MS));
+      }
+      return slack(input, init);
+    }) as typeof fetch;
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service, runtime } = await configuredSlackEndpoint(fixture, { linkedBoardUser: true, fetch: slowFetch });
+    const channel = makeThread({ channelId: "CPOOL", id: "slack:CPOOL:8400.1", name: "pool" });
+    await deliverMessage({ callbacks, endpointId: endpoint.id, thread: channel.thread,
+      message: makeMessage({ id: "8400.1", text: "@maya start here", mentioned: true }), trigger: "mention" });
+    await db.update(chatEndpoints).set({ status: "active" }).where(eq(chatEndpoints.id, endpoint.id));
+    const [conversation] = await service.listConversations(endpoint.id);
+    await service.publishBoardMessage(endpoint.id, conversation.id, "Slow Slack check", randomUUID(), "owner-user");
+    await vi.waitFor(async () => expect((await db.select({ state: chatPublications.state }).from(chatPublications)
+      .where(eq(chatPublications.endpointId, endpoint.id))).map(row => row.state)).toEqual(["published"]), { timeout: 15_000 });
+    const [boardPublication] = await db.select({ id: chatPublications.id }).from(chatPublications).where(eq(chatPublications.endpointId, endpoint.id));
+    const [{ name: application }] = await db.execute(sql`select current_setting('application_name') as name`) as unknown as { name: string }[];
+    // The observer has its own connection: the pool under test may be full.
+    const observer = createDb(externalTestDatabaseUrl ?? tempDb!.connectionString, { maxConnections: 1, applicationName: "pool-class-observer" });
+    const sessions = async () => await observer.execute(sql`select pid, state, wait_event_type, pg_blocking_pids(pid) as blocked_by,
+      left(query, 120) as last_statement from pg_stat_activity where application_name = ${application} and datname = current_database()`) as unknown as
+      { pid: number; state: string; wait_event_type: string | null; blocked_by: number[]; last_statement: string }[];
+    const summarize = (rows: Awaited<ReturnType<typeof sessions>>) => {
+      const holders = rows.filter(row => row.state.startsWith("idle in transaction"));
+      const holderPids = new Set(holders.map(row => row.pid));
+      return {
+        sessions: rows.length,
+        idleInTransaction: holders.map(row => row.last_statement),
+        blockedOnHolder: rows.filter(row => row.wait_event_type === "Lock" && row.blocked_by.some(pid => holderPids.has(pid))).length,
+        lockWaiters: rows.filter(row => row.wait_event_type === "Lock").length,
+      };
+    };
+    let publication: Promise<unknown> | null = null;
+    let deliveries: Promise<unknown>[] = [];
+    let outcome: "done" | "stuck" = "stuck";
+    let duringSlack: ReturnType<typeof summarize> | null = null;
+    let atBound: ReturnType<typeof summarize> | null = null;
+    let afterDrain: ReturnType<typeof summarize> | null = null;
+    let deliveryMs = -1;
+    try {
+      armed = true;
+      await db.update(chatPublications).set({ state: "pending", nextAttemptAt: new Date(0) }).where(eq(chatPublications.endpointId, endpoint.id));
+      publication = service.processPendingPublications();
+      await Promise.race([slackStarted, new Promise(resolve => setTimeout(resolve, 15_000))]);
+      if (slowCalls === 0) throw new Error("The publication did not reach Slack's Board check");
+      const started = Date.now();
+      deliveries = Array.from({ length: DELIVERIES }, (_, index) => deliverMessage({
+        callbacks, endpointId: endpoint.id,
+        thread: makeThread({ channelId: "CPOOL", id: `slack:CPOOL:8401.${index}`, name: "pool" }).thread,
+        message: makeMessage({ id: `8401.${index}`, text: `@maya pool work ${index}`, mentioned: true }), trigger: "mention",
+      }));
+      const settled = Promise.all(deliveries).then(() => { deliveryMs = Date.now() - started; return "done" as const; });
+      await new Promise(resolve => setTimeout(resolve, 5_000));
+      duringSlack = summarize(await sessions());
+      outcome = await Promise.race([settled, new Promise<"stuck">(resolve => setTimeout(() => resolve("stuck"), Math.max(0, DELIVERY_BOUND_MS - (Date.now() - started))))]);
+      if (outcome === "stuck") atBound = summarize(await sessions());
+      console.log(`pool-class: outcome=${outcome} deliveryMs=${deliveryMs} slowSlackCalls=${slowCalls} duringSlack=${JSON.stringify(duringSlack)} atBound=${JSON.stringify(atBound)}`);
+    } finally {
+      // Drain everything (Slack answers after its delay); nothing may stay open.
+      await Promise.allSettled(deliveries);
+      await publication?.catch(() => undefined);
+      afterDrain = summarize((await sessions()).filter(row => row.state !== "idle"));
+      await observer.$client.end();
+    }
+    console.log(`pool-class: afterDrain=${JSON.stringify(afterDrain)} deliveryMs=${deliveryMs}`);
+    expect({ outcome, duringSlack, atBound, afterDrain }).toEqual({
+      outcome: "done", duringSlack: { sessions: expect.any(Number), idleInTransaction: [], blockedOnHolder: 0, lockWaiters: 0 }, atBound: null,
+      afterDrain: { sessions: expect.any(Number), idleInTransaction: [], blockedOnHolder: 0, lockWaiters: 0 },
+    });
+    expect((await db.execute(sql`select count(*)::int as n from pg_stat_activity where application_name = 'pool-class-observer'`) as unknown as { n: number }[])[0].n).toBe(0);
+    expect(await db.select({ id: chatConversations.id }).from(chatConversations).where(eq(chatConversations.endpointId, endpoint.id))).toHaveLength(DELIVERIES + 1);
+    expect((await db.select({ state: chatPublications.state }).from(chatPublications).where(eq(chatPublications.id, boardPublication.id)))[0].state).toBe("published");
+    expect(runtime.endpoints.get(endpoint.id)!.posts.map(post => post.text)).toContain("**Owner User (via Paperclip)**\n\nSlow Slack check");
+  }, 180_000);
+
   it("refreshes Slack tool guidance without restoring disabled catalog policies", async () => {
     const { SLACK_TOOLS } = await import("@paperclipai/shared");
     const { slackBotCatalogIsCurrent, syncSlackBotTools } = await import("../services/connectors/slack-catalog.js");
