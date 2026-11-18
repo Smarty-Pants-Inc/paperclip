@@ -57,11 +57,9 @@ function senderStoppedCheck(db: Pick<Db, "select">, input: CarryInput) {
  * `agentId` is the predecessor run's agent, from trusted run state. */
 export async function pendingContinuationCommentInput(db: Pick<Db, "select">, input: CarryInput): Promise<Record<string, unknown>> {
   const answered = await pendingContinuationInteractionInput(db, input);
-  // An interaction-respond wake also names the asking turn's origin comment;
-  // carrying it makes the successor's contract re-request that turn and cuts its
-  // fresh history before the answer (upstream's seed carries no comment ids at all).
-  if (answered.interactionIds) return answered;
-  return pendingPersonCommentInput(db, input);
+  // A respond wake names the asking origin too, but a separate typed batch is
+  // still pending input. Exclude only the recorded origins below, not that batch.
+  return { ...await pendingPersonCommentInput(db, input), ...answered };
 }
 
 /** Carry-all (H3 cfebb132): the wake and first-turn input of the source run's continuation chain, within the
@@ -118,11 +116,22 @@ async function pendingPersonCommentInput(db: Pick<Db, "select">, input: CarryInp
   });
   const candidates = (carried.wakeCommentIds as string[] | undefined)?.filter(id => UUID.test(id)) ?? [];
   if (candidates.length === 0) return {};
+  const responded = interactionIds(input.contextSnapshot);
   const senderStopped = senderStoppedCheck(db, input);
   const sourceRunId = [input.runId, input.liveOwner?.runId].find(id => typeof id === "string" && UUID.test(id));
   const rows = await db.select({ id: issueComments.id, authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     inArray(issueComments.id, candidates), isNull(issueComments.deletedAt),
+    // A card's asking origin is not new typed input. Keep this independent of
+    // whether the answer is pending, completed, live-owned or sender-stopped.
+    ...(responded.length ? [sql`not exists (select 1 from ${issueThreadInteractions} where ${and(
+      eq(issueThreadInteractions.companyId, input.companyId), eq(issueThreadInteractions.issueId, input.issueId),
+      eq(issueThreadInteractions.createdByAgentId, input.agentId), inArray(issueThreadInteractions.id, responded),
+      isNotNull(issueThreadInteractions.resolvedByUserId), isNull(issueThreadInteractions.resolvedByAgentId),
+      isNotNull(issueThreadInteractions.resolvedAt), inArray(issueThreadInteractions.status, ["answered", "accepted", "rejected"]),
+      or(eq(issueThreadInteractions.sourceCommentId, issueComments.id),
+        sql`coalesce(${issueThreadInteractions.originCommentIds}, '[]'::jsonb) ? ${issueComments.id}::text`),
+    )})`] : []),
     // A chain ancestor contributes only a person's own comments; the source run's direct input is unchanged.
     or(inArray(issueComments.id, directIds), eq(issueComments.authorType, "user")),
     // Only still-pending input: carry unless ANSWERED. A message a completed run's final answer answered (attributed
