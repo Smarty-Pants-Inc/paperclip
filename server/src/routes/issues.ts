@@ -9967,7 +9967,10 @@ export function issueRoutes(
         ...(blockerAttention ? { blockerAttention } : {}),
         ...(reviewAttention ? { reviewAttention } : {}),
         scheduledRetry,
-        activeRecoveryAction: revalidatedActiveRecoveryAction,
+        // r2g: the recovery-action text handed to the agent follows the screen's
+        // one Retry decision, read once after revalidation (as GET /issues/:id does).
+        activeRecoveryAction: await recoveryActionFollowingPresentation(db, issue, revalidatedActiveRecoveryAction,
+          await taskInterruptionPresentation(db, issue)),
         priority: issue.priority,
         projectId: issue.projectId,
         goalId: goal?.id ?? issue.goalId,
