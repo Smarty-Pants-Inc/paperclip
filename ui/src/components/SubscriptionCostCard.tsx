@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { SUBSCRIPTION_CURRENCIES, centsToUsd, usdToCents, type SubscriptionAccountReport, type SubscriptionCostReport, type SubscriptionUsage } from "@paperclipai/shared";
 import { subscriptionsApi } from "../api/subscriptions";
-import { cn, formatCents, formatDateTime, formatTokens, providerDisplayName } from "../lib/utils";
+import { cn, formatCents, formatConfiguredCents, formatDateTime, formatTokens, providerDisplayName } from "../lib/utils";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 import { Card } from "./ui/card";
@@ -12,7 +12,7 @@ import { Label } from "./ui/label";
 import { ANALYTICS_MASK_CLASS } from "@/lib/analytics/privacy";
 
 export function subscriptionMoney(cents: string, currency: string) {
-  return currency === "USD" ? formatCents(Number(cents))
+  return currency === "USD" ? formatConfiguredCents(Number(cents))
     : new Intl.NumberFormat(undefined, { style: "currency", currency, currencyDisplay: "code" }).format(Number(cents) / 100);
 }
 

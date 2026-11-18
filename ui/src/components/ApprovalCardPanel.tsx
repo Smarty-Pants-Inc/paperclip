@@ -6,7 +6,7 @@ import { agentsApi } from "../api/agents";
 import { approvalsApi } from "../api/approvals";
 import { getAdapterLabel } from "../adapters/adapter-display-registry";
 import { queryKeys } from "../lib/queryKeys";
-import { formatCents } from "../lib/utils";
+import { formatConfiguredCents } from "../lib/utils";
 import { NeedsYouPanel, NeedsYouPanelNote, NeedsYouPanelRow } from "./coordinator/NeedsYouCardKit";
 
 function payloadString(payload: Record<string, unknown> | undefined, key: string): string | null {
@@ -20,7 +20,7 @@ const APPROVAL_KIND_LABELS: Record<string, string> = {
   budget_override_required: "Budget override request",
 };
 
-const wholeDollars =(cents: number) => formatCents(cents).replace(/\.00$/, "");
+const wholeDollars =(cents: number) => formatConfiguredCents(cents).replace(/\.00$/, "");
 
 /**
  * What the approval is for, in the card's inset panel (PAP-775, Paper "06"):
