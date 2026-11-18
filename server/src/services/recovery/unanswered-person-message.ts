@@ -249,13 +249,23 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
           and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
-    or exists (select 1 from ${issueComments} n
+    or ${answeredUnansweredNoticeCondition(issueId, companyId)})`;
+}
+
+/**
+ * SQL: this issue row has a live unanswered-message notice whose message an
+ * agent has since answered (answeredSql). The recovery worker visits such a
+ * task in ANY status, so the notice retires even when the task went done after
+ * the answer (P9-60 B).
+ */
+export function answeredUnansweredNoticeCondition(issueId: AnyPgColumn, companyId: AnyPgColumn): SQL {
+  return sql`exists (select 1 from ${issueComments} n
       join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and ${answeredSql(rawMessage("m"))}))`;
+      and ${answeredSql(rawMessage("m"))})`;
 }
 
 /**
