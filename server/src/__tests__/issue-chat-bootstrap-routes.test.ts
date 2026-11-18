@@ -348,4 +348,36 @@ describeEmbeddedPostgres("task chat bootstrap", () => {
         JSON.stringify({ stored: stored!.resultJson, bootstrapRun: run }, null, 2));
     }
   });
+
+  // SCREEN ROW 6: Retry on a person-stopped STARTED turn. The exact-run Retry
+  // route (POST /agents/:id/wakeup, reason retry_failed_run) refuses it through
+  // canRetryStoppedRun (cancelled-native-startup.ts). The chat offers that Retry
+  // only on a "Run failed"-class marker (adjacent-errors.ts
+  // RETRYABLE_FAILURE_LABELS), never on this run's "Run cancelled" marker:
+  // TaskChatThread "SCREEN ROW 6" renders this exact bootstrap row.
+  it.each([["chat", true], ["task", false]] as const)(
+    "SCREEN ROW 6: the Retry route refuses a person-stopped started turn (%s)", async (_surface, conversation) => {
+      const f = await seedCompanyWithBoardAccess(ctx.db, `Row6 ${_surface}`);
+      const task = await seedTask(f.companyId, { userId: f.userId, conversation });
+      await ctx.db.update(heartbeatRuns).set({
+        status: "cancelled", finishedAt: new Date("2026-11-09T11:59:30.000Z"),
+        processStartedAt: new Date("2026-11-09T11:59:01.000Z"),
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: f.userId },
+      }).where(eq(heartbeatRuns.id, task.runId));
+      const server = app(f.actor);
+      const boot = await request(server).get(`/api/issues/${task.issueId}/chat-bootstrap`);
+      const run = (boot.body.recentRuns as Array<{ runId: string; status: string; startedAt: string | null; resultJson: Record<string, unknown> | null }>)
+        .find((entry) => entry.runId === task.runId);
+      expect(run).toMatchObject({ status: "cancelled", startedAt: "2026-11-09T11:59:00.000Z", resultJson: { cancelledByActorType: "user" } });
+      const retry = await request(server).post(`/api/agents/${task.agentId}/wakeup`).send({
+        source: "on_demand", triggerDetail: "manual", reason: "retry_failed_run", failedRunId: task.runId,
+      });
+      expect(retry.status, JSON.stringify(retry.body)).toBe(409);
+      expect(retry.body.error).toBe("Only a failed run or a verified eligible cancellation can start a new attempt.");
+      if (process.env.SCREEN_S5_EVIDENCE_DIR) {
+        const { writeFile } = await import("node:fs/promises");
+        await writeFile(`${process.env.SCREEN_S5_EVIDENCE_DIR}/row6-route-${_surface}.json`,
+          JSON.stringify({ bootstrapRun: run, retry: { status: retry.status, body: retry.body } }, null, 2));
+      }
+    });
 });
