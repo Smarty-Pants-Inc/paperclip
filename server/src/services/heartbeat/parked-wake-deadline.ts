@@ -70,6 +70,10 @@ export const PARKED_WAKE_NOT_STARTED_TEXT =
  * says (nothing started; Send/Retry sends it), never "Sending your messages.". */
 export const PARKED_WAKE_NOT_STARTED_WAIT = { reason: "parked_not_started", message: PARKED_WAKE_NOT_STARTED_TEXT } as const;
 
+/** noticeParkedWakeDeadline's answer when a run carrying a held message is
+ * still queued/running/scheduled_retry: no note yet; check again next pass. */
+export const PARKED_WAKE_CARRIER_ACTIVE = "carrier_active" as const;
+
 /**
  * The ONE note for a parked Send past its first-park deadline, written through
  * the unanswered-message notice (same key, unanswered_message:<message id>, so
@@ -78,7 +82,8 @@ export const PARKED_WAKE_NOT_STARTED_WAIT = { reason: "parked_not_started", mess
  * replaced in place: still one note. The wake is marked parkedNoticeAt in the
  * same transaction, so the note is never repeated per retry. DB writes only.
  */
-export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: string; requestId: string }, now = new Date()) {
+export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: string; requestId: string }, now = new Date()):
+  Promise<boolean | typeof PARKED_WAKE_CARRIER_ACTIVE> {
   const [wake] = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests)
     .where(and(eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.id, scope.requestId),
       eq(agentWakeupRequests.status, "deferred_issue_execution")));
@@ -93,21 +98,35 @@ export async function noticeParkedWakeDeadline(db: Db, scope: { companyId: strin
         eq(agentWakeupRequests.status, "deferred_issue_execution"))).for("update");
     const anchor = parkedWakeAnchor(current?.payload);
     if (!current || anchor === null || anchor + parkedWakeDeadlineMs() > now.getTime() || parkedWakeNoticed(current.payload)) return false;
-    // A held message X leaves this wake only when a run that CARRIED X itself
-    // published a reply after X (rf-4 ruling 09:32Z). A reply to a later
-    // message whose run never carried X does not count: X never started, so it
-    // keeps its note. All held carried-and-replied: the wake is settled
-    // (cancelled, kept) and gets no note.
+    // Per held message X, the runs that CARRIED X (directly or through their
+    // continuation chain, chainCarriesCommentSql) decide (rf-4 rulings):
+    // - a carrying run still queued/running/scheduled_retry: X may yet be
+    //   answered, so "it did not start" would be false. No note now; the
+    //   worker checks again on its next pass.
+    // - X leaves this wake only when its LATEST carrying run published an agent
+    //   reply after X. A latest carrier that failed/was cancelled/timed out
+    //   without a reply keeps X's true note, even if an earlier carrier replied;
+    //   a reply to a later message whose run never carried X does not count.
+    // All held carried-and-replied: the wake is settled (cancelled, kept), no note.
     const held = queuedCommentIdsFromWakePayload(current.payload);
     const message = { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` };
-    const answered = new Set(held.length === 0 ? [] : (await tx.select({ id: issueComments.id }).from(issueComments)
-      .where(and(eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, held),
-        sql`exists (select 1 from ${issueComments} a
-          join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
-          where a.company_id = ${message.companyId} and a.issue_id = ${message.issueId} and a.author_type = 'agent'
-            and a.deleted_at is null and a.created_at > ${message.createdAt}
-            and ${chainCarriesCommentSql("r", message.id, message)})`))).map(row => row.id));
+    const carrier = (alias: string) => sql`${sql.identifier(alias)}.company_id = ${message.companyId}
+      and (${sql.identifier(alias)}.issue_id = ${message.issueId}
+        or ${sql.identifier(alias)}.context_snapshot->>'issueId' = ${message.issueId}::text)
+      and ${chainCarriesCommentSql(alias, message.id, message)}`;
+    const carried = held.length === 0 ? [] : await tx.select({ id: issueComments.id,
+      active: sql<boolean>`exists (select 1 from ${heartbeatRuns} r where ${carrier("r")}
+        and r.status in ('queued', 'running', 'scheduled_retry'))`,
+      answered: sql<boolean>`exists (select 1 from ${issueComments} a
+        where a.company_id = ${message.companyId} and a.issue_id = ${message.issueId} and a.author_type = 'agent'
+          and a.deleted_at is null and a.created_at > ${message.createdAt}
+          and a.created_by_run_id = (select r.id from ${heartbeatRuns} r where ${carrier("r")}
+            order by r.created_at desc, r.started_at desc nulls last, r.id desc limit 1))`,
+    }).from(issueComments)
+      .where(and(eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, held)));
+    if (carried.some(row => row.active)) return PARKED_WAKE_CARRIER_ACTIVE;
+    const answered = new Set(carried.filter(row => row.answered).map(row => row.id));
     const open = held.filter(id => !answered.has(id));
     if (held.length > 0 && open.length === 0) {
       await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now,
