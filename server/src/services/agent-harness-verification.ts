@@ -14,6 +14,7 @@ import { aiConnectionService } from "./ai-connections.js";
 import { withManagedAiProbe, stripAiAuthBindings } from "./ai-connection-runtime.js";
 import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver, pluginRunnerAiConnectionRequiredFailure } from "./plugin-runner-ai-connection.js";
 import { environmentService } from "./environments.js";
+import { environmentRuntimeService } from "./environment-runtime.js";
 import { secretService } from "./secrets.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { assertProviderApiPlacementPolicy, resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
@@ -74,6 +75,7 @@ export function agentHarnessVerificationService(db: Db, manager: PluginWorkerMan
   const tests = agentEnvironmentTestService(db, manager);
   const secrets = secretService(db);
   const environments = environmentService(db);
+  let probeRuntime: ReturnType<typeof environmentRuntimeService> | undefined;
   async function verify(snapshot: LifecycleAgent): Promise<"complete" | "pending" | "waiting"> {
     const [agent] = await db.select().from(agents).where(and(eq(agents.id, snapshot.id), eq(agents.lifecycleVersion, snapshot.lifecycleVersion)));
     if (!agent) return "pending";
@@ -182,7 +184,10 @@ export function agentHarnessVerificationService(db: Db, manager: PluginWorkerMan
       if (target.fallbackChecks.length) throw Object.assign(new Error("The test environment is unavailable"), { code: "test_environment_unavailable" });
       const input = { companyId: agent.companyId, adapterType: agent.adapterType, config,
         executionTarget: target.executionTarget, environmentName: target.environmentName };
-      const result = binding ? await withManagedAiProbe(db, { ...input, agentId: agent.id, responsibleUserId, binding },
+      // F5: a retained probe re-reads Boat's typed state for its own closed lease.
+      const confirmProbeRetirement = (probe: { companyId: string; leaseId: string }) =>
+        (probeRuntime ??= environmentRuntimeService(db, { pluginWorkerManager: manager })).confirmProbeLeaseTermination(probe);
+      const result = binding ? await withManagedAiProbe(db, { ...input, agentId: agent.id, responsibleUserId, binding, confirmProbeRetirement },
         managed => {
           // The account this probe actually uses; the recorded digest must describe it.
           probed.account = { connectionId: managed.attribution.connectionId, grantId: managed.attribution.grantId };
