@@ -15445,6 +15445,132 @@ describe("native warm session supervision", () => {
       }
     });
 
+    // c3 gate 4 live RED (2026-11-18 06:40Z, case c3-gate4-stop-P9-1): a
+    // person pressed Stop at 06:40:03.9Z; (A) stopped the box: the stopped run
+    // d894fe15's lease 49ba24fe (box bx_6hnjpgj5) was released with Boat's
+    // typed "stopped" termination and the stop-and-retain receipt at
+    // 06:40:11.785Z. The successor abd1cb54 failed
+    // native_predecessor_retirement_unproven "(Boat sandbox lease is no longer
+    // active.)" and three messages went unanswered. Only Boat's typed stop or
+    // destroy receipt on the owner's own lease proves it gone (waited for
+    // within warmSessionReleaseWait); never the close error's text, a 503 or a
+    // timeout; and a "stopped" box proves nothing to a successor on that box.
+    describe("c3 Stop then a message: a superseded owner whose box a person's Stop stopped", () => {
+      const ownerRunId = "d894fe15-a4e2-4e5f-b80a-bebef7aa730f", ownerLeaseId = "49ba24fe-b54c-4275-803c-1fb7830dfc39";
+      const box = "bx_6hnjpgj5";
+      const run = async (row: { name: string; closeError: string; receipt: "stopped" | "destroyed" | null;
+        receiptAfterMs?: number; successorBox?: string; boundMs?: number; withWork?: boolean; messages?: number }) => {
+        const { base: shape } = fixture(`c3-stop-retire-${row.name}`);
+        // Live shape: a Boat remote pi_rpc warm chat with an agent_files copy.
+        const owner = { ...shape, binding: { ...shape.binding, runId: ownerRunId },
+          provider: { kind: "pi_rpc", model: "paperclip/selected-model-exactly", profile: QUALIFIED_PI_RPC_PROFILE },
+          session: { ...shape.session, driverKind: "pi_rpc" } } as unknown as NativeExecutionInputV1;
+        const successorRunIds = ["abd1cb54-ab9f-406e-9e9b-1482856f0c96", "abd1cb54-0000-4000-8000-000000000002",
+          "abd1cb54-0000-4000-8000-000000000003"].slice(0, row.messages ?? 1);
+        const copy = (runId: string) => ({ runId, root: `/tmp/c3-stop-${row.name}/agent-files`, preparationKey: "same",
+          // with-work: the owner's turn left changed agent files when the Stop came.
+          hasChanges: async () => row.withWork === true && runId === ownerRunId && stopPressed, collectStopped: async () => undefined });
+        const environmentId = `c3-stop-environment-${row.name}`;
+        let stopPressed = false;
+        const close = vi.fn().mockRejectedValue(new Error(row.closeError));
+        const release = vi.spyOn(nativeLeaseRenewal, "releaseUnstartedNativeExecutionClaim").mockResolvedValue(true);
+        state.execute.mockReset().mockImplementationOnce(async options => {
+          options.onSession?.({ close }); return result;
+        }).mockResolvedValue(result);
+        const leaseRows: Array<Record<string, unknown>> = [];
+        const target = (leaseId: string, providerLeaseId: string) => ({ kind: "remote" as const, transport: "sandbox" as const,
+          providerKey: "boat", environmentId, leaseId, remoteCwd: `/tmp/${environmentId}`,
+          sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId } });
+        // (A) at the person's Stop: Boat's typed receipts bound to the owner's own lease.
+        const writeReceipt = () => {
+          const confirmedAt = new Date().toISOString();
+          leaseRows.length = 0;
+          leaseRows.push({ id: ownerLeaseId, companyId: owner.binding.companyId, environmentId, heartbeatRunId: ownerRunId,
+            provider: "boat", providerLeaseId: box, status: "released", releasedAt: new Date(), cleanupStatus: "success",
+            leasePolicy: "reuse_by_environment", metadata: {
+              remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId: owner.binding.companyId,
+                runId: ownerRunId, leaseId: ownerLeaseId, provider: "boat", providerLeaseId: box, state: row.receipt, confirmedAt },
+              sandboxStopAndRetainReceipt: { schema: "paperclip.sandbox-stop-and-retain-receipt.v1", requestId: "1f7bcdfe",
+                companyId: owner.binding.companyId, runId: ownerRunId, leaseId: ownerLeaseId, provider: "boat",
+                providerLeaseId: box, method: "environmentStopLease", confirmedAt } } });
+        };
+        const original = { ...warmSessionReleaseWait };
+        if (row.boundMs !== undefined) warmSessionReleaseWait.timeoutMs = row.boundMs;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await executePaperclipNativeSession({ db: leaseDb(owner, {}, {}, [], {}, "running", [], leaseRows), execution: owner,
+            runnerInstanceId: "runner", useRunnerd: false, backend: {} as never,
+            runnerExecutionTarget: target(ownerLeaseId, box), instructionWorkingCopy: copy(ownerRunId) });
+          stopPressed = true;
+          // Until (A) writes Boat's receipt, the owner's lease row is still active.
+          const activeLease = { id: ownerLeaseId, companyId: owner.binding.companyId, environmentId, heartbeatRunId: ownerRunId,
+            provider: "boat", providerLeaseId: box, status: "active", releasedAt: null, cleanupStatus: null,
+            leasePolicy: "reuse_by_environment", metadata: {} };
+          if (!row.receipt || row.receiptAfterMs) leaseRows.push(activeLease);
+          if (row.receipt && !row.receiptAfterMs) writeReceipt();
+          if (row.receipt && row.receiptAfterMs) timer = setTimeout(writeReceipt, row.receiptAfterMs);
+          release.mockClear();
+          const answers: Array<PromiseSettledResult<unknown>> = [];
+          for (const runId of successorRunIds) {
+            const next = { ...owner, binding: { ...owner.binding, runId } } as NativeExecutionInputV1;
+            // Live shape: the successor runs on a box created for it, not the stopped bx_6hnjpgj5.
+            const successorBox = row.successorBox ?? `${box}-created`;
+            answers.push(...await Promise.allSettled([executePaperclipNativeSession({ db: leaseDb(next), execution: next,
+              runnerInstanceId: "runner", useRunnerd: false, backend: {} as never, refreshTools: true,
+              runnerExecutionTarget: target(`lease-${runId}`, successorBox), instructionWorkingCopy: copy(runId) })]));
+          }
+          return { answers, close, release, executeCalls: state.execute.mock.calls.length };
+        } finally {
+          if (timer) clearTimeout(timer);
+          Object.assign(warmSessionReleaseWait, original);
+          close.mockResolvedValue(undefined);
+          await closeIdleWarmNativeSessionsForRestart();
+          release.mockRestore();
+        }
+      };
+      const unproven = { status: "rejected", reason: expect.objectContaining({ code: "native_predecessor_retirement_unproven",
+        predecessorRunId: ownerRunId, providerLeaseId: box,
+        message: expect.stringContaining("The previous run's session on this sandbox could not be retired") }) };
+
+      it("RED live shape: the box's Boat 'stopped' receipt is already on the owner's lease; the successor is admitted and answers", async () => {
+        const out = await run({ name: "live", closeError: "Boat sandbox lease is no longer active.", receipt: "stopped" });
+        expect(out.answers).toEqual([{ status: "fulfilled", value: expect.anything() }]);
+        expect(out.executeCalls).toBe(2);
+        expect(out.release).not.toHaveBeenCalled();
+        expect(out.close).toHaveBeenCalledOnce();
+      });
+
+      it("text-only 'lease no longer active' close error, typed receipt written at +5 s: admitted, all three answered", async () => {
+        const started = Date.now();
+        const out = await run({ name: "receipt-later", closeError: "Boat sandbox lease is no longer active.", receipt: "stopped",
+          receiptAfterMs: 5_000, messages: 3 });
+        expect(out.answers.map(answer => answer.status)).toEqual(["fulfilled", "fulfilled", "fulfilled"]);
+        expect(out.executeCalls).toBe(4);
+        expect(Date.now() - started).toBeGreaterThanOrEqual(5_000);
+      }, 20_000);
+
+      it("with-work row: Stop during a with-work turn (agent files changed), then a message: answered", async () => {
+        const out = await run({ name: "with-work", closeError: "Boat sandbox lease is no longer active.", receipt: "stopped",
+          receiptAfterMs: 1_000, withWork: true });
+        expect(out.answers).toEqual([{ status: "fulfilled", value: expect.anything() }]);
+        expect(out.executeCalls).toBe(2);
+      }, 20_000);
+
+      it.each([
+        { name: "text-no-receipt", closeError: "Boat sandbox lease is no longer active.", receipt: null },
+        { name: "download-url-503", closeError: "Boat sandbox download URL is unavailable (503).", receipt: null },
+        { name: "timeout", closeError: "warm Runner close timed out after 30000 ms", receipt: null },
+        { name: "same-box-stopped", closeError: "Boat sandbox lease is no longer active.", receipt: "stopped", successorBox: box },
+      ] as const)("no typed proof within the bound stays unproven exactly as today ($name)", async row => {
+        const started = Date.now();
+        const out = await run({ ...row, boundMs: 300 });
+        expect(out.answers).toEqual([unproven]);
+        expect((out.answers[0] as PromiseRejectedResult).reason.cause).toMatchObject({ message: row.closeError });
+        expect(out.executeCalls).toBe(1);
+        expect(Date.now() - started).toBeGreaterThanOrEqual(300);
+      });
+    });
+
     it.each([true, false])("TL08 retains preparation ownership until startup cleanup drains (%s)", async drained => {
       const { NativePredecessorRetirementUnprovenError } = await import("./predecessor-retirement.js");
       const { base } = fixture(`tl08-preparation-cleanup-${drained}`);
