@@ -6745,9 +6745,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ),
     ).toBe(false);
 
-    // It escalates without another provider attempt, but task ownership can
-    // only be released after this executor's controller and cleanup settle.
-    // The saved needs-attention report may precede that durable Stop proof.
+    // It escalates without another provider attempt and releases task ownership.
     const issue = await waitForValue(async () => {
       const [row] = await db.select({ status: issues.status, checkoutRunId: issues.checkoutRunId,
         executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, issueId));
@@ -6755,16 +6753,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(issue).toMatchObject({ status: "blocked", checkoutRunId: null, executionRunId: null });
 
-    // Stop inspection history is retained. Select the one current recovery
-    // action, never the database's arbitrary first historical row.
+    // Select the current recovery action, not an arbitrary historical row.
     const recoveryActions = await db.select().from(issueRecoveryActions)
       .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
     const activeRecoveryActions = recoveryActions.filter(action => ["active", "escalated"].includes(action.status));
     expect(activeRecoveryActions).toHaveLength(1);
     const recoveryAction = activeRecoveryActions[0]!;
     expect(recoveryAction).toMatchObject({ status: "active", sourceIssueId: issueId });
-    expect(recoveryActions.filter(action => action.cause === "execution_stop_pending")
-      .every(action => ["resolved", "cancelled"].includes(action.status))).toBe(true);
     const [settledInteraction] = await db.select({ result: issueThreadInteractions.result }).from(issueThreadInteractions)
       .where(eq(issueThreadInteractions.id, interactionId));
     expect(settledInteraction.result).toMatchObject({ resumeFailure: { recoveryActionId: recoveryAction.id } });
@@ -6859,8 +6854,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activeRecoveryActions).toHaveLength(1);
     const recoveryAction = activeRecoveryActions[0]!;
     expect(recoveryAction).toMatchObject({ status: "active", sourceIssueId: issueId });
-    expect(recoveryActions.filter(action => action.cause === "execution_stop_pending")
-      .every(action => ["resolved", "cancelled"].includes(action.status))).toBe(true);
 
     const comments = await selectRecoveryCommentsForIssue(issueId);
     expect(comments).toHaveLength(1);

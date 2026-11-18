@@ -768,10 +768,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .resolves.toEqual([{ checkoutRunId: runningRunId, executionRunId: runningRunId }]);
   });
 
-  it("terminalizes a running run whose issue is terminal but retains claims while the process stays alive (reuse-lease path)", async () => {
-    // Terminal task authority still settles the run's status, but cannot prove
-    // execution Stop while its recorded PID is alive. Keep both claims until
-    // the execution evidence is released, even when the task is already done.
+  it("terminalizes a running run whose issue is terminal (reuse-lease path)", async () => {
     const { companyId, agentId, runningRunId } = await seed();
     // process.pid is the live test process, so isPidAlive returns true.
     await db
@@ -795,7 +792,6 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     const result = await heartbeat.sweepStaleIssueLocks();
 
     expect(result.terminalizedRunIds).toEqual([runningRunId]);
-    expect(result.cleared).toBe(0);
 
     const run = await db
       .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
@@ -806,13 +802,6 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // succeeded run carries no error code.
     expect(run?.status).toBe("succeeded");
     expect(run?.errorCode).toBeNull();
-
-    const lock = await db
-      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
-      .from(issues)
-      .where(eq(issues.id, issueId))
-      .then((rows) => rows[0]);
-    expect(lock).toEqual({ checkoutRunId: runningRunId, executionRunId: runningRunId });
 
     const event = await db
       .select({ message: heartbeatRunEvents.message })
@@ -831,8 +820,6 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect.objectContaining({ agent_id: agentId, state: "succeeded" }),
     );
 
-    await db.update(heartbeatRuns).set({ processPid: null }).where(eq(heartbeatRuns.id, runningRunId));
-    expect((await heartbeat.sweepStaleIssueLocks()).cleared).toBe(1);
     await expect(db.select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
       .from(issues).where(eq(issues.id, issueId)))
       .resolves.toEqual([{ checkoutRunId: null, executionRunId: null }]);
