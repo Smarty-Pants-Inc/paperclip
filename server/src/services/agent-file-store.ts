@@ -242,7 +242,7 @@ export function agentFileStore(db: Db) {
   db = fileStorageDb(db);
   async function locked<T>(companyId: string, agentId: string, actor: AuthorizationActor, write: boolean,
     fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor, onRollback: (restore: () => Promise<void>) => void) => Promise<T>, texts: string[] = [],
-    prepared?: PreparedAgentFileObjects, signal?: AbortSignal) {
+    prepared?: PreparedAgentFileObjects) {
     return withAgentFilesRestoredBeforeLock(() => db.transaction(async tx => {
       if (write) await assertAgentInteraction(tx, { companyId, actorAgentId: actor.type === "agent" ? actor.agentId : null,
         operation: "configure", targetAgentId: agentId, lockAgentIds: texts.flatMap(extractAgentMentionIds), lock: "update" });
@@ -255,10 +255,6 @@ export function agentFileStore(db: Db) {
       try {
         const result = await fn(tx, agent, root, bound, callback => { restore = callback; });
         if (write) await persistDurableAgentFiles(tx, agent, root, false, prepared);
-        // The canonical commit boundary: a caller's cancellation raised before
-        // this point rolls the whole write back (the projection was
-        // invalidated above, so it is restored before the next lock).
-        signal?.throwIfAborted();
         return result;
       } catch (error) {
         await restore?.();
@@ -397,7 +393,7 @@ export function agentFileStore(db: Db) {
         return { contentHash: incomingHash, changed: true };
       }, input.bytes && input.bytes.length <= MAX_INSTRUCTION_BYTES ? [input.bytes.toString("utf8")] : []),
     /** `signal`: once aborted, the save stops before its next step and, at the
-     * latest, before the canonical commit (the write is rolled back). */
+     * latest, at the canonical commit boundary (before the tree merge). */
     apply: async (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor,
       options: { signal?: AbortSignal } = {}) => {
       const { signal } = options;
@@ -524,6 +520,12 @@ export function agentFileStore(db: Db) {
           total += size;
         }
         assertDirectorySize(total, finalEntries.size);
+        // The canonical commit boundary: nothing canonical has changed yet (no
+        // byte in the agent's tree, no durable row; the transaction rolls
+        // back). A cancellation raised before this point stops the save here.
+        // From the merge on, the write is not interrupted half-way: a rolled
+        // back transaction would leave the merged tree on disk.
+        signal?.throwIfAborted();
         await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root,
           ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
         for (const item of conflicts) if (item.conflictCopy) await writeConflictCopy(input.sourceDir, root, item, incoming.entries.get(item.path)!);
@@ -531,7 +533,7 @@ export function agentFileStore(db: Db) {
         // caller can acknowledge the save or clean up the run's copy.
         await audit(tx, agent, bound, { sourceRunId, contract: AGENT_FILES_CONTRACT, ...(conflicts.length ? { conflicts } : {}) });
         return { storageWarning: storageWarning(total, finalEntries.size, fullFile), conflicts };
-      }, [...changedMentions.values()].map(value => value.text), prepared, signal);
+      }, [...changedMentions.values()].map(value => value.text), prepared);
     },
   };
 }
