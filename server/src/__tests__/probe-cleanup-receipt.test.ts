@@ -44,8 +44,11 @@ const support = await getEmbeddedPostgresTestSupport();
   }, 120_000);
   afterAll(async () => { await database?.cleanup(); });
   beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-11-18T10:00:00.000Z")); });
+  const hired: string[] = [];
   afterEach(async () => {
     for (const stop of stops.splice(0)) await stop().catch(() => {});
+    // Retire only this test's synthetic hires so later lifecycle reads stay isolated.
+    for (const id of hired.splice(0)) await db.update(agents).set({ lifecycleState: "terminated", status: "terminated" }).where(eq(agents.id, id));
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -94,6 +97,7 @@ const support = await getEmbeddedPostgresTestSupport();
       status: "paused", lifecycleState: "verifying", lifecycleRequiredPluginIds: [],
       runtimeConfig: { aiConnection: { mode: "responsible_user", provider: "openrouter", method: "api_key" } },
       lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
+    hired.push(agent!.id);
     return { companyId, environment: environment!, agent: agent!, accountKey, release, boat };
   }
 
@@ -282,7 +286,6 @@ const support = await getEmbeddedPostgresTestSupport();
   it("N2: -32002 alone (no receipt: the lease is still active) is unproven", async () => {
     const f = await fixture({ release: "destroyed" });
     const boundary = probeBoundary([f]);
-    const verifier = agentHarnessVerificationService(db, f.boat.worker);
     // The release has not run yet: the probe's close was refused with -32002.
     const realTests = environmentTests.agentEnvironmentTestService(db, f.boat.worker);
     const real = realTests.resolveAdapterTestExecutionContext;
@@ -293,6 +296,7 @@ const support = await getEmbeddedPostgresTestSupport();
       testManagedEnvironment: async () => { throw new NativeEnvironmentProbeCleanupError(Promise.reject(new Error("unconfirmed")).catch(() => { throw new Error("unconfirmed"); }) as Promise<void>,
         undefined, [new JsonRpcCallError({ code: -32002, message: BOAT_REFUSAL } as never)], async () => { throw new Error("Native probe remote retirement remains unconfirmed"); }); },
     }) as never);
+    const verifier = agentHarnessVerificationService(db, f.boat.worker);
     await expect(verifier.verify(f.agent as never)).rejects.toMatchObject({ details: { code: "native_probe_cleanup_pending" } });
     await new Promise(resolve => setImmediate(resolve));
     await expect(verifier.verify(f.agent as never)).rejects.toMatchObject({ details: { code: "native_probe_cleanup_pending" } });
@@ -379,7 +383,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await row(f.agent.id)).toMatchObject({ lifecycleError: PARKED_LINE, lifecycleOperation: { retryRequired: true } });
     // Retry with the lease still open (no receipt): the same parked line at once, no automatic retry.
     await createAgentLifecycle(db).retry(f.agent.id);
-    await restarted.process(f.agent.id);
+    await restarted.sweep();
     const again = await row(f.agent.id);
     expect(again).toMatchObject({ lifecycleError: PARKED_LINE, lifecycleOperation: { retryRequired: true } });
     expect(again.lifecycleOperation).not.toHaveProperty("retryAt");
@@ -392,7 +396,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
       metadata: { ...probeLease!.metadata, remoteExecutionTermination: receipt } }).where(and(eq(environmentLeases.id, probeLease!.id)));
     await createAgentLifecycle(db).retry(f.agent.id);
-    await restarted.process(f.agent.id);
+    await restarted.sweep();
     expect(runHost).toHaveBeenCalledTimes(2);
     expect(boundary.cleanups.get(f.agent.id)).toHaveBeenCalledOnce();
     expect(boundary.probes.get(f.agent.id)).toBe(2);
