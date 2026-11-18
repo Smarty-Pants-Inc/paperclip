@@ -424,12 +424,17 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       || !event.turnId || event.payload.providerTerminalObserved === false
     )) throw new Error("native_deferred_observer_terminal_required");
     const terminalItem = /^item\.(completed|failed|cancelled)$/.test(event.eventType);
-    const terminalTurn = /^(turn|session)\.(completed|failed|cancelled|interrupted|closed)$/.test(event.eventType);
+    const toolDelta = event.eventType === "tool.execution.progressed";
+    // PRP currently reports failed/cancelled tools as completed + status; also
+    // accept their explicit terminal names here when admitted by the protocol.
+    const terminalTool = /^tool\.execution\.(completed|failed|cancelled)$/.test(event.eventType);
+    const terminalRun = event.eventType === "run.terminal";
+    const terminalTurn = /^(turn|session)\.(completed|failed|cancelled|interrupted|closed)$/.test(event.eventType) || terminalRun;
     // Always on: besides the run's known secrets, the buffer holds a trailing
     // fragment that may become a strict credential shape (Bearer, a provider
     // key, a JWT) until the joined text is scanned. It runs before the hash,
     // the insert and the live publication, so all three see the same bytes.
-    if (event.eventType === "item.delta" || terminalItem || terminalTurn) {
+    if (event.eventType === "item.delta" || toolDelta || terminalItem || terminalTool || terminalTurn) {
       const key = `${event.sourceInstanceId}:${event.sourceEventId}`;
       const cached = this.#redactedDeltas.get(key);
       const originalSha = nativeSha256(validated.event);
@@ -441,11 +446,16 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
         // The buffer does not read a source event twice either way.
         if (this.#identityRedactor.values.length > 0) throw new Error("native_event_source_payload_conflict");
       } else {
-        const stream = `${event.sourceInstanceId}:${event.turnId}:${event.itemId}`;
-        event = { ...event, payload: event.eventType === "item.delta"
+        // Tool progress uses the SAME redactor/hold/flush, not a second buffer.
+        // It is a distinct publication of the output, scoped by executionId;
+        // item.delta and another tool sharing the envelope itemId cannot join it.
+        const stream = toolDelta || terminalTool
+          ? `${event.sourceInstanceId}:${event.turnId}:tool.execution:${event.payload.executionId}`
+          : `${event.sourceInstanceId}:${event.turnId}:${event.itemId}`;
+        event = { ...event, payload: event.eventType === "item.delta" || toolDelta
           ? this.#identityRedactor.delta(stream, validated.event.payload, event.itemId)
           : this.#identityRedactor.settleDeltas(
-            terminalTurn ? (event.eventType.startsWith("session.") ? `${event.sourceInstanceId}:` : `${event.sourceInstanceId}:${event.turnId}:`) : stream,
+            terminalTurn ? (terminalRun || event.eventType.startsWith("session.") ? `${event.sourceInstanceId}:` : `${event.sourceInstanceId}:${event.turnId}:`) : stream,
             event.payload, terminalTurn,
           ),
         };

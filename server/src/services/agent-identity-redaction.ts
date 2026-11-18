@@ -438,7 +438,7 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       const paths: string[] = [];
       const payload = value as Record<string, unknown>;
       // Durable transports can share one envelope item ID across provider items.
-      stream = JSON.stringify([stream, payload.itemId, payload.providerItemId, payload.channel, payload.stream]);
+      stream = JSON.stringify([stream, payload.itemId, payload.providerItemId, payload.channel, payload.stream, payload.executionId]);
       const visit = (entry: unknown, path: string, field: string): unknown => {
         if (typeof entry === "string") {
           if (!/^(text|delta|output|patch)$/.test(field)) return redactor.redact(entry);
@@ -458,7 +458,7 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
         if ((hasPending(previous) || shapePending(previous)) && !paths.includes(previous)) paths.push(previous);
       }
       if (paths.length) deltaStreams.set(stream, { scope, itemId, paths,
-        payload: Object.fromEntries(["itemId", "providerItemId", "kind", "channel", "stream"]
+        payload: Object.fromEntries(["itemId", "providerItemId", "kind", "channel", "stream", "executionId"]
           .filter(key => typeof payload[key] === "string").map(key => [key, redactor.redact(payload[key])])),
       });
       else deltaStreams.delete(stream);
