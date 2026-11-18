@@ -40,7 +40,7 @@ import { canResumePreservedResultFinalization } from "./preserved-result-finaliz
 import { isServerReplacementInterruption } from "./server-replacement-interruption.js";
 import { normalizeAgentNameKey } from "./agent-name-key.js";
 import { liftInterruptionBlock } from "./interruption-block-release.js";
-import { isAcknowledgedNativeStop } from "./acknowledged-native-stop.js";
+import { isOwnerSendAfterAcknowledgedPersonStop } from "./acknowledged-native-stop.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "agentId" | "status" | "startedAt" | "finishedAt" | "createdAt" |
@@ -347,10 +347,9 @@ export async function admitExplicitNativeContinuation(input: {
     }
     // Option S: the chat owner's Send after an acknowledged person Stop takes the
     // same ordinary admission as a typed message; no synthetic stopped-run source.
-    const ownerSendAfterPersonStop = !blocker && !sourceChecks.length && task.conversationAgentId === agentId
-      && interruptIntent?.actorId === task.conversationUserId && !!latest && isAcknowledgedNativeStop(latest)
-      && latest.resultJson?.operatorInterrupted !== true && !latest.resultJson?.queuedCommentInterruptQueueId
-      && !!latest.finishedAt && latest.finishedAt <= interruptRequestedAt!;
+    const ownerSendAfterPersonStop = isOwnerSendAfterAcknowledgedPersonStop({ task, agentId,
+      senderId: interruptIntent?.actorId, latest, sentAt: interruptRequestedAt!,
+      blockedOrReconciling: !!blocker || sourceChecks.length > 0 });
     if (latest?.runtimeMode === "native" && ["cancelled", "failed"].includes(latest.status) && !ownerSendAfterPersonStop &&
         !sourceChecks.some(source => (source.evidence.runId ?? source.evidence.sourceRunId) === latest.id)) {
       sourceChecks.push({ cause: "native_continuation_requires_reconciliation", evidence: { runId: latest.id } });
