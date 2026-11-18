@@ -152,6 +152,7 @@ import { scheduledResumeContinuationAllowed } from "./scheduled-resume-continuat
 import { readNativeLocalProcessStop, recordedLocalExecutionStopped, PRIOR_OWNER_FENCE_REFUSED, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, withReleasedNativeRunProcess } from "../native-local-process-stop.js";
 import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, remoteLeaseCleanupScope, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "../reusable-sandbox-kept-marker.js";
+import { hasStopOnlyCleanup, prepareSandboxStopAndRetain } from "../sandbox-stop-and-retain.js";
 import { connectorToolDefinitionsForSkills } from "../connector-runtime.js";
 import { NATIVE_PREPARATION_FENCING_VERSION, setNativeExecutionActive } from "./native-active-runs.js";
 import { preserveNativeFailedWorkspace } from "./native-failed-workspace-recovery.js";
@@ -289,7 +290,7 @@ import {
   nativeRunResults,
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
-import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery, RETAINED_OWNER_LEASE_WAIT_MESSAGE, STOPPED_RUN_TOOLS_WAIT_MESSAGE } from "./native-controller-recovery.js";
+import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery, RETAINED_OWNER_LEASE_WAIT_MESSAGE, STOPPED_RUN_TOOLS_WAIT_KEY, STOPPED_RUN_TOOLS_WAIT_MESSAGE } from "./native-controller-recovery.js";
 import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 import type { EnvironmentDriverExecuteInput } from "../environment-runtime.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
@@ -6996,7 +6997,10 @@ async function stopIssuedTurnCommandsOfDirectSuccessor(input: Parameters<typeof 
     const [previous] = await input.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, stopped.agentId),
         eq(heartbeatRuns.nativeSessionId, sessionId), ne(heartbeatRuns.id, successorRunId),
-        lt(heartbeatRuns.createdAt, successor.createdAt)))
+        lt(heartbeatRuns.createdAt, successor.createdAt),
+        // S095 cap: an earlier successor that only waited on this same stopped
+        // run pre-claim (a capped attempt this run Retries) did no turn.
+        sql`coalesce(${heartbeatRuns.contextSnapshot}->${STOPPED_RUN_TOOLS_WAIT_KEY}->>'stoppedRunId', '') <> ${stoppedRunId}`))
       .orderBy(desc(heartbeatRuns.createdAt)).limit(1);
     if (previous?.id !== stoppedRunId) return null;
     // (c)
@@ -7021,6 +7025,72 @@ async function stopIssuedTurnCommandsOfDirectSuccessor(input: Parameters<typeof 
   }
 }
 
+/** S095 cap (RFL 02:30Z). After this many deferrals without the generation
+ * proof the successor requests the stopped run's stop-and-retain itself. */
+export const STOPPED_RUN_TOOLS_STOP_AFTER_DEFERRALS = 2;
+/** From the first deferral: still no proof -> the terminal failure below. */
+export const STOPPED_RUN_TOOLS_WAIT_CAP_MS = 10 * 60_000;
+export const STOPPED_RUN_TOOLS_UNCONFIRMED = "native_stopped_run_tools_unconfirmed";
+export const STOPPED_RUN_TOOLS_UNCONFIRMED_NOTE = "Couldn't confirm the stopped run's tools exited. Your message is saved. Press Retry to try again.";
+
+/** Terminal: no quarantine, nothing deleted; the person's message stays on
+ * the conversation and Retry re-requests the stop first. */
+export class NativeStoppedRunToolsUnconfirmedError extends Error {
+  readonly code = STOPPED_RUN_TOOLS_UNCONFIRMED;
+  constructor(readonly stoppedRunId: string) {
+    super(STOPPED_RUN_TOOLS_UNCONFIRMED_NOTE);
+    this.name = "NativeStoppedRunToolsUnconfirmedError";
+  }
+}
+
+/** The successor's persisted wait on `stoppedRunId` (written by
+ * deferNativeControllerRecovery in the deferral's transaction), and whether
+ * this run is a Retry of a run that already waited on it. */
+async function readStoppedRunToolsWait(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], stoppedRunId: string) {
+  const { companyId, runId } = input.execution.binding;
+  const [run] = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, retryOfRunId: heartbeatRuns.retryOfRunId })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+  const wait = record(record(run?.contextSnapshot)[STOPPED_RUN_TOOLS_WAIT_KEY]);
+  const same = wait.stoppedRunId === stoppedRunId;
+  let retryOfWaited = false;
+  if (run?.retryOfRunId) {
+    const [retried] = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, run.retryOfRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+    retryOfWaited = record(record(retried?.contextSnapshot)[STOPPED_RUN_TOOLS_WAIT_KEY]).stoppedRunId === stoppedRunId;
+  }
+  const firstDeferredAt = same && typeof wait.firstDeferredAt === "string" ? Date.parse(wait.firstDeferredAt) : Number.NaN;
+  return { deferrals: same && typeof wait.deferrals === "number" ? wait.deferrals : 0,
+    firstDeferredAt: Number.isFinite(firstDeferredAt) ? firstDeferredAt : null, retryOfWaited };
+}
+
+/** The same stop a person's Stop releases with: releaseRunLeases'
+ * stop_and_retain step (environment-runtime.ts releaseRunLeases ->
+ * prepareSandboxStopAndRetain) persists the stop-and-retain intent on the
+ * stopped run's still-held lease; the pending-cleanup sweep dispatches the
+ * provider stop and records the bound stop receipt (c) reads. A stop keeps
+ * the disk. Never the successor's box, never a box another lease holds; an
+ * already requested stop is left as it is. */
+async function requestStoppedRunStopAndRetain(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], stoppedRunId: string) {
+  const { companyId } = input.execution.binding;
+  const target = input.runnerExecutionTarget;
+  const successor = target?.kind === "remote" && target.transport === "sandbox"
+    ? { leaseId: target.leaseId, providerLeaseId: target.sandboxLeaseAcquisition?.providerLeaseId } : null;
+  const held = await input.db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, companyId),
+    eq(environmentLeases.heartbeatRunId, stoppedRunId), eq(environmentLeases.status, "active")));
+  let requested = 0;
+  for (const lease of held) {
+    if (!lease.providerLeaseId || hasStopOnlyCleanup(lease) || lease.id === successor?.leaseId
+      || lease.providerLeaseId === successor?.providerLeaseId) continue;
+    const [peer] = await input.db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      ne(environmentLeases.id, lease.id), sql`${environmentLeases.provider} is not distinct from ${lease.provider}`,
+      eq(environmentLeases.providerLeaseId, lease.providerLeaseId),
+      inArray(environmentLeases.status, ["active", "retained", "pending_cleanup"]))).limit(1);
+    if (peer) continue;
+    if (await prepareSandboxStopAndRetain(input.db, lease)) requested++;
+  }
+  await input.onLog?.("stderr", `[paperclip-runner] requested the stop of run ${stoppedRunId}'s box (stop-and-retain, ${requested} lease${requested === 1 ? "" : "s"})\n`);
+}
+
 /** The Stop's own pending turn commands with its Runner generation proven
  * gone: retire through today's proof on the projected journal. Generation not
  * yet proven gone: wait once within warmSessionReleaseWait (outside any
@@ -7032,6 +7102,11 @@ async function retireAfterStopIssuedTurnCommands(input: Parameters<typeof inspec
   let exempt = await stopIssuedTurnCommandsOfDirectSuccessor(input);
   if (!exempt) return { retired: false, refused };
   if (!exempt.generationGone) {
+    const stoppedRunId = String(input.identity.runId);
+    const wait = await readStoppedRunToolsWait(input, stoppedRunId);
+    if (wait.deferrals >= STOPPED_RUN_TOOLS_STOP_AFTER_DEFERRALS || wait.retryOfWaited) {
+      await requestStoppedRunStopAndRetain(input, stoppedRunId);
+    }
     await input.onLog?.("stderr", `[paperclip-runner] waiting for proof that the Runner of run ${String(input.identity.runId)} stopped by its person's Stop is gone\n`);
     const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
     while (Date.now() < deadline && exempt?.generationGone === false) {
@@ -7039,8 +7114,13 @@ async function retireAfterStopIssuedTurnCommands(input: Parameters<typeof inspec
       exempt = await stopIssuedTurnCommandsOfDirectSuccessor(input);
     }
     if (!exempt) return retireFinishedPerTurnRunnerdOwner(input);
-    if (!exempt.generationGone) throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs), undefined,
-      { message: await stoppedRunWaitMessage(input, input.identity.runId) });
+    if (!exempt.generationGone) {
+      if (wait.firstDeferredAt !== null && Date.now() - wait.firstDeferredAt >= STOPPED_RUN_TOOLS_WAIT_CAP_MS) {
+        throw new NativeStoppedRunToolsUnconfirmedError(stoppedRunId);
+      }
+      throw new NativeControllerRecoveryWaitingError(new Date(Date.now() + warmSessionReleaseWait.timeoutMs), undefined,
+        { message: await stoppedRunWaitMessage(input, input.identity.runId), stoppedRunToolsWait: { stoppedRunId } });
+    }
   }
   await input.onLog?.("stderr", `[paperclip-runner] run ${String(input.identity.runId)}'s Runner is gone; `
     + "its unanswered turn commands issued after the person's acknowledged Stop no longer hold this conversation\n");
@@ -11646,7 +11726,8 @@ async function executePaperclipNativeSessionUnnoticed(input: {
     executionFailure = error;
     if (error instanceof NativeControllerRecoveryWaitingError) {
       await deferNativeControllerRecovery(input.db, { ...input.execution.binding,
-        leaseOwner: input.leaseOwner, retryAt: error.retryAt, waitingForOwner: error.owner, message: error.detail?.message });
+        leaseOwner: input.leaseOwner, retryAt: error.retryAt, waitingForOwner: error.owner, message: error.detail?.message,
+        stoppedRunToolsWait: error.detail?.stoppedRunToolsWait });
     }
     if (!(error instanceof NativeRunnerOwnershipUnverifiedError) && !(error instanceof NativeStartupCleanupPendingError) && startup.stopRequested && startup.executionContext?.signal.reason instanceof Error &&
         startup.executionContext.signal.reason.message === "native_session_cancelled") {

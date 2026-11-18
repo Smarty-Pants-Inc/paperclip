@@ -51,7 +51,7 @@ vi.mock("./current-wake-comments.js", async importOriginal => ({
 }));
 import { buildNativeHarnessBackupManifest, createRunnerdBackend, executePaperclipNativeSession, inspectFinishedPerTurnRunnerdOwner,
   quarantinedBootstrapOfOwnerHeldNoProviderWork, resolveNativeHarnessPersistenceProfile, scopedRunnerdStateRoot,
-  warmSessionReleaseWait } from "./native-session-executor.js";
+  NativeStoppedRunToolsUnconfirmedError, STOPPED_RUN_TOOLS_WAIT_CAP_MS, warmSessionReleaseWait } from "./native-session-executor.js";
 
 // Durable-root admission is the boundary under test. Reaching the run's tool
 // authority proves admission passed; no provider or runner process starts.
@@ -1934,6 +1934,103 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(finalization).toMatchObject({ failureCode: "native_controller_recovery_waiting_for_owner" });
     expect((finalization.failureDetail as { message?: string }).message).toBe(message);
   }, 60_000);
+
+  /** The existing retry owner re-claims the deferred run at its nextAttemptAt. */
+  async function retryOwnerClaims(runId: string) {
+    await db.update(nativeRunFinalizations).set({ phase: "observed", nextAttemptAt: null, recoveryState: null,
+      failureCode: null, failureDetail: null }).where(eq(nativeRunFinalizations.runId, runId));
+  }
+  async function oldBoxLease(leaseId: string) {
+    return (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0];
+  }
+  /** The pending-cleanup sweep's provider stop lands: the bound Boat stop receipt on the old box. */
+  async function landStopReceipt(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, leaseId: string) {
+    const providerLeaseId = `sandbox-${prior.runId}`;
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success",
+      metadata: { remoteCwd: "/workspace", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId,
+        runId: prior.runId, leaseId, provider: "boat", providerLeaseId, state: "stopped", confirmedAt: new Date().toISOString() } } })
+      .where(eq(environmentLeases.id, leaseId));
+  }
+  const STOP_REQUEST_LINE = "requested the stop of run";
+  /** Deferral cycles of the successor at the production entry, each re-claimed by the retry owner. */
+  async function deferCycles(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
+    followUp: Awaited<ReturnType<typeof admitFollowUp>>, cycles: number) {
+    for (let cycle = 0; cycle < cycles; cycle++) {
+      const { outcome } = await executeFollowUp(prior, followUp, 300);
+      expect(outcome, `cycle ${cycle + 1}`).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+      await retryOwnerClaims(followUp.runId);
+    }
+  }
+  async function waitFact(runId: string) {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    return (run.contextSnapshot as Record<string, unknown>).stoppedRunToolsWait as
+      { stoppedRunId: string; deferrals: number; firstDeferredAt: string } | undefined;
+  }
+  /** The cap counts from the persisted first deferral: move it back (the clock moves on). */
+  async function ageFirstDeferral(runId: string, ms: number) {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const context = run.contextSnapshot as Record<string, unknown>;
+    const wait = context.stoppedRunToolsWait as Record<string, unknown>;
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...context, stoppedRunToolsWait: { ...wait,
+      firstDeferredAt: new Date(Date.parse(String(wait.firstDeferredAt)) - ms).toISOString() } } }).where(eq(heartbeatRuns.id, runId));
+  }
+
+  it("S095 cap: no receipt -> after 2 deferral cycles the successor requests the stopped run's stop-and-retain -> receipt lands -> admitted",
+    async () => {
+      const { prior, followUp } = await stopTurnShape({ receipt: false });
+      const leaseId = await holdOldBoxLease(prior);
+      await deferCycles(prior, followUp, 2);
+      expect.soft(await waitFact(followUp.runId)).toMatchObject({ stoppedRunId: prior.runId, deferrals: 2 });
+      expect.soft((await oldBoxLease(leaseId)).status, "no stop requested in the first 2 cycles").toBe("active");
+      expect.soft(followUp.logs.join("")).not.toContain(STOP_REQUEST_LINE);
+      await deferCycles(prior, followUp, 1);
+      const requested = await oldBoxLease(leaseId);
+      expect.soft(followUp.logs.join("")).toContain(`${STOP_REQUEST_LINE} ${prior.runId}`);
+      expect.soft(requested.status).toBe("pending_cleanup");
+      expect.soft(requested.metadata?.sandboxStopAndRetain).toMatchObject({ schema: "paperclip.sandbox-stop-and-retain.v1",
+        runId: prior.runId, leaseId });
+      await landStopReceipt(prior, leaseId);
+      const { outcome } = await executeFollowUp(prior, followUp, 5_000);
+      expect.soft(outcome).not.toBeInstanceOf(NativeControllerRecoveryWaitingError);
+      expect.soft(failureText(outcome), "admitted once the receipt is recorded").toContain(ADMITTED);
+      expect.soft(followUp.logs.join("")).toContain(`run ${prior.runId}'s Runner is gone; ${TURN_EXEMPT_LINE}`);
+      expect(await quarantined()).toEqual([]);
+    }, 120_000);
+
+  it("S095 cap: no receipt even after the stop request -> at the cap the terminal note with Retry, not another deferral; "
+    + "Retry re-requests the stop first and is admitted once a receipt lands", async () => {
+    const { prior, followUp } = await stopTurnShape({ receipt: false });
+    const leaseId = await holdOldBoxLease(prior);
+    await deferCycles(prior, followUp, 3);
+    expect((await oldBoxLease(leaseId)).status).toBe("pending_cleanup");
+    await ageFirstDeferral(followUp.runId, STOPPED_RUN_TOOLS_WAIT_CAP_MS);
+    const capped = await executeFollowUp(prior, followUp, 300);
+    expect.soft(capped.outcome).toBeInstanceOf(NativeStoppedRunToolsUnconfirmedError);
+    expect.soft(failureText(capped.outcome)).toBe("Couldn't confirm the stopped run's tools exited. Your message is saved. Press Retry to try again.");
+    expect.soft((capped.outcome as { code?: string }).code).toBe("native_stopped_run_tools_unconfirmed");
+    const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, followUp.runId));
+    expect.soft(finalization, "not deferred again: the run does not loop").toMatchObject({ phase: "observed", nextAttemptAt: null });
+    expect.soft(await waitFact(followUp.runId)).toMatchObject({ deferrals: 3 });
+    expect.soft(await quarantined(), "no quarantine").toEqual([]);
+    expect.soft(await oldBoxLease(leaseId), "nothing deleted").toBeDefined();
+    expect.soft(followUp.remoteExecute).not.toHaveBeenCalled();
+    // The heartbeat fails the capped run; the person presses Retry.
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, followUp.runId));
+    // The earlier stop request never landed; the sweep gave the lease back.
+    await db.update(environmentLeases).set({ status: "active", releasedAt: null, metadata: { remoteCwd: "/workspace" } })
+      .where(eq(environmentLeases.id, leaseId));
+    const retry = await admitFollowUp(prior);
+    await db.update(heartbeatRuns).set({ retryOfRunId: followUp.runId }).where(eq(heartbeatRuns.id, retry.runId));
+    const first = await executeFollowUp(prior, retry, 300);
+    expect.soft(first.outcome).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect.soft(retry.logs.join(""), "the Retry re-requests the stop on its first attempt").toContain(`${STOP_REQUEST_LINE} ${prior.runId}`);
+    expect.soft((await oldBoxLease(leaseId)).metadata?.sandboxStopAndRetain).toMatchObject({ runId: prior.runId, leaseId });
+    await retryOwnerClaims(retry.runId);
+    await landStopReceipt(prior, leaseId);
+    const { outcome } = await executeFollowUp(prior, retry, 5_000);
+    expect.soft(failureText(outcome), "the Retry is admitted once the receipt lands").toContain(ADMITTED);
+    expect(await quarantined()).toEqual([]);
+  }, 120_000);
 
   it("S095 rf-3: the acknowledgement wait's deferral with no lease of the stopped run does not claim a lease", async () => {
     const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm", pendingCommands: STOP_TURN_COMMANDS });
