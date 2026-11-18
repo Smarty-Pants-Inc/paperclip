@@ -5,6 +5,7 @@ import {
   agentWakeupRequests,
   agents,
   heartbeatRunEvents,
+  statusDecisions,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -210,7 +211,11 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
  * comment): the exhausted note of the ONE automatic successor, an account
  * rejection's own text, or the refusal note. Not ANSWERED: Retry and the carry
  * still read completedPersonMessageAnswerSql. All of:
- * - the run's turn failed with a Pi provider cut code (native-mid-stream-cut.ts);
+ * - the run's turn failed with a Pi provider cut code (native-mid-stream-cut.ts),
+ *   or (fam-long u1l, the GENERIC failed-turn lane: runner exit, idle timeout,
+ *   abort) the arbiter's applied decision on that run spent the one
+ *   continuation (native_run_failed_continuation_exhausted), the same
+ *   publication authority readExhaustedNativeFailedTurnCandidate uses for the note;
  * - R-ONCE: the run holds m as its OWN pending input (wake ids, or the cut-lane
  *   successor's attributionCommentIds), never through ancestry;
  * - nothing follows it by itself (no retry of that run exists).
@@ -229,9 +234,12 @@ function explainedByOwnFinalFailureNoteSql(m: { id: SQL; companyId: SQL; issueId
         or coalesce(cut.context_snapshot->'attributionCommentIds', '[]'::jsonb) ? ${m.id}::text
         or coalesce(cut.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
         or coalesce(cut.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${m.id}::text)
-      and exists (select 1 from ${heartbeatRunEvents} failed where failed.company_id = cut.company_id and failed.run_id = cut.id
+      and (exists (select 1 from ${heartbeatRunEvents} failed where failed.company_id = cut.company_id and failed.run_id = cut.id
         and failed.event_type = 'turn.failed'
         and failed.payload#>>'{prpEvent,payload,error,code}' in ('pi_output_truncated', 'pi_provider_error', 'pi_rpc_transport_failed'))
+        or exists (select 1 from ${statusDecisions} spent where spent.company_id = cut.company_id and spent.run_id = cut.id
+          and spent.issue_id = ${m.issueId} and spent.application_state = 'applied'
+          and spent.reason_code = 'native_run_failed_continuation_exhausted'))
       and not exists (select 1 from ${heartbeatRuns} next where next.company_id = cut.company_id and next.retry_of_run_id = cut.id))`;
 }
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
