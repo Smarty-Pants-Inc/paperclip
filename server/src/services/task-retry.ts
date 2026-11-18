@@ -280,6 +280,15 @@ function isTaskRetryContention(error: unknown) {
   return error instanceof NativeChatReviewPresentationContentionError || isExternalChatWaitAuthorizationContention(error);
 }
 
+/** A recovery-action row this Retry must update is locked by another writer. */
+class TaskRetryRecoveryRowBusyError extends Error {}
+const TASK_RETRY_RECOVERY_ROW_ATTEMPTS = 3;
+function isLockNotAvailable(error: unknown) {
+  for (let current = error as { code?: unknown; cause?: unknown } | null | undefined, depth = 0; current && depth < 5;
+    current = current.cause as typeof current, depth++) if (current.code === "55P03") return true;
+  return false;
+}
+
 /** Persist a deliberate click under dispatch's issue-first lock order. This
  * transaction never contacts a provider. The normal wake queue owns execution. */
 export async function requestTaskRetry(input: TaskRetryRequest) {
@@ -287,7 +296,13 @@ export async function requestTaskRetry(input: TaskRetryRequest) {
     try {
       return await admitTaskRetry(input);
     } catch (error) {
-      if (!isTaskRetryContention(error)) throw error;
+      // rf-3 J7: a held recovery row answers busy within a few short tries
+      // (well under a second), in the same shape as chat contention below.
+      if (error instanceof TaskRetryRecoveryRowBusyError) {
+        if (attempt >= TASK_RETRY_RECOVERY_ROW_ATTEMPTS)
+          throw conflict("Retry is busy because Paperclip is updating this task's saved work. Try again.",
+            { code: "task_retry_busy", retryable: true });
+      } else if (!isTaskRetryContention(error)) throw error;
       // Chat authorization for the same principal is briefly locked. The whole
       // admission rolled back, so a fresh attempt rereads every fact.
       if (attempt >= TASK_RETRY_CONTENTION_ATTEMPTS)
@@ -444,9 +459,13 @@ function admitTaskRetry(input: TaskRetryRequest) {
     }
     const retrySources = !busy ? await taskRetryRunAncestry({ db, companyId: issue.companyId,
       issueId: issue.id, agentId: issue.assigneeAgentId, sourceRunId: latest.id }) : null;
+    // fam-retry-c3fix item 2 (rf-3 J7): another writer holding a recovery row
+    // never makes the person's click wait on it. NOWAIT fails at once
+    // (lock_not_available); requestTaskRetry answers the typed busy.
     const records = await tx.select().from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-      inArray(sql`${issueRecoveryActions.evidence}->>'runId'`, retrySources ?? [latest.id]))).for("update");
+      inArray(sql`${issueRecoveryActions.evidence}->>'runId'`, retrySources ?? [latest.id]))).for("update", { noWait: true })
+      .catch(error => { throw isLockNotAvailable(error) ? new TaskRetryRecoveryRowBusyError() : error; });
     for (let index = 0; !busy && index < records.length; index++) {
       const action = records[index];
       if (!hasRequiredWorkspaceRecovery(action.evidence) || readSystemRecovery(action.evidence)) continue;

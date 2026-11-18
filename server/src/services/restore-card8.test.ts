@@ -281,6 +281,43 @@ const FAILURE_WORDS = /could not recover|could not be put back|restore failed/i;
     expect(blocker?.nextAction).toContain(DELAYED);
   }, 120_000);
 
+  // fam-retry-c3fix item 2 (rf-3 #2, J7): an OFFERED Retry while another writer
+  // holds a real row lock on the recovery-action row answers at once (a typed
+  // busy, retryable), never waits for the lock; after release it is accepted.
+  it("J7 Retry: an offered Retry under a real recovery-action row lock answers in under 1 s (busy), then accepts", async () => {
+    const f = await seedOwed(false);
+    await ageHold(f, 61);
+    expect((await getExecutionBlocker(db, f.companyId, f.issueId))?.canRetry).toBe(true);
+    const locker = createDb(database.connectionString);
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let locked!: () => void;
+    const isLocked = new Promise<void>(resolve => { locked = resolve; });
+    const lockTx = locker.transaction(async tx => {
+      await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, f.actionId)).for("update");
+      locked();
+      await released;
+    });
+    let answer: Promise<unknown> | undefined;
+    try {
+      await isLocked;
+      const started = Date.now();
+      answer = retry(f).then(value => ({ value }), error => ({ error }));
+      const outcome = await Promise.race([answer,
+        new Promise(resolve => setTimeout(() => resolve("still waiting"), 1_000))]) as Record<string, any>;
+      expect(outcome).not.toBe("still waiting");
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(outcome.error).toMatchObject({ status: 409, details: { code: "task_retry_busy", retryable: true } });
+    } finally {
+      release();
+      await lockTx;
+      await answer;
+      await locker.$client.end();
+    }
+    expect(await retry(f)).toMatchObject({ accepted: true });
+  }, 120_000);
+
   // J3 control: an adopted, running hold at 61 min (card6 ITEM 1's case).
   it("J3 CONTROL: an adopted running owed hold at 61 min -> card == chat, Retry accepted", async () => {
     const f = await seedOwed();
