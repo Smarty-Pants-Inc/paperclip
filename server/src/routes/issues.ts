@@ -66,7 +66,7 @@ import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
-import { isOwnerSendAfterAcknowledgedPersonStop } from "../services/acknowledged-native-stop.js";
+import { ownerSendAfterAcknowledgedPersonStop } from "../services/acknowledged-native-stop.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -7915,7 +7915,8 @@ export function issueRoutes(
           .where(and(eq(issueRecoveryActions.companyId, input.issue.companyId),
             eq(issueRecoveryActions.sourceIssueId, input.issue.id), inArray(issueRecoveryActions.status, ["active", "escalated"])))
           .limit(1);
-        return isOwnerSendAfterAcknowledgedPersonStop({ task: input.issue, agentId: input.issue.assigneeAgentId!,
+        return ownerSendAfterAcknowledgedPersonStop(input.executor as Db, { task: input.issue, agentId: input.issue.assigneeAgentId!,
+          companyId: input.issue.companyId, issueId: input.issue.id,
           senderId: input.actor.actorId, latest: lastTurn, sentAt: new Date(), blockedOrReconciling: !!blocker || !!source });
       };
       if (personStop && (!recoveryWait || await optionS())) {
