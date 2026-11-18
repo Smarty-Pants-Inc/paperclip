@@ -256,7 +256,7 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     it("RED: a person's recorded Stop shows exactly the one note on the blocker and the recovery card", async () => {
       const f = await fixture(stopped("user", "operator"));
       expect(await surfaces(f)).toEqual([PERSON_STOP_NOTE, PERSON_STOP_NOTE, PERSON_STOP_NOTE]);
-      expect(PERSON_STOP_NOTE).toBe("You stopped this turn. Changes it had not saved are on the previous sandbox and can be recovered. Send a message to continue.");
+      expect(PERSON_STOP_NOTE).toBe("This turn was stopped. Changes it had not saved were not carried forward; the previous sandbox is kept. Send a message to continue.");
     });
 
     it("CONTROL: a stop no person recorded (a managing agent; a failure) keeps its text", async () => {
@@ -272,7 +272,7 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
       const texts = await surfaces(f);
       expect(texts).not.toContain(PERSON_STOP_NOTE);
       expect(texts[1]).toBe("Inspect the source run.");
-      expect(JSON.stringify(texts)).not.toMatch(/can be recovered/);
+      expect(JSON.stringify(texts)).not.toMatch(/can be recovered|previous sandbox is kept/);
     });
   });
 

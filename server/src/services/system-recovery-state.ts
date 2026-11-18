@@ -238,7 +238,7 @@ export function savedFilesUnrecoverable(state: SystemRecoveryState | null | unde
   return unrecoverableSavedFilesFailure(state) !== null;
 }
 
-export const PERSON_STOP_NOTE = "You stopped this turn. Changes it had not saved are on the previous sandbox and can be recovered. Send a message to continue.";
+export const PERSON_STOP_NOTE = "This turn was stopped. Changes it had not saved were not carried forward; the previous sandbox is kept. Send a message to continue.";
 
 /** The one note for a run a person stopped with the Stop button: its recorded
  * cancellation is source "operator" from a "user" (run-cancellation
