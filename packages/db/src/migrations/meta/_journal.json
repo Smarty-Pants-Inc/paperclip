@@ -3508,6 +3508,34 @@
       "when": 1794980287228,
       "tag": "0502_agent_reasoning_display",
       "breakpoints": true
+    },
+    {
+      "idx": 503,
+      "version": "7",
+      "when": 1794980288228,
+      "tag": "0503_retire_legacy_message_notes",
+      "breakpoints": true
+    },
+    {
+      "idx": 504,
+      "version": "7",
+      "when": 1794980289228,
+      "tag": "0504_heartbeat_run_startable_since",
+      "breakpoints": true
+    },
+    {
+      "idx": 505,
+      "version": "7",
+      "when": 1794980290228,
+      "tag": "0505_lease_hold_clear_startable_since",
+      "breakpoints": true
+    },
+    {
+      "idx": 506,
+      "version": "7",
+      "when": 1794980291228,
+      "tag": "0506_manual_hold_clear_startable_since",
+      "breakpoints": true
     }
   ]
 }

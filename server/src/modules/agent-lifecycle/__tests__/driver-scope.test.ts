@@ -16,11 +16,7 @@ describe("lifecycle host stop scope", () => {
       lifecycleVersion: 2, lifecycleRequiredPluginIds: [], lifecycleError: null, lifecycleOperation: null } as never)).toBe("complete");
     expect(update).toHaveBeenCalledOnce();
     // A pause keeps the messages it deferred (work-intent outbox).
-    expect(stop).toHaveBeenCalledWith(["target"], "Agent lifecycle stop requested", {
-      // SUPERSEDED BY REPLACEMENT (RFL 08:27Z 11-16 ruling 1): upstream
-      // #21788 returns the named blocker instead of using the park callback.
-      preservePauseDeferred: true,
-    });
+    expect(stop).toHaveBeenCalledWith(["target"], "Agent lifecycle stop requested", { preservePauseDeferred: true });
     expect(db.select).not.toHaveBeenCalled();
   });
 });

@@ -54,6 +54,12 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
     canRetry={canRetry && presentation.canRetry} onRetry={onRetry} error={error} className={className} />;
+  // Current task state wins over an old click's optimistic/error indicator.
+  // Status and assignee controls already own the action named by this notice.
+  if (presentation?.canRetry === false && presentation.notice
+      && ["waiting_for_user", "resolved"].includes(presentation.state))
+    return <div role="status" aria-label="Task status" data-testid="task-execution-notice"
+      className={cn("text-sm text-muted-foreground", className)}>{presentation.notice.text}</div>;
   // Every branch that renders the card's Retry obeys the task's own refusal
   // (presentation.canRetry=false, e.g. a standing notice) as well as the
   // person's permission, and keeps the refusal's explanation visible: a

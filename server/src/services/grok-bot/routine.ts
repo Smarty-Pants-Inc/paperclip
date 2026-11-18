@@ -1,4 +1,5 @@
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
+import { stampQueuedRunsStartable } from "../heartbeat/startable-since.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, isNotNull, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -271,8 +272,11 @@ export function grokRoutineService(db: Db, deliver: Delivery = deliverGrokRoutin
         and(eq(dispatches.status, "accepted"), lte(dispatches.expiresAt, new Date()))))).limit(1);
     // A canonical finish closes this session; it never proves a webhook ACK or
     // restores execution authority. Other uncertain deliveries keep their hold.
-    if (!uncertain) await db.update(routines).set({ recoveryRequiredAt: null, recoveryReason: null, updatedAt: new Date() })
-      .where(and(eq(routines.companyId, companyId), eq(routines.bindingId, bindingId), eq(routines.recoveryReason, "dispatch")));
+    const cleared = uncertain ? [] : await db.update(routines).set({ recoveryRequiredAt: null, recoveryReason: null, updatedAt: new Date() })
+      .where(and(eq(routines.companyId, companyId), eq(routines.bindingId, bindingId), eq(routines.recoveryReason, "dispatch")))
+      .returning({ agentId: routines.agentId });
+    // FIX16 (RFL 01:00Z (a)): this also clears the routine recovery hold; its queued runs are startable from now.
+    for (const { agentId } of cleared) await stampQueuedRunsStartable(db, { companyId, agentId });
   }
 
   async function acknowledge(principal: McpPrincipal, raw: Ack) {
@@ -314,10 +318,16 @@ export function grokRoutineService(db: Db, deliver: Delivery = deliverGrokRoutin
         const [other] = await tx.select({ id: dispatches.id }).from(dispatches).where(and(eq(dispatches.routineId, routine.id),
           or(eq(dispatches.status, "unknown"), and(eq(dispatches.status, "sending"), lte(dispatches.updatedAt, new Date(Date.now() - 30_000))),
             and(eq(dispatches.status, "accepted"), lte(dispatches.expiresAt, new Date()))))).limit(1);
-        if (!other) await tx.update(routines).set({ recoveryRequiredAt: null, recoveryReason: null })
-          .where(and(eq(routines.id, routine.id), eq(routines.recoveryReason, "dispatch")));
+        const recovered = other ? [] : await tx.update(routines).set({ recoveryRequiredAt: null, recoveryReason: null })
+          .where(and(eq(routines.id, routine.id), eq(routines.recoveryReason, "dispatch"))).returning({ id: routines.id });
+        // RFL 01:00Z (a): the external-agent setup hold (routine recovery) clears.
+        if (recovered.length && row.kind !== "verify") await stampQueuedRunsStartable(tx, { companyId: binding.companyId, agentId: binding.agentId });
       }
-      if (row.kind === "verify") await tx.update(bindings).set({ status: "ready", readyAt: new Date(), updatedAt: new Date() }).where(eq(bindings.id, binding.id));
+      if (row.kind === "verify") {
+        await tx.update(bindings).set({ status: "ready", readyAt: new Date(), updatedAt: new Date() }).where(eq(bindings.id, binding.id));
+        // RFL 01:00Z (a): the external-agent setup hold clears; its queued runs are startable from now.
+        await stampQueuedRunsStartable(tx, { companyId: binding.companyId, agentId: binding.agentId });
+      }
       await logActivity(database, { companyId: binding.companyId, actorType: "agent", actorId: binding.agentId,
         action: row.kind === "verify" ? "grok.wake_verified" : "grok.wake_acknowledged", entityType: "agent", entityId: binding.agentId,
         details: { bindingId: binding.id, generation: binding.generation, correlationId: row.id, kind: row.kind,

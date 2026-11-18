@@ -275,15 +275,13 @@ export function buildStrandedRecoveryEscalationNotice(input: {
   seed?: StrandedRecoveryNoticeSeed | null;
   fallbackBody?: string | null;
   recoveryCause?: string | null;
-  /** Null only for a notice with no recovery action (an unanswered person message). */
+  /** Notices for pending card responses have no recovery action. */
   recoveryActionId: string | null;
   continuesAutomatically?: boolean;
   retryOffered?: boolean;
   recoveryOwner: { id: string; name: string | null } | null | undefined;
-  /** Overrides the cause-derived responsibility: "user" when the person must act. */
+  /** Overrides the cause-derived responsibility when the person must act. */
   recoveryResponsibility?: "system" | "user";
-  /** The allowlisted code when there is no source run. */
-  failureCode?: string | null;
   sourceRun: {
     id: string;
     agentId?: string | null;
@@ -339,8 +337,6 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     if (failureCode) runRows.push(keyValueRow("Failure code", failureCode));
     const failureSummary = input.sourceRun.errorSummary?.trim();
     if (failureSummary) runRows.push(keyValueRow("Failure summary", failureSummary));
-  } else if (input.failureCode?.trim()) {
-    runRows.push(keyValueRow("Failure code", input.failureCode.trim()));
   }
 
   const sections: NoticeMetadataSection[] = [

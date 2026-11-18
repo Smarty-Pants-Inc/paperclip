@@ -331,7 +331,7 @@ describe.skipIf(!support.supported)("task interruption latest run query", () => 
     }
     const result = await taskInterruptionPresentations(db, companyId, list);
     list.forEach((issue, index) => expect(result.get(issue.id)).toMatchObject(index % 2
-      ? { state: "failed", canRetry: true }
+      ? { state: "waiting_for_user", canRetry: false, userAction: "assign_agent", notice: { code: "task_reassigned" } }
       : { state: "retry_scheduled", canRetry: false, nextRetryAt: resumeAt.toISOString() }));
   });
 
@@ -732,8 +732,14 @@ describe.skipIf(!support.supported)("task interruption latest run query", () => 
     expect(captureTaskInterruptionFailure).not.toHaveBeenCalled();
   });
 
-  it("keeps the failed run's adapter after the task is reassigned", async () => {
+  it("keeps the failed run's adapter for its failure, then names reassignment without offering Retry (FIX14)", async () => {
     const f = await seedInterruptionFixture(db, { selected: 1, history: 1, unrelated: 0, payloadBytes: 0 });
+    await markFailuresFresh(f.companyId);
+    captureTaskInterruptionFailure.mockClear();
+    expect((await taskInterruptionPresentations(db, f.companyId, f.input)).get(f.input[0]!.id)?.state).toBe("failed");
+    expect(captureTaskInterruptionFailure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      taskId: f.input[0]!.id, agentAdapter: "process",
+    }));
     const [nextAgent] = await db.insert(agents).values({
       companyId: f.companyId, name: "Next worker", adapterType: "codex_local",
     }).returning();
@@ -742,10 +748,9 @@ describe.skipIf(!support.supported)("task interruption latest run query", () => 
     await markFailuresFresh(f.companyId);
     captureTaskInterruptionFailure.mockClear();
     const result = await taskInterruptionPresentations(db, f.companyId, [reassigned!]);
-    expect(result.get(reassigned!.id)?.state).toBe("failed");
-    expect(captureTaskInterruptionFailure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-      taskId: reassigned!.id, agentAdapter: "process",
-    }));
+    expect(result.get(reassigned!.id)).toMatchObject({ state: "waiting_for_user", canRetry: false, userAction: "assign_agent",
+      notice: { code: "task_reassigned", text: "This task is assigned to another agent. Reassign it to the previous agent to retry this attempt." } });
+    expect(captureTaskInterruptionFailure, "reassignment is not another failed attempt").not.toHaveBeenCalled();
   });
   describe("a newer continuation dropped before it started (Gate C C1 t169)", () => {
     const seed = async (newer: Partial<typeof heartbeatRuns.$inferInsert>) => {

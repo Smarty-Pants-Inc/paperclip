@@ -34,7 +34,7 @@ import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
 import { environmentService } from "../environments.js";
-import { materializePiSessionRecoveryNotice, readUnsupersededHeldConversationNotice, writePiSessionHistoryLossNotice } from "../native-runtime/pi-session-recovery-notice.js";
+import { materializePiSessionRecoveryNotice, writePiSessionHistoryLossNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { ensureFreshContinuation, listFreshContinuations } from "../fresh-continuation-fallback.js";
 import { issueRecoveryActions } from "@paperclipai/db";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
@@ -649,7 +649,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       const { deliverReconciledExecutions } = await import("../execution-recovery-resolution.js");
       const { deliverPendingPauseResumes } = await import("../issue-tree-resume.js");
       const { deliverBudgetResumeContinuations } = await import("../budget-resume-continuation.js");
-      const { settleUnansweredPersonMessages, UNANSWERED_MESSAGE_SETTLE_MS } = await import("../recovery/unanswered-person-message.js");
       const { environmentRuntimeService: inspectionRuntime } = await import("../environment-runtime.js");
       let stopped = false;
       const inspectLeaseResource = vi.fn(async (leaseId: string) => {
@@ -701,11 +700,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         // Admission is proved while the provider's stop is still unconfirmed.
         expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id)))
           .filter(run => run.id !== f.run.id).map(run => run.status)).toEqual(["queued"]);
-        const source = await read(f.run.id);
-        await new Promise(resolve => setTimeout(resolve, Math.max(0,
-          Math.max(message.createdAt.getTime(), source.finishedAt!.getTime()) + UNANSWERED_MESSAGE_SETTLE_MS + 25 - Date.now())));
-        await settleUnansweredPersonMessages(db, {});
-        await observe("unanswered sweep after real 15s settle bound");
         await hb.sweepPendingCleanupLeases({ backoffMs: 0 });
         await observe("pending-cleanup sweep");
         expect(await notes()).toHaveLength(0);
@@ -1039,7 +1033,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         authorType: "system", body: "The earlier attempt is still being checked.",
         metadata: { version: 1, authorizationReason: `native_prior_owner_held:${oldId}`, sections: [] } }).returning();
       heldCommentId = held.id;
-      expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).not.toBeNull();
     }
     // The existing disposition owner runs again when cleanup/turn completion
     // signals it. No Retry, new message, or time advance supplies authority.
@@ -1111,7 +1104,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       expect(notes[0].id).not.toBe(heldCommentId);
       expect(allNotes.find(c => c.id === heldCommentId)).toMatchObject({ body: "The earlier attempt is still being checked.",
         metadata: { supersededByCommentId: notes[0].id } });
-      expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toBeNull();
     }
     if (tl08) for (const oldLease of seedLeases) {
       const [unchanged] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLease.id));

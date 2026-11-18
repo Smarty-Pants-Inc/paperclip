@@ -14,8 +14,7 @@ import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-
 import { finalizeNativeRun } from "../services/native-runtime/native-run-finalizer.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
-import { answeredPersonMessageSql } from "../services/person-message-answer.js";
-import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
+import { answeredPersonMessageSql } from "../services/continuation-comment-input.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
 // Only the execution boundary is controlled. The comment route, persisted wake,
@@ -353,8 +352,6 @@ describePostgres("ordinary assigned tasks awaiting a person's next response", ()
       freshId = row.id;
     } });
     expect(await answerState(f, freshId)).toBe(false);
-    const notice = await settleUnansweredPersonMessage(db, { ...f, now: clockAfterYield() });
-    expect(notice).toMatchObject({ kind: "noticed", code: "no_run" });
     const enqueueWakeup = queue();
     const result = await assignedWorkSweep(db, { enqueueWakeup, now: clockAfterYield }).checkIssue(f);
     const chronology = await db.execute(sql`select r.schema_status, r.created_at::text as result_accepted_at,
@@ -362,7 +359,7 @@ describePostgres("ordinary assigned tasks awaiting a person's next response", ()
       (r.created_at < c.created_at and c.created_at < a.created_at) as message_between_acceptance_and_assessment
       from native_run_results r join work_assessments a on a.result_id = r.id
       join issue_comments c on c.id = ${freshId}::uuid where r.run_id = ${f.runId}::uuid`);
-    console.info(JSON.stringify({ judgeDuringFinalize: { result, attempts: enqueueWakeup.mock.calls.length, notice, chronology } }));
+    console.info(JSON.stringify({ judgeDuringFinalize: { result, attempts: enqueueWakeup.mock.calls.length, chronology } }));
     expect(result).toMatchObject({ outcome: "repaired" });
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });

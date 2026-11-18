@@ -10445,6 +10445,16 @@ export function issueRoutes(
         runId: scheduledRetry.scheduledRetry?.runId ?? scheduledRetryRunId ?? null,
         details: { outcome: scheduledRetry.outcome, message: scheduledRetry.message, source: "task_retry" } });
     }
+    // Retry on a person's queued run that never started (D157/D168). The
+    // dispatcher, re-poked by liveness every pass, already left it untaken, so a
+    // re-poke is no Retry. Cancel that run (never to start later) and enqueue ONE
+    // fresh run carrying only the person's message, nothing of the old run's work.
+    const startQueuedRunId = "startQueuedRunId" in receipt ? receipt.startQueuedRunId : undefined;
+    if (startQueuedRunId) {
+      const { startPersonQueuedRunFresh } = await import("../services/task-retry.js");
+      await startPersonQueuedRunFresh(db, heartbeat, { companyId: issue.companyId, issueId: issue.id,
+        runId: startQueuedRunId, actorId: getActorInfo(req).actorId });
+    }
     const chatActionId = "chatActionId" in receipt ? receipt.chatActionId : undefined;
     const finalizeRunId = "finalizeRunId" in receipt ? receipt.finalizeRunId : undefined;
     // Admit a plain Retry before answering, so the answer never reports as
@@ -10468,7 +10478,10 @@ export function issueRoutes(
       if (timer) clearTimeout(timer);
       if (answeredInTime) admissionSettled = requestId;
     }
-    const presentation = await taskInterruptionPresentation(db, issue);
+    // Project the answer from the task as admission left it: the Retry may have
+    // waited on the issue lock while the task moved (to Backlog, closed or to
+    // another agent), and the pre-admission row would still offer Retry.
+    const presentation = await taskInterruptionPresentation(db, (await svc.getById(issue.id)) ?? issue);
     if (admissionSettled) refused = await Promise.resolve()
       .then(() => taskRetryRefusal(db, issue.companyId, admissionSettled!, presentation)).catch(err => {
         logger.warn({ err, issueId: issue.id }, "Task Retry admission state could not be read");
@@ -17227,7 +17240,19 @@ export function issueRoutes(
             userResumedFromReviewToTodo) &&
           issue.assigneeAgentId
         ) {
-          addWakeup(issue.assigneeAgentId, {
+          // A person's status-only promotion starts the assignment, rather
+          // than re-poking a never-started run's old retry hold. Reuse the
+          // existing current-task gate and once-only queued replacement.
+          let replacedQueuedRun = false;
+          if (statusChangedFromBacklog && issue.status === "todo" && actor.actorType === "user" && !commentBody) {
+            const waiting = await taskInterruptionPresentation(db, issue);
+            if (waiting?.observedRunId) {
+              const { startPersonQueuedRunFresh } = await import("../services/task-retry.js");
+              replacedQueuedRun = Boolean(await startPersonQueuedRunFresh(db, heartbeat, {
+                companyId: issue.companyId, issueId: issue.id, runId: waiting.observedRunId, actorId: actor.actorId }));
+            }
+          }
+          if (!replacedQueuedRun) addWakeup(issue.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "issue_status_changed",

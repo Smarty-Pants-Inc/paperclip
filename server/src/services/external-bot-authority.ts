@@ -4,6 +4,7 @@ import { canConfigureAgentConnection } from "../modules/agent-lifecycle/index.js
 import { accessService } from "./access.js";
 import { boardAuthService } from "./board-auth.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { externalBotProviderOn } from "./heartbeat/startable-since.js";
 import { McpOAuthError, type McpPrincipal } from "./public-mcp/oauth.js";
 
 export async function externalBotEnabled(db: Db, provider: "openai_dot" | "grok_bot", queryOwner?: Pick<Db, "select">) {
@@ -11,7 +12,7 @@ export async function externalBotEnabled(db: Db, provider: "openai_dot" | "grok_
   const experimental = queryOwner
     ? await settings.getExperimentalReadOnly(queryOwner)
     : await settings.getExperimental();
-  return provider === "openai_dot" ? experimental.enableOpenAiDot : experimental.enableGrokBot && experimental.enableNativeRunner;
+  return externalBotProviderOn(experimental, provider);
 }
 
 /** Persistent agent authority, distinct from task/run authority enforced by the broker. */

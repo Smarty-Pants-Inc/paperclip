@@ -1,4 +1,5 @@
 import { budgetServiceInTransaction } from "../../services/budgets.js";
+import { stampQueuedRunsStartable } from "../../services/heartbeat/startable-since.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../services/delivery-work-notifications.js";
 import { withExternalAdmissionGuard, withExternalExecutionAdmission } from "./admission.js";
 import { createNativeExternalBroker } from "./native-broker.js";
@@ -196,6 +197,17 @@ function createBroker(db: Db) {
         if (error instanceof McpOAuthError) return false;
         throw error;
       }
+    },
+    /** Read only, for the task card: the hold `canStartNewWork` (the dispatcher's
+     * external-bot gate, heartbeat/queue.ts claimQueuedRun) refuses on, from the
+     * same rows `snapshot` reads. No reconciliation and no grant check: null when
+     * these read-only checks pass. */
+    async newWorkHold(companyId: string, agentId: string, bindingId: string): Promise<"external_agent_setup" | "external_agent_busy" | null> {
+      const state = await this.bindingForAgent(companyId, agentId);
+      if (!state || !await enabled(state.providerKind) || state.id !== bindingId || state.status !== "ready" || !state.wakeVerified
+        || (state.providerKind === "grok_bot" && await grokRoutineService(db).recoveryNeeded(companyId, agentId))) return "external_agent_setup";
+      const [active] = await db.select({ id: assignments.id }).from(assignments).where(and(eq(assignments.bindingId, bindingId), inArray(assignments.status, ["offered", "accepted"])));
+      return active ? "external_agent_busy" : null;
     },
     async snapshot(companyId: string, agentId: string, bindingId: string): Promise<DotBindingSnapshot> {
       const state = await this.bindingForAgent(companyId, agentId);
@@ -483,6 +495,8 @@ function createBroker(db: Db) {
       const [updated] = await db.update(bindings).set({ status: "ready", readyAt: new Date(), challengeHash: null, challengeExpiresAt: null, updatedAt: new Date() })
         .where(and(eq(bindings.id, b.id), eq(bindings.generation, b.generation), isNull(bindings.revokedAt), eq(bindings.grantId, principal.grant.id), eq(bindings.challengeHash, hash(nonce)), gt(bindings.challengeExpiresAt, new Date()))).returning();
       if (!updated) throw fail("Event test expired or does not match.");
+      // RFL 01:00Z (a): the external-agent setup hold clears; its queued runs are startable from now.
+      await stampQueuedRunsStartable(db, { companyId: b.companyId, agentId: b.agentId });
       await logActivity(db, { companyId: b.companyId, actorType: "agent", actorId: b.agentId,
         action: "dot.event_test_completed", entityType: "agent", entityId: b.agentId, details: { bindingId: b.id } });
       return { status: "ready" };

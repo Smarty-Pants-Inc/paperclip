@@ -16877,6 +16877,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       (await heartbeat.reconcileStrandedAssignedIssues()).continuationRequeued,
     ).toBe(0);
     expect(mockAdapterExecute).not.toHaveBeenCalled();
+    // F3 D121 (stack135 fix7): across both sweeps the repair publishes its
+    // unblock request exactly once, with no rival notice and no redelivery wake.
+    const systemComments = await db.select().from(issueComments).where(and(
+      eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
+    expect(systemComments.map(comment => comment.body)).toEqual([
+      expect.stringContaining(`Unblock request: ${unblockAction}`)]);
+    expect(await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(1);
   });
 
   it.each([
@@ -17016,6 +17024,119 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }
     },
   );
+
+  // F3 D122 (RFL 19:17Z ruling 2). When the sweep refuses the native
+  // blocked-wait repair, the task's card owns the outcome: failed + Retry, one
+  // outcome, never silence and never a fall-through to ordinary recovery.
+  it.each(["edited_message", "later_status_decision"] as const)(
+    "a refused native blocked-wait repair (%s) shows the card's failed + Retry, exactly one outcome",
+    async (refusal) => {
+      const { companyId, issueId, runId, commentId } = await seedNativeBlockedBoardRequest();
+      if (refusal === "edited_message")
+        await db.update(issueComments).set({ body: "Edited after the run finished.", updatedAt: new Date(Date.now() + 1_000) })
+          .where(eq(issueComments.id, commentId));
+      if (refusal === "later_status_decision")
+        await db.update(issues).set({ lastStatusDecisionId: randomUUID() }).where(eq(issues.id, issueId));
+      const heartbeat = heartbeatService(db);
+      const wakesBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        for (const elapsed of [0, 60_000, 180_000]) {
+          vi.setSystemTime(Date.now() + elapsed);
+          const swept = await heartbeat.reconcileStrandedAssignedIssues();
+          expect(swept.escalated, "the repair stays refused").toBe(0);
+          expect(swept.continuationRequeued, "no fall-through to ordinary recovery").toBe(0);
+        }
+        const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(task).toMatchObject({ status: "in_progress", unblockDescriptor: null });
+        const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+          eq(issueComments.authorType, "system")));
+        const live = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])));
+        const card = await taskInterruptionPresentation(db, task!);
+        const outcomes = notes.length + live.length + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
+        console.info(JSON.stringify({ d122: { refusal, card: card && { state: card.state, canRetry: card.canRetry },
+          notes: notes.length, live: live.length, outcomes } }));
+        expect(card).toMatchObject({ state: "failed", canRetry: true, observedRunId: runId });
+        expect(outcomes, "exactly one outcome: the card").toBe(1);
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)))
+          .toHaveLength(wakesBefore.length);
+        expect(mockAdapterExecute).not.toHaveBeenCalled();
+        // The card owns this outcome because the sweep RECORDED its refusal (D122, rf-3 20:53Z).
+        expect(await db.select({ reason: sql<string>`${activityLog.details}->>'reason'` }).from(activityLog).where(and(
+          eq(activityLog.runId, runId), eq(activityLog.action, "issue.native_blocked_wait_refused"))),
+          "one refusal record per run, across three sweeps").toEqual([{ reason: refusal === "edited_message" ? "carried_message_changed" : refusal }]);
+        // The Retry is real: the person's click is admitted for the run the card shows, and starts ONE successor.
+        const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: "responsible-user", idempotencyKey: randomUUID(),
+          observedRunId: card!.observedRunId });
+        expect(receipt).toMatchObject({ accepted: true, stale: false });
+        await heartbeat.resumeTaskRetry(companyId, receipt.requestId!);
+        const successors = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)))
+          .filter(run => run.id !== runId);
+        expect(await successors(), "the Retry starts exactly one successor").toHaveLength(1);
+        const again = await requestTaskRetry({ db, companyId, issueId, actorId: "responsible-user", idempotencyKey: randomUUID(),
+          observedRunId: card!.observedRunId }).catch((error: unknown) => ({ error: String(error) }));
+        if ("requestId" in again && again.requestId) await heartbeat.resumeTaskRetry(companyId, again.requestId);
+        expect(await successors(), "a second press starts no second successor").toHaveLength(1);
+        await heartbeat.drainActiveRunExecutions();
+      } finally { vi.useRealTimers(); }
+    },
+  );
+
+  // D122 MUST-FIX (rf-3 20:53Z, rf3-b135r5b): a HEALTHY repair that waits ~180 s on the issue lock is
+  // not a refusal. The card must not show failed + Retry at +120 s or +179.999 s; after the lock frees
+  // the repair applies the blocked result (escalated 1) and the task shows its unblock request.
+  it("a slow healthy native blocked-wait repair (issue lock held ~180 s) never shows failed + Retry", async () => {
+    const { companyId, issueId, runId, unblockAction } = await seedNativeBlockedBoardRequest();
+    const start = Date.now();
+    let release!: () => void;
+    let acquired!: (pid: number) => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const lockReady = new Promise<number>((resolve) => { acquired = resolve; });
+    const lock = db.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+      const pid = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+      acquired(pid[0]!.pid);
+      await held;
+    });
+    const pid = await lockReady;
+    const heartbeat = heartbeatService(db);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const repair = heartbeat.reconcileStrandedAssignedIssues();
+      try {
+        await vi.waitFor(async () => {
+          const waiters = await db.execute<{ count: number }>(
+            sql`select count(*)::int as count from pg_stat_activity where datname = current_database() and ${pid} = any(pg_blocking_pids(pid))`);
+          expect(waiters[0]!.count).toBeGreaterThan(0);
+        });
+        for (const elapsed of [120_000, 179_999]) {
+          vi.setSystemTime(start + elapsed);
+          const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const card = await taskInterruptionPresentation(db, task!);
+          console.info(JSON.stringify({ d122Healthy: { elapsed, status: task!.status, card: card && { state: card.state, canRetry: card.canRetry } } }));
+          expect(task!.status).toBe("in_progress");
+          expect(card?.state, `a waiting repair is not a failed attempt (+${elapsed} ms)`).not.toBe("failed");
+          expect(card?.canRetry ?? false, `no Retry while the repair waits (+${elapsed} ms)`).toBe(false);
+        }
+        vi.setSystemTime(start + 180_000);
+      } finally { release(); }
+      await lock;
+      const result = await repair;
+      expect(result.escalated, "the repair completed normally").toBe(1);
+      const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(task).toMatchObject({ status: "blocked", unblockDescriptor: { owner: "board", action: unblockAction } });
+      const card = await taskInterruptionPresentation(db, task!);
+      const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
+      console.info(JSON.stringify({ d122HealthyAfter: { status: task!.status, card: card && { state: card.state, canRetry: card.canRetry },
+        notes: notes.map(note => note.body.slice(0, 80)) } }));
+      expect(card?.state ?? null, "the legitimate blocked state, not a failed attempt").not.toBe("failed");
+      expect(notes.map(note => note.body)).toEqual([expect.stringContaining(`Unblock request: ${unblockAction}`)]);
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.runId, runId),
+        eq(activityLog.action, "issue.native_blocked_wait_refused"))), "no refusal was recorded").toHaveLength(0);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
 
   it("preserves a later routed native attention decision after its wake was coalesced", async () => {
     const { companyId, issueId, runId, contractId } =

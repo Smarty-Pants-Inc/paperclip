@@ -182,7 +182,14 @@ describe("durable Dot Runner integration", () => {
     expect(received.at(-1)?.data.kind).toBe("readiness_challenge");
     expect(received.at(-1)?.data).not.toHaveProperty("challenge");
     const challenge = (await broker.mailbox(principal)).items.find(i => i.kind === "readiness_challenge")!;
+    // RFL 01:00Z (a) writer (external-agents/dot.ts confirmChallenge): a run queued behind the setup hold is stamped.
+    const [held] = await db.insert(heartbeatRuns).values({ companyId: company!.id, agentId: agent!.id, status: "queued",
+      invocationSource: "assignment", contextSnapshot: {} }).returning();
+    const confirmedFrom = Date.now();
     await broker.confirmChallenge(principal, String(challenge.references.challenge));
+    const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, held!.id));
+    expect(stamped!.startableSince?.getTime(), "the Dot event test stamps the agent's queued run").toBeGreaterThanOrEqual(confirmedFrom - 1_000);
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, held!.id));
     const snapshot = await broker.snapshot(company!.id, agent!.id, pairing.bindingId);
     await db.update(agents).set({ adapterConfig: { provider: "openai_dot", dotBindingId: pairing.bindingId, allowUnmeteredProvider: true, lifecycleMode: "per_turn" } }).where(eq(agents.id, agent!.id));
     return { company: company!, agent: agent!, userId, broker, principal, oauth, events, subscription, received, snapshot, tokens, client, verifications: () => verifications };

@@ -192,6 +192,21 @@ export const CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON =
   "allow_chat_run_presentation";
 
 export type RunPresentationCommentAction = "reuse" | "create" | "none";
+
+/**
+ * A native conversation turn whose live presentation ran before its own
+ * finalization committed (the finalization lease was busy) cannot know the
+ * committed answered rule yet. Its `none` is provisional: the publication stays
+ * pending and committed-response recovery resolves it from committed state.
+ */
+export const NATIVE_PRESENTATION_PENDING_COMMIT = "native_presentation_pending_commit";
+
+export function isPendingCommitPresentation(decision: unknown): boolean {
+  if (!decision || typeof decision !== "object") return false;
+  const value = decision as { commentAction?: unknown; commentId?: unknown; reasonCodes?: unknown };
+  return value.commentAction === "none" && typeof value.commentId !== "string" &&
+    Array.isArray(value.reasonCodes) && value.reasonCodes.includes(NATIVE_PRESENTATION_PENDING_COMMIT);
+}
 export type { RunPresentationDecision } from "@paperclipai/shared";
 
 export interface ResolvedHeartbeatRunResponse {

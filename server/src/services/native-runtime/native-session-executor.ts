@@ -372,8 +372,8 @@ import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js
 import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
-import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
-  readUnsupersededHeldConversationNotice, writeRestoreUnavailableContinuationNotice } from "./pi-session-recovery-notice.js";
+import { materializePiSessionRecoveryNotice, piSessionRecovery,
+  writeRestoreUnavailableContinuationNotice } from "./pi-session-recovery-notice.js";
 import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
@@ -8009,8 +8009,6 @@ async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExe
   }
 }
 
-/** The banner text for a conversation held behind an unfinished predecessor. */
-import { HELD_PREDECESSOR_NOTICE } from "./held-predecessor-notice-text.js";
 import { providerIdentityResetLine } from "./provider-identity-reset-notice.js";
 
 /**
@@ -8019,74 +8017,6 @@ import { providerIdentityResetLine } from "./provider-identity-reset-notice.js";
  * remembers, is unknown and the new-thread line makes no history claim.
  */
 const freshSessionHandoffOutcomes = new Map<string, boolean>();
-export { HELD_PREDECESSOR_NOTICE };
-// The refusals that hold a conversation behind its unfinished predecessor:
-// the prior-owner fences (including the legacy migration fence), the
-// retained-sandbox binding, a prior session whose
-// cleanup is still quarantined (it guards process ownership of that session),
-// a predecessor Runner whose termination could not be confirmed, and a warm
-// attachment to a predecessor Runner that had already exited.
-const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch: (?:legacy_)?prior_owner_|native_controller_recovery_missing_evidence:retained_sandbox_binding|native_session_cleanup_quarantined:|runner_process_termination_unconfirmed:|native_runner_warm_attachment_runner_exited:)/;
-
-/**
- * A conversation held because its previous run ended without a result (a
- * failed run, or a Stop) and its owner could not be retired is never a silent
- * stuck loop: exactly one durable notice per held predecessor, deduplicated,
- * through the typed history-loss notice helper (one per conversation, so each
- * later refused message adds none). Nothing else changes: the
- * refusal stands.
- */
-/** Exported for the notice-writer regression only. */
-export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution: NativeExecutionInput }, error: unknown): Promise<void> {
-  // D10 disposition owns both waiting and fresh-history notices for typed
-  // refusals; the legacy held writer must not add a competing dead-chat note.
-  if (freshThreadRefusalCode(error)) return;
-  const message = error instanceof Error ? error.message : String(error);
-  if (!HELD_PREDECESSOR_REFUSAL.test(message)) return;
-  const { companyId, issueId, agentId, runId } = input.execution.binding;
-  const normalizedSessionId = nativeSessionKey(input.execution);
-  if (!issueId) return;
-  try {
-    const [current] = await input.db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
-    if (!current) return;
-    const [prior] = await input.db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.nativeIssueId, issueId),
-        eq(heartbeatRuns.nativeSessionId, normalizedSessionId), ne(heartbeatRuns.id, runId),
-        lt(heartbeatRuns.createdAt, current.createdAt)))
-      .orderBy(desc(heartbeatRuns.createdAt)).limit(1);
-    if (!prior || !["failed", "cancelled", "interrupted", "timed_out"].includes(prior.status)) return;
-    const [owner] = await input.db.select({ resultId: nativeRunFinalizations.resultId }).from(nativeRunFinalizations)
-      .where(and(eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, prior.id)));
-    if (owner?.resultId) return;
-    await input.db.transaction(async tx => {
-      const [issue] = await tx.select({ id: issues.id }).from(issues)
-        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId))).for("no key update");
-      if (!issue) return;
-      // One notice per HOLD: while this conversation's notice stands (no later
-      // run of the same session succeeded with a committed result), every
-      // later refused message adds none. A conversation held again after it
-      // continued gets a fresh notice. The standing rule is the banner's own
-      // reader, under this issue lock.
-      const standing = await readUnsupersededHeldConversationNotice(tx as unknown as Db, { companyId, issueId });
-      if (standing?.normalizedSessionId === normalizedSessionId) return;
-      // The stranded sweep's unanswered-message notice already tells the
-      // person (recovery/unanswered-person-message.ts, same issue fence): a
-      // live one stands until an answer supersedes it. One notice, both orders.
-      const [unanswered] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
-        eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
-        isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`)).limit(1);
-      if (unanswered) return;
-      await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
-        kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true,
-      }, metadata: { version: 1, authorizationReason: `${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${normalizedSessionId}`,
-        sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Held conversation" }] }] } }, tx);
-    });
-  } catch (failure) {
-    logger.warn({ err: failure, runId }, "held predecessor notice unavailable");
-  }
-}
-
 /** The controller checkpoint and Runner lifecycle have separate authorities.
  * Rehydrate a missing suspension receipt before choosing live warm adoption.
  * Exported for the provider-boundary regression only. */
@@ -10997,16 +10927,7 @@ export function resolveNativeCancellationStatus(input: {
   };
 }
 
-export async function executePaperclipNativeSession(input: Parameters<typeof executePaperclipNativeSessionUnnoticed>[0]) {
-  try {
-    return await executePaperclipNativeSessionUnnoticed(input);
-  } catch (error) {
-    await noticeHeldUnfinishedPredecessor(input, error);
-    throw error;
-  }
-}
-
-async function executePaperclipNativeSessionUnnoticed(input: {
+export async function executePaperclipNativeSession(input: {
   casesEnabled?: boolean;
   getFreshSessionHandoff?: () => Promise<string | null>;
   /** Retire a retained transport so recovery can replace provider tool declarations. */
@@ -15594,11 +15515,15 @@ export function assertRemoteRunnerBuildMetadata(
   }
 }
 
+// Runtime bundles are sealed (0o555 directories, 0o444 files), and a warm box
+// reuses the instructions destination. removeTree must unseal each directory
+// before unlinking its entries, or replacing a changed bundle fails with EACCES
+// after the switch and leaves the old copy beside the new one.
 const REMOTE_RUNTIME_ASSET_INSTALL_SCRIPT = `
 const fs=require("node:fs"),path=require("node:path");
 const root=path.resolve(process.argv[1]), assets=JSON.parse(process.argv[2]), nonce=process.argv[3];
 function regularTree(file){const s=fs.lstatSync(file);if(s.isSymbolicLink()||(!s.isDirectory()&&!s.isFile()))throw Error("runtime_asset_not_regular");if(s.isDirectory())for(const name of fs.readdirSync(file))regularTree(path.join(file,name));}
-function removeTree(file){const s=fs.lstatSync(file,{throwIfNoEntry:false});if(s?.isDirectory()&&!s.isSymbolicLink()){for(const name of fs.readdirSync(file))removeTree(path.join(file,name));fs.chmodSync(file,(s.mode&0o777)|0o700);}fs.rmSync(file,{recursive:true,force:true});}
+function removeTree(file){const s=fs.lstatSync(file,{throwIfNoEntry:false});if(s?.isDirectory()&&!s.isSymbolicLink()){fs.chmodSync(file,(s.mode&0o777)|0o700);for(const name of fs.readdirSync(file))removeTree(path.join(file,name));}fs.rmSync(file,{recursive:true,force:true});}
 function ensureParents(file){const parts=path.resolve(path.dirname(file)).split(path.sep).filter(Boolean);let current=path.parse(file).root;for(const part of parts){current=path.join(current,part);try{const s=fs.lstatSync(current);if(!s.isDirectory()||s.isSymbolicLink())throw Error("unsafe_runtime_asset_parent");}catch(e){if(e.code!=="ENOENT")throw e;fs.mkdirSync(current,{mode:0o700});}}}
 for(const [index,a] of assets.entries()){
  const source=path.join(root,String(index));regularTree(source);const target=path.resolve(a.targetPath);if(!path.isAbsolute(a.targetPath))throw Error("runner_remote_staging_target_invalid");ensureParents(target);
@@ -17727,6 +17652,18 @@ export function remoteCheckpointIncompleteFailure(
 }
 
 /** Production runnerd backend seam, exported so provider wiring can be regression tested. */
+/** Chat P0 (11-17): how long a runner refresh refusal waits, in the run, for
+ * a turn still showing on the warm session (after a Stop) to settle before it
+ * keeps the refusal. Never rotates over a live turn. */
+let nativeRefreshRotationWaitBoundMs = 60_000;
+const NATIVE_REFRESH_ROTATION_POLL_MS = 1_000;
+/** Test seam: sets the bound, returns the previous one. */
+export function setNativeRefreshRotationWaitBoundMsForTests(ms: number): number {
+  const previous = nativeRefreshRotationWaitBoundMs;
+  nativeRefreshRotationWaitBoundMs = ms;
+  return previous;
+}
+
 export async function createRunnerdBackend(input: {
   executionContext?: NativeExecutionContext;
   casesEnabled?: boolean;
@@ -20282,6 +20219,92 @@ async function createRunnerdBackendWithinSessionClaim(
     });
     return true;
   };
+  // Chat P0 (fresh 11-17, S1 17b3cb35 / S2 ed94e6f6). The runner refused to
+  // refresh the warm session: its run.prepare saw a next-run config that
+  // differs ONLY in 'instructions' (for example another run of the same agent
+  // saved a file under the agent instruction root) and answered
+  // provider_refresh_required (refresh_wait: a turn still shows on the warm
+  // session; refresh_fresh: the old session's close could not be confirmed).
+  // The driver returns that as a not-recovered result with failureClass
+  // provider_refresh_required and NSR throws NativeRunnerRefreshRequiredError:
+  // the run failed and only the NEXT message was answered, on a fresh thread.
+  // Take that fresh thread in THIS run through NSR's own in-run replacement
+  // (the F20 note: on the recover path NSR's replacement owns it): drop the
+  // failure class, so NSR reports the continuity break, openReplacementSession
+  // sets the old warm state aside (never deleted) BEFORE it opens the fresh
+  // session, and the fresh session's first turn carries the saved-history
+  // handoff. Only when nothing of the old thread can be lost or run twice: the
+  // checkpoint is idle in the rebound shape and NSR itself may replace it;
+  // the box shows no goal, descendant thread, pending tool call or unreadable
+  // state; a turn still showing (after a Stop) is waited for, bounded, and
+  // never rotated over. Anything else keeps today's named refusal.
+  const refreshRefusalFreshThread = async <T extends { recovered: boolean; reason?: string }>(result: T,
+    previous: PersistedNativeSession, signal?: AbortSignal): Promise<T | null> => {
+    const refusal = result as T & { failureClass?: unknown; prepareRefusalCode?: unknown; refreshWaitForTurn?: unknown };
+    if (result.recovered || refusal.failureClass !== "provider_refresh_required") return null;
+    const code = typeof refusal.prepareRefusalCode === "string" ? refusal.prepareRefusalCode : "provider_prepare_refused";
+    const waitForTurn = refusal.refreshWaitForTurn === true;
+    logger.warn({ runId: input.execution.binding.runId, prepareRefusalCode: code, refreshWaitForTurn: waitForTurn },
+      "native runner refused to refresh the warm session (native_runner_refresh_required)");
+    await input.onLog?.("stderr", "[paperclip-runner] the runner refused to refresh the warm session "
+      + `(native_runner_refresh_required): prepareRefusalCode=${code} refreshWaitForTurn=${waitForTurn}\n`);
+    const keep = async (why: string) => {
+      await input.onLog?.("stderr", `[paperclip-runner] keeping the refresh refusal: ${why}\n`);
+      return null;
+    };
+    if (code === "provider_live_descendants" || code === "provider_active_goal") return keep(code);
+    if (!["codex", "pi_rpc"].includes(input.execution.provider.kind) || remoteTarget?.transport !== "sandbox"
+      || !remoteCommandRunner || !remoteStateDirectory || input.remoteWarmRecovery || input.restartRecovery
+      || restoreUnavailableFreshThread || hasRetainedWarmTransitionEvidence(root)) return keep("not a fresh sandbox run");
+    // NSR must take its own replacement for a plain not-recovered result.
+    if (previous.providerRecoveryPolicy !== "allow_replacement_after_resume_failure"
+      || ("homeMode" in input.execution && input.execution.homeMode === "preconfigured")) return keep("checkpoint is not replaceable");
+    if (previous.activeTurnId != null || (previous.pendingRuntimeRequests?.length ?? 0) > 0
+      || previous.semanticResult != null || previous.terminal != null || (previous.terminalTurns?.length ?? 0) > 0
+      || previous.governedWait != null || previous.dispositionOnlyRecoveryConsumed === true
+      || previous.dispositionOnlyRecoveryTurnId != null || (previous as { goal?: unknown }).goal != null) {
+      return keep("the checkpoint carries run authority of the old thread");
+    }
+    const deadline = Date.now() + nativeRefreshRotationWaitBoundMs;
+    for (;;) {
+      let box: Record<string, unknown>;
+      try {
+        box = await readRemoteRunnerProviderState({ runner: remoteCommandRunner, stateDirectory: remoteStateDirectory,
+          execution: input.execution });
+      } catch { return keep("the warm session's state is unreadable"); }
+      const goal = box.goal && typeof box.goal === "object" ? box.goal as Record<string, unknown> : null;
+      const bridge = box.toolBridge && typeof box.toolBridge === "object" ? box.toolBridge as Record<string, unknown> : {};
+      const pendingCalls = bridge.pending && typeof bridge.pending === "object" ? Object.keys(bridge.pending).length : 0;
+      const descendants = Array.isArray(box.descendantThreadIds) ? box.descendantThreadIds.length : 0;
+      if (goal?.status === "active" || goal?.workingNow === true || descendants > 0 || pendingCalls > 0) {
+        return keep("the warm session holds a goal, a descendant thread or a pending tool call");
+      }
+      const turnShowing = (box.activeProviderTurnId ?? null) !== null || (box.piDeferredTerminal ?? null) !== null
+        || box.ambiguousTurnStartPending === true || (box.startupAttempt ?? null) !== null;
+      if (!turnShowing) break;
+      // Only a refresh_wait (the runner saw the turn) is waited for; a turn
+      // showing beside any other refusal keeps it.
+      if (!waitForTurn && code !== "provider_active_turn") return keep("a turn shows on the warm session");
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || signal?.aborted) {
+        return keep(`a turn still shows on the warm session after ${nativeRefreshRotationWaitBoundMs}ms`);
+      }
+      await new Promise<void>(resolveWait => {
+        const timer = setTimeout(done, Math.min(NATIVE_REFRESH_ROTATION_POLL_MS, remaining));
+        function done() { clearTimeout(timer); signal?.removeEventListener("abort", done); resolveWait(); }
+        signal?.addEventListener("abort", done, { once: true });
+      });
+    }
+    const atMs = Date.now();
+    await input.trace?.record({ name: "provider.session.refresh_refusal_fresh_thread", startedAtMs: atMs, endedAtMs: atMs,
+      attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
+        prepareRefusalCode: code, refreshWaitForTurn: waitForTurn } });
+    await input.onLog?.("stdout", "[paperclip-runner] continuing in a fresh provider thread: the runner refused to refresh "
+      + `the warm session (${code}); this run continues the conversation in a fresh provider thread with its saved history.\n`);
+    const { failureClass: _failureClass, prepareRefusalCode: _code, refreshWaitForTurn: _wait, ...rest } = refusal;
+    return { ...rest, recovered: false, reason: `the runner refused to refresh the warm session (${code}); `
+      + "the conversation continues in a fresh provider session with its saved history" } as unknown as T;
+  };
   /** The fresh session opened: append the old thread -> the box's new thread. */
   const recordRestoreUnavailableFreshThread = async () => {
     const taken = restoreUnavailableFreshThread;
@@ -20989,6 +21012,8 @@ async function createRunnerdBackendWithinSessionClaim(
           ? { recovered: true, session: await backend.openSession({ identity: snapshot.identity,
               workingDirectory: input.execution.workspace.cwd ?? undefined, signal: options.signal }) }
           : backend.recoverSession ? await backend.recoverSession(snapshot, options) : { recovered: false, reason: "driver does not support recovery" };
+        const rotated = reopenPi ? null : await refreshRefusalFreshThread(result, snapshot, options.signal);
+        if (rotated) { cursorCloudRuntime?.unregister(); return rotated; }
         const session = result.session ? wrapManagedSession(result.session) : undefined;
         if (result.recovered && session) await recordAdmittedProviderPack(session, snapshot.identity, Boolean(adoptedProcess));
         if (!result.recovered || !session) cursorCloudRuntime?.unregister();

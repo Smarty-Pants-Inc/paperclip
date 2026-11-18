@@ -38,6 +38,9 @@ export function useTaskRetry(issue: Issue | undefined) {
       if (isCurrent) request.current = null;
       const refs = [...new Set([variables.issueId, variables.identifier].filter((ref): ref is string => Boolean(ref)))];
       if (isCurrent && result.accepted) setReconcile({ refs, sourceRunId: variables.observedRunId });
+      // A refused or stale answer starts no work: end the pending indicator now,
+      // not after the task's other reads finish refreshing.
+      if (isCurrent && !result.accepted) { setOptimistic(false); setTakingLonger(false); }
       if (isCurrent) {
         const reason = taskRetryNotStartedReason(result);
         setNotStarted(reason ? { error: new Error(reason), state: result.presentation?.state ?? null,
@@ -56,13 +59,12 @@ export function useTaskRetry(issue: Issue | undefined) {
     },
     onError: (error, variables) => {
       if (request.current?.idempotencyKey !== variables.idempotencyKey) return;
-      if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
-        request.current = null;
-        setOptimistic(false);
-        setTakingLonger(false);
-      } else {
-        setTakingLonger(true);
-      }
+      // Any error ends the pending indicator and shows the error. A refused
+      // request is forgotten; after any other error the next press repeats the
+      // same durable request (same idempotency key).
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500) request.current = null;
+      setOptimistic(false);
+      setTakingLonger(false);
     },
   });
   useEffect(() => {
