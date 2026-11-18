@@ -30,6 +30,22 @@ pnpm paperclipai db:backup
 pnpm db:backup
 ```
 
+## Consistent JavaScript snapshots
+
+The JavaScript engine reserves one database connection and runs every catalog
+and table read (including streamed COPY data) inside one
+`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` transaction. It commits after
+the last read, or rolls back on failure. Concurrent writes cannot add a child
+from a later database state to a backup that already read its parent table.
+
+This uses PostgreSQL's [Repeatable Read isolation](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-REPEATABLE-READ):
+“successive `SELECT` commands within a single transaction see the same data”.
+The connection is held using Postgres.js's documented
+[`sql.reserve()` / `release()`](https://github.com/porsager/postgres#reserving-connections)
+API. These references were checked on 2026-11-18. Sequence counters retain
+PostgreSQL's nontransactional behavior; this does not make concurrent schema
+changes safe or add filesystem files to a logical backup.
+
 ## Restore constraint warnings
 
 Restore into a separate disposable database before you use a backup for recovery.
