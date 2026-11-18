@@ -1687,10 +1687,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
   });
 
-  // The sweep owes every unanswered message (joint rule). On this base the ONE answered function has no card
-  // carry (the B-line unit 'tA-min card carry', bb/tamin6 5cddd3d1), so the EARLIER message, whose run posted only a
-  // card that the person's next message made stale, is owed too and gets its own ONE notice. Old: 1 notice (latest only).
-  it("supersedes(JUDGE: a question card from BEFORE the latest failed message does not answer that message; " + "RECORD PENDING: joint rule 'one owed set per task', rf-5's bar" + ")", async () => {
+  // Record row 8. OLD: 1 notice, the latest (failed) message's; the earlier message stayed silent. NEW: 2 notices,
+  // one per owed group: the earlier message's run finished with only a card that the person's next message made
+  // stale (the ONE answered function has no card carry on this base: B-line unit 'tA-min card carry', bb/tamin6
+  // 5cddd3d1), the latest message's run failed. Ruling: every owed message keeps a true line until THAT message
+  // is answered; two separate runs are two groups (RFL ruling B), never two notices for one message.
+  it("supersedes(JUDGE: a question card from BEFORE the latest failed message does not answer that message; "
+    + "RFL record SUPERSEDE-ANSWERED-MERGED-OLDRULE-ROWS-1118)", async () => {
     const f = await fixture({ status: "blocked" });
     const earlier = await f.message("Deploy it.");
     const prior = await f.run({ commentId: earlier, status: "succeeded" });
@@ -1704,8 +1707,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     await f.sweep();
     const notices = await f.visible();
+    expect(notices, "exactly two notices: one per owed message").toHaveLength(2);
     expect(notices.map(n => [n.metadata?.authorizationReason, n.body]).sort(), "ONE notice per owed message, never two for one").toEqual([
       [`unanswered_message:${earlier}`, NO_REPLY], [`unanswered_message:${message}`, NOT_ANSWERED]].sort());
+    expect(notices.map(n => (n.metadata as { unansweredMessageIds?: string[] }).unansweredMessageIds), "two groups of one").toEqual([undefined, undefined]);
   });
 
   it("JUDGE: a newer board-created confirmation for someone else does not answer the latest failed message", async () => {
