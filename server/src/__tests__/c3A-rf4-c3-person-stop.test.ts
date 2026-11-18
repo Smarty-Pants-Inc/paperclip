@@ -216,27 +216,36 @@ describe.skipIf(!support.supported)("rf4 C3 product-only person Stop", () => {
     expect.soft(r.confirmed).toBe(true);
     expect(executedOnce || actionable, `runs=${r.runs.length}; blocker=${JSON.stringify(r.blocker)}`).toBe(true);
   }, 60_000);
-  it("Q5 after receipt the screen has no stale stopping text and exactly one truthful retained-work note", async () => {
-    const r = await exercise("mid_turn", "q5");
-    const visible = JSON.stringify({ blocker: r.blocker, projection: r.projection, interruption: r.interruption, activeActions: r.holds.filter(h => ["active", "escalated"].includes(h.status)) });
-    expect.soft(r.confirmed).toBe(true);
-    expect.soft(visible).not.toMatch(/Stop pending|will start automatically|Waiting for execution and required resources to stop\./);
-    const notes = r.holds.filter(h => /stopp|recover|sandbox|saved/i.test(h.nextAction));
-    expect.soft(notes, "one truthful note, not a fabricated active recovery promise").toHaveLength(1);
-    expect.soft(visible).not.toMatch(/refused to recover|Create a new task|Recovering your saved work/);
+  // rf-4 06:20Z ruling (org 06:20-06:21Z: c3-stop ships with NO Stop note): after a person's
+  // Stop the next answer arrives, and once the receipt lands the REAL chat read routes show
+  // none of the stale stopping / recovery lines.
+  it("Q5 after a person's Stop the next answer arrives and, once the receipt lands, the chat shows no stale stopping or recovery text", async () => {
+    const r = await exercise("mid_turn", "q5", { chat: true });
+    const later = await sweepRuns(r, 10_000);
+    const successors = later.runs.filter(run => run.id !== r.runId);
+    expect(r.confirmed, "the stop_and_retain receipt landed").toBe(true);
+    expect(successors, "the next answer arrives: exactly one run").toHaveLength(1);
+    expect(carries(successors[0]!, r.commentId), "it carries the person's next message").toBe(true);
+    expect(fixture.calls).toEqual([r.runId, successors[0]!.id]);
+    const reads: Record<string, unknown> = {};
+    for (const route of ["", "/comments", "/queued-comments", "/recovery-actions", "/active-run", "/live-runs"]) {
+      const res = await request(r.app).get(`/api/issues/${r.issueId}${route}`);
+      expect(res.status, `GET /api/issues/:id${route}`).toBe(200); reads[route || "/"] = res.body;
+    }
+    await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q5-chat-reads.json"), JSON.stringify(reads, null, 2));
+    const shown = JSON.stringify(reads);
+    for (const stale of ["Stop pending", "Recovering your saved work", "will start automatically", "Recovery needed", "Waiting for execution recovery", "Waiting for the previous environment to stop"])
+      expect(shown, `the chat shows "${stale}"`).not.toContain(stale);
   }, 60_000);
-  it("Q5 control (RFL): a THROWING successor provider still gets its own true failure note, separate from the Stop note", async () => {
+  it("Q5 control (RFL): a THROWING successor provider still gets its own true failure note", async () => {
     fixture.successorThrows = true;
     try {
       const r = await exercise("mid_turn", "q5-control");
       const failure = r.holds.filter(h => h.evidence?.runId !== r.runId && ["active", "escalated"].includes(h.status));
-      const stopNotes = r.holds.filter(h => h.evidence?.runId === r.runId && /unsaved changes stay on the previous sandbox/.test(h.nextAction ?? ""));
       await fs.writeFile(path.join(process.env.TASK_OUT!, "own-q5-control-holds.json"), JSON.stringify({ holds: r.holds, blocker: r.blocker }, null, 2));
       expect(r.calls.length, "the provider was reached").toBe(2);
       expect(failure, "the successor's real failure has its own note").toHaveLength(1);
-      expect(failure[0]!.nextAction).not.toMatch(/unsaved changes stay on the previous sandbox/);
       expect(r.blocker?.runId, "the blocker names the failed successor, not the stopped run").toBe(r.runs[0]?.id);
-      expect(stopNotes, "the Stop note is still there once").toHaveLength(1);
     } finally { fixture.successorThrows = false; }
   }, 60_000);
   // a8 D2 (Fable, FABLE-RESULT.md): acknowledged-native-stop.ts demanded a sandbox
