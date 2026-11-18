@@ -1,23 +1,23 @@
 [
   {
     "input": "bearer of good news",
-    "expected": "bearer ***REDACTED*** good news"
+    "expected": "bearer of good news"
   },
   {
     "input": "bearer of this letter",
-    "expected": "bearer ***REDACTED*** this letter"
+    "expected": "bearer of this letter"
   },
   {
     "input": "bearer marks every room",
-    "expected": "bearer ***REDACTED*** every room"
+    "expected": "bearer marks every room"
   },
   {
     "input": "bearer bonds were common",
-    "expected": "bearer ***REDACTED*** were common"
+    "expected": "bearer bonds were common"
   },
   {
     "input": "bearer Johnson led us",
-    "expected": "bearer ***REDACTED*** led us"
+    "expected": "bearer Johnson led us"
   },
   {
     "input": "bearer authentication and bearer tokens.",
@@ -33,11 +33,11 @@
   },
   {
     "input": "bearer lanterns glow",
-    "expected": "bearer ***REDACTED*** glow"
+    "expected": "bearer lanterns glow"
   },
   {
     "input": "bearer responsibilities continue",
-    "expected": "bearer ***REDACTED*** continue"
+    "expected": "bearer responsibilities continue"
   },
   {
     "input": "bearer internationalization matters",
@@ -61,7 +61,7 @@
   },
   {
     "input": "bearer abcdefghijkl",
-    "expected": "bearer ***REDACTED***"
+    "expected": "bearer abcdefghijkl"
   },
   {
     "input": "bearer 0123456789abcdef",
@@ -85,7 +85,7 @@
   },
   {
     "input": "bearer xxxxxxxxxxxxxxxxxxx",
-    "expected": "bearer ***REDACTED***"
+    "expected": "bearer xxxxxxxxxxxxxxxxxxx"
   },
   {
     "input": "bearer xxxxxxxxxxxxxxxxxxxx",
@@ -105,23 +105,23 @@
   },
   {
     "input": "the bearer of good news",
-    "expected": "the bearer ***REDACTED*** good news"
+    "expected": "the bearer of good news"
   },
   {
     "input": "the bearer of this letter",
-    "expected": "the bearer ***REDACTED*** this letter"
+    "expected": "the bearer of this letter"
   },
   {
     "input": "the bearer marks every room",
-    "expected": "the bearer ***REDACTED*** every room"
+    "expected": "the bearer marks every room"
   },
   {
     "input": "the bearer bonds were common",
-    "expected": "the bearer ***REDACTED*** were common"
+    "expected": "the bearer bonds were common"
   },
   {
     "input": "the bearer Johnson led us",
-    "expected": "the bearer ***REDACTED*** led us"
+    "expected": "the bearer Johnson led us"
   },
   {
     "input": "the bearer authentication and bearer tokens.",
@@ -137,11 +137,11 @@
   },
   {
     "input": "the bearer lanterns glow",
-    "expected": "the bearer ***REDACTED*** glow"
+    "expected": "the bearer lanterns glow"
   },
   {
     "input": "the bearer responsibilities continue",
-    "expected": "the bearer ***REDACTED*** continue"
+    "expected": "the bearer responsibilities continue"
   },
   {
     "input": "the bearer internationalization matters",
@@ -165,7 +165,7 @@
   },
   {
     "input": "the bearer abcdefghijkl",
-    "expected": "the bearer ***REDACTED***"
+    "expected": "the bearer abcdefghijkl"
   },
   {
     "input": "the bearer 0123456789abcdef",
@@ -189,7 +189,7 @@
   },
   {
     "input": "the bearer xxxxxxxxxxxxxxxxxxx",
-    "expected": "the bearer ***REDACTED***"
+    "expected": "the bearer xxxxxxxxxxxxxxxxxxx"
   },
   {
     "input": "the bearer xxxxxxxxxxxxxxxxxxxx",
@@ -209,23 +209,23 @@
   },
   {
     "input": "lantern bearer of good news",
-    "expected": "lantern bearer ***REDACTED*** good news"
+    "expected": "lantern bearer of good news"
   },
   {
     "input": "lantern bearer of this letter",
-    "expected": "lantern bearer ***REDACTED*** this letter"
+    "expected": "lantern bearer of this letter"
   },
   {
     "input": "lantern bearer marks every room",
-    "expected": "lantern bearer ***REDACTED*** every room"
+    "expected": "lantern bearer marks every room"
   },
   {
     "input": "lantern bearer bonds were common",
-    "expected": "lantern bearer ***REDACTED*** were common"
+    "expected": "lantern bearer bonds were common"
   },
   {
     "input": "lantern bearer Johnson led us",
-    "expected": "lantern bearer ***REDACTED*** led us"
+    "expected": "lantern bearer Johnson led us"
   },
   {
     "input": "lantern bearer authentication and bearer tokens.",
@@ -241,11 +241,11 @@
   },
   {
     "input": "lantern bearer lanterns glow",
-    "expected": "lantern bearer ***REDACTED*** glow"
+    "expected": "lantern bearer lanterns glow"
   },
   {
     "input": "lantern bearer responsibilities continue",
-    "expected": "lantern bearer ***REDACTED*** continue"
+    "expected": "lantern bearer responsibilities continue"
   },
   {
     "input": "lantern bearer internationalization matters",
@@ -269,7 +269,7 @@
   },
   {
     "input": "lantern bearer abcdefghijkl",
-    "expected": "lantern bearer ***REDACTED***"
+    "expected": "lantern bearer abcdefghijkl"
   },
   {
     "input": "lantern bearer 0123456789abcdef",
@@ -293,7 +293,7 @@
   },
   {
     "input": "lantern bearer xxxxxxxxxxxxxxxxxxx",
-    "expected": "lantern bearer ***REDACTED***"
+    "expected": "lantern bearer xxxxxxxxxxxxxxxxxxx"
   },
   {
     "input": "lantern bearer xxxxxxxxxxxxxxxxxxxx",
@@ -313,23 +313,23 @@
   },
   {
     "input": "standard bearer of good news",
-    "expected": "standard bearer ***REDACTED*** good news"
+    "expected": "standard bearer of good news"
   },
   {
     "input": "standard bearer of this letter",
-    "expected": "standard bearer ***REDACTED*** this letter"
+    "expected": "standard bearer of this letter"
   },
   {
     "input": "standard bearer marks every room",
-    "expected": "standard bearer ***REDACTED*** every room"
+    "expected": "standard bearer marks every room"
   },
   {
     "input": "standard bearer bonds were common",
-    "expected": "standard bearer ***REDACTED*** were common"
+    "expected": "standard bearer bonds were common"
   },
   {
     "input": "standard bearer Johnson led us",
-    "expected": "standard bearer ***REDACTED*** led us"
+    "expected": "standard bearer Johnson led us"
   },
   {
     "input": "standard bearer authentication and bearer tokens.",
@@ -345,11 +345,11 @@
   },
   {
     "input": "standard bearer lanterns glow",
-    "expected": "standard bearer ***REDACTED*** glow"
+    "expected": "standard bearer lanterns glow"
   },
   {
     "input": "standard bearer responsibilities continue",
-    "expected": "standard bearer ***REDACTED*** continue"
+    "expected": "standard bearer responsibilities continue"
   },
   {
     "input": "standard bearer internationalization matters",
@@ -373,7 +373,7 @@
   },
   {
     "input": "standard bearer abcdefghijkl",
-    "expected": "standard bearer ***REDACTED***"
+    "expected": "standard bearer abcdefghijkl"
   },
   {
     "input": "standard bearer 0123456789abcdef",
@@ -397,7 +397,7 @@
   },
   {
     "input": "standard bearer xxxxxxxxxxxxxxxxxxx",
-    "expected": "standard bearer ***REDACTED***"
+    "expected": "standard bearer xxxxxxxxxxxxxxxxxxx"
   },
   {
     "input": "standard bearer xxxxxxxxxxxxxxxxxxxx",
@@ -417,7 +417,7 @@
   },
   {
     "input": "Bearer x",
-    "expected": "Bearer ***REDACTED***"
+    "expected": "Bearer x"
   },
   {
     "input": "Authorization: Bearer x",
@@ -441,7 +441,7 @@
   },
   {
     "input": "Bearer abc",
-    "expected": "Bearer ***REDACTED***"
+    "expected": "Bearer abc"
   },
   {
     "input": "Authorization: Bearer abc",
@@ -489,7 +489,7 @@
   },
   {
     "input": "Bearer abcdefghijkl",
-    "expected": "Bearer ***REDACTED***"
+    "expected": "Bearer abcdefghijkl"
   },
   {
     "input": "Authorization: Bearer abcdefghijkl",
@@ -609,7 +609,7 @@
   },
   {
     "input": "Bearer abcdefghijklmno",
-    "expected": "Bearer ***REDACTED***"
+    "expected": "Bearer abcdefghijklmno"
   },
   {
     "input": "Authorization: Bearer abcdefghijklmno",
@@ -657,7 +657,7 @@
   },
   {
     "input": "Bearer xxxxxxxxxxxxxxxxxxx",
-    "expected": "Bearer ***REDACTED***"
+    "expected": "Bearer xxxxxxxxxxxxxxxxxxx"
   },
   {
     "input": "Authorization: Bearer xxxxxxxxxxxxxxxxxxx",
