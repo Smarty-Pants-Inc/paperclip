@@ -144,7 +144,14 @@ export async function decidePersonStopExportAtBound(input: {
   if (decision.decision === "without_files") {
     // adopt-stopu-twoclock: the decision owns the person's line from now on; a
     // Stop-pending card no receipt can close (the box is kept) is superseded.
-    await supersedePersonStopCardByBoundDecision(db, run).catch(() => undefined);
+    // adopt-stopu-twoclock3: a failure is recorded, never silent; the sweep's
+    // deferral heals the card on its next pass (recovery/service.ts).
+    await supersedePersonStopCardByBoundDecision(db, run).catch(async (error: unknown) => {
+      await appendHeartbeatRunEvent(db, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
+        eventType: "person_stop.card_supersede_failed", stream: "system", level: "error",
+        message: error instanceof Error ? error.message : String(error),
+        payload: { decision: decision.decision, reason } }).catch(() => undefined);
+    });
     // ONE true line in the chat (rf-4 22:30Z + RFL 22:31Z): no 'restored'
     // claim, the box/lease unchanged (kept, not destroyed).
     const line = PERSON_STOP_WITHOUT_FILES_LINE;

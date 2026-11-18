@@ -1,8 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { agents, companies, createDb, environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agents, companies, heartbeatRunEvents, createDb, environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+const seam = vi.hoisted(() => ({ failSupersede: 0 }));
+vi.mock("../services/recovery/stop-pending.js", async importOriginal => {
+  const real = await importOriginal<typeof import("../services/recovery/stop-pending.js")>();
+  return { ...real, supersedePersonStopCardByBoundDecision: async (...args: Parameters<typeof real.supersedePersonStopCardByBoundDecision>) => {
+    if (seam.failSupersede > 0) { seam.failSupersede--; throw new Error("forced supersede failure (twoclock3 b)"); }
+    return real.supersedePersonStopCardByBoundDecision(...args);
+  } };
+});
 import { recoveryService } from "../services/recovery/service.js";
 import { recordTaskStopPending } from "../services/recovery/stop-pending.js";
 import { decidePersonStopExportAtBound, readPersonStopBoundDecision } from "../services/heartbeat/person-stop-release-export.js";
@@ -125,5 +133,48 @@ describe("adopt-stopu-twoclock: the person-Stop card and the export hold share o
     expect(rows.map(row => [row.status, row.outcome])).toEqual([["cancelled", "cancelled"]]);
     // It does not claim the Stop was proved.
     expect(rows[0]!.resolutionNote).not.toMatch(/Stop proved/);
+  });
+
+  it("twoclock3 (a): a card write after the decision committed (sweep read before it) writes no card", async () => {
+    const f = await fixture();
+    at(FAILING_SINCE + PERSON_STOP_EXPORT_BOUND_MS);
+    // 1. the sweep's deferral read happened (no decision yet); 2. the decision
+    // and its supersede commit (no card yet, nothing to supersede); 3. the
+    // sweep's card writer runs under its task + run locks.
+    expect(await decide(f)).toMatchObject({ decision: "without_files" });
+    expect(await openCards(f.issueId)).toEqual([]);
+    await db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("update");
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)).for("update");
+      await recordTaskStopPending(tx as unknown as Db, { companyId: f.companyId, issueId: f.issueId,
+        runIds: [f.runId], source: "recovery.sweep_stale_issue_locks" }, []);
+    });
+    expect(await openCards(f.issueId)).toEqual([]);
+  });
+
+  it("twoclock3 (b): a failed supersede is logged as a run event and the next sweep closes the card", async () => {
+    const f = await fixture();
+    at(STOP_AT + 5 * 60_000 + 1_000);
+    await db.transaction(async tx => recordTaskStopPending(tx as unknown as Db, { companyId: f.companyId, issueId: f.issueId,
+      runIds: [f.runId], source: "recovery.sweep_stale_issue_locks" }, []));
+    expect(await openCards(f.issueId)).toHaveLength(1);
+    at(FAILING_SINCE + PERSON_STOP_EXPORT_BOUND_MS);
+    seam.failSupersede = 1;
+    expect(await decide(f)).toMatchObject({ decision: "without_files" });
+    expect(seam.failSupersede).toBe(0);
+    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    const failed = events.filter(event => event.eventType === "person_stop.card_supersede_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!.message).toMatch(/forced supersede failure/);
+    expect(await openCards(f.issueId)).toHaveLength(1);
+    // twoclock2 cleared the task's pointers with the decision, so the sweep no
+    // longer visits this task. Put the execution pointer back on the stopped run
+    // (a pointer that still names it) so the sweep's deferral is what runs next.
+    await db.update(issues).set({ executionRunId: f.runId, checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    at(FAILING_SINCE + PERSON_STOP_EXPORT_BOUND_MS + 30_000);
+    await sweep(f);
+    expect(await openCards(f.issueId)).toEqual([]);
+    const rows = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(rows.map(row => [row.status, row.outcome])).toEqual([["cancelled", "cancelled"]]);
   });
 });

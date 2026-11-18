@@ -123,7 +123,7 @@ import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js"
 import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
 import { isCancelledNativeStartup } from "../cancelled-native-startup.js";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
-import { clearTaskStopPending, hasRecordedStopRequest, hasTaskStopPending, isPersonStop, personStopCardBoundAt, recheckTaskStopPending, recordTaskStopPending } from "./stop-pending.js";
+import { clearTaskStopPending, hasRecordedStopRequest, hasTaskStopPending, isPersonStop, personStopCardBoundAt, recheckTaskStopPending, recordTaskStopPending, supersedePersonStopCardLocked } from "./stop-pending.js";
 import { personStopExportBoundAt, readPersonStopBoundDecision } from "../heartbeat/person-stop-export-bound.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { redactSensitiveText } from "../../redaction.js";
@@ -4326,6 +4326,9 @@ export function recoveryService(
         // adopt-stopu-twoclock: the bound decided and kept the box (no stop
         // request, so no stop receipt will come); its one true line owns the
         // person's chat, not a card no receipt can close. Keep re-checking.
+        // adopt-stopu-twoclock3: and HEAL here (the decision's supersede may
+        // have failed): an open Stop-pending card for this run is superseded.
+        healRunIds.add(lease.heartbeatRunId!);
         return now + 30_000;
       } else {
         // adopt-stopu-twoclock: ONE clock. While the export hold is on (its own
@@ -4337,10 +4340,18 @@ export function recoveryService(
       // active lease (cancel-finalize export first). That is the same Stop, same bound.
       return Number.isFinite(deadline) && now < deadline ? deadline : null;
     };
+    const healRunIds = new Set<string>();
     let next = now + 30_000;
     for (const lease of blockers) {
       if (lease.heartbeatRunId && personStops.has(lease.heartbeatRunId)) {
         const deadline = personStopDeadline(lease);
+        for (const runId of healRunIds) {
+          // Caller holds the task + run locks (the same the supersede takes).
+          const healPublications: ActivityPublication[] = [];
+          await supersedePersonStopCardLocked(tx, personStops.get(runId)!, issue.id, healPublications);
+          for (const publication of healPublications) publishActivity(publication);
+          healRunIds.delete(runId);
+        }
         if (deadline === null) return false;
         next = Math.min(next, deadline);
         continue;

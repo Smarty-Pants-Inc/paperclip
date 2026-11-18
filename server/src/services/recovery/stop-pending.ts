@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
-import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { readPersonStopBoundDecision } from "../heartbeat/person-stop-export-bound.js";
 import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
@@ -162,6 +163,12 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
   const boundRuns = await tx.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, runIds)));
   const personStop = runIds.length > 0 && boundRuns.length === runIds.length && boundRuns.every(isPersonStop);
+  // adopt-stopu-twoclock3 (F2): re-read the bound decision HERE, under the same
+  // task + run row locks the supersede takes. A without_files decision kept the
+  // box (no stop request, so no receipt can close a card): no card. A decision
+  // committed after this read is ordered after this transaction by those locks,
+  // and its supersede then closes this card.
+  if (personStop && await personStopBoundDecidedWithoutFiles(tx, input.companyId, runIds)) return;
   const copy = personStop ? STOP_PENDING_PERSON_ACTION : STOP_PENDING_ACTION;
   const now = new Date();
   await notify(tx, input);
@@ -200,6 +207,12 @@ export async function recordTaskStopPending(tx: Db, input: TaskBinding & { sourc
     details: { code: STOP_PENDING_CODE, source: input.source, runIds, recoveryActionId: actionId,
       escalation: "board", automaticInspectionLimit: 1 },
   }, publications);
+}
+
+async function personStopBoundDecidedWithoutFiles(tx: Db, companyId: string, runIds: string[]) {
+  const leases = await tx.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, runIds)));
+  return leases.some(lease => readPersonStopBoundDecision(lease.metadata)?.decision === "without_files");
 }
 
 /** Caller supplies guarded Stop proof, or a checked later answer without any
@@ -292,6 +305,16 @@ export async function supersedePersonStopCardByBoundDecision(db: Db, run: Stoppe
       eq(issues.companyId, run.companyId), eq(issues.id, issueId))).for("update");
     await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).for("update");
+    await supersedePersonStopCardLocked(tx as unknown as Db, run, issueId, publications);
+  });
+  for (const publication of publications) publishActivity(publication);
+}
+/** adopt-stopu-twoclock3: the supersede body. Caller holds the task and run
+ * locks (the decision's own transaction above, or the sweep's deferral heal).
+ * Idempotent: no open card for exactly this run -> nothing. */
+export async function supersedePersonStopCardLocked(tx: Db, run: StoppedRun & { contextSnapshot?: Record<string, unknown> | null },
+  issueId: string, publications: ActivityPublication[]) {
+  {
     const existing = await activeAction(tx as unknown as Db, { companyId: run.companyId, issueId, runIds: [run.id] });
     const pending = existing && stopPending(existing);
     if (!existing || !pending || JSON.stringify(pending.runIds) !== JSON.stringify([run.id])) return;
@@ -311,8 +334,7 @@ export async function supersedePersonStopCardByBoundDecision(db: Db, run: Stoppe
     await logActivity(tx as unknown as Db, { companyId: run.companyId, actorType: "system", actorId: "recovery",
       action: "issue.execution_stop_pending_superseded", entityType: "issue", entityId: issueId,
       details: { runIds: [run.id], recoveryActionId: existing.id, reason: "person_stop_export_bound_decided" } }, publications);
-  });
-  for (const publication of publications) publishActivity(publication);
+  }
 }
 /** The person's line while this run's Stop-pending card is open, else null. */
 export async function personStopPendingLine(db: Db, input: { companyId: string; issueId: string; runId: string }) {
