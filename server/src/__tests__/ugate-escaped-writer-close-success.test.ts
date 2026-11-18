@@ -83,7 +83,11 @@ describe.skipIf(!support.supported)("adopt-stopu-ugate (2), never-OK: close-succ
   });
 
   /** The "box": commands run locally in its directory (as cancel-finalize-warm-stop.test.ts). */
+  let processTableUnreadable = false;
   const boxRunner: CommandManagedRuntimeRunner = { execute: async input => new Promise(resolve => {
+    // Case 2: the box answers, but its process table cannot be read (no /proc).
+    if (processTableUnreadable && input.command === "sh" && String(input.args?.[1] ?? "").includes("/proc/stat"))
+      return resolve({ exitCode: 4, signal: null, timedOut: false, stdout: "ERR no_proc\n", stderr: "", pid: null, startedAt: null });
     const child = execFile(input.command, input.args ?? [], { cwd: input.cwd, env: { ...process.env, ...input.env },
       timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => resolve({
       exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0, signal: error?.signal ?? null,
@@ -92,8 +96,11 @@ describe.skipIf(!support.supported)("adopt-stopu-ugate (2), never-OK: close-succ
   }) };
 
 
-  it("a setsid/nohup loop writing notes.md survives the clean close: no export while it lives; killed, then the export is consistent", async () => {
+  it.each([["killable: the writer is killed, then the export is consistent", false],
+    ["process table unreadable: no export, box kept, the true line", true]] as const)
+  ("a setsid/nohup loop writing notes.md survives the clean close (%s)", async (_label, unreadable) => {
     const exportDelayMs = 0;
+    processTableUnreadable = unreadable;
 
     providerTurns.length = 0;
     const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
@@ -212,12 +219,13 @@ describe.skipIf(!support.supported)("adopt-stopu-ugate (2), never-OK: close-succ
       await new Promise(resolve => setTimeout(resolve, 600));
       const boxSha2 = await fs.readFile(owedFile).then(sha, () => null);
       const hostSha = await fs.readFile(path.join(hostCwd, "notes.md")).then(sha, () => null);
-      const evidence = { writerPid, writerAliveAfter, state, mark: runAfter.runnerProfileJson?.nativeCancelledWarmExport,
+      const evidence = { label: _label, writerPid, writerAliveAfter, state, mark: runAfter.runnerProfileJson?.nativeCancelledWarmExport,
         leaseStatus: leaseAfter.status, providerStops: stop.mock.calls.filter(([i]) => i.providerLeaseId === providerLeaseId).length,
         boxStable: boxSha1 === boxSha2, hostEqualsBox: hostSha === boxSha2, hostSha, boxSha: boxSha2,
         lines: events.filter(e => e.eventType === "workspace_export_deferred").map(e => e.message) };
       console.log("UGATE_ESCAPED_EVIDENCE", JSON.stringify(evidence));
       if (process.env.UGATE_EVIDENCE_FILE) await fs.appendFile(process.env.UGATE_EVIDENCE_FILE, `${JSON.stringify(evidence)}\n`);
+      if (unreadable) expect(state).toBe("prepared"); else expect(state).toBe("finalized");
       if (state === "finalized") {
         // Exported: only after the writer was killed, and the host holds exactly the box's final bytes.
         expect(writerAliveAfter).toBe(false);
