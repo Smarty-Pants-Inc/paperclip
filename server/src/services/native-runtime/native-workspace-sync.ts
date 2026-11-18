@@ -8,7 +8,7 @@ import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import type { WorkspaceCheckpointMetrics } from "@paperclipai/adapter-utils/workspace-checkpoint";
 import type { RuntimeSpanRunner } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import fs from "node:fs/promises";
-import { hostCleanup, hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
+import { hostCleanup, hostMutation, hostWork } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -1195,7 +1195,11 @@ export async function prepareNativeWorkspaceSync(input: {
     restoreWorkspace: async (assertOwnership, options) => {
       if (!restorePromise) {
         exportSignal = options?.signal;
-        restorePromise = finalizePreparedRuntime({
+        // adopt-drain3: the whole restore, including its finally-block cleanup
+        // of private snapshots, temp files and the merge owner sidecar, joins
+        // the current owner's host-mutation drain, so the owner releases only
+        // after that cleanup finished (even if its action stopped awaiting it).
+        restorePromise = hostWork(() => finalizePreparedRuntime({
           db: input.db,
           runId: input.runId,
           target,
@@ -1205,7 +1209,7 @@ export async function prepareNativeWorkspaceSync(input: {
           signal: options?.signal,
           onPhase: input.onPhase,
           onCheckpoint: input.onCheckpoint,
-        })
+        }))
           .then((finalizedReference) => {
             reference = finalizedReference;
           })

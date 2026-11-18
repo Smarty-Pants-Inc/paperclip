@@ -56,7 +56,7 @@ import {
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
-import { hostCleanup, hostMutation } from "./host-mutation-drain.js";
+import { hostCleanup, hostMutation, hostWork } from "./host-mutation-drain.js";
 import {
   scheduleSyncOperations,
   SYNC_OPERATION_CONCURRENCY_LIMIT,
@@ -2048,7 +2048,9 @@ export async function prepareSandboxManagedRuntime(input: {
         ? { baseline: baselineSnapshot, gitSnapshot, ...(!gitSnapshot && repositories.length ? { repositories } : {}) }
         : null,
     cleanupWorkspaceSnapshot,
-    restoreWorkspace: async (onProgress?: RuntimeProgressSink, restoreOptions?: WorkspaceRestoreOptions) => {
+    // adopt-drain3: the whole restore (including the finally below that
+    // removes this run's private snapshots) joins the current owner's drain.
+    restoreWorkspace: (onProgress?: RuntimeProgressSink, restoreOptions?: WorkspaceRestoreOptions) => hostWork(async () => {
       try {
       const restoreSink = onProgress ?? input.onProgress;
       const restoreSignal = restoreOptions?.signal;
@@ -2472,7 +2474,7 @@ export async function prepareSandboxManagedRuntime(input: {
         }
       }
       } finally { await cleanupWorkspaceSnapshot(); }
-    },
+    }),
   };
   } catch (error) { await cleanupWorkspaceSnapshot(); throw error; }
 }
