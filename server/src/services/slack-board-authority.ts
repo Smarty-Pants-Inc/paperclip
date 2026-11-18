@@ -50,14 +50,17 @@ export async function slackBoardAuthor(db: Reader, endpoint: Endpoint, userId: s
 
 /** Recheck the author of a durable Board receipt immediately before transport.
  * The source comment/run supplies identity; publication text never does. */
-export async function authorizeSlackBoardPublication(
+export type SlackBoardChannelCheck = { slackUserId: string; channelId: string };
+
+/** Database-only part of the Board publication check. A returned target still
+ * needs Slack's channel check; run that outside any database transaction. */
+export async function slackBoardPublicationCheck(
   db: Reader,
   endpoint: Endpoint,
   conversation: typeof chatConversations.$inferSelect,
   publication: typeof chatPublications.$inferSelect,
   botToken: string,
-  fetchImpl: typeof fetch,
-) {
+): Promise<boolean | SlackBoardChannelCheck> {
   if (!publication.commentId) return true;
   const [source] = await db
     .select({ comment: issueComments, run: heartbeatRuns })
@@ -123,15 +126,33 @@ export async function authorizeSlackBoardPublication(
   if (source.comment.deletedAt) return false;
   const principal = await slackBoardAuthor(db, endpoint, userId);
   if (!principal || receipt.payload.principalId !== principal.id || !botToken) return false;
+  return { slackUserId: principal.externalId, channelId: conversation.externalConversationId.replace(/^slack:/, "") };
+}
+
+/** Slack's remote channel check. Never call it inside a database transaction. */
+export async function verifySlackBoardChannel(
+  endpoint: Endpoint,
+  target: SlackBoardChannelCheck,
+  botToken: string,
+  fetchImpl: typeof fetch,
+) {
   try {
-    await authorizeSlackChannel(
-      { endpoint, slackUserId: principal.externalId },
-      slackClient(botToken, fetchImpl),
-      conversation.externalConversationId.replace(/^slack:/, ""),
-    );
+    await authorizeSlackChannel({ endpoint, slackUserId: target.slackUserId }, slackClient(botToken, fetchImpl), target.channelId);
   } catch (error) {
     if (error instanceof HttpError && error.status === 403) return false;
     throw error;
   }
   return true;
+}
+
+export async function authorizeSlackBoardPublication(
+  db: Reader,
+  endpoint: Endpoint,
+  conversation: typeof chatConversations.$inferSelect,
+  publication: typeof chatPublications.$inferSelect,
+  botToken: string,
+  fetchImpl: typeof fetch,
+) {
+  const target = await slackBoardPublicationCheck(db, endpoint, conversation, publication, botToken);
+  return typeof target === "boolean" ? target : verifySlackBoardChannel(endpoint, target, botToken, fetchImpl);
 }
