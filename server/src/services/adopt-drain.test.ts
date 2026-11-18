@@ -207,7 +207,12 @@ const support = await getEmbeddedPostgresTestSupport();
           nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId, companyId, issueId, scope: "run",
             reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
             intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } },
-        runnerProfileJson: { ...current.runnerProfileJson },
+        runnerProfileJson: { ...current.runnerProfileJson,
+          // pl/r4-work3 (a), taken into U (adopt-stopu-compose8: ported as in
+          // r4-symlink-judge.test.ts): NSE's settle of the Stop records the
+          // closed session's clean close (the stopped turn's tools are gone).
+          ...(variant.settled ? { nativeStoppedSessionClose: { schema: "paperclip.native-stopped-session-close.v1",
+            companyId, issueId, runId, sessionId: null, clean: true, at: stoppedAt.toISOString() } } : {}) },
       }).where(eq(heartbeatRuns.id, runId));
       if (variant.settled) await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId,
         phase: "terminal_failure", failureCode: "native_retry_cancelled" });
@@ -290,6 +295,13 @@ const support = await getEmbeddedPostgresTestSupport();
   async function settleLater(f: Awaited<ReturnType<typeof stopMidTurn>>) {
     await db.insert(nativeRunFinalizations).values({ runId: f.runId, companyId: f.companyId, issueId: f.issueId,
       phase: "terminal_failure", failureCode: "native_retry_cancelled" });
+    // pl/r4-work3 (a): NSE's settle writes the clean-close proof with it
+    // (adopt-stopu-compose8: ported as in r4-symlink-judge.test.ts settleLater).
+    const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...current.runnerProfileJson,
+      nativeStoppedSessionClose: { schema: "paperclip.native-stopped-session-close.v1", companyId: f.companyId,
+        issueId: f.issueId, runId: f.runId, sessionId: null, clean: true, at: new Date().toISOString() } } })
+      .where(eq(heartbeatRuns.id, f.runId));
   }
 
 
