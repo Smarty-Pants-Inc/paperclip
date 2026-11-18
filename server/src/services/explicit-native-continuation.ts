@@ -349,7 +349,6 @@ export async function admitExplicitNativeContinuation(input: {
     // same ordinary admission as a typed message; no synthetic stopped-run source.
     const ownerSendAfterPersonStop = !blocker && !sourceChecks.length && task.conversationAgentId === agentId
       && interruptIntent?.actorId === task.conversationUserId && !!latest && isAcknowledgedNativeStop(latest)
-      && latest.resultJson?.operatorInterrupted !== true && !latest.resultJson?.queuedCommentInterruptQueueId
       && !!latest.finishedAt && latest.finishedAt <= interruptRequestedAt!
       // Only when nothing else is active or queued on this chat (the same source as
       // run-control resumeSavedComments); otherwise the Send takes the ordinary path.
