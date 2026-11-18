@@ -30,7 +30,38 @@ pnpm paperclipai db:backup
 pnpm db:backup
 ```
 
-Environment overrides:
+## Restore constraint warnings
+
+Restore into a separate disposable database before you use a backup for recovery.
+`runDatabaseRestore` uses `psql` when available. For JavaScript backups with
+statement boundaries, it can also apply the SQL with the database client.
+
+JavaScript dumps restore CHECK, UNIQUE and EXCLUDE constraints after the data.
+If existing rows violate a CHECK, restore adds it as `NOT VALID`, which still
+checks new inserts and updates. A UNIQUE or EXCLUDE constraint cannot be added
+as `NOT VALID`; restore skips it instead. An affected foreign key is also
+reported: it remains `NOT VALID` for orphan rows, or is skipped when its
+referenced unique constraint could not be restored. Constraints that were
+already `NOT VALID` remain so without a new data-violation warning.
+
+Every affected constraint produces a `WARNING` with its schema, table, name,
+exact definition, violating-row count, and up to five sample primary keys.
+The SQL emits these warnings even when you restore it directly with `psql`.
+Capture `psql` stderr if you use that path without the restore runner.
+A skipped dependent foreign key can have zero orphan rows; its warning still
+identifies the missing constraint.
+
+The restore runner returns a `constraintViolations` list and a `summary`.
+For a nonempty list, it writes a mode-0600 JSON report beside the archive, logs
+one warning per constraint, and prints `restored with N constraint violations:
+see <report path>`. Callers can set `violationReportFile` to select a writable
+report location. The worktree command includes this summary in its restore
+phase. Repair the reported rows, then validate the `NOT VALID` constraints or
+re-add skipped constraints with their saved definitions. Other SQL errors still
+fail restore. This recovery behavior belongs to the JavaScript dump format;
+it does not rewrite constraint statements in an ordinary `pg_dump` archive.
+
+## Environment overrides
 
 - `PAPERCLIP_DB_BACKUP_ENABLED=true|false`
 - `PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES=<minutes>`
