@@ -17,10 +17,33 @@ function allRows(metadata: { sections: Array<{ rows: unknown[] }> }) {
 }
 
 describe("stranded recovery notice seeds", () => {
-  it("says what happened and the one thing to do, with no internal words (the UI recognizes this wording)", () => {
-    for (const seed of [buildImmediateExecutionPathRecoveryNoticeSeed({ status: "todo" }),
-      buildNoRunningExecutionNoticeSeed({ status: "in_progress", attempts: 3 })]) {
-      expect(seed.body).toMatch(/^Paperclip tried to (start|continue) this task again, but it still could not (start|continue)\b/);
+  // Keep: recorded gate-1 catch, one setup failure falsely claimed a repeated failure.
+  it.each([undefined, 0, 1])("one-note: attempts %s never claims the task failed again", (attempts) => {
+    expect(buildNoRunningExecutionNoticeSeed({ status: "todo", attempts }).body).toBe(
+      "Paperclip could not start this task. Press Retry to start it.",
+    );
+    expect(buildNoRunningExecutionNoticeSeed({ status: "in_progress", attempts }).body).toBe(
+      "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
+    );
+  });
+
+  it("one-note: two failures retain the repeated-attempt wording", () => {
+    expect(buildNoRunningExecutionNoticeSeed({ status: "todo", attempts: 2 }).body).toBe(
+      "Paperclip tried to start this task again, but it still could not start after 2 tries. Press Retry to start it again.",
+    );
+    expect(buildNoRunningExecutionNoticeSeed({ status: "in_progress", attempts: 2 }).body).toBe(
+      "Paperclip tried to continue this task again, but it still could not continue after 2 tries. Press Retry to start it again from the saved work.",
+    );
+  });
+
+  it("(superseded by replacement: one-note wording, RFL record 00:01Z) says what happened and the one thing to do, with no internal words (the UI recognizes this wording)", () => {
+    for (const [seed, expectedBody] of [
+      [buildImmediateExecutionPathRecoveryNoticeSeed({ status: "todo" }),
+        "Paperclip could not start this task. Press Retry to start it."],
+      [buildNoRunningExecutionNoticeSeed({ status: "in_progress", attempts: 3 }),
+        "Paperclip tried to continue this task again, but it still could not continue after 3 tries. Press Retry to start it again from the saved work."],
+    ] as const) {
+      expect(seed.body).toBe(expectedBody);
       expect(seed.body).toContain("Press Retry");
       expect(seed.body).not.toMatch(/execution path|intervention|`blocked`|`todo`|`in_progress`|issue|board operator|inspect|repair/i);
     }
@@ -127,10 +150,12 @@ describe("stranded recovery notice seeds", () => {
     });
   });
 
-  it("distinguishes todo dispatch from in_progress continuation copy", () => {
-    expect(buildImmediateExecutionPathRecoveryNoticeSeed({ status: "todo" }).body).toContain("tried to start this task again");
-    expect(buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }).body).toContain(
-      "tried to continue this task again",
+  it("(superseded by replacement: one-note wording, RFL record 00:01Z) distinguishes todo dispatch from in_progress continuation copy", () => {
+    expect(buildImmediateExecutionPathRecoveryNoticeSeed({ status: "todo" }).body).toBe(
+      "Paperclip could not start this task. Press Retry to start it.",
+    );
+    expect(buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }).body).toBe(
+      "Paperclip could not continue this task. Press Retry to start it again from the saved work.",
     );
   });
 });
